@@ -16,14 +16,14 @@ use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
-use super::common_fields::CommonFields;
+use super::common_fields::{BkptFlag, CommonFields};
 use super::link::{
     ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
 };
 use super::menu_choices::MenuBound;
 use super::record_trait::{
-    AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, InputLinkRequest, LinkReadAs,
+    ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -888,6 +888,55 @@ pub(crate) enum ForwardTarget {
     /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger.
     External(String),
 }
+impl ProcessPlan {
+    /// The answers, asked of the record type once. Pure in the record's
+    /// type: every input is a `Record` method or a table keyed on its name,
+    /// so the plan is the same whenever it is built.
+    pub(crate) fn of(record: &dyn Record) -> Self {
+        let rtype = record.record_type();
+        let declares_simulation = field_desc_of(record, "SIMM").is_some();
+        ProcessPlan {
+            dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
+            simulation: declares_simulation,
+            sel_nvl: rtype == "sel",
+            string_input: !record.string_input_links().is_empty(),
+            multi_output_dispatch: crate::server::database::multi_output_dispatch_owned(rtype),
+            reads_sell: crate::server::database::reads_sell(rtype),
+            posts_software_event: crate::server::database::posts_software_event(rtype),
+            resolves_subroutine_from_link: crate::server::database::resolves_subroutine_from_link(
+                rtype,
+            ),
+            // Asked of the record itself, not of a table keyed on `rtype`: the
+            // type that implements the step is the one that answers whether it
+            // has one, so the two cannot drift into different files.
+            substitutes_input_stage_when_simulating: record.simulation_substitutes_input_stage(),
+            redecides_after_output: record.redecides_after_output(),
+            input_fetch_policy: record.input_fetch_policy(),
+            constants_deliver_at_process: record.constant_inputs_deliver_at_process(),
+            multi_input_is_db_get_link: record.multi_input_fetch_is_db_get_link(),
+            multi_inputs_read_native: record.input_link_answers_fixed_at_type()
+                && record.multi_input_links().iter().all(|(lf, _)| {
+                    record.input_link_request(lf) == InputLinkRequest::As(LinkReadAs::Native)
+                        && !record.input_link_failure_is_inert(lf)
+                }),
+            dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
+                rtype,
+            ) && record.declares_multi_output_links(),
+            narrows_input_links: record.narrows_input_links(),
+            output_stage: record.can_device_write()
+                || field_desc_of(record, "OUT").is_some()
+                || field_desc_of(record, "OEVT").is_some()
+                || crate::server::database::multi_output_dispatch_owned(rtype)
+                || record.declares_multi_output_links()
+                || declares_simulation,
+            fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
+            soft_channel_skips_convert: record.soft_channel_skips_convert(),
+            skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
+            restamps_time_after_completion: record.restamps_time_after_completion(),
+            clears_udf: record.clears_udf(),
+        }
+    }
+}
 
 /// C's `if (prec->udf) recGblSetSevr(prec, UDF_ALARM, prec->udfs);` line, as
 /// one record type writes it — whether the type has the line at all, whether
@@ -909,8 +958,10 @@ pub(crate) struct UdfAlarm {
 /// may refuse it, another for the simulation block, another for `sel`'s NVL
 /// and another for the string-input fetch — four locks and four dynamic calls
 /// to learn four answers that were fixed when the type was compiled. They are
-/// settled once, in [`RecordInstance::new_boxed`], and the cycle carries them
-/// by value.
+/// settled once, in [`RecordCell::new`], and live on the cell rather than
+/// under its lock: a cycle borrows them ([`RecordCell::process_plan`])
+/// instead of copying them out of the guarded instance, which the body did
+/// field by field — one load and one spill per flag — on every cycle.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProcessPlan {
     /// This type's C `process()` opens with a dset test that can refuse the
@@ -955,6 +1006,14 @@ pub(crate) struct ProcessPlan {
     /// Whether a failed multi-input read owes C's `setLinkAlarm` — see
     /// [`Record::multi_input_fetch_is_db_get_link`].
     pub(crate) multi_input_is_db_get_link: bool,
+    /// Every declared multi-input link reads [`LinkReadAs::Native`] and none
+    /// declares its failure inert — the framework default, which every base
+    /// numeric type gives. The fetch loop then carries the answer instead of
+    /// asking [`Record::input_link_request`] and
+    /// [`Record::input_link_failure_is_inert`] through the vtable per link,
+    /// per cycle. Only settled here for a type whose answers are fixed at the
+    /// type ([`Record::input_link_answers_fixed_at_type`]).
+    pub(crate) multi_inputs_read_native: bool,
     /// This type declares generic multi-output pairs
     /// ([`Record::multi_output_links`]) for the pre-commit output stage to
     /// drive — scalcout, acalcout, aSub, epid. `false` makes
@@ -967,10 +1026,6 @@ pub(crate) struct ProcessPlan {
     /// `dispatch_multi_output`, and `multi_output_dispatch_owned` excludes
     /// them from the generic block, so no type can answer `true` to both.
     pub(crate) dispatches_generic_multi_output: bool,
-    /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
-    /// support has no such line (`swait`, `waveform` proper). See
-    /// [`UdfAlarm`].
-    pub(crate) udf_alarm: Option<UdfAlarm>,
     /// This type can narrow the cycle's input list — see
     /// [`Record::narrows_input_links`]. `false` makes the guard that asks
     /// disappear.
@@ -994,29 +1049,43 @@ pub(crate) struct ProcessPlan {
 
 /// The allocation every holder of a record shares — the port's `precord`.
 ///
-/// What lives HERE rather than in [`RecordInstance`] is decided by one rule:
-/// **a fact a caller needs before it holds the data lock cannot live behind
-/// the data lock.** C has exactly one such fact, and `dbScanLock`
-/// (`dbLock.c:184-213`) is the reason — it reads `precord->lset` to learn
-/// which mutex to take, which cannot itself be guarded by a lock the caller
-/// has not got. C reads it off `dbCommon` with no lock at all; the port has a
-/// data lock C has no counterpart for, and keeping the cell inside it meant
-/// every cycle took the record's `RwLock` once to learn which set to lock and
-/// then again to do any work.
+/// The record's data is guarded by its **lock set** and nothing else — C's
+/// `dbScanLock` (`dbLock.c:184-213`), the one mutex every record a DB link
+/// reaches shares. [`Self::read`] and [`Self::write`] take that set
+/// (recursively, as C's `epicsMutex` is) and hand out a borrow of the data;
+/// a thread already inside the set — the process path, which took it at
+/// entry — pays a thread-key compare and a counter, no atomic
+/// read-modify-write. The per-record `RwLock` this replaced was a second
+/// lock over the same data: every field access on the process path took it
+/// again under the set that already excluded every other writer.
 ///
-/// Everything else is [`RecordInstance`] behind the data lock, and `Deref`
-/// hands that lock out, so a holder still writes `rec.read()` / `rec.write()`.
+/// What lives HERE rather than in [`RecordInstance`] is decided by one rule:
+/// **a fact a caller needs before it holds the lock cannot live behind the
+/// lock.** C has exactly one such fact — `precord->lset`, read off
+/// `dbCommon` with no lock at all to learn which mutex to take.
+///
+/// Same-thread aliasing is what the `RwLock` used to refuse by deadlocking
+/// (a `write()` under a live guard of the same record never returned). The
+/// set recurses, so that refusal is [`Self::borrow`]'s now, and it panics —
+/// on the thread that did it, naming the record — instead of parking it.
 pub struct RecordCell {
-    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Empty until the record has been
-    /// given a gate, which is C's null `lset` before `dbLockInitRecords`.
-    ///
-    /// A `OnceLock` and not a swappable slot because the cell is this
-    /// record's identity in the lock registry: a lock-set MERGE moves the set
-    /// the cell points at, never the cell. `PvDatabase::lock_instance` is the
-    /// only writer, through [`Self::attach_lock_record`], because the cell a
-    /// record holds must be the one the registry hands out for its name — a
-    /// second cell would be a second answer to "which set is this record in".
-    lock_record: std::sync::OnceLock<std::sync::Arc<crate::server::database::LockRecord>>,
+    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
+    /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
+    /// moved onto a set of its own by the registry, which adopts this very
+    /// cell for the record's name so that the record and the registry can
+    /// never hold two answers to "which set is this record in". A lock-set
+    /// MERGE moves the set the cell points at, never the cell.
+    lock_record: std::sync::Arc<crate::server::database::LockRecord>,
+    /// `RefCell`-style borrow state of `data`: `0` free, `n > 0` that many
+    /// shared borrows, `-1` one exclusive borrow. Touched only by the thread
+    /// holding the record's lock set, which is why plain loads and stores
+    /// (no read-modify-write) are enough — the atomic is for `Sync`, not for
+    /// contention, and there is none.
+    borrow: std::sync::atomic::AtomicIsize,
+    /// The record's `BKPT` byte, shared with `data.common.bkpt` — reachable
+    /// here without the lock set, as C reads `precord->bkpt` (see
+    /// [`BkptFlag`]).
+    bkpt: BkptFlag,
     /// Which published `cp_links` map [`Self::sources_cp_edges`] was resolved
     /// from, or 0 before it ever was.
     ///
@@ -1032,16 +1101,243 @@ pub struct RecordCell {
     /// The cached answer, valid only while [`Self::cp_edges_revision`] still
     /// matches the registry's.
     cp_edges: std::sync::atomic::AtomicBool,
-    data: parking_lot::RwLock<RecordInstance>,
+    /// C `dbCommon::rdes` — the record type's description, reachable without
+    /// a borrow of the record because a cell's type never changes. What a
+    /// link target's field address ([`FieldAddr`]) is resolved against.
+    rdes: RecordDesc,
+    /// [`Record::field_slot`] for each entry of `rdes.fields`, asked once
+    /// here so a link resolving its target's address needs no lock.
+    slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// [`Record::field_slot`] of each [`Record::multi_input_links`] value
+    /// field, by the link's index — C's `&prec->a + i`, the address the
+    /// fetch stores through ([`Record::put_slot_f64`]) when the type hands
+    /// one out.
+    multi_input_val_slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// The type-static answers a process cycle tests — see [`ProcessPlan`].
+    /// Fixed by the type, like `rdes`, so it is reachable without a borrow
+    /// of the record.
+    plan: ProcessPlan,
+    data: LockSetGuarded<RecordInstance>,
 }
+
+/// A record type's declaration, C's `dbRecordType` behind `precord->rdes`:
+/// the two static tables a field name is resolved against.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordDesc {
+    pub(crate) record_type: &'static str,
+    pub(crate) fields: &'static [FieldDesc],
+}
+
+impl RecordDesc {
+    pub(crate) fn of<R: Record + ?Sized>(record: &R) -> Self {
+        RecordDesc {
+            record_type: record.record_type(),
+            fields: record.field_list(),
+        }
+    }
+}
+
+/// C's `dbAddr` field half — `pfldDes`, plus whether the name is one the
+/// type DECLARES (an undeclared one falls to the attribute table, C
+/// `dbNameToAddr`'s `dbGetAttributePart` fallthrough, `dbAccess.c:667-675`).
+/// Settled once per link target and read through every cycle after, as C
+/// resolves a link's `dbAddr` once in `dbDbInitLink`.
+#[derive(Clone, Copy)]
+pub(crate) struct FieldAddr {
+    pub(crate) declared: bool,
+    pub(crate) desc: Option<&'static FieldDesc>,
+    /// The record's own handle for the field ([`Record::field_slot`]), when
+    /// the type has one and the address was resolved with the record in
+    /// hand ([`FieldAddr::resolve_in`]). A read at a slot goes to the typed
+    /// accessor and skips the by-name chain.
+    pub(crate) slot: Option<super::record_trait::FieldSlot>,
+}
+
+impl FieldAddr {
+    /// `field` is upper-case already.
+    pub(crate) fn resolve(rdes: &RecordDesc, field: &str) -> Self {
+        FieldAddr {
+            declared: declares_field(rdes.record_type, field),
+            desc: field_desc_in(rdes.fields, field),
+            slot: None,
+        }
+    }
+
+    /// [`Self::resolve`] with the record's slot for the field — for an
+    /// address that is kept and read through. Takes no lock: the slots were
+    /// settled with the cell ([`RecordCell::field_slot`]), so a record may
+    /// resolve a link to itself while it is held for writing.
+    pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
+        let mut addr = Self::resolve(rec.rdes(), field);
+        let slot = rec.field_slot(field);
+        debug_assert!(
+            slot.is_none() || (addr.declared && addr.desc.is_some_and(|d| !d.unreadable())),
+            "{}.{field}: a field slot must name a declared, readable field",
+            rec.rdes().record_type
+        );
+        addr.slot = slot;
+        addr
+    }
+}
+
+/// Whether `record_type`'s `.dbd` declares `field` — C `dbFindField` on the
+/// type's declared list, which `pvNameLookup` (`dbChannel.c:311-329`) asks
+/// before it falls through to the attribute table.
+pub(crate) fn declares_field(record_type: &str, field: &str) -> bool {
+    super::dbd_generated::record_declaration_order(record_type)
+        .is_some_and(|names| names.contains(&field))
+}
+
+/// The record's data, guarded by its lock set. `Sync` on exactly the bound
+/// `RwLock<T>` demanded for it — the lock set excludes every other thread
+/// while a borrow is out, the same guarantee the `RwLock` gave.
+struct LockSetGuarded<T: Send + Sync>(std::cell::UnsafeCell<T>);
+
+// SAFETY: a `&T` or `&mut T` is only ever produced by `RecordCell::read` /
+// `RecordCell::write`, on a thread that holds the record's lock set, and
+// lives no longer than that hold (`RecordRef` / `RecordMut` carry the set
+// guard). Two threads therefore never observe the cell at once, and the
+// same-thread borrow rules are enforced by `RecordCell::borrow`.
+unsafe impl<T: Send + Sync> Sync for LockSetGuarded<T> {}
 
 impl RecordCell {
     pub(crate) fn new(instance: RecordInstance) -> Self {
         Self {
-            lock_record: std::sync::OnceLock::new(),
+            lock_record: crate::server::database::LockRecord::bootstrap(),
+            borrow: std::sync::atomic::AtomicIsize::new(0),
+            bkpt: instance.common.bkpt.share(),
             cp_edges_revision: std::sync::atomic::AtomicU64::new(0),
             cp_edges: std::sync::atomic::AtomicBool::new(false),
-            data: parking_lot::RwLock::new(instance),
+            rdes: RecordDesc::of(&*instance.record),
+            slots: instance
+                .record
+                .field_list()
+                .iter()
+                .map(|f| instance.record.field_slot(f.name))
+                .collect(),
+            multi_input_val_slots: instance
+                .record
+                .multi_input_links()
+                .iter()
+                .map(|(_, vf)| instance.record.field_slot(vf))
+                .collect(),
+            plan: ProcessPlan::of(&*instance.record),
+            data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
+        }
+    }
+
+    /// The type-static answers this cycle may test instead of re-asking the
+    /// record under a lock.
+    pub(crate) fn process_plan(&self) -> &ProcessPlan {
+        &self.plan
+    }
+
+    /// The record type's declaration — C `precord->rdes`.
+    pub(crate) fn rdes(&self) -> &RecordDesc {
+        &self.rdes
+    }
+
+    /// [`Record::field_slot`] for `field` (upper-case), answered from the
+    /// table settled at construction: a slot names a field of the type's
+    /// own list, and `dbCommon` fields have none.
+    /// The slot the fetch stores multi-input link `index`'s value through,
+    /// when the type hands one out.
+    #[inline(always)]
+    pub(crate) fn multi_input_val_slot(
+        &self,
+        index: usize,
+    ) -> Option<super::record_trait::FieldSlot> {
+        self.multi_input_val_slots[index]
+    }
+
+    pub(crate) fn field_slot(&self, field: &str) -> Option<super::record_trait::FieldSlot> {
+        self.rdes
+            .fields
+            .iter()
+            .position(|f| f.name.eq_ignore_ascii_case(field))
+            .and_then(|i| self.slots[i])
+    }
+
+    /// The record's `BKPT` byte, without taking its lock set.
+    pub(crate) fn bkpt(&self) -> &BkptFlag {
+        &self.bkpt
+    }
+
+    /// Shared access to the record — C `dbScanLock` followed by reading the
+    /// fields. Blocks while another thread holds the record's lock set;
+    /// recurses on the thread that holds it.
+    ///
+    /// # Panics
+    ///
+    /// If this thread holds a [`RecordMut`] of the same record: the borrow
+    /// the caller asked for cannot coexist with it, and the `RwLock` this
+    /// replaced would have parked the thread forever here.
+    pub fn read(&self) -> RecordRef<'_> {
+        use std::sync::atomic::Ordering;
+        let set = self.lock_record.acquire();
+        let borrow = self.borrow.load(Ordering::Relaxed);
+        assert!(
+            borrow >= 0,
+            "record data read while this thread holds it for writing"
+        );
+        self.borrow.store(borrow + 1, Ordering::Relaxed);
+        RecordRef {
+            cell: self,
+            _set: Some(set),
+        }
+    }
+
+    /// [`Self::read`] for a thread that holds `held`: when this record is in
+    /// that set the set is held already, and only the borrow count is
+    /// touched — no thread key, no depth counter. Every DB link target is in
+    /// its reader's set (the merge, see `record_lock.rs`), so this is the
+    /// per-link read of a process cycle; a record in another set takes
+    /// [`Self::read`]'s path. Sound by Rule R: a held set keeps its records,
+    /// so the test cannot go stale while `held` lives, and the borrow is
+    /// bound to `held` so it cannot outlive the hold.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::read`].
+    #[inline]
+    pub(crate) fn read_in<'a>(
+        &'a self,
+        held: &'a crate::server::database::SetGuard,
+    ) -> RecordRef<'a> {
+        use std::sync::atomic::Ordering;
+        if !held.holds(&self.lock_record) {
+            return self.read();
+        }
+        let borrow = self.borrow.load(Ordering::Relaxed);
+        assert!(
+            borrow >= 0,
+            "record data read while this thread holds it for writing"
+        );
+        self.borrow.store(borrow + 1, Ordering::Relaxed);
+        RecordRef {
+            cell: self,
+            _set: None,
+        }
+    }
+
+    /// Exclusive access to the record — C `dbScanLock` followed by writing
+    /// the fields. Blocks and recurses as [`Self::read`] does.
+    ///
+    /// # Panics
+    ///
+    /// If this thread holds any guard of the same record, for the reason
+    /// given on [`Self::read`].
+    pub fn write(&self) -> RecordMut<'_> {
+        use std::sync::atomic::Ordering;
+        let set = self.lock_record.acquire();
+        assert!(
+            self.borrow.load(Ordering::Relaxed) == 0,
+            "record data written while this thread still holds a guard of it"
+        );
+        self.borrow.store(-1, Ordering::Relaxed);
+        RecordMut {
+            cell: self,
+            _set: set,
         }
     }
 
@@ -1066,30 +1362,366 @@ impl RecordCell {
             .store(registry_revision, Ordering::Release);
     }
 
-    /// The lock-set cell, or `None` before this record has ever been locked.
-    pub(crate) fn lock_record(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::server::database::LockRecord>> {
-        self.lock_record.get()
-    }
-
-    /// Install the cell and hand back the one now installed — another thread
-    /// racing the same first lock installs the registry's cell for this same
-    /// name, so whichever wins, both callers lock through the same set.
-    pub(crate) fn attach_lock_record(
-        &self,
-        lr: std::sync::Arc<crate::server::database::LockRecord>,
-    ) -> &std::sync::Arc<crate::server::database::LockRecord> {
-        self.lock_record.get_or_init(|| lr)
+    /// The lock-set cell — C `precord->lset`.
+    pub(crate) fn lock_record(&self) -> &std::sync::Arc<crate::server::database::LockRecord> {
+        &self.lock_record
     }
 }
 
-impl std::ops::Deref for RecordCell {
-    type Target = parking_lot::RwLock<RecordInstance>;
+/// A shared borrow of a record, holding its lock set — what
+/// [`RecordCell::read`] hands out. `!Send`, as the set guard inside it is:
+/// a lock set is released by the thread that took it.
+#[must_use = "the record's lock set is released as soon as the guard is dropped"]
+pub struct RecordRef<'a> {
+    cell: &'a RecordCell,
+    /// `None` for a [`RecordCell::read_in`] borrow, which rides on the set
+    /// guard of its `'a` rather than taking one.
+    _set: Option<crate::server::database::SetGuard>,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.data
+impl RecordRef<'_> {
+    /// Whether the borrow rode a set guard the caller held rather than
+    /// taking one — [`RecordCell::read_in`]'s same-set case.
+    #[cfg(test)]
+    pub(crate) fn rides_held_set(&self) -> bool {
+        self._set.is_none()
     }
+}
+
+impl std::ops::Deref for RecordRef<'_> {
+    type Target = RecordInstance;
+
+    fn deref(&self) -> &RecordInstance {
+        // SAFETY: this thread holds the record's lock set (`_set`) and the
+        // borrow count admitted a shared borrow, so no `&mut` exists.
+        unsafe { &*self.cell.data.0.get() }
+    }
+}
+
+impl Drop for RecordRef<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Runs before `_set` is released (fields drop after this body), so
+        // the count is never touched by a thread outside the set.
+        let borrow = self.cell.borrow.load(Ordering::Relaxed);
+        self.cell.borrow.store(borrow - 1, Ordering::Relaxed);
+    }
+}
+
+/// An exclusive borrow of a record, holding its lock set — what
+/// [`RecordCell::write`] hands out.
+#[must_use = "the record's lock set is released as soon as the guard is dropped"]
+pub struct RecordMut<'a> {
+    cell: &'a RecordCell,
+    _set: crate::server::database::SetGuard,
+}
+
+impl std::ops::Deref for RecordMut<'_> {
+    type Target = RecordInstance;
+
+    fn deref(&self) -> &RecordInstance {
+        // SAFETY: as `RecordRef`, and the borrow count admitted the one
+        // exclusive borrow, so this is the only reference.
+        unsafe { &*self.cell.data.0.get() }
+    }
+}
+
+impl std::ops::DerefMut for RecordMut<'_> {
+    fn deref_mut(&mut self) -> &mut RecordInstance {
+        // SAFETY: as `deref`, through the unique borrow of the guard.
+        unsafe { &mut *self.cell.data.0.get() }
+    }
+}
+
+impl RecordMut<'_> {
+    /// The instance and the set guard it is held under, apart — for a
+    /// caller that writes the record while it reads another record of the
+    /// same set through [`RecordCell::read_in`].
+    #[inline]
+    pub(crate) fn split(&mut self) -> (&mut RecordInstance, &crate::server::database::SetGuard) {
+        // SAFETY: as `deref_mut`; the set guard is a separate field.
+        (unsafe { &mut *self.cell.data.0.get() }, &self._set)
+    }
+}
+
+impl Drop for RecordMut<'_> {
+    fn drop(&mut self) {
+        self.cell
+            .borrow
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One entry of [`RecordInstance::parsed_inputs`]: a link text the record
+/// held at some read, its parse, and the local record the parse addressed.
+pub(crate) struct ParsedInputLink {
+    text: String,
+    /// The [`Record::input_links_generation`] the record answered when
+    /// `text` was last read off it, for a type that answers one: while the
+    /// record still answers it, `text` IS the field's text and the cycle
+    /// need not read the field to know.
+    generation: Option<u64>,
+    parsed: Arc<ParsedLink>,
+    /// C's `dbAddr` from `dbDbInitLink` (`dbDbLink.c:88-111`): the target
+    /// record, resolved once and read through until something can have
+    /// changed the answer. C re-resolves only when the link text is put; the
+    /// port also re-resolves when a name map changed, because records and
+    /// aliases can come and go after `iocInit` here.
+    target: Option<LinkTargetHandle>,
+}
+
+/// A resolved link target and the name-map revision it was resolved under.
+///
+/// Holds the target's `Arc` — C's `dbAddr` holds the record pointer — so the
+/// cycle's read is a load, not a `Weak` upgrade. What keeps that from
+/// leaking: a record leaves the name map only through
+/// [`RecordInstance::destroy`], which drops the handles the record holds,
+/// and the map's revision moves with it so every handle that named the
+/// record is re-resolved on its holder's next read; the database's own drop
+/// destroys every record still in the map, which breaks the `A -> B -> A`
+/// cycles two such handles make.
+struct LinkTargetHandle {
+    target: ResolvedTarget,
+    revision: u64,
+    /// Settled with the target, since every input is the parse's or the
+    /// target's: whether the reader's own hold reads it, and how.
+    native: Option<NativeRead>,
+}
+
+/// How the held native fetch reads a link it may read — C's link flags and
+/// `dbAddr` as the fetch consumes them, decided once per resolution rather
+/// than per cycle.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeRead {
+    /// The field is not `VAL`, so a simple PV may shadow its spelling and
+    /// the directory is asked first.
+    pub(crate) shadowed: bool,
+    /// `MS` / `MSS` / `MSI`: the target's alarm is inherited.
+    pub(crate) inherits: bool,
+    /// The reader's own slot for the link's value field
+    /// ([`RecordCell::multi_input_val_slot`]) — C's `&prec->a + i`, the
+    /// address the read is stored through, when the type hands one out.
+    pub(crate) val_slot: Option<super::record_trait::FieldSlot>,
+}
+
+impl NativeRead {
+    /// The read the reader's hold makes of `parsed` at `target`, or `None`
+    /// when it is not this frame's: a read of the reader's own field, a `PP`
+    /// source (processed with the guard released), a filtered channel, or
+    /// not a local record read at all.
+    fn of(
+        parsed: &ParsedLink,
+        target: &ResolvedTarget,
+        reader: &Arc<RecordCell>,
+        slot: usize,
+    ) -> Option<Self> {
+        use crate::server::record::{LinkProcessPolicy, MonitorSwitch};
+        let ParsedLink::Db(db) = parsed else {
+            return None;
+        };
+        let channel = db.target();
+        if Arc::ptr_eq(&target.rec, reader)
+            || db.policy == LinkProcessPolicy::ProcessPassive
+            || channel.json_suffix.is_some()
+        {
+            return None;
+        }
+        Some(NativeRead {
+            shadowed: &*channel.field != "VAL",
+            inherits: db.monitor_switch != MonitorSwitch::NoMaximize,
+            val_slot: reader.multi_input_val_slot(slot),
+        })
+    }
+}
+
+impl ParsedInputLink {
+    /// The entry of `cache` for `slot`, holding the parse of the text `record`
+    /// has in link `slot` of `declared` (its [`Record::multi_input_links`])
+    /// now; `None` when the link is unset. The list rather than the name,
+    /// so the frame carries an index and reads the name only when it reads
+    /// the text.
+    ///
+    /// The single writer of [`RecordInstance::parsed_inputs`]: the record's
+    /// current text is read first and the cached entry is reused only when
+    /// its text is that text byte for byte, so the parse runs once per
+    /// distinct text a slot has held and the invariant on the field's doc
+    /// needs no other site to hold. Takes the record's parts rather than the
+    /// record so the fetch stage can hold the entry while it writes the
+    /// record's fields. `always`: the held and the general fetch both call
+    /// it, and the held one is the loop's common frame.
+    ///
+    /// `generation` is [`Record::input_links_generation`] as the caller read
+    /// it under the hold it calls this under — never carried across a
+    /// release, since a put in the gap moves it. An entry stamped with that
+    /// generation was compared byte for byte at it, and the record's one
+    /// counting writer has not run since — so the text is not read at all.
+    #[inline(always)]
+    pub(crate) fn validated<'c>(
+        cache: &'c mut [Option<ParsedInputLink>],
+        record: &dyn Record,
+        slot: usize,
+        declared: &'static [(&'static str, &'static str)],
+        generation: Option<u64>,
+    ) -> Option<&'c mut ParsedInputLink> {
+        let cell = cache.get_mut(slot)?;
+        if generation.is_some()
+            && let Some(entry) = cell.as_ref()
+            && entry.generation == generation
+        {
+            debug_assert!(
+                record.link_text_ref(declared[slot].0) == Some(entry.text.as_str()),
+                "{}: the link text changed under generation {generation:?} — \
+                 a writer of the text does not move input_links_generation",
+                declared[slot].0
+            );
+            return cell.as_mut();
+        }
+        let link_field = declared[slot].0;
+        let owned;
+        let text: &str = match record.link_text_ref(link_field) {
+            Some("") => return None,
+            Some(text) => text,
+            None => {
+                owned = link_text_of(record, link_field)?;
+                &owned
+            }
+        };
+        if cell.as_ref().is_none_or(|entry| entry.text != text) {
+            *cell = Some(Self::fresh(text));
+        }
+        let entry = cell.as_mut()?;
+        entry.generation = generation;
+        Some(entry)
+    }
+
+    /// A slot's entry for a text it has not held: the parse, with no target
+    /// resolved yet. Its own frame so the cycle's byte-for-byte reuse test
+    /// does not carry the parser's.
+    fn fresh(text: &str) -> ParsedInputLink {
+        ParsedInputLink {
+            text: text.to_owned(),
+            generation: None,
+            parsed: Arc::new(parse_link_v2(text)),
+            target: None,
+        }
+    }
+
+    /// The parse, shared: the cycle hands it to reads that run after the
+    /// record lock is released.
+    pub(crate) fn parsed(&self) -> &Arc<ParsedLink> {
+        &self.parsed
+    }
+
+    /// The handle at the name maps' current revision: reused while the maps
+    /// are at the revision it was resolved under, re-resolved otherwise. A
+    /// link that resolves to no local record is asked again on every read,
+    /// as it was before the cache. `reader` is the record holding the entry
+    /// and `slot` the entry's index in its list, for [`NativeRead::of`].
+    ///
+    /// Over the entry's parts, so a caller can hold the parse beside the
+    /// handle it returns.
+    #[inline(always)]
+    fn resolve<'h>(
+        handle: &'h mut Option<LinkTargetHandle>,
+        parsed: &ParsedLink,
+        names: &dyn LinkTargetResolver,
+        reader: &Arc<RecordCell>,
+        slot: usize,
+    ) -> Option<&'h LinkTargetHandle> {
+        let revision = names.name_revision();
+        if handle
+            .as_ref()
+            .is_none_or(|handle| handle.revision != revision)
+        {
+            *handle = names.local_target(parsed).map(|target| {
+                let native = NativeRead::of(parsed, &target, reader, slot);
+                LinkTargetHandle {
+                    target,
+                    revision,
+                    native,
+                }
+            });
+        }
+        handle.as_ref()
+    }
+
+    /// The parse, with C's `dbAddr` for it — the local record and field the
+    /// link addresses, or `None` for a link that is not a local record read.
+    /// The two come out together because both borrow the entry and the
+    /// cycle wants both of every link.
+    #[inline(always)]
+    pub(crate) fn target(
+        &mut self,
+        names: &dyn LinkTargetResolver,
+        reader: &Arc<RecordCell>,
+        slot: usize,
+    ) -> (&ParsedLink, Option<&ResolvedTarget>) {
+        let target = Self::resolve(&mut self.target, &self.parsed, names, reader, slot)
+            .map(|handle| &handle.target);
+        (&self.parsed, target)
+    }
+
+    /// The link as the reader's own hold reads it — see [`NativeRead::of`]
+    /// — or `None` for a link that is not that frame's.
+    #[inline(always)]
+    pub(crate) fn native_read(
+        &mut self,
+        names: &dyn LinkTargetResolver,
+        reader: &Arc<RecordCell>,
+        slot: usize,
+    ) -> Option<(&crate::server::record::DbLink, &ResolvedTarget, NativeRead)> {
+        let handle = Self::resolve(&mut self.target, &self.parsed, names, reader, slot)?;
+        let native = handle.native?;
+        let ParsedLink::Db(db) = &*self.parsed else {
+            return None;
+        };
+        Some((db, &handle.target, native))
+    }
+
+    /// Drop the target handle, leaving the parse. What
+    /// [`RecordInstance::destroy`] does to every entry, so a record that has
+    /// left the database holds no other record.
+    fn release_target(&mut self) {
+        self.target = None;
+    }
+
+    /// Whether the handle names `cell`.
+    fn targets(&self, cell: &Arc<RecordCell>) -> bool {
+        self.target
+            .as_ref()
+            .is_some_and(|handle| Arc::ptr_eq(&handle.target.rec, cell))
+    }
+}
+
+/// The text of link field `field` of `record`, `None` when the link is unset
+/// — [`RecordInstance::link_text`] over the record alone.
+fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
+    if let Some(text) = record.link_text_ref(field) {
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    match record.get_field(field)? {
+        EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// A link's local target with its field resolved — C's `dbAddr`.
+#[derive(Clone)]
+pub(crate) struct ResolvedTarget {
+    pub(crate) rec: Arc<RecordCell>,
+    pub(crate) field: FieldAddr,
+}
+
+/// Where a DB link's local target comes from — `PvDatabase` in production.
+pub(crate) trait LinkTargetResolver {
+    /// The revision of the name maps (records and aliases). Loaded BEFORE
+    /// the maps are read, so a handle stamped with it can never be one a
+    /// later mutation produced under an earlier number.
+    fn name_revision(&self) -> u64;
+    /// The local record a `Db` link addresses, with its field resolved, or
+    /// `None` for a link that is not a local record read (a constant, an
+    /// external PV, a simple PV).
+    fn local_target(&self, link: &ParsedLink) -> Option<ResolvedTarget>;
 }
 
 /// A type-erased record instance stored in the database.
@@ -1107,6 +1739,14 @@ pub struct RecordInstance {
     destroyed: bool,
     // Link parse cache
     pub parsed_inp: ParsedLink,
+    /// The parsed form of each [`Record::multi_input_links`] slot the record
+    /// has wired, validated against the text the record holds NOW on every
+    /// read — see [`ParsedInputLink::validated`], the one writer. The record's
+    /// put paths need no hook: an entry whose text is not the record's text
+    /// is re-parsed at the next read, so `parsed == parse_link_v2(&text)`
+    /// holds for every entry by construction. C parses a link once at
+    /// `dbInitLink`; the port parsed every set `INPA`..`INPL` on every cycle.
+    pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
     pub parsed_out: ParsedLink,
     pub parsed_flnk: ParsedLink,
     pub parsed_sdis: ParsedLink,
@@ -1230,7 +1870,11 @@ pub struct RecordInstance {
     link_backed_metadata_links: Vec<String>,
     /// What this record's TYPE can reach in a process cycle, settled once at
     /// construction. See [`ProcessPlan`].
-    process_plan: ProcessPlan,
+    /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
+    /// support has no such line (`swait`, `waveform` proper). See
+    /// [`UdfAlarm`]. Read by [`Self::evaluate_alarms`] under the lock, which
+    /// is why it lives here and not on the cell's [`ProcessPlan`].
+    udf_alarm: Option<UdfAlarm>,
     /// What this record's TYPE answers to `monitor()`'s type-static
     /// questions, settled once at construction. See [`MonitorPlan`].
     monitor_plan: MonitorPlan,
@@ -1464,8 +2108,17 @@ pub(crate) fn field_desc_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
 ) -> Option<&'static FieldDesc> {
+    field_desc_in(record.field_list(), field)
+}
+
+/// [`field_desc_of`] against a type's table — C `dbFindFieldPart`: the
+/// record type's own `.dbd` table, then `dbCommon`.
+pub(crate) fn field_desc_in(
+    fields: &'static [FieldDesc],
+    field: &str,
+) -> Option<&'static FieldDesc> {
     let named = |t: &'static [FieldDesc]| t.iter().find(|f| f.name.eq_ignore_ascii_case(field));
-    named(record.field_list()).or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
+    named(fields).or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
 }
 
 /// **The single owner of "which choice list does this field resolve against"**,
@@ -1624,12 +2277,6 @@ impl RecordInstance {
         &self.link_backed_metadata_input_slot
     }
 
-    /// The type-static answers this cycle may test instead of re-asking the
-    /// record under a lock.
-    pub(crate) fn process_plan(&self) -> ProcessPlan {
-        self.process_plan
-    }
-
     /// C `monitor()` and the `recGblResetAlarms` it opens with, for every
     /// path that ends a process cycle. The single owner of the cycle's
     /// monitor STATE — alarm commit, MLST/ALST, the previous-value store, the
@@ -1723,6 +2370,30 @@ impl RecordInstance {
         self.declares_simulation
     }
 
+    /// The parse of multi-input link `slot` for a reader that holds the
+    /// record shared: the cached one when its text is the record's current
+    /// text, a fresh parse otherwise — never written back, since the fetch
+    /// stage that runs under the exclusive guard validates the entry itself.
+    pub(crate) fn cached_multi_input(
+        &self,
+        slot: usize,
+        link_field: &str,
+    ) -> Option<Arc<ParsedLink>> {
+        let owned;
+        let text: &str = match self.record.link_text_ref(link_field) {
+            Some("") => return None,
+            Some(text) => text,
+            None => {
+                owned = self.link_text(link_field)?;
+                &owned
+            }
+        };
+        match self.parsed_inputs.get(slot) {
+            Some(Some(entry)) if entry.text == text => Some(entry.parsed.clone()),
+            _ => Some(Arc::new(parse_link_v2(text))),
+        }
+    }
+
     /// The text of a link field, `None` when the link is unset.
     ///
     /// A declared link is unset far more often than set — a `calc` declares 21
@@ -1736,12 +2407,15 @@ impl RecordInstance {
     /// it away.
     #[inline]
     pub(crate) fn link_text(&self, field: &str) -> Option<String> {
-        if let Some(text) = self.record.link_text_ref(field) {
-            return (!text.is_empty()).then(|| text.to_owned());
-        }
-        match self.record.get_field(field)? {
-            EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
-            _ => None,
+        link_text_of(&*self.record, field)
+    }
+
+    /// Whether link field `field` holds a text — [`Self::link_text`] without
+    /// the copy.
+    pub(crate) fn link_is_set(&self, field: &str) -> bool {
+        match self.record.link_text_ref(field) {
+            Some(text) => !text.is_empty(),
+            None => self.link_text(field).is_some(),
         }
     }
 
@@ -1774,46 +2448,11 @@ impl RecordInstance {
             .collect();
         // The gate on the whole simulation block — see the field's own doc.
         let declares_simulation = field_desc_of(record.as_ref(), "SIMM").is_some();
-        let process_plan = ProcessPlan {
-            dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
-            simulation: declares_simulation,
-            sel_nvl: rtype == "sel",
-            string_input: !record.string_input_links().is_empty(),
-            multi_output_dispatch: crate::server::database::multi_output_dispatch_owned(rtype),
-            reads_sell: crate::server::database::reads_sell(rtype),
-            posts_software_event: crate::server::database::posts_software_event(rtype),
-            resolves_subroutine_from_link: crate::server::database::resolves_subroutine_from_link(
-                rtype,
-            ),
-            // Asked of the record itself, not of a table keyed on `rtype`: the
-            // type that implements the step is the one that answers whether it
-            // has one, so the two cannot drift into different files.
-            substitutes_input_stage_when_simulating: record.simulation_substitutes_input_stage(),
-            redecides_after_output: record.redecides_after_output(),
-            input_fetch_policy: record.input_fetch_policy(),
-            constants_deliver_at_process: record.constant_inputs_deliver_at_process(),
-            multi_input_is_db_get_link: record.multi_input_fetch_is_db_get_link(),
-            udf_alarm: record.raises_udf_alarm().then(|| UdfAlarm {
-                exact_one: record.udf_alarm_on_exact_one(),
-                severity: record.udf_alarm_severity(),
-                message: record.udf_alarm_message(),
-            }),
-            dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
-                rtype,
-            ) && record.declares_multi_output_links(),
-            narrows_input_links: record.narrows_input_links(),
-            output_stage: record.can_device_write()
-                || field_desc_of(record.as_ref(), "OUT").is_some()
-                || field_desc_of(record.as_ref(), "OEVT").is_some()
-                || crate::server::database::multi_output_dispatch_owned(rtype)
-                || record.declares_multi_output_links()
-                || declares_simulation,
-            fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
-            soft_channel_skips_convert: record.soft_channel_skips_convert(),
-            skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
-            restamps_time_after_completion: record.restamps_time_after_completion(),
-            clears_udf: record.clears_udf(),
-        };
+        let udf_alarm = record.raises_udf_alarm().then(|| UdfAlarm {
+            exact_one: record.udf_alarm_on_exact_one(),
+            severity: record.udf_alarm_severity(),
+            message: record.udf_alarm_message(),
+        });
         let monitor_plan = MonitorPlan::of(record.as_ref());
         let analog_alarm = match rtype {
             // C parity: every record type whose dbd carries
@@ -1843,6 +2482,7 @@ impl RecordInstance {
         };
         let mut common = CommonFields::default();
         common.analog_alarm = analog_alarm;
+        let multi_input_slots = record.multi_input_links().len();
 
         Self {
             destroyed: false,
@@ -1855,6 +2495,7 @@ impl RecordInstance {
             parsed_flnk: ParsedLink::None,
             parsed_sdis: ParsedLink::None,
             parsed_tsel: ParsedLink::None,
+            parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
             device: None,
             subroutine: None,
             init_subroutines: None,
@@ -1866,7 +2507,7 @@ impl RecordInstance {
             link_backed_metadata_links,
             link_backed_metadata_input_slot,
             declares_simulation,
-            process_plan,
+            udf_alarm,
             monitor_plan,
             array_hash_changed: false,
             suppress_subroutine_run: false,
@@ -2633,9 +3274,32 @@ impl RecordInstance {
     /// a name: C likewise reads `precord->inp` directly when it wants the
     /// link and `dbGet` when it wants what a client would see.
     pub fn resolve_field(&self, name: &str) -> Option<EpicsValue> {
-        let name = name.to_ascii_uppercase();
-        let value = self.resolve_field_stored(&name)?;
-        Some(self.as_a_reader_sees(&name, value))
+        self.resolve_field_upper(&name.to_ascii_uppercase())
+    }
+
+    /// [`Self::resolve_field`] for a name the caller has already normalised
+    /// — a parsed link's target field, a channel name's field — so the link
+    /// read path does not allocate an upper-cased copy of a name that is
+    /// upper-case by construction. `name` must already be upper-case.
+    pub fn resolve_field_upper(&self, name: &str) -> Option<EpicsValue> {
+        debug_assert!(
+            !name.bytes().any(|b| b.is_ascii_lowercase()),
+            "resolve_field_upper takes a normalised name, got {name:?}"
+        );
+        self.resolve_field_upper_at(name, self.field_desc(name))
+    }
+
+    /// [`Self::resolve_field_upper`] with the field's declaration in hand:
+    /// `desc` is [`Self::field_desc`]'s answer for `name`, which a link
+    /// target settles once ([`FieldAddr`]) instead of scanning per read.
+    #[inline]
+    pub(crate) fn resolve_field_upper_at(
+        &self,
+        name: &str,
+        desc: Option<&'static FieldDesc>,
+    ) -> Option<EpicsValue> {
+        let value = self.resolve_field_stored_at(name, desc)?;
+        Some(self.as_a_reader_sees(name, value))
     }
 
     /// [`Self::resolve_field`] without the reader's view — what the field
@@ -2652,7 +3316,17 @@ impl RecordInstance {
     ///
     /// `name` must already be upper-case.
     pub fn resolve_field_stored(&self, name: &str) -> Option<EpicsValue> {
-        let value = match self.field_desc(name) {
+        self.resolve_field_stored_at(name, self.field_desc(name))
+    }
+
+    /// [`Self::resolve_field_stored`] with `desc` = [`Self::field_desc`]`(name)`.
+    #[inline]
+    fn resolve_field_stored_at(
+        &self,
+        name: &str,
+        desc: Option<&'static FieldDesc>,
+    ) -> Option<EpicsValue> {
+        let value = match desc {
             // C `dbGet`'s validity gate (`dbAccess.c:667-675`): the NAME
             // resolves — `dbNameToAddr` finds every field the `.dbd` declares
             // — and the READ is what fails, with `S_db_badDbrtype`. The two
@@ -2674,13 +3348,18 @@ impl RecordInstance {
             // without the declaration in front of them a `calc` answered
             // `.OUT` with an empty string where C answers `PV 'C:GOOD.OUT'
             // not found`. The declaration is the namespace, not the storage.
-            Some(_) => self
-                .record
-                .get_field(name)
-                .or_else(|| self.get_common_field(name))
-                .or_else(|| self.get_virtual_field(name))
-                .or_else(|| self.declared_overrides.get(name).cloned())
-                .or_else(|| self.declared_default(name))?,
+            //
+            // The record's own answer is returned as it lands rather than
+            // threaded through the fallbacks' `or_else` chain, which moved
+            // the 32-byte value once per link in the chain on the way out.
+            Some(_) => match self.record.get_field(name) {
+                Some(value) => value,
+                None => self
+                    .get_common_field(name)
+                    .or_else(|| self.get_virtual_field(name))
+                    .or_else(|| self.declared_overrides.get(name).cloned())
+                    .or_else(|| self.declared_default(name))?,
+            },
             // C `dbNameToAddr` falls through to `dbGetAttributePart` on
             // `S_dbLib_fieldNotFound` (`dbAccess.c:672-675`), which is how
             // `RTYP` — declared by no record type — reads as the type name.
@@ -2697,6 +3376,7 @@ impl RecordInstance {
     /// The class lookup is behind the string test because only a string-valued
     /// field can be a link, and the numeric fields a processing cycle reads
     /// (`HASH`, `SIMM`, `SDLY`) must not pay for a declaration scan.
+    #[inline]
     fn as_a_reader_sees(&self, upper_field: &str, value: EpicsValue) -> EpicsValue {
         let EpicsValue::String(ref text) = value else {
             return value;
@@ -3702,7 +4382,7 @@ impl RecordInstance {
             // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
             // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
             "TPRO" => Some(EpicsValue::UChar(self.common.tpro)),
-            "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
+            "BKPT" => Some(EpicsValue::Char(self.common.bkpt.get())),
             "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
             // A record type whose C `.dbd` has no INP has no `.INP` channel
             // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
@@ -4167,7 +4847,7 @@ impl RecordInstance {
             }
             "BKPT" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.bkpt = v;
+                    self.common.bkpt.set(v);
                 }
             }
             "FLNK" => {
@@ -4672,11 +5352,11 @@ impl RecordInstance {
         // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
         // no central UDF alarm; see `Record::raises_udf_alarm`.
         debug_assert!(
-            self.process_plan.udf_alarm.is_some() == self.record.raises_udf_alarm(),
+            self.udf_alarm.is_some() == self.record.raises_udf_alarm(),
             "a record that changes its UDF_ALARM guard after construction \
              cannot be served from ProcessPlan"
         );
-        if let Some(udf) = self.process_plan.udf_alarm {
+        if let Some(udf) = self.udf_alarm {
             recgbl::rec_gbl_check_udf(&mut self.common, udf.exact_one, udf.severity, udf.message);
         }
 
@@ -6874,15 +7554,33 @@ impl RecordInstance {
     }
 
     /// Destroy this record: drop every field monitor and refuse every future
-    /// one. The record-backed half of the rule
-    /// [`crate::server::pv::ProcessVariable::destroy`] states for simple PVs,
-    /// so one sweep in a server closes both kinds of channel. Returns `true`
-    /// for the call that performed the transition.
+    /// one, and drop every link target handle it holds. The record-backed
+    /// half of the rule [`crate::server::pv::ProcessVariable::destroy`]
+    /// states for simple PVs, so one sweep in a server closes both kinds of
+    /// channel; and the one place a record lets go of the records its links
+    /// resolved to, so a destroyed record keeps no other alive. Returns
+    /// `true` for the call that performed the transition.
     pub(crate) fn destroy(&mut self) -> bool {
         let first = !self.destroyed;
         self.destroyed = true;
         self.subscribers.clear();
+        for entry in self.parsed_inputs.iter_mut().flatten() {
+            entry.release_target();
+        }
         first
+    }
+
+    /// Drop every link target handle that names `cell` — the other half of
+    /// the rule [`Self::destroy`] keeps: a handle never outlives its
+    /// target's map entry. The remover calls it on every record left in the
+    /// map once the entry is gone, so a record that never processes again
+    /// does not keep the removed one alive.
+    pub(crate) fn release_link_targets_to(&mut self, cell: &Arc<RecordCell>) {
+        for entry in self.parsed_inputs.iter_mut().flatten() {
+            if entry.targets(cell) {
+                entry.release_target();
+            }
+        }
     }
 
     /// Whether `Self::destroy` has run.

@@ -12,8 +12,8 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget, ProcessAction, ProcessOutcome,
-    Record,
+    FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget, ProcessAction, ProcessActions,
+    ProcessOutcome, Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -2572,7 +2572,7 @@ impl Record for TableRecord {
     /// `set_resolved_out_target`. The read actions below are still chosen from
     /// the PREVIOUS cycle's `lnk_stat`, so a link that changes kind mid-run
     /// starts or stops being read one cycle after C would.
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_process_actions(&mut self) -> ProcessActions {
         // C GetMotorLimits zeroes h0x[i]/l0x[i] whenever the limit read fails
         // (tableRecord.c:1024-1031), so a stale prior value never survives a
         // failed read. The Rust ReadDbLink leaves the target field unchanged on
@@ -2601,7 +2601,7 @@ impl Record for TableRecord {
         actions.extend(self.build_read_encoder_actions());
         actions.extend(self.build_read_limit_actions());
         actions.extend(self.build_read_speed_actions());
-        actions
+        actions.into()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

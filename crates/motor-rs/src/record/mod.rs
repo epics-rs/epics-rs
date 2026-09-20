@@ -6,8 +6,8 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    FieldDesc, ParsedLink, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
-    parse_link_v2,
+    FieldDesc, ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    RecordProcessResult, ResolvedInputLinks, parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -330,7 +330,7 @@ impl Record for MotorRecord {
     ///   the `RDBL_VAL` carrier. C reads with `dbGetLink` regardless of link
     ///   type, so any RDBL link form is read (the framework skips an empty
     ///   link).
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_process_actions(&mut self) -> ProcessActions {
         let mut actions = Vec::new();
 
         // CLOSED_LOOP: drive VAL from the DOL link (motorRecord.cc:1994-1999).
@@ -361,7 +361,7 @@ impl Record for MotorRecord {
                 target_field: "RDBL_VAL",
             });
         }
-        actions
+        actions.into()
     }
 
     /// Framework report of which requested link reads produced a value
@@ -377,7 +377,7 @@ impl Record for MotorRecord {
     /// gate `pre_process_actions` requested the read under, and nothing more:
     /// a second, local "is the link empty" test was the port re-deriving a rule
     /// the framework owns, and it did not cover `field(RDBL,"5")`.
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+    fn set_resolved_input_links(&mut self, resolved: ResolvedInputLinks<'_>) {
         // C closed-loop DOL collection (motorRecord.cc:1994-2005): a
         // failed dbGetLink on DOL sets `udf = TRUE` and aborts the pass
         // (return ERROR — the motion side is inert anyway because the
@@ -386,10 +386,10 @@ impl Record for MotorRecord {
         // pre_process_actions request — and applied to the framework's
         // CommonFields.udf in check_alarms (the C alarm_sub consumer).
         if self.stat.dmov && self.closed_loop_dol_collection() {
-            self.internal.dol_udf = Some(!resolved.contains(&"DOL"));
+            self.internal.dol_udf = Some(!resolved.contains("DOL"));
         }
         if self.conv.urip && !self.conv.ueip {
-            self.conv.rdbl_error = !resolved.contains(&"RDBL");
+            self.conv.rdbl_error = !resolved.contains("RDBL");
         }
     }
 
@@ -920,19 +920,19 @@ mod tests {
         let mut common = CommonFields::default();
 
         // Failed read: the resolved report omits DOL.
-        rec.set_resolved_input_links(&[]);
+        rec.set_resolved_input_links(ResolvedInputLinks::of_names(&[]));
         rec.check_alarms(&mut common);
         assert!(common.udf != 0, "failed DOL read marks VAL undefined");
 
         // Successful read clears it.
-        rec.set_resolved_input_links(&["DOL"]);
+        rec.set_resolved_input_links(ResolvedInputLinks::of_names(&["DOL"]));
         rec.check_alarms(&mut common);
         assert!(common.udf == 0, "successful DOL read clears UDF");
 
         // Supervisory pass (no DOL request): udf stays as-is.
         common.udf = 1;
         rec.links.omsl = 0;
-        rec.set_resolved_input_links(&[]);
+        rec.set_resolved_input_links(ResolvedInputLinks::of_names(&[]));
         rec.check_alarms(&mut common);
         assert!(
             common.udf != 0,

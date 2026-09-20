@@ -4446,19 +4446,25 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
     rec.conv.urip = true;
     rec.links.rdbl = "ext_readback.RBV".to_string();
 
-    rec.set_resolved_input_links(&[]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &[],
+    ));
     assert!(
         rec.conv.rdbl_error,
         "missing RDBL in the report = failed read"
     );
 
-    rec.set_resolved_input_links(&["RDBL"]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &["RDBL"],
+    ));
     assert!(!rec.conv.rdbl_error, "resolved RDBL clears the error");
 
     // UEIP=Yes wins the C else-if chain (3676): the RDBL read is not
     // requested, so a stale report must not re-latch the error.
     rec.conv.ueip = true;
-    rec.set_resolved_input_links(&[]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &[],
+    ));
     assert!(!rec.conv.rdbl_error, "no RDBL read under UEIP=Yes");
 }
 

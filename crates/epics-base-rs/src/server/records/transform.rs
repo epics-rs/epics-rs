@@ -993,9 +993,12 @@ impl Record for TransformRecord {
     ///
     /// Runs before `process()` (the framework's report point), which is where C
     /// does it — the zero is what the calc loop and the OUTx write then see.
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+    fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
         for i in 0..NUM_CHANNELS {
-            if !self.no_inlink(i) && !resolved.contains(&INP_FIELD_NAMES[i]) {
+            if !self.no_inlink(i) && !resolved.contains(INP_FIELD_NAMES[i]) {
                 self.vals[i] = 0.0;
             }
         }

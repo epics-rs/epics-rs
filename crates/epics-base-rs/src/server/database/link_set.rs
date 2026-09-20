@@ -349,6 +349,21 @@ impl PostBacking {
     }
 }
 
+/// The first half of a poster's resolve — what
+/// [`PvDatabase::plan_link_backed_metadata_for_posts`](crate::server::database::PvDatabase::plan_link_backed_metadata_for_posts)
+/// learned under the record's own lock, for
+/// [`PvDatabase::resolve_link_backed_metadata_plan`](crate::server::database::PvDatabase::resolve_link_backed_metadata_plan)
+/// to walk with none held. The two answers a [`PostBacking`] can give without
+/// a walk are settled here; only `Links` locks another record.
+pub(crate) enum MetadataPlan {
+    /// See [`PostBacking::Empty`].
+    Empty,
+    /// See [`PostBacking::Declined`].
+    Declined,
+    /// The set links whose targets carry the metadata, by link field.
+    Links(Vec<(String, std::sync::Arc<crate::server::record::ParsedLink>)>),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkMetadata {
     /// DBF type the remote value maps to (`pvaGetDBFtype`). A connected

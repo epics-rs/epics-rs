@@ -531,16 +531,18 @@ impl Record for HistogramRecord {
     /// `special()`, so the SPC_MOD `add_count` on a SGNL *caput* must not fire
     /// here — `process()` performs the cycle's single bin increment
     /// (`histogramRecord.c:218-219`).
-    fn pre_input_link_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> crate::server::record::ProcessActions {
         if crate::server::recgbl::simm::is_constant(&crate::server::record::parse_link_v2(
             &self.svl,
         )) {
-            return Vec::new();
+            return crate::server::record::ProcessActions::new();
         }
-        vec![crate::server::record::ProcessAction::ReadDbLink {
-            link_field: "SVL",
-            target_field: "SGNL",
-        }]
+        crate::server::record::ProcessActions::from(vec![
+            crate::server::record::ProcessAction::ReadDbLink {
+                link_field: "SVL",
+                target_field: "SGNL",
+            },
+        ])
     }
 
     /// Internal (link / framework) delivery of a field value — C's

@@ -1341,10 +1341,30 @@ impl EpicsValue {
     /// `None` is C's non-zero `dbGetLink` status. Array variants answer
     /// `None` exactly as `to_f64` does; callers take `first_element` first
     /// where C's one-element destination does.
+    /// The `Double` taken apart, or the value back untouched. The variant
+    /// owns nothing, so it is released without its destructor: that call
+    /// is out of line and would only test the tag this match already did.
+    #[inline]
+    pub fn into_double(self) -> Result<f64, Self> {
+        match self {
+            Self::Double(v) => {
+                std::mem::forget(self);
+                Ok(v)
+            }
+            other => Err(other),
+        }
+    }
+
     pub fn get_convert_f64(&self) -> Option<f64> {
-        match self.get_convert(DbFieldType::Double) {
-            Ok(Self::Double(v)) => Some(v),
-            _ => None,
+        match self {
+            // The row C's `dbGet` picks for DBR_DOUBLE of a DBF_DOUBLE is a
+            // copy (`getDoubleDouble`); the general path below clones the
+            // value to convert it to what it already is.
+            Self::Double(v) => Some(*v),
+            _ => match self.get_convert(DbFieldType::Double) {
+                Ok(Self::Double(v)) => Some(v),
+                _ => None,
+            },
         }
     }
 

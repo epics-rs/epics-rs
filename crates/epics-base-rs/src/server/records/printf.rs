@@ -996,6 +996,11 @@ impl Record for PrintfRecord {
         })
     }
 
+    /// `FMT` is a field, so the request above is the instance's.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
     /// The `INP0..INP9` texts read straight off the record's own array, not
     /// through the default body's one name match per link.
     /// See [`Record::set_input_link_slots`].
@@ -1018,14 +1023,17 @@ impl Record for PrintfRecord {
         ]
     }
 
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+    fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
         // Record which INPn links produced a value this cycle so
         // `apply_fmt` can emit IVLS for the directives whose link read
         // failed (C `printfRecord.c` F_BADLNK). The framework passes the
         // `link_field` names ("INP0".."INP9") that resolved; any slot not
         // listed is a failed/unconfigured link this cycle.
         self.resolved = [false; 10];
-        for &lf in resolved {
+        for lf in resolved.names() {
             if let Some(idx) = Self::inp_index(lf) {
                 self.resolved[idx] = true;
             }

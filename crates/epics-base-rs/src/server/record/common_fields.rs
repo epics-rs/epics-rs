@@ -1,9 +1,47 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::scan::{ScanType, SimModeScan};
 use super::sparse_text::SparseText;
 use crate::types::PvString;
+
+/// `BKPT` (`DBF_UCHAR` in `dbCommon.dbd`) — the breakpoint debugger's
+/// `BKPT_ON_MASK` / `BKPT_PRINT_MASK` byte.
+///
+/// C reads and writes `precord->bkpt` with no lock held: `dbstat`
+/// (`dbBkpt.c:930`), `dbap` (`:860-866`) and `dbb`'s first test (`:296`)
+/// all run outside `dbScanLock`. The byte is therefore atomic, and the
+/// record cell keeps a handle to the same byte so those commands can reach
+/// it without the record's lock set — which a continuation thread holds
+/// for the whole of the chain it is stepping.
+///
+/// `Clone` makes a fresh byte with the same value, as cloning a record's
+/// fields makes a different record; [`Self::share`] is the cell's handle to
+/// this one.
+#[derive(Debug, Default)]
+pub struct BkptFlag(Arc<AtomicU8>);
+
+impl BkptFlag {
+    pub fn get(&self) -> u8 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, value: u8) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn share(&self) -> BkptFlag {
+        BkptFlag(self.0.clone())
+    }
+}
+
+impl Clone for BkptFlag {
+    fn clone(&self) -> Self {
+        BkptFlag(Arc::new(AtomicU8::new(self.get())))
+    }
+}
 
 /// Common fields shared by all records.
 #[derive(Clone, Debug)]
@@ -66,9 +104,9 @@ pub struct CommonFields {
     /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
     /// stores the raw put byte and serves it as SIGNED `DBR_CHAR`
     /// (`caput TPRO 255` → `caget` = -1). Modeled as the raw `u8`, like
-    /// [`Self::bkpt`], so the byte round-trips; consumers test `!= 0`.
+    /// [`Self::disp`], so the byte round-trips; consumers test `!= 0`.
     pub tpro: u8,
-    pub bkpt: u8,
+    pub bkpt: BkptFlag,
     // Links (raw strings)
     pub flnk: String,
     pub inp: String,
@@ -132,7 +170,7 @@ pub struct CommonFields {
     pub lcnt: i16,
     // DISP — disable putfield from CA. `DBF_UCHAR` in `dbCommon.dbd`: C
     // stores the raw put byte and serves it SIGNED as `DBR_CHAR`
-    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::bkpt`];
+    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::tpro`];
     // consumers test `!= 0`.
     pub disp: u8,
     // Process control
@@ -223,7 +261,7 @@ impl Default for CommonFields {
             oldsimm: 0,
             pini: 0,
             tpro: 0,
-            bkpt: 0,
+            bkpt: BkptFlag::default(),
             flnk: String::new(),
             inp: String::new(),
             out: String::new(),

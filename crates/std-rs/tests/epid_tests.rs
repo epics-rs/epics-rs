@@ -1489,7 +1489,7 @@ fn test_process_runs_do_pid_once_udf_cleared() {
 /// C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a successful
 /// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check.
 /// The framework fetches STPL->VAL before process() and reports the
-/// fetch success via `set_resolved_input_links(&["STPL"])`; with that
+/// fetch success via `set_resolved_input_links(ResolvedInputLinks::of_names(&["STPL"]))`; with that
 /// signal, a closed-loop epid runs do_pid that cycle even though the
 /// pushed `udf` is still the stale-TRUE from before the fetch.
 #[test]
@@ -1506,7 +1506,9 @@ fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
 
     // Framework reports the STPL fetch succeeded this cycle, then
     // pushes the stale udf=TRUE (recomputed only after process()).
-    rec.set_resolved_input_links(&["STPL"]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &["STPL"],
+    ));
     rec.set_process_context(&ctx_with_udf(true));
     rec.process().unwrap();
 
@@ -1539,7 +1541,9 @@ fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
 
     // Framework reports NO link resolved this cycle (STPL fetch failed
     // or STPL empty), then pushes udf=TRUE.
-    rec.set_resolved_input_links(&[]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &[],
+    ));
     rec.set_process_context(&ctx_with_udf(true));
     rec.process().unwrap();
 

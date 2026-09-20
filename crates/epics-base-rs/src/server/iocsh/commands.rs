@@ -2053,8 +2053,9 @@ fn dbpr_no_access(
             ),
         );
     }
+    let bkpt = inst.common.bkpt.get();
     let bytes: &[u8] = match d.name {
-        "BKPT" => std::slice::from_ref(&inst.common.bkpt),
+        "BKPT" => std::slice::from_ref(&bkpt),
         _ => return None,
     };
     let mut out = String::new();

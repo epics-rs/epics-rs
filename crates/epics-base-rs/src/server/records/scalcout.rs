@@ -1,7 +1,8 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    InputFetchPolicy, OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -1351,8 +1352,8 @@ impl Record for ScalcoutRecord {
     /// that choice decides whether PACT is held. Resolving from inside the
     /// framework's put path would be too late: the record would have to
     /// commit the cycle first and learn afterwards that it should have waited.
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
-        vec![ProcessAction::ResolveOutTarget { link_field: "OUT" }]
+    fn pre_process_actions(&mut self) -> ProcessActions {
+        ProcessActions::from(vec![ProcessAction::ResolveOutTarget { link_field: "OUT" }])
     }
 
     /// C `sCalcoutRecord.c:340-353` — the input snapshot into PA..PL and
@@ -1365,14 +1366,14 @@ impl Record for ScalcoutRecord {
     /// input-link fetch; `pre_process_actions` runs after it and would record
     /// this cycle's own values. The two re-entry flags are C's `pact == TRUE`
     /// arms (`:421-439`), which reach neither loop.
-    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> ProcessActions {
         if !self.awaiting_out && self.dlya != 1 {
             self.pa = self.num_vals;
             for (dst, src) in self.prev_str_vals.iter_mut().zip(self.str_vals.iter()) {
                 Self::snapshot_prev_str(dst, src);
             }
         }
-        Vec::new()
+        ProcessActions::new()
     }
 
     /// calc#42: PAA..PLL are read-only (`special(SPC_NOMOD)` in the fixed

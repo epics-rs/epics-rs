@@ -6,7 +6,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, LinkType, ProcessAction,
-    ProcessContext, ProcessOutcome, Record, link_field_type,
+    ProcessActions, ProcessContext, ProcessOutcome, Record, ResolvedInputLinks, link_field_type,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -577,7 +577,7 @@ impl Record for EpidRecord {
     /// `OUTL` link, mirroring C's `outl.type != CONSTANT` guard — for a
     /// CONSTANT/empty `OUTL` nothing is staged and the seeded field keeps
     /// its prior value.
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_process_actions(&mut self) -> ProcessActions {
         // The staged readback is per-cycle: whatever a previous cycle left
         // behind must not be mistaken for this cycle's OUTL value.
         self.outl_seed = None;
@@ -585,15 +585,15 @@ impl Record for EpidRecord {
         if edge {
             match link_field_type(&self.outl) {
                 LinkType::Db | LinkType::Ca => {
-                    return vec![ProcessAction::ReadDbLink {
+                    return ProcessActions::from(vec![ProcessAction::ReadDbLink {
                         link_field: "OUTL",
                         target_field: OUTL_SEED_FIELD,
-                    }];
+                    }]);
                 }
                 _ => {}
             }
         }
-        Vec::new()
+        ProcessActions::new()
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -1155,32 +1155,32 @@ impl Record for EpidRecord {
     /// on the callback pass. `ca_trig` is that `pact`, and the
     /// `AwaitingCallback` arm below is C's `!pepid->pact` guard: on the
     /// callback pass the trigger block is skipped entirely.
-    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> ProcessActions {
         if !self.is_async_callback_dtyp() {
-            return Vec::new();
+            return ProcessActions::new();
         }
         // C `devEpidSoftCallback.c:116` `if (!pepid->pact)` — the
         // callback pass re-processes to run the PID, never to re-fire.
         if self.ca_trig == CaTrigPhase::AwaitingCallback {
             self.ca_trig = CaTrigPhase::Idle;
-            return Vec::new();
+            return ProcessActions::new();
         }
         let write = ProcessAction::WriteDbLink {
             link_field: "TRIG",
             value: EpicsValue::Double(self.tval),
         };
         match link_field_type(&self.trig) {
-            LinkType::Db => vec![write],
+            LinkType::Db => ProcessActions::from(vec![write]),
             LinkType::Ca => {
                 self.ca_trig = CaTrigPhase::AwaitingCallback;
-                vec![
+                ProcessActions::from(vec![
                     write,
                     ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
-                ]
+                ])
             }
             // C `ptriglink->type` is CONSTANT/empty: `dbPutLink` to a
             // constant link is a no-op, and the PID runs in this pass.
-            LinkType::Constant | LinkType::Empty | LinkType::Other => Vec::new(),
+            LinkType::Constant | LinkType::Empty | LinkType::Other => ProcessActions::new(),
         }
     }
 
@@ -1192,8 +1192,8 @@ impl Record for EpidRecord {
     /// setpoint fetch actually succeeded this cycle. A STPL that is
     /// empty, or a DB/CA link whose fetch failed, is absent — so
     /// `stpl_resolved` is reset to false and `udf` is not cleared.
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
-        self.stpl_resolved = resolved.contains(&"STPL");
+    fn set_resolved_input_links(&mut self, resolved: ResolvedInputLinks<'_>) {
+        self.stpl_resolved = resolved.contains("STPL");
     }
 
     /// C `epidRecord.c:160-164` `init_record`: when `STPL` is a

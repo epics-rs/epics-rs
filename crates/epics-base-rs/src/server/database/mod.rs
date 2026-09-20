@@ -12,6 +12,7 @@ pub(crate) mod scan_index;
 mod snapshot;
 
 pub use field_io::ProcessMode;
+pub(crate) use link_set::MetadataPlan;
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
     LinkSetRegistry, PostBacking, PutAdmission, RemoteAlarm,
@@ -20,7 +21,7 @@ pub(crate) use links::{
     multi_output_dispatch_owned, posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
 pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts, ProcStack};
-pub(crate) use record_lock::LockRecord;
+pub(crate) use record_lock::{LockRecord, SetGuard};
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
@@ -485,7 +486,7 @@ struct PvDatabaseInner {
     /// chain — the cycle guard, the scan key, the lock-set lookup — carries a
     /// share of it rather than a copy. A name-keyed map that owned `String`s
     /// made a scan step allocate the name of every record it touched.
-    records: parking_lot::RwLock<HashMap<Arc<str>, Arc<RecordCell>>>,
+    records: RecursiveReadLock<HashMap<Arc<str>, Arc<RecordCell>>>,
     /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
     /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
@@ -547,7 +548,7 @@ struct PvDatabaseInner {
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: parking_lot::RwLock<HashMap<String, String>>,
+    aliases: RecursiveReadLock<HashMap<String, String>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -769,6 +770,74 @@ thread_local! {
     /// [`PvDatabase::lock_registration`].
     static REGISTRATION_GATE_HELD: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Whether this thread is inside a [`RegistrationGate`] window — the L46
+/// half of the check a fresh lock-set acquisition makes in debug builds
+/// (`record_lock.rs`, `LockSet::acquire`).
+pub(super) fn registration_gate_held() -> bool {
+    REGISTRATION_GATE_HELD.with(|h| h.get().is_some())
+}
+
+/// A reader-writer lock whose readers never queue behind a waiting writer.
+///
+/// The records map and the alias table are read from inside a record's lock
+/// set — every `get_record` on the process path — and written only by the
+/// registration entry points. With a fair `RwLock`, a reader arriving while
+/// a writer waits is parked, and that parks a thread holding a lock set: if
+/// the reader the writer is waiting on then wants that same set (a
+/// registration-path walk that reads records), the three are wedged. With
+/// `read_recursive` a reader is parked only by an ACTIVE writer, and no
+/// writer of these maps takes a lock set (`record_lock.rs`, acquisition
+/// order), so the cycle cannot close. This is the one place readers of
+/// these two maps are handed out, which is what makes that rule structural.
+pub(crate) struct RecursiveReadLock<T> {
+    lock: parking_lot::RwLock<T>,
+    /// Bumped under every write lock, so a reader can tell whether the map
+    /// may have changed since it last looked — what a cached link target
+    /// ([`crate::server::record::record_instance::LinkTargetResolver`])
+    /// checks instead of re-resolving a name every cycle.
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl<T> RecursiveReadLock<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            lock: parking_lot::RwLock::new(value),
+            revision: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, T> {
+        self.lock.read_recursive()
+    }
+
+    /// Bumps the revision once the write lock is held, so a reader that
+    /// loaded the revision before reading the map either saw the old number
+    /// or waited for this write to finish.
+    pub(crate) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, T> {
+        let guard = self.lock.write();
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        guard
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The database's end is every record's removal — `remove_record`'s rule,
+/// removal IS destruction, applied to the records the map still holds. What
+/// lets the cells drop with the map: a link target handle holds its target's
+/// `Arc`, so two records linked to each other hold each other until
+/// [`RecordInstance::destroy`] lets go.
+impl Drop for PvDatabaseInner {
+    fn drop(&mut self) {
+        for rec in self.records.lock.get_mut().values() {
+            rec.write().destroy();
+        }
+    }
 }
 
 /// RAII guard for L46, `PvDatabaseInner::registration_mutex`.
@@ -1145,13 +1214,13 @@ impl PvDatabase {
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
-                records: parking_lot::RwLock::new(HashMap::new()),
+                records: RecursiveReadLock::new(HashMap::new()),
                 scan_index: scan_index::ScanIndex::new(),
                 load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(HashMap::new()),
                 external_cp_links: SnapshotCell::new(HashMap::new()),
-                aliases: parking_lot::RwLock::new(HashMap::new()),
+                aliases: RecursiveReadLock::new(HashMap::new()),
                 registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
@@ -1291,6 +1360,12 @@ impl PvDatabase {
         // confirmed cycle; uniform order forecloses one. Same idiom as
         // `all_record_names`. (The registry write lock was released above.)
         let instances: Vec<_> = self.inner.records.read().values().cloned().collect();
+        // Record data is behind the record's lock set, which sits ABOVE L46
+        // in the acquisition order; the gate has done its job (registry
+        // update and map snapshot are one transaction) and is released
+        // before any record is opened. A record registered from here on
+        // installs the snapshot itself in `add_loaded_record`.
+        drop(_gate);
         for inst in instances {
             inst.write()
                 .record
@@ -2655,33 +2730,55 @@ impl PvDatabase {
         if prefetched.none_set() {
             return PostBacking::empty();
         }
-        let links = {
-            let inst = record.read();
-            if inst.link_backed_metadata_links().is_empty() {
-                return PostBacking::empty();
+        let plan = Self::plan_link_backed_metadata_for_posts(&record.read(), prefetched);
+        self.resolve_link_backed_metadata_plan(plan)
+    }
+
+    /// The first half of [`Self::resolve_link_backed_metadata_for_posts_with`]:
+    /// everything it asks of THIS record, under the caller's acquisition of
+    /// it. The process cycle asks from inside its entry guard, so the gate
+    /// costs it no second acquisition; the other posters ask under a read
+    /// lock of their own.
+    pub(crate) fn plan_link_backed_metadata_for_posts(
+        inst: &crate::server::record::RecordInstance,
+        prefetched: &InputLinkTexts,
+    ) -> MetadataPlan {
+        if prefetched.none_set() || inst.link_backed_metadata_links().is_empty() {
+            return MetadataPlan::Empty;
+        }
+        // **The gate, and the only place it is asked** — inside the one
+        // acquisition the text read below needs anyway. A poster's result
+        // reaches a consumer only through
+        // `RecordInstance::make_monitor_snapshot`, and every caller of
+        // that sits inside a `self.subscribers.get(field)` hit, so with
+        // nobody subscribed the walk is work no one can read. C pays
+        // nothing here either way: its five metadata slots are
+        // `dbDb_lset` entries (`dbDbLink.c:414-415`) reached from `dbGet`,
+        // so a link-backed slot is resolved when a CONSUMER asks the link,
+        // never from `dbProcess`.
+        //
+        // The answer is a DECLINE, not an empty map. A subscriber can
+        // arrive between a poster's read lock and the post's write lock, and
+        // the post must be able to tell that its backing was never looked up —
+        // otherwise that one event carries the record's own C seed where
+        // the link's metadata belongs.
+        if inst.subscribers.is_empty() {
+            return MetadataPlan::Declined;
+        }
+        MetadataPlan::Links(Self::link_backed_metadata_texts(inst, prefetched))
+    }
+
+    /// The second half: the walk, with NO lock on the record held — it
+    /// reaches for each TARGET's lock, and a self-link's target is this
+    /// record.
+    pub(crate) fn resolve_link_backed_metadata_plan(&self, plan: MetadataPlan) -> PostBacking {
+        match plan {
+            MetadataPlan::Empty => PostBacking::empty(),
+            MetadataPlan::Declined => PostBacking::declined(),
+            MetadataPlan::Links(links) => {
+                PostBacking::resolved(self.walk_link_backed_metadata(links))
             }
-            // **The gate, and the only place it is asked** — inside the one
-            // acquisition the text read below needs anyway. A poster's result
-            // reaches a consumer only through
-            // `RecordInstance::make_monitor_snapshot`, and every caller of
-            // that sits inside a `self.subscribers.get(field)` hit, so with
-            // nobody subscribed the walk is work no one can read. C pays
-            // nothing here either way: its five metadata slots are
-            // `dbDb_lset` entries (`dbDbLink.c:414-415`) reached from `dbGet`,
-            // so a link-backed slot is resolved when a CONSUMER asks the link,
-            // never from `dbProcess`.
-            //
-            // The answer is a DECLINE, not an empty map. A subscriber can
-            // arrive between this read lock and the post's write lock, and the
-            // post must be able to tell that its backing was never looked up —
-            // otherwise that one event carries the record's own C seed where
-            // the link's metadata belongs.
-            if inst.subscribers.is_empty() {
-                return PostBacking::declined();
-            }
-            Self::link_backed_metadata_texts(&inst, prefetched)
-        };
-        PostBacking::resolved(self.walk_link_backed_metadata(links))
+        }
     }
 
     /// [`Self::resolve_link_backed_metadata`] for a caller that has already
@@ -2719,7 +2816,7 @@ impl PvDatabase {
     fn link_backed_metadata_texts(
         inst: &crate::server::record::RecordInstance,
         prefetched: &InputLinkTexts,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(String, Arc<crate::server::record::ParsedLink>)> {
         inst.link_backed_metadata_links()
             .iter()
             // The field name is cloned only for a link that is actually set:
@@ -2728,8 +2825,8 @@ impl PvDatabase {
             // is empty for the unwired record that is the common case.
             .zip(inst.link_backed_metadata_input_slots())
             .filter_map(|(lf, slot)| {
-                let text = prefetched.text_at(*slot, inst, lf)?;
-                Some((lf.clone(), text))
+                let link = prefetched.link_at(*slot, inst, lf)?;
+                Some((lf.clone(), link))
             })
             .collect()
     }
@@ -2739,11 +2836,10 @@ impl PvDatabase {
     /// that legal only from here.
     fn walk_link_backed_metadata(
         &self,
-        links: Vec<(String, String)>,
+        links: Vec<(String, Arc<crate::server::record::ParsedLink>)>,
     ) -> HashMap<String, LinkMetadata> {
         let mut resolved = HashMap::new();
-        for (link_field, text) in links {
-            let parsed = crate::server::record::parse_link_v2(&text);
+        for (link_field, parsed) in links {
             let mut visited = std::collections::HashSet::new();
             if let Some(meta) = self.link_metadata(&parsed, &mut visited) {
                 resolved.insert(link_field, meta);
@@ -2792,13 +2888,14 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let gate = self.lock_registration("add_loaded_record");
         // A record created after `iocInit` needs a lock set, and its links —
         // in both directions — may merge it into existing ones. `None` while
         // the database is still loading, which is every ordinary
         // `dbLoadRecords`: `build_lock_sets` builds the whole graph at
-        // `iocInit` instead.
+        // `iocInit` instead. Declared ABOVE the gate: the relink takes lock
+        // sets, which sit above L46, so it must run once the gate is down.
         let _relink = self.lock_set_membership_change(name);
+        let gate = self.lock_registration("add_loaded_record");
         self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
@@ -2967,6 +3064,10 @@ impl PvDatabase {
         let phas = instance.common.phas;
         let record_type = instance.record.record_type();
         let rec_arc = Arc::new(RecordCell::new(instance));
+        // C `createLockRecord` allocates the `lockRecord` INTO the record:
+        // the registry's answer for this name is this record's own cell,
+        // adopted before the record is reachable by anyone.
+        self.inner.record_locks.adopt(name, rec_arc.lock_record());
         self.inner
             .records
             .write()
@@ -3168,16 +3269,52 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
-        let _gate = self.lock_registration("remove_record");
         // C `dbDeleteRecord` frees the record's `lockRecord`, so the set it
         // was in loses a member and may fall apart into several. Declared
-        // here so the relink runs once the record is out of the map.
+        // first so it drops last: the relink runs once the record is out of
+        // the map AND once both gates below are down, since it takes lock
+        // sets and those sit above L46.
         let _relink = self.lock_set_membership_change(name);
-        // 1) Remove from main map; keep scan + phas for scan-index cleanup.
-        let removed = self.inner.records.write().remove(name);
-        let Some(rec_arc) = removed else {
+        let Some(removed) = self.remove_record_entry(name) else {
             return false;
         };
+        // With both gates down: every other record's handle to the removed
+        // one is dropped, one record's lock set at a time. A handle made
+        // after this sweep would need the map to still answer the name, and
+        // it stopped answering before the sweep began.
+        let others: Vec<Arc<RecordCell>> = self.inner.records.read().values().cloned().collect();
+        for rec in &others {
+            rec.write().release_link_targets_to(&removed);
+        }
+        true
+    }
+
+    /// [`Self::remove_record`] under its gates: the entry out of every map
+    /// and index, the record destroyed. The removed cell, for the sweep the
+    /// caller runs once the gates are down.
+    fn remove_record_entry(&self, name: &str) -> Option<Arc<RecordCell>> {
+        // The record's data — its SCAN for the index sweep, `destroy()` at
+        // the end — is behind its lock set, which is taken ABOVE L46 in the
+        // acquisition order. So the set is taken first, off the handle, and
+        // the gate under it; the map is then re-read under the gate to prove
+        // the handle locked is the handle registered, as `update_scan_index`
+        // does. Reverse declaration order releases the gate first.
+        let (rec_arc, _record_gate, _gate) = loop {
+            let rec_arc = self.get_record_no_resolve(name)?;
+            let record_gate = self.lock_instance(&rec_arc);
+            let gate = self.lock_registration("remove_record");
+            let registered = self
+                .inner
+                .records
+                .read()
+                .get(name)
+                .is_some_and(|live| Arc::ptr_eq(live, &rec_arc));
+            if registered {
+                break (rec_arc, record_gate, gate);
+            }
+        };
+        // 1) Remove from main map; keep scan + phas for scan-index cleanup.
+        self.inner.records.write().remove(name);
         let scan = {
             let inst = rec_arc.read();
             inst.common.scan
@@ -3230,8 +3367,7 @@ impl PvDatabase {
         // keep serving a record the database no longer has.
         rec_arc.write().destroy();
         self.signal_destroyed();
-
-        true
+        Some(rec_arc)
     }
 
     /// Internal: synchronous lookup without invoking the search resolver.
@@ -3285,10 +3421,12 @@ impl PvDatabase {
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
-        let _gate = self.lock_registration("add_alias");
         // A link naming `alias` resolved to nothing until now, so the alias
         // can turn a dangling link into a real edge and merge two sets.
+        // Declared above the gate so the relink, which takes lock sets, runs
+        // after L46 is released.
         let _relink = self.lock_set_membership_change(target);
+        let _gate = self.lock_registration("add_alias");
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
@@ -4267,6 +4405,71 @@ mod tests {
     /// `LINR >= 3` conversion resolves — without any explicit per-call-site
     /// `install_breaktable_registry`. This covers the dbCreateRecord and
     /// inline-record creation paths that previously skipped the install.
+    /// A link target handle holds its target's `Arc`, so two records that
+    /// read each other hold each other; the database's drop must still free
+    /// both. The strong count proves the handle is strong, the `Weak`
+    /// proves the sweep breaks the cycle.
+    #[epics_macros_rs::epics_test]
+    async fn dropping_the_database_frees_records_that_link_to_each_other() {
+        let db = PvDatabase::new();
+        for (name, other) in [("CYC:A", "CYC:B"), ("CYC:B", "CYC:A")] {
+            let mut rec = crate::server::records::calc::CalcRecord::new("A+1");
+            rec.put_field(
+                "INPA",
+                EpicsValue::String(format!("{other} NPP NMS").into()),
+            )
+            .unwrap();
+            db.add_record(name, Box::new(rec)).await.unwrap();
+        }
+        db.process_record("CYC:A").await.unwrap();
+        db.process_record("CYC:B").await.unwrap();
+        let a = db.get_record("CYC:A").unwrap();
+        let b = db.get_record("CYC:B").unwrap();
+        assert_eq!(
+            (Arc::strong_count(&a), Arc::strong_count(&b)),
+            (3, 3),
+            "the map, this test and the other record's handle each hold the cell"
+        );
+        let (weak_a, weak_b) = (Arc::downgrade(&a), Arc::downgrade(&b));
+        drop((a, b, db));
+        assert!(
+            weak_a.upgrade().is_none() && weak_b.upgrade().is_none(),
+            "the cycle of handles outlived the database"
+        );
+    }
+
+    /// The other half of the rule: a record's removal drops every handle
+    /// that named it, so a holder that never processes again does not keep
+    /// the removed record alive.
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_record_releases_every_handle_to_it() {
+        let db = PvDatabase::new();
+        let mut reader = crate::server::records::calc::CalcRecord::new("A");
+        reader
+            .put_field("INPA", EpicsValue::String("REL:SRC NPP NMS".into()))
+            .unwrap();
+        db.add_record(
+            "REL:SRC",
+            Box::new(crate::server::records::calc::CalcRecord::new("1")),
+        )
+        .await
+        .unwrap();
+        db.add_record("REL:READER", Box::new(reader)).await.unwrap();
+        db.process_record("REL:READER").await.unwrap();
+        let src = db.get_record("REL:SRC").unwrap();
+        assert_eq!(
+            Arc::strong_count(&src),
+            3,
+            "the map, the reader's handle, this test"
+        );
+        assert!(db.remove_record("REL:SRC").await);
+        assert_eq!(
+            Arc::strong_count(&src),
+            1,
+            "the reader's handle outlived the removal"
+        );
+    }
+
     #[epics_macros_rs::epics_test]
     async fn add_record_installs_breaktable_registry_from_snapshot() {
         let db = PvDatabase::new();

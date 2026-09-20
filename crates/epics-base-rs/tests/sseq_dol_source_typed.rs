@@ -22,7 +22,7 @@ use std::time::Duration;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, ProcessAction, ProcessActions, ProcessOutcome, Record, RecordProcessResult,
 };
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::mbbi::MbbiRecord;
@@ -296,11 +296,11 @@ impl Record for PickyReader {
             post_write_fields: Vec::new(),
         })
     }
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
-        vec![ProcessAction::ReadDbLink {
+    fn pre_process_actions(&mut self) -> ProcessActions {
+        ProcessActions::from(vec![ProcessAction::ReadDbLink {
             link_field: "INP",
             target_field: "VAL",
-        }]
+        }])
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {

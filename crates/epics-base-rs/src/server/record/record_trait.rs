@@ -102,6 +102,12 @@ pub enum Base {
     Hex,
 }
 
+/// A record type's index for one of its fields — C's `dbFldDes::offset`
+/// as a handle rather than a byte count. Meaningful only to the type that
+/// handed it out ([`Record::field_slot`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FieldSlot(pub u16);
+
 /// The `.dbd` declaration of a single record field.
 ///
 /// Every one of these is **generated** from the vendored EPICS `.dbd` by
@@ -1226,6 +1232,89 @@ pub enum ProcessAction {
     CancelReprocess,
 }
 
+/// A list a record hands the framework for one cycle — the actions of
+/// [`Record::pre_input_link_actions`] and [`Record::pre_process_actions`],
+/// and the shape a `process()` outcome's lists are carried in.
+///
+/// An empty list is the answer of every record type that never fills it,
+/// on every cycle, so discarding one must cost nothing: the list owns no
+/// allocation while its capacity is zero, and the drop is a single inline
+/// test then. A bare `Vec` pays an out-of-line drop glue call for the same
+/// nothing, once per list per cycle.
+#[derive(Debug)]
+pub struct CycleList<T>(std::mem::ManuallyDrop<Vec<T>>);
+
+/// The actions a record hands the framework for one cycle.
+pub type ProcessActions = CycleList<ProcessAction>;
+
+impl<T> CycleList<T> {
+    /// An empty list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one entry, after those already listed.
+    pub fn push(&mut self, entry: T) {
+        self.0.push(entry);
+    }
+
+    /// The list as the `Vec` it is, for the consumers that take it apart.
+    pub fn into_vec(mut self) -> Vec<T> {
+        // The take leaves a capacity-0 `Vec` behind, which the drop below
+        // then has nothing to release.
+        std::mem::take(&mut *self.0)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release(entries: &mut std::mem::ManuallyDrop<Vec<T>>) {
+        // SAFETY: called once, from `drop`, on a field nothing else drops —
+        // it is `ManuallyDrop`, and `into_vec` leaves a fresh `Vec` in it.
+        unsafe { std::mem::ManuallyDrop::drop(entries) }
+    }
+}
+
+impl<T> Default for CycleList<T> {
+    fn default() -> Self {
+        Self(std::mem::ManuallyDrop::new(Vec::new()))
+    }
+}
+
+impl<T> From<Vec<T>> for CycleList<T> {
+    fn from(entries: Vec<T>) -> Self {
+        Self(std::mem::ManuallyDrop::new(entries))
+    }
+}
+
+impl<T> Drop for CycleList<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // A capacity-0 `Vec` holds no elements and owns no allocation, so
+        // there is nothing to run for it. The release is a frame of its own
+        // so that this test is all the drop glue holds, and is inlined.
+        if self.0.capacity() != 0 {
+            Self::release(&mut self.0);
+        }
+    }
+}
+
+impl<T> std::ops::Deref for CycleList<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> IntoIterator for CycleList<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
 /// What the [`ProcessAction::DelayedCallbackAfter`] timer does once the
 /// record's [`Record::delayed_callback_fire`] handler has run — the three arms
 /// of C `boRecord.c::myCallbackFunc` (:105-118).
@@ -1802,6 +1891,64 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
 }
 
 /// Trait that all EPICS record types must implement.
+/// The per-cycle report of which input links produced a value — C's
+/// `RTN_SUCCESS(dbGetLink(..))` per link, as [`Record::set_resolved_input_links`]
+/// is handed it. It is the bits the multi-input fetch set over the record's
+/// own [`Record::multi_input_links`] and the names the pre-process reads
+/// resolved, so making it costs a cycle nothing and asking it is one scan
+/// of a static list; no name list is built for the types that ignore it.
+#[derive(Clone, Copy)]
+pub struct ResolvedInputLinks<'a> {
+    /// The record's `multi_input_links`, the slots `mask` covers.
+    multi: &'static [(&'static str, &'static str)],
+    mask: u64,
+    /// The pre-process `ReadDbLink` fields that resolved.
+    pre: &'a [&'static str],
+}
+
+impl<'a> ResolvedInputLinks<'a> {
+    pub(crate) fn new(
+        multi: &'static [(&'static str, &'static str)],
+        mask: u64,
+        pre: &'a [&'static str],
+    ) -> Self {
+        ResolvedInputLinks { multi, mask, pre }
+    }
+
+    /// A report of these link fields alone — for a test that plays the
+    /// framework.
+    pub fn of_names(names: &'a [&'static str]) -> Self {
+        ResolvedInputLinks {
+            multi: &[],
+            mask: 0,
+            pre: names,
+        }
+    }
+
+    /// Whether `link_field`'s read produced a value this cycle.
+    pub fn contains(&self, link_field: &str) -> bool {
+        self.multi_names().any(|name| name == link_field) || self.pre.contains(&link_field)
+    }
+
+    /// Every link field whose read produced a value this cycle.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + 'a {
+        self.multi_names().chain(self.pre.iter().copied())
+    }
+
+    fn multi_names(&self) -> impl Iterator<Item = &'static str> + 'a {
+        let multi = self.multi;
+        let mut mask = self.mask;
+        std::iter::from_fn(move || {
+            if mask == 0 {
+                return None;
+            }
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            Some(multi[slot].0)
+        })
+    }
+}
+
 pub trait Record: Send + Sync + 'static {
     /// Return the record type name (e.g., "ai", "ao", "bi").
     fn record_type(&self) -> &'static str;
@@ -3248,7 +3395,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Additive, framework-set-hook pattern (same shape as
     /// [`Record::set_process_context`]). Default: ignore.
-    fn set_resolved_input_links(&mut self, _resolved: &[&'static str]) {}
+    fn set_resolved_input_links(&mut self, _resolved: ResolvedInputLinks<'_>) {}
 
     /// Report this cycle's `fetch_values()` outcome: `failed == true` means C's
     /// helper would have returned a non-zero status, so the record body — the
@@ -3286,6 +3433,19 @@ pub trait Record: Send + Sync + 'static {
     /// wins the tie and publishes the wrong STAT.
     fn multi_input_fetch_is_db_get_link(&self) -> bool {
         true
+    }
+
+    /// The generation of this record's [`Self::multi_input_links`] texts: a
+    /// count that moves on EVERY write of any of them, so a parse validated
+    /// against the texts at generation `g` is still the parse of those texts
+    /// while the record answers `g`. A type answers `Some` only when its link
+    /// texts have ONE writer that counts — `calc`'s `set_inp_link`, behind
+    /// private fields — and the count is then what C's `dbPutSpecial` on a
+    /// `DBF_INLINK` gives `dbDbInitLink`: the moment the link changed. `None`
+    /// (the default) validates every parse against the text itself, byte for
+    /// byte, on every read.
+    fn input_links_generation(&self) -> Option<u64> {
+        None
     }
 
     /// Whether a FAILED read of this multi-input link leaves the cycle
@@ -4078,6 +4238,46 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Deliver a multi-input link's scalar read to `field`, a value field of
+    /// [`Self::multi_input_links`] — C's `dbGetLink(plink, DBR_DOUBLE,
+    /// pvalue, 0, 0)` landing in `&prec->a` (`calcRecord.c:434`). The
+    /// default routes through [`Self::put_field_internal`]; a record whose
+    /// value fields are a plain `f64` block stores directly, since the
+    /// by-name path resolves the field three times to reach the same store.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        self.put_field_internal(field, EpicsValue::Double(value))
+    }
+
+    /// C `dbFldDes::offset` for `field` (upper-case): a handle into the
+    /// record's own storage that [`Self::get_slot_f64`] takes in place of
+    /// the name, settled once per link target as `dbDbInitLink` settles a
+    /// `dbAddr`. A type hands out a slot ONLY for a field the typed accessor
+    /// answers; `None` (the default) sends every read of the field through
+    /// [`Self::get_field`] by name.
+    fn field_slot(&self, _field: &str) -> Option<FieldSlot> {
+        None
+    }
+
+    /// The field at `slot` as `dbGet(DBR_DOUBLE)` delivers it: what
+    /// [`Self::get_field`] followed by the numeric funnel
+    /// ([`EpicsValue::into_double`] / `get_convert_f64`) produces, without
+    /// the value built and taken apart on the way. Defined for every slot
+    /// [`Self::field_slot`] hands out; `None` for any other.
+    fn get_slot_f64(&self, _slot: FieldSlot) -> Option<f64> {
+        None
+    }
+
+    /// Store a multi-input link's scalar read at `slot`, the
+    /// [`Self::field_slot`] of one of [`Self::multi_input_links`]' value
+    /// fields — C's `dbGetLink(plink, DBR_DOUBLE, &prec->a + i, ...)` store
+    /// through the address instead of the name. `true` when stored; the
+    /// default stores nothing and the fetch falls back to
+    /// [`Self::put_multi_input_f64`]. A type that overrides this must store
+    /// exactly what `put_multi_input_f64` stores for that field.
+    fn put_slot_f64(&mut self, _slot: FieldSlot, _value: f64) -> bool {
+        false
+    }
+
     /// The `(link_field, value_field)` pairs whose CONSTANT value this record's
     /// C `special()` RE-SEEDS on a runtime put to the link field —
     /// `recGblInitConstantLink(plink, DBF_DOUBLE, pvalue)` +
@@ -4530,6 +4730,16 @@ pub trait Record: Send + Sync + 'static {
         InputLinkRequest::As(LinkReadAs::Native)
     }
 
+    /// Whether [`Self::input_link_request`] and
+    /// [`Self::input_link_failure_is_inert`] are settled by the link field
+    /// alone, so the process plan may ask them once for every declared link
+    /// when the record is built. `false` for the two types whose answer reads
+    /// instance state — aSub (`FTA..FTU`) and printf (`FMT`) — which the fetch
+    /// loop then asks per link, per cycle, through the vtable.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        true
+    }
+
     /// The same request for a record whose [`Self::input_link_request`]
     /// answered [`InputLinkRequest::FromSource`] — C's `dbGetLinkLS` switch on
     /// `dbGetLinkDBFtype`, and sseq's on the same accessor. Reached ONLY
@@ -4588,8 +4798,8 @@ pub trait Record: Send + Sync + 'static {
     /// execute BEFORE calling process(). This is called once per cycle.
     /// Default returns empty. Override in records that need link reads
     /// to be available during process().
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
-        Vec::new()
+    fn pre_process_actions(&mut self) -> ProcessActions {
+        ProcessActions::new()
     }
 
     /// Return actions the framework must execute BEFORE the input-link
@@ -4612,8 +4822,8 @@ pub trait Record: Send + Sync + 'static {
     /// framework executes the returned actions (currently `WriteDbLink`
     /// and `ReadDbLink`) and then performs the input-link fetch.
     /// Default returns empty.
-    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
-        Vec::new()
+    fn pre_input_link_actions(&mut self) -> ProcessActions {
+        ProcessActions::new()
     }
 
     /// Called by the framework immediately before `process()` to push a

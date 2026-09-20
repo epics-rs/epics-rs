@@ -228,12 +228,32 @@ impl PvDatabase {
         old_phas: i16,
         _new_phas: i16,
     ) {
-        let _gate = self.lock_registration("update_scan_index");
         let _ = old_phas; // entry matched by name; PHAS not needed.
+        // The LIVE record's SCAN/PHAS are read under L46 so that the map
+        // check and the index mutation are one transaction against a
+        // concurrent `remove_record`. Record data is behind the record's
+        // lock set, which sits ABOVE L46, so the set is taken first — a
+        // re-entry for every caller, which holds it already (C reaches
+        // `scanAdd` from `dbPut` under `dbScanLock`) — and the map is
+        // re-read under the gate to prove the handle locked is the handle
+        // registered. A remove+re-add between the two reads is retried
+        // against the fresh record.
+        let (rec_arc, _record_gate, _gate) = loop {
+            let rec_arc = self.inner.records.read().get(name).cloned();
+            let record_gate = rec_arc.as_ref().map(|rec| self.lock_instance(rec));
+            let gate = self.lock_registration("update_scan_index");
+            let live = self.inner.records.read().get(name).cloned();
+            match (&rec_arc, &live) {
+                (Some(locked), Some(live)) if Arc::ptr_eq(locked, live) => {}
+                (None, None) => {}
+                _ => continue,
+            }
+            break (rec_arc, record_gate, gate);
+        };
         // 1) Remove the OLD entry the caller knew about — even if
         // remove_record already swept it.
         self.delete_from_scan_list(old_scan, name);
-        // 2) Look up the LIVE record under the mutex. If concurrent
+        // 2) Re-insert from the LIVE record's state. If concurrent
         // remove+re-add replaced the Arc with a fresh one whose
         // scan differs from the caller's `_new_scan`, we re-insert
         // based on the fresh record's state. The fresh record's
@@ -241,9 +261,8 @@ impl PvDatabase {
         // duplicate-insertion of the same (phas, name) pair into
         // the same scan bucket is a no-op (`BTreeSet::insert`
         // returns false on present key).
-        let rec_arc = match self.inner.records.read().get(name).cloned() {
-            Some(r) => r,
-            None => return,
+        let Some(rec_arc) = rec_arc else {
+            return;
         };
         let (cur_scan, cur_phas, cur_type) = {
             let inst = rec_arc.read();

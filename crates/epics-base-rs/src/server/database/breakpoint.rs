@@ -395,13 +395,18 @@ impl BreakpointTable {
     }
 
     /// C `dbBkpt()` (`dbBkpt.c:665-802`), called from `run_process_frame`
-    /// before the record gate is taken and before record support runs.
+    /// under the record gate and before record support runs — C's
+    /// `dbProcess` runs it under `dbScanLock`, and the lock order this fixes
+    /// is lock set, then the breakpoint stack, on every path.
     ///
     /// The order of the tests is C's and is load-bearing — C says so at
     /// `:672-675`. In particular `pact` is checked *after* entry-point
     /// queuing, so the entry-point statistics `dbstat` reports count an async
     /// record's cycles rather than only its completions (C `:754-758`).
     pub fn before_process(&self, db: &PvDatabase, record: &str) -> Before {
+        let Some(rec) = db.get_record(record) else {
+            return Before::Run;
+        };
         {
             let mut stack = self.lock();
             let Some(idx) = stack.index_of_record(db, record) else {
@@ -418,12 +423,9 @@ impl BreakpointTable {
             // owner of that link and re-fetching from a hook would double a
             // link read C performs once. The window is one cycle of a record
             // whose SDIS changed since it last processed.
-            let (disa, disv, pact) = match db.get_record(record) {
-                Some(rec) => {
-                    let inst = rec.read();
-                    (inst.common.disa, inst.common.disv, inst.is_processing())
-                }
-                None => return Before::Run,
+            let (disa, disv, pact) = {
+                let inst = rec.read();
+                (inst.common.disa, inst.common.disv, inst.is_processing())
             };
             if disa == disv {
                 return Before::Run;
@@ -472,12 +474,13 @@ impl BreakpointTable {
             stack.sets.push_front(node);
         };
 
-        // Parked with the stack mutex dropped and no record gate taken, which
-        // is C's state at `:794-796`: it releases both before suspending so
-        // the debugger commands still work while a record is stopped. The
-        // thread marks itself suspended here and nowhere else, so what
+        // Parked with the stack mutex dropped and the lock set given up,
+        // which is C's state at `:794-796`: it releases both before
+        // suspending so the debugger commands still work and other records
+        // of the set still process while one is stopped. The thread marks
+        // itself suspended here and nowhere else, so what
         // `epicsThreadShowAll` reports is this call, not a flag beside it.
-        crate::runtime::task::suspend_self();
+        rec.lock_record().unheld(crate::runtime::task::suspend_self);
         Before::Run
     }
 
@@ -790,16 +793,16 @@ impl Stack {
     }
 }
 
+/// C's unlocked `precord->bkpt` read — `dbstat` and `dbb` run it with no
+/// lock set held, and the set may be held by a stepping continuation thread.
 fn record_bkpt(db: &PvDatabase, record: &str) -> u8 {
-    db.get_record(record)
-        .map(|r| r.read().common.bkpt)
-        .unwrap_or(0)
+    db.get_record(record).map(|r| r.bkpt().get()).unwrap_or(0)
 }
 
 fn set_record_bkpt(db: &PvDatabase, record: &str, f: impl FnOnce(u8) -> u8) {
     if let Some(rec) = db.get_record(record) {
-        let mut inst = rec.write();
-        inst.common.bkpt = f(inst.common.bkpt);
+        let flag = rec.bkpt();
+        flag.set(f(flag.get()));
     }
 }
 
@@ -1252,6 +1255,7 @@ mod tests {
                 crate::runtime::task::StackSizeClass::Small,
                 move || {
                     claim_continuation(set_id, &taskid);
+                    let _gate = db.lock_instance(&db.get_record("BP:a").expect("record"));
                     tx.send("entered").expect("send");
                     assert_eq!(table.before_process(&db, "BP:a"), Before::Run);
                     tx.send("resumed").expect("send");
@@ -1309,6 +1313,7 @@ mod tests {
                 crate::runtime::task::StackSizeClass::Small,
                 move || {
                     claim_continuation(set_id, &taskid);
+                    let _gate = db.lock_instance(&db.get_record("BP:a").expect("record"));
                     tx.send("entered").expect("send");
                     assert_eq!(table.before_process(&db, "BP:a"), Before::Run);
                     tx.send("resumed").expect("send");

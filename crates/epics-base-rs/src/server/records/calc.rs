@@ -1,7 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmLimit, AnalogAlarmInput, InputFetchPolicy, ProcessOutcome, Record,
+    AlarmLimit, AnalogAlarmInput, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -48,6 +48,10 @@ pub struct CalcRecord {
     /// [`Self::set_inp_link`], the single writer of the 21 texts, so
     /// [`Record::set_input_link_slots`] answers off it without touching them.
     inp_set: u64,
+    /// [`Record::input_links_generation`]: moved on by [`Self::set_inp_link`],
+    /// the one writer of `INPA..INPU` (private fields — nothing else can
+    /// store a text without going through it).
+    inp_generation: u64,
     // Input values A-U
     pub vars: [f64; crate::calc::CALC_NARGS],
     // Previous values LA-LU (saved after each process)
@@ -120,6 +124,7 @@ impl Default for CalcRecord {
             inpt: String::new(),
             inpu: String::new(),
             inp_set: 0,
+            inp_generation: 0,
             vars: [0.0; crate::calc::CALC_NARGS],
             prev: [0.0; crate::calc::CALC_NARGS],
             calc_alarm: false,
@@ -262,6 +267,7 @@ impl CalcRecord {
         } else {
             self.inp_set &= !bit;
         }
+        self.inp_generation += 1;
     }
 
     fn put_inp_link(
@@ -302,6 +308,10 @@ fn var_index(name: &str) -> Option<usize> {
         _ => None,
     }
 }
+
+/// [`Record::field_slot`]'s index for `VAL`, past the `A`..`U` and
+/// `LA`..`LU` blocks.
+const VAL_SLOT: usize = 2 * crate::calc::CALC_NARGS;
 
 /// `LA`..`LU` → 0..21, the same index into the previous-value block.
 fn prev_index(name: &str) -> Option<usize> {
@@ -725,6 +735,60 @@ impl Record for CalcRecord {
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
         Some((self.inp_set, 0))
+    }
+
+    fn input_links_generation(&self) -> Option<u64> {
+        Some(self.inp_generation)
+    }
+
+    /// `A`..`U`, `LA`..`LU` and `VAL` — the fields a link reads — by
+    /// index into the three `f64` blocks C lays them out in.
+    fn field_slot(&self, field: &str) -> Option<FieldSlot> {
+        let slot = if let Some(i) = var_index(field) {
+            i
+        } else if let Some(i) = prev_index(field) {
+            crate::calc::CALC_NARGS + i
+        } else if field == "VAL" {
+            VAL_SLOT
+        } else {
+            return None;
+        };
+        Some(FieldSlot(slot as u16))
+    }
+
+    fn get_slot_f64(&self, slot: FieldSlot) -> Option<f64> {
+        let i = usize::from(slot.0);
+        if i < crate::calc::CALC_NARGS {
+            Some(self.vars[i])
+        } else if i < VAL_SLOT {
+            Some(self.prev[i - crate::calc::CALC_NARGS])
+        } else if i == VAL_SLOT {
+            Some(self.val)
+        } else {
+            None
+        }
+    }
+
+    fn put_slot_f64(&mut self, slot: FieldSlot, value: f64) -> bool {
+        let i = usize::from(slot.0);
+        if i < crate::calc::CALC_NARGS {
+            self.vars[i] = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// What `put_field` stores for `A`..`L`, without the three by-name
+    /// lookups that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match var_index(field) {
+            Some(i) => {
+                self.vars[i] = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
     }
 
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {

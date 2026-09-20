@@ -1054,11 +1054,6 @@ fn dbput_post_put_field(
 /// internals — exactly what `record_declaration_order` carries. A record type
 /// the generated table does not know declares nothing, which is what C's
 /// `!precordType` guard answers too.
-fn declares_field(record_type: &str, field: &str) -> bool {
-    crate::server::record::dbd_generated::record_declaration_order(record_type)
-        .is_some_and(|names| names.contains(&field))
-}
-
 impl PvDatabase {
     /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
@@ -1103,33 +1098,31 @@ impl PvDatabase {
     /// name a second time to reach it. C has the same split: `dbNameToAddr`
     /// resolves once into a `dbAddr` and every later `dbGet` reads through it,
     /// which is why a `dbGetLink` costs no name work at all.
+    ///
+    /// `field` is upper-case already: every caller hands it a channel name's
+    /// or a parsed link's field, both normalised where they were made.
     pub(crate) fn read_resolved_field(
         &self,
         instance: &crate::server::record::RecordInstance,
         field: &str,
         name: &str,
     ) -> CaResult<EpicsValue> {
-        // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
-        // against the record type's DECLARED field list first and falls
-        // through to `dbGetAttributePart` only on
-        // `S_dbLib_fieldNotFound`. So a record type that declares a field
-        // of the attribute's name — `motor.VERS` — shadows the attribute,
-        // and `RTYP`, which no record type declares, never is shadowed.
-        //
-        // Asked in that order, which is also the cheap one: the declared
-        // list is a static slice this process never writes, while the
-        // attribute map is behind a `Mutex` the whole IOC shares — a lock
-        // every link value read and every `get_pv` was taking to miss.
-        // Both operands are pure reads, so the conjunction's answer does not
-        // depend on which is asked first. The same order, for the same C
-        // lines, is already what `PvDatabase::channel_field_exists` uses.
-        let record_type = instance.record.record_type();
-        if !declares_field(record_type, field)
-            && let Some(value) = self.record_type_attribute(record_type, field)
-        {
-            return Ok(EpicsValue::String(value.into()));
-        }
-        if let Some(value) = instance.resolve_field(field) {
+        let rdes = crate::server::record::record_instance::RecordDesc::of(&*instance.record);
+        let addr = crate::server::record::record_instance::FieldAddr::resolve(&rdes, field);
+        self.read_resolved_field_at(instance, field, name, addr)
+    }
+
+    /// [`Self::read_resolved_field`] with the field's address already
+    /// resolved — what a link target reads through every cycle, C's `dbGet`
+    /// on a `dbAddr` from `dbDbInitLink`.
+    pub(crate) fn read_resolved_field_at(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        name: &str,
+        addr: crate::server::record::record_instance::FieldAddr,
+    ) -> CaResult<EpicsValue> {
+        if let Some(value) = self.read_field_at(instance, field, addr) {
             return Ok(value);
         }
         // Resolve-ok-but-read-fail is a state of its own, and one
@@ -1148,13 +1141,46 @@ impl PvDatabase {
         // state — present, unreadable — and C would likewise resolve it
         // and fail the get. Naming the class here instead would put a
         // second rule at the boundary.
-        Err(if declares_field(record_type, field) {
+        Err(if addr.declared {
             CaError::BadDbrType(format!(
                 "dbGet: {name} is declared but has no readable value"
             ))
         } else {
             CaError::ChannelNotFound(name.to_string())
         })
+    }
+
+    /// [`Self::read_resolved_field_at`] as the value alone — what a link
+    /// read wants, which drops the error's text unread. One frame from the
+    /// address to the field's accessor, so the value is built once and
+    /// handed up, not repacked through a `Result` on the way.
+    #[inline]
+    pub(crate) fn read_field_at(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        addr: crate::server::record::record_instance::FieldAddr,
+    ) -> Option<EpicsValue> {
+        // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
+        // against the record type's DECLARED field list first and falls
+        // through to `dbGetAttributePart` only on
+        // `S_dbLib_fieldNotFound`. So a record type that declares a field
+        // of the attribute's name — `motor.VERS` — shadows the attribute,
+        // and `RTYP`, which no record type declares, never is shadowed.
+        //
+        // Asked in that order, which is also the cheap one: the declared
+        // list is a static slice this process never writes, while the
+        // attribute map is behind a `Mutex` the whole IOC shares — a lock
+        // every link value read and every `get_pv` was taking to miss.
+        // Both operands are pure reads, so the conjunction's answer does not
+        // depend on which is asked first. The same order, for the same C
+        // lines, is already what `PvDatabase::channel_field_exists` uses.
+        if !addr.declared
+            && let Some(value) = self.record_type_attribute(instance.record.record_type(), field)
+        {
+            return Some(EpicsValue::String(value.into()));
+        }
+        instance.resolve_field_upper_at(field, addr.desc)
     }
 
     /// Set a PV value or record field — the C `dbPut` analogue
@@ -1172,7 +1198,8 @@ impl PvDatabase {
     ///
     /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(name);
+        let (base, field) = super::parse_pv_name(name);
+        let _record_gate = self.acquire_put_gate(base, field, Some(&value));
         self.put_pv_already_locked(name, value)
     }
 
@@ -1198,10 +1225,74 @@ impl PvDatabase {
     /// `None` when `name` names no record: a simple PV has no `dbCommon` and
     /// therefore no `dbScanLock` in C either. The record lookup is repeated by
     /// the body — a map read, and records are never removed once loaded.
-    fn acquire_put_gate(&self, name: &str) -> Option<super::record_lock::RecordWriteGuard> {
-        let (base, _) = super::parse_pv_name(name);
-        let rec = self.get_record(base)?;
-        Some(self.lock_instance(&rec))
+    /// The gate a put of `value` to `record.field` needs — C's
+    /// `dbScanLock(precord)`, or for a DBF link field `dbPutFieldLink`'s
+    /// `dbScanLockMany` over the record AND the local record the new link
+    /// names (`dbAccess.c:1115-1123`). The relink that follows a link write
+    /// moves records between exactly those two sets, and a mover holds the
+    /// sets it moves out of (`record_lock.rs`, `Registry::place`); taking
+    /// both here, in id order, is what lets the relink run inside the
+    /// window as a re-entry rather than nest a second set under the first.
+    /// `None` when `record` is not a record; `value` is `None` for a gate
+    /// that guards no write.
+    ///
+    /// A caller that reaches a link-field write already holding the record's
+    /// set (`*_already_locked`, a deferred put-notify restart) does nest the
+    /// target's set under it; C's `dbPutFieldLink` nests the same way when
+    /// called under a `dbScanLock`.
+    fn acquire_put_gate(
+        &self,
+        record: &str,
+        field: &str,
+        value: Option<&EpicsValue>,
+    ) -> Option<PutGate> {
+        let rec = self.get_record(record)?;
+        if let Some(target) = value.and_then(|value| self.db_link_put_target(&rec, field, value)) {
+            let canonical = self
+                .resolve_alias(record)
+                .unwrap_or_else(|| record.to_string());
+            return Some(PutGate::Many {
+                _held: self.lock_records([canonical, target]),
+            });
+        }
+        Some(PutGate::One {
+            _held: self.lock_instance(&rec),
+        })
+    }
+
+    /// The local record a DB link field `field` of `rec` would reach with
+    /// `value` as its text — `dbPutFieldLink`'s second lock operand. The
+    /// locality rule is `db_link_targets`': only a link that resolves to a
+    /// record this IOC has merges lock sets, so only such a link is locked.
+    fn db_link_put_target(
+        &self,
+        rec: &std::sync::Arc<crate::server::record::RecordCell>,
+        field: &str,
+        value: &EpicsValue,
+    ) -> Option<String> {
+        let EpicsValue::String(text) = value else {
+            return None;
+        };
+        let field_upper = field.to_ascii_uppercase();
+        let class = {
+            let guard = rec.read();
+            crate::types::dbf_link_class(guard.record.record_type(), &field_upper)?
+        };
+        let ftype = match class {
+            crate::types::DbfLinkClass::InLink => crate::server::record::LinkFieldType::In,
+            crate::types::DbfLinkClass::OutLink => crate::server::record::LinkFieldType::Out,
+            crate::types::DbfLinkClass::FwdLink => crate::server::record::LinkFieldType::Fwd,
+        };
+        let text = text.as_str_lossy();
+        match crate::server::record::parse_link_field(&text, ftype) {
+            crate::server::record::ParsedLink::Db(link) => {
+                let name = self
+                    .resolve_alias(&link.target().record)
+                    .unwrap_or_else(|| link.target().record.clone());
+                self.get_record_no_resolve(&name).map(|_| name)
+            }
+            _ => None,
+        }
     }
 
     /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
@@ -1634,11 +1725,6 @@ impl PvDatabase {
     ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
-        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
-        // relinks the target's lock set. The obligation is taken out here, so
-        // that every exit path below discharges it; see
-        // `record_lock.rs`'s `LinkFieldWrite`.
-        let _relink = self.link_field_write(base, &field);
 
         // Simple-PV path: PVs registered via `add_pv` (e.g. CA gateway
         // shadow PVs, IOCsh stats PVs) are stored in `simple_pvs`,
@@ -1668,7 +1754,13 @@ impl PvDatabase {
             // `put_pv_inner`'s gate: C's `dbScanLock` covers `dbPut`
             // including `dbPutSpecial(paddr, 1)` and the scan-list move, so
             // both tails below stay inside the window.
-            let _record_gate = self.lock_instance(&rec);
+            let _record_gate = self.acquire_put_gate(base, &field, Some(&value));
+            // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
+            // field relinks the record's lock set, inside the gate window
+            // above, which holds both sets the relink moves between. The
+            // obligation is taken out here so that every exit path below
+            // discharges it; see `record_lock.rs`'s `LockSetEdit`.
+            let _relink = self.link_field_write(base, &field);
             // The canonical name itself is wanted further down, by
             // `update_scan_index` and `run_special_actions`.
             let canonical_base: String =
@@ -1905,7 +1997,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        let _record_gate = self.acquire_put_gate(record_name);
+        let _record_gate = self.acquire_put_gate(record_name, field, Some(&value));
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
     }
 
@@ -1957,7 +2049,7 @@ impl PvDatabase {
         value: EpicsValue,
         origin: u64,
     ) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(record_name);
+        let _record_gate = self.acquire_put_gate(record_name, field, Some(&value));
         let _origin_scope = crate::server::record::ambient_write_origin_scope(origin);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
@@ -2157,7 +2249,7 @@ impl PvDatabase {
         // it -- firing a `block=true` completion for a cycle the client never
         // requested, and leaving this one to run unarmed.
         let installed = {
-            let _record_gate = self.acquire_put_gate(record_name);
+            let _record_gate = self.acquire_put_gate(record_name, "", None);
             self.install_notify_and_process_already_locked(
                 record_name,
                 completion_tx,
@@ -2220,7 +2312,7 @@ impl PvDatabase {
     /// The PACT (RPRO) branch is success, as it is in C: `dbPutField` returns
     /// the `dbProcess` status only on the branch that ran it.
     pub async fn put_driven_process(&self, record_name: &str) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(record_name);
+        let _record_gate = self.acquire_put_gate(record_name, "", None);
         self.put_driven_process_already_locked(record_name)
     }
 
@@ -2261,7 +2353,7 @@ impl PvDatabase {
         // The clients already hold their receivers; a failure here (record gone,
         // field refused) must still release them, which dropping the senders
         // does — the same completion a `dbNotifyCancel` gives the C client.
-        let _record_gate = self.acquire_put_gate(record_name);
+        let _record_gate = self.acquire_put_gate(record_name, "", None);
         let Some(rec) = self.get_record(record_name) else {
             return;
         };
@@ -3244,11 +3336,6 @@ impl PvDatabase {
     pub async fn put_pv_no_process(&self, name: &str, mut value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
-        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
-        // relinks the target's lock set. The obligation is taken out here, so
-        // that every exit path below discharges it; see
-        // `record_lock.rs`'s `LinkFieldWrite`.
-        let _relink = self.link_field_write(base, &field);
 
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
@@ -3266,7 +3353,13 @@ impl PvDatabase {
             // on the record, so an alias and its target share one gate
             // for the reason C's do — one `dbCommon`, one `lset`. Held
             // until return.
-            let _record_gate = self.lock_instance(&rec);
+            let _record_gate = self.acquire_put_gate(base, &field, Some(&value));
+            // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
+            // field relinks the record's lock set, inside the gate window
+            // above, which holds both sets the relink moves between. The
+            // obligation is taken out here so that every exit path below
+            // discharges it; see `record_lock.rs`'s `LockSetEdit`.
+            let _relink = self.link_field_write(base, &field);
             // The canonical name itself is wanted further down, by
             // `update_scan_index` and `run_special_actions`.
             let canonical_base: String =
@@ -3474,6 +3567,18 @@ fn metadata_from_snapshot(snapshot: &Snapshot) -> crate::server::pv::PvMetadata 
         control: snapshot.control.clone(),
         enums: snapshot.enums.clone(),
     }
+}
+
+/// What [`PvDatabase::acquire_put_gate`] holds: one record's set, or — for a
+/// DBF link field — the record's and the new target's, as `dbPutFieldLink`
+/// holds them.
+enum PutGate {
+    One {
+        _held: super::record_lock::RecordWriteGuard,
+    },
+    Many {
+        _held: super::record_lock::ManyRecordWriteGuard,
+    },
 }
 
 #[cfg(test)]

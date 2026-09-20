@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
-    parse_link_v2,
+    FieldMetadataOverride, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessActions,
+    ProcessOutcome, Record, parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
@@ -1387,23 +1387,23 @@ impl Record for WaveformRecord {
     /// Residual: the init-time constant-array load (`dbLoadLinkArray`, C's
     /// `init && isConst` arm) is not applied here — it belongs to
     /// `init_record`, not to the per-cycle hook.
-    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> ProcessActions {
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
-            return Vec::new();
+            return ProcessActions::new();
         }
         // C `!dbLinkIsConstant(&prec->dol)`: only a real (DB/CA/PVA) link is
         // fetched at process time; a constant (scalar, array literal, or
         // empty) is not re-applied each cycle.
         if dol_is_constant(&self.dol) {
-            return Vec::new();
+            return ProcessActions::new();
         }
         // The cycle now depends on this fetch — `set_resolved_input_links`
         // reports whether it landed.
         self.dol_fetch_requested = true;
-        vec![ProcessAction::ReadDbLink {
+        ProcessActions::from(vec![ProcessAction::ReadDbLink {
             link_field: "DOL",
             target_field: "VAL",
-        }]
+        }])
     }
 
     /// The framework's per-cycle report of which input-link fetches produced a
@@ -1411,8 +1411,11 @@ impl Record for WaveformRecord {
     /// is `fetchValue`'s status: a requested DOL fetch missing from the report
     /// is C's non-zero `dbGetLink` status, which aborts the cycle in
     /// [`Self::process`].
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
-        self.dol_read_failed = self.dol_fetch_requested && !resolved.contains(&"DOL");
+    fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
+        self.dol_read_failed = self.dol_fetch_requested && !resolved.contains("DOL");
         self.dol_fetch_requested = false;
     }
 
@@ -1939,11 +1942,11 @@ mod array_kind_tests {
         aao.omsl = MENU_OMSL_CLOSED_LOOP;
         aao.dol = "srcWaveform.VAL".to_string();
         assert_eq!(
-            aao.pre_input_link_actions(),
-            vec![ProcessAction::ReadDbLink {
+            &*aao.pre_input_link_actions(),
+            &[ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
-            }]
+            }][..]
         );
 
         // A bare record name parses to a DB link too (parse_link_v2), so it

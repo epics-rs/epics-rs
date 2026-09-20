@@ -92,7 +92,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-use super::PvDatabase;
+use super::{MetadataPlan, PvDatabase};
 
 /// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
 /// string field a string-input link writes into. The text therefore carries at
@@ -627,7 +627,10 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
                 .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
         }
     }
-    instance.suppress_subroutine_run = ds.skip_run;
+    // One-shot, armed by any reason and cleared only by its owner
+    // (`run_registered_subroutine`): OR-ed in, so a failed `fetch_values`
+    // that armed it before this hook still skips the run.
+    instance.suppress_subroutine_run |= ds.skip_run;
 }
 
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
@@ -778,12 +781,12 @@ impl AlarmPosts {
 /// the [`ForwardTarget`](crate::server::record::record_instance::ForwardTarget)
 /// the tail is handed, so only the target that needs them carries them.
 #[derive(Clone, Copy)]
-struct TailCtx {
+struct TailCtx<'a> {
     posts: CyclePosts,
-    /// The cycle's already-read [`ProcessPlan`], so the tail's two type-static
+    /// The cycle's [`ProcessPlan`], so the tail's two type-static
     /// dispatchers can be skipped without re-taking the record's lock to ask
     /// what type it is.
-    plan: crate::server::record::record_instance::ProcessPlan,
+    plan: &'a crate::server::record::record_instance::ProcessPlan,
 }
 
 /// What one process cycle published to monitors: the union of every `DBE_*`
@@ -917,26 +920,32 @@ enum SimOutcome {
     DeferRead(std::time::Duration),
 }
 
-/// The link fields of a [`Record::multi_input_links`] list that are SET,
-/// read once at the top of a process cycle and shared by both stages that
-/// want them.
+/// Which link fields of a [`Record::multi_input_links`] list are SET, read
+/// once at the top of a process cycle and shared by both stages that want
+/// them.
 ///
-/// Sparse, and that is the whole point. A `calc` declares twenty-one input
-/// links and a stock database wires none of them, so one entry per DECLARED
-/// link meant a 1.3 kB heap allocation per record per pass carrying
-/// twenty-one empty strings — the largest single allocation in the cycle, for
-/// a record with no inputs at all. Holding only the set links makes that
-/// record's pass allocate nothing here.
+/// A mask, and nothing else. A `calc` declares twenty-one input links and a
+/// stock database wires none of them, so any per-link entry — a text, a
+/// parse, a set-link record — was a heap allocation per record per pass. The
+/// parse and target of a set link live in the record's own cache
+/// ([`RecordInstance::parsed_inputs`]) and are read from there, under the
+/// record's guard, by the fetch that uses them.
 pub struct InputLinkTexts {
-    /// The list the slots below index — a record's
+    /// The list the mask indexes — a record's
     /// [`Record::multi_input_links`], or the subset it selected for this pass.
-    /// Carried WITH the texts, and the only list a reader is offered, so no
-    /// reader can pair one list's slots with another list's texts.
+    /// Carried WITH the mask, and the only list a reader is offered, so no
+    /// reader can pair one list's slots with another list's bits.
     links: &'static [(&'static str, &'static str)],
-    /// `(slot, text, failure_is_inert)` for the set links, ascending by slot.
-    set: Vec<(usize, String, bool)>,
-    /// Whether the links were read at all. For a reader, absence from `set`
-    /// then means "unset"; without the flag it would also mean "never asked",
+    /// The record's own [`Record::multi_input_links`] — the list the parse
+    /// cache is indexed by, and what [`Self::links`] is unless the record
+    /// narrowed it for this pass. Asked of the record once, here: the fetch
+    /// loop and the resolved-links report take it from this value.
+    own: &'static [(&'static str, &'static str)],
+    /// Bit `slot` set when `links[slot]` holds a link text. Every declared
+    /// list fits: the widest, `aSub`'s, has twenty-one entries.
+    wired: u64,
+    /// Whether the links were read at all. For a reader, a clear bit then
+    /// means "unset"; without the flag it would also mean "never asked",
     /// which is the put paths below, and they must go to the record instead.
     read: bool,
 }
@@ -948,93 +957,71 @@ impl InputLinkTexts {
     pub fn none() -> Self {
         Self {
             links: &[],
-            set: Vec::new(),
+            own: &[],
+            wired: 0,
             read: false,
         }
     }
 
-    /// The set links of `links`, as `instance` holds them now.
-    pub(crate) fn read_from(
+    /// The record's own set links, as `instance` holds them now.
+    pub(crate) fn read_own(instance: &RecordInstance) -> Self {
+        let own = instance.record.multi_input_links();
+        Self::read_from(instance, own, own)
+    }
+
+    /// The set links of `links` — [`Self::own`] narrowed to the subset the
+    /// record selected for this pass — as `instance` holds them now.
+    pub(crate) fn read_narrowed(
+        &self,
         instance: &RecordInstance,
         links: &'static [(&'static str, &'static str)],
     ) -> Self {
+        Self::read_from(instance, self.own, links)
+    }
+
+    fn read_from(
+        instance: &RecordInstance,
+        own: &'static [(&'static str, &'static str)],
+        links: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        debug_assert!(links.len() <= u64::BITS as usize);
         // Which links are wired is asked of the record as ONE question —
         // `Record::set_input_link_slots`, whose default body is codegen'd per
         // record type and so reads the type's own fields inline. Walking the
         // list here instead put one vtable call per declared link in the
         // cycle: 21 for a `calc`, to learn that a stock database wires none
-        // of them, and then a `Vec` allocation to say so.
+        // of them.
         //
         // Only for the record's OWN list. A caller that narrowed it — the
         // `sel` selected-input pass — is asking about a different list than
         // the record answered for, so it falls through to the walk.
-        let masks = std::ptr::eq(links, instance.record.multi_input_links())
+        let masks = std::ptr::eq(links, own)
             .then(|| instance.record.set_input_link_slots())
             .flatten();
-        let Some((set_mask, unknown_mask)) = masks else {
-            return Self {
-                links,
-                set: Self::walk(instance, links),
-                read: true,
-            };
-        };
-
-        let mut wired = set_mask | unknown_mask;
-        let mut set = Vec::with_capacity(wired.count_ones() as usize);
-        while wired != 0 {
-            let slot = wired.trailing_zeros() as usize;
-            wired &= wired - 1;
-            let (link_field, _) = links[slot];
-            let text = if set_mask & (1 << slot) != 0 {
-                // The mask already said the record lends a non-empty text.
-                instance
-                    .record
-                    .link_text_ref(link_field)
-                    .unwrap_or_default()
-                    .to_owned()
-            } else {
-                // A slot the record declines to lend: the owned path, as
-                // below.
-                match instance.link_text(link_field) {
-                    Some(text) => text,
-                    None => continue,
+        let wired = match masks {
+            Some((set, mut unknown)) => {
+                let mut wired = set;
+                while unknown != 0 {
+                    let slot = unknown.trailing_zeros() as usize;
+                    unknown &= unknown - 1;
+                    if instance.link_is_set(links[slot].0) {
+                        wired |= 1 << slot;
+                    }
                 }
-            };
-            set.push((
-                slot,
-                text,
-                instance.record.input_link_failure_is_inert(link_field),
-            ));
-        }
+                wired
+            }
+            None => links
+                .iter()
+                .enumerate()
+                .filter(|(_, (link_field, _))| instance.link_is_set(link_field))
+                .fold(0, |wired, (slot, _)| wired | 1 << slot),
+        };
         Self {
             links,
-            set,
+            own,
+            wired,
             read: true,
         }
-    }
-
-    /// [`Self::read_from`] link by link, for a list the record did not answer
-    /// a mask for.
-    fn walk(
-        instance: &RecordInstance,
-        links: &'static [(&'static str, &'static str)],
-    ) -> Vec<(usize, String, bool)> {
-        links
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, (link_field, _))| {
-                let text = match instance.record.link_text_ref(link_field) {
-                    Some("") => return None,
-                    Some(text) => text.to_owned(),
-                    None => instance.link_text(link_field)?,
-                };
-                Some((
-                    slot,
-                    text,
-                    instance.record.input_link_failure_is_inert(link_field),
-                ))
-            })
-            .collect()
     }
 
     /// Whether this pass read the links and found none of them set — the
@@ -1042,7 +1029,7 @@ impl InputLinkTexts {
     /// all unwired. A reader that needs a set link for every one of its own
     /// entries is finished before it starts.
     pub(crate) fn none_set(&self) -> bool {
-        self.read && self.set.is_empty()
+        self.read && self.wired == 0
     }
 
     /// The `(link_field, value_field)` pairs these texts were read from — the
@@ -1051,26 +1038,37 @@ impl InputLinkTexts {
         self.links
     }
 
-    /// The text and failure class of the link at `slot` of [`Self::links`],
-    /// `None` when that link is unset.
-    pub(crate) fn set_link_at(&self, slot: usize) -> Option<(&str, bool)> {
-        let i = self.set.binary_search_by_key(&slot, |(s, ..)| *s).ok()?;
-        let (_, text, failure_is_inert) = &self.set[i];
-        Some((text.as_str(), *failure_is_inert))
+    /// The record's own list — what the parse cache and the resolved-links
+    /// report are indexed by, whether or not [`Self::links`] was narrowed.
+    pub(crate) fn own(&self) -> &'static [(&'static str, &'static str)] {
+        self.own
     }
 
-    /// The text of the link at `slot` of the multi-input list: what was
-    /// pre-read if the cycle pre-read it, and otherwise what the record says
-    /// now. `None` is an unset link on both paths — the one meaning this
-    /// answers. The slot comes from
-    /// [`RecordInstance::link_backed_metadata_input_slots`], fixed by the
-    /// record type, so no caller searches this list by name.
-    pub(crate) fn text_at(
+    /// The set slots of [`Self::links`], as a mask — what a fetch walks, as
+    /// C's `fetch_values` loop is over the record's links but its work is
+    /// only on the set ones (`dbGetLink` on a constant link is a no-op
+    /// success).
+    pub(crate) fn wired(&self) -> u64 {
+        self.wired
+    }
+
+    /// Whether `slot` of [`Self::links`] holds a link.
+    pub(crate) fn is_set(&self, slot: usize) -> bool {
+        1u64.checked_shl(slot as u32)
+            .is_some_and(|bit| self.wired & bit != 0)
+    }
+
+    /// The link at `slot` of the multi-input list: what was pre-read if the
+    /// cycle pre-read it, and otherwise what the record says now. `None` is
+    /// an unset link on both paths — the one meaning this answers. The slot
+    /// comes from [`RecordInstance::link_backed_metadata_input_slots`], fixed
+    /// by the record type, so no caller searches this list by name.
+    pub(crate) fn link_at(
         &self,
         slot: Option<usize>,
         instance: &RecordInstance,
         field: &str,
-    ) -> Option<String> {
+    ) -> Option<Arc<crate::server::record::ParsedLink>> {
         match slot.filter(|_| self.read) {
             Some(slot) => {
                 debug_assert_eq!(
@@ -1078,11 +1076,510 @@ impl InputLinkTexts {
                     Some(field),
                     "a metadata slot must name the link it was taken for"
                 );
-                self.set_link_at(slot).map(|(text, _)| text.to_string())
+                if !self.is_set(slot) {
+                    return None;
+                }
+                instance.cached_multi_input(slot, field)
             }
-            None => instance.link_text(field),
+            None => instance
+                .link_text(field)
+                .map(|text| Arc::new(crate::server::record::parse_link_v2(&text))),
         }
     }
+}
+
+/// One set link of the multi-input fetch, as the loop hands it to
+/// [`PvDatabase::land_multi_input`].
+struct MultiInputLink<'a> {
+    link_field: &'static str,
+    val_field: &'static str,
+    parsed: &'a crate::server::record::ParsedLink,
+    /// [`Record::input_link_request`] for the link — C's `dbrType` argument
+    /// to `dbGetLink`.
+    request: crate::server::record::InputLinkRequest,
+    /// [`Record::input_link_failure_is_inert`] for the link.
+    failure_is_inert: bool,
+}
+
+/// What one link's read came to, for the fetch policy after it.
+struct LinkOutcome {
+    read_failed: bool,
+    /// Failed, and the type declared that failure inert.
+    skipped: bool,
+}
+
+impl PvDatabase {
+    /// The tail of one `dbGetLink` into the reader: the read converted to
+    /// the record's request, the LINK alarm on failure, the value stored,
+    /// the source's severity inherited — in that order, C's, and in one frame
+    /// so the value is moved once.
+    #[inline]
+    fn land_multi_input(
+        &self,
+        record: &mut dyn crate::server::record::Record,
+        common: &mut crate::server::record::CommonFields,
+        reader: &Arc<RecordCell>,
+        link: &MultiInputLink<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        (mut fetch, alarm): (
+            crate::server::recgbl::simm::LinkFetch,
+            Option<super::links::SourceAlarm>,
+        ),
+    ) -> LinkOutcome {
+        use crate::server::recgbl::simm::LinkFetch;
+        let store_raw = self.convert_link_fetch_as(
+            record,
+            link.link_field,
+            link.parsed,
+            link.request,
+            &mut fetch,
+        );
+        let read_failed = !fetch.is_ok();
+        // C `dbGetLink` on failure: `recGblSetSevrMsg(LINK_ALARM)` — for the
+        // types whose fetch IS `dbGetLink`, and not for a link whose failure
+        // the type declares inert.
+        if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
+            crate::server::recgbl::rec_gbl_set_link_alarm(common, link.link_field);
+        }
+        let value = match fetch {
+            LinkFetch::Value(v) => Some(v),
+            LinkFetch::NoData if plan.constants_deliver_at_process => {
+                crate::server::recgbl::simm::constant_load_value(link.parsed)
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            deliver_multi_input(record, link.val_field, value, store_raw);
+        }
+        // MS/NMS propagation from the source record, C `recGblInheritSevrMsg`
+        // inside a successful `dbGetLink`.
+        if let Some(alarm) = alarm {
+            self.fold_input_link_alarm(common, reader, link.parsed, alarm);
+        }
+        LinkOutcome {
+            read_failed,
+            skipped: read_failed && link.failure_is_inert,
+        }
+    }
+
+    /// C `dbGetLink` on a DB link to a held local record, read at the
+    /// reader's own type with no filter chain — the whole of `dbDbGetValue`'s
+    /// scalar arm (`dbDbLink.c:220-232`) in one frame: the target's field
+    /// read under its lock, the reader's `LINK_ALARM` on failure, the value
+    /// stored, the target's committed severity inherited. Returns whether
+    /// the read failed.
+    ///
+    /// The general path is [`Self::read_db_link_at`] into
+    /// [`Self::land_multi_input`], which answers the same questions for every
+    /// caller and so packs the value and alarm into a fetch and a source
+    /// alarm on the way. This frame asks nothing the general one does not;
+    /// it only keeps the value where it is consumed. Which is why its
+    /// callers are gated on [`ProcessPlan::multi_inputs_read_native`]: the
+    /// conversion step it omits is a no-op for a native request, and the
+    /// inert-failure test it omits is settled `false` by the same plan bit.
+    /// Self-reads are excluded by the caller as C excludes them from
+    /// `recGblInheritSevrMsg` (`precord != dbChannelRecord(chan)`), so the
+    /// inheritance needs no record test here.
+    #[inline(always)]
+    fn fetch_native_db_input(
+        &self,
+        record: &mut dyn crate::server::record::Record,
+        common: &mut crate::server::record::CommonFields,
+        held: &crate::server::database::SetGuard,
+        (db, at, native): (
+            &crate::server::record::DbLink,
+            &crate::server::record::record_instance::ResolvedTarget,
+            crate::server::record::record_instance::NativeRead,
+        ),
+        (declared, cache_slot): (&'static [(&'static str, &'static str)], usize),
+        sets_link_alarm: bool,
+    ) -> bool {
+        use super::links::{LinkAlarm, inherit_sevr_msg, local_name};
+        let target = db.target();
+        let field: &str = &target.field;
+        // The simple PV that shadows the field's spelling, asked as
+        // `read_field_of` asks it — and never for `VAL`, whose spelling is
+        // the record's own name.
+        if native.shadowed {
+            let pv_name = local_name(&target.record, field);
+            if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
+                deliver_multi_input(record, declared[cache_slot].1, pv.get(), false);
+                return false;
+            }
+        }
+        let inherits = native.inherits;
+        let instance = at.rec.read_in(held);
+        // A field the target hands out a slot for is read as the `f64` the
+        // numeric funnel would make of it; any other goes by name and
+        // through the funnel.
+        let value = match at.field.slot {
+            Some(slot) => instance.record.get_slot_f64(slot).map(Ok),
+            None => self
+                .read_field_at(&instance, field, at.field)
+                .map(|value| value.into_double()),
+        };
+        let alarm = inherits.then(|| LinkAlarm::committed(&instance.common));
+        drop(instance);
+        let Some(value) = value else {
+            if sets_link_alarm {
+                crate::server::recgbl::rec_gbl_set_link_alarm(common, declared[cache_slot].0);
+            }
+            return true;
+        };
+        let stored = match value {
+            Ok(f) => Some(f),
+            Err(value) => deliver_converted(record, declared[cache_slot].1, value),
+        };
+        if let Some(f) = stored
+            && !native
+                .val_slot
+                .is_some_and(|slot| record.put_slot_f64(slot, f))
+        {
+            let _ = record.put_multi_input_f64(declared[cache_slot].1, f);
+        }
+        if let Some(alarm) = alarm {
+            inherit_sevr_msg(common, db.monitor_switch, &alarm);
+        }
+        false
+    }
+}
+
+/// What one link of the multi-input fetch came to, before the reader's
+/// fields were touched: unset, read under the reader's own hold, or not a
+/// read that hold can make.
+enum HeldFetch {
+    /// The link is unset — C `dbConstGetValue` with nothing to deliver.
+    Unset,
+    Done(LinkOutcome),
+    /// A read the general path owns: a target in no local record, the
+    /// reader's own field, a `PP` source, a filtered target.
+    NotHeld,
+}
+
+/// The fetch loop's fold of its links' outcomes — C `fetch_values`'
+/// `status` under the record's [`InputFetchPolicy`], and the mask of links
+/// that delivered (`RTN_SUCCESS(dbGetLink)` per link). One fold for both
+/// shapes of the loop, so a policy is applied in one place.
+#[derive(Default)]
+struct FetchFold {
+    resolved: u64,
+    /// This cycle's `fetch_values()` outcome — non-zero status in C, i.e.
+    /// "the record body must not run" — under every policy but the sel one.
+    fetch_values_failed: bool,
+    /// C `fetch_values`' `status` local, for the record types that return
+    /// it rather than an early/first-failure fold: assigned on EVERY pass of
+    /// the loop, so at `return(status)` it holds the LAST link's status and
+    /// an empty/constant link counts as a success.
+    last_input_read_failed: bool,
+}
+
+impl FetchFold {
+    /// Note one link's outcome; `true` when the policy ends the loop here.
+    fn note(
+        &mut self,
+        policy: InputFetchPolicy,
+        cache_slot: usize,
+        is_last: bool,
+        LinkOutcome {
+            read_failed,
+            skipped,
+        }: LinkOutcome,
+    ) -> bool {
+        self.last_input_read_failed = read_failed && !skipped && is_last;
+        if !read_failed && let Some(bit) = 1u64.checked_shl(cache_slot as u32) {
+            self.resolved |= bit;
+        }
+        if read_failed && !skipped {
+            match policy {
+                InputFetchPolicy::ReadAll => {}
+                InputFetchPolicy::ReadAllGateOnFailure => {
+                    self.fetch_values_failed = true;
+                }
+                InputFetchPolicy::AbortOnFirstFailure => {
+                    self.fetch_values_failed = true;
+                    self.last_input_read_failed = true;
+                    return true;
+                }
+                // `sel`: the LAST link's status decides, and the loop
+                // carries that decision to the gate after the loop.
+                InputFetchPolicy::ReadAllGateOnLastFailure => {}
+            }
+        }
+        false
+    }
+
+    /// C `fetch_values`' return, folded with the sel gate into the ONE
+    /// boolean delivered to `Record::set_fetch_gate_failed` (calc/calcout/
+    /// scalcout/acalcout/swait/sel) and `suppress_subroutine_run` (sub/aSub).
+    ///
+    /// C `selRecord.c::fetch_values` returns the status of its LAST
+    /// `dbGetLink` (`:434-437` assigns `status` unguarded every pass), and
+    /// `process` (`:114-116`) gates `do_sel` on it in EVERY mode. The gate is
+    /// "the last link read FAILED" — never "a link delivered no value":
+    /// `dbGetLink` on an unset OR constant link returns success
+    /// (`dbConstGetValue`), and the field it would have written keeps its
+    /// init-seeded value, which flows into `do_sel`.
+    fn failed(&self, policy: InputFetchPolicy, sel_nvl_read_failed: bool) -> bool {
+        let failed = if matches!(policy, InputFetchPolicy::ReadAllGateOnLastFailure) {
+            self.last_input_read_failed
+        } else {
+            self.fetch_values_failed
+        };
+        failed || sel_nvl_read_failed
+    }
+}
+
+impl PvDatabase {
+    /// One `dbGetLink` of the multi-input fetch, whichever way the link
+    /// reads: the held native read where the plan allows it and the link is
+    /// one, else the general read. `None` for an unset link, which C's loop
+    /// visits as a `dbConstGetValue` success with nothing to deliver.
+    ///
+    /// `always`: the two loops are its callers, and the frame it would
+    /// otherwise be — the held path's arguments moved in and the outcome
+    /// moved out — is what the held path exists to avoid.
+    #[inline(always)]
+    fn fetch_multi_input(
+        &self,
+        guard: &mut DataGuard<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        declared: &'static [(&'static str, &'static str)],
+        cache_slot: usize,
+        visited: &mut ProcStack,
+    ) -> Option<LinkOutcome> {
+        if plan.multi_inputs_read_native {
+            match self.fetch_native_input_held(guard, plan, declared, cache_slot) {
+                HeldFetch::Done(outcome) => return Some(outcome),
+                HeldFetch::Unset => return None,
+                HeldFetch::NotHeld => {}
+            }
+        }
+        self.fetch_multi_input_general(guard, plan, declared, cache_slot, visited)
+    }
+
+    /// The common link of a wired record — a held local target read at its
+    /// own type, no filter — through [`Self::fetch_native_db_input`], with
+    /// the reader's guard held throughout. Decides from the cached parse and
+    /// target alone, so a link it declines has cost the general path one
+    /// cache hit.
+    #[inline(always)]
+    fn fetch_native_input_held(
+        &self,
+        guard: &mut DataGuard<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        declared: &'static [(&'static str, &'static str)],
+        cache_slot: usize,
+    ) -> HeldFetch {
+        use crate::server::record::record_instance::ParsedInputLink;
+        let rec = guard.rec;
+        let (inst, held) = guard.hold_in();
+        // Under THIS hold, as the parse it validates is: a link before this
+        // one may have released the guard, and a put to the text in that
+        // window moved the count.
+        let generation = inst.record.input_links_generation();
+        let Some(entry) = ParsedInputLink::validated(
+            &mut inst.parsed_inputs,
+            &*inst.record,
+            cache_slot,
+            declared,
+            generation,
+        ) else {
+            return HeldFetch::Unset;
+        };
+        // C `dbGetLink`: a `ProcessPassive` DB input link processes its
+        // passive source record before the value is read. The source's
+        // cycle may read THIS record back through a link of its own, so it
+        // runs with the guard released — as does a read of this record's
+        // own field. Neither is this frame's, and the handle knows which
+        // it is.
+        let Some((db, at, native)) = entry.native_read(self, rec, cache_slot) else {
+            return HeldFetch::NotHeld;
+        };
+        HeldFetch::Done(LinkOutcome {
+            read_failed: self.fetch_native_db_input(
+                &mut *inst.record,
+                &mut inst.common,
+                held,
+                (db, at, native),
+                (declared, cache_slot),
+                plan.multi_input_is_db_get_link,
+            ),
+            skipped: false,
+        })
+    }
+
+    /// One `dbGetLink` of the multi-input fetch in its general form: the
+    /// read converted to the record's request, a `PP` source processed
+    /// first, a target found by name, the reader's own field read with the
+    /// guard released — every case, through [`Self::land_multi_input`].
+    /// Out of the loop's line so the loop carries the common case's frame
+    /// alone.
+    #[inline(never)]
+    fn fetch_multi_input_general(
+        &self,
+        guard: &mut DataGuard<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        declared: &'static [(&'static str, &'static str)],
+        cache_slot: usize,
+        visited: &mut ProcStack,
+    ) -> Option<LinkOutcome> {
+        use crate::server::record::record_instance::ParsedInputLink;
+        use crate::server::record::{InputLinkRequest, LinkProcessPolicy, LinkReadAs, ParsedLink};
+        let (link_field, val_field) = declared[cache_slot];
+        let rec = guard.rec;
+        let inst = guard.hold();
+        let (failure_is_inert, request) = if plan.multi_inputs_read_native {
+            debug_assert!(
+                !inst.record.input_link_failure_is_inert(link_field)
+                    && inst.record.input_link_request(link_field)
+                        == InputLinkRequest::As(LinkReadAs::Native),
+                "{}: input_link_answers_fixed_at_type must be false for a \
+                 per-instance input_link_request / input_link_failure_is_inert",
+                inst.record.record_type()
+            );
+            (false, InputLinkRequest::As(LinkReadAs::Native))
+        } else {
+            (
+                inst.record.input_link_failure_is_inert(link_field),
+                inst.record.input_link_request(link_field),
+            )
+        };
+        let generation = inst.record.input_links_generation();
+        let entry = ParsedInputLink::validated(
+            &mut inst.parsed_inputs,
+            &*inst.record,
+            cache_slot,
+            declared,
+            generation,
+        )?;
+        let (parsed, target) = entry.target(self, rec, cache_slot);
+        // C `dbGetLink`: a `ProcessPassive` DB input link processes its
+        // passive source record before the value is read. The source's cycle
+        // may read THIS record back through a link of its own, so it runs
+        // with the guard released — as does a read of this record's own
+        // field, and a read that has to find its target by name.
+        let held_target = match (target, parsed) {
+            (Some(at), ParsedLink::Db(db))
+                if !Arc::ptr_eq(&at.rec, rec) && db.policy != LinkProcessPolicy::ProcessPassive =>
+            {
+                Some((db, at))
+            }
+            _ => None,
+        };
+        // One landing site, so the read is written once into the frame it
+        // is consumed from; the arms differ only in whether the parse and
+        // the target are borrowed from the cache (the guard held, so nothing
+        // can replace them) or cloned out to survive the release.
+        let owned;
+        let owned_target;
+        let (record, common, parsed, read) = if let Some((db, at)) = held_target {
+            let read = self.read_db_link_at(db, at);
+            (&mut *inst.record, &mut inst.common, parsed, read)
+        } else {
+            owned_target = target.cloned();
+            owned = entry.parsed().clone();
+            guard.release();
+            if let ParsedLink::Db(db) = &*owned {
+                self.process_passive_db_source(db, visited);
+            }
+            let read = self.read_link_with_alarm_at(&owned, owned_target.as_ref());
+            let inst = guard.hold();
+            (&mut *inst.record, &mut inst.common, &*owned, read)
+        };
+        let link = MultiInputLink {
+            link_field,
+            val_field,
+            parsed,
+            request,
+            failure_is_inert,
+        };
+        Some(self.land_multi_input(record, common, rec, &link, plan, read))
+    }
+
+    /// The input stage of a cycle that reads nothing but the record's own
+    /// input links, each at its own type — see the shape test in
+    /// [`Self::fetch_input_stage`]. The multi-input loop alone, over the
+    /// record's own list, under the guard the caller holds; returns the
+    /// resolved mask, the one thing the body wants of such a cycle.
+    fn fetch_own_native_inputs(
+        &self,
+        guard: &mut DataGuard<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        link_texts: &InputLinkTexts,
+        visited: &mut ProcStack,
+    ) -> u64 {
+        let declared = link_texts.own();
+        let policy = plan.input_fetch_policy;
+        let mut fold = FetchFold::default();
+        // Over the set links only: C's loop visits every declared link, but
+        // an unset one is a `dbConstGetValue` success with nothing to
+        // deliver, so the passes it would make here are no-ops.
+        let mut wired = link_texts.wired();
+        while wired != 0 {
+            let slot = wired.trailing_zeros() as usize;
+            wired &= wired - 1;
+            let Some(outcome) = self.fetch_multi_input(guard, plan, declared, slot, visited) else {
+                continue;
+            };
+            if fold.note(policy, slot, slot + 1 == declared.len(), outcome) {
+                break;
+            }
+        }
+        let fetch_values_failed = fold.failed(policy, false);
+        let inst = guard.hold();
+        inst.record.set_fetch_gate_failed(fetch_values_failed);
+        if fetch_values_failed {
+            inst.suppress_subroutine_run = true;
+        }
+        fold.resolved
+    }
+}
+
+/// One `fetch_values` result into its value field — C's `dbGetLink(plink,
+/// DBR_DOUBLE, &prec->a, ...)` store, for the types that funnel through the
+/// numeric put and the ones that take the value as read.
+#[inline]
+fn deliver_multi_input(
+    record: &mut dyn crate::server::record::Record,
+    val_field: &'static str,
+    value: EpicsValue,
+    store_raw: bool,
+) {
+    if store_raw {
+        // A string-class declared request (printf `%s`) already produced the
+        // value the record asked for — the numeric funnel below is the OTHER
+        // records' `DBR_DOUBLE` request, not a store rule.
+        let _ = record.put_field_internal(val_field, value);
+        return;
+    }
+    // What a numeric source's `DBR_DOUBLE` fetch is; everything else
+    // converts in its own frame.
+    let f = match value.into_double() {
+        Ok(f) => f,
+        Err(value) => match deliver_converted(record, val_field, value) {
+            Some(f) => f,
+            None => return,
+        },
+    };
+    let _ = record.put_multi_input_f64(val_field, f);
+}
+
+/// [`deliver_multi_input`]'s non-`Double` arm: an array stored whole when
+/// the field takes one, else the scalar the numeric funnel makes of it.
+fn deliver_converted(
+    record: &mut dyn crate::server::record::Record,
+    val_field: &'static str,
+    value: EpicsValue,
+) -> Option<f64> {
+    if value.is_array() {
+        if record.put_field_internal(val_field, value.clone()).is_ok() {
+            return None;
+        }
+        // The target is a scalar field: element 0, as C's one-element
+        // destination takes.
+        return value.first_element().and_then(|v| v.get_convert_f64());
+    }
+    value.get_convert_f64()
 }
 
 /// The record's data guard across the guarded segments of one process cycle.
@@ -1122,7 +1619,7 @@ impl std::ops::Deref for FrameName<'_> {
 
 struct DataGuard<'a> {
     rec: &'a Arc<RecordCell>,
-    held: Option<parking_lot::RwLockWriteGuard<'a, RecordInstance>>,
+    held: Option<crate::server::record::RecordMut<'a>>,
 }
 
 impl<'a> DataGuard<'a> {
@@ -1131,9 +1628,23 @@ impl<'a> DataGuard<'a> {
     }
 
     /// The instance under the guard — taken now if the last boundary released it.
+    ///
+    /// `always`, as is [`Self::hold_in`]: the body asks a dozen times per
+    /// cycle and the answer is a loaded pointer whenever the guard is held.
+    /// Left to the inliner, one more caller of [`RecordCell::write`] flipped
+    /// it out of line, at 150 instructions of frame per cycle.
+    #[inline(always)]
     fn hold(&mut self) -> &mut RecordInstance {
         let rec = self.rec;
         self.held.get_or_insert_with(|| rec.write())
+    }
+
+    /// [`Self::hold`] with the set guard alongside, for the link reads of
+    /// the same set ([`RecordCell::read_in`]).
+    #[inline(always)]
+    fn hold_in(&mut self) -> (&mut RecordInstance, &crate::server::database::SetGuard) {
+        let rec = self.rec;
+        self.held.get_or_insert_with(|| rec.write()).split()
     }
 
     /// Give the guard up ahead of work that may lock another record, or this one.
@@ -1146,6 +1657,12 @@ impl<'a> DataGuard<'a> {
 /// [`PvDatabase::fetch_input_stage`].
 struct InputStage {
     is_soft: bool,
+    /// The multi-input links whose fetch produced a value, one bit per slot
+    /// of the record's own `multi_input_links` — C's `RTN_SUCCESS(dbGetLink)`
+    /// per link, recorded at no cost and delivered as the bits it is
+    /// ([`crate::server::record::ResolvedInputLinks`]), so every type's
+    /// report is made.
+    resolved: u64,
     /// What the link reads produced. `None` is the cycle that had nothing to
     /// read — a stock `calc` — and costs that cycle one tag, where a struct
     /// of empty results cost it every field's write and drop.
@@ -1163,11 +1680,9 @@ struct LinkInputs {
     dol_fetch: Option<crate::server::recgbl::simm::LinkFetch>,
     dol_read_failed: bool,
     sel_nvl_value: Option<EpicsValue>,
-    multi_input_values: Vec<(&'static str, EpicsValue, bool)>,
     string_input_values: Vec<(String, EpicsValue)>,
     asub_dynamic: Option<AsubDynamicSub>,
     resolved_link_fields: Vec<&'static str>,
-    fetch_values_failed: bool,
     link_alarms: Vec<(
         crate::server::record::MonitorSwitch,
         super::links::LinkAlarm,
@@ -1177,9 +1692,10 @@ struct LinkInputs {
 impl InputStage {
     /// The stage's result for a cycle that had nothing to read: what the
     /// fetch produces when every link it would ask is unset.
-    fn none(is_soft: bool) -> Self {
+    fn none(is_soft: bool, resolved: u64) -> Self {
         Self {
             is_soft,
+            resolved,
             links: None,
         }
     }
@@ -1198,11 +1714,9 @@ impl LinkInputs {
             dol_fetch: None,
             dol_read_failed: false,
             sel_nvl_value: None,
-            multi_input_values: Vec::new(),
             string_input_values: Vec::new(),
             asub_dynamic: None,
             resolved_link_fields: Vec::new(),
-            fetch_values_failed: false,
             link_alarms: Vec::new(),
         }
     }
@@ -1435,37 +1949,6 @@ impl PvDatabase {
             return Ok(());
         };
 
-        // Breakpoint hook, C `dbAccess.c:504-515`:
-        //
-        //     if (lset_stack_count != 0) {
-        //         if (dbBkpt(precord)) goto all_done;
-        //     }
-        //
-        // guarding both the hook and its "skip record support" answer. Here
-        // the guard is the `ArcSwapOption` load: `None` for a database nobody
-        // is debugging, so this costs one relaxed atomic per processed record
-        // where C costs one comparison.
-        //
-        // Placed BEFORE the gate is taken, because a stop parks the calling
-        // thread: C likewise drops `dbScanLock` before `epicsThreadSuspendSelf`
-        // (`dbBkpt.c:794-796`) so `dbb`/`dbd`/`dbc`/`dbs` keep working while a
-        // record is stopped. The thread that parks here is never a runtime
-        // worker — the hook hands foreign processing to the lock set's own
-        // continuation thread and returns `Skip`, and only that thread reaches
-        // the parking arm.
-        let breakpoints = self.breakpoints_if_debugging();
-        if let Some(table) = breakpoints.as_ref() {
-            if table.before_process(self, &name)
-                == crate::server::database::breakpoint::Before::Skip
-            {
-                // C's `goto all_done`, which unwinds the same way the normal
-                // path does. `visited` was inserted by the prelude above and
-                // this frame owns it, so it comes out here as it would below.
-                visited.release(&rec);
-                return Ok(());
-            }
-        }
-
         // advisory write gate (`dbScanLock(precord)` analogue).
         // A foreign full-processing entry (scan loop, scan_event, FLNK
         // dispatch from another chain, CA put, PINI/startup) acquires
@@ -1485,6 +1968,40 @@ impl PvDatabase {
         } else {
             None
         };
+
+        // Breakpoint hook, C `dbAccess.c:504-515`:
+        //
+        //     if (lset_stack_count != 0) {
+        //         if (dbBkpt(precord)) goto all_done;
+        //     }
+        //
+        // guarding both the hook and its "skip record support" answer. Here
+        // the guard is the `ArcSwapOption` load: `None` for a database nobody
+        // is debugging, so this costs one relaxed atomic per processed record
+        // where C costs one comparison.
+        //
+        // Under the gate, as C's `dbProcess` runs under `dbScanLock`: the
+        // hook reads the record and orders the lock set before the
+        // breakpoint stack, the one order every debugger path uses. A stop
+        // parks the calling thread with the set given up — C drops
+        // `dbScanLock` before `epicsThreadSuspendSelf` (`dbBkpt.c:794-796`)
+        // — so `dbb`/`dbd`/`dbc`/`dbs` keep working and the set's other
+        // records keep processing while one is stopped. The thread that
+        // parks is never a runtime worker: the hook hands foreign processing
+        // to the lock set's own continuation thread and returns `Skip`, and
+        // only that thread reaches the parking arm.
+        let breakpoints = self.breakpoints_if_debugging();
+        if let Some(table) = breakpoints.as_ref() {
+            if table.before_process(self, &name)
+                == crate::server::database::breakpoint::Before::Skip
+            {
+                // C's `goto all_done`, which unwinds the same way the normal
+                // path does. `visited` was inserted by the prelude above and
+                // this frame owns it, so it comes out here as it would below.
+                visited.release(&rec);
+                return Ok(());
+            }
+        }
 
         // NO `.await` may appear below this line while `_record_gate` is
         // live — see the module note on `process_record_with_links_body`.
@@ -1946,7 +2463,11 @@ impl PvDatabase {
     /// `:728`, `:1185` — never inside `asyncFinish`), the second `aborting`
     /// post (`:1192`), and `scalerRecord.c:372` (`cnt`). So a member published
     /// in the same cycle as an alarm transition omits a `DBE_ALARM` C sets.
-    pub(crate) fn publish_post_write_fields(&self, name: &str, fields: Vec<(String, EpicsValue)>) {
+    pub(crate) fn publish_post_write_fields(
+        &self,
+        name: &str,
+        fields: crate::server::record::CycleList<(String, EpicsValue)>,
+    ) {
         if fields.is_empty() {
             return;
         }
@@ -2643,7 +3164,7 @@ impl PvDatabase {
     /// the two answers could disagree, since neither read holds the record
     /// across the cycle.
     fn read_input_link_texts(instance: &RecordInstance) -> InputLinkTexts {
-        InputLinkTexts::read_from(instance, instance.record.multi_input_links())
+        InputLinkTexts::read_own(instance)
     }
 
     /// The process cycle's input stage — C's `dbGetLink` calls before the
@@ -2663,12 +3184,12 @@ impl PvDatabase {
         &self,
         name: &str,
         guard: &mut DataGuard<'_>,
-        plan: crate::server::record::record_instance::ProcessPlan,
+        plan: &crate::server::record::record_instance::ProcessPlan,
         input_link_texts: &InputLinkTexts,
         visited: &mut ProcStack,
     ) -> InputStage {
         let rec = guard.rec;
-        let (inp_parsed, is_soft, wants_source_time, dol_info, pre_input_actions) = {
+        let shape = {
             let instance = guard.hold();
 
             let is_soft = instance.common.dtyp.is_soft();
@@ -2755,26 +3276,47 @@ impl PvDatabase {
             // fetch's to own once the guard is released. The type-static
             // halves come off the plan; the per-instance halves were read
             // under this guard.
-            if crate::server::recgbl::simm::is_constant(&instance.parsed_inp)
+            let only_own_inputs = crate::server::recgbl::simm::is_constant(&instance.parsed_inp)
                 && dol.is_none()
                 && pre_input_actions.is_empty()
-                && input_link_texts.none_set()
                 && !plan.string_input
                 && !plan.sel_nvl
-                && !plan.resolves_subroutine_from_link
-            {
-                return InputStage::none(is_soft);
+                && !plan.resolves_subroutine_from_link;
+            if only_own_inputs && input_link_texts.none_set() {
+                instance.record.set_fetch_gate_failed(false);
+                return InputStage::none(is_soft, 0);
             }
-
-            (
-                instance.parsed_inp.clone(),
-                is_soft,
-                wants_source_time,
-                dol,
-                pre_input_actions,
-            )
+            // The cycle whose only reads are the record's own input links,
+            // each at its own type — a wired `calc` — is the multi-input
+            // loop alone: no INP or DOL to clone out and read, no deferred
+            // delivery for the body's hold. It runs below in that shape,
+            // under the guard this block holds.
+            if only_own_inputs && plan.multi_inputs_read_native && !plan.narrows_input_links {
+                Err(is_soft)
+            } else {
+                // A constant (or unset) INP is no read — C `dbConstGetValue`
+                // returns 0 without touching the buffer — so nothing below
+                // asks it: not the soft read, not the source alarm, not a
+                // remote time. `None` says so once, instead of each reader
+                // finding out.
+                let inp = (!crate::server::recgbl::simm::is_constant(&instance.parsed_inp))
+                    .then(|| instance.parsed_inp.clone());
+                Ok((inp, is_soft, wants_source_time, dol, pre_input_actions))
+            }
         };
-        guard.release();
+        let (inp, is_soft, wants_source_time, dol_info, pre_input_actions) = match shape {
+            Ok(general) => general,
+            Err(is_soft) => {
+                let resolved = self.fetch_own_native_inputs(guard, plan, input_link_texts, visited);
+                return InputStage::none(is_soft, resolved);
+            }
+        };
+        // The reads between here and the multi-input loop — pre-input
+        // actions, INP, DOL, NVL — go through the by-name link readers, which
+        // take the record's lock themselves; the loop takes the guard back.
+        if inp.is_some() || dol_info.is_some() || plan.sel_nvl || !pre_input_actions.is_empty() {
+            guard.release();
+        }
 
         // 1.1. Pre-input-link actions: actions a record needs the
         // framework to execute BEFORE any input-link fetch this cycle.
@@ -2819,9 +3361,10 @@ impl PvDatabase {
         // request (stringin/lsi ask for `DBR_STRING`/`dbGetLinkLS` —
         // `devSiSoft.c:53`, `devLsiSoft.c:32` — so an ENUM/MENU source
         // delivers its state label, not the index).
-        let inp_value = self
-            .read_link_value_soft(&inp_parsed, is_soft, visited)
-            .and_then(|v| self.typed_input_value(rec, "INP", &inp_parsed, v));
+        let inp_value = inp.as_ref().and_then(|inp_parsed| {
+            self.read_link_value_soft(inp_parsed, is_soft, visited)
+                .and_then(|v| self.typed_input_value(rec, "INP", inp_parsed, v))
+        });
 
         // C `readLocked` (`devAiSoft.c:54-63`): the same `dbLinkDoLocked` that
         // read the value reads the source's timestamp, under the source's lock
@@ -2837,8 +3380,12 @@ impl PvDatabase {
         // `wants_source_time` already carries. So the pair the owner returns
         // is adopted whole for a calc link and time-only otherwise.
         let (inp_source_time, inp_source_utag): (Option<std::time::SystemTime>, Option<u64>) =
-            if is_soft && wants_source_time && inp_value.is_some() {
-                match self.db_get_time_stamp_tag(&inp_parsed) {
+            if let Some(inp_parsed) = inp.as_ref()
+                && is_soft
+                && wants_source_time
+                && inp_value.is_some()
+            {
+                match self.db_get_time_stamp_tag(inp_parsed) {
                     Some((t, tag))
                         if matches!(inp_parsed, crate::server::record::ParsedLink::Calc(_)) =>
                     {
@@ -2872,9 +3419,11 @@ impl PvDatabase {
         let inp_link_alarm: Option<(
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
-        )> = if is_soft {
-            let (_v, alarm) = self.read_link_with_alarm(&inp_parsed);
-            self.input_link_inheritance(rec, &inp_parsed, alarm)
+        )> = if let Some(inp_parsed) = inp.as_ref()
+            && is_soft
+        {
+            let (_v, alarm) = self.read_link_with_alarm(inp_parsed);
+            self.input_link_inheritance(rec, inp_parsed, alarm)
         } else {
             None
         };
@@ -2887,10 +3436,10 @@ impl PvDatabase {
         // `time=true`), so a bare connected link without the flag still
         // produces local processing time. Mirrors pvxs
         // `pvxs/ioc/pvalink_lset.cpp:577-593`.
-        let inp_link_remote_time: Option<(i64, i32, u64)> = match inp_parsed.external_pv_name() {
-            Some(name) => self.external_link_time(&name),
-            None => None,
-        };
+        let inp_link_remote_time: Option<(i64, i32, u64)> = inp
+            .as_ref()
+            .and_then(|inp_parsed| inp_parsed.external_pv_name())
+            .and_then(|name| self.external_link_time(&name));
 
         // Read DOL value. Through the input-fetch owner, so C's
         // `dbDbGetValue` inheritance tail runs on it like every other
@@ -2989,45 +3538,33 @@ impl PvDatabase {
             .map(|f| f as u16);
 
         // 1.5. Multi-input link fetch (calc/calcout/sel/sub)
-        // Also collect alarm info from source records for MS/NMS propagation.
-        // (value field, value, store-raw) — `store_raw` marks a value a
-        // string-class declared request produced, which must reach the field
-        // as-is instead of through the numeric store funnel below.
-        let multi_input_values: Vec<(&'static str, EpicsValue, bool)>;
-        let mut link_alarms: Vec<(
-            crate::server::record::MonitorSwitch,
-            super::links::LinkAlarm,
-        )> = Vec::new();
+        // C's `fetch_values` runs inside `process()`, under the record lock
+        // it entered with, and each `dbGetLink` writes its result straight
+        // into the record (`calcRecord.c:434`). The loop below does the
+        // same: it holds the guard across a read whose target is another
+        // record — the lock set is shared, so the target's lock is a
+        // re-entry — and gives it up only for a read that could reach this
+        // record's data again: a self-link, a `PP` source to process first,
+        // a link with no local target. Each result is delivered, and its
+        // alarm inherited, before the next link is read, as `dbGetLink` does.
+        //
         // Link fields whose fetch actually produced a value this cycle —
         // pushed to the record via `set_resolved_input_links` so its
         // `process()` can observe link-fetch success (C
         // `RTN_SUCCESS(dbGetLink(...))`). ONE list per cycle, covering every
         // framework-run input read: the pre-input stage (aao DOL, sseq SELL),
         // the `multi_input_links` fetch, and the pre-process ReadDbLink reads.
-        let mut resolved_link_fields: Vec<&'static str> = pre_input_resolved;
-        // This cycle's `fetch_values()` outcome — non-zero status in C, i.e.
-        // "the record body must not run". Derived from the record's declared
-        // `InputFetchPolicy` (see the loop below) and folded with the sel gate
-        // into ONE boolean, which is then delivered to its single consumer:
-        // `Record::set_fetch_gate_failed` for records that compute in their own
-        // `process()` (calc/calcout/scalcout/acalcout/swait/sel), and
-        // `RecordInstance::suppress_subroutine_run` for the two whose body is
-        // the framework-dispatched subroutine (sub/aSub).
-        let mut fetch_values_failed = false;
-        // C `fetch_values`' `status` local, for the record types that return
-        // it rather than an early/first-failure fold: it is assigned on EVERY
-        // pass of the loop, so at `return(status)` it holds the LAST link's
-        // status and an empty/constant link counts as a success.
-        let mut last_input_read_failed = false;
+        // Built only for a type that reads it.
+        let resolved_link_fields = pre_input_resolved;
+        let mut fold = FetchFold::default();
         {
-            // The three shape questions — what a failed read means
+            // The shape questions — what a failed read means
             // (`input_fetch_policy`), whether a constant delivers at process
-            // (`printf` alone), and whether the fetch is C's `dbGetLink` — are
-            // settled when the type is compiled, so the cycle carries them
-            // rather than taking the record lock to ask.
+            // (`printf` alone), and whether the fetch is C's `dbGetLink` —
+            // are settled when the type is compiled, so the cycle carries
+            // them rather than asking the record.
             let input_fetch_policy = plan.input_fetch_policy;
-            let constants_deliver_at_process = plan.constants_deliver_at_process;
-            let multi_input_is_db_get_link = plan.multi_input_is_db_get_link;
+            let instance = guard.hold();
             // Restrict to the record's active inputs this cycle (sel
             // `Specified` → only INP[SELN]); `None` = fetch every link, which
             // is every record type but `sel` / `swait` and every pass of them
@@ -3036,120 +3573,59 @@ impl PvDatabase {
             // taken here rather than read a second time. A restriction that
             // selects nothing is still a restriction: the `Option`, not the
             // emptiness, says whether the record narrowed its inputs this
-            // pass. Only a type that CAN narrow takes a lock to be asked.
-            let restricted: Option<InputLinkTexts> = plan
-                .narrows_input_links
-                .then(|| {
-                    let instance = rec.read();
-                    instance
-                        .record
-                        .select_input_links(sel_selector)
-                        .map(|subset| InputLinkTexts::read_from(&instance, subset))
-                })
-                .flatten();
+            // pass.
+            let restricted: Option<InputLinkTexts> = if plan.narrows_input_links {
+                instance
+                    .record
+                    .select_input_links(sel_selector)
+                    .map(|subset| input_link_texts.read_narrowed(instance, subset))
+            } else {
+                None
+            };
             let link_texts = restricted.as_ref().unwrap_or(input_link_texts);
-            let mut results = Vec::new();
-            for (slot, (link_field, val_field)) in link_texts.links().iter().enumerate() {
-                // C assigns `status` on every pass; an unset link is a
-                // `dbConstGetValue` success, so entering the pass clears it.
-                last_input_read_failed = false;
-                if let Some((link_str, failure_is_inert)) = link_texts.set_link_at(slot) {
-                    let parsed = crate::server::record::parse_link_v2(link_str);
-                    // C `dbGetLink`: a `ProcessPassive` DB input link
-                    // processes its passive source record before the
-                    // value is read. `read_link_with_alarm` does a bare
-                    // `get_pv`, so process the source here first —
-                    // matching the single-INP `read_link_value_soft`
-                    // path. Without this, calc/sel/sub/aSub INPA..INPL
-                    // PP links read a stale source value.
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.process_passive_db_source(db, visited);
-                    }
-                    // The record's declared per-link request (printf reads a
-                    // `%s` slot with `DBR_STRING`, `printfRecord.c:291`) is
-                    // applied inside the owner, and a conversion miss is a
-                    // failed read there.
-                    let (fetch, alarm, store_raw) =
-                        if multi_input_is_db_get_link && !failure_is_inert {
-                            self.db_get_link_deferred(rec, link_field, &parsed)
-                        } else {
-                            self.db_try_get_link_deferred(rec, link_field, &parsed)
-                        };
-                    let read_failed = !fetch.is_ok();
-                    // C never asked this link (`Record::input_link_failure_is_inert`),
-                    // so its failure is not a status: no alarm above, no gate
-                    // below, and it does not become the LAST status either.
-                    let skipped = read_failed && failure_is_inert;
-                    last_input_read_failed = read_failed && !skipped;
-                    // `NoData` (a CONSTANT link) delivers nothing — the value
-                    // field keeps what the init-seed owner
-                    // (`rec_gbl_init_constant_links`) loaded into it, so a
-                    // client's `caput REC.A 99` survives every later process.
-                    // printf is the declared exception (see above).
-                    let value = match fetch {
-                        crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
-                        crate::server::recgbl::simm::LinkFetch::NoData
-                            if constants_deliver_at_process =>
-                        {
-                            crate::server::recgbl::simm::constant_load_value(&parsed)
-                        }
-                        _ => None,
-                    };
-                    if let Some(value) = value {
-                        results.push((*val_field, value, store_raw));
-                    }
-                    // "Resolved" is C's `RTN_SUCCESS(dbGetLink(...))` — status
-                    // 0 — which a CONSTANT link satisfies (it delivers nothing
-                    // and returns success). So a constant input counts as
-                    // resolved even though it wrote no value: `epidRecord.c:191`
-                    // clears UDF on exactly that, and `motorRecord.cc:1994`
-                    // does not fail its DOL pass on it.
-                    if !read_failed {
-                        resolved_link_fields.push(link_field);
-                    }
-                    // Multi-input alarm propagation, through the inheritance
-                    // owner (which applies the MS class and C's self-link
-                    // exclusion).
-                    if let Some(pair) = self.input_link_inheritance(rec, &parsed, alarm) {
-                        link_alarms.push(pair);
-                    }
-                    // The record's declared fetch shape decides what a failed
-                    // read means. The failed link's own alarm is already folded
-                    // above in every shape: C's `dbGetLink` raises the MS
-                    // severity for the link it failed on before returning.
-                    if read_failed && !skipped {
-                        match input_fetch_policy {
-                            // C `transformRecord.c::process` (534-547): read on,
-                            // and compute anyway.
-                            InputFetchPolicy::ReadAll => {}
-                            // C `calcRecord.c::fetch_values` (427-443):
-                            // `if (status == 0) status = newStatus;` — the loop
-                            // runs to the end, so the inputs behind the failure
-                            // still refresh (and post), but the first failing
-                            // status is what `process` (:120) gates the calc on.
-                            InputFetchPolicy::ReadAllGateOnFailure => {
-                                fetch_values_failed = true;
-                            }
-                            // C `subRecord.c::fetch_values` (407-418):
-                            // `if (dbGetLink(plink, ...)) return -1;` — the loop
-                            // stops dead at the first failing link. Every input
-                            // behind it is never read, so its value field keeps
-                            // the previous cycle's value (no monitor, no PP of
-                            // that source, no link-alarm inheritance), and the
-                            // record body is skipped below.
-                            InputFetchPolicy::AbortOnFirstFailure => {
-                                fetch_values_failed = true;
-                                break;
-                            }
-                            // C `selRecord.c:434-436` keeps reading and lets
-                            // the LAST link decide; `last_input_read_failed`
-                            // carries that decision to the gate after the loop.
-                            InputFetchPolicy::ReadAllGateOnLastFailure => {}
-                        }
-                    }
+            let declared = link_texts.links();
+            // The record's cache is indexed by its OWN list; a narrowed list
+            // maps each of its slots back by name.
+            let own = link_texts.own();
+            let own_list = std::ptr::eq(declared, own);
+            // Over the set links only: C's loop visits every declared link,
+            // but an unset one is a `dbConstGetValue` success with nothing to
+            // deliver, so the passes it would make here are no-ops.
+            let mut wired = link_texts.wired();
+            while wired != 0 {
+                let slot = wired.trailing_zeros() as usize;
+                wired &= wired - 1;
+                let (link_field, val_field) = declared[slot];
+                let cache_slot = if own_list {
+                    Some(slot)
+                } else {
+                    own.iter().position(|(lf, _)| *lf == link_field)
+                };
+                debug_assert!(
+                    cache_slot.is_some(),
+                    "select_input_links must narrow to a subset of multi_input_links"
+                );
+                let Some(cache_slot) = cache_slot else {
+                    continue;
+                };
+                debug_assert_eq!(
+                    own[cache_slot],
+                    (link_field, val_field),
+                    "a narrowed link is the same pair as its multi_input_links entry"
+                );
+                let Some(outcome) = self.fetch_multi_input(guard, plan, own, cache_slot, visited)
+                else {
+                    continue;
+                };
+                if fold.note(
+                    input_fetch_policy,
+                    cache_slot,
+                    slot + 1 == declared.len(),
+                    outcome,
+                ) {
+                    break;
                 }
             }
-            multi_input_values = results;
 
             // C `selRecord.c::fetch_values` returns the status of its LAST
             // `dbGetLink` (`:434-437` assigns `status` unguarded every pass),
@@ -3158,17 +3634,60 @@ impl PvDatabase {
             // delivered no value": `dbGetLink` on an unset OR constant link
             // returns success (`dbConstGetValue`), and the field it would have
             // written keeps its init-seeded value, which flows into `do_sel`.
-            if matches!(
-                input_fetch_policy,
-                InputFetchPolicy::ReadAllGateOnLastFailure
-            ) {
-                fetch_values_failed = last_input_read_failed;
-            }
             // `Specified` mode returns early on a failed NVL read
             // (`selRecord.c:423-425`), before any INP is touched. Only `sel`
             // reads NVL, so this needs no record-type test.
-            fetch_values_failed |= sel_nvl_read_failed;
+            let fetch_values_failed = fold.failed(input_fetch_policy, sel_nvl_read_failed);
+
+            // The outcome, delivered here under the guard the loop holds: to
+            // `Record::set_fetch_gate_failed` for the records that compute in
+            // their own `process()` (calc/calcout/scalcout/acalcout/swait/sel)
+            // — written on EVERY cycle, `false` included, so the flag cannot
+            // outlive the cycle it belongs to — and, for sub/aSub, whose body
+            // is the framework-dispatched subroutine, to the same one-shot
+            // skip the bad-SNAM path arms (C `subRecord.c:144-147`,
+            // `aSubRecord.c:216-218`: `status = fetch_values(prec); if
+            // (status == 0) status = do_sub(prec);`), consumed by the single
+            // owner `run_registered_subroutine`.
+            let inst = guard.hold();
+            inst.record.set_fetch_gate_failed(fetch_values_failed);
+            if fetch_values_failed {
+                inst.suppress_subroutine_run = true;
+            }
         }
+        let resolved = fold.resolved;
+        // The two stages below read this record by name through the shared
+        // lock, so they run with the guard released.
+        if plan.string_input || plan.resolves_subroutine_from_link {
+            guard.release();
+        }
+
+        // The multi-input fetch delivered everything it read; what is left
+        // is the reads whose delivery waits for the body's own hold. A cycle
+        // that made none of them — a `calc` with only its inputs wired —
+        // hands the body the same nothing a cycle with no links does.
+        let deferred = inp.is_some()
+            || dol_info.is_some()
+            || plan.sel_nvl
+            || plan.string_input
+            || plan.resolves_subroutine_from_link
+            || !resolved_link_fields.is_empty()
+            || inp_link_alarm.is_some();
+        if !deferred {
+            return InputStage::none(is_soft, resolved);
+        }
+        // PR #d0cf47c continued: the INP alarm (if any) goes into the same
+        // `link_alarms` list the lock-section iterates over. Order doesn't
+        // matter — `rec_gbl_set_sevr_msg` takes the maximum severity across
+        // all sources.
+        let mut link_alarms: Vec<(
+            crate::server::record::MonitorSwitch,
+            super::links::LinkAlarm,
+        )> = Vec::new();
+        link_alarms.extend(inp_link_alarm);
+        // The two fetches only a deferring cycle has, made once the early
+        // return is behind them: built before it, their empty results were
+        // dropped on the path that never has them.
         // 1.6. String-input link fetch — C `sCalcoutRecord.c::fetch_values`'s
         // SECOND loop (890-942), over INAA..INLL → AA..LL. It is a separate
         // loop here for the same reason it is one in C: it does not feed the
@@ -3204,7 +3723,9 @@ impl PvDatabase {
                 // like every other input, so a failed one raises `setLinkAlarm`
                 // (LINK/INVALID, AMSG `field INAA`) even though `fetch_values`
                 // itself returns 0 (`:941`) and never gates `sCalcPerform`.
-                let (fetch, alarm, _raw) = self.db_get_link_deferred(rec, link_field, &parsed);
+                let request = rec.read().record.input_link_request(link_field);
+                let (fetch, alarm, _raw) =
+                    self.db_get_link_deferred(rec, link_field, &parsed, None, request);
                 if let Some(pair) = self.input_link_inheritance(rec, &parsed, alarm) {
                     link_alarms.push(pair);
                 }
@@ -3233,14 +3754,6 @@ impl PvDatabase {
             results
         };
 
-        // PR #d0cf47c continued: feed the INP alarm (if any) into the
-        // same `link_alarms` list the lock-section iterates over. Order
-        // doesn't matter — `rec_gbl_set_sevr_msg` takes the maximum
-        // severity across all sources.
-        if let Some(pair) = inp_link_alarm {
-            link_alarms.push(pair);
-        }
-
         // aSub LFLG=READ: re-read the subroutine name from the SUBL link and,
         // if it changed, re-resolve the function — computed here, before the
         // process write lock, so the SUBL link read cannot deadlock against
@@ -3254,6 +3767,7 @@ impl PvDatabase {
 
         InputStage {
             is_soft,
+            resolved,
             links: Some(LinkInputs {
                 inp_value,
                 inp_source_time,
@@ -3263,11 +3777,9 @@ impl PvDatabase {
                 dol_fetch,
                 dol_read_failed,
                 sel_nvl_value,
-                multi_input_values,
                 string_input_values,
                 asub_dynamic,
                 resolved_link_fields,
-                fetch_values_failed,
                 link_alarms,
             }),
         }
@@ -3321,12 +3833,12 @@ impl PvDatabase {
         // at construction and the PACT test is two field reads, so splitting
         // them across two acquisitions cost the record lock twice at the top
         // of every cycle and bought nothing.
-        let (plan, active, input_link_texts) = {
+        let (plan, active, input_link_texts, metadata) = {
+            let plan = guard.rec.process_plan();
             let instance = guard.hold();
             if instance.is_destroyed() {
                 return Err(CaError::ChannelNotFound(name.to_string()));
             }
-            let plan = instance.process_plan();
             let active = !is_continuation
                 && if instance.is_processing() {
                     true
@@ -3336,7 +3848,28 @@ impl PvDatabase {
                     instance.common.lcnt = 0;
                     false
                 };
-            (plan, active, Self::read_input_link_texts(instance))
+            let input_link_texts = Self::read_input_link_texts(instance);
+            // C reads a link-backed field's metadata live inside the rset,
+            // under the TARGET record's lock (`dbDbLink.c:240-261`). A poster
+            // here holds THIS record's lock and cannot reach for a second one,
+            // so the cycle resolves once, below, and hands every poster the
+            // borrowed result. The borrow is what makes "the metadata a
+            // monitor carries was resolved during this cycle" true by
+            // construction: there is nowhere to keep it.
+            //
+            // What the resolve asks of this record — which links, and whether
+            // anyone is subscribed to read the answer — it asks here, under
+            // the guard the cycle already holds. The lock set is held for the
+            // whole cycle, so the subscriber list it reads is the one every
+            // poster below will see. Empty for every record type that backs
+            // no field's metadata with a link — all but calc, calcout, sub,
+            // aSub and seq.
+            let metadata = if active {
+                MetadataPlan::Empty
+            } else {
+                PvDatabase::plan_link_backed_metadata_for_posts(instance, &input_link_texts)
+            };
+            (plan, active, input_link_texts, metadata)
         };
         if active {
             guard.release();
@@ -3344,22 +3877,12 @@ impl PvDatabase {
             return Ok(());
         }
 
-        // C reads a link-backed field's metadata live inside the rset, under
-        // the TARGET record's lock (`dbDbLink.c:240-261`). A poster here holds
-        // THIS record's lock and cannot reach for a second one, so the cycle
-        // resolves once at this point — where it holds no record lock — and
-        // hands every poster below the borrowed result. The borrow is what
-        // makes "the metadata a monitor carries was resolved during this
-        // cycle" true by construction: there is nowhere to keep it.
-        //
-        // Empty for every record type that backs no field's metadata with a
-        // link — all but calc, calcout, sub, aSub and seq. The link texts it
-        // reads came out of the entry guard above, so this costs no
-        // acquisition of THIS record's lock at all.
-        if !input_link_texts.none_set() {
+        // The walk locks each link's target, which for a self-link is this
+        // record; a plan with nothing to walk keeps the guard.
+        if matches!(metadata, MetadataPlan::Links(_)) {
             guard.release();
         }
-        let link_backing = self.resolve_link_backed_metadata_for_posts_with(rec, &input_link_texts);
+        let link_backing = self.resolve_link_backed_metadata_plan(metadata);
         let link_backing = link_backing.as_link_backing();
 
         // 0. SDIS disable check — C parity dbAccess.c:562-592.
@@ -3884,42 +4407,13 @@ impl PvDatabase {
                 // AA..LL never populated and the record calculated on an empty
                 // array. The view is `get_convert_f64`, C's DBR_DOUBLE get row,
                 // not `to_f64`: the two disagree on an empty DBF_STRING source.
-                let (multi_input_values, sel_nvl_value, string_input_values) = match links {
+                let (sel_nvl_value, string_input_values) = match links {
                     Some(l) => (
-                        l.multi_input_values.as_slice(),
                         l.sel_nvl_value.take(),
                         Some(std::mem::take(&mut l.string_input_values)),
                     ),
-                    None => (&[][..], None, None),
+                    None => (None, None),
                 };
-                for (val_field, value, store_raw) in multi_input_values {
-                    if *store_raw {
-                        // A string-class declared request (printf `%s`)
-                        // already produced the value the record asked for —
-                        // the numeric funnel below is the OTHER records'
-                        // `DBR_DOUBLE` request, not a store rule.
-                        let _ = instance.record.put_field_internal(val_field, value.clone());
-                    } else if value.is_array() {
-                        if instance
-                            .record
-                            .put_field_internal(val_field, value.clone())
-                            .is_ok()
-                        {
-                            continue;
-                        }
-                        // The target is a scalar field: element 0, as C's
-                        // one-element destination takes.
-                        if let Some(f) = value.first_element().and_then(|v| v.get_convert_f64()) {
-                            let _ = instance
-                                .record
-                                .put_field_internal(val_field, EpicsValue::Double(f));
-                        }
-                    } else if let Some(f) = value.get_convert_f64() {
-                        let _ = instance
-                            .record
-                            .put_field_internal(val_field, EpicsValue::Double(f));
-                    }
-                }
 
                 // The set_resolved_input_links report is deferred until after
                 // the pre-process ReadDbLink reads below, so the record sees
@@ -4124,17 +4618,17 @@ impl PvDatabase {
                 // (`epidRecord.c:191-193`, `motorRecord.cc:3687-3698`).
                 let links = stage.links.as_ref();
                 instance.record.set_resolved_input_links(
-                    links.map_or(&[][..], |l| l.resolved_link_fields.as_slice()),
+                    crate::server::record::ResolvedInputLinks::new(
+                        input_link_texts.own(),
+                        stage.resolved,
+                        links.map_or(&[][..], |l| l.resolved_link_fields.as_slice()),
+                    ),
                 );
 
-                // The cycle's single `fetch_values()` outcome: a link read that
-                // failed under a gating `InputFetchPolicy`, or sel's Specified-mode
-                // selected-input read that did not resolve (C `selRecord.c::process`
-                // (114) skips `do_sel` on it). Every C record that gates its body on
-                // `if (fetch_values(prec) == 0)` reads it from here — one boolean,
-                // one hook — and a record with no gate ignores it (default no-op).
-                let fetch_gate_failed = links.is_some_and(|l| l.fetch_values_failed);
-                instance.record.set_fetch_gate_failed(fetch_gate_failed);
+                // The cycle's single `fetch_values()` outcome reached
+                // `set_fetch_gate_failed` (and sub/aSub's
+                // `suppress_subroutine_run`) inside the input stage, under the
+                // guard its loop held.
 
                 // Note: C EPICS LCNT prevents reentrant processing of the same
                 // record within a single processing chain. In Rust, this is handled
@@ -4236,14 +4730,6 @@ impl PvDatabase {
                 // — VAL (and aSub's VALA..VALU) freeze, and none of `do_sub`'s
                 // alarms (BAD_SUB / SOFT at BRSV) or its `udf = isnan(val)` update
                 // happen. Same one-shot flag the aSub bad-SNAM skip arms, consumed
-                // by the single owner `run_registered_subroutine`; OR-ed in so
-                // whichever reason fired first still suppresses the run. Same
-                // `fetch_values()` outcome the `set_fetch_gate_failed` hook above
-                // carries — sub/aSub differ only in WHERE their body runs.
-                if fetch_gate_failed {
-                    instance.suppress_subroutine_run = true;
-                }
-
                 // Invoke the registered subroutine (sub/aSub SNAM) before the
                 // record body, on the same dispatch path as process_local. The
                 // framework owns the SubroutineFn registry (the record's own
@@ -4259,8 +4745,9 @@ impl PvDatabase {
                     outcome.actions.extend(deferred);
                 }
                 let process_result = outcome.result;
-                let process_actions = outcome.actions;
-                let post_write_fields = outcome.post_write_fields;
+                let process_actions = crate::server::record::ProcessActions::from(outcome.actions);
+                let post_write_fields =
+                    crate::server::record::CycleList::from(outcome.post_write_fields);
                 // Captured before the `AsyncPendingNotify` `if let` below moves
                 // `process_result`; consulted after the monitor epilogue to defer
                 // the OUT/OEVT/FLNK tail (swait ODLY — see `CompleteDeferOutput`).
@@ -4804,7 +5291,7 @@ impl PvDatabase {
                         // that half for itself out of the record instead of
                         // taking the answer this arm hands it.
                         crate::server::record::record_instance::ForwardTarget::None,
-                        Vec::new(),
+                        crate::server::record::ProcessActions::new(),
                         false,
                         restamps_after,
                         posts,
@@ -4958,9 +5445,10 @@ impl PvDatabase {
             // `out_info` match returns straight from the function.
             // The cycle's link-carried writes, split off the record's other
             // actions; `None` when it has none, which is the usual cycle.
-            let (link_writes, process_actions): (Option<Vec<_>>, Vec<_>) = if process_actions
-                .is_empty()
-            {
+            let (link_writes, process_actions): (
+                Option<Vec<_>>,
+                crate::server::record::ProcessActions,
+            ) = if process_actions.is_empty() {
                 (None, process_actions)
             } else {
                 let (writes, rest): (Vec<_>, Vec<_>) = process_actions.into_iter().partition(|a| {
@@ -4970,7 +5458,7 @@ impl PvDatabase {
                             | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
                     )
                 });
-                ((!writes.is_empty()).then_some(writes), rest)
+                ((!writes.is_empty()).then_some(writes), rest.into())
             };
             // Whether this cycle has an output stage at all — the one rule that
             // decides both the output segment and the guard release it needs.
@@ -5421,6 +5909,10 @@ impl PvDatabase {
         // them can carry the parked put. Taking it here disarms the guard, so
         // the release happens once whether the cycle reaches this line or leaves
         // by one of the exits above.
+        // The fetch buffers back to the chain, from exactly the cycle that
+        // took them — the gates are the same facts the takes were: an input
+        // stage exists only past `fetch_input_stage`'s take, and a set-link
+        // list has capacity only if `read_into` took the buffer.
         finish_cycle(guard.hold());
         guard.release();
         self.apply_pact_exit(name, rec, cycle_end.take());
@@ -5508,10 +6000,8 @@ impl PvDatabase {
         posts: CyclePosts,
         visited: &mut ProcStack,
     ) {
-        let (flnk_name, plan) = {
-            let instance = rec.read();
-            (instance.forward_target(), instance.process_plan())
-        };
+        let flnk_name = rec.read().forward_target();
+        let plan = rec.process_plan();
         let mut guard = DataGuard::new(rec);
         self.run_forward_link_tail_with_putf(
             name,
@@ -5532,7 +6022,7 @@ impl PvDatabase {
         name: &str,
         guard: &mut DataGuard<'_>,
         flnk: &crate::server::record::record_instance::ForwardTarget,
-        src: TailCtx,
+        src: TailCtx<'_>,
         visited: &mut ProcStack,
     ) {
         let rec = guard.rec;
@@ -5870,7 +6360,7 @@ impl PvDatabase {
         &self,
         record_name: &str,
         rec: &Arc<RecordCell>,
-        actions: Vec<crate::server::record::ProcessAction>,
+        actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
     ) {
         use crate::server::record::ProcessAction;
@@ -6370,7 +6860,7 @@ impl PvDatabase {
                     src_putf,
                     src_notify,
                     src_alarm,
-                    instance.process_plan(),
+                    rec.process_plan(),
                 )
             };
 
@@ -6448,7 +6938,7 @@ impl PvDatabase {
         // completion — it is C's `asyncFinish` for the DLYn group chain
         // (`seqRecord.c:219-241`) — and its groups have already run, so
         // re-dispatching them here would drive every LNKn twice.
-        let plan = rec.read().process_plan();
+        let plan = rec.process_plan();
         if plan.multi_output_dispatch {
             let _ =
                 self.dispatch_multi_output(&rec, super::links::MultiOutPhase::ForwardLink, visited);
@@ -6890,21 +7380,74 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         fetch: crate::server::recgbl::simm::LinkFetch,
     ) -> (crate::server::recgbl::simm::LinkFetch, bool) {
+        let instance = rec.read();
+        let request = instance.record.input_link_request(link_field);
+        let mut fetch = fetch;
+        let store_raw =
+            self.convert_link_fetch_as(&*instance.record, link_field, link, request, &mut fetch);
+        (fetch, store_raw)
+    }
+
+    /// [`Self::convert_link_fetch`] for a caller that already holds the
+    /// record's request for the link — the multi-input fetch reads it for
+    /// every set link under the cycle's entry guard, where C's
+    /// `fetch_values` has it for free, instead of taking the record's lock
+    /// once per link to ask.
+    #[inline]
+    fn convert_link_fetch_as(
+        &self,
+        record: &dyn crate::server::record::Record,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        request: crate::server::record::InputLinkRequest,
+        fetch: &mut crate::server::recgbl::simm::LinkFetch,
+    ) -> bool {
+        use crate::server::recgbl::simm::LinkFetch;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        // A native request converts nothing — C's `dbGet` with the field's
+        // own `dbrType` is a copy — so the fetch is left where it is, and
+        // the two tests that settle that are the whole of what the common
+        // path pays: the conversion itself is a frame of its own.
+        if let InputLinkRequest::As(LinkReadAs::Native) = request {
+            return false;
+        }
+        if !matches!(fetch, LinkFetch::Value(_)) {
+            return false;
+        }
+        self.convert_link_value(record, link_field, link, request, fetch)
+    }
+
+    /// [`Self::convert_link_fetch_as`] past its gates: `fetch` holds a value
+    /// and the request is not native.
+    fn convert_link_value(
+        &self,
+        record: &dyn crate::server::record::Record,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        request: crate::server::record::InputLinkRequest,
+        fetch: &mut crate::server::recgbl::simm::LinkFetch,
+    ) -> bool {
         use crate::server::recgbl::simm::LinkFetch;
         use crate::server::record::LinkReadAs;
-        let LinkFetch::Value(value) = fetch else {
-            return (fetch, false);
+        let LinkFetch::Value(value) = std::mem::replace(fetch, LinkFetch::NoData) else {
+            unreachable!("gated by convert_link_fetch_as");
         };
-        match self.input_link_read_as(rec, link_field, link) {
-            None => (LinkFetch::NoData, false),
+        match self.link_read_as(record, link_field, link, request) {
+            None => false,
             Some(read_as) => {
                 let raw = matches!(
                     read_as,
                     LinkReadAs::String | LinkReadAs::CharArrayAsString { .. }
                 );
                 match self.apply_link_read_as(link, read_as, value) {
-                    Some(v) => (LinkFetch::Value(v), raw),
-                    None => (LinkFetch::Failed, false),
+                    Some(v) => {
+                        *fetch = LinkFetch::Value(v);
+                        raw
+                    }
+                    None => {
+                        *fetch = LinkFetch::Failed;
+                        false
+                    }
                 }
             }
         }
@@ -6927,12 +7470,15 @@ impl PvDatabase {
         rec: &Arc<RecordCell>,
         link_field: &str,
         link: &crate::server::record::ParsedLink,
+        target: Option<&crate::server::record::record_instance::ResolvedTarget>,
+        request: crate::server::record::InputLinkRequest,
     ) -> (
         crate::server::recgbl::simm::LinkFetch,
         Option<super::links::SourceAlarm>,
         bool,
     ) {
-        let (fetch, alarm, store_raw) = self.db_try_get_link_deferred(rec, link_field, link);
+        let (fetch, alarm, store_raw) =
+            self.db_try_get_link_deferred(rec, link_field, link, target, request);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
             let mut instance = rec.write();
             crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
@@ -6950,13 +7496,18 @@ impl PvDatabase {
         rec: &Arc<RecordCell>,
         link_field: &str,
         link: &crate::server::record::ParsedLink,
+        target: Option<&crate::server::record::record_instance::ResolvedTarget>,
+        request: crate::server::record::InputLinkRequest,
     ) -> (
         crate::server::recgbl::simm::LinkFetch,
         Option<super::links::SourceAlarm>,
         bool,
     ) {
-        let (fetch, alarm) = self.read_link_with_alarm(link);
-        let (fetch, store_raw) = self.convert_link_fetch(rec, link_field, link, fetch);
+        let (mut fetch, alarm) = self.read_link_with_alarm_at(link, target);
+        let store_raw = {
+            let instance = rec.read();
+            self.convert_link_fetch_as(&*instance.record, link_field, link, request, &mut fetch)
+        };
         (fetch, alarm, store_raw)
     }
 
@@ -6982,8 +7533,22 @@ impl PvDatabase {
         link_field: &str,
         link: &crate::server::record::ParsedLink,
     ) -> Option<crate::server::record::LinkReadAs> {
+        let instance = rec.read();
+        let request = instance.record.input_link_request(link_field);
+        self.link_read_as(&*instance.record, link_field, link, request)
+    }
+
+    /// [`Self::input_link_read_as`] with the record's request already in
+    /// hand. The `FromSource` arm still resolves the source and asks the
+    /// record for its answer, as before.
+    fn link_read_as(
+        &self,
+        record: &dyn crate::server::record::Record,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        request: crate::server::record::InputLinkRequest,
+    ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::InputLinkRequest;
-        let request = rec.read().record.input_link_request(link_field);
         match request {
             InputLinkRequest::As(read_as) => Some(read_as),
             // C's `default:` arm — the record's switch has no case for this
@@ -6991,10 +7556,7 @@ impl PvDatabase {
             InputLinkRequest::NotRead => None,
             InputLinkRequest::FromSource => {
                 let source = self.resolve_out_target(link);
-                let instance = rec.read();
-                instance
-                    .record
-                    .input_link_read_as_from_source(link_field, &source)
+                record.input_link_read_as_from_source(link_field, &source)
             }
         }
     }
@@ -7020,9 +7582,9 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         alarm: Option<super::links::SourceAlarm>,
     ) {
-        if let Some((ms, src)) = self.input_link_inheritance(reader, link, alarm) {
+        if let Some(alarm) = alarm {
             let mut instance = reader.write();
-            super::links::inherit_sevr_msg(&mut instance.common, ms, &src);
+            self.fold_input_link_alarm(&mut instance.common, reader, link, alarm);
         }
     }
 
@@ -8172,6 +8734,7 @@ impl Drop for CycleEndGuard<'_> {
 mod input_link_texts_tests {
     use super::InputLinkTexts;
     use crate::server::record::RecordInstance;
+    use crate::server::record::record_instance::ParsedInputLink;
     use crate::server::records::calc::CalcRecord;
     use crate::types::EpicsValue;
 
@@ -8192,11 +8755,13 @@ mod input_link_texts_tests {
             .expect("INPB takes a link string");
         let texts = InputLinkTexts::none();
         assert_eq!(
-            texts.text_at(Some(1), &instance, "INPB").as_deref(),
-            Some("SRC:ONE.VAL"),
+            texts
+                .link_at(Some(1), &instance, "INPB")
+                .map(|l| pvname(&l)),
+            Some("SRC:ONE".to_string()),
             "slot 1 is INPB, and an unread list must not answer it itself"
         );
-        assert_eq!(texts.text_at(Some(0), &instance, "INPA"), None);
+        assert!(texts.link_at(Some(0), &instance, "INPA").is_none());
     }
 
     #[test]
@@ -8208,17 +8773,84 @@ mod input_link_texts_tests {
             .expect("INPB takes a link string");
         let links = instance.record.multi_input_links();
         assert_eq!(links[1].0, "INPB", "slot 1 is INPB");
-        let texts = InputLinkTexts::read_from(&instance, links);
+        let texts = InputLinkTexts::read_own(&instance);
 
-        assert_eq!(texts.set_link_at(1).map(|(t, _)| t), Some("SRC:ONE.VAL"));
-        assert_eq!(texts.set_link_at(0), None, "INPA is unwired");
-        assert_eq!(texts.set_link_at(links.len() - 1), None, "the last is too");
-        // The unwired record is the case the sparse form exists for: a calc
-        // declares twenty-one inputs and a stock database wires none.
+        assert!(texts.is_set(1));
+        assert_eq!(
+            texts
+                .link_at(Some(1), &instance, "INPB")
+                .map(|l| pvname(&l)),
+            Some("SRC:ONE".to_string())
+        );
+        assert!(!texts.is_set(0), "INPA is unwired");
+        assert!(!texts.is_set(links.len() - 1), "the last is too");
+        assert!(!texts.none_set());
+        assert!(InputLinkTexts::read_own(&calc()).none_set());
+    }
+
+    #[test]
+    fn the_parse_follows_the_text_the_record_holds() {
+        let mut instance = calc();
+        let put = |instance: &mut RecordInstance, text: &str| {
+            instance
+                .record
+                .put_field("INPB", EpicsValue::String(text.into()))
+                .expect("INPB takes a link string");
+        };
+        let parse = |instance: &mut RecordInstance| {
+            let generation = instance.record.input_links_generation();
+            ParsedInputLink::validated(
+                &mut instance.parsed_inputs,
+                &*instance.record,
+                1,
+                instance.record.multi_input_links(),
+                generation,
+            )
+            .map(|entry| entry.parsed().clone())
+        };
+        put(&mut instance, "SRC:ONE.VAL");
+        let first = parse(&mut instance).expect("INPB is set");
+        let again = parse(&mut instance).expect("INPB is set");
         assert!(
-            InputLinkTexts::read_from(&calc(), links)
-                .set_link_at(1)
+            std::sync::Arc::ptr_eq(&again, &first),
+            "the same text reuses the same parse"
+        );
+        let texts = InputLinkTexts::read_own(&instance);
+        let shared = texts
+            .link_at(Some(1), &instance, "INPB")
+            .expect("INPB is set");
+        assert!(
+            std::sync::Arc::ptr_eq(&shared, &first),
+            "a shared reader hands out the cached parse"
+        );
+        put(&mut instance, "SRC:TWO.VAL");
+        assert_eq!(
+            texts
+                .link_at(Some(1), &instance, "INPB")
+                .map(|l| pvname(&l)),
+            Some("SRC:TWO".to_string()),
+            "a stale cache entry is not handed out"
+        );
+        assert_eq!(
+            parse(&mut instance).map(|l| pvname(&l)),
+            Some("SRC:TWO".to_string())
+        );
+        put(&mut instance, "");
+        assert!(
+            parse(&mut instance).is_none(),
+            "an emptied link is unset again"
+        );
+        assert!(
+            InputLinkTexts::read_own(&instance)
+                .link_at(Some(1), &instance, "INPB")
                 .is_none()
         );
+    }
+
+    fn pvname(link: &crate::server::record::ParsedLink) -> String {
+        match link {
+            crate::server::record::ParsedLink::Db(db) => db.pvname(),
+            other => panic!("expected a DB link, got {other:?}"),
+        }
     }
 }

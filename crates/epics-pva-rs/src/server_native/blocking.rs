@@ -2293,9 +2293,18 @@ pub(super) mod tests {
     }
 
     /// §4.2b without a seventh `select!` arm: a writer that ends wakes the
-    /// connection through the socket, so the reader's parked `read` returns 0
-    /// and the loop unwinds down its existing EOF path. This is what lets
-    /// `tcp.rs` stay untouched and the hosted `select!` stay byte-identical.
+    /// connection through the socket, so the reader pump's parked `read`
+    /// returns and its adapter reports end-of-stream, down which the loop
+    /// unwinds on its existing EOF path. This is what lets `tcp.rs` stay
+    /// untouched and the hosted `select!` stay byte-identical.
+    ///
+    /// Through the real reader pump, not a bare `read` on the descriptor: the
+    /// wake is the pump's contract, not the socket's. On Windows the parked
+    /// `recv` is never returned by the shutdown at all; it is the pump's wait
+    /// cap that sees it (`runtime::blocking_io`), and a bare read asserted the
+    /// one thing that target does not do. The reader guard is held until the
+    /// assertion has been made, because its drop shuts the same socket and
+    /// would otherwise answer the question this test is asking.
     ///
     /// Mutation-checked: delete the socket shutdown at the end of
     /// `runtime::blocking_io`'s writer pump and the parked reader here is never
@@ -2305,26 +2314,28 @@ pub(super) mod tests {
         // The client stays connected and silent, so the only thing that can
         // return the reader's `read` is a shutdown from this side.
         let (_client, server, peer) = socket_pair();
-
         let server = Arc::new(server);
-
-        // A bare `read` on the shared descriptor stands in for the reader pump:
-        // using the pump here would bring its own guard, whose drop shuts the
-        // same socket and would answer the question this test is asking.
-        let read_sock = server.clone();
-        let (read_done, read_result) = std::sync::mpsc::channel();
-        let reader = thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = [0u8; 64];
-            let _ = read_done.send((&*read_sock).read(&mut buf));
-        });
-        thread::sleep(Duration::from_millis(200));
+        // An effectively-infinite receive bound: only the shutdown can end the
+        // pump.
+        server
+            .set_read_timeout(Some(Duration::from_secs(64_000)))
+            .expect("SO_RCVTIMEO");
 
         let label = format!("PVA connection {peer}");
-        // Held past `drop(guard)` below, so the set returns only after the pump
-        // job is joined.
-        let (_lease, _reader_worker, writer_worker) = lease_pumps();
-        let (adapter, guard) = spawn_writer_pump(
+        // Held past both guards below, so the set returns only after the pump
+        // jobs are joined.
+        let (_lease, reader_worker, writer_worker) = lease_pumps();
+        let (mut reader_adapter, reader_guard) = spawn_reader_pump(
+            reader_worker,
+            server.clone(),
+            &label,
+            DEFAULT_READ_CHUNK,
+            CHUNK_QUEUE_DEPTH,
+        );
+        // The peer sends nothing, so the pump is parked in its read.
+        thread::sleep(Duration::from_millis(200));
+
+        let (writer_adapter, writer_guard) = spawn_writer_pump(
             writer_worker,
             server.clone(),
             &label,
@@ -2334,15 +2345,32 @@ pub(super) mod tests {
 
         // The pump's last strong sender goes with the guard: it ends, and on the
         // way out it shuts the socket, waking the reader.
-        drop(adapter);
-        drop(guard);
-        let n = read_result
-            .recv_timeout(RETIRE_BOUND)
-            .expect("a parked reader must be released when the writer ends")
-            .expect("the shutdown surfaces as a clean end-of-stream, not an error");
+        drop(writer_adapter);
+        drop(writer_guard);
+        let started = Instant::now();
+        let mut buf = [0u8; 64];
+        let n = loop {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+            let mut cx = Context::from_waker(Waker::noop());
+            match tokio::io::AsyncRead::poll_read(
+                std::pin::Pin::new(&mut reader_adapter),
+                &mut cx,
+                &mut read_buf,
+            ) {
+                Poll::Ready(Ok(())) => break read_buf.filled().len(),
+                Poll::Ready(Err(e)) => panic!("the woken read surfaces as end-of-stream, not {e}"),
+                Poll::Pending => {
+                    assert!(
+                        started.elapsed() < RETIRE_BOUND,
+                        "a parked reader must be released when the writer ends"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         assert_eq!(n, 0, "the woken read must report end-of-stream");
 
-        reader.join().expect("reader thread");
+        drop(reader_guard);
     }
 
     /// F6: a connection that panics while holding the registry lock must not

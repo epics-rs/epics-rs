@@ -13,7 +13,6 @@
 //! do. `busy` carries every one of them because BUSY=1 is what gates a synApps
 //! scan step.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -52,7 +51,7 @@ async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
 
     // `caput B 1` — the put, then the process it triggers.
     db.put_pv("B", EpicsValue::Enum(1)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
@@ -60,7 +59,7 @@ async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
     assert_eq!(db.get_pv("T").unwrap(), EpicsValue::Long(1));
 
     // The second process is NOT the timer — it must leave the pulse alone.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
@@ -90,13 +89,13 @@ async fn a_foreign_process_does_not_clear_a_busy_flag_early() {
         .0;
 
     db.put_pv("BSY", EpicsValue::Enum(1)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BSY", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("BSY").unwrap(), EpicsValue::Enum(1));
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BSY", &mut visited)
         .await
         .unwrap();
@@ -129,7 +128,7 @@ record(bo, "SB") {
         .0;
 
     db.put_pv("SB", EpicsValue::Enum(1)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SB", &mut visited)
         .await
         .unwrap();

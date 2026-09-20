@@ -25,7 +25,7 @@
 //! differs by one scan cycle, which C also spends in LINK/INVALID whenever the
 //! link has not connected yet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -106,7 +106,7 @@ async fn add_ai_with_inp(db: &PvDatabase, name: &str, inp: &str) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

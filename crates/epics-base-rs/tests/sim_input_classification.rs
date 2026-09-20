@@ -7,8 +7,6 @@
 //! wrote VAL OUT to SIOL (direction inverted, simulation defeated). These tests
 //! pin the corrected input direction.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -37,7 +35,7 @@ async fn sim_waveform_reads_siol_array_into_val() {
     wf.siol = "WFIN_SRC".to_string();
     db.add_record("WFIN", Box::new(wf)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("WFIN", &mut v).await.unwrap();
 
     // VAL read inward from SIOL.
@@ -78,7 +76,7 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
     hg.siol = "HGIN_SRC".to_string();
     db.add_record("HGIN", Box::new(hg)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("HGIN", &mut v).await.unwrap();
 
     // SIOL source untouched — the record read from it, not wrote to it.
@@ -119,7 +117,7 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
     hg.sval = 42.0; // would land in bin 1 if the read were treated as OK
     db.add_record("HGF", Box::new(hg)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("HGF", &mut v).await.unwrap();
 
     assert_eq!(

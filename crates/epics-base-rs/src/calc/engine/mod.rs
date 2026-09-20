@@ -6,6 +6,7 @@ pub mod opcodes;
 pub mod postfix;
 pub mod random;
 pub mod scanf;
+pub(crate) mod stack;
 pub mod strtod;
 pub mod token;
 
@@ -296,6 +297,36 @@ impl NumericInputs {
         NumericInputs {
             vars,
             prev_val: 0.0,
+            num_args: CALC_NARGS,
+        }
+    }
+
+    /// The engine's view of this arg block.
+    pub(crate) fn view(&mut self) -> NumericVars<'_> {
+        NumericVars {
+            vars: &mut self.vars,
+            prev_val: self.prev_val,
+            num_args: self.num_args,
+        }
+    }
+}
+
+/// What the numeric evaluator runs on: C's `calcPerform(double *parg, double
+/// *presult, ...)` arguments — a borrowed arg block, so a store opcode writes
+/// the caller's own slot (the record's `A..U`) as C's `parg[op - STORE_A] =`
+/// does — plus the count C omits (see [`NumericInputs::num_args`]).
+pub(crate) struct NumericVars<'a> {
+    pub(crate) vars: &'a mut [f64; CALC_NARGS],
+    pub(crate) prev_val: f64,
+    num_args: usize,
+}
+
+impl<'a> NumericVars<'a> {
+    /// Every arg present — the caller owns all [`CALC_NARGS`] of them.
+    pub(crate) fn all(vars: &'a mut [f64; CALC_NARGS], prev_val: f64) -> Self {
+        NumericVars {
+            vars,
+            prev_val,
             num_args: CALC_NARGS,
         }
     }

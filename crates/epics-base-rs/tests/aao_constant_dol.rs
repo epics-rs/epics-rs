@@ -20,8 +20,6 @@
 //! Boundaries: constant array DOL vs constant scalar DOL vs real link DOL; and
 //! closed_loop vs supervisory (C returns before the load in supervisory).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -114,7 +112,7 @@ async fn supervisory_mode_ignores_the_constant_dol() {
 async fn loaded_constant_writes_out_and_is_not_re_fetched() {
     let db = build().await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CL:ARRAY", &mut visited)
         .await
         .unwrap();
@@ -127,7 +125,7 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
     db.put_pv("CL:ARRAY", EpicsValue::DoubleArray(vec![9.0, 9.0]))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CL:ARRAY", &mut visited)
         .await
         .unwrap();

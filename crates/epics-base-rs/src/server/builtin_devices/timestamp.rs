@@ -394,7 +394,7 @@ mod tests {
     /// A `ProcessContext` carrying an explicit device-time stamp with
     /// `tse = -2` (`epicsTimeEventDeviceTime`), so `read()` resolves the
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
-    fn ctx_device_time(time: SystemTime) -> ProcessContext {
+    fn ctx_device_time(time: SystemTime) -> ProcessContext<'static> {
         ProcessContext {
             udf: false,
             udfs: AlarmSeverity::Invalid,
@@ -402,8 +402,7 @@ mod tests {
             phas: 0,
             tse: -2,
             time,
-            tsel: String::new(),
-            dtyp: String::new(),
+            dtyp: "",
             callback_priority: crate::runtime::task::CallbackPriority::Low,
         }
     }

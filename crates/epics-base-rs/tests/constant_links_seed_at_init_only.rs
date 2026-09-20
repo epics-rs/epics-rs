@@ -26,7 +26,6 @@ use epics_base_rs::server::records::printf::PrintfRecord;
 use epics_base_rs::server::records::sel::SelRecord;
 use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::types::EpicsValue;
-use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     let r = db.get_record(rec).unwrap();
@@ -35,7 +34,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
@@ -47,8 +46,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 async fn constant_input_is_seeded_at_init_and_never_re_applied() {
     let db = PvDatabase::new();
     let mut calc = CalcRecord::new("A+B");
-    calc.inpa = "5".to_string();
-    calc.inpb = "3".to_string();
+    calc.set_inp_link(0, "5");
+    calc.set_inp_link(1, "3");
     db.add_record("C1", Box::new(calc)).await.unwrap();
 
     // Seeded at init — BEFORE the first process (C reads A=5 right after

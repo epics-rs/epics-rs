@@ -25,8 +25,6 @@
 //! put route — the CA route and the no-process autosave-restore route, which is
 //! C's `dbPutField` under `reboot_restore` and runs the same pass-0 special.
 
-use std::collections::HashSet;
-
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -64,7 +62,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

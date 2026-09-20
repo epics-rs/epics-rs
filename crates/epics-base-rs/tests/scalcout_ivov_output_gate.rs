@@ -11,8 +11,6 @@
 //! (record_instance.rs:1653) raises CALC_ALARM/INVALID from the CALC_ALARM
 //! field, so `sevr == INVALID` and `apply_invalid_output_value` runs.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
@@ -34,7 +32,7 @@ async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
     sc.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
     db.add_record("SC_IVOV", Box::new(sc)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC_IVOV", &mut visited)
         .await
         .unwrap();

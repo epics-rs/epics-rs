@@ -759,7 +759,7 @@ fn test_parse_link_v2() {
     // Was wrongly `ProcessPassive`.
     assert_eq!(
         parse_link_v2("TEMP"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "TEMP",
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
@@ -768,7 +768,7 @@ fn test_parse_link_v2() {
 
     assert_eq!(
         parse_link_v2("TEMP.EGU"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "TEMP.EGU",
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
@@ -777,7 +777,7 @@ fn test_parse_link_v2() {
 
     assert_eq!(
         parse_link_v2("TEMP.EGU NPP"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "TEMP.EGU",
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
@@ -788,7 +788,7 @@ fn test_parse_link_v2() {
     // and nothing else did: an explicit `.VAL` carrying each process modifier.
     assert_eq!(
         parse_link_v2("TEMP.VAL PP"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "TEMP.VAL",
             LinkProcessPolicy::ProcessPassive,
             MonitorSwitch::NoMaximize,
@@ -796,7 +796,7 @@ fn test_parse_link_v2() {
     );
     assert_eq!(
         parse_link_v2("TEMP.VAL NPP"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "TEMP.VAL",
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
@@ -1013,8 +1013,7 @@ fn test_deadband_mdel() {
     rec.adel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
     let val_mask = |snap: &epics_base_rs::server::record::ProcessSnapshot| {
-        snap.changed_fields
-            .iter()
+        snap.iter()
             .find(|(k, _, _)| k == "VAL")
             .map(|(_, _, m)| *m)
             .unwrap_or(EventMask::NONE)
@@ -1069,10 +1068,7 @@ fn test_deadband_mdel_zero() {
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert_eq!(
-        snap.changed_fields
-            .iter()
-            .find(|(k, _, _)| k == "VAL")
-            .map(|(_, _, m)| *m),
+        snap.iter().find(|(k, _, _)| k == "VAL").map(|(_, _, m)| *m),
         Some(EventMask::ALARM),
         "no deadband fired — only the initial alarm transition"
     );
@@ -1080,7 +1076,7 @@ fn test_deadband_mdel_zero() {
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
+    assert!(snap.iter().any(|(k, _, _)| k == "VAL"));
 }
 
 #[test]
@@ -1092,7 +1088,7 @@ fn test_deadband_mdel_negative() {
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
+    assert!(snap.iter().any(|(k, _, _)| k == "VAL"));
 }
 
 #[test]
@@ -1208,11 +1204,7 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     // and the alarm transition adds `val_mask = DBE_ALARM`
     // (recGbl.c:212) — so VAL posts with DBE_LOG|DBE_ALARM, never
     // DBE_VALUE.
-    let val_mask = snap
-        .changed_fields
-        .iter()
-        .find(|(k, _, _)| k == "VAL")
-        .map(|(_, _, m)| *m);
+    let val_mask = snap.iter().find(|(k, _, _)| k == "VAL").map(|(_, _, m)| *m);
     assert_eq!(
         val_mask,
         Some(EventMask::LOG | EventMask::ALARM),
@@ -1221,8 +1213,8 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     );
     // SEVR / STAT are NOT in the snapshot — they ride the per-field
     // `alarm_posts` list instead.
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "SEVR"));
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "STAT"));
+    assert!(!snap.iter().any(|(k, _, _)| k == "SEVR"));
+    assert!(!snap.iter().any(|(k, _, _)| k == "STAT"));
     // SEVR posted DBE_VALUE on a sevr change.
     let sevr_mask = alarm_posts
         .iter()
@@ -1298,12 +1290,7 @@ fn test_per_field_masks_narrow_deadband_and_aux_posts() {
         .unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _) = instance.process_local().unwrap();
-    let mask_of = |f: &str| {
-        snap.changed_fields
-            .iter()
-            .find(|(k, _, _)| k == f)
-            .map(|(_, _, m)| *m)
-    };
+    let mask_of = |f: &str| snap.iter().find(|(k, _, _)| k == f).map(|(_, _, m)| *m);
     assert_eq!(
         mask_of("VAL"),
         Some(EventMask::LOG),
@@ -1373,7 +1360,7 @@ fn test_acks_posts_once_with_dbe_value_only() {
     );
     // ...and NOT a second time from the record-wide change-detection snapshot.
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "ACKS"),
+        !snap.iter().any(|(k, _, _)| k == "ACKS"),
         "ACKS must not also ride the generic snapshot — C posts it once"
     );
 }
@@ -1404,8 +1391,8 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "SEVR"));
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "STAT"));
+    assert!(!snap.iter().any(|(k, _, _)| k == "SEVR"));
+    assert!(!snap.iter().any(|(k, _, _)| k == "STAT"));
     assert!(!alarm_posts.iter().any(|(f, _)| *f == "SEVR"));
     assert!(!alarm_posts.iter().any(|(f, _)| *f == "STAT"));
 }
@@ -1444,11 +1431,11 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(
-        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        snap.iter().any(|(k, _, _)| k == "VAL"),
         "the alarm transition posts VAL"
     );
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "RVAL"),
+        !snap.iter().any(|(k, _, _)| k == "RVAL"),
         "ai has no alarm-cycle fanout list: unchanged RVAL must not post"
     );
 }
@@ -1483,11 +1470,11 @@ fn test_ai_rval_not_posted_when_val_within_deadband() {
     instance.record.set_device_did_compute(true);
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        !snap.iter().any(|(k, _, _)| k == "VAL"),
         "VAL within both deadbands: monitor_mask == 0, VAL not posted"
     );
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "RVAL"),
+        !snap.iter().any(|(k, _, _)| k == "RVAL"),
         "RVAL must not post when monitor_mask == 0 (C nests it in `if(monitor_mask)`)"
     );
 }
@@ -1530,7 +1517,6 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
     instance.record.set_device_did_compute(true);
     let (snap, _) = instance.process_local().unwrap();
     let rval_mask = snap
-        .changed_fields
         .iter()
         .find(|(k, _, _)| k == "RVAL")
         .map(|(_, _, m)| *m);
@@ -1622,10 +1608,10 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        snap.iter().any(|(k, _, _)| k == "VAL"),
         "On Change: VAL posts when content hash changes"
     );
-    let hash_post = snap.changed_fields.iter().find(|(k, _, _)| k == "HASH");
+    let hash_post = snap.iter().find(|(k, _, _)| k == "HASH");
     assert!(hash_post.is_some(), "HASH posts on a hash change");
     assert_eq!(
         hash_post.unwrap().2,
@@ -1646,11 +1632,11 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        !snap.iter().any(|(k, _, _)| k == "VAL"),
         "On Change: VAL suppressed when content hash is unchanged"
     );
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        !snap.iter().any(|(k, _, _)| k == "HASH"),
         "HASH not posted when the hash is unchanged"
     );
 
@@ -1661,11 +1647,11 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        snap.iter().any(|(k, _, _)| k == "VAL"),
         "On Change: VAL posts again on new content"
     );
     assert!(
-        snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        snap.iter().any(|(k, _, _)| k == "HASH"),
         "HASH posts again on new content"
     );
 }
@@ -1692,7 +1678,7 @@ fn test_waveform_always_mode_never_posts_hash() {
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        !snap.iter().any(|(k, _, _)| k == "HASH"),
         "Always mode: HASH is never posted (C never enters the hash block)"
     );
     assert_eq!(
@@ -1778,16 +1764,16 @@ fn test_lcnt_alarm_posts_exactly_once() {
     // 11th attempt: fresh raise — snapshot carries the transition.
     let (snapshot, _) = instance.process_local().unwrap();
     assert!(
-        snapshot.changed_fields.iter().any(|(f, _, _)| f == "SEVR"),
+        snapshot.iter().any(|(f, _, _)| f == "SEVR"),
         "the fresh SCAN_ALARM raise must post SEVR"
     );
     // 12th and later attempts: already raised — nothing re-posts.
     let (snapshot, _) = instance.process_local().unwrap();
     assert!(
-        snapshot.changed_fields.is_empty(),
+        snapshot.is_empty(),
         "an already-raised SCAN_ALARM must not re-post on later \
          reentrant attempts, got {:?}",
-        snapshot.changed_fields
+        snapshot.iter().collect::<Vec<_>>()
     );
 }
 

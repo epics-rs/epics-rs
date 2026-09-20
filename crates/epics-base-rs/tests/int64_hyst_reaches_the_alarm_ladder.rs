@@ -23,8 +23,6 @@
 //! clears), on both record types, plus the read-back that hid the split and a
 //! record whose own `check_alarms` owns HYST (`sel`), which must be untouched.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -64,7 +62,7 @@ fn val_of(rec: &str, v: i64) -> EpicsValue {
 /// `dbPut` does, and `checkAlarms` runs inside the cycle that follows.
 async fn drive(db: &PvDatabase, rec: &str, val: i64) -> AlarmSeverity {
     db.put_pv(rec, val_of(rec, val)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

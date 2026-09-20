@@ -8,7 +8,6 @@
 //! `modules/database/src/ioc/db/callback.c` (delayed re-entry) and
 //! `dbNotify.c` (put-notify wait-set / completion).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -510,7 +509,7 @@ async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -609,7 +608,7 @@ async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
     .await
     .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PEND_SRC", &mut visited)
         .await
         .unwrap();
@@ -652,7 +651,7 @@ async fn cancel_reprocess_action_supersedes_outstanding_token() {
     assert!(token.is_current(), "freshly-minted token is current");
 
     // Drive a process() that emits CancelReprocess.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CR", &mut visited)
         .await
         .unwrap();

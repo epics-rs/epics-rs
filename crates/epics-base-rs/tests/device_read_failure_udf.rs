@@ -39,7 +39,7 @@
 //! writing `common.udf`: the point is the device-support contract, and a test
 //! that sets the field by hand proves nothing about the path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::PvDatabase;
@@ -155,7 +155,7 @@ const VALUE: f64 = 42.0;
 const RAW: i32 = 7;
 
 async fn process(db: &Arc<PvDatabase>) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(REC, &mut visited)
         .await
         .unwrap();

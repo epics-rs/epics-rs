@@ -26,8 +26,6 @@
 //! Boundaries: SIOL read failed vs succeeded; UDF set vs UDF alarm raised; the
 //! three unconditional kinds vs subArray.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
@@ -74,7 +72,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
             "{rec}: undefined before the first process"
         );
 
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(rec, &mut visited)
             .await
             .unwrap();

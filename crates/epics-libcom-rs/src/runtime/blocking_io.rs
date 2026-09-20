@@ -82,13 +82,13 @@
 //! dropping the guards in that order, or by declaring them in the reverse of
 //! it.
 //!
-//! The reader guard's row is a POSIX contract: `shutdown` waking a thread
-//! parked in a blocking `read` is what unix (RTEMS included) provides and
-//! Windows does not (measured, PR #56 CI 2026-07-24 — the parked read
-//! outlived a 120 s bound). That is why `exec_backend`, the only
-//! configuration that runs these pumps in production, refuses Windows at
-//! compile time (`lib.rs`), and why the tests asserting this contract are
-//! `#[cfg(unix)]`.
+//! The reader guard's row rests on the wait, not on the park. On unix (RTEMS
+//! included) a local `shutdown` surfaces as `POLLHUP` in the `poll` the pump
+//! waits in. Windows does not return a `recv` parked on a socket another
+//! thread has shut down (measured, PR #56 CI 2026-07-24 — the parked read
+//! outlived a 120 s bound), so there the wait caps every park at
+//! `WAKE_POLL_PERIOD` and the `recv` after the cap is the one that reports
+//! the shutdown.
 //!
 //! # Where the async goes
 //!
@@ -571,8 +571,11 @@ fn reader_pump(
     // `impl Read for &TcpStream`: one shared descriptor, no `try_clone`.
     let mut sock = &*sock;
     let mut chunk = vec![0u8; chunk_size];
+    // One deadline per read, held across the empty returns below, so a wait
+    // that re-arms after one re-arms the bound that is left, not a fresh one.
+    let mut deadline = read_timeout.map(|t| Instant::now() + t);
     loop {
-        match wait_readable(sock, read_timeout.map(|t| Instant::now() + t)) {
+        match wait_readable(sock, deadline) {
             Ok(true) => {}
             Ok(false) => {
                 debug!(label, "blocking reader: receive timeout, ending connection");
@@ -587,18 +590,17 @@ fn reader_pump(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            // Readiness that yielded nothing: back to the wait, which re-arms
-            // the same bound, so this cannot spin.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) if is_socket_timeout(e.kind()) => {
-                debug!(label, "blocking reader: receive timeout, ending connection");
-                break;
-            }
+            // Readiness that yielded nothing (`EAGAIN`), or the non-Unix arm's
+            // socket timeout: back to the wait, which owns the bound and is the
+            // only thing that ends the connection on it — so this cannot spin,
+            // and no park outlives the wait's cap.
+            Err(e) if is_socket_timeout(e.kind()) => continue,
             Err(e) => {
                 debug!(label, error = %e, "blocking reader: read failed");
                 break;
             }
         };
+        deadline = read_timeout.map(|t| Instant::now() + t);
         // The house sync-over-async primitive: parks this thread (no runtime
         // entered) or hands the worker off (hosted). NOT `blocking_send`.
         if !matches!(block_on_sync(tx.send(chunk[..n].to_vec())), Ok(Ok(()))) {
@@ -915,18 +917,36 @@ fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool
     }
 }
 
+/// The longest a non-Unix pump may park in one socket call.
+///
+/// Windows does not return a `recv` or `send` parked on a socket that another
+/// thread has since shut down (measured, PR #56 CI 2026-07-24: a parked `recv`
+/// outlived shutdown by the full 120 s test bound), and `poll` there would be
+/// `WSAPoll` and a Win32 dependency this crate does not carry. So both waits
+/// arm `SO_RCVTIMEO` / `SO_SNDTIMEO` to at most this: a call that times out
+/// goes back to its wait, which re-arms whatever the deadline has left, and the
+/// call after a shutdown is the one that reports it (`WSAESHUTDOWN`). The wake
+/// a unix `POLLHUP` delivers at once arrives here within one period.
+#[cfg(not(unix))]
+const WAKE_POLL_PERIOD: Duration = Duration::from_millis(100);
+
 /// Non-Unix arm: Windows implements `SO_RCVTIMEO` and keeps a blocking socket,
-/// so the read that follows carries its own bound and this only arms it.
+/// so the read that follows carries its own bound and this only arms it — to
+/// the lesser of the deadline's remainder and `WAKE_POLL_PERIOD`, and to the
+/// period alone when there is no deadline, so that no park outlives a shutdown
+/// by more than a period.
 #[cfg(not(unix))]
 fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool> {
-    let Some(d) = deadline else {
-        sock.set_read_timeout(None)?;
-        return Ok(true);
+    let remaining = match deadline {
+        Some(d) => {
+            let remaining = d.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            remaining.min(WAKE_POLL_PERIOD)
+        }
+        None => WAKE_POLL_PERIOD,
     };
-    let remaining = d.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Ok(false);
-    }
     sock.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
     Ok(true)
 }
@@ -1034,9 +1054,10 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 ///
 /// `poll` would mean `WSAPoll` and a Win32 dependency this crate does not
 /// carry, and Windows *does* implement `SO_SNDTIMEO`. So arm it — from inside
-/// this module, not from a caller — to the time the deadline has left: the send
-/// that follows returns within `remaining`, and the loop ends the frame on the
-/// next pass. The bound is still owned here, which is the property that
+/// this module, not from a caller — to the lesser of the time the deadline has
+/// left and `WAKE_POLL_PERIOD`: the send that follows returns within that, and
+/// the loop either ends the frame on the next pass or comes back here for the
+/// remainder. The bound is still owned here, which is the property that
 /// matters.
 ///
 /// The blocking pumps are refused on Windows at compile time (`lib.rs`), so
@@ -1048,7 +1069,10 @@ fn wait_writable(sock: &TcpStream, deadline: Instant) -> io::Result<bool> {
     if remaining.is_zero() {
         return Ok(false);
     }
-    sock.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+    let armed = remaining
+        .min(WAKE_POLL_PERIOD)
+        .max(Duration::from_millis(1));
+    sock.set_write_timeout(Some(armed))?;
     Ok(true)
 }
 
@@ -1758,13 +1782,10 @@ mod tests {
     /// The reader guard's whole purpose: a pump parked in `read` behind a
     /// timeout longer than the test could wait is returned by the guard's drop.
     ///
-    /// unix-only: this asserts the POSIX teardown contract — a local
-    /// `shutdown(Shutdown::Both)` returns a thread parked in a blocking
-    /// `read`. Windows does not provide that wake (measured, PR #56 CI
-    /// 2026-07-24: the parked read outlived the 120 s test bound on x86_64),
-    /// which is why `exec_backend` refuses Windows at compile time
-    /// (`lib.rs`) — nothing there can reach the pumps' teardown.
-    #[cfg(unix)]
+    /// On unix the return is the `POLLHUP` a local `shutdown(Shutdown::Both)`
+    /// raises in the pump's `poll`; on Windows, which does not return a parked
+    /// `recv` for it, it is the wait's `WAKE_POLL_PERIOD` cap and the `recv`
+    /// after it reporting the shutdown. Either way well inside the bound.
     #[test]
     fn the_reader_guard_returns_a_pump_parked_in_read() {
         let (client, server) = socket_pair();

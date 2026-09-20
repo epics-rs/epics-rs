@@ -753,6 +753,17 @@ impl Record for TransformRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// C reads `ptran->inpa..inpp` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 16 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp_links.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if name == "VAL" {
             // The dummy result field — never written by process()/monitor().
@@ -982,9 +993,12 @@ impl Record for TransformRecord {
     ///
     /// Runs before `process()` (the framework's report point), which is where C
     /// does it — the zero is what the calc loop and the OUTx write then see.
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+    fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
         for i in 0..NUM_CHANNELS {
-            if !self.no_inlink(i) && !resolved.contains(&INP_FIELD_NAMES[i]) {
+            if !self.no_inlink(i) && !resolved.contains(INP_FIELD_NAMES[i]) {
                 self.vals[i] = 0.0;
             }
         }
@@ -1086,7 +1100,14 @@ impl Record for TransformRecord {
         crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// The `INPA..INPP` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_links)
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
             ("INPB", "B"),

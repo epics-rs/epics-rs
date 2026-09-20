@@ -36,7 +36,12 @@ impl AlarmSeverity {
 /// round-trips, matching sel/dfanout's already-raw `hhsv`/… fields; read the
 /// alarm meaning with `AlarmSeverity::from_u16(field as u16)` and the C nonzero
 /// enable with `field != 0`.
-#[derive(Clone, Debug)]
+/// `Copy` because the alarm ladder reads it once per cycle on every analog
+/// record and cannot borrow it — `evaluate_analog_alarm` needs `&mut` on the
+/// same `CommonFields`. Every field is already `Copy`, so a by-value read is a
+/// register move, where the `Clone` it replaces was four `AlarmLimit` matches
+/// and reconstructions per record per cycle.
+#[derive(Clone, Copy, Debug)]
 pub struct AnalogAlarmConfig {
     pub hihi: AlarmLimit,
     pub high: AlarmLimit,
@@ -120,6 +125,19 @@ impl AlarmLimit {
             Self::Double(v) => EpicsValue::Double(v),
             Self::Long(v) => EpicsValue::Long(v),
             Self::Int64(v) => EpicsValue::Int64(v),
+        }
+    }
+
+    /// The VAL the ladder compares, or `None` for a stored variant the ladder
+    /// has no arm for: C's `checkAlarms` exists only on the records whose VAL
+    /// is `DBF_DOUBLE`, `DBF_LONG` or `DBF_INT64`, and the variant is what
+    /// picks the comparison domain, so it is kept rather than flattened.
+    pub fn from_ladder_value(value: &EpicsValue) -> Option<Self> {
+        match value {
+            EpicsValue::Double(v) => Some(Self::Double(*v)),
+            EpicsValue::Long(v) => Some(Self::Long(*v)),
+            EpicsValue::Int64(v) => Some(Self::Int64(*v)),
+            _ => None,
         }
     }
 

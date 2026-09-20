@@ -6,8 +6,8 @@ use super::link_status::{
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult, parse_link_v2,
+    CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions, ProcessOutcome,
+    Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -1250,23 +1250,23 @@ impl Record for SseqRecord {
         Ok(outcome)
     }
 
-    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> ProcessActions {
         // C `process` (sseqRecord.c:315-317) reads `SELL` into `SELN` before
         // building the selection mask, and only when `SELM != All`. This is
         // the earliest hook (it runs before the selection is resolved), and
         // only at a sequence start (`busy == 0`); a continuation must not
         // re-read `SELL` mid-sequence.
         if self.busy == 0 && self.selm != 0 && !self.sell.is_empty() {
-            vec![ProcessAction::ReadDbLink {
+            ProcessActions::from(vec![ProcessAction::ReadDbLink {
                 link_field: "SELL",
                 target_field: "SELN",
-            }]
+            }])
         } else {
-            Vec::new()
+            ProcessActions::new()
         }
     }
 
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+    fn pre_process_actions(&mut self) -> ProcessActions {
         // C `processCallback` reads the current step's `DOLn` AFTER its delay
         // has elapsed (sseqRecord.c:643-666). The per-step `ReprocessAfter`
         // re-enters in phase `Fire` with `cursor` on that step, so the DOL
@@ -1289,9 +1289,9 @@ impl Record for SseqRecord {
             actions.push(ProcessAction::ResolveOutTarget {
                 link_field: LNK_FIELDS[i],
             });
-            return actions;
+            return actions.into();
         }
-        Vec::new()
+        ProcessActions::new()
     }
 
     fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
@@ -1488,10 +1488,21 @@ impl Record for SseqRecord {
     /// `SELL` is not part of this switch: C reads it with a FIXED
     /// `dbGetLink(&pR->sell, DBF_USHORT, &pR->seln, 0, 0)` (:315-317), so it
     /// keeps the framework's native read and `SELN`'s own put coercion.
-    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
-        let Some((_, "DOL")) = Self::step_index_from_suffix(link_field) else {
-            return Some(LinkReadAs::Native);
-        };
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::InputLinkRequest;
+        match Self::step_index_from_suffix(link_field) {
+            // Only `DOLn` is read through the source-class switch; `SELL` and
+            // every other link keep the framework's native read.
+            Some((_, "DOL")) => InputLinkRequest::FromSource,
+            _ => InputLinkRequest::As(LinkReadAs::Native),
+        }
+    }
+
+    fn input_link_read_as_from_source(
+        &self,
+        _link_field: &str,
+        source: &OutTarget,
+    ) -> Option<LinkReadAs> {
         if source.puts_as_string {
             return Some(LinkReadAs::String);
         }
@@ -1521,7 +1532,7 @@ impl Record for SseqRecord {
     ///
     /// The per-cycle read never sees a constant again — C pins its
     /// `dol_field_type` to `DBF_NOACCESS`, which falls to `processCallback`'s
-    /// `default: break` ([`Self::input_link_read_as`]).
+    /// `default: break` ([`Self::input_link_read_as_from_source`]).
     ///
     /// `SELL → SELN` is the other seed C declares (`sseqRecord.c:187-192`,
     /// `recGblInitConstantLink(&pR->sell, DBF_USHORT, &pR->seln)` — the same one

@@ -276,9 +276,10 @@ impl BlockingBridge {
         spawn_background(CallbackPriority::Medium, future)
     }
 
-    /// See the `tokio_backend` definition; there is no state to carry here.
+    /// See the `tokio_backend` definition; this carries no runtime, only the
+    /// default (callback-pool) spawn target.
     pub fn reactor(&self) -> Reactor {
-        Reactor
+        Reactor::default()
     }
 }
 
@@ -577,8 +578,12 @@ pub struct Reactor {
 /// shape on both backends is what lets the same source compile clean under
 /// either.
 #[cfg(exec_backend)]
-#[derive(Clone, Debug)]
-pub struct Reactor;
+#[derive(Clone, Debug, Default)]
+pub struct Reactor {
+    /// Where [`Reactor::spawn`] puts the future. `None` is the process-global
+    /// callback pool's middle band — see [`Reactor::with_executor`].
+    exec: Option<Arc<crate::runtime::background::DedicatedExecutor>>,
+}
 
 #[cfg(tokio_backend)]
 impl Reactor {
@@ -616,6 +621,17 @@ impl Reactor {
     {
         self.handle.spawn_blocking(f)
     }
+
+    /// The `exec_backend` twin's no-op: here the runtime *is* the executor and
+    /// its band is the runtime's to set, so `exec` is ignored. It exists so a
+    /// server that chooses its own band compiles unchanged on both backends —
+    /// see the `exec_backend` copy for what it does there.
+    pub fn with_executor(
+        &self,
+        _exec: &Arc<crate::runtime::background::DedicatedExecutor>,
+    ) -> Self {
+        self.clone()
+    }
 }
 
 #[cfg(exec_backend)]
@@ -623,27 +639,60 @@ impl Reactor {
     /// The background executor is process-global, so this never fails — see
     /// the type's own docs for what that does and does not promise.
     pub fn current() -> Option<Self> {
-        Some(Self)
+        Some(Self::default())
     }
 
-    /// [`spawn_background`] verbatim: on this backend there is nothing else to
-    /// spawn onto. Middle band for the same reason as the `tokio_backend`
-    /// copy — the reactor seam carries no record.
+    /// This reactor, with spawned futures routed to `exec` instead of the
+    /// callback pool.
+    ///
+    /// The band a server's connection work runs in is the server's to choose,
+    /// and the reactor is the capability it is already handed — so binding the
+    /// executor here is what moves every downstream `spawn`, including the ones
+    /// in futures this reactor is cloned into, without a second handle to
+    /// thread beside it.
+    ///
+    /// The `tokio_backend` twin ignores `exec`: there the runtime *is* the
+    /// executor, and its band is the runtime's to set.
+    pub fn with_executor(&self, exec: &Arc<crate::runtime::background::DedicatedExecutor>) -> Self {
+        Self {
+            exec: Some(Arc::clone(exec)),
+        }
+    }
+
+    /// Spawn on this reactor's executor, or — with none bound —
+    /// [`spawn_background`] verbatim on the middle band, for the same reason
+    /// as the `tokio_backend` copy: the reactor seam carries no record.
     pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        spawn_background(CallbackPriority::Medium, future)
+        match &self.exec {
+            Some(exec) => crate::runtime::background::spawn_future(
+                &exec.handle(),
+                CallbackPriority::Medium,
+                future,
+            ),
+            None => spawn_background(CallbackPriority::Medium, future),
+        }
     }
 
+    /// [`Reactor::spawn`] for a blocking closure. A bound executor takes it on
+    /// one of its own workers; with none bound this is
     /// [`spawn_blocking_background`] verbatim, middle band.
     pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        spawn_blocking_background(CallbackPriority::Medium, f)
+        match &self.exec {
+            Some(exec) => crate::runtime::background::spawn_blocking_on(
+                &exec.handle(),
+                CallbackPriority::Medium,
+                f,
+            ),
+            None => spawn_blocking_background(CallbackPriority::Medium, f),
+        }
     }
 }
 
@@ -2986,6 +3035,50 @@ fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The band binding, end to end: a reactor with an executor bound puts its
+    /// spawned future on that executor's worker, and one without still uses the
+    /// process-global callback pool.
+    ///
+    /// This is the property every PVA connection future depends on — the seam
+    /// is one `with_executor` at the top of `serve`, and everything downstream
+    /// inherits it through its clone of the reactor.
+    #[cfg(exec_backend)]
+    #[test]
+    fn a_bound_executor_takes_the_spawned_future_off_the_callback_pool() {
+        use crate::runtime::background::DedicatedExecutor;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn worker_name_of(reactor: &Reactor) -> String {
+            let (tx, rx) = mpsc::channel();
+            reactor.spawn(async move {
+                let name = std::thread::current()
+                    .name()
+                    .unwrap_or_default()
+                    .to_string();
+                tx.send(name).expect("send");
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the future ran")
+        }
+
+        let plain = Reactor::default();
+        assert!(
+            worker_name_of(&plain).starts_with("cbMedium"),
+            "an unbound reactor still lands on C's middle callback band"
+        );
+
+        let exec = Arc::new(
+            DedicatedExecutor::new("BOUNDEXEC", ThreadPriority::Custom(18), 1)
+                .expect("executor starts"),
+        );
+        let bound = plain.with_executor(&exec);
+        assert_eq!(worker_name_of(&bound), "BOUNDEXEC");
+        // The binding is per-reactor, not global: the one it was derived from
+        // is unchanged.
+        assert!(worker_name_of(&plain).starts_with("cbMedium"));
+    }
 
     /// The workspace's one production-slice rule, under this file's old name.
     ///

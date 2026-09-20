@@ -29,7 +29,6 @@
 //! `recGblResetAlarms` then re-committed: a self-sustaining latch.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -48,7 +47,7 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut v).await.unwrap();
 }
 
@@ -102,6 +101,52 @@ async fn a_read_db_link_input_without_ms_inherits_nothing() {
         alarm(&db, "CMP2").await,
         (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
         "NMS: recGblInheritSevrMsg propagates nothing"
+    );
+}
+
+/// The self-exclusion's other spelling: the link names the reader through an
+/// ALIAS. C compares record POINTERS (`precord != dbChannelRecord(chan)`,
+/// `dbDbLink.c:228`) and `dbNameToAddr` resolves an alias to the record it
+/// names, so the guard fires here exactly as it does above — epics-base PR
+/// #336's point. The port answered it by canonicalising both names through the
+/// alias table; it now compares the two `Arc<RecordCell>` handles the read
+/// already produced, so this case holds by construction rather than by a
+/// second lookup.
+#[epics_macros_rs::epics_test]
+async fn a_self_referencing_ms_link_spelled_as_an_alias_is_excluded_too() {
+    let db = build(
+        r#"record(calc, "SELF") { field(INPA, "NICK.VAL MS") field(CALC, "A")
+                                 field(HIGH, "1") field(HSV, "MAJOR")
+                                 alias("NICK") }"#,
+    )
+    .await;
+
+    db.put_pv("SELF.VAL", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    process(&db, "SELF").await;
+    assert_eq!(
+        alarm(&db, "SELF").await,
+        (alarm_status::HIGH_ALARM, AlarmSeverity::Major),
+        "VAL=5 > HIGH=1: the record's OWN limit alarm"
+    );
+
+    db.put_pv("SELF.HIGH", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    process(&db, "SELF").await;
+    assert_eq!(
+        alarm(&db, "SELF").await,
+        (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+        "the alias names this same record, so the self-link is excluded and \
+         the alarm clears instead of latching"
+    );
+
+    process(&db, "SELF").await;
+    assert_eq!(
+        alarm(&db, "SELF").await,
+        (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+        "and it stays clear"
     );
 }
 

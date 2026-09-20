@@ -50,7 +50,7 @@ async fn add_calc(db: &PvDatabase, name: &str, inpa: &str) {
     calc.prec = 7;
     calc.hopr = 100.0;
     calc.lopr = -100.0;
-    calc.inpa = inpa.into();
+    calc.set_inp_link(0, inpa);
     db.add_record(name, Box::new(calc)).await.unwrap();
 }
 
@@ -239,7 +239,7 @@ async fn a_field_no_link_backs_still_serves_the_record() {
 fn the_record_alone_cannot_serve_a_link_backed_field() {
     let mut calc = CalcRecord::default();
     calc.prec = 7;
-    calc.inpa = "SRC".into();
+    calc.set_inp_link(0, "SRC");
     let inst = RecordInstance::new_boxed("T:CALC".to_string(), Box::new(calc));
 
     assert!(

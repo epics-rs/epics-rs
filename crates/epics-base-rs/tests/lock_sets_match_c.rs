@@ -553,3 +553,77 @@ record(calc, "A:REAL") { field(CALC, "1") }
         "the alias made the link resolve, and C merges on a resolved DB link"
     );
 }
+
+/// C `dbScanLock(precord)` reaches the set through `precord->lset`, so the
+/// gate a caller takes with the record in hand and the set `dblsr` reports for
+/// its name are one thing, not two that have to be kept in step.
+///
+/// The three boundaries are the three states of the cell: minted for an
+/// unlinked record, moved by a merge, moved back by a split. A test that only
+/// checked the first would pass with a record that kept the set it was born
+/// in.
+#[epics_macros_rs::epics_test]
+async fn an_instance_gate_follows_the_record_through_a_relink() {
+    let db = ioc(RELINK_DB).await;
+    let a = db.get_record("L:A").expect("L:A");
+
+    {
+        let _gate = db.lock_instance(&a);
+        assert!(db.lock_set_of("L:A").unwrap().locked, "L:A's own set");
+        assert!(
+            !db.lock_set_of("L:B").unwrap().locked,
+            "unlinked records do not share a set"
+        );
+    }
+
+    // Written on the B side ON PURPOSE. The seed of a relink keeps the set it
+    // was already in, so a link written on L:A would leave L:A exactly where
+    // it was and a stale cell would still take the right mutex. Seeding from
+    // L:B is what forces L:A to move.
+    dbpf(&db, "L:B", "INPA", "L:A").await;
+    {
+        let _gate = db.lock_instance(&a);
+        assert!(
+            db.lock_set_of("L:B").unwrap().locked,
+            "the merge moved L:A behind L:B's mutex, and the record's own \
+             cell is what the merge moved"
+        );
+    }
+
+    dbpf(&db, "L:B", "INPA", "").await;
+    {
+        let _gate = db.lock_instance(&a);
+        assert!(
+            db.lock_set_of("L:A").unwrap().locked,
+            "the split gave L:A a set of its own, through the same cell"
+        );
+        assert!(
+            !db.lock_set_of("L:B").unwrap().locked,
+            "and left it holding nothing of L:B's"
+        );
+    }
+}
+
+/// The other half of the same invariant: whichever path mints the record's
+/// cell, the other must find it rather than create a second set.
+///
+/// Both orders, because the two paths mint through different entry points —
+/// `lock_instance` attaches to the record, `lock_record` only touches the
+/// registry — and a cell created by one and missed by the other would let two
+/// gates on ONE record run at once.
+#[epics_macros_rs::epics_test]
+async fn a_name_gate_and_an_instance_gate_name_one_set_in_either_order() {
+    let db = ioc(RELINK_DB).await;
+
+    let a = db.get_record("L:A").expect("L:A");
+    let by_instance = db.lock_set_of("L:A").unwrap().id;
+    drop(db.lock_instance(&a));
+    drop(db.lock_record("L:A"));
+    assert_eq!(db.lock_set_of("L:A").unwrap().id, by_instance);
+
+    let c = db.get_record("L:C").expect("L:C");
+    let by_name = db.lock_set_of("L:C").unwrap().id;
+    drop(db.lock_record("L:C"));
+    drop(db.lock_instance(&c));
+    assert_eq!(db.lock_set_of("L:C").unwrap().id, by_name);
+}

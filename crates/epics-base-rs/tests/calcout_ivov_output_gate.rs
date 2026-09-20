@@ -10,8 +10,6 @@
 //! spurious OVAL monitor on a non-output cycle (D3). The fix gates the OVAL
 //! write on the record's `cached_should_output`.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::calcout::CalcoutRecord;
@@ -33,7 +31,7 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
     co.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
     db.add_record("CO_NOOUT", Box::new(co)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_NOOUT", &mut visited)
         .await
         .unwrap();
@@ -77,7 +75,7 @@ async fn calcout_ivov_applied_on_output_cycle() {
     co.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
     db.add_record("CO_OUT", Box::new(co)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_OUT", &mut visited)
         .await
         .unwrap();

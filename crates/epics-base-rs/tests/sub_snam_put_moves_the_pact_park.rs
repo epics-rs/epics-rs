@@ -36,7 +36,7 @@
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const DB: &str = r#"
@@ -91,7 +91,7 @@ fn val(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> f64 {
 }
 
 async fn proc(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links(rec, &mut visited).await;
 }
 

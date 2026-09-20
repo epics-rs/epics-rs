@@ -965,7 +965,7 @@ impl Record for CompressRecord {
     /// That field was a second, always-empty INP: the action never fired for a
     /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers
     /// the link text. It is gone; INP has one source.
-    fn pre_input_link_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+    fn pre_input_link_actions(&mut self) -> crate::server::record::ProcessActions {
         // The per-cycle ingest/emit facts, cleared before the framework's input
         // stage can set them. If no value arrives (link not connected, or a
         // failed read), both stay false: `check_alarms` raises LINK/INVALID and
@@ -973,7 +973,7 @@ impl Record for CompressRecord {
         // those paths.
         self.cycle_ingested = false;
         self.cycle_emitted = false;
-        Vec::new()
+        crate::server::record::ProcessActions::new()
     }
 
     /// The framework's soft-input stage delivering this cycle's INP value —
@@ -1064,10 +1064,10 @@ mod pbuf_tests {
         let (snap, actions) = inst.process_local().unwrap();
 
         assert!(
-            snap.changed_fields.is_empty(),
+            snap.is_empty(),
             "a non-emit (CompleteNoEmit) cycle must publish no field changes via \
              process_local — got {:?}",
-            snap.changed_fields
+            snap.iter().collect::<Vec<_>>()
         );
         assert!(actions.is_empty(), "compress is soft → no process actions");
     }

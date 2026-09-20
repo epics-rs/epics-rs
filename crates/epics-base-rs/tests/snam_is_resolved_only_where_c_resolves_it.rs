@@ -33,7 +33,7 @@
 //! so the line belongs to the errlog and not to stderr. The PACT half was
 //! already ported (`SubRecord::parks_pact`); only the line was missing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::PvDatabase;
@@ -77,7 +77,7 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

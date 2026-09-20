@@ -1,8 +1,47 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::scan::{ScanType, SimModeScan};
+use super::sparse_text::SparseText;
 use crate::types::PvString;
+
+/// `BKPT` (`DBF_UCHAR` in `dbCommon.dbd`) — the breakpoint debugger's
+/// `BKPT_ON_MASK` / `BKPT_PRINT_MASK` byte.
+///
+/// C reads and writes `precord->bkpt` with no lock held: `dbstat`
+/// (`dbBkpt.c:930`), `dbap` (`:860-866`) and `dbb`'s first test (`:296`)
+/// all run outside `dbScanLock`. The byte is therefore atomic, and the
+/// record cell keeps a handle to the same byte so those commands can reach
+/// it without the record's lock set — which a continuation thread holds
+/// for the whole of the chain it is stepping.
+///
+/// `Clone` makes a fresh byte with the same value, as cloning a record's
+/// fields makes a different record; `Self::share` is the cell's handle to
+/// this one.
+#[derive(Debug, Default)]
+pub struct BkptFlag(Arc<AtomicU8>);
+
+impl BkptFlag {
+    pub fn get(&self) -> u8 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, value: u8) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn share(&self) -> BkptFlag {
+        BkptFlag(self.0.clone())
+    }
+}
+
+impl Clone for BkptFlag {
+    fn clone(&self) -> Self {
+        BkptFlag(Arc::new(AtomicU8::new(self.get())))
+    }
+}
 
 /// Common fields shared by all records.
 #[derive(Clone, Debug)]
@@ -14,13 +53,13 @@ pub struct CommonFields {
     /// records may attach a human-readable explanation alongside
     /// `stat`/`sevr`. Empty means "no message". Transferred from
     /// `namsg` by `rec_gbl_reset_alarms`.
-    pub amsg: String,
+    pub amsg: SparseText,
     // New alarm state (pending, transferred by rec_gbl_reset_alarms)
     pub nsev: AlarmSeverity,
     pub nsta: u16,
     /// Pending alarm message — set during process(), transferred to
     /// `amsg` by `rec_gbl_reset_alarms` (epics-base PR #566).
-    pub namsg: String,
+    pub namsg: SparseText,
     // Alarm acknowledgement
     pub acks: AlarmSeverity,
     pub ackt: bool,
@@ -65,15 +104,17 @@ pub struct CommonFields {
     /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
     /// stores the raw put byte and serves it as SIGNED `DBR_CHAR`
     /// (`caput TPRO 255` → `caget` = -1). Modeled as the raw `u8`, like
-    /// [`Self::bkpt`], so the byte round-trips; consumers test `!= 0`.
+    /// [`Self::disp`], so the byte round-trips; consumers test `!= 0`.
     pub tpro: u8,
-    pub bkpt: u8,
+    pub bkpt: BkptFlag,
     // Links (raw strings)
     pub flnk: String,
     pub inp: String,
     pub out: String,
     // Device
-    pub dtyp: String,
+    /// `DTYP` and the soft-channel class it names, taken together — see
+    /// [`Dtyp`](crate::server::device_support::Dtyp).
+    pub dtyp: crate::server::device_support::Dtyp,
     // Timestamp
     pub time: SystemTime,
     pub tse: i16,
@@ -129,7 +170,7 @@ pub struct CommonFields {
     pub lcnt: i16,
     // DISP — disable putfield from CA. `DBF_UCHAR` in `dbCommon.dbd`: C
     // stores the raw put byte and serves it SIGNED as `DBR_CHAR`
-    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::bkpt`];
+    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::tpro`];
     // consumers test `!= 0`.
     pub disp: u8,
     // Process control
@@ -172,7 +213,7 @@ impl CommonFields {
     /// Build a [`ProcessContext`](super::record_trait::ProcessContext)
     /// snapshot of the framework-owned state a record's `process()` or
     /// device support's `read()` needs to observe during the cycle.
-    pub fn process_context(&self) -> super::record_trait::ProcessContext {
+    pub fn process_context(&self) -> super::record_trait::ProcessContext<'_> {
         super::record_trait::ProcessContext {
             udf: self.udf != 0,
             udfs: AlarmSeverity::from_u16(self.udfs as u16),
@@ -180,8 +221,7 @@ impl CommonFields {
             phas: self.phas,
             tse: self.tse,
             time: self.time,
-            tsel: self.tsel.clone(),
-            dtyp: self.dtyp.clone(),
+            dtyp: self.dtyp.as_str(),
             callback_priority: self.callback_priority(),
         }
     }
@@ -204,10 +244,10 @@ impl Default for CommonFields {
             // (`RecordInstance::run_init_passes`, C `iocInit.c:521-523`), which
             // keys off exactly this STAT value.
             stat: crate::server::recgbl::alarm_status::UDF_ALARM,
-            amsg: String::new(),
+            amsg: SparseText::default(),
             nsev: AlarmSeverity::NoAlarm,
             nsta: 0,
-            namsg: String::new(),
+            namsg: SparseText::default(),
             acks: AlarmSeverity::NoAlarm,
             ackt: true,
             udf: 1,
@@ -221,11 +261,11 @@ impl Default for CommonFields {
             oldsimm: 0,
             pini: 0,
             tpro: 0,
-            bkpt: 0,
+            bkpt: BkptFlag::default(),
             flnk: String::new(),
             inp: String::new(),
             out: String::new(),
-            dtyp: String::new(),
+            dtyp: crate::server::device_support::Dtyp::default(),
             // An `epicsTimeStamp {0,0}` — C's never-processed `dbCommon.time`
             // — is the EPICS epoch, not the Unix epoch. Seeding this with
             // `UNIX_EPOCH` made a never-processed record publish

@@ -34,7 +34,6 @@
 mod module_records;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -57,7 +56,7 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

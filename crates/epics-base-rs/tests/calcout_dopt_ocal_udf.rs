@@ -7,8 +7,6 @@
 //! the Rust udf was VAL-based only (`value_is_undefined` default), so OCAL→NaN
 //! drove NaN to the OUT link with NO_ALARM — a silent-wrong-value divergence.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -31,7 +29,7 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
     co.oopt = 0; // Every Time → always an output cycle
     db.add_record("CO_OCAL_NAN", Box::new(co)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_OCAL_NAN", &mut visited)
         .await
         .unwrap();
@@ -86,7 +84,7 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
     co.oopt = 0; // Every Time → always an output cycle
     db.add_record("CO_NANVAL", Box::new(co)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_NANVAL", &mut visited)
         .await
         .unwrap();
@@ -122,7 +120,7 @@ async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
     co.oopt = 0; // Every Time
     db.add_record("CO_BOTHFIN", Box::new(co)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_BOTHFIN", &mut visited)
         .await
         .unwrap();

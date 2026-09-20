@@ -88,20 +88,18 @@
     clippy::manual_range_contains
 )]
 
-// The exec backend's blocking pumps end a parked reader with a local
-// `shutdown(Shutdown::Both)` and bound a stuck writer through loopback
-// send-backpressure (`runtime::blocking_io`). Both are POSIX blocking-socket
-// semantics; Windows provides neither (measured, PR #56 CI 2026-07-24: a
-// parked `recv` outlived shutdown by the full 120 s test bound, and an
-// 8 MiB frame to a never-reading peer was swallowed in 12 ms), so a Windows
-// build selecting this backend would hang on connection teardown instead of
-// failing visibly. Refuse it at compile time rather than ship that.
+// The exec backend's blocking pumps bound a stuck writer through loopback
+// send-backpressure (`runtime::blocking_io`), a POSIX blocking-socket
+// semantic Windows does not provide (measured, PR #56 CI 2026-07-24: an
+// 8 MiB frame to a never-reading peer was swallowed in 12 ms), so on a
+// Windows build selecting this backend the send deadline that reclaims a
+// stuck writer cannot be shown to hold. Refuse it at compile time rather
+// than ship an unverified bound.
 #[cfg(all(windows, exec_backend))]
 compile_error!(
     "the exec backend (EPICS_RS_BUILD_EXEC_BACKEND=thread) relies on POSIX \
-     blocking-socket semantics (shutdown wakes a parked read; loopback sends \
-     see backpressure) that Windows does not provide; build the default tokio \
-     backend on Windows instead"
+     blocking-socket semantics (loopback sends see backpressure) that Windows \
+     does not provide; build the default tokio backend on Windows instead"
 );
 
 // Lets `#[epics_macros_rs::epics_test]` expansions — which name the runtime

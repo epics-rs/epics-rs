@@ -43,7 +43,7 @@
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ProcessCompletion;
 use epics_base_rs::types::EpicsValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DB: &str = r#"
@@ -113,7 +113,7 @@ async fn settle_until(db: &Db, rec: &str, want: f64) -> f64 {
 
 /// Drive one process cycle, the way anything else in the IOC would.
 async fn process(db: &Db, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links(rec, &mut visited).await;
 }
 

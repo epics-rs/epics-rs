@@ -28,6 +28,8 @@ fn main() {
     println!("cargo::rerun-if-changed=src/contract.rs");
     println!("cargo::rerun-if-env-changed={BSP_PREFIX_ENV}");
     println!("cargo::rerun-if-env-changed={BSP_ENV}");
+    println!("cargo::rerun-if-env-changed={CMDLINE_ENV}");
+    println!("cargo::rerun-if-env-changed={KQUEUE_ENV}");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("rtems") {
         return;
@@ -70,6 +72,16 @@ fn main() {
         .define(&format!("BSP_{}", prefix.bsp), None)
         .warnings(true);
 
+    // Not echoed here: `csrc/rtems_init.c` prints the line it parsed at boot
+    // ("rtems-boot: boot command line (N argument(s)): [...]"), which is the
+    // report that comes from the image that actually holds it.
+    if let Some(cmdline) = boot_cmdline() {
+        build.define(
+            "EPICS_RTEMS_CMDLINE",
+            Some(format!("\"{cmdline}\"").as_str()),
+        );
+    }
+
     // `cc` cannot guess a cross compiler for a tier-3 triple. An explicit
     // CC_armv7_rtems_eabihf wins if the operator set one; otherwise take the
     // driver from the same prefix everything else is derived from.
@@ -102,4 +114,72 @@ fn main() {
     }
 
     println!("cargo::rustc-cfg=rtems_boot_linked");
+}
+
+/// The environment variable carrying the image's boot command line.
+const CMDLINE_ENV: &str = "EPICS_RTEMS_CMDLINE";
+
+/// The readiness-backend override, forwarded from the build environment into
+/// that line. See [`boot_cmdline`].
+const KQUEUE_ENV: &str = "EPICS_RTEMS_KQUEUE";
+
+/// `csrc/rtems_init.c`'s `boot_cmdline` buffer. A longer line is refused here
+/// rather than truncated, for the reason the C side refuses an oversized DHCP
+/// value: half an address list is a wrong address list.
+const BOOT_CMDLINE_CAPACITY: usize = 1024;
+
+/// The boot command line to compile in, or `None` for the empty default.
+///
+/// `csrc/rtems_init.c` takes the line from the compile-time
+/// `EPICS_RTEMS_CMDLINE` define, overridden at run time by the DHCP
+/// `rtems_cmdline` option. There is no third source: QEMU's `-append` does not
+/// reach it, and a variable exported in the build shell is the *host's*
+/// environment, not the target's. So a define is what an image built outside a
+/// DHCP site has, and this is where it is made.
+///
+/// `EPICS_RTEMS_KQUEUE` is forwarded because the prefix's generated
+/// `epics-rs-env.sh` sets it (`scripts/rtems-bsp.sh`: a series-6 tree reports
+/// 6.0.0, below the 6.3 the readiness gate needs, though the script asserted
+/// the fixes are in the tree it built) — and the gate reads it in the target
+/// process. Without this forward that export selected nothing; it only ever
+/// configured the build host. It is prepended, so an assignment of the same
+/// name inside `EPICS_RTEMS_CMDLINE` comes later and wins: `boot_args` applies
+/// assignments in the order they appear.
+fn boot_cmdline() -> Option<String> {
+    let mut line = String::new();
+    if let Ok(kqueue) = std::env::var(KQUEUE_ENV) {
+        let kqueue = kqueue.trim();
+        if !kqueue.is_empty() {
+            line.push_str(&format!("{KQUEUE_ENV}={kqueue}"));
+        }
+    }
+    if let Ok(extra) = std::env::var(CMDLINE_ENV) {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(extra);
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+    // The line becomes a C string literal. A quote or a backslash would end or
+    // re-interpret it, so neither is escaped away into something the operator
+    // did not write - it is refused.
+    if let Some(bad) = line.chars().find(|c| matches!(c, '"' | '\\')) {
+        panic!(
+            "{CMDLINE_ENV}/{KQUEUE_ENV} produced a boot command line containing {bad:?}, \
+             which cannot go through a C string literal: {line}"
+        );
+    }
+    if line.len() >= BOOT_CMDLINE_CAPACITY {
+        panic!(
+            "boot command line is {} bytes; csrc/rtems_init.c's buffer is \
+             {BOOT_CMDLINE_CAPACITY}: {line}",
+            line.len()
+        );
+    }
+    Some(line)
 }

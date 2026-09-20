@@ -131,7 +131,7 @@ async fn a_put_queued_behind_a_failing_cycle_still_gets_its_restart() {
         .await
         .expect("the no-notify route has no PACT gate");
     assert_eq!(pact(&db, "PARKED"), 0, "the park is released");
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("PARKED", &mut visited).await;
 
     assert!(
@@ -168,7 +168,7 @@ async fn a_put_queued_behind_a_succeeding_cycle_gets_its_restart_the_ordinary_wa
     db.put_record_field_from_ca_no_notify("PARKED", "SNAM", EpicsValue::String("fine".into()))
         .await
         .expect("the no-notify route has no PACT gate");
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("PARKED", &mut visited).await;
 
     assert!(settled(first).await, "the first replays");

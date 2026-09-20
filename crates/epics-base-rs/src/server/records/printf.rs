@@ -862,6 +862,17 @@ impl Record for PrintfRecord {
         Some(EpicsValue::CharArray(self.val.as_bytes().to_vec()))
     }
 
+    /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 10 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'0')?);
+        self.inp_links.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
@@ -977,19 +988,27 @@ impl Record for PrintfRecord {
     /// (epics-base#183). Every other conversion's numeric request is
     /// value-equivalent to the native fetch (`%ls` reads the char array the
     /// native fetch already delivers).
-    fn input_link_read_as(
-        &self,
-        link_field: &str,
-        _source: &crate::server::record::OutTarget,
-    ) -> Option<crate::server::record::LinkReadAs> {
-        use crate::server::record::LinkReadAs;
-        Some(match Self::inp_index(link_field) {
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match Self::inp_index(link_field) {
             Some(idx) if self.plain_string_slots()[idx] => LinkReadAs::String,
             _ => LinkReadAs::Native,
         })
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// `FMT` is a field, so the request above is the instance's.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
+    /// The `INP0..INP9` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_links)
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INP0", "A"),
             ("INP1", "B"),
@@ -1004,14 +1023,17 @@ impl Record for PrintfRecord {
         ]
     }
 
-    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+    fn set_resolved_input_links(
+        &mut self,
+        resolved: crate::server::record::ResolvedInputLinks<'_>,
+    ) {
         // Record which INPn links produced a value this cycle so
         // `apply_fmt` can emit IVLS for the directives whose link read
         // failed (C `printfRecord.c` F_BADLNK). The framework passes the
         // `link_field` names ("INP0".."INP9") that resolved; any slot not
         // listed is a failed/unconfigured link this cycle.
         self.resolved = [false; 10];
-        for &lf in resolved {
+        for lf in resolved.names() {
             if let Some(idx) = Self::inp_index(lf) {
                 self.resolved[idx] = true;
             }

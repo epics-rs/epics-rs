@@ -13,8 +13,6 @@
 //! `write_out_link_value`'s single-raise invariant. SIOL now goes through the
 //! put owner like every other OUT link.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -23,7 +21,7 @@ use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

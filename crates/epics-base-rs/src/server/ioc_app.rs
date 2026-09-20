@@ -2566,8 +2566,8 @@ pub(crate) fn attach_device_support(
     name: &str,
     resolve: Option<&DeviceSupportResolver>,
 ) -> bool {
-    let dtyp = instance.common.dtyp.clone();
-    if crate::server::device_support::is_soft_dtyp(&dtyp) {
+    let dtyp = instance.common.dtyp.as_str().to_string();
+    if instance.common.dtyp.is_soft() {
         // A soft channel needs no dset. Its `"Async Soft Channel"` variant
         // still owns an `add_record`, but that is C's `doResolveLinks` moment,
         // which sits BETWEEN the two init passes — so the init owner runs it,
@@ -2784,7 +2784,7 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
 /// the other.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     let all_names = db.all_record_names().await;
-    let io_intr_recs: Vec<(String, Arc<parking_lot::RwLock<record::RecordInstance>>)> = {
+    let io_intr_recs: Vec<(String, Arc<record::RecordCell>)> = {
         let mut recs = Vec::new();
         for name in &all_names {
             if let Some(arc) = db.get_record(name) {
@@ -2855,7 +2855,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                     if !process {
                         continue;
                     }
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = crate::server::database::ProcStack::new();
                     // Driver-callback cycle: an output (`asyn:READBACK`)
                     // record reads the value back into VAL and skips the
                     // device write; input records are unaffected.
@@ -3557,7 +3557,7 @@ mod tests {
             let rec = db.get_record("BO:RBK").unwrap();
             let mut inst = rec.write();
             // Non-soft DTYP so the read stage is eligible to run.
-            inst.common.dtyp = "TestReadback".to_string();
+            inst.common.dtyp = "TestReadback".into();
             inst.device = Some(Box::new(ReadbackDev {
                 writes: writes.clone(),
                 readback_val: 0,
@@ -3567,7 +3567,7 @@ mod tests {
         // Driver-callback cycle: the driver reported Acquire=0 (acquisition
         // done). The record must read 0 back into VAL and must NOT write.
         {
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = crate::server::database::ProcStack::new();
             db.process_record_readback("BO:RBK", &mut visited)
                 .await
                 .unwrap();
@@ -3595,7 +3595,7 @@ mod tests {
             inst.record.put_field("VAL", EpicsValue::Enum(1)).unwrap();
         }
         {
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = crate::server::database::ProcStack::new();
             db.process_record_with_links("BO:RBK", &mut visited)
                 .await
                 .unwrap();

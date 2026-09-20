@@ -4446,19 +4446,25 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
     rec.conv.urip = true;
     rec.links.rdbl = "ext_readback.RBV".to_string();
 
-    rec.set_resolved_input_links(&[]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &[],
+    ));
     assert!(
         rec.conv.rdbl_error,
         "missing RDBL in the report = failed read"
     );
 
-    rec.set_resolved_input_links(&["RDBL"]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &["RDBL"],
+    ));
     assert!(!rec.conv.rdbl_error, "resolved RDBL clears the error");
 
     // UEIP=Yes wins the C else-if chain (3676): the RDBL read is not
     // requested, so a stale report must not re-latch the error.
     rec.conv.ueip = true;
-    rec.set_resolved_input_links(&[]);
+    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
+        &[],
+    ));
     assert!(!rec.conv.rdbl_error, "no RDBL read under UEIP=Yes");
 }
 
@@ -6184,7 +6190,7 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     let mut rec = MotorRecord::new();
     rec.pos.rbv = 42.0;
     rec.pos.val = 10.0; // setpoint differs from readback
-    assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(42.0)));
+    assert_eq!(rec.monitor_deadband_value(), Some(42.0));
 }
 
 // --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc
@@ -7893,8 +7899,8 @@ fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's
     // deadband owner performs that write through put_field
-    // (put_coerced); the arms must accept it even though the fields
-    // stay SPC_NOMOD toward CA. Pre-fix the write was FieldNotFound
+    // (`store_monitor_last_posted`); the arms must accept it even though
+    // the fields stay SPC_NOMOD toward CA. Pre-fix the write was FieldNotFound
     // (silently swallowed) and the anchor read 0.0 forever.
     let mut rec = MotorRecord::new();
     rec.put_field("MLST", EpicsValue::Double(3.5)).unwrap();
@@ -9049,7 +9055,7 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // Quiescent pass: no alarm transition, DMOV unchanged — no DMOV post.
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "DMOV"),
+        !snap.iter().any(|(k, _, _)| k == "DMOV"),
         "no alarm and no change: DMOV must not post"
     );
 
@@ -9066,7 +9072,6 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
         .insert(MstaFlags::PROBLEM);
     let (snap, _) = instance.process_local().unwrap();
     let dmov_mask = snap
-        .changed_fields
         .iter()
         .find(|(k, _, _)| k == "DMOV")
         .map(|(_, _, m)| *m);

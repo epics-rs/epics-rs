@@ -26,15 +26,13 @@
 //! window between cycles — which is exactly what a `caget .LA` is for. The port
 //! did not serve the fields at all: `caget TR.LA` failed.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

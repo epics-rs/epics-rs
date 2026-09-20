@@ -15,7 +15,6 @@
 //! test-thread stack.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -57,7 +56,7 @@ fn a_forty_deep_flnk_chain_processes_every_record() {
         .spawn(|| {
             epics_base_rs::runtime::task::test_block_on(async {
                 let db = chain_db().await;
-                let mut visited = HashSet::new();
+                let mut visited = epics_base_rs::server::database::ProcStack::new();
                 db.process_record_with_links("L0", &mut visited)
                     .await
                     .expect("the head processes");

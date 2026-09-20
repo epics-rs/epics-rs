@@ -14,7 +14,6 @@
 // and passes under `EPICS_RS_BUILD_EXEC_BACKEND=thread`; the other 11 drive a
 // live `CaServer` and leave the exec-backend suite with it.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -311,7 +310,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         inst.common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CADST", &mut visited)
         .await
         .unwrap();

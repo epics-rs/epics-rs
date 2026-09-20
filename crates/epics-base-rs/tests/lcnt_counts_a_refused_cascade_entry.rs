@@ -28,7 +28,6 @@
 //! never reached `dbProcess` at all.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -57,7 +56,11 @@ fn lcnt_of(db: &PvDatabase, rec: &str) -> i16 {
 fn alarm_of(db: &PvDatabase, rec: &str) -> (u16, AlarmSeverity, String) {
     let inst = db.get_record(rec).expect("record exists");
     let g = inst.read();
-    (g.common.stat, g.common.sevr, g.common.amsg.clone())
+    (
+        g.common.stat,
+        g.common.sevr,
+        g.common.amsg.as_str().to_owned(),
+    )
 }
 
 /// Boundary: the SYNCHRONOUS half — a record already on the current process
@@ -73,7 +76,7 @@ async fn a_cycle_back_into_the_running_record_counts_in_lcnt() {
     )
     .await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LCNT:A", &mut visited)
         .await
         .unwrap();
@@ -123,7 +126,7 @@ async fn a_pact_link_target_accrues_lcnt_and_alarms_past_max_lock() {
     }
 
     for i in 1..=10 {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("LCNTP:SRC", &mut visited)
             .await
             .unwrap();
@@ -139,7 +142,7 @@ async fn a_pact_link_target_accrues_lcnt_and_alarms_past_max_lock() {
         );
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LCNTP:SRC", &mut visited)
         .await
         .unwrap();

@@ -134,7 +134,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
         r.write().common.udf = 1;
     }
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASUB", &mut visited)
         .await
         .unwrap();

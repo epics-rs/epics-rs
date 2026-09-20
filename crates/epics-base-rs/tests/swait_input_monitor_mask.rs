@@ -22,8 +22,6 @@
 //! a field posts that field `DBE_VALUE | DBE_LOG` on its own, which is a
 //! different post from `monitor()`'s.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -61,7 +59,7 @@ async fn swait_db(mdel: f64, adel: f64) -> PvDatabase {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

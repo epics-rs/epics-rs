@@ -6,14 +6,13 @@
 //! `AsyncPendingNotify` pass (DMOV 1→0), and the readback pass drives the
 //! completion (DMOV 0→1).
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynError;
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use asyn_rs::user::AsynUser;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -114,12 +113,12 @@ impl MotorFixture {
         {
             let arc = db.get_record("M1").unwrap();
             let mut inst = arc.write();
-            inst.common.dtyp = "simMotor".to_string();
+            inst.common.dtyp = "simMotor".into();
             inst.device = Some(Box::new(dev));
         }
 
         // Startup pass consumes the status `init` seeded (seq 1).
-        db.process_record_readback("M1", &mut HashSet::new())
+        db.process_record_readback("M1", &mut ProcStack::new())
             .await
             .unwrap();
 
@@ -152,7 +151,7 @@ impl MotorFixture {
             status,
         });
         self.db
-            .process_record_readback("M1", &mut HashSet::new())
+            .process_record_readback("M1", &mut ProcStack::new())
             .await
             .unwrap();
         assert_eq!(

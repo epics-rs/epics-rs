@@ -36,8 +36,6 @@
 //! INP="SRC" : SEVR=NO_ALARM STAT=NO_ALARM  NUSE=2  VAL=7 7   (two processes)
 //! ```
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -62,7 +60,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

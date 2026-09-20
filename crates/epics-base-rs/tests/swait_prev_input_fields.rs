@@ -17,8 +17,6 @@
 //! LA, both with `monitor_mask | DBE_VALUE` — the mask R9-72 gave A. The port
 //! had no LA..LL fields at all.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -47,7 +45,7 @@ async fn swait_db() -> PvDatabase {
 }
 
 async fn process(db: &PvDatabase) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut visited)
         .await
         .unwrap();

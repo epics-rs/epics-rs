@@ -177,7 +177,7 @@ async fn an_unresolved_snam_leaves_the_sub_record_undefined() {
         .unwrap();
     db.add_record("S1", rec).await.unwrap();
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("S1", &mut visited)
         .await
         .unwrap();

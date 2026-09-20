@@ -114,21 +114,26 @@ impl Record for LsiRecord {
     /// with no alarm. That silent success is the same wart family as
     /// `putStringUlong`'s accepted-but-writes-nothing (`c_parse.rs`); the
     /// port keeps its failed-read LINK alarm instead.
-    fn input_link_read_as(
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        match link_field {
+            "INP" | "SIOL" => InputLinkRequest::FromSource,
+            _ => InputLinkRequest::As(LinkReadAs::Native),
+        }
+    }
+
+    fn input_link_read_as_from_source(
         &self,
-        link_field: &str,
+        _link_field: &str,
         source: &crate::server::record::OutTarget,
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
         use crate::types::DbFieldType;
-        Some(match link_field {
-            "INP" | "SIOL" => match source.field_type {
-                Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
-                    max_elements: self.sizv as usize,
-                },
-                _ => LinkReadAs::String,
+        Some(match source.field_type {
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
+                max_elements: self.sizv as usize,
             },
-            _ => LinkReadAs::Native,
+            _ => LinkReadAs::String,
         })
     }
 

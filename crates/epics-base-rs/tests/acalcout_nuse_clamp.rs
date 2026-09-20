@@ -31,7 +31,6 @@ use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use std::collections::HashSet;
 
 async fn acalcout_db(nelm: u32, nuse: u32) -> PvDatabase {
     let db = PvDatabase::new();
@@ -51,7 +50,7 @@ async fn nuse(db: &PvDatabase) -> u32 {
 }
 
 async fn process(db: &PvDatabase) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut visited)
         .await
         .unwrap();

@@ -23,7 +23,7 @@
 //! as unsigned, so CA stops reaching this arm); the `DBF_CHAR -> DBF_ENUM`
 //! LINK path still does.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -142,7 +142,7 @@ async fn a_char_waveform_linked_into_an_enum_waveform_lands_signed() {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .expect("process");

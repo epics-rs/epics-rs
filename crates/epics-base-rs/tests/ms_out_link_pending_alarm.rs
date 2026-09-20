@@ -24,8 +24,6 @@
 //! the `dispatch_multi_output` path (dfanout OUTx), the recovery cycle, and
 //! NMS (no propagation at all).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -50,7 +48,7 @@ async fn add_source(db: &PvDatabase) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

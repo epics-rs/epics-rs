@@ -15,10 +15,8 @@
 //! and an out-of-band post with no bucket; the control keeps a subscriber
 //! throughout.
 
-use std::collections::HashSet;
-
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::*;
@@ -89,7 +87,7 @@ async fn mover_db() -> PvDatabase {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
@@ -199,7 +197,7 @@ async fn acalcout_unwatched_odly_then_subscribe_sees_dlya_rise() {
         let db = db.clone();
         async move {
             process(&db, "AC").await;
-            db.process_record_continuation("AC", &mut HashSet::new())
+            db.process_record_continuation("AC", &mut ProcStack::new())
                 .await
                 .unwrap();
         }

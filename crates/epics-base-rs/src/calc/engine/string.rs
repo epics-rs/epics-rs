@@ -6,6 +6,13 @@ use super::random::local_random;
 use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
+/// `sCalcPostfix.c` — `#define SCALC_STACKSIZE 30`, the ceiling the sCalc
+/// element table declares (`token.rs` `SCALC_TABLE.stack_size`).
+const SCALC_STACKSIZE: usize = 30;
+
+/// C `sCalcPerform`'s frame-resident operand stack.
+type Stack = super::stack::Stack<StackValue, SCALC_STACKSIZE>;
+
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
     // C `sCalcPerform.c:396` — `if (*post == END_EXPRESSION) return(-1);`,
     // checked before anything else, so an empty CALC (which sCalcPostfix
@@ -20,7 +27,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     // whether or not they are ever reached.
     expr.check_until_ceiling()?;
 
-    let mut stack: Vec<StackValue> = Vec::with_capacity(20);
+    let mut stack = Stack::new();
     let code = &expr.code;
     let mut pc = 0;
     // C's `until_scratch[]` (`sCalcPerform.c:330`) and `loopsDone` (`:331`) —
@@ -989,9 +996,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     // model: C's double-only evaluator has no `case SUBLAST`, silently skips it, and
     // the operand it should have consumed is what trips this check. That gap is
     // reported separately; it is not this guard.)
-    let result = match <[StackValue; 1]>::try_from(stack) {
-        Ok([result]) => result,
-        Err(_) => return Err(CalcError::StackLeak),
+    if stack.overflowed() {
+        return Err(CalcError::Overflow);
+    }
+    let Some(result) = stack.into_only() else {
+        return Err(CalcError::StackLeak);
     };
     // The non-finite tail (`sCalcPerform.c:834`, `:2056`) is NOT this
     // function's business: C writes `*presult` FIRST and only then returns -1,
@@ -1892,17 +1901,17 @@ pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcR
     }
 }
 
-fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
+fn pop1(stack: &mut Stack) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
 /// Pop `n` operands in C's scan order: `[0]` is the top of the stack, which is
 /// where C's `ps` starts and the direction its `DEC(ps)` walks.
-fn pop_n(stack: &mut Vec<StackValue>, n: usize) -> Result<Vec<StackValue>, CalcError> {
+fn pop_n(stack: &mut Stack, n: usize) -> Result<Vec<StackValue>, CalcError> {
     if n == 0 || stack.len() < n {
         return Err(CalcError::Underflow);
     }
-    Ok(stack.split_off(stack.len() - n).into_iter().rev().collect())
+    Ok(stack.take_top(n).into_iter().rev().collect())
 }
 
 /// C's mixed-type rule for the binary operators that HAVE a string branch —
@@ -2100,12 +2109,12 @@ fn subrange_bounds(subject: &[u8], start: &StackValue, end: &StackValue) -> (i64
 /// (sCalcPerform.c: MULT, DIV, POWER, MODULO, the trig/log/abs/sqrt functions,
 /// COND_IF, REL_AND/OR/NOT, the bit ops, ...), which coerces a string instead
 /// of rejecting it — so this cannot fail on type, only on underflow.
-fn pop1_f64(stack: &mut Vec<StackValue>) -> Result<f64, CalcError> {
+fn pop1_f64(stack: &mut Stack) -> Result<f64, CalcError> {
     let v = stack.pop().ok_or(CalcError::Underflow)?;
     Ok(v.to_double())
 }
 
-fn pop2_f64(stack: &mut Vec<StackValue>) -> Result<(f64, f64), CalcError> {
+fn pop2_f64(stack: &mut Stack) -> Result<(f64, f64), CalcError> {
     let b = pop1_f64(stack)?;
     let a = pop1_f64(stack)?;
     Ok((a, b))

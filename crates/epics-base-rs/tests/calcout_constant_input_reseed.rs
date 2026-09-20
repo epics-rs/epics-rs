@@ -39,7 +39,6 @@ use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     db.get_record(rec)
@@ -57,7 +56,7 @@ async fn put(db: &PvDatabase, rec: &str, f: &str, v: &str) {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

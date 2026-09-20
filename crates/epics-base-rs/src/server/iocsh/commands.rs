@@ -1104,7 +1104,7 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
 /// block and `dbtgf T:AI.RSET` the option block plus twelve `failed.` lines,
 /// where this port printed nothing and `PV 'T:AI.RSET' not found`.
 struct DbAddr {
-    rec: Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    rec: Arc<crate::server::record::RecordCell>,
     /// C's `pfldDes->name`: uppercased, and `VAL` when the name carried no
     /// dot.
     field: String,
@@ -2054,8 +2054,9 @@ fn dbpr_no_access(
             ),
         );
     }
+    let bkpt = inst.common.bkpt.get();
     let bytes: &[u8] = match d.name {
-        "BKPT" => std::slice::from_ref(&inst.common.bkpt),
+        "BKPT" => std::slice::from_ref(&bkpt),
         _ => return None,
     };
     let mut out = String::new();
@@ -6431,9 +6432,9 @@ fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &str) -> V
                 // The addressed record, not the raw half: `resolve_alias`
                 // and `get_record_no_resolve` both miss on `src.[2]`, and the
                 // `?` below then dropped every filtered link from the report.
-                let addressed = link.target().record;
+                let addressed = &link.target().record;
                 let target = db
-                    .resolve_alias(&addressed)
+                    .resolve_alias(addressed)
                     .unwrap_or_else(|| addressed.clone());
                 db.get_record_no_resolve(&target)?;
                 let pp = if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive
@@ -10651,7 +10652,7 @@ record(bo, "$(P)_calc_ctrl") {{
             ctx.block_on(async {
                 let rec = db.get_record(name).expect("record loaded");
                 let inst = rec.read();
-                inst.common.dtyp.clone()
+                inst.common.dtyp.as_str().to_string()
             })
         };
 
@@ -10731,7 +10732,7 @@ record(bo, "$(P)_calc_ctrl") {{
         let dtyp = ctx.block_on(async {
             let rec = db.get_record("DEV").expect("record present");
             let inst = rec.read();
-            inst.common.dtyp.clone()
+            inst.common.dtyp.as_str().to_string()
         });
         assert_eq!(dtyp, "Async Soft Channel");
     }
@@ -10833,7 +10834,7 @@ record(bo, "$(P)_calc_ctrl") {{
         let dtyp = ctx.block_on(async {
             let rec = db.get_record("CONTRIB").expect("record present");
             let inst = rec.read();
-            inst.common.dtyp.clone()
+            inst.common.dtyp.as_str().to_string()
         });
         assert_eq!(dtyp, "Dbpf Contributed Probe");
     }

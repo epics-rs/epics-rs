@@ -35,7 +35,7 @@
 //! is deliberately NOT adopted — only TSEL `.TIME` (`recGbl.c:317`) takes that.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -66,7 +66,7 @@ fn stamp_src(db: &Db) {
 }
 
 async fn proc(db: &Db, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

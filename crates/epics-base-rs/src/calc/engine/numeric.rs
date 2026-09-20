@@ -2,9 +2,18 @@ use super::cast::{d2i, d2ui, imod, nint};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
 use super::random::calc_random;
-use super::{CompiledExpr, NumericInputs};
+use super::{CompiledExpr, NumericInputs, NumericVars};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
+    eval_vars(expr, inputs.view())
+}
+
+/// `eval` on a borrowed arg block — the record's own `A..U`, as C's
+/// `calcPerform(&prec->a, ...)` is handed a pointer into the record.
+pub(crate) fn eval_vars(
+    expr: &CompiledExpr,
+    mut inputs: NumericVars<'_>,
+) -> Result<f64, CalcError> {
     // C `calcPerform` runs the empty program's loop zero times and leaves the
     // stack empty, so its closing `if (ptop != stack + 1) return -1`
     // (`calcPerform.c:419-420`) fails it — and `*presult` is never written, so
@@ -15,7 +24,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
         return Err(CalcError::EmptyProgram);
     }
 
-    let mut stack: Vec<f64> = Vec::with_capacity(20);
+    let mut stack = Stack::new();
     let code = &expr.code;
     let mut pc = 0;
 
@@ -403,17 +412,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
 
     // C calcPerform.c:419-420 — the stack must hold exactly one value at
     // END_EXPRESSION; otherwise the postfix was malformed.
+    // A push the frame's array could not hold. C has no such test — it writes
+    // past `stack[CALCPERFORM_STACK]` and keeps going — so this is the port
+    // refusing where C corrupts, and it is checked before the result is read so
+    // no overflowed run can answer.
+    if stack.overflowed() {
+        return Err(CalcError::Overflow);
+    }
     if stack.len() != 1 {
         return Err(CalcError::Internal);
     }
     Ok(stack[0])
 }
 
-fn pop1(stack: &mut Vec<f64>) -> Result<f64, CalcError> {
+/// `postfix.h:31` — `#define CALCPERFORM_STACK 80`, the ceiling the numeric
+/// element table declares (`token.rs` `NUMERIC_TABLE.stack_size`) and the
+/// compiler refuses to compile past.
+const CALCPERFORM_STACK: usize = 80;
+
+/// C `calcPerform`'s `double stack[CALCPERFORM_STACK+1]` (`calcPerform.c:49`).
+type Stack = super::stack::Stack<f64, CALCPERFORM_STACK>;
+
+fn pop1(stack: &mut Stack) -> Result<f64, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
-fn pop2(stack: &mut Vec<f64>) -> Result<(f64, f64), CalcError> {
+fn pop2(stack: &mut Stack) -> Result<(f64, f64), CalcError> {
     let b = stack.pop().ok_or(CalcError::Underflow)?;
     let a = stack.pop().ok_or(CalcError::Underflow)?;
     Ok((a, b))
@@ -797,6 +821,32 @@ mod parity_tests {
             eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
             CalcError::Internal
         );
+    }
+
+    /// The frame array's ceiling is refused, not written past. C has no test
+    /// here — `calcPerform` indexes off the end of `stack[CALCPERFORM_STACK+1]`
+    /// — so the program has to be hand-assembled: the compiler stops at
+    /// `runtime_depth >= CALCPERFORM_STACK`, which is why no compiled
+    /// expression can reach this.
+    #[test]
+    fn a_push_past_the_frame_array_fails_the_evaluation() {
+        use crate::calc::engine::opcodes::{CoreOp, Opcode};
+        use crate::calc::{CompiledExpr, ExprKind};
+        for (pushes, expected) in [
+            (super::CALCPERFORM_STACK, CalcError::Internal),
+            (super::CALCPERFORM_STACK + 1, CalcError::Overflow),
+        ] {
+            let mut hand_built = CompiledExpr::empty(ExprKind::Numeric);
+            hand_built.code = (0..pushes)
+                .map(|i| Opcode::Core(CoreOp::PushConst(i as f64)))
+                .chain(std::iter::once(Opcode::Core(CoreOp::End)))
+                .collect();
+            assert_eq!(
+                eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
+                expected,
+                "{pushes} pushes"
+            );
+        }
     }
 
     // L-5: VAL token reads the previous result, not the stack top.

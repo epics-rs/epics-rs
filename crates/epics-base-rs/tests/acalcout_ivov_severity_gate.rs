@@ -17,7 +17,6 @@
 //! IVOA=Set_output_to_IVOV. Severity is the framework's — the record may not
 //! re-derive it from a private flag.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,7 +102,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
         .unwrap();
     db.add_record("AC", Box::new(a)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v).await.unwrap();
 
     let rec = db.get_record("AC").unwrap();
@@ -157,7 +156,7 @@ async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
         .unwrap();
     db.add_record("AC", Box::new(a)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v).await.unwrap();
 
     assert_eq!(writes.load(Ordering::SeqCst), 0, "OOPT=Never: no OUT write");

@@ -22,8 +22,6 @@
 //! array this cycle", which is what an aCalcout-driven waveform client waits on;
 //! a second identical process must therefore not go silent.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -31,7 +29,7 @@ use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

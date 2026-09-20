@@ -49,7 +49,7 @@ async fn watch(db: &PvDatabase, field: &str, sid: u32, mask: EventMask) -> Event
 }
 
 async fn process(db: &PvDatabase) {
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SCAL", &mut visited)
         .await
         .unwrap();

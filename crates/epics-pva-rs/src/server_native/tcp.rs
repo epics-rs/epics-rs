@@ -3663,6 +3663,15 @@ impl SrvTx {
     fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// Resolves once the writer task's receiver is gone.
+    ///
+    /// [`is_closed`](Self::is_closed) answers the same question but only
+    /// when someone asks; the read loop parks for minutes at a time and
+    /// needs to be woken by the answer, not to poll for it.
+    async fn closed(&self) {
+        self.tx.closed().await
+    }
 }
 
 /// Both writer bounds — one queue slot and `len` bytes of [`TxBudget`] —
@@ -3878,6 +3887,24 @@ pub(super) async fn handle_connection_io(
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
 
+    // Peer liveness, shared because the deadline and the stamp have
+    // different owners: the read loop stamps it on every completed frame,
+    // the writer task enforces the inactivity deadline against it.
+    //
+    // It cannot be a local of the read loop. That loop parks on `tx`
+    // whenever the peer stops draining, so a deadline evaluated there is
+    // switched off by exactly the condition it exists to catch — measured:
+    // a client `SIGSTOP`ped for 60 s was never reaped and never even
+    // logged, because the heartbeat arm parked in `tx.send` before the tick
+    // that would have noticed. The client side never had this defect; its
+    // heartbeat is a separate task reading a shared `last_rx`
+    // (`client_native::server_conn`), which is the split restored here.
+    let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(now_nanos()));
+    // Set while the read loop is deliberately not reading (a CREATE_CHANNEL
+    // resolver pause). Peer silence during such a pause is this loop's
+    // doing, not the peer's, and neither watchdog has ever counted it.
+    let reads_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Spawn the dedicated writer task. All emit sites push framed bytes
     // into `tx`; the task drains and writes serially. Two failure
     // modes are detected:
@@ -3897,6 +3924,8 @@ pub(super) async fn handle_connection_io(
     let (tx, mut rx, writer_budget) = SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
+    let last_rx_writer = last_rx.clone();
+    let reads_paused_writer = reads_paused.clone();
     let writer_task = reactor.spawn(async move {
         // Dropping this guard — loop break OR abort at the `recv` await —
         // closes the byte budget so producers parked in `TxBudget::acquire`
@@ -3906,7 +3935,56 @@ pub(super) async fn handle_connection_io(
         // charge is per frame (`TxBudget::charge` clamps each one), so
         // it is returned per frame, once the batch has left.
         let mut frame_lens: Vec<usize> = Vec::new();
-        while let Some(mut batch) = rx.recv().await {
+        // The inactivity deadline, in pvxs's place rather than in the
+        // protocol loop: libevent runs a bufferevent's read timeout
+        // (`serverconn.cpp:84-85`, `tcpTimeout` = 40 s) from the I/O layer,
+        // so a silent peer is reaped whatever the protocol code is waiting
+        // on. This task is the only part of a connection that can make that
+        // promise — it is the queue's consumer, so it never waits on the
+        // queue, and its one blocking call is already bounded by
+        // `send_timeout`.
+        //
+        // Reaping is a `break`: dropping `_budget_guard` closes the byte
+        // budget and `rx`, so every producer parked in `reserve` — the
+        // heartbeat and the read-side dispatcher alike — fails and the read
+        // loop unwinds. That is the same path a hard write error takes.
+        //
+        // One armed deadline, not a ticker: it is re-armed only when it
+        // expires, for whatever silence is still owed, so a live peer costs
+        // at most one wakeup per `idle_timeout` — fewer than the 15 s
+        // heartbeat beside it — and a dead one is reaped at the deadline
+        // rather than at the next tick after it. Held pinned across
+        // iterations for the other half of that: re-creating the future per
+        // loop pass would arm a timer per frame written, which on a busy
+        // connection is the timer-wheel churn `read_frame`'s per-read
+        // `timeout()` wrapper was removed to avoid.
+        let mut idle_deadline = std::pin::pin!(epics_base_rs::runtime::task::sleep(idle_timeout));
+        loop {
+            let next = tokio::select! {
+                v = rx.recv() => v,
+                _ = idle_deadline.as_mut() => {
+                    let silent = Duration::from_nanos(
+                        now_nanos().saturating_sub(last_rx_writer.load(Ordering::Relaxed)),
+                    );
+                    // A CREATE_CHANNEL resolver pause is the read loop's own
+                    // choice, so it does not count as peer silence; re-arm on
+                    // the full period and look again.
+                    if !reads_paused_writer.load(Ordering::Relaxed) && silent >= idle_timeout {
+                        warn!(
+                            peer = ?writer_peer,
+                            ?idle_timeout,
+                            "writer task: peer sent nothing for the inactivity timeout, dropping connection"
+                        );
+                        break;
+                    }
+                    let owed = idle_timeout
+                        .saturating_sub(silent)
+                        .max(Duration::from_millis(50));
+                    idle_deadline.set(epics_base_rs::runtime::task::sleep(owed));
+                    continue;
+                }
+            };
+            let Some(mut batch) = next else { break };
             frame_lens.clear();
             frame_lens.push(batch.len());
             while batch.len() < WRITER_COALESCE_BYTES {
@@ -3950,23 +4028,26 @@ pub(super) async fn handle_connection_io(
     // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
 
-    // Per-connection liveness for the idle and read-stall watchdogs. A
-    // plain local, not an `Arc<AtomicU64>`: the read loop both stamps it
-    // (on every frame) and reads it (in the two watchdog arms), so there
-    // is no second owner to share it with.
+    // `last_rx` (declared above, before the writer task that shares it) is
+    // stamped here and read by two watchdogs: the writer's inactivity
+    // deadline, and the read-stall arm below.
     //
     // Both watchdogs measure peer silence *while this loop is reading*. A
     // CREATE_CHANNEL resolver pause (`!pending_creates.is_empty()`, the
     // gate on the socket arm) is the loop's own choice — the peer's frames
-    // sit unread in the socket — so neither arm counts it, and the stamp
-    // restarts when reads resume. libevent runs a bufferevent's read
+    // sit unread in the socket — so neither counts it, and the stamp
+    // restarts when reads resume. One of the two now lives in the writer
+    // task and reads the gate from `reads_paused` instead of from
+    // `pending_creates` directly. libevent runs a bufferevent's read
     // timeout only while `EV_READ` is enabled, which is the bound pvxs's
     // connection timeout rides on.
-    let mut last_rx = now_nanos();
 
     // Server-side echo heartbeat as a deadline arm of the read loop rather
     // than a per-connection task: send ECHO_REQUEST every 15 s, and stop
-    // beating once the peer has been silent for `idle_timeout`.
+    // beating once the writer is gone. It no longer evaluates the
+    // inactivity deadline — that moved to the writer task, which is the one
+    // part of a connection that cannot be silenced by the connection's own
+    // backpressure.
     //
     // `Interval::tick` is cancel-safe — losing the race in `select!` consumes
     // no tick — so holding the interval across iterations reproduces the
@@ -3984,18 +4065,17 @@ pub(super) async fn handle_connection_io(
     // [`op_timeout`, `op_timeout` + tick period] instead of exactly at
     // `op_timeout` — an acceptable coarsening of a guard whose default
     // is 64,000 s. Unlike the heartbeat this arm is never latched off:
-    // it must keep watching after `hb_stopped`, or an idle-latched
-    // connection whose peer then wedges mid-frame would never be
+    // it must keep watching after `hb_stopped`, or a connection whose
+    // writer has gone and whose peer then wedges mid-frame would never be
     // reclaimed.
     let mut op_deadline_tick = epics_base_rs::runtime::task::interval(
         (op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)),
     );
     op_deadline_tick.tick().await;
-    // Latched when the idle watchdog fires or the writer channel closes —
-    // the two conditions that used to `break` the task's loop. Note this
-    // stops the *heartbeat*, not the connection: the task ending never tore
-    // the connection down either (its `JoinHandle` was only ever aborted),
-    // so the existing "closing" wording overstates what happens.
+    // Latched when the writer channel closes, so the probe cannot spin
+    // against a writer that is gone while the loop unwinds. Peer silence no
+    // longer latches it: that deadline belongs to the writer task now, and
+    // it ends the connection rather than only the heartbeat.
     let mut hb_stopped = false;
 
     // Outbound byte order as a shared, mutable per-connection cell, seeded
@@ -4171,6 +4251,12 @@ pub(super) async fn handle_connection_io(
         // channels HashMap drop fires its AbortOnDrop chain and the
         // peer's connection slot is released within ms instead of
         // ~30-45 s.
+        //
+        // This covers a writer that died while this loop was running —
+        // a dispatch path's own `tx.send` failing. A writer that dies
+        // while the loop is parked is caught by the `tx.closed()` arm of
+        // the select below, which is the only one of the two that can
+        // wake it.
         if tx.is_closed() {
             return Ok(());
         }
@@ -4191,8 +4277,36 @@ pub(super) async fn handle_connection_io(
         // (pvxs cannot: `doReply` transitions at `serverget.cpp:112-115` and
         // enqueues at `:124`, on the loop that reads frames). Every completion
         // source is finite per in-flight op, so the socket arm cannot starve.
+        //
+        // Publish whether the next park is this loop's own choice before
+        // taking it: a CREATE_CHANNEL resolver pause leaves the peer's
+        // frames unread in the socket, so its silence is not the peer's and
+        // must not count against the inactivity deadline the writer task
+        // enforces. Both watchdogs used to read `pending_creates` directly;
+        // one of them no longer can, so the gate is published instead of
+        // duplicated.
+        reads_paused.store(!pending_creates.is_empty(), Ordering::Relaxed);
         let frame = tokio::select! {
             biased;
+            // The writer task is gone: it hit a write error, its
+            // `send_timeout`, or its inactivity deadline. Nothing produced
+            // after this point can reach the peer, so this outranks every
+            // other arm.
+            //
+            // It has to be an arm and not only the loop-top
+            // `tx.is_closed()` check. The condition this loop is parked on
+            // is the peer sending a frame, and the connection the writer
+            // reaps is by definition one where that never happens — the
+            // check at the top is not reached again until some unrelated
+            // timer fires. Measured before this arm existed: the writer
+            // logged the drop at its 45 s deadline and the socket stayed
+            // open to 60 s, closing only when the next 15 s heartbeat tick
+            // failed its `tx.send`. pvxs has no equivalent gap because the
+            // timeout is libevent's on the bufferevent itself, which owns
+            // the fd.
+            _ = tx.closed() => {
+                return Ok(());
+            }
             cc_opt = cc_rx.recv() => {
                 // A worker finished one CREATE_CHANNEL entry. `None` means
                 // every resolver worker is gone (source panics inside
@@ -4477,7 +4591,7 @@ pub(super) async fn handle_connection_io(
                 if pending_creates.is_empty() {
                     // Reads resume. The pause was this loop's choice, not
                     // peer silence, so the watchdog clocks restart here.
-                    last_rx = now_nanos();
+                    last_rx.store(now_nanos(), Ordering::Relaxed);
                 }
                 continue;
             }
@@ -4520,24 +4634,18 @@ pub(super) async fn handle_connection_io(
                 continue;
             }
             _ = hb_tick.tick(), if !hb_stopped => {
-                // Server-side echo heartbeat, formerly its own per-connection
-                // task. Same cadence, same frame, same two stop conditions —
-                // only the owner changed, from a task reading `last_rx` and
-                // `out_order` through shared cells to this loop reading its
-                // own `last_rx` and `order` directly.
-                let elapsed = now_nanos().saturating_sub(last_rx);
-                if pending_creates.is_empty() && Duration::from_nanos(elapsed) > idle_timeout {
-                    warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
-                    hb_stopped = true;
-                    continue;
-                }
+                // Server-side echo heartbeat: probe only. The inactivity
+                // deadline it used to evaluate here moved to the writer
+                // task, which can act on it — this arm could not, because
+                // the `tx.send` below parks on a congested queue and the
+                // next tick never arrives.
                 let h = PvaHeader::control(true, order, ControlCommand::EchoRequest.code(), 0);
                 let mut buf = Vec::with_capacity(8);
                 h.write_into(&mut buf);
                 if tx.send(buf).await.is_err() {
-                    // Writer gone. The loop-top `tx.is_closed()` check
-                    // unwinds the connection on the next iteration; stop
-                    // beating so this arm cannot spin in the meantime.
+                    // Writer gone. The `tx.closed()` arm above unwinds the
+                    // connection on the next iteration; stop beating so
+                    // this arm cannot spin in the meantime.
                     hb_stopped = true;
                 }
                 continue;
@@ -4549,7 +4657,7 @@ pub(super) async fn handle_connection_io(
                 // sent no complete frame for `op_timeout` while the loop
                 // was reading — a wedged or byte-trickling circuit, never
                 // a resolver pause.
-                let elapsed = now_nanos().saturating_sub(last_rx);
+                let elapsed = now_nanos().saturating_sub(last_rx.load(Ordering::Relaxed));
                 if pending_creates.is_empty() && Duration::from_nanos(elapsed) >= op_timeout {
                     return Err(PvaError::Timeout);
                 }
@@ -4568,7 +4676,7 @@ pub(super) async fn handle_connection_io(
         // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
-        last_rx = now_nanos();
+        last_rx.store(now_nanos(), Ordering::Relaxed);
         if frame.header.flags.is_control() {
             // A peer may re-negotiate the connection byte order mid-stream
             // with another SET_BYTE_ORDER control frame. pvxs latches

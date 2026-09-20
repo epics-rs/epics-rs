@@ -475,7 +475,7 @@ pub(crate) fn is_local_source(src: SocketAddr, diag: Diag) -> bool {
     sock.bind(&probe).is_ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     /// fd 1 / fd 2 capture for the two daemon tests below.
@@ -486,11 +486,12 @@ mod tests {
     /// away first is this one, so a helper left over there is stranded with no
     /// caller at all.
     ///
-    /// Gated once, here. `capture_streams` dups and swaps this process's fds 1
-    /// and 2, so it is unix-only; carrying that `#[cfg]` on the function
-    /// instead left the module inhabited on Windows and an ungated `use` of a
-    /// name that was configured out, which is E0432 rather than a quiet skip.
-    #[cfg(unix)]
+    /// Gated once, on the tests module. `capture_streams` dups and swaps this
+    /// process's fds 1 and 2, so it is unix-only, and every test here goes
+    /// through it. Carrying the `#[cfg]` on the function instead left the
+    /// module inhabited on Windows and an ungated `use` of a name that was
+    /// configured out (E0432); carrying it per item left the module's
+    /// `use super::*` with nothing to feed there.
     mod stream_capture {
         /// Serialises the fd-swapping capture below: fds 1 and 2 are
         /// process-global, so two of these running at once would cross-read.
@@ -565,7 +566,6 @@ mod tests {
     // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own current-thread
     // runtime rather than taking an ambient one; green on the exec
     // backend.
-    #[cfg(unix)]
     #[test]
     fn second_repeater_says_one_is_already_running_on_stdout() {
         // Hold the port so the daemon's exclusive bind must fail.
@@ -625,7 +625,6 @@ mod tests {
     // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
     // runtime rather than taking an ambient one; green on the exec
     // backend.
-    #[cfg(unix)]
     #[test]
     fn repeater_is_silent_at_debug_zero() {
         use std::time::{Duration, Instant};
@@ -709,7 +708,6 @@ mod tests {
     // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
     // runtime rather than taking an ambient one; green on the exec
     // backend.
-    #[cfg(unix)]
     #[test]
     fn repeater_diagnostics_carry_c_bytes_on_c_streams() {
         use std::time::{Duration, Instant};

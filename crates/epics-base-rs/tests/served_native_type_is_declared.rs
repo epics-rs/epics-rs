@@ -166,11 +166,13 @@ fn get_and_monitor_serve_what_create_channel_announced() {
         let Some(stored) = inst.resolve_field(field) else {
             continue;
         };
-        let posted = inst.make_monitor_snapshot(
-            field,
-            stored,
-            epics_base_rs::server::database::LinkBacking::none(),
-        );
+        let posted = inst
+            .make_monitor_snapshot(
+                field,
+                stored,
+                epics_base_rs::server::database::LinkBacking::none(),
+            )
+            .expect("nothing was declined: the backing is unresolved, not declined");
         if served_code(&posted.value) != announced {
             disagree.push(format!(
                 "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({:?})",

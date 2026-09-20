@@ -222,7 +222,7 @@ async fn a_precision_that_arrives_over_a_connected_link_is_not_clamped() {
     db.add_record("SRC", Box::new(src)).await.unwrap();
 
     let mut calc = epics_base_rs::server::records::calc::CalcRecord::default();
-    calc.inpa = "SRC".into();
+    calc.set_inp_link(0, "SRC");
     calc.prec = 3;
     db.add_record("CALC", Box::new(calc)).await.unwrap();
     db.ioc_init().await;

@@ -18,8 +18,6 @@
 //! and `DTYP` fell through to the numeric arm and received OVAL. The class is
 //! now settled at target resolution (`OutTarget::puts_as_string`).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -46,7 +44,7 @@ async fn add_scalcout(db: &PvDatabase, out: &str, dopt: i16) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

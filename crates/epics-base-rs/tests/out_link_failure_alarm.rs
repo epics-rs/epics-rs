@@ -16,7 +16,6 @@
 //! boundary of the put owner: local DB target, external `ca://` target, SIOL
 //! simulated output, and the recovery cycle.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::{LinkPutOp, LinkSet, PvDatabase};
@@ -93,7 +92,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     let db = PvDatabase::new();
     add_ao_with_out(&db, "AO_BADOUT", "NO_SUCH_TARGET").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADOUT", &mut visited)
         .await
         .unwrap();
@@ -116,7 +115,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
 
     add_ao_with_out(&db, "AO_BADCA", "ca://REMOTE:OUT").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADCA", &mut visited)
         .await
         .unwrap();
@@ -145,7 +144,7 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     ao.siol = "NO_SUCH_SIOL".to_string(); // no local record, no link set
     db.add_record("AO_BADSIOL", Box::new(ao)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADSIOL", &mut visited)
         .await
         .unwrap();
@@ -169,7 +168,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
 
     add_ao_with_out(&db, "AO_RECOVER", "ca://REMOTE:OUT").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
         .unwrap();
@@ -188,7 +187,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     )
     .await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
         .unwrap();
@@ -222,7 +221,7 @@ async fn r14_62_successful_local_out_put_raises_no_alarm() {
 
     add_ao_with_out(&db, "AO_GOODOUT", "AO_GOOD_DEST").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_GOODOUT", &mut visited)
         .await
         .unwrap();

@@ -31,8 +31,6 @@
 //! delivery, so the single entry the port keeps must carry the NEWEST value,
 //! never the oldest.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -45,7 +43,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 const STRINGS: [&str; 3] = ["first", "second", "third"];
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

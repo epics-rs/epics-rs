@@ -145,7 +145,12 @@
 //! SEARCH to this server's port is answered; one that relies on being told we
 //! exist is not, yet.
 
-// RTEMS-EXEC-MODEL-ALLOW(17): checked - 16 run and pass in the exec-backend suite; the 17th is `harness_reactor`'s `new_multi_thread` builder, whose `#[cfg(tokio_backend)]` arm is not compiled there at all.
+// RTEMS-EXEC-MODEL-ALLOW(18): checked - all 18 run and pass in the
+// exec-backend suite. The two inactivity-deadline tests were added to the
+// count after running them there: the deadline they exercise lives in the
+// writer task, which is the same task on both backends. `harness_reactor`'s `new_multi_thread` builder used to be
+// counted as a 17th; it sits under `#[cfg(tokio_backend)]`, so the guard now
+// accounts for it by its own gate and it must not be counted here too.
 use std::collections::HashMap;
 use std::io;
 use std::net::{
@@ -172,7 +177,7 @@ use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
 use super::source::{ChannelInvalidator, DynSource};
-use super::tcp::{ConnInit, TCP_TX_LIMIT_MULT, TX_LIMIT_FALLBACK, handle_connection_io};
+use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
 
 /// The EPICS priority every PVA server thread runs at.
@@ -203,7 +208,39 @@ use crate::error::{PvaError, PvaResult};
 /// call `pthread_setschedparam`, and the number is load-bearing there: RTEMS
 /// pthreads inherit `POSIX_Init`'s priority, so a thread that does not take a
 /// band runs one level above idle rather than "at the default".
-const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18);
+pub(super) const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18);
+
+/// The executor a PVA server's spawned connection work runs on, or `None`
+/// where there is no band to choose.
+///
+/// `Reactor::spawn` with nothing bound lands a future on the process-global
+/// callback pool's middle band — `epicsThreadPriorityScanLow + 4` = 64, which
+/// is C's band for deferred record processing. pvxs runs its connection
+/// reactor at `CAServerLow-2` = 18, and the accept loop and poll thread here
+/// already do; the connection futures they start did not, so the server's work
+/// sat one ladder over from where the rest of it runs and shared its rings
+/// with record tails.
+///
+/// One worker: the reactor driver's whole claim is that connections cost no
+/// thread, and its futures never block (every socket is a `ReadyStream`). The
+/// blocking driver's per-connection threads are unaffected — this carries the
+/// tasks those threads spawn, the writer task above all.
+///
+/// `None` on `tokio_backend`: there the runtime is the executor and its band
+/// is the runtime's, so an executor here would be a thread nothing uses.
+#[cfg(exec_backend)]
+pub(super) fn pva_task_executor()
+-> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>> {
+    epics_base_rs::runtime::background::DedicatedExecutor::new("PVASTASK", PVA_SERVER_PRIORITY, 1)
+        .map(|e| Some(std::sync::Arc::new(e)))
+}
+
+/// See the `exec_backend` twin: on this backend there is no band to choose.
+#[cfg(tokio_backend)]
+pub(super) fn pva_task_executor()
+-> std::io::Result<Option<std::sync::Arc<epics_base_rs::runtime::background::DedicatedExecutor>>> {
+    Ok(None)
+}
 
 /// The EPICS priority the UDP SEARCH responder runs at — deliberately **not**
 /// [`PVA_SERVER_PRIORITY`].
@@ -642,6 +679,10 @@ pub struct BlockingPvaServer {
     /// [`shutdown`](Self::shutdown) order, so its `Stop`s never queue behind a
     /// live connection.
     conn_pool: WorkerPool<3>,
+    /// The executor connection futures spawn onto — see
+    /// [`pva_task_executor`]. `None` on
+    /// `tokio_backend`, where the runtime is the executor.
+    task_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
     shutdown: AtomicBool,
 }
 
@@ -731,6 +772,9 @@ impl BlockingPvaServer {
         // Read before `config` is moved into the struct; it is the pool's
         // capacity, and the pool's capacity is the connection limit.
         let max_connections = config.max_connections;
+        // Started here for the reason the worker pool is: a server that cannot
+        // run its connections' tasks is a `bind` failure.
+        let task_exec = pva_task_executor()?;
         Ok(Self {
             listener,
             source,
@@ -744,6 +788,7 @@ impl BlockingPvaServer {
             // appends `-{suffix} {index}` (e.g. `PVAS-reader 3`). Capacity is
             // the connection limit — admission refuses past it.
             conn_pool: WorkerPool::new("PVAS", connection_roster(), max_connections),
+            task_exec,
             shutdown: AtomicBool::new(false),
         })
     }
@@ -795,6 +840,22 @@ impl BlockingPvaServer {
         )
     }
 
+    /// `reactor` bound to this server's own executor, or `reactor` unchanged
+    /// where there is none to bind (`tokio_backend`).
+    ///
+    /// Called once per `serve`, at the top, so nothing below it can reach the
+    /// caller's reactor by accident: the band is a property of the server, not
+    /// of the call site that happens to spawn.
+    fn conn_reactor(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> epics_base_rs::runtime::task::Reactor {
+        match &self.task_exec {
+            Some(exec) => reactor.with_executor(exec),
+            None => reactor.clone(),
+        }
+    }
+
     /// Accept until [`shutdown`](Self::shutdown).
     ///
     /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
@@ -802,6 +863,10 @@ impl BlockingPvaServer {
     /// other work.
     pub fn serve(&self, reactor: &epics_base_rs::runtime::task::Reactor) {
         let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
+        // From here down `reactor` is the server's own — see the reactor
+        // driver's `serve`. It carries the per-connection writer task, which
+        // is this driver's one spawned future.
+        let reactor = &self.conn_reactor(reactor);
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
@@ -1051,8 +1116,10 @@ pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 /// RTEMS reason as [`bind_udp_search`]; on a failed read the connection is
 /// served under [`TX_LIMIT_FALLBACK`] instead of refused as pvxs does.
 #[cfg(unix)]
-fn tx_limit_bytes(stream: &TcpStream) -> usize {
+pub(super) fn tx_limit_bytes(stream: &TcpStream) -> usize {
     use std::os::fd::AsRawFd;
+
+    use super::tcp::TCP_TX_LIMIT_MULT;
     let mut val: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: the fd is a valid open socket borrowed from `stream`; `val`
@@ -1074,7 +1141,7 @@ fn tx_limit_bytes(stream: &TcpStream) -> usize {
 }
 
 #[cfg(not(unix))]
-fn tx_limit_bytes(_stream: &TcpStream) -> usize {
+pub(super) fn tx_limit_bytes(_stream: &TcpStream) -> usize {
     TX_LIMIT_FALLBACK
 }
 
@@ -1162,7 +1229,7 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 ///   peeled out of an ORIGIN_TAG prefix.
 /// * `origin_tag_forwarding = false` — no loopback multicast socket is bound,
 ///   so no forward can be emitted.
-fn handle_udp_search_blocking(
+pub(super) fn handle_udp_search_blocking(
     socket: UdpSocket,
     source: &DynSource,
     config: &PvaServerConfig,
@@ -1246,7 +1313,7 @@ fn handle_udp_search_blocking(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::codec::PvaCodec;
     use crate::proto::{
@@ -1307,6 +1374,7 @@ mod tests {
         for (file, src) in [
             ("server_native/blocking.rs", include_str!("blocking.rs")),
             ("server_native/accept.rs", include_str!("accept.rs")),
+            ("server_native/reactor.rs", include_str!("reactor.rs")),
         ] {
             let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
                 + src
@@ -1435,7 +1503,7 @@ mod tests {
         })
     }
 
-    fn test_source() -> DynSource {
+    pub(crate) fn test_source() -> DynSource {
         let pv = SharedPV::new();
         pv.open(scalar_intro(), scalar_value(1.5)).expect("open pv");
         let shared = SharedSource::new();
@@ -1446,17 +1514,17 @@ mod tests {
     /// The client end of a connection, with just enough framing to drive the
     /// server. Shared by the per-connection tests and the accept-loop tests
     /// below, so neither grows its own frame reader.
-    struct TestClient(TcpStream);
+    pub(crate) struct TestClient(pub(crate) TcpStream);
 
     impl TestClient {
-        fn connect(addr: SocketAddr) -> TestClient {
+        pub(crate) fn connect(addr: SocketAddr) -> TestClient {
             let sock = TcpStream::connect(addr).expect("connect");
             sock.set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("client read timeout");
             TestClient(sock)
         }
 
-        fn send(&mut self, bytes: &[u8]) {
+        pub(crate) fn send(&mut self, bytes: &[u8]) {
             self.0.write_all(bytes).expect("client write");
         }
 
@@ -1474,7 +1542,7 @@ mod tests {
         }
 
         /// Read frames until one carries `command` as an application message.
-        fn read_until(&mut self, command: Command) -> Vec<u8> {
+        pub(crate) fn read_until(&mut self, command: Command) -> Vec<u8> {
             for _ in 0..32 {
                 let (header, body) = self.read_frame();
                 if !header.flags.is_control() && header.command == command.code() {
@@ -1484,7 +1552,7 @@ mod tests {
             panic!("no {command:?} frame arrived within 32 frames");
         }
 
-        fn close(&self) {
+        pub(crate) fn close(&self) {
             let _ = self.0.shutdown(Shutdown::Both);
         }
     }
@@ -1578,14 +1646,14 @@ mod tests {
     /// ≤15 s heartbeat window a `select!`-arm-less design would have left.
     const RETIRE_BOUND: Duration = Duration::from_secs(5);
 
-    fn isolated_config() -> PvaServerConfig {
+    pub(crate) fn isolated_config() -> PvaServerConfig {
         PvaServerConfig {
             wire_byte_order: ByteOrder::Little,
             ..PvaServerConfig::isolated()
         }
     }
 
-    fn app_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn app_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Vec<u8> {
         // Client → server: the Server direction bit stays clear.
         let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
         let mut out = Vec::new();
@@ -1594,7 +1662,7 @@ mod tests {
         out
     }
 
-    fn create_channel_payload(cid: u32, name: &str, order: ByteOrder) -> Vec<u8> {
+    pub(crate) fn create_channel_payload(cid: u32, name: &str, order: ByteOrder) -> Vec<u8> {
         let mut payload = Vec::new();
         // `count` is a plain u16, not a Size (pvxs serverchan.cpp:269).
         payload.put_u16(1, order);
@@ -1693,16 +1761,13 @@ mod tests {
     /// SegFirst → SegMiddle … forever and `seg_buf` grows until the
     /// allocator says no.
     ///
-    /// unix-only, like every `#[cfg(unix)]` test in this module: the retire
-    /// assertion is the POSIX teardown contract — a local
-    /// `shutdown(Shutdown::Both)` returns a connection parked in a blocking
-    /// `read` behind the ~64,000 s `op_timeout` (§1.6). Windows does not
-    /// provide that wake (measured, PR #56 CI 2026-07-24: all eight of these
-    /// tests timed out on their retire bounds on both Windows runners), which
-    /// is why `exec_backend` refuses Windows at compile time
-    /// (`epics-libcom-rs/src/lib.rs`) — no production build can reach this
-    /// driver there.
-    #[cfg(unix)]
+    /// The retire assertion rests on `runtime::blocking_io`'s wait, not on
+    /// the park: a local `shutdown(Shutdown::Both)` returns a connection
+    /// parked in `read` behind the ~64,000 s `op_timeout` (§1.6) at once on
+    /// unix (`POLLHUP`), and within the wait's `WAKE_POLL_PERIOD` on Windows,
+    /// which does not return the parked `recv` itself (measured, PR #56 CI
+    /// 2026-07-24: all eight of these tests timed out on their retire bounds
+    /// on both Windows runners while the park carried the bound).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reassembly_is_capped_on_the_accumulated_size_not_the_segment() {
         let order = ByteOrder::Little;
@@ -1940,9 +2005,6 @@ mod tests {
     ///
     /// Mutation-checked: make `ConnWake::wake` a no-op and this test fails on
     /// its retire bound instead of hanging, because `wait_retired` is bounded.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_wakes_a_connection_parked_in_its_read() {
         let order = ByteOrder::Little;
@@ -2044,9 +2106,6 @@ mod tests {
     /// arrives. The connection must still retire — teardown drains `channels`,
     /// which drops each `OpState` and fires its guards — rather than the
     /// in-flight op holding the loop open.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_retires_a_connection_with_an_operation_in_flight() {
         let order = ByteOrder::Little;
@@ -2096,9 +2155,6 @@ mod tests {
     /// Boundary: `stop` called more than once, including after everything has
     /// already gone. It is a latch, not a toggle, and the second call must not
     /// find a half-removed entry or panic on one.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_is_idempotent() {
         let registry = Arc::new(ConnRegistry::new());
@@ -2156,42 +2212,130 @@ mod tests {
         assert_eq!(registry.live_connections(), 0);
     }
 
+    /// The inactivity deadline as the peer experiences it: a client that
+    /// connects and then says nothing is dropped when `idle_timeout`
+    /// expires, whatever the read loop happens to be parked on.
+    ///
+    /// The bound is the point. Before the deadline moved to the writer task
+    /// it was evaluated in the read loop's own 15 s heartbeat arm, so it
+    /// could only be noticed at a tick: a probe against a live server
+    /// measured 60.0 s for the 45 s default, and this test with its 200 ms
+    /// timeout would have taken 15 s. pvxs closes at its `tcpTimeout`
+    /// (40.0 s measured against the 40 s default) because there the timeout
+    /// is libevent's on the bufferevent, which owns the fd.
+    ///
+    /// Mutation-checked: drop the `tx.closed()` arm from the `tcp.rs`
+    /// `select!` and the connection stays parked past `RETIRE_BOUND`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_peer_is_dropped_when_the_inactivity_deadline_expires() {
+        let idle_timeout = Duration::from_millis(200);
+        let config = PvaServerConfig {
+            idle_timeout,
+            ..isolated_config()
+        };
+        let started = Instant::now();
+        // Nothing is ever sent. The server's own CONNECTION_VALIDATION is
+        // outbound and must not stand in for the peer's liveness.
+        let h = Harness::start(config, Arc::new(ConnRegistry::new()));
+        let result = h.wait_retired(RETIRE_BOUND).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= idle_timeout,
+            "a connection reaped before its own deadline: {elapsed:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "reaping a silent peer is a deliberate close, not an I/O failure: {result:?}"
+        );
+    }
+
+    /// The other half of that deadline: it is re-armed for whatever silence
+    /// is still owed, so a peer that keeps talking is never reaped. The
+    /// re-arm is what a fixed ticker got wrong in both directions — late on
+    /// a dead peer, and, with the period set anywhere near the timeout,
+    /// early on a live one.
+    ///
+    /// Ten deadlines' worth of connection at half the period, so a deadline
+    /// that failed to re-arm — or re-armed without subtracting the silence
+    /// already served — ends the connection here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_keeps_sending_outlives_the_re_armed_deadline() {
+        let order = ByteOrder::Little;
+        let config = PvaServerConfig {
+            idle_timeout: Duration::from_millis(200),
+            ..isolated_config()
+        };
+        let mut h = Harness::start(config, Arc::new(ConnRegistry::new()));
+
+        let mut echo = Vec::new();
+        PvaHeader::control(
+            false,
+            order,
+            crate::proto::ControlCommand::EchoRequest.code(),
+            0,
+        )
+        .write_into(&mut echo);
+        for _ in 0..10 {
+            h.client.send(&echo);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            !h.conn
+                .as_ref()
+                .expect("connection task present")
+                .is_finished(),
+            "a peer sending every 100 ms must not be reaped by a 200 ms deadline"
+        );
+        // The hangup below is the connection's own end-of-life path
+        // (`Protocol("client closed")`), as in every other Harness test.
+        let _ = h.finish().await;
+    }
+
     /// §4.2b without a seventh `select!` arm: a writer that ends wakes the
-    /// connection through the socket, so the reader's parked `read` returns 0
-    /// and the loop unwinds down its existing EOF path. This is what lets
-    /// `tcp.rs` stay untouched and the hosted `select!` stay byte-identical.
+    /// connection through the socket, so the reader pump's parked `read`
+    /// returns and its adapter reports end-of-stream, down which the loop
+    /// unwinds on its existing EOF path. This is what lets `tcp.rs` stay
+    /// untouched and the hosted `select!` stay byte-identical.
+    ///
+    /// Through the real reader pump, not a bare `read` on the descriptor: the
+    /// wake is the pump's contract, not the socket's. On Windows the parked
+    /// `recv` is never returned by the shutdown at all; it is the pump's wait
+    /// cap that sees it (`runtime::blocking_io`), and a bare read asserted the
+    /// one thing that target does not do. The reader guard is held until the
+    /// assertion has been made, because its drop shuts the same socket and
+    /// would otherwise answer the question this test is asking.
     ///
     /// Mutation-checked: delete the socket shutdown at the end of
     /// `runtime::blocking_io`'s writer pump and the parked reader here is never
     /// released.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[test]
     fn a_writer_that_ends_wakes_a_reader_parked_on_the_socket() {
         // The client stays connected and silent, so the only thing that can
         // return the reader's `read` is a shutdown from this side.
         let (_client, server, peer) = socket_pair();
-
         let server = Arc::new(server);
-
-        // A bare `read` on the shared descriptor stands in for the reader pump:
-        // using the pump here would bring its own guard, whose drop shuts the
-        // same socket and would answer the question this test is asking.
-        let read_sock = server.clone();
-        let (read_done, read_result) = std::sync::mpsc::channel();
-        let reader = thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = [0u8; 64];
-            let _ = read_done.send((&*read_sock).read(&mut buf));
-        });
-        thread::sleep(Duration::from_millis(200));
+        // An effectively-infinite receive bound: only the shutdown can end the
+        // pump.
+        server
+            .set_read_timeout(Some(Duration::from_secs(64_000)))
+            .expect("SO_RCVTIMEO");
 
         let label = format!("PVA connection {peer}");
-        // Held past `drop(guard)` below, so the set returns only after the pump
-        // job is joined.
-        let (_lease, _reader_worker, writer_worker) = lease_pumps();
-        let (adapter, guard) = spawn_writer_pump(
+        // Held past both guards below, so the set returns only after the pump
+        // jobs are joined.
+        let (_lease, reader_worker, writer_worker) = lease_pumps();
+        let (mut reader_adapter, reader_guard) = spawn_reader_pump(
+            reader_worker,
+            server.clone(),
+            &label,
+            DEFAULT_READ_CHUNK,
+            CHUNK_QUEUE_DEPTH,
+        );
+        // The peer sends nothing, so the pump is parked in its read.
+        thread::sleep(Duration::from_millis(200));
+
+        let (writer_adapter, writer_guard) = spawn_writer_pump(
             writer_worker,
             server.clone(),
             &label,
@@ -2201,15 +2345,32 @@ mod tests {
 
         // The pump's last strong sender goes with the guard: it ends, and on the
         // way out it shuts the socket, waking the reader.
-        drop(adapter);
-        drop(guard);
-        let n = read_result
-            .recv_timeout(RETIRE_BOUND)
-            .expect("a parked reader must be released when the writer ends")
-            .expect("the shutdown surfaces as a clean end-of-stream, not an error");
+        drop(writer_adapter);
+        drop(writer_guard);
+        let started = Instant::now();
+        let mut buf = [0u8; 64];
+        let n = loop {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+            let mut cx = Context::from_waker(Waker::noop());
+            match tokio::io::AsyncRead::poll_read(
+                std::pin::Pin::new(&mut reader_adapter),
+                &mut cx,
+                &mut read_buf,
+            ) {
+                Poll::Ready(Ok(())) => break read_buf.filled().len(),
+                Poll::Ready(Err(e)) => panic!("the woken read surfaces as end-of-stream, not {e}"),
+                Poll::Pending => {
+                    assert!(
+                        started.elapsed() < RETIRE_BOUND,
+                        "a parked reader must be released when the writer ends"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         assert_eq!(n, 0, "the woken read must report end-of-stream");
 
-        reader.join().expect("reader thread");
+        drop(reader_guard);
     }
 
     /// F6: a connection that panics while holding the registry lock must not
@@ -2286,9 +2447,6 @@ mod tests {
     /// `read` behind an `op_timeout` of ~64,000 s, holding its socket and
     /// descriptor for the life of the IOC — while `live_connections()` read 0
     /// and the `max_connections` slot came back, so nothing looked wrong.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[test]
     fn a_reader_is_released_when_connection_setup_fails_after_it_is_spawned() {
         // The client stays connected and silent, so nothing but a wake from
@@ -2337,9 +2495,6 @@ mod tests {
     /// The same guard on the panic path, which no cleanup on the error branch
     /// could have covered — `catch_unwind` stands in for a panic unwinding out
     /// of `handle_connection_io`.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[test]
     fn a_reader_is_released_when_the_connection_handler_panics() {
         let (_client, server, peer) = socket_pair();
@@ -2440,7 +2595,7 @@ mod tests {
     /// than each body pretending to be async. On RTEMS the same call is the
     /// process-global background executor and no runtime is built.
     #[cfg(tokio_backend)]
-    fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
+    pub(crate) fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
         static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         let rt = RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -2458,8 +2613,40 @@ mod tests {
     /// `exec_backend` twin: there is no runtime to build — see the
     /// `tokio_backend` copy.
     #[cfg(exec_backend)]
-    fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
+    pub(crate) fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
         crate::test_reactor()
+    }
+
+    /// The band a bound server hands its connection work, measured through the
+    /// same accessor `serve` uses.
+    ///
+    /// pvxs runs its TCP acceptor and connection reactor at `CAServerLow-2`;
+    /// before `pva_task_executor` the accept loop honoured that and every
+    /// future it spawned went to the callback pool's middle band instead.
+    #[cfg(exec_backend)]
+    #[test]
+    fn a_bound_server_spawns_its_connection_work_on_its_own_band() {
+        use std::sync::mpsc;
+        let server =
+            BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), isolated_config())
+                .expect("bind the blocking PVA server");
+        let reactor = server.conn_reactor(&harness_reactor());
+        let (tx, rx) = mpsc::channel();
+        reactor.spawn(async move {
+            tx.send(
+                std::thread::current()
+                    .name()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+            .expect("send");
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the spawned future ran"),
+            "PVASTASK",
+        );
+        server.shutdown();
     }
 
     fn start_server(config: PvaServerConfig) -> (Arc<BlockingPvaServer>, thread::JoinHandle<()>) {
@@ -2481,7 +2668,7 @@ mod tests {
     /// Poll `f` until it holds, or fail. Connection setup and teardown both
     /// finish on threads this test does not join, so every assertion about
     /// them is "eventually", and it must be a bounded eventually.
-    fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    pub(crate) fn eventually(what: &str, mut f: impl FnMut() -> bool) {
         for _ in 0..500 {
             if f() {
                 return;
@@ -2729,9 +2916,6 @@ mod tests {
     /// itself. This is the half CA's blocking server still lacks — stopping
     /// the accept loop leaves its clients running — and the reason the server
     /// owns a `ConnRegistry`.
-    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
-    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_also_ends_a_live_connection() {
         let order = ByteOrder::Little;

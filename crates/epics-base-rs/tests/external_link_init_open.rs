@@ -24,7 +24,7 @@
 //! `stage_external_link_open_by_name`, i.e. the same `LinkPutQueue` owner
 //! that consumes `connect_link`. Nothing here opens a channel inline.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -112,7 +112,7 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

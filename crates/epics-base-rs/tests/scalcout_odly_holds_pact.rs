@@ -15,8 +15,6 @@
 //! generalization of the swait PACT fix; motor's notify carries no
 //! `ReprocessAfter` and so is untouched.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -47,7 +45,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     db.add_record("SC", Box::new(sc)).await.unwrap();
 
     // Delaying cycle: ODLY>0 defers, sets DLYA=1, OUT not written.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
@@ -63,7 +61,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     // Foreign dbProcess DURING the delay (is_continuation=false): must BAIL at
     // the PACT entry guard, NOT re-enter process() while dlya==1 and fire the
     // deferred OUT early.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC", &mut v2).await.unwrap();
     assert_eq!(
         db.get_pv("TGT").unwrap().to_f64(),
@@ -73,7 +71,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     );
 
     // Continuation (bypasses the PACT guard): fires the deferred output once.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SC", &mut v3).await.unwrap();
     assert_eq!(
         db.get_pv("TGT").unwrap().to_f64(),

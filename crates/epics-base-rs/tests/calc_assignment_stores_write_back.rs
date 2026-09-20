@@ -21,8 +21,6 @@
 //! accumulates across cycles; it is visible to the second pass of the same
 //! cycle (calcout CALC → OCAL, transform channel → channel).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
@@ -66,7 +64,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

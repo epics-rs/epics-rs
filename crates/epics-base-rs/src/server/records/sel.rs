@@ -10,6 +10,26 @@ const SEL_MAX: usize = 12;
 /// 2=Low Signal, 3=Median Signal.
 const SELM_CHOICES: &[&str] = &["Specified", "High Signal", "Low Signal", "Median Signal"];
 
+/// `INPA`..`INPL` → `A`..`L`, C `selRecord.c`'s `&prec->inpa` / `&prec->a`
+/// walk. Named rather than written inline at each use because
+/// `select_input_links` hands out a SUBSLICE of it: the selected input's slot
+/// in the restricted list has to be its slot in this one, and that holds by
+/// construction only while both come from the same table.
+static SEL_INPUT_LINKS: &[(&str, &str)] = &[
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+];
+
 /// Sel (select) record — selects one of A-L based on SELM algorithm.
 pub struct SelRecord {
     pub val: f64,
@@ -348,6 +368,30 @@ impl Record for SelRecord {
         self.lalm = val;
     }
 
+    /// C reads `prec->inpa..inpl` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 12 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        Some(match slot {
+            b'A' => &self.inpa,
+            b'B' => &self.inpb,
+            b'C' => &self.inpc,
+            b'D' => &self.inpd,
+            b'E' => &self.inpe,
+            b'F' => &self.inpf,
+            b'G' => &self.inpg,
+            b'H' => &self.inph,
+            b'I' => &self.inpi,
+            b'J' => &self.inpj,
+            b'K' => &self.inpk,
+            b'L' => &self.inpl,
+            _ => return None,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -538,21 +582,28 @@ impl Record for SelRecord {
         seeds
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[
-            ("INPA", "A"),
-            ("INPB", "B"),
-            ("INPC", "C"),
-            ("INPD", "D"),
-            ("INPE", "E"),
-            ("INPF", "F"),
-            ("INPG", "G"),
-            ("INPH", "H"),
-            ("INPI", "I"),
-            ("INPJ", "J"),
-            ("INPK", "K"),
-            ("INPL", "L"),
-        ]
+    /// The 12 `INPA..INPL` texts read straight off the record's own fields, not
+    /// through the default body's 12 name matches on `link_text_ref`.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&[
+            self.inpa.as_str(),
+            self.inpb.as_str(),
+            self.inpc.as_str(),
+            self.inpd.as_str(),
+            self.inpe.as_str(),
+            self.inpf.as_str(),
+            self.inpg.as_str(),
+            self.inph.as_str(),
+            self.inpi.as_str(),
+            self.inpj.as_str(),
+            self.inpk.as_str(),
+            self.inpl.as_str(),
+        ])
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        SEL_INPUT_LINKS
     }
 
     /// C `selRecord.c::fetch_values` (lines 421-432): in `Specified`
@@ -567,18 +618,17 @@ impl Record for SelRecord {
         crate::server::record::InputFetchPolicy::ReadAllGateOnLastFailure
     }
 
+    fn narrows_input_links(&self) -> bool {
+        true
+    }
+
     fn select_input_links(
         &self,
         selector: Option<u16>,
-    ) -> Option<Vec<(&'static str, &'static str)>> {
+    ) -> Option<&'static [(&'static str, &'static str)]> {
         if self.selm == 0 {
             let idx = selector.unwrap_or(self.seln) as usize;
-            Some(
-                self.multi_input_links()
-                    .get(idx)
-                    .map(|&pair| vec![pair])
-                    .unwrap_or_default(),
-            )
+            Some(SEL_INPUT_LINKS.get(idx..=idx).unwrap_or(&[]))
         } else {
             None
         }

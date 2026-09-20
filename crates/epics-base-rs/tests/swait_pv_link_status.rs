@@ -15,8 +15,6 @@
 //! on DOLV; see `r9_76_dol_fetch_does_not_wait_for_the_classification_task` for
 //! why gating on it would be wrong.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -34,7 +32,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<EpicsValue> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

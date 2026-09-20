@@ -18,7 +18,6 @@
 //! touches `time` and not `utag`, so the tag survives in BOTH rows while the
 //! timestamp survives only in the declared one.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -75,7 +74,7 @@ async fn the_declared_tse_decides_whether_the_remote_time_survives() {
     }
 
     for name in ["TSEP_UNDEC", "TSEP_DEV"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();

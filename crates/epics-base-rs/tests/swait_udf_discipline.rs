@@ -30,12 +30,11 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
-use std::collections::HashSet;
 
 const CALC_ALARM: u16 = 12;
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

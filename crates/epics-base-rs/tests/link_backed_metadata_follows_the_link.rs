@@ -89,7 +89,7 @@ async fn a_calc_arg_serves_its_links_target_not_the_calc_record() {
     calc.prec = 7;
     calc.hopr = 100.0;
     calc.lopr = -100.0;
-    calc.inpa = "SRC".into();
+    calc.set_inp_link(0, "SRC");
     db.add_record("CALC", Box::new(calc)).await.unwrap();
     db.ioc_init().await;
 
@@ -138,7 +138,7 @@ async fn a_constant_arg_keeps_every_dbaccess_seed() {
     calc.prec = 7;
     calc.hopr = 100.0;
     calc.lopr = -100.0;
-    calc.inpb = "5".into();
+    calc.set_inp_link(1, "5");
     db.add_record("CALC", Box::new(calc)).await.unwrap();
     db.ioc_init().await;
 

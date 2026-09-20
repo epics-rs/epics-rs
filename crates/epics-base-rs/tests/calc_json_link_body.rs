@@ -300,7 +300,7 @@ async fn the_documented_two_literal_form_loads_and_evaluates() {
         .await
         .expect("build");
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let link = db.get_record("A").unwrap().read().parsed_inp.clone();
     let value = db
         .read_link_value_soft(&link, true, &mut visited)

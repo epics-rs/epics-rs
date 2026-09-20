@@ -352,7 +352,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST:SCMON", &mut visited)
         .await
         .unwrap();
@@ -457,7 +457,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
         scaler.special("CNT", true).unwrap();
     }
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST:SCVO", &mut visited)
         .await
         .unwrap();
@@ -556,7 +556,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST:SCGUARD", &mut visited)
         .await
         .unwrap();

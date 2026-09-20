@@ -21,7 +21,6 @@
 //! the same rule for `seq`'s per-group restamp (`seqRecord.c:261`); this pins
 //! it for the ordinary one-stamp cycle.
 
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::server::database::PvDatabase;
@@ -54,7 +53,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

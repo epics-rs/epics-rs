@@ -74,12 +74,8 @@ impl Record for StringinRecord {
     /// C reads INP (`devSiSoft.c:53`) and SIOL (`stringinRecord.c:208`) with
     /// a plain `dbGetLink(..., DBR_STRING, ...)`: an ENUM/MENU source
     /// delivers its state label, never the index digits (epics-base#183).
-    fn input_link_read_as(
-        &self,
-        link_field: &str,
-        _source: &crate::server::record::OutTarget,
-    ) -> Option<crate::server::record::LinkReadAs> {
-        Some(match link_field {
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
             "INP" | "SIOL" => crate::server::record::LinkReadAs::String,
             _ => crate::server::record::LinkReadAs::Native,
         })

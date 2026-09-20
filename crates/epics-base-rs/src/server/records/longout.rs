@@ -449,6 +449,10 @@ impl Record for LongoutRecord {
         self.first_output_done = true;
     }
 
+    fn redecides_after_output(&self) -> bool {
+        true
+    }
+
     /// C `longoutRecord.c::special` (PR #6c573b4 part 2): when the
     /// OUT link is rewritten at runtime and `OOCH=YES`, force the
     /// next process cycle to emit output regardless of OOPT=On_Change

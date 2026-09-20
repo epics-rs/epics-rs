@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, Ftype, InputFetchPolicy, LinkReadAs, OutTarget, ProcessOutcome, Record,
+    FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs, OutTarget,
+    ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -429,6 +430,17 @@ impl Record for ASubRecord {
         }
     }
 
+    /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 21 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Long(self.val)),
@@ -708,7 +720,14 @@ impl Record for ASubRecord {
         seeds
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// The `INPA..INPU` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp)
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         use std::sync::OnceLock;
         static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
         PAIRS.get_or_init(|| {
@@ -740,11 +759,30 @@ impl Record for ASubRecord {
     /// of `nRequest = NOx` elements). Every non-STRING FTx likewise reads
     /// native — the cell is FTx-typed, so the put boundary's element-wise
     /// coercion is C's `dbGet` conversion into the FTx buffer.
-    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+    fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
         let string_channel = parse_channel(link_field)
             .filter(|(prefix, _)| *prefix == "INP")
             .is_some_and(|(_, idx)| channel_ftype(self.fta[idx]) == Ftype::String);
-        if string_channel && source.element_count <= 1 {
+        // Only a STRING channel's read depends on whether the source is a
+        // scalar; every other FTx reads native whatever the source is.
+        if string_channel {
+            InputLinkRequest::FromSource
+        } else {
+            InputLinkRequest::As(LinkReadAs::Native)
+        }
+    }
+
+    /// `FTA..FTU` are fields, so the request above is the instance's.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
+    fn input_link_read_as_from_source(
+        &self,
+        _link_field: &str,
+        source: &OutTarget,
+    ) -> Option<LinkReadAs> {
+        if source.element_count <= 1 {
             Some(LinkReadAs::String)
         } else {
             Some(LinkReadAs::Native)
@@ -776,6 +814,10 @@ impl Record for ASubRecord {
     /// the status itself, not a per-link condition. The framework's generic
     /// `multi_output_links` dispatch skips an empty link name, which is C's
     /// `dbPutLink` on an unset link (a no-op).
+    fn declares_multi_output_links(&self) -> bool {
+        true
+    }
+
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if self.sub_status == 0 {
             asub_output_links()
@@ -993,7 +1035,12 @@ mod tests {
             ..OutTarget::UNRESOLVED
         };
         assert_eq!(
-            rec.input_link_read_as("INPC", &scalar),
+            rec.input_link_request("INPC"),
+            InputLinkRequest::FromSource,
+            "a STRING channel's read depends on whether the source is scalar"
+        );
+        assert_eq!(
+            rec.input_link_read_as_from_source("INPC", &scalar),
             Some(LinkReadAs::String)
         );
         let array = OutTarget {
@@ -1001,17 +1048,19 @@ mod tests {
             ..OutTarget::UNRESOLVED
         };
         assert_eq!(
-            rec.input_link_read_as("INPC", &array),
+            rec.input_link_read_as_from_source("INPC", &array),
             Some(LinkReadAs::Native)
         );
+        // The other two settle WITHOUT the source, so the framework never
+        // resolves the target for them — that is the whole point of the split.
         assert_eq!(
-            rec.input_link_read_as("INPA", &scalar),
-            Some(LinkReadAs::Native),
-            "a DOUBLE channel reads native"
+            rec.input_link_request("INPA"),
+            InputLinkRequest::As(LinkReadAs::Native),
+            "a DOUBLE channel reads native, source unasked"
         );
         assert_eq!(
-            rec.input_link_read_as("SUBL", &scalar),
-            Some(LinkReadAs::Native),
+            rec.input_link_request("SUBL"),
+            InputLinkRequest::As(LinkReadAs::Native),
             "only INPx links carry a channel FTx"
         );
     }

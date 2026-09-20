@@ -93,7 +93,7 @@ pub struct SwaitRecord {
     // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
     // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
     pub odly: f32,
-    pub out: String,
+    pub out: crate::server::record::SparseText,
     pub prec: i16,
     // MDEL / ADEL (C `swaitRecord.dbd:477-486`, both DBF_DOUBLE): the monitor
     // and archive deadbands `monitor()` (swaitRecord.c:622-640) tests VAL
@@ -206,7 +206,7 @@ impl Default for SwaitRecord {
             oval: 0.0,
             oevt: 0,
             odly: 0.0,
-            out: String::new(),
+            out: crate::server::record::SparseText::default(),
             prec: 0,
             mdel: 0.0,
             adel: 0.0,
@@ -382,7 +382,7 @@ impl SwaitRecord {
         let handle = handle.clone();
         let mut links: Vec<String> = self.inp_names.to_vec();
         links.push(self.doln.clone());
-        links.push(self.out.clone());
+        links.push(self.out.as_str().to_owned());
         let link_gen = self.link_gen.clone();
         // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
         let token = link_gen.next();
@@ -496,7 +496,7 @@ impl Record for SwaitRecord {
     }
 
     fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.out = common.out.clone();
+        self.out.set(&common.out);
         self.refresh_link_status();
     }
 
@@ -521,7 +521,7 @@ impl Record for SwaitRecord {
         // OUTN lives in the common fields, so a runtime re-point is invisible to
         // `special()`. Catch it here — the same split calcout uses for its OUT.
         if self.out != common.out {
-            self.out = common.out.clone();
+            self.out.set(&common.out);
             self.refresh_link_status();
         }
 
@@ -622,12 +622,16 @@ impl Record for SwaitRecord {
     /// keep their previous values, and no input's connection state can gate the
     /// cycle). `Some(&[])` is "no active inputs this cycle", the same per-cycle
     /// restriction sel uses for `Specified`.
+    fn narrows_input_links(&self) -> bool {
+        true
+    }
+
     fn select_input_links(
         &self,
         _selector: Option<u16>,
-    ) -> Option<Vec<(&'static str, &'static str)>> {
+    ) -> Option<&'static [(&'static str, &'static str)]> {
         if self.simulation_active {
-            Some(Vec::new())
+            Some(&[])
         } else {
             None
         }
@@ -844,6 +848,17 @@ impl Record for SwaitRecord {
         Some(EpicsValue::Double(self.val))
     }
 
+    /// C reads `pwait->inan..inln` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 12 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp_names.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -1033,7 +1048,14 @@ impl Record for SwaitRecord {
         Ok(())
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// The `INAN..INLN` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_names)
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INAN", "A"),
             ("INBN", "B"),

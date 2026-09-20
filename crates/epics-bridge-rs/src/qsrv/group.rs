@@ -638,10 +638,7 @@ fn get_or_create_struct_array_desc<'a>(
 async fn lock_group_records_read(
     db: &PvDatabase,
     members: &[MemberChannel],
-) -> Vec<(
-    String,
-    Arc<parking_lot::RwLock<epics_base_rs::server::record::RecordInstance>>,
-)> {
+) -> Vec<(String, Arc<epics_base_rs::server::record::RecordCell>)> {
     // Collect unique record names and sort for deterministic lock order.
     let mut record_names: Vec<String> = members
         .iter()
@@ -877,7 +874,7 @@ impl GroupChannel {
         // CRITICAL: an atomic group MUST NOT re-lock a member record
         // inside `read_member` — `lock_group_records_read` (this file,
         // `:637-660`) only resolves each member to a bare
-        // `Arc<parking_lot::RwLock<RecordInstance>>`; no guard is held
+        // `Arc<RecordCell>`; no guard is held
         // yet at that point. The real `parking_lot::RwLockReadGuard`s
         // are taken synchronously, all at once, in the loop below (this
         // file, `:946-956`) into `guard_map`, with the advisory
@@ -944,10 +941,7 @@ impl GroupChannel {
             // out of its write guard for this window, so this acquisition is
             // uncontended and deadlock-free; the guards are consumed synchronously
             // by `read_member_locked` below and never held across an await.
-            let guards: Vec<(
-                &str,
-                parking_lot::RwLockReadGuard<'_, epics_base_rs::server::record::RecordInstance>,
-            )> = member_guards
+            let guards: Vec<(&str, epics_base_rs::server::record::RecordRef<'_>)> = member_guards
                 .iter()
                 .map(|(name, rec)| (name.as_str(), rec.read()))
                 .collect();
@@ -1580,7 +1574,7 @@ impl GroupChannel {
                     // Any PACT park this put releases replays on the cycle two
                     // lines down, from its tail — C's only restart owner.
                     self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited)
                         .map_err(to_err)?;
@@ -1627,7 +1621,7 @@ impl GroupChannel {
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
                     self.db.put_pv(&pv, value).await.map_err(to_err)?;
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links(record_name, &mut visited)
                         .await
@@ -5650,8 +5644,16 @@ mod tests {
     /// sequential `read_group_atomic(false)` path (no `lock_records`) and would
     /// finish while a member gate was held, shipping a torn snapshot the wire
     /// still stamps atomic. A plain non-atomic GET (no monitor stamp) still
-    /// takes the sequential path — asserted here as the contrast.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// takes the sequential path, which locks each member in turn (pvxs
+    /// `DBLocker F(pDbChannel->addr.precord)`, `groupsource.cpp:521`) — so it
+    /// blocks on the held member too, and the record's data has no lock
+    /// apart from its lock set for it to read through. Both reads complete
+    /// once the gate is released.
+    ///
+    /// Three workers: both reads park their worker in a blocking lock, and
+    /// the test task needs a third to come back from its sleep and release
+    /// the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn q38_nonatomic_group_monitor_read_composes_atomically() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -5689,21 +5691,27 @@ mod tests {
              (it forces the atomic many-lock so its atomic=true stamp is truthful)"
         );
 
-        // Contrast: a plain non-atomic GET (no monitor stamp) does NOT take the
-        // many-lock — it reads sequentially and completes with the gate held.
+        // A plain non-atomic GET (no monitor stamp) does NOT take the
+        // many-lock — it reads the members one at a time, each under its own
+        // lock set, and the held member's set is the lock on its data.
         let get_channel = GroupChannel::new(db.clone(), def.clone());
         let get = tokio::spawn(async move { get_channel.read_group().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !get.is_finished(),
+            "a non-atomic GET locks each member in turn and blocks on the held one"
+        );
+
+        // Release the gate; both reads now complete.
+        drop(held);
         let get_done = tokio::time::timeout(Duration::from_secs(5), get)
             .await
-            .expect("non-atomic GET must finish without the many-lock")
+            .expect("non-atomic GET must finish once the member gate is free")
             .expect("non-atomic GET task panicked");
         assert!(
             get_nested_field(&get_done, "a").is_some(),
-            "non-atomic GET returns a snapshot without blocking"
+            "non-atomic GET returns a snapshot"
         );
-
-        // Release the gate; the monitor read now completes atomically.
-        drop(held);
         let mon_snapshot = tokio::time::timeout(Duration::from_secs(5), mon)
             .await
             .expect("monitor read must complete once the member gate is free")

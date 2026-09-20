@@ -29,8 +29,6 @@
 //! SNAM names a function that was never registered read back
 //! `NO_ALARM NO_ALARM`, and aSub's VAL kept its previous value.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -42,7 +40,7 @@ use epics_base_rs::types::EpicsValue;
 const S_DB_BAD_SUB: i32 = (511 << 16) | 35;
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

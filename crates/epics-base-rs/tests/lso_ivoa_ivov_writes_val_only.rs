@@ -67,7 +67,7 @@
 //! C's `monitor()` position; the same-cycle boundary is asserted for all five
 //! records that carry the arm in `ivoa_ivov_posts_on_its_own_cycle.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -90,7 +90,7 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

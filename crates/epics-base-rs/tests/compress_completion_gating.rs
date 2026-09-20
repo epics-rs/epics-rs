@@ -12,7 +12,6 @@
 //! compress with N=4, fed one sample per cycle, must fire its FLNK exactly
 //! once over four cycles — on the 4th, when the average is emitted.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -67,7 +66,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
         db.put_pv("src", EpicsValue::Double(i as f64))
             .await
             .unwrap();
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("cmp", &mut visited)
             .await
             .unwrap();

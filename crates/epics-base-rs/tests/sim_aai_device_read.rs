@@ -14,8 +14,6 @@
 //! took the OUTPUT redirect and wrote its VAL array OUT to its DBF_INLINK SIOL
 //! (direction inverted). Classifying it as an input pins the correct SIOL read.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -53,7 +51,7 @@ async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
     aai.sims = MINOR;
     db.add_record("AAIIN", Box::new(aai)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AAIIN", &mut v).await.unwrap();
 
     // 1. VAL read inward from SIOL (the soft device reads SIOL when SIMM=YES).

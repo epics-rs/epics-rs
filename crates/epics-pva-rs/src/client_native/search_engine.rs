@@ -69,7 +69,7 @@ use tokio::sync::{mpsc, oneshot};
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, Interval, interval, sleep, sleep_until};
+use epics_base_rs::runtime::task::{Instant, Interval, interval, sleep, sleep_until, timeout};
 use tracing::debug;
 use tracing::warn;
 
@@ -2977,6 +2977,40 @@ async fn ns_task(
     }
 }
 
+/// One whole frame onto an NS circuit, under that circuit's own deadline.
+///
+/// Every write in [`ns_run_once`] goes through here, and that is the point
+/// rather than the brevity. This circuit is the one PVA connection that has
+/// no writer task: it writes inline, from the arms of the same `select!`
+/// that holds its liveness check. A `write_all` parked against a peer that
+/// accepts the connection and then stops reading therefore stops the loop
+/// being polled at all, which switches off the very check that exists to
+/// catch a black-holed peer — the deadline disabled by exactly the
+/// condition it is for. `dial_pva`'s `write_deadline` already bounds this
+/// on the blocking transport (`blocking_io::write_frame_deadline`); a
+/// hosted build got no bound at all, and the rule belongs to the circuit,
+/// not to whichever transport happens to implement it.
+///
+/// The same defect on the server side is `tcp.rs`'s inactivity deadline,
+/// which is answered the other way — there a writer task already existed,
+/// so the deadline moved to it.
+async fn ns_write_all<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    within: Duration,
+) -> std::io::Result<()> {
+    match timeout(within, writer.write_all(bytes)).await {
+        Ok(res) => res,
+        // A partial frame may be on the wire. That is survivable only
+        // because this error ends the circuit: `ns_task` re-dials and the
+        // engine re-sends from its bucket ring.
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "name-server write stalled",
+        )),
+    }
+}
+
 /// One connection attempt to `ns_addr`: TCP connect → PVA handshake → forward
 /// SEARCH frames and route SEARCH_RESPONSE bytes back to the engine.
 async fn ns_run_once(
@@ -3035,7 +3069,7 @@ async fn ns_run_once(
         user,
         host,
     );
-    writer.write_all(&reply).await?;
+    ns_write_all(&mut writer, &reply, handshake_timeout).await?;
     wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
         .await
         .map_err(std::io::Error::other)?;
@@ -3102,13 +3136,13 @@ async fn ns_run_once(
                 let h = PvaHeader::application(false, byte_order, Command::Echo.code(), 0);
                 let mut bytes = Vec::with_capacity(PvaHeader::SIZE);
                 h.write_into(&mut bytes);
-                writer.write_all(&bytes).await?;
+                ns_write_all(&mut writer, &bytes, ns_idle_timeout).await?;
             }
             pkt = search_rx.recv() => {
                 match pkt {
                     Some(bytes) => {
                         let len = bytes.len();
-                        writer.write_all(&bytes).await?;
+                        ns_write_all(&mut writer, &bytes, ns_idle_timeout).await?;
                         // Frame is now on the socket: release its share of the
                         // queued-byte backlog so the engine's tick gate frees up.
                         queued_bytes.fetch_sub(len, Ordering::SeqCst);

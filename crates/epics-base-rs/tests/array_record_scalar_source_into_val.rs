@@ -15,8 +15,6 @@
 //! (link path), On-Change hash across successive scalar updates, and the OUT
 //! target's received type.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
@@ -111,7 +109,7 @@ record(aao, "AAO:CL") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AAO:CL", &mut visited)
         .await
         .unwrap();

@@ -18,7 +18,6 @@
 //!
 //! One test per boundary of that switch.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -114,7 +113,7 @@ impl LinkSet for ExtLset {
 }
 
 async fn kick(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

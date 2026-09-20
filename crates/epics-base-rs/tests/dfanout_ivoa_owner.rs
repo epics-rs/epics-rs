@@ -31,8 +31,6 @@
 //! single owner in `process_record_with_links_inner`, and every output path
 //! (OUT, SIOL, the generic multi-output pairs, dfanout's push) consumes it.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -41,7 +39,7 @@ use epics_base_rs::server::records::dfanout::DfanoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

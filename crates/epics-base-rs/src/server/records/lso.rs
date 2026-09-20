@@ -116,21 +116,26 @@ impl Record for LsoRecord {
     /// `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it spells (capped
     /// at SIZV), anything else as `DBR_STRING` — so an ENUM/MENU source
     /// delivers its state label (epics-base#183).
-    fn input_link_read_as(
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        match link_field {
+            "DOL" => InputLinkRequest::FromSource,
+            _ => InputLinkRequest::As(LinkReadAs::Native),
+        }
+    }
+
+    fn input_link_read_as_from_source(
         &self,
-        link_field: &str,
+        _link_field: &str,
         source: &crate::server::record::OutTarget,
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
         use crate::types::DbFieldType;
-        Some(match link_field {
-            "DOL" => match source.field_type {
-                Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
-                    max_elements: self.sizv as usize,
-                },
-                _ => LinkReadAs::String,
+        Some(match source.field_type {
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
+                max_elements: self.sizv as usize,
             },
-            _ => LinkReadAs::Native,
+            _ => LinkReadAs::String,
         })
     }
 

@@ -1558,6 +1558,24 @@ impl Record for AcalcoutRecord {
         Some(self.dbaddr_no_elements() as u32)
     }
 
+    /// C reads `prec->inpa..inpl / inaa..inll` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 24 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match *link_field.as_bytes() {
+            [b'I', b'N', b'P', slot] => {
+                let slot = usize::from(slot.checked_sub(b'A')?);
+                self.inp_links.get(slot).map(String::as_str)
+            }
+            // INAA..INLL, the doubled-letter array/string inputs.
+            [b'I', b'N', slot, tail] if slot == tail => {
+                let slot = usize::from(slot.checked_sub(b'A')?);
+                self.ina_links.get(slot).map(String::as_str)
+            }
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -1966,7 +1984,8 @@ impl Record for AcalcoutRecord {
                 Ok(())
             }
             // SPC_NOMOD trackers — accept the framework's internal deadband/
-            // alarm writes (put_coerced "MLST"/"ALST", check_alarms "LALM").
+            // alarm writes (`store_monitor_last_posted` "MLST"/"ALST",
+            // `store_analog_lalm` "LALM").
             "LALM" => {
                 self.lalm = value
                     .to_f64()
@@ -2140,7 +2159,22 @@ impl Record for AcalcoutRecord {
         crate::server::record::seed_input_links(self.special_reseed_input_links())
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// The `INPA..INPL` then `INAA..INLL` texts read straight off the record's
+    /// own two arrays, in `ACALCOUT_INPUT_LINKS` order, not through the default
+    /// body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        let mut texts: [&str; 24] = [""; 24];
+        for (dst, src) in texts[..12].iter_mut().zip(&self.inp_links) {
+            *dst = src.as_str();
+        }
+        for (dst, src) in texts[12..].iter_mut().zip(&self.ina_links) {
+            *dst = src.as_str();
+        }
+        crate::server::record::input_link_slots_of(&texts)
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         ACALCOUT_INPUT_LINKS
     }
 
@@ -2185,6 +2219,10 @@ impl Record for AcalcoutRecord {
     /// supplies the `nelm == 1 ? &val : aval` / `nelm == 1 ? &oval : oav`
     /// buffer choice — necessary since IVOA=Set_output_to_IVOV decouples
     /// `OVAL` from `OAV[0]` (see `set_output_to_ivov`).
+    fn declares_multi_output_links(&self) -> bool {
+        true
+    }
+
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if !self.cached_should_output {
             &[]

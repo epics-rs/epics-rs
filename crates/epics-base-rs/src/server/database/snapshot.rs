@@ -49,6 +49,11 @@ const FACILITY: &str = "database index";
 /// rebuild-and-publish writes. See the module doc for the invariant.
 pub(crate) struct SnapshotCell<T> {
     cell: arc_swap::ArcSwap<T>,
+    /// How many values this cell has published. Moved by [`Self::update`] and
+    /// by nothing else, which is what lets a reader cache an answer derived
+    /// from the map and know, with one relaxed load, whether the map it was
+    /// derived from is still the published one.
+    revision: std::sync::atomic::AtomicU64,
     /// Serializes [`Self::update`]'s clone → mutate → publish. `std`, not
     /// `tokio`: it is held for a map clone and never across an `.await`, and
     /// making it async would put the writer back on the park path this cell
@@ -60,6 +65,7 @@ impl<T> SnapshotCell<T> {
     pub(crate) fn new(value: T) -> Self {
         Self {
             cell: arc_swap::ArcSwap::from_pointee(value),
+            revision: std::sync::atomic::AtomicU64::new(1),
             writer: std::sync::Mutex::new(()),
         }
     }
@@ -75,6 +81,18 @@ impl<T> SnapshotCell<T> {
     /// value is bound across statements or outlives an `.await`.
     pub(crate) fn load_full(&self) -> Arc<T> {
         self.cell.load_full()
+    }
+
+    /// Which published value this cell is on. Never zero, so a cache may keep
+    /// zero for "never resolved".
+    ///
+    /// A reader that caches something derived from the map must read this
+    /// FIRST and the map second. Taken in that order, a write landing between
+    /// the two files the fresher answer under the older revision — the next
+    /// reader finds the revision moved and recomputes — whereas the reverse
+    /// order would file a stale answer under the newer revision and keep it.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -92,6 +110,10 @@ impl<T: Clone> SnapshotCell<T> {
         f(&mut next);
         let published = Arc::new(next);
         self.cell.store(published.clone());
+        // After the store: see [`Self::revision`] for why this edge, and not
+        // the one before it, is the one a reader's cache can be gated on.
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         published
     }
 }

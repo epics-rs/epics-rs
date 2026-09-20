@@ -1,6 +1,8 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
+use crate::server::record::{
+    AlarmLimit, AnalogAlarmInput, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Calc record — evaluates CALC expression with inputs A-U.
@@ -21,71 +23,39 @@ pub struct CalcRecord {
     pub alst: f64,
     pub mlst: f64,
     // Input link strings (INPA..INPU)
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
-    pub inpm: String,
-    pub inpn: String,
-    pub inpo: String,
-    pub inpp: String,
-    pub inpq: String,
-    pub inpr: String,
-    pub inps: String,
-    pub inpt: String,
-    pub inpu: String,
+    inpa: String,
+    inpb: String,
+    inpc: String,
+    inpd: String,
+    inpe: String,
+    inpf: String,
+    inpg: String,
+    inph: String,
+    inpi: String,
+    inpj: String,
+    inpk: String,
+    inpl: String,
+    inpm: String,
+    inpn: String,
+    inpo: String,
+    inpp: String,
+    inpq: String,
+    inpr: String,
+    inps: String,
+    inpt: String,
+    inpu: String,
+    /// Bit `i` set ⟺ `INP<i>` is non-empty. Written only by
+    /// [`Self::set_inp_link`], the single writer of the 21 texts, so
+    /// [`Record::set_input_link_slots`] answers off it without touching them.
+    inp_set: u64,
+    /// [`Record::input_links_generation`]: moved on by [`Self::set_inp_link`],
+    /// the one writer of `INPA..INPU` (private fields — nothing else can
+    /// store a text without going through it).
+    inp_generation: u64,
     // Input values A-U
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-    pub d: f64,
-    pub e: f64,
-    pub f: f64,
-    pub g: f64,
-    pub h: f64,
-    pub i: f64,
-    pub j: f64,
-    pub k: f64,
-    pub l: f64,
-    pub m: f64,
-    pub n: f64,
-    pub o: f64,
-    pub p: f64,
-    pub q: f64,
-    pub r: f64,
-    pub s: f64,
-    pub t: f64,
-    pub u: f64,
+    pub vars: [f64; crate::calc::CALC_NARGS],
     // Previous values LA-LU (saved after each process)
-    pub la: f64,
-    pub lb: f64,
-    pub lc: f64,
-    pub ld: f64,
-    pub le: f64,
-    pub lf: f64,
-    pub lg: f64,
-    pub lh: f64,
-    pub li: f64,
-    pub lj: f64,
-    pub lk: f64,
-    pub ll: f64,
-    pub lm: f64,
-    pub ln: f64,
-    pub lo: f64,
-    pub lp: f64,
-    pub lq: f64,
-    pub lr: f64,
-    pub ls: f64,
-    pub lt: f64,
-    pub lu: f64,
+    pub prev: [f64; crate::calc::CALC_NARGS],
     // This cycle's `calcPerform` outcome (C `calcRecord.c:121-123`). A per-cycle
     // fact, not record state: `check_alarms` — the owner of this record's alarm
     // transitions — consumes it, so it cannot outlive the cycle that set it.
@@ -153,48 +123,10 @@ impl Default for CalcRecord {
             inps: String::new(),
             inpt: String::new(),
             inpu: String::new(),
-            a: 0.0,
-            b: 0.0,
-            c: 0.0,
-            d: 0.0,
-            e: 0.0,
-            f: 0.0,
-            g: 0.0,
-            h: 0.0,
-            i: 0.0,
-            j: 0.0,
-            k: 0.0,
-            l: 0.0,
-            m: 0.0,
-            n: 0.0,
-            o: 0.0,
-            p: 0.0,
-            q: 0.0,
-            r: 0.0,
-            s: 0.0,
-            t: 0.0,
-            u: 0.0,
-            la: 0.0,
-            lb: 0.0,
-            lc: 0.0,
-            ld: 0.0,
-            le: 0.0,
-            lf: 0.0,
-            lg: 0.0,
-            lh: 0.0,
-            li: 0.0,
-            lj: 0.0,
-            lk: 0.0,
-            ll: 0.0,
-            lm: 0.0,
-            ln: 0.0,
-            lo: 0.0,
-            lp: 0.0,
-            lq: 0.0,
-            lr: 0.0,
-            ls: 0.0,
-            lt: 0.0,
-            lu: 0.0,
+            inp_set: 0,
+            inp_generation: 0,
+            vars: [0.0; crate::calc::CALC_NARGS],
+            prev: [0.0; crate::calc::CALC_NARGS],
             calc_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
@@ -261,53 +193,9 @@ impl CalcRecord {
     /// calcRecord.c:119-125), so both paths through `process()` come through
     /// here.
     fn advance_prev_inputs(&mut self) {
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
-    }
-
-    fn get_vars(&self) -> [f64; 21] {
-        [
-            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
-            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
-        ]
-    }
-
-    /// Land the calc pass's variable stores back in A..U — the inverse of
-    /// [`Self::get_vars`], and the record's ONLY write-back of an engine var set.
-    ///
-    /// C needs no such step: `calcPerform(&prec->a, &prec->val, rpcl)` is handed
-    /// a pointer INTO the record, so its store opcode (`calcPerform.c:101-123`,
-    /// `parg[op - STORE_A] = *ptop--`) IS the field write. The engine here
-    /// evaluates an owned copy, so `CALC="A:=A+1;A"` incremented a temporary and
-    /// dropped it — VAL climbed while A stayed 0 forever.
-    ///
-    /// Applied on the failure path too: C's stores go into the record as the
-    /// expression runs, so the ones a later failing operator did not reach still
-    /// stand.
-    fn apply_stores(&mut self, vars: &[f64; 21]) {
-        [
-            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
-            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
-        ] = *vars;
+        for (new, prev) in self.vars.iter().zip(self.prev.iter_mut()) {
+            Self::advance_prev(*new, prev);
+        }
     }
 
     pub fn get_inp_link(&self, idx: usize) -> &str {
@@ -337,6 +225,66 @@ impl CalcRecord {
         }
     }
 
+    fn inp_link_mut(&mut self, idx: usize) -> Option<&mut String> {
+        match idx {
+            0 => Some(&mut self.inpa),
+            1 => Some(&mut self.inpb),
+            2 => Some(&mut self.inpc),
+            3 => Some(&mut self.inpd),
+            4 => Some(&mut self.inpe),
+            5 => Some(&mut self.inpf),
+            6 => Some(&mut self.inpg),
+            7 => Some(&mut self.inph),
+            8 => Some(&mut self.inpi),
+            9 => Some(&mut self.inpj),
+            10 => Some(&mut self.inpk),
+            11 => Some(&mut self.inpl),
+            12 => Some(&mut self.inpm),
+            13 => Some(&mut self.inpn),
+            14 => Some(&mut self.inpo),
+            15 => Some(&mut self.inpp),
+            16 => Some(&mut self.inpq),
+            17 => Some(&mut self.inpr),
+            18 => Some(&mut self.inps),
+            19 => Some(&mut self.inpt),
+            20 => Some(&mut self.inpu),
+            _ => None,
+        }
+    }
+
+    /// The single writer of `INPA..INPU`: stores the text and keeps `inp_set`
+    /// in step. A slot past `INPU` is ignored, as [`Self::get_inp_link`]
+    /// ignores it on the read side.
+    pub fn set_inp_link(&mut self, slot: usize, text: impl Into<String>) {
+        let Some(link) = self.inp_link_mut(slot) else {
+            return;
+        };
+        *link = text.into();
+        let wired = !link.is_empty();
+        let bit = 1u64 << slot;
+        if wired {
+            self.inp_set |= bit;
+        } else {
+            self.inp_set &= !bit;
+        }
+        self.inp_generation += 1;
+    }
+
+    fn put_inp_link(
+        &mut self,
+        slot: usize,
+        field: &'static str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        match value {
+            EpicsValue::String(s) => {
+                self.set_inp_link(slot, s.as_str_lossy());
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(field.into())),
+        }
+    }
+
     /// Get input link strings for external processing.
     pub fn input_links(&self) -> [&str; 21] {
         [
@@ -347,30 +295,29 @@ impl CalcRecord {
     }
 
     pub fn set_var(&mut self, idx: usize, val: f64) {
-        match idx {
-            0 => self.a = val,
-            1 => self.b = val,
-            2 => self.c = val,
-            3 => self.d = val,
-            4 => self.e = val,
-            5 => self.f = val,
-            6 => self.g = val,
-            7 => self.h = val,
-            8 => self.i = val,
-            9 => self.j = val,
-            10 => self.k = val,
-            11 => self.l = val,
-            12 => self.m = val,
-            13 => self.n = val,
-            14 => self.o = val,
-            15 => self.p = val,
-            16 => self.q = val,
-            17 => self.r = val,
-            18 => self.s = val,
-            19 => self.t = val,
-            20 => self.u = val,
-            _ => {}
+        if let Some(slot) = self.vars.get_mut(idx) {
+            *slot = val;
         }
+    }
+}
+
+/// `A`..`U` → 0..21, the index C's `calcPerform` uses into `&prec->a`.
+fn var_index(name: &str) -> Option<usize> {
+    match name.as_bytes() {
+        [c @ b'A'..=b'U'] => Some(usize::from(c - b'A')),
+        _ => None,
+    }
+}
+
+/// [`Record::field_slot`]'s index for `VAL`, past the `A`..`U` and
+/// `LA`..`LU` blocks.
+const VAL_SLOT: usize = 2 * crate::calc::CALC_NARGS;
+
+/// `LA`..`LU` → 0..21, the same index into the previous-value block.
+fn prev_index(name: &str) -> Option<usize> {
+    match name.as_bytes() {
+        [b'L', c @ b'A'..=b'U'] => Some(usize::from(c - b'A')),
+        _ => None,
     }
 }
 
@@ -468,20 +415,15 @@ impl Record for CalcRecord {
         // always a program, so there is no "no expression" case to improvise
         // around: an empty or uncompilable CALC IS the empty program, and the
         // engine fails it every cycle.
-        let vars = self.get_vars();
-        let mut inputs = crate::calc::NumericInputs::with_vars(vars);
-        // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
-        // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
-        // pushes the *previous* VAL. Seed `prev_val` from the current
-        // `self.val` before it is overwritten below; otherwise
-        // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
-        inputs.prev_val = self.val;
-        let outcome = crate::calc::eval(&self.rpcl, &mut inputs);
-        // The stores land BEFORE the result and before LA..LU advance: C writes
-        // them through `&prec->a` during the perform, so `monitor()` sees the
-        // stored A against the old LA and posts it, exactly as it does for an
-        // input that changed.
-        self.apply_stores(&inputs.vars);
+        // C `calcPerform(&prec->a, &prec->val, rpcl)`: the engine runs on the
+        // record's own A..U, so a store opcode IS the field write and lands
+        // before the result and before LA..LU advance — `monitor()` sees the
+        // stored A against the old LA and posts it, as for an input that
+        // changed. `presult = &val` makes the `VAL` token (`FETCH_VAL`,
+        // calcPerform.c:73-74) push the *previous* VAL, seeded here from
+        // `self.val` before it is overwritten below; otherwise `CALC="VAL+1"`
+        // reads 0 every cycle instead of incrementing.
+        let outcome = crate::calc::eval_in_place(&self.rpcl, &mut self.vars, self.val);
         match outcome {
             Ok(v) => {
                 self.val = v;
@@ -507,7 +449,108 @@ impl Record for CalcRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 21 clones on every cycle of a record that wires none of them.
+    /// The framework's per-cycle cells, read as struct members — the
+    /// defaults would each cost a full `get_field` name match. `calc`'s
+    /// `get_field` has 32 four-character arms, so every one of these is a
+    /// walk through that bucket on every scan cycle.
+    ///
+    /// `hyst` is `None` because `calc` declares no HYST
+    /// (`calcRecord.dbd.pod`).
+    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
+        Some(AnalogAlarmInput {
+            val: AlarmLimit::Double(self.val),
+            hyst: None,
+            lalm: Some(AlarmLimit::Double(self.lalm)),
+        })
+    }
+
+    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
+        Some((self.aftc, self.afvl))
+    }
+
+    fn store_alarm_filter_value(&mut self, afvl: f64) {
+        self.afvl = afvl;
+    }
+
+    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
+        self.lalm = lalm.as_f64();
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Double(self.val))
+    }
+
+    fn monitor_deadband_value(&self) -> Option<f64> {
+        Some(self.val)
+    }
+
+    /// `calc` declares no OVAL, so the default's `get_field("OVAL")` is a
+    /// miss through the whole four-character bucket on every cycle.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        self.val()
+    }
+
+    fn monitor_deadband_cells(&self) -> crate::server::record::MonitorDeadbandCells {
+        crate::server::record::MonitorDeadbandCells {
+            mdel: Some(self.mdel),
+            adel: Some(self.adel),
+            mlst: Some(self.mlst),
+            alst: Some(self.alst),
+        }
+    }
+
+    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
+        if mlst {
+            self.mlst = val;
+        }
+        if alst {
+            self.alst = val;
+        }
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        // INPA..INPU differ in their last byte alone, so the cycle's 21 asks
+        // cost one shape test and one indexed branch instead of 21 name
+        // compares.
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        Some(match slot {
+            b'A' => &self.inpa,
+            b'B' => &self.inpb,
+            b'C' => &self.inpc,
+            b'D' => &self.inpd,
+            b'E' => &self.inpe,
+            b'F' => &self.inpf,
+            b'G' => &self.inpg,
+            b'H' => &self.inph,
+            b'I' => &self.inpi,
+            b'J' => &self.inpj,
+            b'K' => &self.inpk,
+            b'L' => &self.inpl,
+            b'M' => &self.inpm,
+            b'N' => &self.inpn,
+            b'O' => &self.inpo,
+            b'P' => &self.inpp,
+            b'Q' => &self.inpq,
+            b'R' => &self.inpr,
+            b'S' => &self.inps,
+            b'T' => &self.inpt,
+            b'U' => &self.inpu,
+            _ => return None,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        if let Some(i) = var_index(name) {
+            return Some(EpicsValue::Double(self.vars[i]));
+        }
+        if let Some(i) = prev_index(name) {
+            return Some(EpicsValue::Double(self.prev[i]));
+        }
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
@@ -543,53 +586,20 @@ impl Record for CalcRecord {
             "INPS" => Some(EpicsValue::String(self.inps.clone().into())),
             "INPT" => Some(EpicsValue::String(self.inpt.clone().into())),
             "INPU" => Some(EpicsValue::String(self.inpu.clone().into())),
-            "A" => Some(EpicsValue::Double(self.a)),
-            "B" => Some(EpicsValue::Double(self.b)),
-            "C" => Some(EpicsValue::Double(self.c)),
-            "D" => Some(EpicsValue::Double(self.d)),
-            "E" => Some(EpicsValue::Double(self.e)),
-            "F" => Some(EpicsValue::Double(self.f)),
-            "G" => Some(EpicsValue::Double(self.g)),
-            "H" => Some(EpicsValue::Double(self.h)),
-            "I" => Some(EpicsValue::Double(self.i)),
-            "J" => Some(EpicsValue::Double(self.j)),
-            "K" => Some(EpicsValue::Double(self.k)),
-            "L" => Some(EpicsValue::Double(self.l)),
-            "M" => Some(EpicsValue::Double(self.m)),
-            "N" => Some(EpicsValue::Double(self.n)),
-            "O" => Some(EpicsValue::Double(self.o)),
-            "P" => Some(EpicsValue::Double(self.p)),
-            "Q" => Some(EpicsValue::Double(self.q)),
-            "R" => Some(EpicsValue::Double(self.r)),
-            "S" => Some(EpicsValue::Double(self.s)),
-            "T" => Some(EpicsValue::Double(self.t)),
-            "U" => Some(EpicsValue::Double(self.u)),
-            "LA" => Some(EpicsValue::Double(self.la)),
-            "LB" => Some(EpicsValue::Double(self.lb)),
-            "LC" => Some(EpicsValue::Double(self.lc)),
-            "LD" => Some(EpicsValue::Double(self.ld)),
-            "LE" => Some(EpicsValue::Double(self.le)),
-            "LF" => Some(EpicsValue::Double(self.lf)),
-            "LG" => Some(EpicsValue::Double(self.lg)),
-            "LH" => Some(EpicsValue::Double(self.lh)),
-            "LI" => Some(EpicsValue::Double(self.li)),
-            "LJ" => Some(EpicsValue::Double(self.lj)),
-            "LK" => Some(EpicsValue::Double(self.lk)),
-            "LL" => Some(EpicsValue::Double(self.ll)),
-            "LM" => Some(EpicsValue::Double(self.lm)),
-            "LN" => Some(EpicsValue::Double(self.ln)),
-            "LO" => Some(EpicsValue::Double(self.lo)),
-            "LP" => Some(EpicsValue::Double(self.lp)),
-            "LQ" => Some(EpicsValue::Double(self.lq)),
-            "LR" => Some(EpicsValue::Double(self.lr)),
-            "LS" => Some(EpicsValue::Double(self.ls)),
-            "LT" => Some(EpicsValue::Double(self.lt)),
-            "LU" => Some(EpicsValue::Double(self.lu)),
             _ => None,
         }
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if let Some(i) = var_index(name) {
+            return match value.to_f64() {
+                Some(f) => {
+                    self.vars[i] = f;
+                    Ok(())
+                }
+                None => Err(CaError::TypeMismatch(name.into())),
+            };
+        }
         match name {
             "VAL" => match value {
                 EpicsValue::Double(v) => {
@@ -687,447 +697,27 @@ impl Record for CalcRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            "INPA" => match value {
-                EpicsValue::String(s) => {
-                    self.inpa = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPA".into())),
-            },
-            "INPB" => match value {
-                EpicsValue::String(s) => {
-                    self.inpb = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPB".into())),
-            },
-            "INPC" => match value {
-                EpicsValue::String(s) => {
-                    self.inpc = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPC".into())),
-            },
-            "INPD" => match value {
-                EpicsValue::String(s) => {
-                    self.inpd = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPD".into())),
-            },
-            "INPE" => match value {
-                EpicsValue::String(s) => {
-                    self.inpe = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPE".into())),
-            },
-            "INPF" => match value {
-                EpicsValue::String(s) => {
-                    self.inpf = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPF".into())),
-            },
-            "INPG" => match value {
-                EpicsValue::String(s) => {
-                    self.inpg = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPG".into())),
-            },
-            "INPH" => match value {
-                EpicsValue::String(s) => {
-                    self.inph = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPH".into())),
-            },
-            "INPI" => match value {
-                EpicsValue::String(s) => {
-                    self.inpi = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPI".into())),
-            },
-            "INPJ" => match value {
-                EpicsValue::String(s) => {
-                    self.inpj = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPJ".into())),
-            },
-            "INPK" => match value {
-                EpicsValue::String(s) => {
-                    self.inpk = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPK".into())),
-            },
-            "INPL" => match value {
-                EpicsValue::String(s) => {
-                    self.inpl = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPL".into())),
-            },
-            "INPM" => match value {
-                EpicsValue::String(s) => {
-                    self.inpm = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPM".into())),
-            },
-            "INPN" => match value {
-                EpicsValue::String(s) => {
-                    self.inpn = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPN".into())),
-            },
-            "INPO" => match value {
-                EpicsValue::String(s) => {
-                    self.inpo = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPO".into())),
-            },
-            "INPP" => match value {
-                EpicsValue::String(s) => {
-                    self.inpp = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPP".into())),
-            },
-            "INPQ" => match value {
-                EpicsValue::String(s) => {
-                    self.inpq = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPQ".into())),
-            },
-            "INPR" => match value {
-                EpicsValue::String(s) => {
-                    self.inpr = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPR".into())),
-            },
-            "INPS" => match value {
-                EpicsValue::String(s) => {
-                    self.inps = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPS".into())),
-            },
-            "INPT" => match value {
-                EpicsValue::String(s) => {
-                    self.inpt = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPT".into())),
-            },
-            "INPU" => match value {
-                EpicsValue::String(s) => {
-                    self.inpu = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("INPU".into())),
-            },
-            "A" => match value {
-                EpicsValue::Double(v) => {
-                    self.a = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.a = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("A".into()))
-                    }
-                }
-            },
-            "B" => match value {
-                EpicsValue::Double(v) => {
-                    self.b = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.b = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("B".into()))
-                    }
-                }
-            },
-            "C" => match value {
-                EpicsValue::Double(v) => {
-                    self.c = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.c = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("C".into()))
-                    }
-                }
-            },
-            "D" => match value {
-                EpicsValue::Double(v) => {
-                    self.d = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.d = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("D".into()))
-                    }
-                }
-            },
-            "E" => match value {
-                EpicsValue::Double(v) => {
-                    self.e = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.e = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("E".into()))
-                    }
-                }
-            },
-            "F" => match value {
-                EpicsValue::Double(v) => {
-                    self.f = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.f = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("F".into()))
-                    }
-                }
-            },
-            "G" => match value {
-                EpicsValue::Double(v) => {
-                    self.g = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.g = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("G".into()))
-                    }
-                }
-            },
-            "H" => match value {
-                EpicsValue::Double(v) => {
-                    self.h = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.h = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("H".into()))
-                    }
-                }
-            },
-            "I" => match value {
-                EpicsValue::Double(v) => {
-                    self.i = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.i = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("I".into()))
-                    }
-                }
-            },
-            "J" => match value {
-                EpicsValue::Double(v) => {
-                    self.j = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.j = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("J".into()))
-                    }
-                }
-            },
-            "K" => match value {
-                EpicsValue::Double(v) => {
-                    self.k = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.k = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("K".into()))
-                    }
-                }
-            },
-            "L" => match value {
-                EpicsValue::Double(v) => {
-                    self.l = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.l = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("L".into()))
-                    }
-                }
-            },
-            "M" => match value {
-                EpicsValue::Double(v) => {
-                    self.m = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.m = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("M".into()))
-                    }
-                }
-            },
-            "N" => match value {
-                EpicsValue::Double(v) => {
-                    self.n = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.n = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("N".into()))
-                    }
-                }
-            },
-            "O" => match value {
-                EpicsValue::Double(v) => {
-                    self.o = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.o = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("O".into()))
-                    }
-                }
-            },
-            "P" => match value {
-                EpicsValue::Double(v) => {
-                    self.p = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.p = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("P".into()))
-                    }
-                }
-            },
-            "Q" => match value {
-                EpicsValue::Double(v) => {
-                    self.q = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.q = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("Q".into()))
-                    }
-                }
-            },
-            "R" => match value {
-                EpicsValue::Double(v) => {
-                    self.r = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.r = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("R".into()))
-                    }
-                }
-            },
-            "S" => match value {
-                EpicsValue::Double(v) => {
-                    self.s = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.s = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("S".into()))
-                    }
-                }
-            },
-            "T" => match value {
-                EpicsValue::Double(v) => {
-                    self.t = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.t = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("T".into()))
-                    }
-                }
-            },
-            "U" => match value {
-                EpicsValue::Double(v) => {
-                    self.u = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.u = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch("U".into()))
-                    }
-                }
-            },
+            "INPA" => self.put_inp_link(0, "INPA", value),
+            "INPB" => self.put_inp_link(1, "INPB", value),
+            "INPC" => self.put_inp_link(2, "INPC", value),
+            "INPD" => self.put_inp_link(3, "INPD", value),
+            "INPE" => self.put_inp_link(4, "INPE", value),
+            "INPF" => self.put_inp_link(5, "INPF", value),
+            "INPG" => self.put_inp_link(6, "INPG", value),
+            "INPH" => self.put_inp_link(7, "INPH", value),
+            "INPI" => self.put_inp_link(8, "INPI", value),
+            "INPJ" => self.put_inp_link(9, "INPJ", value),
+            "INPK" => self.put_inp_link(10, "INPK", value),
+            "INPL" => self.put_inp_link(11, "INPL", value),
+            "INPM" => self.put_inp_link(12, "INPM", value),
+            "INPN" => self.put_inp_link(13, "INPN", value),
+            "INPO" => self.put_inp_link(14, "INPO", value),
+            "INPP" => self.put_inp_link(15, "INPP", value),
+            "INPQ" => self.put_inp_link(16, "INPQ", value),
+            "INPR" => self.put_inp_link(17, "INPR", value),
+            "INPS" => self.put_inp_link(18, "INPS", value),
+            "INPT" => self.put_inp_link(19, "INPT", value),
+            "INPU" => self.put_inp_link(20, "INPU", value),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -1140,7 +730,68 @@ impl Record for CalcRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    /// Answered off `inp_set`, which [`Self::set_inp_link`] keeps in step with
+    /// the 21 `INPA..INPU` texts, so the cycle touches none of them.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        Some((self.inp_set, 0))
+    }
+
+    fn input_links_generation(&self) -> Option<u64> {
+        Some(self.inp_generation)
+    }
+
+    /// `A`..`U`, `LA`..`LU` and `VAL` — the fields a link reads — by
+    /// index into the three `f64` blocks C lays them out in.
+    fn field_slot(&self, field: &str) -> Option<FieldSlot> {
+        let slot = if let Some(i) = var_index(field) {
+            i
+        } else if let Some(i) = prev_index(field) {
+            crate::calc::CALC_NARGS + i
+        } else if field == "VAL" {
+            VAL_SLOT
+        } else {
+            return None;
+        };
+        Some(FieldSlot(slot as u16))
+    }
+
+    fn get_slot_f64(&self, slot: FieldSlot) -> Option<f64> {
+        let i = usize::from(slot.0);
+        if i < crate::calc::CALC_NARGS {
+            Some(self.vars[i])
+        } else if i < VAL_SLOT {
+            Some(self.prev[i - crate::calc::CALC_NARGS])
+        } else if i == VAL_SLOT {
+            Some(self.val)
+        } else {
+            None
+        }
+    }
+
+    fn put_slot_f64(&mut self, slot: FieldSlot, value: f64) -> bool {
+        let i = usize::from(slot.0);
+        if i < crate::calc::CALC_NARGS {
+            self.vars[i] = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// What `put_field` stores for `A`..`L`, without the three by-name
+    /// lookups that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match var_index(field) {
+            Some(i) => {
+                self.vars[i] = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
+    }
+
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
             ("INPB", "B"),

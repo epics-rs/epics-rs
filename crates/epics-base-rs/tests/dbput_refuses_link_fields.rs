@@ -13,7 +13,7 @@
 //! (`put_record_field_from_ca_no_notify`, the autosave restore's
 //! `put_pv_no_process`) still rewire.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::error::CaError;
@@ -58,7 +58,7 @@ async fn db_out_link_write_to_a_link_field_is_refused() {
         "#,
     )
     .await;
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut v).await.unwrap();
 
     assert_eq!(

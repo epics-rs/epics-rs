@@ -33,8 +33,6 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, EventMask, Record};
 use epics_base_rs::server::records::ai::AiRecord;
@@ -47,7 +45,7 @@ use std_rs::EpidRecord;
 const SECONDARIES: &[&str] = &["OVAL", "P", "I", "D", "DT", "ERR", "CVAL"];
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

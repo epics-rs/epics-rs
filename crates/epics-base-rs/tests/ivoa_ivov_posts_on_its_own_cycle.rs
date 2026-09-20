@@ -21,7 +21,7 @@
 //! the arming cycle, and the INVALID cycle that does NOT arm, where VAL is
 //! untouched and nothing may be posted at all.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -114,7 +114,7 @@ async fn one_cycle(
     // iocInit's own initial post is not this cycle's.
     while rx.try_recv().is_ok() {}
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R", &mut visited)
         .await
         .unwrap();

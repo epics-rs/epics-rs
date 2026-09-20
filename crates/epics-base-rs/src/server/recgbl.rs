@@ -246,12 +246,12 @@ pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
-    msg: impl Into<String>,
+    msg: impl AsRef<str>,
 ) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
-        common.namsg = msg.into();
+        common.namsg.set(msg.as_ref());
         return true;
     }
     false

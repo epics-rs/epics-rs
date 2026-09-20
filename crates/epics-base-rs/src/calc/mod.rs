@@ -41,6 +41,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> CalcResult<f64> 
     engine::numeric::eval(expr, inputs)
 }
 
+/// [`eval`] on the caller's own arg block — C `calcPerform(&prec->a, &prec->val,
+/// rpcl)`, whose stores land in the record as the expression runs. `prev_val`
+/// is what the `VAL` token reads.
+pub fn eval_in_place(
+    expr: &CompiledExpr,
+    vars: &mut [f64; CALC_NARGS],
+    prev_val: f64,
+) -> CalcResult<f64> {
+    engine::numeric::eval_vars(expr, engine::NumericVars::all(vars, prev_val))
+}
+
 /// Compile and evaluate an expression in one step.
 pub fn calc(expr: &str, inputs: &mut NumericInputs) -> CalcResult<f64> {
     let compiled = compile(expr)?;

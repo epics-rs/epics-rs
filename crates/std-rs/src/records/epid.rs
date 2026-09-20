@@ -1118,7 +1118,7 @@ impl Record for EpidRecord {
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.udf = ctx.udf;
         self.dtyp.clear();
-        self.dtyp.push_str(&ctx.dtyp);
+        self.dtyp.push_str(ctx.dtyp);
     }
 
     /// C `devEpidSoftCallback.c:120-132` — the DB-type TRIG readback
@@ -1311,6 +1311,10 @@ impl Record for EpidRecord {
             static WITHOUT_STPL: &[(&str, &str)] = &[("INP", "CVAL")];
             WITHOUT_STPL
         }
+    }
+
+    fn declares_multi_output_links(&self) -> bool {
+        true
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {

@@ -638,10 +638,7 @@ fn get_or_create_struct_array_desc<'a>(
 async fn lock_group_records_read(
     db: &PvDatabase,
     members: &[MemberChannel],
-) -> Vec<(
-    String,
-    Arc<parking_lot::RwLock<epics_base_rs::server::record::RecordInstance>>,
-)> {
+) -> Vec<(String, Arc<epics_base_rs::server::record::RecordCell>)> {
     // Collect unique record names and sort for deterministic lock order.
     let mut record_names: Vec<String> = members
         .iter()
@@ -877,7 +874,7 @@ impl GroupChannel {
         // CRITICAL: an atomic group MUST NOT re-lock a member record
         // inside `read_member` — `lock_group_records_read` (this file,
         // `:637-660`) only resolves each member to a bare
-        // `Arc<parking_lot::RwLock<RecordInstance>>`; no guard is held
+        // `Arc<RecordCell>`; no guard is held
         // yet at that point. The real `parking_lot::RwLockReadGuard`s
         // are taken synchronously, all at once, in the loop below (this
         // file, `:946-956`) into `guard_map`, with the advisory
@@ -1580,7 +1577,7 @@ impl GroupChannel {
                     // Any PACT park this put releases replays on the cycle two
                     // lines down, from its tail — C's only restart owner.
                     self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited)
                         .map_err(to_err)?;
@@ -1627,7 +1624,7 @@ impl GroupChannel {
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
                     self.db.put_pv(&pv, value).await.map_err(to_err)?;
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links(record_name, &mut visited)
                         .await

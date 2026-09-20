@@ -1064,10 +1064,10 @@ mod pbuf_tests {
         let (snap, actions) = inst.process_local().unwrap();
 
         assert!(
-            snap.changed_fields.is_empty(),
+            snap.is_empty(),
             "a non-emit (CompleteNoEmit) cycle must publish no field changes via \
              process_local — got {:?}",
-            snap.changed_fields
+            snap.iter().collect::<Vec<_>>()
         );
         assert!(actions.is_empty(), "compress is soft → no process actions");
     }

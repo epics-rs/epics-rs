@@ -24,8 +24,6 @@
 //! already covers that at the ENGINE boundary; nothing covered what the RECORD
 //! does with AVAL afterwards.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
@@ -39,7 +37,7 @@ const FITTED: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 const PRIMED: [f64; 6] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

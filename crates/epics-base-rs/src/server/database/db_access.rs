@@ -253,7 +253,7 @@ pub struct DbSubscription {
     ignore_origin: u64,
     /// Reference back to the record + this subscription's sid, for the
     /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
-    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<crate::server::record::RecordCell>,
     sid: u32,
 }
 
@@ -268,7 +268,7 @@ pub struct DbSubscription {
 /// stays consistent.
 #[derive(Clone)]
 pub struct SubscriptionActivation {
-    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<crate::server::record::RecordCell>,
     sid: u32,
 }
 

@@ -22,8 +22,6 @@
 //! Pre-fix the port enforced `read_only` only on the CA route, so the OUT link
 //! truncated NELM (and the data with it) and the writer stayed NO_ALARM.
 
-use std::collections::HashSet;
-
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -58,7 +56,7 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
     let db = build().await;
 
     db.put_pv("AO.VAL", EpicsValue::Double(2.0)).await.unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO", &mut v).await.unwrap();
 
     let wf = db.get_record("WF").unwrap();

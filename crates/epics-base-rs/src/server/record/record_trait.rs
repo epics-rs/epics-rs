@@ -2,6 +2,7 @@ use crate::error::CaResult;
 use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
+use super::alarm::AlarmLimit;
 use super::scan::ScanType;
 
 /// Which of a `devXxxSoftRaw` dset's two entry points is delivering a value to
@@ -498,6 +499,32 @@ pub enum LinkReadAs {
     CharArrayAsString { max_elements: usize },
 }
 
+/// A record's per-link `dbGetLink` request, asked BEFORE the link's source is
+/// resolved.
+///
+/// Resolving the source ([`PvDatabase::resolve_out_target`](crate::server::database::PvDatabase))
+/// costs a records-map lookup and the TARGET record's read lock, and it has to
+/// happen with no reader lock held, so it cannot be deferred into
+/// [`Record::input_link_read_as_from_source`]. Only four record types let the
+/// source decide (`sseq` `DOLn`, `aSub`'s STRING channels, `lsi` `INP`/`SIOL`,
+/// `lso` `DOL`) — every other type's C switch is on the LINK FIELD alone. This
+/// enum is what lets those four ask for the walk and everyone else skip it,
+/// measured at 0.10 us per link per cycle.
+///
+/// [`Self::FromSource`] is the only way to reach
+/// [`Record::input_link_read_as_from_source`], so the two answers cannot
+/// disagree: a record that never asks for the source is never handed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLinkRequest {
+    /// The request, settled by the link field alone.
+    As(LinkReadAs),
+    /// C's `default: break` — this record does not read that link at all.
+    NotRead,
+    /// The request depends on the source's DBF class / element count: resolve
+    /// the target and ask [`Record::input_link_read_as_from_source`].
+    FromSource,
+}
+
 /// How C gates a secondary field named by
 /// [`Record::fields_posted_with_value_mask`] *inside* the guard that decides
 /// whether VAL posts at all.
@@ -584,6 +611,22 @@ pub(crate) fn value_gate(
         .iter()
         .find(|(name, _)| *name == field)
         .map(|(_, gate)| *gate)
+}
+
+/// [`Record::set_input_link_slots`] answered off the record's own link texts,
+/// in [`Record::multi_input_links`] order.
+///
+/// Every slot is lent a text, so the "unknown" half of the pair is empty by
+/// construction: a type that can answer this way knows all of its own links.
+pub fn input_link_slots_of<S: AsRef<str>>(texts: &[S]) -> Option<(u64, u64)> {
+    debug_assert!(texts.len() <= u64::BITS as usize);
+    let mut set = 0u64;
+    for (slot, text) in texts.iter().enumerate() {
+        if !text.as_ref().is_empty() {
+            set |= 1 << slot;
+        }
+    }
+    Some((set, 0))
 }
 
 /// The event mask a change-detected AUXILIARY field posts with — the single
@@ -1400,7 +1443,7 @@ pub enum CommonFieldPutResult {
 /// `set_device_did_compute` framework-set-hook pattern: additive,
 /// no `process()` / `read()` signature change.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ProcessContext {
+pub struct ProcessContext<'a> {
     /// `dbCommon.udf` — value is undefined. C records check this at the
     /// top of `process()` (e.g. `epidRecord.c:195`).
     pub udf: bool,
@@ -1431,14 +1474,22 @@ pub struct ProcessContext {
     /// member is the device-provided value that helper returns verbatim on
     /// the `TSE == epicsTimeEventDeviceTime (-2)` branch.
     pub time: std::time::SystemTime,
-    /// `dbCommon.tsel` — time-stamp event link string.
-    pub tsel: String,
     /// `dbCommon.dtyp` — device-support type name. A record's
     /// `process()` / pre-process hooks can branch on the DTYP to mirror
     /// C device support that lives in a separate DSET (e.g. the epid
     /// record's `devEpidSoftCallback` callback DSET drives the TRIG
     /// readback link, whereas `devEpidSoft` does not).
-    pub dtyp: String,
+    ///
+    /// Borrowed from `dbCommon`, not owned: the context is built under the
+    /// record's own guard and handed straight to the hook, which is the whole
+    /// of its life. Owning it cost a `String` per build — two per cycle, three
+    /// for a record with device support — and the one reader
+    /// (`EpidRecord::set_process_context`) copies into its own cell anyway.
+    ///
+    /// `dbCommon.tsel` used to sit beside it and was read by nobody, so it is
+    /// not here; a hook that needs the TSEL text should take it the same way
+    /// this one does.
+    pub dtyp: &'a str,
     /// The callback band `dbCommon.prio` selects for work this cycle defers —
     /// C `seqRecord.c:145-146`, which re-runs
     /// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of every
@@ -1454,24 +1505,75 @@ pub struct ProcessContext {
 /// uses it to take the OS-clock branch instead of `recGblGetTimeStamp`.
 pub const EPICS_TIME_EVENT_DEVICE_TIME: i16 = -2;
 
+/// One `db_post_events(prec, &field, mask)` a process cycle owes.
+///
+/// Every posted field carries its OWN `DBE_*` mask, mirroring C's per-field
+/// call. One cycle posts different classes per field: a deadband-gated
+/// readback narrows to the deadbands that actually crossed (MDEL → `DBE_VALUE`,
+/// ADEL → `DBE_LOG`; motorRecord.cc `monitor()` 3476-3507, aiRecord.c
+/// `monitor()`), while a change-detected auxiliary field posts
+/// `DBE_VALUE | DBE_LOG` (motorRecord.cc 3522-3645 `DBE_VAL_LOG`;
+/// calcRecord.c:420). A single record-wide mask collapses that granularity —
+/// an archive-only deadband crossing would wrongly reach `DBE_VALUE`
+/// subscribers whenever any other field changed in the same pass.
+///
+/// The name is `Cow` because most posts name a field the record type declared
+/// — a `&'static str` already in the binary, which C posts as `&prec->val`, a
+/// pointer. Owning it charged one malloc and one free per posted field per
+/// cycle. Subscriber-driven posts, whose names come from the subscription map,
+/// are the owned case.
+pub type FieldPost = (
+    std::borrow::Cow<'static, str>,
+    EpicsValue,
+    crate::server::recgbl::EventMask,
+);
+
 /// Snapshot of changes from a process cycle, used for notify outside lock.
+///
+/// The first post is held inline and the rest spill to a `Vec`, the same shape
+/// as [`ProcStack`](crate::server::database::ProcStack) and for the same
+/// reason: the overwhelmingly common cycle posts exactly one field — the
+/// record's deadband-tracked value, with nothing subscribed behind it — and a
+/// `Vec` charged that cycle a 256-byte allocation and its free. It was the last
+/// per-cycle allocation on the process path.
+///
+/// `head` and `rest` carry no meaning of their own: `head` is post 0 and `rest`
+/// is posts 1.., so nothing may read them apart from [`Self::iter`].
+#[derive(Default)]
 pub struct ProcessSnapshot {
-    /// `(field, value, mask)` — every posted field carries its own
-    /// `DBE_*` posting mask, mirroring C's per-field
-    /// `db_post_events(prec, &field, mask)`. One process cycle posts
-    /// different classes per field: a deadband-gated readback narrows
-    /// to the deadbands that actually crossed (MDEL → `DBE_VALUE`,
-    /// ADEL → `DBE_LOG`; motorRecord.cc `monitor()` 3476-3507,
-    /// aiRecord.c `monitor()`), while a change-detected auxiliary
-    /// field posts `DBE_VALUE | DBE_LOG` (motorRecord.cc 3522-3645
-    /// `DBE_VAL_LOG`; calcRecord.c:420). A single record-wide mask
-    /// collapses that granularity — an archive-only deadband crossing
-    /// would wrongly reach `DBE_VALUE` subscribers whenever any other
-    /// field changed in the same pass.
-    pub changed_fields: Vec<(String, EpicsValue, crate::server::recgbl::EventMask)>,
+    head: Option<FieldPost>,
+    rest: Vec<FieldPost>,
 }
 
 impl ProcessSnapshot {
+    /// A cycle that posted nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one post, after every post already added.
+    pub fn push(&mut self, post: FieldPost) {
+        match self.head {
+            None => self.head = Some(post),
+            Some(_) => self.rest.push(post),
+        }
+    }
+
+    /// Whether this cycle posted nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    /// How many fields this cycle posts.
+    pub fn len(&self) -> usize {
+        usize::from(self.head.is_some()) + self.rest.len()
+    }
+
+    /// The cycle's posts, in the order they were added.
+    pub fn iter(&self) -> impl Iterator<Item = &FieldPost> {
+        self.head.iter().chain(self.rest.iter())
+    }
+
     /// The union of every `DBE_*` class this cycle actually published — the
     /// port's answer to "what did `db_post_events` send for this record".
     ///
@@ -1479,11 +1581,26 @@ impl ProcessSnapshot {
     /// (`RecordInstance::notify_from_snapshot` skips it), so an empty union
     /// means the cycle published nothing and no monitor of any class fired.
     pub fn published_mask(&self) -> crate::server::recgbl::EventMask {
-        self.changed_fields
-            .iter()
+        self.iter()
             .fold(crate::server::recgbl::EventMask::NONE, |acc, (_, _, m)| {
                 acc | *m
             })
+    }
+}
+
+impl Extend<FieldPost> for ProcessSnapshot {
+    fn extend<I: IntoIterator<Item = FieldPost>>(&mut self, iter: I) {
+        for post in iter {
+            self.push(post);
+        }
+    }
+}
+
+impl FromIterator<FieldPost> for ProcessSnapshot {
+    fn from_iter<I: IntoIterator<Item = FieldPost>>(iter: I) -> Self {
+        let mut out = Self::new();
+        out.extend(iter);
+        out
     }
 }
 
@@ -1503,11 +1620,12 @@ impl ProcessSnapshot {
 /// for records that compute in their own `process()`, and
 /// `RecordInstance::suppress_subroutine_run` for the two whose body is a
 /// framework-dispatched subroutine (sub/aSub).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InputFetchPolicy {
     /// Read every configured link; a failed read neither stops the loop nor
     /// gates the record body. C `transformRecord.c::process` (534-547) reads
     /// on through a failed `dbGetLink` and computes anyway.
+    #[default]
     ReadAll,
     /// Read every configured link — a failure does NOT stop the loop, so the
     /// inputs behind it still refresh — but the body is skipped this cycle.
@@ -2411,6 +2529,17 @@ pub trait Record: Send + Sync + 'static {
     /// `process()`, as their C does.
     fn after_output_decision(&mut self) {}
 
+    /// Whether [`Record::after_output_decision`] does anything for this type —
+    /// whether its C `process()` has a `conditional_write` epilogue outside
+    /// `if (doDevSupWrite)` at all. Answered so the cycle can settle it once
+    /// (`ProcessPlan::redecides_after_output`) instead of taking the record's
+    /// write lock every cycle to call an empty body; 42 of the 43 types have
+    /// one. Override it in the same impl block as the epilogue — a type that
+    /// forgets is caught by `a_type_that_redecides_after_output_says_so`.
+    fn redecides_after_output(&self) -> bool {
+        false
+    }
+
     /// Whether this record uses MDEL/ADEL deadband for monitor posting.
     /// Binary records (bi, bo, busy, mbbi, mbbo) return false because
     /// C EPICS always posts monitors for these record types regardless
@@ -2511,9 +2640,14 @@ pub trait Record: Send + Sync + 'static {
     /// MDEL/ADEL to `RBV` (the readback) — its C `monitor()` deadbands
     /// `RBV`, not `VAL`. Such a record returns its readback field here.
     ///
+    /// In the deadband's own domain: C compares `double`s
+    /// (`recGblCheckDeadband`), so a record that stores the cell as one hands
+    /// it over without an `EpicsValue` round trip. `None` is a value the
+    /// deadband cannot compare, which posts unconditionally.
+    ///
     /// Default is `val()`, so existing records are unaffected.
-    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
-        self.val()
+    fn monitor_deadband_value(&self) -> Option<f64> {
+        self.val().and_then(|v| v.to_f64())
     }
 
     /// The FIELD whose VALUE/LOG monitor delivery the MDEL/ADEL
@@ -3077,7 +3211,7 @@ pub trait Record: Send + Sync + 'static {
     /// ALST); everything else their tail does is
     /// [`Self::init_record_tail`]'s.
     fn seed_deadband_tracking(&mut self) {
-        let seed = match self.monitor_deadband_value().and_then(|v| v.to_f64()) {
+        let seed = match self.monitor_deadband_value() {
             Some(v) if v.is_finite() => v,
             _ => return,
         };
@@ -3199,6 +3333,147 @@ pub trait Record: Send + Sync + 'static {
 
     fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {
         false
+    }
+
+    /// C `monitor()`'s four deadband cells, read in one question: the MDEL /
+    /// ADEL thresholds and the MLST / ALST values the record last posted at.
+    /// `None` is a cell this type does not carry, which is the "nothing
+    /// posted yet" state [`check_deadband`](crate::server::record::check_deadband)
+    /// takes for MLST/ALST and a zero deadband for MDEL/ADEL.
+    ///
+    /// Asked as one question because the cycle otherwise asks
+    /// [`Self::get_field`] four times through the vtable and pays an
+    /// [`EpicsValue`](crate::types::EpicsValue) per answer. This default body
+    /// is codegen'd per record type, so the four asks inside it are static
+    /// calls with literal field names on the type's own cells; overriding it
+    /// buys nothing and no record type should.
+    fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
+        MonitorDeadbandCells {
+            mdel: self.get_field("MDEL").and_then(|v| v.to_f64()),
+            adel: self.get_field("ADEL").and_then(|v| v.to_f64()),
+            mlst: self.get_field("MLST").and_then(|v| v.to_f64()),
+            alst: self.get_field("ALST").and_then(|v| v.to_f64()),
+        }
+    }
+
+    /// Store the value this cycle posted at into the cells whose deadband it
+    /// crossed — C `monitor()`'s `prec->mlst = prec->val` /
+    /// `prec->alst = prec->val`.
+    ///
+    /// The coercion is
+    /// [`RecordInstance::put_coerced`](crate::server::record::RecordInstance)'s:
+    /// C declares MLST/ALST with the record's VAL type, so the double is
+    /// converted to whatever the cell holds. Same one-question reason as
+    /// [`Self::monitor_deadband_cells`] — this is four more vtable calls
+    /// otherwise.
+    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
+        for (field, store) in [("ALST", alst), ("MLST", mlst)] {
+            if !store {
+                continue;
+            }
+            let target = self
+                .get_field(field)
+                .map(|v| v.db_field_type())
+                .unwrap_or(crate::types::DbFieldType::Double);
+            let _ = self.put_field(field, EpicsValue::Double(val).convert_to(target));
+        }
+    }
+
+    /// The three cells C `checkAlarms` reads straight off the record — VAL,
+    /// HYST and LALM — in one question, in the ladder's own domain. `None`
+    /// is a VAL the ladder has no arm for; a `None` cell is one this type
+    /// does not carry.
+    ///
+    /// Same reason as [`Self::monitor_deadband_cells`]: the ladder runs on
+    /// every cycle of every analog record, and asking [`Self::get_field`] by
+    /// name is a full name match per cell, each answered in an `EpicsValue`
+    /// the ladder then converts back to the number C reads as a struct
+    /// member.
+    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
+        let val = AlarmLimit::from_ladder_value(&self.val()?)?;
+        Some(AnalogAlarmInput {
+            val,
+            hyst: self
+                .get_field("HYST")
+                .and_then(|v| AlarmLimit::from_stored(&v)),
+            lalm: self
+                .get_field("LALM")
+                .and_then(|v| AlarmLimit::from_stored(&v)),
+        })
+    }
+
+    /// C `checkAlarms`'s AFTC low-pass cells — the time constant and the
+    /// filter accumulator — in one question.
+    ///
+    /// `None` is a record type that carries no AFTC field, and so has no
+    /// filter block in its C `checkAlarms` at all: `ao`, `longout`,
+    /// `int64out` and `calcout` (confirmed against their `.dbd.pod`). That
+    /// used to be a hard-coded list of the four types that DO carry it,
+    /// beside the field reads that would have answered the same question.
+    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
+        let aftc = self.get_field("AFTC")?.to_f64().unwrap_or(0.0);
+        let afvl = self
+            .get_field("AFVL")
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0);
+        Some((aftc, afvl))
+    }
+
+    /// Store the AFTC filter accumulator — C's `prec->afvl = afvl`.
+    fn store_alarm_filter_value(&mut self, afvl: f64) {
+        let _ = self.put_field("AFVL", EpicsValue::Double(afvl));
+    }
+
+    /// Arm C's `prec->lalm` latch, coerced to the type the cell is declared
+    /// with — the same coercion
+    /// [`RecordInstance::put_coerced`](crate::server::record::RecordInstance)
+    /// makes, and for the same reason: C declares LALM with the record's VAL
+    /// type, so an `epicsInt64` latch must not round through a double.
+    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
+        let target = self
+            .get_field("LALM")
+            .map(|v| v.db_field_type())
+            .unwrap_or(crate::types::DbFieldType::Double);
+        let _ = self.put_field("LALM", lalm.to_epics_value().convert_to(target));
+    }
+
+    /// Which slots of [`Self::multi_input_links`] are wired, as two bitmasks
+    /// over that list: `.0` the slots [`Self::link_text_ref`] lends a
+    /// non-empty text for, `.1` the slots it declines to lend at all, which
+    /// the caller must resolve through the instance instead.
+    ///
+    /// Asked as ONE question because the cycle otherwise asks one per declared
+    /// link — 21 trips through the vtable for a `calc`, to learn that a stock
+    /// database wires none of them. A trait default body is codegen'd per
+    /// implementing type, so `multi_input_links` and `link_text_ref` inside
+    /// this one are static calls the compiler can inline.
+    ///
+    /// Inlined is still one name match per declared link on every cycle of
+    /// every record of the type — the cycle's most-repeated question, measured
+    /// at 232 of a `calc` cycle's ~2570 TSC. A type whose link texts sit in one
+    /// array answers off that array through [`input_link_slots_of`] and skips
+    /// the walk; a type whose texts are separate fields hands the same helper
+    /// an array of references to them. Either way the answer must be the one
+    /// this body would give, which is what
+    /// `a_record_that_reads_its_own_link_slots_answers_what_the_name_walk_would`
+    /// pins for every declared type.
+    ///
+    /// `None` for a type declaring more links than a mask holds; the caller
+    /// then walks the list link by link, as it did before this existed.
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        let links = self.multi_input_links();
+        if links.len() > u64::BITS as usize {
+            return None;
+        }
+        let (mut set, mut unknown) = (0u64, 0u64);
+        for (slot, (link_field, _)) in links.iter().enumerate() {
+            match self.link_text_ref(link_field) {
+                Some("") => {}
+                Some(_) => set |= 1 << slot,
+                None => unknown |= 1 << slot,
+            }
+        }
+        Some((set, unknown))
     }
 
     /// Whether this record's C `process()` performs the SCALAR closed-loop DOL
@@ -3748,7 +4023,7 @@ pub trait Record: Send + Sync + 'static {
     /// The sole exception in base is `mbboDirectRecord.c:191`, which raises
     /// `recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs, "UDFS")` — a bespoke
     /// literal. That record overrides this to `"UDFS"`.
-    fn udf_alarm_message(&self) -> &str {
+    fn udf_alarm_message(&self) -> &'static str {
         ""
     }
 
@@ -3917,6 +4192,15 @@ pub trait Record: Send + Sync + 'static {
         _selector: Option<u16>,
     ) -> Option<&'static [(&'static str, &'static str)]> {
         None
+    }
+
+    /// Whether [`Self::select_input_links`] can EVER narrow this type's input
+    /// list — `sel` in `Specified` mode, `swait` while simulating. The answer
+    /// is a property of the type, not of its state, and the cycle carries it
+    /// in its [`ProcessPlan`](crate::server::record::RecordInstance), so the
+    /// other forty-odd types no longer take the record lock to be told `None`.
+    fn narrows_input_links(&self) -> bool {
+        false
     }
 
     /// A `SIMM != NO` cycle substitutes only this record's INPUT STAGE — the
@@ -4128,6 +4412,27 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Does this TYPE declare a [`Self::multi_output_links`] table at all,
+    /// whether or not this cycle drives it?
+    ///
+    /// `multi_output_links` is a per-CYCLE answer: `scalcout` withholds its
+    /// pair while its own put-callback is in flight, `aSub` while the
+    /// subroutine returned non-zero, `acalcout` and `epid` while the cycle
+    /// computed nothing. Every one of them therefore answers `&[]` at
+    /// construction and on most cycles, so the engine cannot settle "does
+    /// this type have multi-outputs" by asking it. This is that settled
+    /// answer, carried by `ProcessPlan`, so a record type with no such table
+    /// never takes its own lock once a cycle to be told so.
+    ///
+    /// MUST be `true` for every type whose `multi_output_links` can ever
+    /// return a non-empty slice. `dispatch_multi_output_values` debug-asserts
+    /// the implication on every cycle it declines, so a type that adds the
+    /// table and forgets this fails the test suite rather than losing its
+    /// outputs in release.
+    fn declares_multi_output_links(&self) -> bool {
+        false
+    }
+
     /// The record's C soft device support write-buffer switch for a
     /// multi-output pair: given the pair's staged value (the value field
     /// named by [`Self::multi_output_links`]) and the RESOLVED TARGET
@@ -4220,7 +4525,21 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: [`LinkReadAs::Native`] — the source's native value, coerced at
     /// the target field's own put boundary.
-    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+    fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
+        let _ = link_field;
+        InputLinkRequest::As(LinkReadAs::Native)
+    }
+
+    /// The same request for a record whose [`Self::input_link_request`]
+    /// answered [`InputLinkRequest::FromSource`] — C's `dbGetLinkLS` switch on
+    /// `dbGetLinkDBFtype`, and sseq's on the same accessor. Reached ONLY
+    /// through that answer, so a record that never gives it needs no
+    /// implementation.
+    fn input_link_read_as_from_source(
+        &self,
+        link_field: &str,
+        source: &OutTarget,
+    ) -> Option<LinkReadAs> {
         let _ = (link_field, source);
         Some(LinkReadAs::Native)
     }
@@ -5132,6 +5451,275 @@ mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
 
+    /// A type that reads its own link texts to answer
+    /// [`Record::set_input_link_slots`] must give the answer the default body's
+    /// name walk would, or the cycle fetches the wrong set of input links —
+    /// silently, since an unwired slot and a slot the override forgot look the
+    /// same to it. Pinned against the default body's own algorithm, for every
+    /// declared type and for each slot wired alone as well as none and all.
+    #[test]
+    fn a_record_that_reads_its_own_link_slots_answers_what_the_name_walk_would() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        for record_type in RECORD_TYPES {
+            let Ok(probe) = crate::server::db_loader::create_record(record_type) else {
+                continue;
+            };
+            let links = probe.multi_input_links();
+            if links.is_empty() || links.len() > u64::BITS as usize {
+                continue;
+            }
+            let wirings = std::iter::once(Vec::new())
+                .chain((0..links.len()).map(|i| vec![i]))
+                .chain(std::iter::once((0..links.len()).collect::<Vec<_>>()));
+            for wired in wirings {
+                let Ok(mut record) = crate::server::db_loader::create_record(record_type) else {
+                    continue;
+                };
+                for &slot in &wired {
+                    let _ = record.put_field(links[slot].0, EpicsValue::String("SRC".into()));
+                }
+                let walked = {
+                    let (mut set, mut unknown) = (0u64, 0u64);
+                    for (slot, (link_field, _)) in links.iter().enumerate() {
+                        match record.link_text_ref(link_field) {
+                            Some("") => {}
+                            Some(_) => set |= 1 << slot,
+                            None => unknown |= 1 << slot,
+                        }
+                    }
+                    Some((set, unknown))
+                };
+                assert_eq!(
+                    record.set_input_link_slots(),
+                    walked,
+                    "{record_type}: set_input_link_slots() disagrees with the name walk \
+                     with slots {wired:?} wired"
+                );
+            }
+        }
+    }
+
+    /// The cycle skips [`Record::select_input_links`] — and the record read
+    /// lock it needs — whenever [`Record::narrows_input_links`] is false. A
+    /// type that answers `false` must never narrow, or the cycle skips a real
+    /// restriction to save the lock that would have found it.
+    #[test]
+    fn a_type_that_never_narrows_its_inputs_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        for record_type in RECORD_TYPES {
+            let Ok(record) = crate::server::db_loader::create_record(record_type) else {
+                continue;
+            };
+            if record.narrows_input_links() {
+                continue;
+            }
+            for selector in std::iter::once(None).chain((0..=20u16).map(Some)) {
+                assert!(
+                    record.select_input_links(selector).is_none(),
+                    "{record_type}: narrows_input_links() is false but \
+                     select_input_links({selector:?}) narrowed the list"
+                );
+            }
+        }
+    }
+
+    /// The cycle skips [`Record::after_output_decision`] — and the record write
+    /// lock it needs — whenever [`Record::redecides_after_output`] is false
+    /// (`ProcessPlan::redecides_after_output`). A type that grows an epilogue
+    /// and forgets the predicate would be silently skipped, so every type is
+    /// driven through both and the two are required to agree.
+    #[test]
+    fn a_type_that_redecides_after_output_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        for record_type in RECORD_TYPES {
+            let (Ok(mut ran), Ok(untouched)) = (
+                crate::server::db_loader::create_record(record_type),
+                crate::server::db_loader::create_record(record_type),
+            ) else {
+                continue;
+            };
+            // C `longoutRecord.c:492` latches VAL into PVAL, so a record left at
+            // its initial VAL would hide the epilogue behind `pval == val`.
+            let _ = ran.put_field("VAL", EpicsValue::Long(7));
+            let before = field_dump(&*ran);
+            ran.after_output_decision();
+            let changed = field_dump(&*ran) != before;
+
+            let diff: Vec<_> = field_dump(&*ran)
+                .into_iter()
+                .zip(before.iter())
+                .filter(|(a, b)| a.1 != b.1)
+                .map(|(a, b)| (a.0, b.1.clone(), a.1.clone()))
+                .collect();
+            assert_eq!(
+                changed,
+                untouched.redecides_after_output(),
+                "{record_type}: after_output_decision changed {diff:?}, but \
+                 redecides_after_output said {}",
+                untouched.redecides_after_output()
+            );
+        }
+    }
+
+    /// Every field the type declares, rendered — `sel` initialises A..L to
+    /// `NaN`, which is never equal to itself, so the comparison is over the
+    /// `Debug` form rather than the values.
+    fn field_dump(r: &dyn Record) -> Vec<(&'static str, String)> {
+        r.field_list()
+            .iter()
+            .map(|d| (d.name, format!("{:?}", r.get_field(d.name))))
+            .collect()
+    }
+
+    /// Every one-question cycle accessor must answer exactly what the
+    /// `get_field` path it replaces would answer, for every record type in
+    /// the database — the overrides exist only to skip a name match, never to
+    /// change what is read.
+    ///
+    /// The cells are seeded with DISTINCT values first, through the generic
+    /// put path and in the type the cell is declared with, so an override
+    /// that returns the neighbouring cell cannot pass on a default-valued
+    /// record where every cell reads zero.
+    #[test]
+    fn every_record_answers_the_cycle_cells_as_get_field_does() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        let f64_of = |r: &dyn Record, field: &str| r.get_field(field).and_then(|v| v.to_f64());
+
+        for record_type in RECORD_TYPES {
+            let Ok(mut r) = crate::server::db_loader::create_record(record_type) else {
+                continue;
+            };
+            seed_cycle_cells(&mut *r);
+
+            let r = &*r;
+            let deadband = r.monitor_deadband_cells();
+            assert_eq!(deadband.mdel, f64_of(r, "MDEL"), "{record_type} MDEL");
+            assert_eq!(deadband.adel, f64_of(r, "ADEL"), "{record_type} ADEL");
+            assert_eq!(deadband.mlst, f64_of(r, "MLST"), "{record_type} MLST");
+            assert_eq!(deadband.alst, f64_of(r, "ALST"), "{record_type} ALST");
+
+            let ladder = r
+                .val()
+                .and_then(|v| AlarmLimit::from_ladder_value(&v))
+                .map(|val| AnalogAlarmInput {
+                    val,
+                    hyst: r
+                        .get_field("HYST")
+                        .and_then(|v| AlarmLimit::from_stored(&v)),
+                    lalm: r
+                        .get_field("LALM")
+                        .and_then(|v| AlarmLimit::from_stored(&v)),
+                });
+            assert_eq!(
+                r.analog_alarm_input(),
+                ladder,
+                "{record_type} analog_alarm_input"
+            );
+
+            let filter = r.get_field("AFTC").map(|aftc| {
+                (
+                    aftc.to_f64().unwrap_or(0.0),
+                    f64_of(r, "AFVL").unwrap_or(0.0),
+                )
+            });
+            assert_eq!(r.alarm_filter_cells(), filter, "{record_type} AFTC/AFVL");
+        }
+    }
+
+    /// The write half, pinned against the path it replaces rather than
+    /// against a restatement of it: two records of the same type, one driven
+    /// through the store accessor and one through the `get_field` type probe
+    /// and `put_field` the accessor stands in for. Their cells must end up
+    /// identical, including where the put is refused — which is how the port
+    /// behaved before the accessor existed.
+    #[test]
+    fn every_record_stores_the_cycle_cells_as_put_field_does() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        for record_type in RECORD_TYPES {
+            let (Ok(mut fast), Ok(mut slow)) = (
+                crate::server::db_loader::create_record(record_type),
+                crate::server::db_loader::create_record(record_type),
+            ) else {
+                continue;
+            };
+            seed_cycle_cells(&mut *fast);
+            seed_cycle_cells(&mut *slow);
+
+            fast.store_monitor_last_posted(23.0, true, true);
+            for field in ["ALST", "MLST"] {
+                let target = slow
+                    .get_field(field)
+                    .map(|v| v.db_field_type())
+                    .unwrap_or(crate::types::DbFieldType::Double);
+                let _ = slow.put_field(field, EpicsValue::Double(23.0).convert_to(target));
+            }
+
+            fast.store_alarm_filter_value(29.0);
+            let _ = slow.put_field("AFVL", EpicsValue::Double(29.0));
+
+            fast.store_analog_lalm(AlarmLimit::Double(31.0));
+            let target = slow
+                .get_field("LALM")
+                .map(|v| v.db_field_type())
+                .unwrap_or(crate::types::DbFieldType::Double);
+            let _ = slow.put_field("LALM", EpicsValue::Double(31.0).convert_to(target));
+
+            for field in ["MLST", "ALST", "AFVL", "LALM"] {
+                assert_eq!(
+                    fast.get_field(field),
+                    slow.get_field(field),
+                    "{record_type} {field}"
+                );
+            }
+        }
+    }
+
+    /// `Record::val` and `Record::output_link_value` carry SEMANTICS that
+    /// several types legitimately override (`stringout` serves neither from
+    /// OVAL), so they cannot be pinned database-wide. The types whose
+    /// override exists only to skip the name match are listed here, and each
+    /// must still answer what the default body would.
+    #[test]
+    fn a_speed_override_of_val_answers_what_the_default_would() {
+        const SPEED_OVERRIDES: &[&str] = &["calc"];
+
+        for record_type in SPEED_OVERRIDES {
+            let mut r = crate::server::db_loader::create_record(record_type)
+                .expect("a listed type is creatable");
+            seed_cycle_cells(&mut *r);
+            let _ = r.put_field("VAL", EpicsValue::Double(41.0));
+
+            let r = &*r;
+            assert_eq!(r.val(), r.get_field(r.primary_field()), "{record_type} val");
+            assert_eq!(
+                r.output_link_value(),
+                r.get_field("OVAL").or_else(|| r.val()),
+                "{record_type} output_link_value"
+            );
+        }
+    }
+
+    /// Distinct values in every cell the cycle accessors read, each in the
+    /// type its record declares it with.
+    fn seed_cycle_cells(r: &mut dyn Record) {
+        let cells = [
+            "MDEL", "ADEL", "MLST", "ALST", "HYST", "LALM", "AFTC", "AFVL", "OVAL",
+        ];
+        for (i, field) in cells.iter().enumerate() {
+            let Some(target) = r.get_field(field).map(|v| v.db_field_type()) else {
+                continue;
+            };
+            let _ = r.put_field(
+                field,
+                EpicsValue::Double(11.0 + i as f64).convert_to(target),
+            );
+        }
+    }
+
     /// Internal delivery is not a `dbPut`, and the two entries have to stay
     /// two. A `compress` INP reading a `DBF_LONG` source delivers ONE sample
     /// as an `EpicsValue::Long`; C's link layer converts it to the target's
@@ -5156,4 +5744,30 @@ mod tests {
             "compressRecord.c:273-304 never touches prec->n"
         );
     }
+}
+
+/// The three cells C `checkAlarms` compares — see
+/// [`Record::analog_alarm_input`], which is the only producer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnalogAlarmInput {
+    /// VAL, in the variant that picks the ladder's arm.
+    pub val: AlarmLimit,
+    /// HYST, or `None` for a type that keeps it in `CommonFields`.
+    pub hyst: Option<AlarmLimit>,
+    /// LALM, the armed latch, or `None` for a type with no cell for it.
+    pub lalm: Option<AlarmLimit>,
+}
+
+/// The four cells C `monitor()`'s deadband compares against — see
+/// [`Record::monitor_deadband_cells`], which is the only producer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MonitorDeadbandCells {
+    /// MDEL, the monitor deadband.
+    pub mdel: Option<f64>,
+    /// ADEL, the archive deadband.
+    pub adel: Option<f64>,
+    /// MLST, the value the last `DBE_VALUE` post carried.
+    pub mlst: Option<f64>,
+    /// ALST, the value the last `DBE_LOG` post carried.
+    pub alst: Option<f64>,
 }

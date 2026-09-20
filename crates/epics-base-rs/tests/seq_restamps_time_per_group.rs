@@ -21,7 +21,6 @@
 //! restamp must go through the TSE owner (TSE=-2 leaves TIME alone) and must
 //! re-resolve TSEL per group (a `.TIME` TSEL re-copies its source).
 
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::server::database::PvDatabase;
@@ -69,7 +68,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 /// with `pact = TRUE` (`seqRecord.c:143`) and `asyncFinish` (`:219-241`)
 /// clears it from the last hop.
 async fn run_chain(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

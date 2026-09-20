@@ -42,7 +42,7 @@
 //! equal severity and the strict-greater test dropped it. It is a regression
 //! guard for a path the defect never reached, not evidence of the defect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -89,7 +89,7 @@ async fn build() -> Db {
 }
 
 async fn process(db: &Db, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
@@ -98,7 +98,11 @@ async fn process(db: &Db, name: &str) {
 fn alarm(db: &Db, name: &str) -> (u16, AlarmSeverity, String) {
     let rec = db.get_record(name).unwrap();
     let inst = rec.read();
-    (inst.common.stat, inst.common.sevr, inst.common.amsg.clone())
+    (
+        inst.common.stat,
+        inst.common.sevr,
+        inst.common.amsg.as_str().to_owned(),
+    )
 }
 
 /// The multi-input fetch (`db_get_link_deferred`), which reads INPA..INPL with

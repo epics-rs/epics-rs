@@ -16,7 +16,7 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -57,11 +57,11 @@ record(stringin, "TOD_STR") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TOD_SEC", &mut visited)
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TOD_STR", &mut visited)
         .await
         .unwrap();

@@ -126,7 +126,7 @@ async fn drive(db: &PvDatabase, val: f64) {
             .put_field("VAL", EpicsValue::Double(val))
             .unwrap();
     }
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();

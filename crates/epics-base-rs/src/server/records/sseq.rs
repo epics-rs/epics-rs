@@ -1488,10 +1488,21 @@ impl Record for SseqRecord {
     /// `SELL` is not part of this switch: C reads it with a FIXED
     /// `dbGetLink(&pR->sell, DBF_USHORT, &pR->seln, 0, 0)` (:315-317), so it
     /// keeps the framework's native read and `SELN`'s own put coercion.
-    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
-        let Some((_, "DOL")) = Self::step_index_from_suffix(link_field) else {
-            return Some(LinkReadAs::Native);
-        };
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::InputLinkRequest;
+        match Self::step_index_from_suffix(link_field) {
+            // Only `DOLn` is read through the source-class switch; `SELL` and
+            // every other link keep the framework's native read.
+            Some((_, "DOL")) => InputLinkRequest::FromSource,
+            _ => InputLinkRequest::As(LinkReadAs::Native),
+        }
+    }
+
+    fn input_link_read_as_from_source(
+        &self,
+        _link_field: &str,
+        source: &OutTarget,
+    ) -> Option<LinkReadAs> {
         if source.puts_as_string {
             return Some(LinkReadAs::String);
         }

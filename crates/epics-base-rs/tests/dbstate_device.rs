@@ -9,7 +9,7 @@
 //! merely that processing leaves the records un-alarmed — a no-alarm-only test
 //! would pass even if the device never ran.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -42,13 +42,13 @@ record(bi, "DBST_BI") {
     db.put_pv_no_process("DBST_BO.VAL", EpicsValue::Enum(1))
         .await
         .unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DBST_BO", &mut v)
         .await
         .unwrap();
 
     // bi process → reads the bit into VAL (device read, skip-convert).
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DBST_BI", &mut v)
         .await
         .unwrap();
@@ -72,11 +72,11 @@ record(bi, "DBST_BI") {
     db.put_pv_no_process("DBST_BO.VAL", EpicsValue::Enum(0))
         .await
         .unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DBST_BO", &mut v)
         .await
         .unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DBST_BI", &mut v)
         .await
         .unwrap();
@@ -144,7 +144,7 @@ record(bi, "DBST_NONAME") {
         .unwrap();
 
     for _ in 0..3 {
-        let mut v = HashSet::new();
+        let mut v = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("DBST_NONAME", &mut v)
             .await
             .unwrap();

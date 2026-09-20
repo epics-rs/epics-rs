@@ -62,6 +62,13 @@ impl From<ArrayStackValue> for Cell {
     }
 }
 
+/// `aCalcPostfix.c` — `#define ACALC_STACKSIZE 20`, the ceiling the aCalc
+/// element table declares (`token.rs` `ACALC_TABLE.stack_size`).
+const ACALC_STACKSIZE: usize = 20;
+
+/// C `aCalcPerform`'s frame-resident operand stack.
+type Stack = super::stack::Stack<Cell, ACALC_STACKSIZE>;
+
 pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
     // C `aCalcPerform.c:312-314` — `if (*postfix == END_EXPRESSION) return(-1);`,
     // ahead of even the value-stack allocation. Same contract as the other two
@@ -79,7 +86,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     // caller may pre-set it, and every caller may trust it afterwards.
     inputs.amask = 0;
 
-    let mut stack: Vec<Cell> = Vec::with_capacity(20);
+    let mut stack = Stack::new();
     let code = &expr.code;
     let mut pc = 0;
 
@@ -1123,9 +1130,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     // publish the wrong stack cell as VAL/AVAL: `stack.last()` would have handed
     // back the leaked operand, and an empty stack would have invented a 0 that C
     // never produces.
-    match <[Cell; 1]>::try_from(stack) {
-        Ok([result]) => Ok(result.v),
-        Err(_) => Err(CalcError::StackLeak),
+    if stack.overflowed() {
+        return Err(CalcError::Overflow);
+    }
+    match stack.into_only() {
+        Some(result) => Ok(result.v),
+        None => Err(CalcError::StackLeak),
     }
 }
 
@@ -1234,11 +1244,7 @@ fn derivative_into_window(cell: &mut ArrayCell, npts: i64, status: &mut Status) 
 /// Returns `(constant_target, linear_target, quadratic_target)`.
 type FitTargets = (Option<usize>, Option<usize>, Option<usize>);
 
-fn pop_fit_targets(
-    stack: &mut Vec<Cell>,
-    nargs: usize,
-    max: usize,
-) -> Result<FitTargets, CalcError> {
+fn pop_fit_targets(stack: &mut Stack, nargs: usize, max: usize) -> Result<FitTargets, CalcError> {
     let mut nargs = nargs;
     while nargs > max {
         pop(stack)?;
@@ -1399,7 +1405,7 @@ impl Extremum {
 /// `MAX(NaN,5)` are both NaN (status -1). The port's test was inverted — it
 /// DISCARDED a NaN accumulator — so both answered 5.
 fn vararg_extremum(
-    stack: &mut Vec<Cell>,
+    stack: &mut Stack,
     nargs: usize,
     array_size: usize,
     op: Extremum,
@@ -1653,23 +1659,23 @@ fn shift_elements(a: &mut [f64], e: f64) {
 /// observable effect: `AA[2,3e9]` selects the tail, before and after.
 ///
 /// The rest of the rule is [`super::subrange_bounds`], shared with sCalc.
-fn pop_subrange_bounds(stack: &mut Vec<Cell>, array_size: i64) -> Result<(i64, i64), CalcError> {
+fn pop_subrange_bounds(stack: &mut Stack, array_size: i64) -> Result<(i64, i64), CalcError> {
     let j = i64::from(c_int(pop_f64(stack)?));
     let i = i64::from(c_int(pop_f64(stack)?));
     Ok(super::subrange_bounds(i, j, array_size))
 }
 
 /// C's `INC(ps)` (`:88`): a fresh cell, with neither a window nor a provenance.
-fn push(stack: &mut Vec<Cell>, v: ArrayStackValue) {
+fn push(stack: &mut Stack, v: ArrayStackValue) {
     stack.push(Cell { v, src: None });
 }
 
 /// C's two `sourceDouble` writers — `FETCH_A..P` (`:434`) and `A_FETCH` (`:1475`).
-fn push_src(stack: &mut Vec<Cell>, v: ArrayStackValue, src: Option<usize>) {
+fn push_src(stack: &mut Stack, v: ArrayStackValue, src: Option<usize>) {
     stack.push(Cell { v, src });
 }
 
-fn pop(stack: &mut Vec<Cell>) -> Result<Cell, CalcError> {
+fn pop(stack: &mut Stack) -> Result<Cell, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
@@ -1701,7 +1707,7 @@ fn try_unary_op(
 /// the LEFT operand's cell IS the result cell, so the LEFT operand's provenance
 /// survives and the right operand's is discarded with its cell.
 fn binary(
-    stack: &mut Vec<Cell>,
+    stack: &mut Stack,
     f: impl FnOnce(ArrayStackValue, ArrayStackValue) -> ArrayStackValue,
 ) -> Result<(), CalcError> {
     let b = pop(stack)?;
@@ -1709,18 +1715,14 @@ fn binary(
 }
 
 /// Pop the `n` arguments of a VARARG operator, keeping their shapes intact.
-fn popn(stack: &mut Vec<Cell>, n: usize) -> Result<Vec<ArrayStackValue>, CalcError> {
+fn popn(stack: &mut Stack, n: usize) -> Result<Vec<ArrayStackValue>, CalcError> {
     if stack.len() < n {
         return Err(CalcError::Underflow);
     }
-    Ok(stack
-        .split_off(stack.len() - n)
-        .into_iter()
-        .map(|c| c.v)
-        .collect())
+    Ok(stack.take_top(n).into_iter().map(|c| c.v).collect())
 }
 
-fn pop_f64(stack: &mut Vec<Cell>) -> Result<f64, CalcError> {
+fn pop_f64(stack: &mut Stack) -> Result<f64, CalcError> {
     pop(stack)?.v.as_f64()
 }
 

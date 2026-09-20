@@ -21,7 +21,6 @@
 //! reached VALA..VALU (and their CA monitors) but no downstream record.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -42,7 +41,7 @@ fn sub_writing(vals: Vec<(&'static str, f64)>, status: i64) -> Arc<SubroutineFn>
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

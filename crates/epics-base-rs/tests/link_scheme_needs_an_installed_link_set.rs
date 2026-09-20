@@ -142,7 +142,7 @@ async fn a_pva_link_is_never_serviced_by_another_schemes_link_set() {
     let db = build(&[("ca", ca.clone())]).await;
 
     assert!(matches!(inp(&db, "JSON"), ParsedLink::None));
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("JSON", &mut visited).await;
     db.sync_external_link_puts().await;
 
@@ -173,7 +173,7 @@ async fn the_same_links_are_serviced_when_the_link_set_is_installed() {
     assert!(matches!(inp(&db, "OPTS"), ParsedLink::PvaJson(_)));
     assert!(matches!(inp(&db, "PREFIX"), ParsedLink::Pva(_)));
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("JSON", &mut visited).await;
     assert_eq!(db.get_pv("JSON").unwrap(), EpicsValue::Long(3));
     assert!(
@@ -213,7 +213,7 @@ async fn a_reparsed_pva_link_is_not_serviced_by_another_schemes_link_set() {
     let ca = SpyLset::new("ca");
     let db = build(&[("ca", ca.clone())]).await;
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("REPARSED", &mut visited).await;
 
     assert_eq!(

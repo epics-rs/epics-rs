@@ -2158,6 +2158,21 @@ impl Record for AcalcoutRecord {
         crate::server::record::seed_input_links(self.special_reseed_input_links())
     }
 
+    /// The `INPA..INPL` then `INAA..INLL` texts read straight off the record's
+    /// own two arrays, in `ACALCOUT_INPUT_LINKS` order, not through the default
+    /// body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        let mut texts: [&str; 24] = [""; 24];
+        for (dst, src) in texts[..12].iter_mut().zip(&self.inp_links) {
+            *dst = src.as_str();
+        }
+        for (dst, src) in texts[12..].iter_mut().zip(&self.ina_links) {
+            *dst = src.as_str();
+        }
+        crate::server::record::input_link_slots_of(&texts)
+    }
+
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         ACALCOUT_INPUT_LINKS
     }
@@ -2203,6 +2218,10 @@ impl Record for AcalcoutRecord {
     /// supplies the `nelm == 1 ? &val : aval` / `nelm == 1 ? &oval : oav`
     /// buffer choice — necessary since IVOA=Set_output_to_IVOV decouples
     /// `OVAL` from `OAV[0]` (see `set_output_to_ivov`).
+    fn declares_multi_output_links(&self) -> bool {
+        true
+    }
+
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if !self.cached_should_output {
             &[]

@@ -24,8 +24,6 @@
 //! nothing moving, a channel that DID move on a later cycle, and the mask —
 //! C overwrites `recGblResetAlarms`'s, so no alarm bit reaches these posts.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -50,7 +48,7 @@ fn subscribe(db: &PvDatabase, field: &str, id: u32) -> EventReader {
 }
 
 async fn process(db: &PvDatabase) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("T", &mut visited)
         .await
         .unwrap();

@@ -221,7 +221,7 @@ mod tests {
     use epics_base_rs::server::records::stringin::StringinRecord;
     use std::time::Duration;
 
-    fn ctx_with_phas(phas: i16) -> ProcessContext {
+    fn ctx_with_phas(phas: i16) -> ProcessContext<'static> {
         ProcessContext {
             udf: false,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
@@ -229,8 +229,7 @@ mod tests {
             phas,
             tse: 0,
             time: SystemTime::UNIX_EPOCH,
-            tsel: String::new(),
-            dtyp: String::new(),
+            dtyp: "",
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
         }
     }
@@ -238,7 +237,7 @@ mod tests {
     /// A `ProcessContext` carrying an explicit device-time stamp with
     /// `tse = -2` (`epicsTimeEventDeviceTime`), so `read()` resolves the
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
-    fn ctx_device_time(phas: i16, time: SystemTime) -> ProcessContext {
+    fn ctx_device_time(phas: i16, time: SystemTime) -> ProcessContext<'static> {
         ProcessContext {
             udf: false,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
@@ -246,8 +245,7 @@ mod tests {
             phas,
             tse: -2,
             time,
-            tsel: String::new(),
-            dtyp: String::new(),
+            dtyp: "",
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
         }
     }

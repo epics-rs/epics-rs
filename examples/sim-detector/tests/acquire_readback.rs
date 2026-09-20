@@ -95,7 +95,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
     let db2 = db.clone();
     tokio::spawn(async move {
         while intr_rx.recv().await.is_some() {
-            let mut visited = HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             let _ = db2.process_record_readback("Acquire", &mut visited).await;
         }
     });
@@ -108,7 +108,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
         inst.record.set_val(EpicsValue::Enum(1)).unwrap();
     }
     {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("Acquire", &mut visited)
             .await
             .unwrap();

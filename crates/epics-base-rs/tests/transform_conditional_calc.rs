@@ -25,7 +25,6 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
-use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
     db.get_record(rec)
@@ -43,7 +42,7 @@ async fn put(db: &PvDatabase, rec: &str, f: &str, v: EpicsValue) {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

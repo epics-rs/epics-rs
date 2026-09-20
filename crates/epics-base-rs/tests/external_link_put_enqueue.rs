@@ -22,7 +22,6 @@
 //!
 //! Each test below is one boundary of that queue, not one narrative.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
@@ -165,7 +164,7 @@ async fn set_val(db: &PvDatabase, name: &str, val: f64) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

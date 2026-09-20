@@ -32,8 +32,6 @@
 //! redirect. The port omitted the fields there too, so `check_simulation_mode`
 //! saw an unconfigured record and a simulated busy drove its real output.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::ai::AiRecord;
@@ -85,7 +83,7 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
 }
 
 async fn process(db: &PvDatabase) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut visited)
         .await
         .unwrap();
@@ -108,7 +106,7 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
 async fn amsg(db: &PvDatabase) -> String {
     let inst = db.get_record("W").unwrap();
     let g = inst.read();
-    g.common.amsg.clone()
+    g.common.amsg.as_str().to_owned()
 }
 
 /// SIMM = YES: VAL comes from SIOL through SVAL, the calc does not run, and the
@@ -328,7 +326,7 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
         w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
@@ -378,7 +376,7 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
         w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B2", &mut visited)
         .await
         .unwrap();

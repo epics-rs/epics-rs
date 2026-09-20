@@ -31,7 +31,7 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::db_loader::{apply_fields, create_record, parse_db};
@@ -82,7 +82,7 @@ async fn load(db: &PvDatabase, text: &str) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

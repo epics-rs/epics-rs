@@ -505,8 +505,8 @@ impl Record for MotorRecord {
     /// MDEL/ADEL monitor deadband applies to the readback (RBV), not the
     /// VAL setpoint. C `monitor()` gates RBV value/archive monitors on
     /// MDEL/ADEL; VAL is a setpoint that only changes on a move command.
-    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(self.pos.rbv))
+    fn monitor_deadband_value(&self) -> Option<f64> {
+        Some(self.pos.rbv)
     }
 
     /// The deadband gates RBV's monitor delivery (C motorRecord.cc
@@ -807,7 +807,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.pos.rbv = 7.25;
         assert_eq!(rec.monitor_deadband_field(), "RBV");
-        assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(7.25)));
+        assert_eq!(rec.monitor_deadband_value(), Some(7.25));
     }
 
     // C motorRecord.cc:3687 — URIP=Yes pulls the readback from the RDBL link

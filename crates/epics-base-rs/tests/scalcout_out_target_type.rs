@@ -19,8 +19,6 @@
 //! tests in `records::scalcout`. This file proves the framework owner feeds it
 //! the real target metadata end to end.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -58,7 +56,7 @@ async fn r14_61_string_target_receives_osv_not_oval() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC_STR", &mut visited)
         .await
         .unwrap();
@@ -83,7 +81,7 @@ async fn r14_61_char_array_target_receives_sval_bytes() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC_WF", &mut visited)
         .await
         .unwrap();
@@ -112,7 +110,7 @@ async fn r14_61_numeric_target_still_receives_oval() {
     sc.special("OCAL", true).unwrap();
     db.add_record("SC_NUM", Box::new(sc)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC_NUM", &mut visited)
         .await
         .unwrap();

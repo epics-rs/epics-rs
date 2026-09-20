@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::error::{CaError, CaResult};
 use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
@@ -590,11 +588,8 @@ fn commit_special_reset_alarm(
 ) -> crate::server::recgbl::EventMask {
     use crate::server::recgbl::EventMask;
     let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-    for (af, mask) in
-        crate::server::database::processing::alarm_field_posts(&instance.common, &alarm_result)
-    {
-        instance.notify_field(af, mask);
-    }
+    crate::server::database::processing::alarm_field_posts(&instance.common, &alarm_result)
+        .for_each(|af, mask| instance.notify_field(af, mask));
     if alarm_result.alarm_changed || alarm_result.amsg_changed {
         EventMask::ALARM
     } else {
@@ -912,7 +907,7 @@ impl Drop for ClientAwaitingNotify<'_> {
 /// returns carries a line of cleanup, and a new one cannot forget to.
 #[must_use = "dropping the claim releases the record's put-notify slot"]
 struct NotifyClaim<'a> {
-    rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    rec: &'a std::sync::Arc<crate::server::record::RecordCell>,
     /// `None` once committed — the record processes under the set and owns its
     /// release from then on (`complete_put_notify`, C `dbNotifyCompletion`).
     set: Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>,
@@ -1095,51 +1090,71 @@ impl PvDatabase {
         // Records — alias-aware via `get_record` (epics-base PR #336).
         if let Some(rec) = self.get_record(base) {
             let instance = rec.read();
-            // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
-            // against the record type's DECLARED field list first and falls
-            // through to `dbGetAttributePart` only on
-            // `S_dbLib_fieldNotFound`. So a record type that declares a field
-            // of the attribute's name — `motor.VERS` — shadows the attribute,
-            // and `RTYP`, which no record type declares, never is shadowed.
-            //
-            // The two tests are in this order because the attribute map holds
-            // two entries per type and the declared list holds hundreds: the
-            // cheap lookup decides whether the expensive one is needed at all.
-            let record_type = instance.record.record_type();
-            if let Some(value) = self.record_type_attribute(record_type, &field)
-                && !declares_field(record_type, &field)
-            {
-                return Ok(EpicsValue::String(value.into()));
-            }
-            if let Some(value) = instance.resolve_field(&field) {
-                return Ok(value);
-            }
-            // Resolve-ok-but-read-fail is a state of its own, and one
-            // `ChannelNotFound` cannot hold it. C `dbNameToAddr` resolves any
-            // field the `.dbd` declares, `DBF_NOACCESS` ones included, so a
-            // declared field's read reaches `dbGet` and fails THERE — its
-            // validity gate refuses `field_type > DBF_DEVICE` with
-            // `S_db_badDbrtype` — while an undeclared name never resolves at
-            // all. `dbgf` shows the two apart: `dbgf REC.TIME` prints a type
-            // header and then `failed.` (`dbTest.c:994-997`, reached only
-            // because the address resolved), where `dbgf REC.NOSUCH` prints
-            // "not found".
-            //
-            // The rule is the declaration, not the `DBF_NOACCESS` class: a
-            // field this record type declares but does not serve is the same
-            // state — present, unreadable — and C would likewise resolve it
-            // and fail the get. Naming the class here instead would put a
-            // second rule at the boundary.
-            return Err(if declares_field(record_type, &field) {
-                CaError::BadDbrType(format!(
-                    "dbGet: {name} is declared but has no readable value"
-                ))
-            } else {
-                CaError::ChannelNotFound(name.to_string())
-            });
+            return self.read_resolved_field(&instance, &field, name);
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// The half of [`Self::get_pv`] that runs once the name HAS resolved to a
+    /// record — the attribute shadow test and the field read itself.
+    ///
+    /// Split out so a caller holding the record already does not resolve the
+    /// name a second time to reach it. C has the same split: `dbNameToAddr`
+    /// resolves once into a `dbAddr` and every later `dbGet` reads through it,
+    /// which is why a `dbGetLink` costs no name work at all.
+    pub(crate) fn read_resolved_field(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        name: &str,
+    ) -> CaResult<EpicsValue> {
+        // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
+        // against the record type's DECLARED field list first and falls
+        // through to `dbGetAttributePart` only on
+        // `S_dbLib_fieldNotFound`. So a record type that declares a field
+        // of the attribute's name — `motor.VERS` — shadows the attribute,
+        // and `RTYP`, which no record type declares, never is shadowed.
+        //
+        // Asked in that order, which is also the cheap one: the declared
+        // list is a static slice this process never writes, while the
+        // attribute map is behind a `Mutex` the whole IOC shares — a lock
+        // every link value read and every `get_pv` was taking to miss.
+        // Both operands are pure reads, so the conjunction's answer does not
+        // depend on which is asked first. The same order, for the same C
+        // lines, is already what `PvDatabase::channel_field_exists` uses.
+        let record_type = instance.record.record_type();
+        if !declares_field(record_type, field)
+            && let Some(value) = self.record_type_attribute(record_type, field)
+        {
+            return Ok(EpicsValue::String(value.into()));
+        }
+        if let Some(value) = instance.resolve_field(field) {
+            return Ok(value);
+        }
+        // Resolve-ok-but-read-fail is a state of its own, and one
+        // `ChannelNotFound` cannot hold it. C `dbNameToAddr` resolves any
+        // field the `.dbd` declares, `DBF_NOACCESS` ones included, so a
+        // declared field's read reaches `dbGet` and fails THERE — its
+        // validity gate refuses `field_type > DBF_DEVICE` with
+        // `S_db_badDbrtype` — while an undeclared name never resolves at
+        // all. `dbgf` shows the two apart: `dbgf REC.TIME` prints a type
+        // header and then `failed.` (`dbTest.c:994-997`, reached only
+        // because the address resolved), where `dbgf REC.NOSUCH` prints
+        // "not found".
+        //
+        // The rule is the declaration, not the `DBF_NOACCESS` class: a
+        // field this record type declares but does not serve is the same
+        // state — present, unreadable — and C would likewise resolve it
+        // and fail the get. Naming the class here instead would put a
+        // second rule at the boundary.
+        Err(if declares_field(record_type, field) {
+            CaError::BadDbrType(format!(
+                "dbGet: {name} is declared but has no readable value"
+            ))
+        } else {
+            CaError::ChannelNotFound(name.to_string())
+        })
     }
 
     /// Set a PV value or record field — the C `dbPut` analogue
@@ -1319,8 +1334,8 @@ impl PvDatabase {
             // metadata `INPA`'s target has NOW, not what it had when the
             // source last processed. Empty after one read lock for every
             // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata(&rec);
-            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
+            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
+            let link_backing = link_backing.as_link_backing();
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1350,7 +1365,7 @@ impl PvDatabase {
                 // invalidation (and the downstream `DBE_PROPERTY`
                 // emission) can be skipped when the put is a no-op —
                 // epics-base faac1df1.
-                let prev_value = instance.record.get_field(&field);
+                let prev_value = instance.resolve_field_stored(&field);
                 let old_nord = array_nord_before_put(&instance, &field);
 
                 // Link writes the record's `special()` makes itself (C runs them
@@ -1673,8 +1688,8 @@ impl PvDatabase {
             // metadata `INPA`'s target has NOW, not what it had when the
             // source last processed. Empty after one read lock for every
             // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata(&rec);
-            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
+            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
+            let link_backing = link_backing.as_link_backing();
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1690,7 +1705,7 @@ impl PvDatabase {
                 // `dbPut` body and must match the other two.
                 instance.record.special(&field, false)?;
 
-                let old_value = instance.record.get_field(&field);
+                let old_value = instance.resolve_field_stored(&field);
                 let old_stat = instance.common.stat;
                 let old_sevr = instance.common.sevr;
                 let old_nord = array_nord_before_put(&instance, &field);
@@ -1869,13 +1884,13 @@ impl PvDatabase {
     fn run_special_actions(
         &self,
         record_name: &str,
-        rec: &std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+        rec: &std::sync::Arc<crate::server::record::RecordCell>,
         actions: Vec<crate::server::record::ProcessAction>,
     ) {
         if actions.is_empty() {
             return;
         }
-        let mut visited = HashSet::new();
+        let mut visited = crate::server::database::ProcStack::new();
         self.execute_process_actions(record_name, rec, actions, &mut visited);
     }
 
@@ -2086,8 +2101,8 @@ impl PvDatabase {
 
         // Resolved before the record lock: the record-wide `DBE_ALARM` post
         // below reaches every subscribed field, a link-backed one included.
-        let backing = self.resolve_link_backed_metadata(&rec);
-        let backing = crate::server::database::LinkBacking::resolved(&backing);
+        let backing = self.resolve_link_backed_metadata_for_posts(&rec);
+        let backing = backing.as_link_backing();
 
         let mut instance = rec.write();
         check_put_disabled(&instance, &field_upper)?;
@@ -2223,7 +2238,7 @@ impl PvDatabase {
             }
             instance.common.putf = true;
         }
-        let mut visited = HashSet::new();
+        let mut visited = crate::server::database::ProcStack::new();
         self.process_record_with_links_already_locked(record_name, &mut visited)
     }
 
@@ -2332,7 +2347,7 @@ impl PvDatabase {
                 None => return Ok(None),
             }
         };
-        let mut visited = HashSet::new();
+        let mut visited = crate::server::database::ProcStack::new();
         self.process_record_with_links_already_locked(record_name, &mut visited)?;
         Ok(Some(notify))
     }
@@ -2398,7 +2413,7 @@ impl PvDatabase {
     /// point is that the test and the claim are one critical section, so this
     /// takes the guard it tested under rather than re-reading the record.
     fn claim_put_notify<'a>(
-        rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+        rec: &'a std::sync::Arc<crate::server::record::RecordCell>,
         guard: &mut crate::server::record::RecordInstance,
         completion: crate::runtime::sync::oneshot::Sender<()>,
     ) -> NotifyClaim<'a> {
@@ -2734,8 +2749,8 @@ impl PvDatabase {
         // metadata `INPA`'s target has NOW, not what it had when the
         // source last processed. Empty after one read lock for every
         // record type but calc, calcout, sub, aSub and seq.
-        let link_backing = self.resolve_link_backed_metadata(&rec);
-        let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
+        let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
+        let link_backing = link_backing.as_link_backing();
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
             let mut instance = rec.write();
 
@@ -2766,7 +2781,7 @@ impl PvDatabase {
                 special_before_put(&mut instance, &field);
 
                 // Capture pre-put value for faac1df1 idempotent-write suppression.
-                let prev_value = instance.record.get_field(&field);
+                let prev_value = instance.resolve_field_stored(&field);
                 let old_nord = array_nord_before_put(&instance, &field);
 
                 // Try record-specific field first; fall back to common on FieldNotFound.
@@ -3265,8 +3280,8 @@ impl PvDatabase {
             // metadata `INPA`'s target has NOW, not what it had when the
             // source last processed. Empty after one read lock for every
             // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata(&rec);
-            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
+            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
+            let link_backing = link_backing.as_link_backing();
             let mut special_actions = Vec::new();
 
             let common_result = {
@@ -3306,7 +3321,7 @@ impl PvDatabase {
                 instance.record.special(&field, false)?;
                 special_before_put(&mut instance, &field);
 
-                let prev_value = instance.record.get_field(&field);
+                let prev_value = instance.resolve_field_stored(&field);
                 // C's `reboot_restore` writes through `dbPutField` → `dbPut`,
                 // which renders the request in the destination field's shape
                 // AND THEN runs the `dbPutConvertRoutine` type row

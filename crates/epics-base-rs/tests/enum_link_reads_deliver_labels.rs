@@ -17,7 +17,7 @@
 //! label table rides `LinkMetadata::enum_choices` — C `dbCa`'s second
 //! `DBR_STRING` monitor).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
@@ -35,7 +35,7 @@ async fn build(db_text: &str) -> Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut v).await.unwrap();
 }
 

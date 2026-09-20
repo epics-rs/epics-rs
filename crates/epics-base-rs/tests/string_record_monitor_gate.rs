@@ -181,7 +181,7 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
     // Six scan cycles with VAL never written — the oracle's 6 s window.
     let mut events = 0;
     for _ in 0..6 {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();

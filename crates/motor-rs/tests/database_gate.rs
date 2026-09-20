@@ -32,7 +32,7 @@ async fn anchor(db: &PvDatabase, state: &motor_rs::device_state::SharedDeviceSta
             ..MotorStatus::default()
         },
     });
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
@@ -172,7 +172,6 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     use asyn_rs::user::AsynUser;
     use motor_rs::device_state::StampedStatus;
     use motor_rs::device_support::MotorDeviceSupport;
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -262,12 +261,12 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     db.add_record("M1", Box::new(rec)).await.unwrap();
     if let Some(arc) = db.get_record("M1") {
         let mut inst = arc.write();
-        inst.common.dtyp = "simMotor".to_string();
+        inst.common.dtyp = "simMotor".into();
         inst.device = Some(Box::new(dev));
     }
 
     // Startup pass consumes the init-seeded status (seq 1).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
@@ -285,7 +284,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
     stamp(2);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
@@ -297,7 +296,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
 
     // Retry landed on target: the next callback pass finalizes.
     stamp(3);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
@@ -327,7 +326,6 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     use asyn_rs::user::AsynUser;
     use motor_rs::device_state::StampedStatus;
     use motor_rs::device_support::MotorDeviceSupport;
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -418,7 +416,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     db.add_record("M1", Box::new(rec)).await.unwrap();
     if let Some(arc) = db.get_record("M1") {
         let mut inst = arc.write();
-        inst.common.dtyp = "simMotor".to_string();
+        inst.common.dtyp = "simMotor".into();
         inst.device = Some(Box::new(dev));
     }
 
@@ -459,7 +457,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     // The anchor's forced refresh queues the replay pass: the parked put
     // now dispatches as an ordinary post-init move.
     stamp(2);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
@@ -471,7 +469,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
 
     // Completion pass: the axis landed on target.
     stamp(3);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();

@@ -31,8 +31,6 @@
 //! Boundaries: dead DOL vs live DOL; OUT target written / not written; FLNK
 //! fired / not fired; pending alarm vs committed alarm.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::EpicsValue;
@@ -92,7 +90,7 @@ async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> 
 }
 
 async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

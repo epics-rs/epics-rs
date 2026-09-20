@@ -36,7 +36,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -167,7 +166,7 @@ async fn add_ao(db: &PvDatabase, name: &str, val: f64, notify: bool) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

@@ -28,8 +28,6 @@
 //! `epicsParseInt32`; and the `DBF_DOUBLE` records, whose fractional limits
 //! must be untouched.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -60,7 +58,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 /// `dbPut` does, and `checkAlarms` runs inside the cycle that follows.
 async fn drive(db: &PvDatabase, rec: &str, val: EpicsValue) -> AlarmSeverity {
     db.put_pv(rec, val).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

@@ -17,8 +17,6 @@
 //! case-insensitive match, the name's terminator, and the shortcut pass that
 //! must run ahead of the macro pass.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::transform::TransformRecord;
@@ -43,7 +41,7 @@ async fn load(db: &PvDatabase, name: &str, fields: &[(&str, &str)]) {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

@@ -36,8 +36,8 @@
 //!
 //! Rust port
 //! ---------
-//! `epics-base-rs` stores each record behind its own
-//! `parking_lot::RwLock<RecordInstance>`, but the put/process helpers
+//! `epics-base-rs` stores each record in a `RecordCell`, whose data half is
+//! its own `parking_lot::RwLock<RecordInstance>`, but the put/process helpers
 //! (`put_record_field_from_ca`, `put_pv`, `process_record`,
 //! `process_record_with_links`) acquire that `RwLock` *internally*
 //! and recurse into link targets, so a caller cannot hold N
@@ -329,7 +329,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::server::record::RecordInstance;
+use crate::server::record::RecordCell;
 
 use crate::runtime::sync::{
     MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
@@ -440,12 +440,28 @@ static SET_MUTEX_SEQ: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 ///
 /// `ThreadId` has no stable integer form on stable Rust, and the value only
 /// has to be comparable and never reused while a thread lives.
+///
+/// The slot is `const`-initialised and holds a `Cell` rather than being
+/// initialised from `NEXT` directly, because that is what makes the read a
+/// plain TLS offset: a `thread_local!` with a runtime initialiser carries a
+/// lazy-init flag and a destructor registration, and goes through
+/// `LocalKey::try_with` on every access. `LockSet::acquire` asks for this key
+/// on every `dbScanLock`, so that check was the single largest cost in taking
+/// a record's lock set. Zero is the "not yet minted" value and never a key,
+/// which is why `NEXT` starts at 1.
 fn thread_key() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     thread_local! {
-        static KEY: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+        static KEY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
-    KEY.with(|k| *k)
+    KEY.with(|k| match k.get() {
+        0 => {
+            let minted = NEXT.fetch_add(1, Ordering::Relaxed);
+            k.set(minted);
+            minted
+        }
+        key => key,
+    })
 }
 
 impl LockSet {
@@ -985,7 +1001,7 @@ impl PvDatabase {
                     // against the source's own processing.
                     let name = self
                         .resolve_alias(&link.target().record)
-                        .unwrap_or_else(|| link.target().record);
+                        .unwrap_or_else(|| link.target().record.clone());
                     self.get_record_no_resolve(&name).map(|_| name)
                 }
                 _ => None,
@@ -1205,18 +1221,15 @@ impl PvDatabase {
     /// process path — which always has the record, having just read it out of
     /// the records map — that was 0.85 us of a 11.5 us calc cycle, measured
     /// on 2000 records at 10 Hz.
-    pub fn lock_instance(
-        &self,
-        rec: &Arc<parking_lot::RwLock<RecordInstance>>,
-    ) -> RecordWriteGuard {
-        // The read guard is dropped BEFORE the set is taken, and the binding
-        // is what forces that: a guard still live across `acquire_through`
-        // would invert this file's one lock order — the process body holds the
-        // set and then takes `rec.write()`, so a thread holding a read and
-        // waiting for the set closes a cycle against it.
-        let attached = { rec.read().lock_record() };
-        if let Some(lr) = attached {
-            return Self::acquire_through(&lr);
+    pub fn lock_instance(&self, rec: &Arc<RecordCell>) -> RecordWriteGuard {
+        // The cell is read off the handle, not from behind the data lock —
+        // see [`RecordCell`]. No data-lock guard may be live across
+        // `acquire_through` either way: it would invert this file's one lock
+        // order, since the process body holds the set and then takes
+        // `rec.write()`, so a thread holding a read and waiting for the set
+        // closes a cycle against it.
+        if let Some(lr) = rec.lock_record() {
+            return Self::acquire_through(lr);
         }
         // First gate this record has ever been given. C mints the cell in
         // `dbLockInitRecords` before anything can lock; the port allows a
@@ -1226,8 +1239,7 @@ impl PvDatabase {
             let name = rec.read().name.clone();
             self.inner.record_locks.lock().lock_record_of(&name)
         };
-        rec.write().attach_lock_record(lr.clone());
-        Self::acquire_through(&lr)
+        Self::acquire_through(rec.attach_lock_record(lr))
     }
 
     /// C `dbScanLock`'s body (`dbLock.c:184-213`) — take the set the cell

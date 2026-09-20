@@ -19,7 +19,6 @@
 //!     holds its `CON` default until the first process re-points it through
 //!     `check_alarms`.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -134,7 +133,7 @@ async fn calcout_outv_classifies_via_process() {
     )
     .await
     .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_OUT", &mut visited)
         .await
         .unwrap();

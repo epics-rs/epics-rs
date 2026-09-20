@@ -23,7 +23,6 @@
 
 use epics_base_rs::server::database::filters::arr::{ArrayFilter, ArrayFilterConfig};
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
-use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::MonitorEvent;
@@ -55,7 +54,7 @@ async fn rotated_compress_db() -> PvDatabase {
         db.put_pv("src", EpicsValue::Double(i as f64))
             .await
             .unwrap();
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("CB", &mut visited)
             .await
             .unwrap();

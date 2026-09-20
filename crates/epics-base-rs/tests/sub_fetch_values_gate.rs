@@ -27,7 +27,6 @@
 //!
 //! `aSubRecord.c` (fetch 277-289, process 216-218) has the identical shape.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -90,7 +89,7 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
     // `fetch_values` returns -1 before ever reaching INPC.
     let db = sub_db("NOSUCHPV").await;
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SUB", &mut v).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
@@ -121,7 +120,7 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
 async fn r9_69_unset_link_is_not_a_fetch_failure() {
     let db = sub_db("").await;
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SUB", &mut v).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
@@ -163,7 +162,7 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
         inst.subroutine = Some(Arc::new(sub_fn));
     }
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASUB", &mut v).await.unwrap();
 
     let arc = db.get_record("ASUB").unwrap();

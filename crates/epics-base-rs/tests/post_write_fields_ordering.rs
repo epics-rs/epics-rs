@@ -27,7 +27,6 @@
 //!   * and the control: a source that stores the clear inside `process()` — the
 //!     shape this replaces — which the same reader catches.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
 
@@ -225,7 +224,7 @@ async fn run(arm: Arm) -> (i32, EpicsValue, EpicsValue) {
     .await
     .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();

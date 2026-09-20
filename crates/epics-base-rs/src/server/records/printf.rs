@@ -988,16 +988,19 @@ impl Record for PrintfRecord {
     /// (epics-base#183). Every other conversion's numeric request is
     /// value-equivalent to the native fetch (`%ls` reads the char array the
     /// native fetch already delivers).
-    fn input_link_read_as(
-        &self,
-        link_field: &str,
-        _source: &crate::server::record::OutTarget,
-    ) -> Option<crate::server::record::LinkReadAs> {
-        use crate::server::record::LinkReadAs;
-        Some(match Self::inp_index(link_field) {
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match Self::inp_index(link_field) {
             Some(idx) if self.plain_string_slots()[idx] => LinkReadAs::String,
             _ => LinkReadAs::Native,
         })
+    }
+
+    /// The `INP0..INP9` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_links)
     }
 
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {

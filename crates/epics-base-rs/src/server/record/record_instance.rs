@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -576,6 +577,15 @@ pub(crate) struct MetadataSnapshot {
     pub display: Option<DisplayInfo>,
     pub control: Option<ControlInfo>,
     pub enums: Option<EnumInfo>,
+    /// `(hihi, high, low, lolo)` from [`RecordInstance::explicit_alarm_limits`]
+    /// — the record's OWN bands, which C `get_alarm_double` reads as struct
+    /// members (`calcRecord.c:205-221`). Record-level, not per-field: the
+    /// function ignores the field and answers from `rtype` alone, so which
+    /// FIELDS receive these is still [`RecordInstance::route_field_metadata`]'s
+    /// decision — only the eight `resolve_field` name lookups behind the
+    /// numbers move here, where an invalidation rather than a snapshot pays
+    /// for them.
+    pub alarm: (f64, f64, f64, f64),
 }
 
 /// Does a write to this field make [`RecordInstance::metadata_cache`] stale?
@@ -608,6 +618,13 @@ fn is_metadata_cache_source(name: &str) -> bool {
         "EGU" | "PREC" | "HOPR" | "LOPR" | "HLM" | "LLM"
         // `populate_control_info` — the ao/longout/int64out drive limits.
         | "DRVH" | "DRVL"
+        // `explicit_alarm_limits` — the four bands and the four severities
+        // that gate them. C reads these as struct members on every
+        // `get_alarm_double`, so nothing there has to be invalidated; here
+        // they are cached, and a write to any of the eight is what makes the
+        // cached answer wrong.
+        | "HIHI" | "HIGH" | "LOW" | "LOLO"
+        | "HHSV" | "HSV" | "LSV" | "LLSV"
         // `populate_enum_info` via `Record::enum_state_strings` — bi/bo/busy
         // two-state names and the sixteen mbbi/mbbo state strings.
         | "ZNAM" | "ONAM"
@@ -851,19 +868,234 @@ pub enum AlarmAck {
     Severity,
 }
 
+pub(crate) enum ForwardTarget {
+    /// Nothing to forward: the record vetoed its own FLNK this cycle
+    /// ([`Record::should_fire_forward_link`]), or `FLNK` is unset / constant /
+    /// hardware — every kind C's `dbScanFwdLink` walks past.
+    None,
+    /// A local database record, C `dbScanFwdLink` → `dbScanPassive` →
+    /// `processTarget`, with what that call carries: C `processTarget`
+    /// (dbDbLink.c:460-474) hands each target `psrc->putf` and `psrc->ppn`
+    /// as a unit — the PUTF bit and the put-notify wait-set always travel
+    /// together. Resolved here, under the guard that resolved the target, so
+    /// a cycle with no DB forward link reads neither.
+    Db {
+        name: String,
+        putf: bool,
+        notify: Option<Arc<crate::server::record::NotifyWaitSet>>,
+    },
+    /// An external `pva://` / `ca://` PV, C `dbScanFwdLink` → the link set's
+    /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger.
+    External(String),
+}
+
+/// C's `if (prec->udf) recGblSetSevr(prec, UDF_ALARM, prec->udfs);` line, as
+/// one record type writes it — whether the type has the line at all, whether
+/// it tests `udf == TRUE` instead of truthiness, the severity it substitutes
+/// for `UDFS`, and the message it attaches. Four `&dyn Record` calls, once per
+/// cycle per record, for four answers the type fixed at construction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UdfAlarm {
+    pub(crate) exact_one: bool,
+    pub(crate) severity: Option<crate::server::record::AlarmSeverity>,
+    pub(crate) message: &'static str,
+}
+
+/// What a record's TYPE can reach in a process cycle.
+///
+/// C enters a record through one `rset->process` pointer and runs only the
+/// lines that type has. This port runs one generic body for every type, so a
+/// `calc` cycle otherwise takes a record lock to ask whether device support
+/// may refuse it, another for the simulation block, another for `sel`'s NVL
+/// and another for the string-input fetch — four locks and four dynamic calls
+/// to learn four answers that were fixed when the type was compiled. They are
+/// settled once, in [`RecordInstance::new_boxed`], and the cycle carries them
+/// by value.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProcessPlan {
+    /// This type's C `process()` opens with a dset test that can refuse the
+    /// cycle (`dev_sup_process_refusal`). `false` for `calc`, `sub`, `fanout`
+    /// and `calcout`, whose C `process()` has no such line.
+    pub(crate) dset_can_refuse: bool,
+    /// This type's dbd declares SIMM, so it has a C `readValue`/`writeValue`
+    /// simulation block at all.
+    pub(crate) simulation: bool,
+    /// This type is `sel`, the only one with an NVL link feeding SELN.
+    pub(crate) sel_nvl: bool,
+    /// This type declares at least one string-input link.
+    pub(crate) string_input: bool,
+    /// This type's `fanout`/`dfanout`/`seq` link array is driven by
+    /// `PvDatabase::dispatch_multi_output`. Gates all three of its call sites
+    /// — the pre-commit value phase and both forward-link tails.
+    pub(crate) multi_output_dispatch: bool,
+    /// This type reads `SELL` into `SELN` at some phase of the cycle.
+    pub(crate) reads_sell: bool,
+    /// This type is `event`, the only one that posts a named software event
+    /// from the forward-link tail.
+    pub(crate) posts_software_event: bool,
+    /// This type is `aSub`, the only one that can re-read its subroutine name
+    /// from a link mid-cycle.
+    pub(crate) resolves_subroutine_from_link: bool,
+    /// This type's simulation block replaces the input stage rather than
+    /// running alongside it — `swait` alone. `false` makes the whole
+    /// `set_simulation_active` step disappear, lock included, rather than
+    /// taking the record's write lock to ask and be told no.
+    pub(crate) substitutes_input_stage_when_simulating: bool,
+    /// This type has a `conditional_write` epilogue — see
+    /// [`Record::redecides_after_output`]. `false` makes the post-output write
+    /// lock disappear.
+    pub(crate) redecides_after_output: bool,
+    /// What a failed multi-input read means to this type — see
+    /// [`Record::input_fetch_policy`].
+    pub(crate) input_fetch_policy: crate::server::record::InputFetchPolicy,
+    /// `printf` alone re-runs `recGblInitConstantLink` on every process, so
+    /// its constant inputs deliver every cycle — see
+    /// [`Record::constant_inputs_deliver_at_process`].
+    pub(crate) constants_deliver_at_process: bool,
+    /// Whether a failed multi-input read owes C's `setLinkAlarm` — see
+    /// [`Record::multi_input_fetch_is_db_get_link`].
+    pub(crate) multi_input_is_db_get_link: bool,
+    /// This type declares generic multi-output pairs
+    /// ([`Record::multi_output_links`]) for the pre-commit output stage to
+    /// drive — scalcout, acalcout, aSub, epid. `false` makes
+    /// `dispatch_multi_output_values` and the record lock it takes disappear,
+    /// rather than acquiring the lock to re-derive the answer from the
+    /// record's type name every cycle.
+    ///
+    /// Disjoint from [`ProcessPlan::multi_output_dispatch`] by construction:
+    /// the `fanout`/`dfanout`/`seq` arrays are driven by
+    /// `dispatch_multi_output`, and `multi_output_dispatch_owned` excludes
+    /// them from the generic block, so no type can answer `true` to both.
+    pub(crate) dispatches_generic_multi_output: bool,
+    /// C's `UDF_ALARM` guard for this type, or `None` for a type whose C
+    /// support has no such line (`swait`, `waveform` proper). See
+    /// [`UdfAlarm`].
+    pub(crate) udf_alarm: Option<UdfAlarm>,
+    /// This type can narrow the cycle's input list — see
+    /// [`Record::narrows_input_links`]. `false` makes the guard that asks
+    /// disappear.
+    pub(crate) narrows_input_links: bool,
+    /// This type has an output stage — a device it can write, an `OUT` link,
+    /// an `OEVT` event, multi-output links, or a simulation block — so a cycle
+    /// composes and drives outputs between `checkAlarms` and the alarm commit.
+    /// `false` is that whole stage absent from the type's C `process()`
+    /// (`calcRecord.c` has no such lines): the cycle skips it, and with it the
+    /// guard boundary the stage's link writes would need.
+    pub(crate) output_stage: bool,
+    /// Five per-type answers the cycle asked the record for through the
+    /// vtable every process; each is a literal in every implementation, so
+    /// they are read once here. See the `Record` method of the same name.
+    pub(crate) fetches_dol_closed_loop: bool,
+    pub(crate) soft_channel_skips_convert: bool,
+    pub(crate) skips_timestamp_when_undefined: bool,
+    pub(crate) restamps_time_after_completion: bool,
+    pub(crate) clears_udf: bool,
+}
+
+/// The allocation every holder of a record shares — the port's `precord`.
+///
+/// What lives HERE rather than in [`RecordInstance`] is decided by one rule:
+/// **a fact a caller needs before it holds the data lock cannot live behind
+/// the data lock.** C has exactly one such fact, and `dbScanLock`
+/// (`dbLock.c:184-213`) is the reason — it reads `precord->lset` to learn
+/// which mutex to take, which cannot itself be guarded by a lock the caller
+/// has not got. C reads it off `dbCommon` with no lock at all; the port has a
+/// data lock C has no counterpart for, and keeping the cell inside it meant
+/// every cycle took the record's `RwLock` once to learn which set to lock and
+/// then again to do any work.
+///
+/// Everything else is [`RecordInstance`] behind the data lock, and `Deref`
+/// hands that lock out, so a holder still writes `rec.read()` / `rec.write()`.
+pub struct RecordCell {
+    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Empty until the record has been
+    /// given a gate, which is C's null `lset` before `dbLockInitRecords`.
+    ///
+    /// A `OnceLock` and not a swappable slot because the cell is this
+    /// record's identity in the lock registry: a lock-set MERGE moves the set
+    /// the cell points at, never the cell. `PvDatabase::lock_instance` is the
+    /// only writer, through [`Self::attach_lock_record`], because the cell a
+    /// record holds must be the one the registry hands out for its name — a
+    /// second cell would be a second answer to "which set is this record in".
+    lock_record: std::sync::OnceLock<std::sync::Arc<crate::server::database::LockRecord>>,
+    /// Which published `cp_links` map [`Self::sources_cp_edges`] was resolved
+    /// from, or 0 before it ever was.
+    ///
+    /// The question the cache answers — "does any CP/CPP edge name this
+    /// record as its source?" — is asked once per process cycle by
+    /// `PvDatabase::dispatch_cp_targets`, and the registry that holds the
+    /// answer is keyed by record NAME. Asking it directly costs a hash of the
+    /// name and a map probe every cycle to hear `false`, which is what every
+    /// record with no CP holder hears forever. The registry moves its
+    /// revision on every edit, so a record that has heard the answer once may
+    /// keep it until it does.
+    cp_edges_revision: std::sync::atomic::AtomicU64,
+    /// The cached answer, valid only while [`Self::cp_edges_revision`] still
+    /// matches the registry's.
+    cp_edges: std::sync::atomic::AtomicBool,
+    data: parking_lot::RwLock<RecordInstance>,
+}
+
+impl RecordCell {
+    pub(crate) fn new(instance: RecordInstance) -> Self {
+        Self {
+            lock_record: std::sync::OnceLock::new(),
+            cp_edges_revision: std::sync::atomic::AtomicU64::new(0),
+            cp_edges: std::sync::atomic::AtomicBool::new(false),
+            data: parking_lot::RwLock::new(instance),
+        }
+    }
+
+    /// The answer this record cached for `registry_revision`, or `None` when
+    /// it has not heard one for that revision.
+    ///
+    /// Only `PvDatabase::sources_cp_edges` reads or writes the pair, so the
+    /// two atomics move as one: the flag is stored first and the revision
+    /// second, which is the order that makes a matching revision proof that
+    /// the flag beside it belongs to that revision.
+    pub(crate) fn cached_cp_edges(&self, registry_revision: u64) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        (self.cp_edges_revision.load(Ordering::Acquire) == registry_revision)
+            .then(|| self.cp_edges.load(Ordering::Relaxed))
+    }
+
+    /// File `present` as this record's answer for `registry_revision`.
+    pub(crate) fn cache_cp_edges(&self, registry_revision: u64, present: bool) {
+        use std::sync::atomic::Ordering;
+        self.cp_edges.store(present, Ordering::Relaxed);
+        self.cp_edges_revision
+            .store(registry_revision, Ordering::Release);
+    }
+
+    /// The lock-set cell, or `None` before this record has ever been locked.
+    pub(crate) fn lock_record(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::server::database::LockRecord>> {
+        self.lock_record.get()
+    }
+
+    /// Install the cell and hand back the one now installed — another thread
+    /// racing the same first lock installs the registry's cell for this same
+    /// name, so whichever wins, both callers lock through the same set.
+    pub(crate) fn attach_lock_record(
+        &self,
+        lr: std::sync::Arc<crate::server::database::LockRecord>,
+    ) -> &std::sync::Arc<crate::server::database::LockRecord> {
+        self.lock_record.get_or_init(|| lr)
+    }
+}
+
+impl std::ops::Deref for RecordCell {
+    type Target = parking_lot::RwLock<RecordInstance>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
 /// A type-erased record instance stored in the database.
 pub struct RecordInstance {
     pub name: String,
     pub record: Box<dyn Record>,
-    /// C `dbCommon::lset` — the cell this record locks through
-    /// (`dbLockPvt.h:52`). `None` until the record has been given a gate,
-    /// which is C's null `lset` before `dbLockInitRecords`.
-    ///
-    /// PRIVATE: `PvDatabase::lock_instance` is the only writer, through
-    /// [`Self::attach_lock_record`], because the cell a record holds must be
-    /// the one the lock-set registry hands out for its name — a second cell
-    /// would be a second answer to "which set is this record in".
-    lock_record: Option<std::sync::Arc<crate::server::database::LockRecord>>,
     pub common: CommonFields,
     pub subscribers: HashMap<String, Vec<Subscriber>>,
     /// Terminal destruction marker, the [`crate::server::pv::ProcessVariable`]
@@ -996,6 +1228,12 @@ pub struct RecordInstance {
     /// statement, so the two cannot drift the way the central
     /// `match rtype` list they replace drifted away from `aSub`.
     link_backed_metadata_links: Vec<String>,
+    /// What this record's TYPE can reach in a process cycle, settled once at
+    /// construction. See [`ProcessPlan`].
+    process_plan: ProcessPlan,
+    /// What this record's TYPE answers to `monitor()`'s type-static
+    /// questions, settled once at construction. See [`MonitorPlan`].
+    monitor_plan: MonitorPlan,
     /// Where each of those links sits in [`Record::multi_input_links`] — the
     /// list a process cycle reads once at its top. Both lists are properties
     /// of the record TYPE, so the mapping is fixed here and cannot drift;
@@ -1135,6 +1373,56 @@ const S_DB_BAD_SUB: i64 = (511 << 16) | 35;
 /// returns a `long`), and a failed cycle either way.
 const SUBROUTINE_STATUS_ERROR: i64 = -3;
 
+/// What a record TYPE answers to the type-static questions C `monitor()`
+/// asks about it — the deadband field and its mask narrowings, the value
+/// gate, and whether the record posts its value at all. Every answer is a
+/// property of the type, so it is read once at construction rather than
+/// through the `dyn Record` vtable on every cycle. The per-cycle questions
+/// (`monitor_value_changed`, `process_posted_fields`, the `take_*` one-shot
+/// masks) stay dynamic.
+#[derive(Clone, Copy)]
+pub(crate) struct MonitorPlan {
+    /// [`Record::process_posts_value_monitor`].
+    pub(crate) posts_value_monitor: bool,
+    /// [`Record::uses_monitor_deadband`].
+    pub(crate) uses_deadband: bool,
+    /// [`Record::monitor_deadband_field`].
+    pub(crate) deadband_field: &'static str,
+    /// The deadband field is in [`Record::value_only_change_fields`] or
+    /// [`Record::fields_posted_with_monitor_mask`]: C posts it without
+    /// `DBE_LOG`.
+    pub(crate) log_suppressed: bool,
+    /// [`Record::fields_posted_with_value_mask`].
+    pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
+    /// The change-detected aux fields' mask resolver.
+    pub(crate) aux_post: AuxPostMask,
+}
+
+impl MonitorPlan {
+    pub(crate) fn of(record: &dyn Record) -> Self {
+        let deadband_field = record.monitor_deadband_field();
+        Self {
+            posts_value_monitor: record.process_posts_value_monitor(),
+            uses_deadband: record.uses_monitor_deadband(),
+            deadband_field,
+            log_suppressed: record.value_only_change_fields().contains(&deadband_field)
+                || record
+                    .fields_posted_with_monitor_mask()
+                    .contains(&deadband_field),
+            value_masked: record.fields_posted_with_value_mask(),
+            aux_post: AuxPostMask::of(record),
+        }
+    }
+}
+
+/// What one `monitor()` hands its publisher: the value snapshot (only the
+/// fields somebody subscribes to carry a value) and the `recGblResetAlarms`
+/// posts with their per-field C masks.
+pub(crate) struct MonitorOutcome {
+    pub(crate) snapshot: ProcessSnapshot,
+    pub(crate) alarm_posts: crate::server::database::AlarmPosts,
+}
+
 /// C `monitor()`'s post of the deadband field, as assembled by the single owner
 /// [`RecordInstance::deadband_post`].
 pub(crate) struct DeadbandPost {
@@ -1144,8 +1432,10 @@ pub(crate) struct DeadbandPost {
     pub mask: EventMask,
     /// The deadband field's own post — `(field, value)`. `None` when no class
     /// fired (C's `if (monitor_mask)` skips the post) or the field does not
-    /// resolve.
-    pub field: Option<(String, EpicsValue)>,
+    /// resolve. The name is the one [`Record::monitor_deadband_field`] already
+    /// hands out as a `&'static str`; owning a copy of it charged a malloc per
+    /// cycle for a string that is in the binary.
+    pub field: Option<(&'static str, EpicsValue)>,
 }
 
 /// A value's `DBR_STRING` form, for a source whose field metadata is NOT
@@ -1290,24 +1580,6 @@ impl RecordInstance {
         Self::new_boxed(name, Box::new(record))
     }
 
-    /// C `precord->lset` — the lock-set cell this record locks through, or
-    /// `None` before it has ever been given a gate.
-    pub(crate) fn lock_record(
-        &self,
-    ) -> Option<std::sync::Arc<crate::server::database::LockRecord>> {
-        self.lock_record.clone()
-    }
-
-    /// Install the cell. `PvDatabase::lock_instance` is the only caller, and
-    /// it passes the cell the lock-set registry holds for this record's name,
-    /// so record and registry name the same set by construction.
-    pub(crate) fn attach_lock_record(
-        &mut self,
-        lr: std::sync::Arc<crate::server::database::LockRecord>,
-    ) {
-        self.lock_record = Some(lr);
-    }
-
     /// The raw text of one `COMMON_LINK_FIELDS` entry, or `None` for any
     /// other field name.
     pub fn common_link_text(&self, field: &str) -> Option<&str> {
@@ -1350,6 +1622,99 @@ impl RecordInstance {
     /// record's multi-input link list, in that same order. See the field.
     pub(crate) fn link_backed_metadata_input_slots(&self) -> &[Option<usize>] {
         &self.link_backed_metadata_input_slot
+    }
+
+    /// The type-static answers this cycle may test instead of re-asking the
+    /// record under a lock.
+    pub(crate) fn process_plan(&self) -> ProcessPlan {
+        self.process_plan
+    }
+
+    /// C `monitor()` and the `recGblResetAlarms` it opens with, for every
+    /// path that ends a process cycle. The single owner of the cycle's
+    /// monitor STATE — alarm commit, MLST/ALST, the previous-value store, the
+    /// record's one-shot post masks — and of the posts it hands the
+    /// publisher. The state half runs whether or not anyone subscribes;
+    /// the per-field payload is built by [`Self::collect_subscriber_posts`]
+    /// only for subscribed fields, decided under the guard the caller
+    /// delivers with, so no post is decided on one lock and delivered on
+    /// another.
+    pub(crate) fn monitor_cycle(&mut self) -> MonitorOutcome {
+        let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common);
+        // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
+        // (recGbl.c:194/203/212) when the severity/status OR the alarm
+        // message moved — every monitored-value post this cycle carries
+        // DBE_ALARM so a `DBE_ALARM`-only subscriber sees the value at the
+        // moment the alarm changed.
+        let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
+            EventMask::ALARM
+        } else {
+            EventMask::NONE
+        };
+
+        let (include_val, include_archive) = self.value_include_classes();
+        // The deadband-tracked field posts with the classes that actually
+        // fired: MDEL crossing → DBE_VALUE, ADEL crossing → DBE_LOG, alarm
+        // movement → DBE_ALARM — and nothing else (C `monitor()` per-field
+        // masks: motorRecord.cc:3476-3507 RBV, aiRecord.c VAL). A record
+        // like motor deadbands its readback; its VAL then routes through
+        // the change-detected loop in `collect_subscriber_posts`.
+        let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
+        let mut snapshot = ProcessSnapshot::new();
+        if let Some((field, value)) = deadband.field {
+            snapshot.push((field.into(), value, deadband.mask));
+        }
+        self.collect_subscriber_posts(&mut snapshot, deadband.mask, alarm_bits, include_val);
+        // C waveform/aai/aao `monitor()` posts HASH with a literal
+        // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
+        // 317-319), independent of the VAL post mask. `array_hash_changed`
+        // was set by `check_deadband_ext` this cycle.
+        if self.array_hash_changed {
+            if let Some(h) = self.resolve_field("HASH") {
+                snapshot.push(("HASH".into(), h, EventMask::VALUE));
+            }
+        }
+        // NO `.UDF` post. C `monitor()` never posts UDF, and neither does
+        // `recGblResetAlarms` (recGbl.c:202-222 posts SEVR/STAT/AMSG/ACKS
+        // only). UDF reaches a `.UDF` subscriber only through the generic
+        // put path (C `dbPut` posts the field it wrote, dbAccess.c:1411-1413).
+        let alarm_posts = crate::server::database::alarm_field_posts(&self.common, &alarm_result);
+        MonitorOutcome {
+            snapshot,
+            alarm_posts,
+        }
+    }
+
+    /// This cycle's forward link, resolved from the two things C's
+    /// `dbScanFwdLink` reads: the record's own veto
+    /// ([`Record::should_fire_forward_link`]) and `FLNK`'s parsed kind.
+    ///
+    /// The single owner of that question. The DB half and the external half
+    /// used to be derived at separate points — the DB name under the monitor
+    /// segment's guard, the external PV by `dispatch_external_forward_link`
+    /// re-taking the record's read lock in the tail — so every record in the
+    /// database paid a second acquisition and a second `should_fire_forward_link`
+    /// call once a cycle, and the two derivations could disagree about a
+    /// record whose veto changed in between.
+    pub(crate) fn forward_target(&self) -> ForwardTarget {
+        if !self.record.should_fire_forward_link() {
+            return ForwardTarget::None;
+        }
+        match &self.parsed_flnk {
+            ParsedLink::Db(l) => ForwardTarget::Db {
+                name: l.target().record.clone(),
+                putf: self.common.putf,
+                notify: self.notify.clone(),
+            },
+            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_) => self
+                .parsed_flnk
+                .external_pv_name()
+                .map_or(ForwardTarget::None, |s| {
+                    ForwardTarget::External(s.to_string())
+                }),
+            // Constant / Hw / Calc / None carry no forward action.
+            _ => ForwardTarget::None,
+        }
     }
 
     /// Does this record's `.dbd` declare the simulation block — the gate C's
@@ -1409,6 +1774,47 @@ impl RecordInstance {
             .collect();
         // The gate on the whole simulation block — see the field's own doc.
         let declares_simulation = field_desc_of(record.as_ref(), "SIMM").is_some();
+        let process_plan = ProcessPlan {
+            dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
+            simulation: declares_simulation,
+            sel_nvl: rtype == "sel",
+            string_input: !record.string_input_links().is_empty(),
+            multi_output_dispatch: crate::server::database::multi_output_dispatch_owned(rtype),
+            reads_sell: crate::server::database::reads_sell(rtype),
+            posts_software_event: crate::server::database::posts_software_event(rtype),
+            resolves_subroutine_from_link: crate::server::database::resolves_subroutine_from_link(
+                rtype,
+            ),
+            // Asked of the record itself, not of a table keyed on `rtype`: the
+            // type that implements the step is the one that answers whether it
+            // has one, so the two cannot drift into different files.
+            substitutes_input_stage_when_simulating: record.simulation_substitutes_input_stage(),
+            redecides_after_output: record.redecides_after_output(),
+            input_fetch_policy: record.input_fetch_policy(),
+            constants_deliver_at_process: record.constant_inputs_deliver_at_process(),
+            multi_input_is_db_get_link: record.multi_input_fetch_is_db_get_link(),
+            udf_alarm: record.raises_udf_alarm().then(|| UdfAlarm {
+                exact_one: record.udf_alarm_on_exact_one(),
+                severity: record.udf_alarm_severity(),
+                message: record.udf_alarm_message(),
+            }),
+            dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
+                rtype,
+            ) && record.declares_multi_output_links(),
+            narrows_input_links: record.narrows_input_links(),
+            output_stage: record.can_device_write()
+                || field_desc_of(record.as_ref(), "OUT").is_some()
+                || field_desc_of(record.as_ref(), "OEVT").is_some()
+                || crate::server::database::multi_output_dispatch_owned(rtype)
+                || record.declares_multi_output_links()
+                || declares_simulation,
+            fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
+            soft_channel_skips_convert: record.soft_channel_skips_convert(),
+            skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
+            restamps_time_after_completion: record.restamps_time_after_completion(),
+            clears_udf: record.clears_udf(),
+        };
+        let monitor_plan = MonitorPlan::of(record.as_ref());
         let analog_alarm = match rtype {
             // C parity: every record type whose dbd carries
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
@@ -1442,7 +1848,6 @@ impl RecordInstance {
             destroyed: false,
             name,
             record,
-            lock_record: None,
             common,
             subscribers: HashMap::new(),
             parsed_inp: ParsedLink::None,
@@ -1461,6 +1866,8 @@ impl RecordInstance {
             link_backed_metadata_links,
             link_backed_metadata_input_slot,
             declares_simulation,
+            process_plan,
+            monitor_plan,
             array_hash_changed: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1532,7 +1939,7 @@ impl RecordInstance {
     ///   creation sink has run its bind is C's `pdevSup == NULL`.
     pub(crate) fn init_record_reaches_body(&self) -> bool {
         self.device.is_some()
-            || crate::server::device_support::is_soft_dtyp(&self.common.dtyp)
+            || self.common.dtyp.is_soft()
             || crate::server::recgbl::dev_sup_refusal(self.record.record_type()).is_none()
     }
 
@@ -1679,8 +2086,8 @@ impl RecordInstance {
     /// measured on `pva2pva/testApp/testpvalink.db:30-35`, whose `longout`
     /// drives a pva OUT link that never fired.
     pub fn soft_output_value(&self) -> Option<Option<EpicsValue>> {
-        use crate::server::device_support::{SoftDtyp, classify_soft};
-        match classify_soft(&self.common.dtyp)? {
+        use crate::server::device_support::SoftDtyp;
+        match self.common.dtyp.soft()? {
             SoftDtyp::Raw => Some(
                 self.record
                     .raw_soft_output_value()
@@ -1799,7 +2206,15 @@ impl RecordInstance {
         if !cache_source && !posts_property {
             return;
         }
-        let now = self.record.get_field(&upper);
+        // The SAME reader the put's pre-value was captured with
+        // (`field_io.rs`'s three `dbPut` bodies). `Record::get_field` alone
+        // sees only the record type's own struct, and this port keeps on
+        // `CommonFields` a good deal of storage C keeps per record type — the
+        // whole analog-alarm ladder among it — so a `caput HIHI` on a calc
+        // compared `None` to `None`, reported "unchanged", and posted neither
+        // the `DBE_PROPERTY` C sends for a `prop(YES)` field nor the cache
+        // invalidation the metadata it feeds depends on.
+        let now = self.resolve_field_stored(&upper);
         if prev == now.as_ref() {
             return;
         }
@@ -1850,6 +2265,7 @@ impl RecordInstance {
             display: tmp.display,
             control: tmp.control,
             enums: tmp.enums,
+            alarm: self.explicit_alarm_limits(self.record.record_type()),
         };
 
         // Store back; ignore poisoning (cache is best-effort).
@@ -2860,12 +3276,13 @@ impl RecordInstance {
         // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
         // string re-synthesized from the condition code. Empty for records
         // that raise no message (C's plain `recGblSetSevr` clears namsg).
-        snap.alarm.amsg = self.common.amsg.clone();
+        snap.alarm.amsg = self.common.amsg.as_str().to_owned();
 
         // Pull display/control/enums from the metadata cache (build on
         // first call, hit thereafter until invalidated by a metadata-class
         // field write).
         let meta = self.cached_metadata();
+        let explicit_alarm = meta.alarm;
         snap.display = meta.display;
         snap.control = meta.control;
         snap.enums = meta.enums;
@@ -2873,7 +3290,7 @@ impl RecordInstance {
         // The cache above is the record's VAL metadata. C routes PER FIELD, so
         // a non-VAL-class field does NOT get VAL's limits — see
         // [`Self::route_field_metadata`], which owns that decision.
-        self.route_field_metadata(field, backing, &mut snap);
+        self.route_field_metadata(field, backing, explicit_alarm, &mut snap);
 
         // Per-field RSET metadata (C get_units/get_precision/
         // get_graphic_double/get_control_double/get_alarm_double key on
@@ -3254,8 +3671,8 @@ impl RecordInstance {
             "NSEV" => Some(EpicsValue::Short(self.common.nsev as i16)),
             "NSTA" => Some(EpicsValue::Short(self.common.nsta as i16)),
             // epics-base PR #568 / #566 — alarm message string.
-            "AMSG" => Some(EpicsValue::String(self.common.amsg.clone().into())),
-            "NAMSG" => Some(EpicsValue::String(self.common.namsg.clone().into())),
+            "AMSG" => Some(EpicsValue::String(self.common.amsg.as_str().into())),
+            "NAMSG" => Some(EpicsValue::String(self.common.namsg.as_str().into())),
             "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
             // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
             // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
@@ -3659,12 +4076,12 @@ impl RecordInstance {
             }
             "AMSG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.amsg = s.as_str_lossy().into_owned();
+                    self.common.amsg.set(&s.as_str_lossy());
                 }
             }
             "NAMSG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.namsg = s.as_str_lossy().into_owned();
+                    self.common.namsg.set(&s.as_str_lossy());
                 }
             }
             // ACKS/ACKT carry NO acknowledgement semantics here. They are
@@ -3833,11 +4250,11 @@ impl RecordInstance {
             // name (asyn's "asynInt32", scaler-rs's "Asyn Scaler") back to
             // NoChange, leaving DTYP unset after a valid put.
             "DTYP" => match value {
-                EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned().into(),
                 EpicsValue::Enum(i) => {
                     let merged = super::merged_device_menu(self.record.record_type());
                     match merged.get(i as usize) {
-                        Some(name) => self.common.dtyp = (*name).to_string(),
+                        Some(name) => self.common.dtyp = (*name).into(),
                         None => return Ok(CommonFieldPutResult::NoChange),
                     }
                 }
@@ -4254,13 +4671,13 @@ impl RecordInstance {
         // Check UDF first — but only for record types whose C support carries
         // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
         // no central UDF alarm; see `Record::raises_udf_alarm`.
-        if self.record.raises_udf_alarm() {
-            recgbl::rec_gbl_check_udf(
-                &mut self.common,
-                self.record.udf_alarm_on_exact_one(),
-                self.record.udf_alarm_severity(),
-                self.record.udf_alarm_message(),
-            );
+        debug_assert!(
+            self.process_plan.udf_alarm.is_some() == self.record.raises_udf_alarm(),
+            "a record that changes its UDF_ALARM guard after construction \
+             cannot be served from ProcessPlan"
+        );
+        if let Some(udf) = self.process_plan.udf_alarm {
+            recgbl::rec_gbl_check_udf(&mut self.common, udf.exact_one, udf.severity, udf.message);
         }
 
         // The analog-alarm SLOT is the enumeration — a record has the ladder iff
@@ -4273,20 +4690,19 @@ impl RecordInstance {
         // lives in each record's `Record::check_alarms` hook (C `checkAlarms`);
         // those records carry no analog config, so they never reach here and
         // cannot double-raise.
-        if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
+        if let Some(alarm_cfg) = self.common.analog_alarm {
             // VAL goes down in the variant the record stores it in, not
             // flattened to `f64`: it is what picks the ladder's comparison
             // domain, and `Int64(v) as f64` had already rounded the value
             // before the first comparison ran.
-            let val = match self.record.val() {
-                Some(v @ (EpicsValue::Double(_) | EpicsValue::Long(_) | EpicsValue::Int64(_))) => v,
-                _ => return,
+            let Some(input) = self.record.analog_alarm_input() else {
+                return;
             };
-            self.evaluate_analog_alarm(val, alarm_cfg);
+            self.evaluate_analog_alarm(input, &alarm_cfg);
         }
     }
 
-    fn evaluate_analog_alarm(&mut self, val: EpicsValue, cfg: &AnalogAlarmConfig) {
+    fn evaluate_analog_alarm(&mut self, input: super::AnalogAlarmInput, cfg: &AnalogAlarmConfig) {
         use crate::server::recgbl::{self, alarm_status};
 
         // C `checkAlarms` returns immediately on a UDF cycle: it raises
@@ -4304,12 +4720,10 @@ impl RecordInstance {
         // return. Running the range check here would drift `LALM` to `val`
         // (NaN on an undefined cycle) and filter `AFVL` — both observable.
         if self.common.udf != 0 {
-            if matches!(
-                self.record.record_type(),
-                "calc" | "ai" | "longin" | "int64in"
-            ) && self.record.get_field("AFVL").and_then(|v| v.to_f64()) != Some(0.0)
-            {
-                let _ = self.record.put_field("AFVL", EpicsValue::Double(0.0));
+            if let Some((_, afvl)) = self.record.alarm_filter_cells() {
+                if afvl != 0.0 {
+                    self.record.store_alarm_filter_value(0.0);
+                }
             }
             return;
         }
@@ -4327,8 +4741,7 @@ impl RecordInstance {
         // to the declared type its only remaining readers are the
         // `DBF_DOUBLE` records and longin/longout, and every `epicsInt32` is
         // an `f64` exactly.
-        let hyst_field = self.record.get_field("HYST");
-        let lalm_field = self.record.get_field("LALM");
+        let super::AnalogAlarmInput { val, hyst, lalm } = input;
 
         // C-style per-level hysteresis: alarm fires if val passes the level,
         // OR if we were already at that alarm level (lalm == alev) and val
@@ -4347,22 +4760,15 @@ impl RecordInstance {
         // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
         // `Invalid`).
         let sevs = [cfg.hhsv, cfg.llsv, cfg.hsv, cfg.lsv];
-        let mut alarm_range = match &val {
-            // The `DBF_LONG`/`DBF_INT64` records. `convert_to(Int64)` is the
-            // workspace's one value-coercion owner, so a limit, a hysteresis
-            // and a LALM all land here as the exact `epicsInt64` C compares.
-            EpicsValue::Long(_) | EpicsValue::Int64(_) => {
-                let int = |v: Option<EpicsValue>, dflt: i128| -> i128 {
-                    match v.map(|v| v.convert_to(DbFieldType::Int64)) {
-                        Some(EpicsValue::Int64(i)) => i as i128,
-                        _ => dflt,
-                    }
-                };
-                let v = int(Some(val.clone()), 0);
+        let mut alarm_range = match val {
+            // The `DBF_LONG`/`DBF_INT64` records: a limit, a hysteresis and a
+            // LALM all land here as the exact `epicsInt64` C compares.
+            AlarmLimit::Long(_) | AlarmLimit::Int64(_) => {
+                let v = val.as_i128();
                 super::alarm::analog_alarm_range(
                     v,
-                    int(hyst_field, self.common.hyst as i128),
-                    int(lalm_field, v),
+                    hyst.map_or(self.common.hyst as i128, AlarmLimit::as_i128),
+                    lalm.map_or(v, AlarmLimit::as_i128),
                     [
                         cfg.hihi.as_i128(),
                         cfg.lolo.as_i128(),
@@ -4372,23 +4778,18 @@ impl RecordInstance {
                     sevs,
                 )
             }
-            _ => {
-                let v = val.to_f64().unwrap_or(0.0);
-                super::alarm::analog_alarm_range(
-                    v,
-                    hyst_field
-                        .and_then(|h| h.to_f64())
-                        .unwrap_or(self.common.hyst),
-                    lalm_field.and_then(|l| l.to_f64()).unwrap_or(v),
-                    [
-                        cfg.hihi.as_f64(),
-                        cfg.lolo.as_f64(),
-                        cfg.high.as_f64(),
-                        cfg.low.as_f64(),
-                    ],
-                    sevs,
-                )
-            }
+            AlarmLimit::Double(v) => super::alarm::analog_alarm_range(
+                v,
+                hyst.map_or(self.common.hyst, AlarmLimit::as_f64),
+                lalm.map_or(v, AlarmLimit::as_f64),
+                [
+                    cfg.hihi.as_f64(),
+                    cfg.lolo.as_f64(),
+                    cfg.high.as_f64(),
+                    cfg.low.as_f64(),
+                ],
+                sevs,
+            ),
         };
 
         // C `range_stat[]` (`int64inRecord.c:250-253`) plus the severity and
@@ -4427,21 +4828,7 @@ impl RecordInstance {
         // AFTC/AFVL fields run it — `ao`/`longout`/`int64out`/`calcout`
         // have no AFTC field (confirmed via the respective `.dbd.pod`),
         // so they are excluded.
-        let aftc_capable = matches!(
-            self.record.record_type(),
-            "calc" | "ai" | "longin" | "int64in"
-        );
-        if aftc_capable {
-            let aftc = self
-                .record
-                .get_field("AFTC")
-                .and_then(|v| v.to_f64())
-                .unwrap_or(0.0);
-            let afvl = self
-                .record
-                .get_field("AFVL")
-                .and_then(|v| v.to_f64())
-                .unwrap_or(0.0);
+        if let Some((aftc, afvl)) = self.record.alarm_filter_cells() {
             if aftc > 0.0 {
                 let now = crate::runtime::general_time::get_current();
                 let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
@@ -4451,7 +4838,7 @@ impl RecordInstance {
                     self.common.time,
                     now,
                 );
-                let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
+                self.record.store_alarm_filter_value(new_afvl);
                 // C re-maps through the SAME `switch (alarmRange)` the ladder
                 // fell out of, so the filter changes only the range and
                 // `resolve` below answers for both.
@@ -4465,7 +4852,7 @@ impl RecordInstance {
                 // `aftc > 0` run cannot mis-seed the filter if AFTC is
                 // re-enabled later.
                 if afvl != 0.0 {
-                    let _ = self.record.put_field("AFVL", EpicsValue::Double(0.0));
+                    self.record.store_alarm_filter_value(0.0);
                 }
             }
         }
@@ -4480,12 +4867,12 @@ impl RecordInstance {
             // `lalm == alev && val >= alev - hyst` clause hold an alarm C has
             // already cleared.
             if recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr) {
-                self.put_coerced("LALM", alev.map(|l| l.to_epics_value()).unwrap_or(val));
+                self.record.store_analog_lalm(alev.unwrap_or(val));
             }
         } else {
             // No alarm condition: reset LALM to current value. C `aiRecord.c:409`
             // does this unconditionally — only the alarm arm is gated.
-            self.put_coerced("LALM", val);
+            self.record.store_analog_lalm(val);
         }
     }
 
@@ -4681,13 +5068,64 @@ impl RecordInstance {
     ///   ([`Record::log_swept_fields`]).
     pub(crate) fn collect_subscriber_posts(
         &mut self,
-        deadband_field: &str,
+        snapshot: &mut ProcessSnapshot,
         deadband_mask: EventMask,
         alarm_bits: EventMask,
-        aux_post: AuxPostMask,
         include_val: bool,
-    ) -> Vec<(String, EpicsValue, EventMask)> {
+    ) {
         use crate::server::record::{CyclePostMask, ValuePostGate, value_gate};
+
+        // TAKE — this also clears the state it answers from (C's
+        // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
+        let mut cycle_posted = self.record.take_cycle_posted_fields();
+        // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
+        // iocInit's per-cycle drain must not be able to eat. Merged here so
+        // both reach the same branch with the same mask mapping.
+        let first_cycle = self.record.take_first_monitor_cycle();
+        if !first_cycle.is_empty() {
+            cycle_posted.extend(first_cycle);
+        }
+        let MonitorPlan {
+            deadband_field,
+            value_masked,
+            aux_post,
+            ..
+        } = self.monitor_plan;
+        // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
+        // `OnChangeForced` fields sit behind, which the record may open on a
+        // cycle where VAL's own mask is shut. TAKEn, like `cycle_posted`, so
+        // this loop may run only once per cycle.
+        let secondary_guard = deadband_mask | self.record.take_secondary_value_mask();
+
+        // C aoRecord.c:536-549: the secondary block runs once per cycle, from
+        // inside `if (monitor_mask)`, and each field's own `oraw != rval` test
+        // is welded to the `oraw = rval` that follows its `db_post_events`.
+        // Decided by the record's own old copy, not this walk's `last_posted`
+        // change detection, and taken whether or not anyone is subscribed —
+        // so the bookkeeping must not depend on who is watching. The posts
+        // themselves land after the walk below, in the order C emits them.
+        let forced_mask = (!secondary_guard.is_empty())
+            .then_some(secondary_guard | EventMask::VALUE | EventMask::LOG);
+        // Nothing is subscribed, so the walk below has no field to reach and
+        // the forced posts have nowhere to land either — both are gated on a
+        // field having a subscriber. The record's declared post sets are the
+        // walk's inputs alone, so asking for them, six more trips through the
+        // vtable, is asked only here. Everything a cycle owes whether or not
+        // anyone is watching — the TAKEs above and the record's own old-copy
+        // advance — still runs.
+        if self.subscribers.is_empty() {
+            if forced_mask.is_some() {
+                for (name, gate) in value_masked {
+                    if *gate == ValuePostGate::OnChangeForced {
+                        self.record.take_secondary_value_change(name);
+                    }
+                }
+            }
+            return;
+        }
+        // Every post this walk adds sits at or past this index, so the
+        // published-state advance at the tail covers exactly those.
+        let first_post = snapshot.len();
 
         // C's default for a change-detected auxiliary post:
         // `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400;
@@ -4699,56 +5137,14 @@ impl RecordInstance {
             self.record.alarm_cycle_monitored_fields()
         };
         let force_fields = self.record.force_posted_fields();
-        // TAKE — this also clears the state it answers from (C's
-        // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let mut cycle_posted = self.record.take_cycle_posted_fields();
-        // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
-        // iocInit's per-cycle drain must not be able to eat. Merged here so
-        // both reach the same branch with the same mask mapping.
-        cycle_posted.extend(self.record.take_first_monitor_cycle());
         let log_swept = self.record.log_swept_fields();
         // C change-detects nothing about these fields; only the record's own
         // per-cycle mark may post them (aCalcout AA..LL — no PAA..PLL previous
         // copy exists to compare against).
         let marked_only = self.record.fields_posted_only_when_marked();
-        let value_masked = self.record.fields_posted_with_value_mask();
-        // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
-        // `OnChangeForced` fields sit behind, which the record may open on a
-        // cycle where VAL's own mask is shut. TAKEn, like `cycle_posted`, so
-        // this loop may run only once per cycle.
-        let secondary_guard = deadband_mask | self.record.take_secondary_value_mask();
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
 
-        let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
-        // C aoRecord.c:536-549: the secondary block runs once per cycle, from
-        // inside `if (monitor_mask)`, and each field's own `oraw != rval` test
-        // is welded to the `oraw = rval` that follows its `db_post_events`.
-        // Decided HERE and not in the subscriber walk below, for two reasons
-        // the walk cannot satisfy: C's guard is the record's own old copy, not
-        // this loop's `last_posted` change detection, and C posts whether or
-        // not anyone is subscribed — so the bookkeeping must not depend on who
-        // is watching.
-        let forced_posts: Vec<(String, EpicsValue, EventMask)> = if secondary_guard.is_empty() {
-            Vec::new()
-        } else {
-            let forced_mask = secondary_guard | EventMask::VALUE | EventMask::LOG;
-            let forced: Vec<&'static str> = value_masked
-                .iter()
-                .filter(|(_, gate)| *gate == ValuePostGate::OnChangeForced)
-                .map(|(name, _)| *name)
-                .collect();
-            let mut out = Vec::new();
-            for name in forced {
-                if !self.record.take_secondary_value_change(name) {
-                    continue;
-                }
-                if let Some(val) = self.resolve_field(name) {
-                    out.push((name.to_string(), val, forced_mask));
-                }
-            }
-            out
-        };
         for (field, subs) in &self.subscribers {
             if subs.is_empty()
                 || field == deadband_field
@@ -4792,18 +5188,18 @@ impl RecordInstance {
                     ValuePostGate::OnChangeForced => false,
                 };
                 if post {
-                    sub_updates.push((field.clone(), val.clone(), deadband_mask));
+                    snapshot.push((field.clone().into(), val.clone(), deadband_mask));
                 }
             } else if changed && !marked_only.contains(&field.as_str()) {
-                sub_updates.push((
-                    field.clone(),
+                snapshot.push((
+                    field.clone().into(),
                     val.clone(),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
             } else if force_fields.contains(&field.as_str()) {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                sub_updates.push((field.clone(), val.clone(), aux_mask));
+                snapshot.push((field.clone().into(), val.clone(), aux_mask));
             } else if cycle_posted.iter().any(|(name, _)| *name == field) {
                 // One event per MARK, each with the mask of the C call site that
                 // made it (`CyclePostMask`) — a field marked twice (aCalcout's
@@ -4815,13 +5211,13 @@ impl RecordInstance {
                         CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
                         CyclePostMask::MonitorValueLog => aux_mask,
                     };
-                    sub_updates.push((field.clone(), val.clone(), mask));
+                    snapshot.push((field.clone().into(), val.clone(), mask));
                 }
             } else if alarm_fanout.contains(&field.as_str()) {
                 // C motor `monitor()` (motorRecord.cc:3456-3646) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
                 // observes the alarm moment on any of them.
-                sub_updates.push((field.clone(), val.clone(), alarm_bits));
+                snapshot.push((field.clone().into(), val.clone(), alarm_bits));
             }
             // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
             // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
@@ -4852,7 +5248,7 @@ impl RecordInstance {
             // path is separately served by the change post (C's `updateCounts()`
             // DBE_VALUE at `:582`).
             if log_swept.contains(&field.as_str()) {
-                sub_updates.push((field.clone(), val, EventMask::LOG | alarm_bits));
+                snapshot.push((field.clone().into(), val, EventMask::LOG | alarm_bits));
             }
         }
         // A guarded secondary post reaches the snapshot only if the field has
@@ -4860,15 +5256,25 @@ impl RecordInstance {
         // `db_post_events` with no subscriber delivers nothing either. The
         // record's old copy has already advanced regardless — that is the
         // half that must not depend on who is watching.
-        for (field, val, mask) in forced_posts {
-            if self.subscribers.get(&field).is_some_and(|s| !s.is_empty()) {
-                sub_updates.push((field, val, mask));
+        if let Some(forced_mask) = forced_mask {
+            for (name, gate) in value_masked {
+                if *gate != ValuePostGate::OnChangeForced
+                    || !self.record.take_secondary_value_change(name)
+                {
+                    continue;
+                }
+                if self.subscribers.get(*name).is_some_and(|s| !s.is_empty()) {
+                    if let Some(val) = self.resolve_field(name) {
+                        snapshot.push((Cow::Borrowed(name), val, forced_mask));
+                    }
+                }
             }
         }
-        for (field, val, _) in &sub_updates {
+        // `snapshot` is the caller's, not a field of `self`, so the walk's
+        // pushes and this advance do not contend for the record.
+        for (field, val, _) in snapshot.iter().skip(first_post) {
             self.record_value_post(field, val.clone());
         }
-        sub_updates
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
@@ -4918,12 +5324,7 @@ impl RecordInstance {
             let lcnt_before = self.common.lcnt;
             self.common.lcnt = lcnt_before.saturating_add(1);
             if already_scan_alarm || lcnt_before < LCNT_ALARM_THRESHOLD || already_invalid {
-                return Ok((
-                    ProcessSnapshot {
-                        changed_fields: Vec::new(),
-                    },
-                    Vec::new(),
-                ));
+                return Ok((ProcessSnapshot::new(), Vec::new()));
             }
             recgbl::rec_gbl_set_sevr_msg(
                 &mut self.common,
@@ -4938,21 +5339,21 @@ impl RecordInstance {
             // the shared `stat_mask` = DBE_ALARM|DBE_VALUE, VAL posts
             // DBE_VALUE|DBE_LOG plus `val_mask` = DBE_ALARM.
             let stat_mask = EventMask::ALARM | EventMask::VALUE;
-            let mut changed_fields = Vec::new();
+            let mut changed_fields = crate::server::record::ProcessSnapshot::new();
             if let Some(val) = self.record.val() {
                 changed_fields.push((
-                    "VAL".to_string(),
+                    "VAL".into(),
                     val,
                     EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
                 ));
             }
             changed_fields.push((
-                "SEVR".to_string(),
+                "SEVR".into(),
                 EpicsValue::Short(self.common.sevr as i16),
                 EventMask::VALUE,
             ));
             changed_fields.push((
-                "STAT".to_string(),
+                "STAT".into(),
                 EpicsValue::Short(self.common.stat as i16),
                 stat_mask,
             ));
@@ -4960,11 +5361,11 @@ impl RecordInstance {
             // transition (C recGbl.c posts STAT and AMSG together
             // when any alarm field moved).
             changed_fields.push((
-                "AMSG".to_string(),
-                EpicsValue::String(self.common.amsg.clone().into()),
+                "AMSG".into(),
+                EpicsValue::String(self.common.amsg.as_str().into()),
                 stat_mask,
             ));
-            return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
+            return Ok((changed_fields, Vec::new()));
         }
         self.common.lcnt = 0;
         // RAII guard that resets `self.pact` to false on drop — both for the
@@ -5035,7 +5436,7 @@ impl RecordInstance {
             // The same "does the input dset return 2" question the
             // `processing.rs` link path asks — Plain and Async, not Raw.
             let is_soft = matches!(
-                crate::server::device_support::classify_soft(&self.common.dtyp),
+                self.common.dtyp.soft(),
                 Some(
                     crate::server::device_support::SoftDtyp::Plain
                         | crate::server::device_support::SoftDtyp::Async
@@ -5103,12 +5504,7 @@ impl RecordInstance {
             // Async: PACT stays set, no further processing this cycle
             // Don't clear processing flag (guard won't run — we leak it intentionally)
             std::mem::forget(_guard);
-            return Ok((
-                ProcessSnapshot {
-                    changed_fields: Vec::new(),
-                },
-                Vec::new(),
-            ));
+            return Ok((ProcessSnapshot::new(), Vec::new()));
         }
         if let RecordProcessResult::AsyncPendingNotify(fields) = process_result {
             // Intermediate notification (e.g. DMOV=0 at move start).
@@ -5121,7 +5517,7 @@ impl RecordInstance {
             // `db_post_events` calls use `DBE_VAL_LOG`
             // (motorRecord.cc:2606 DMOV, and every other do_work post);
             // no alarm transition ran on this pending pass.
-            let mut changed_fields = Vec::new();
+            let mut changed_fields = crate::server::record::ProcessSnapshot::new();
             for (name, val) in fields {
                 let changed = match self.posted_value(&name) {
                     Some(prev) => prev != &val,
@@ -5135,11 +5531,11 @@ impl RecordInstance {
                         }
                     }
                     self.record_value_post(&name, val.clone());
-                    changed_fields.push((name, val, EventMask::VALUE | EventMask::LOG));
+                    changed_fields.push((name.into(), val, EventMask::VALUE | EventMask::LOG));
                 }
             }
             // _guard drops here, clearing the processing flag
-            return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
+            return Ok((changed_fields, Vec::new()));
         }
         if process_result == RecordProcessResult::CompleteNoEmit {
             // The record accumulated this cycle without emitting (compress
@@ -5152,12 +5548,7 @@ impl RecordInstance {
             // invariant holds by construction, not by "process_local never
             // produces it". CompleteNoEmit is synchronous (PACT already
             // cleared); the `_guard` drops here, clearing the processing flag.
-            return Ok((
-                ProcessSnapshot {
-                    changed_fields: Vec::new(),
-                },
-                Vec::new(),
-            ));
+            return Ok((ProcessSnapshot::new(), Vec::new()));
         }
 
         // `CompleteDeferOutput` (swait ODLY delay-start) is NOT special-cased
@@ -5188,116 +5579,15 @@ impl RecordInstance {
         // Evaluate alarms (accumulates into nsta/nsev)
         self.evaluate_alarms();
 
-        // Transfer nsta/nsev → sevr/stat, detect alarm change
-        let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
-
         self.common.time = crate::runtime::general_time::get_current();
         // UDF already updated above — do not clear unconditionally.
 
-        // Deadband check for VAL monitor filtering
-        let (include_val, include_archive) = self.check_deadband_ext();
-        // C `recGblResetAlarms` `val_mask = DBE_ALARM`
-        // (recGbl.c:194/203/212): every monitored-value post this cycle
-        // carries DBE_ALARM when the severity/status OR the alarm
-        // message moved — same parity rule as the `processing.rs`
-        // paths.
-        let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
-            EventMask::ALARM
-        } else {
-            EventMask::NONE
-        };
+        let MonitorOutcome {
+            snapshot,
+            alarm_posts,
+        } = self.monitor_cycle();
 
-        // Build snapshot
-        let mut changed_fields = Vec::new();
-        // Same deadband-field routing and per-field mask as the
-        // `processing.rs` paths: the tracked field posts the classes
-        // that actually fired (MDEL → DBE_VALUE, ADEL → DBE_LOG, alarm
-        // movement → DBE_ALARM); a non-primary deadband field (motor
-        // RBV — C motor `monitor()`, motorRecord.cc:3468-3507) leaves
-        // VAL to the generic change-detection loop below.
-        let deadband_field = self.record.monitor_deadband_field();
-        // The mask every change-detected aux field posts with — owned by
-        // `AuxPostMask`, the same resolver the `processing.rs` paths use, so
-        // this builder cannot drift from them on what mask a field carries.
-        let aux_post = AuxPostMask::of(self.record.as_ref());
-        // The deadband field's post — mask owned by `deadband_post`, the single
-        // assembler C's `db_post_events(&prec->val, monitor_mask)` maps to.
-        let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
-        let deadband_mask = deadband.mask;
-        if let Some((field, value)) = deadband.field {
-            changed_fields.push((field, value, deadband_mask));
-        }
-        // C `recGblResetAlarms` (recGbl.c:202-222) posts each alarm
-        // field with its OWN per-field mask, not one record-wide mask:
-        //   * SEVR — DBE_VALUE, ONLY on a sevr change.
-        //   * STAT — DBE_ALARM (sevr change) | DBE_VALUE (stat change).
-        //   * ACKS — DBE_VALUE, only when an alarm field moved.
-        // Pushing SEVR/STAT into `changed_fields` collapses them onto
-        // the single record-wide `event_mask` (which carries ALARM on
-        // `alarm_changed`): a DBE_VALUE-only `.SEVR` subscriber would
-        // miss a stat-only-driven sevr change, and a DBE_ALARM-only
-        // `.SEVR` subscriber would be wrongly notified. Post them via
-        // `notify_field` with their individual masks instead — exactly
-        // as the `processing.rs` link path does.
-        let sevr_changed = self.common.sevr != alarm_result.prev_sevr;
-        let stat_changed = self.common.stat != alarm_result.prev_stat;
-        let stat_mask = {
-            let mut m = EventMask::NONE;
-            // C `recGblResetAlarms` carries DBE_ALARM on the STAT/AMSG
-            // posts whenever the severity OR the alarm message moved —
-            // not on a severity change alone. Aligning with the
-            // `processing.rs` link path (and `complete_async_record`).
-            if sevr_changed || alarm_result.amsg_changed {
-                m |= EventMask::ALARM;
-            }
-            if stat_changed {
-                m |= EventMask::VALUE;
-            }
-            m
-        };
-        let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
-        if sevr_changed {
-            alarm_posts.push(("SEVR", EventMask::VALUE));
-        }
-        if !stat_mask.is_empty() {
-            alarm_posts.push(("STAT", stat_mask));
-            // AMSG shares STAT's mask — C posts it alongside STAT when
-            // any alarm field moved.
-            alarm_posts.push(("AMSG", stat_mask));
-        }
-        // C parity (recGbl.c:214-217): ACKS is posted (DBE_VALUE) whenever the
-        // alarm-acknowledge rule fires — `acks_posted` already folds in C's
-        // `if (stat_mask)` guard, and the post carries no value-change test.
-        if alarm_result.acks_posted {
-            alarm_posts.push(("ACKS", EventMask::VALUE));
-        }
-
-        // The cycle's subscriber posts — assembled by the single owner
-        // `collect_subscriber_posts`, shared with every `processing.rs` path.
-        changed_fields.extend(self.collect_subscriber_posts(
-            deadband_field,
-            deadband_mask,
-            alarm_bits,
-            aux_post,
-            include_val,
-        ));
-        // C waveform/aai/aao `monitor()` posts HASH with a literal
-        // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
-        // 317-319), independent of the VAL post mask. `array_hash_changed`
-        // was set by `check_deadband_ext` this cycle.
-        if self.array_hash_changed {
-            if let Some(h) = self.resolve_field("HASH") {
-                changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
-            }
-        }
-
-        // No `.UDF` post — C `monitor()` posts UDF nowhere, and
-        // `recGblResetAlarms` (recGbl.c:202-222) posts only SEVR/STAT/AMSG/
-        // ACKS. A `.UDF` event exists only where C's generic `dbPut` posts
-        // the field it wrote (dbAccess.c:1411-1413) — i.e. a client caput to
-        // `.UDF` itself.
-
-        Ok((ProcessSnapshot { changed_fields }, alarm_posts))
+        Ok((snapshot, alarm_posts.to_vec()))
     }
 
     /// **The single owner of "write a value into a record field in the type
@@ -5367,7 +5657,7 @@ impl RecordInstance {
         // `Record::process_posts_value_monitor`. The alarm bits still reach VAL
         // via `deadband_post`'s `alarm_bits`, so an alarm transition still posts
         // it; only the value/archive classes are suppressed.
-        if !self.record.process_posts_value_monitor() {
+        if !self.monitor_plan.posts_value_monitor {
             return (false, false);
         }
         match self.record.monitor_value_changed() {
@@ -5383,7 +5673,7 @@ impl RecordInstance {
                 (changed || val_always, changed || archive_always)
             }
             None => {
-                if self.record.uses_monitor_deadband() {
+                if self.monitor_plan.uses_deadband {
                     self.check_deadband_ext()
                 } else {
                     // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
@@ -5399,12 +5689,11 @@ impl RecordInstance {
         include_val: bool,
         include_archive: bool,
     ) -> DeadbandPost {
-        let field = self.record.monitor_deadband_field();
-        let log_suppressed = self.record.value_only_change_fields().contains(&field)
-            || self
-                .record
-                .fields_posted_with_monitor_mask()
-                .contains(&field);
+        let MonitorPlan {
+            deadband_field: field,
+            log_suppressed,
+            ..
+        } = self.monitor_plan;
 
         let mut mask = alarm_bits;
         if include_val {
@@ -5437,7 +5726,7 @@ impl RecordInstance {
         };
         DeadbandPost {
             mask,
-            field: value.map(|v| (field.to_string(), v)),
+            field: value.map(|v| (field, v)),
         }
     }
 
@@ -5462,50 +5751,32 @@ impl RecordInstance {
         // not its primary value (e.g. the motor record, VAL=setpoint /
         // RBV=readback — C `monitor()` deadbands RBV) overrides that
         // hook. Default is `val()`, so other records are unaffected.
-        let val = match self
-            .record
-            .monitor_deadband_value()
-            .and_then(|v| v.to_f64())
-        {
-            Some(v) => v,
-            None => return (true, true),
+        let Some(val) = self.record.monitor_deadband_value() else {
+            return (true, true);
         };
 
-        let mdel = self
-            .record
-            .get_field("MDEL")
-            .and_then(|v| v.to_f64())
-            .unwrap_or(0.0);
-        let adel = self
-            .record
-            .get_field("ADEL")
-            .and_then(|v| v.to_f64())
-            .unwrap_or(0.0);
-
-        // Use record's MLST/ALST fields if available, otherwise fall back to
-        // CommonFields. `None` survives to `check_deadband` as the "nothing
+        // The four cells in one ask — see `Record::monitor_deadband_cells`.
+        // `None` for MLST/ALST survives to `check_deadband` as the "nothing
         // posted yet" state: record types that carry no MLST/ALST cell (sel,
-        // scalcout) have nowhere to hold a last-posted value.
-        let mlst = self
-            .record
-            .get_field("MLST")
-            .and_then(|v| v.to_f64())
-            .or(self.common.mlst);
-        let alst = self
-            .record
-            .get_field("ALST")
-            .and_then(|v| v.to_f64())
-            .or(self.common.alst);
+        // scalcout) have nowhere to hold a last-posted value, and fall back to
+        // the `CommonFields` shadow.
+        let cells = self.record.monitor_deadband_cells();
+        let mdel = cells.mdel.unwrap_or(0.0);
+        let adel = cells.adel.unwrap_or(0.0);
+        let mlst = cells.mlst.or(self.common.mlst);
+        let alst = cells.alst.or(self.common.alst);
 
         let monitor_trigger = check_deadband(val, mlst, mdel);
         let archive_trigger = check_deadband(val, alst, adel);
 
+        if monitor_trigger || archive_trigger {
+            self.record
+                .store_monitor_last_posted(val, monitor_trigger, archive_trigger);
+        }
         if archive_trigger {
-            self.put_coerced("ALST", EpicsValue::Double(val));
             self.common.alst = Some(val);
         }
         if monitor_trigger {
-            self.put_coerced("MLST", EpicsValue::Double(val));
             self.common.mlst = Some(val);
         }
 
@@ -5533,12 +5804,25 @@ impl RecordInstance {
     /// post runs with the record's own lock held — so the caller that owns the
     /// process/put cycle resolves it at a point where no lock is held and
     /// hands it in.
+    ///
+    /// Returns `None` when the backing DECLINED and this field is link-backed.
+    /// The poster's gate ("nobody is subscribed, so skip the resolve") is asked
+    /// under a read lock the walk then releases, and a subscriber can attach
+    /// before the post takes the write lock. That one event would otherwise go
+    /// out carrying the record's own seed where the link's metadata belongs.
+    /// C closes the same window by lock discipline: `db_add_event` takes
+    /// `dbScanLock` on the record's lock set (`dbEvent.c:730`), which
+    /// `dbProcess` holds for the whole cycle, so a monitor attaching mid-cycle
+    /// joins after it and receives events from the NEXT process, never that
+    /// one. Refusing here reproduces that: the late subscriber's first event
+    /// comes from the next cycle, and its initial value came from the
+    /// create-channel GET, which resolves on the ungated door.
     pub fn make_monitor_snapshot(
         &self,
         field: &str,
         value: EpicsValue,
         backing: LinkBacking<'_>,
-    ) -> super::super::snapshot::Snapshot {
+    ) -> Option<super::super::snapshot::Snapshot> {
         // A monitor update is posted from the record's own change-detection
         // loop, which hands over the STORED variant. Project it onto the
         // field's declared type here, at the same owner the GET path and the
@@ -5562,8 +5846,19 @@ impl RecordInstance {
              at a point where it holds no record lock",
             self.name
         );
+        // The window above. Cheap enum test first — a declined backing only
+        // ever comes from the poster door, so every other caller pays one
+        // discriminant compare and never the field lookup.
+        if backing.is_declined()
+            && self
+                .record
+                .link_backed_metadata_field(&field.to_ascii_uppercase())
+                .is_some()
+        {
+            return None;
+        }
         let value = self.project_to_declared_type(field, value);
-        self.finish_field_snapshot(field, value, backing)
+        Some(self.finish_field_snapshot(field, value, backing))
     }
 
     /// Apply a record's per-field metadata override (C RSET
@@ -5676,6 +5971,7 @@ impl RecordInstance {
         &self,
         field: &str,
         backing: LinkBacking<'_>,
+        explicit_alarm: (f64, f64, f64, f64),
         snap: &mut super::super::snapshot::Snapshot,
     ) {
         // The rset slots this record type actually supplies. A NULL slot makes
@@ -5831,7 +6127,7 @@ impl RecordInstance {
         // single owner removes.
         if slots.alarm_double {
             let (hihi, high, low, lolo) = if Self::alarm_explicit_field(rtype, field) {
-                self.explicit_alarm_limits(rtype)
+                explicit_alarm
             } else if link_backed.is_some() {
                 // `dbGetAlarmLimits` on the backing link; `dbAccess.c:294`'s
                 // four NaN stand when it supplies nothing.
@@ -6266,22 +6562,32 @@ impl RecordInstance {
     pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
         use crate::server::database::filters::FilteredMonitorEvent;
 
+        // Nothing is subscribed to any field, so no post below can land; the
+        // per-field lookup is a hash of the field name per post per cycle to
+        // find that out. Same gate as `collect_subscriber_posts`.
+        if self.subscribers.is_empty() {
+            return;
+        }
+
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its
         // posts with the writer's origin, so the writer's own filtered
         // subscriptions do not hear its cascade. 0 outside any scope.
         let origin = ambient_write_origin();
 
-        for (field, value, posting_mask) in &snapshot.changed_fields {
+        for (field, value, posting_mask) in snapshot.iter() {
             let posting_mask = *posting_mask;
-            if let Some(subs) = self.subscribers.get(field) {
+            if let Some(subs) = self.subscribers.get(field.as_ref()) {
                 // Build a full snapshot once per field (with display
                 // metadata) and hand every subscriber a reference to that one
                 // snapshot — C posts the fixed-size `db_field_log` and reads
                 // the wide value by reference at delivery (`camessage.c:516`),
                 // so a per-subscriber deep copy of an array value is a port
                 // deviation, not parity.
-                let mon_snap = Arc::new(self.make_monitor_snapshot(field, value.clone(), backing));
+                let Some(snap) = self.make_monitor_snapshot(field, value.clone(), backing) else {
+                    continue;
+                };
+                let mon_snap = Arc::new(snap);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -6403,10 +6709,18 @@ impl RecordInstance {
         let mut posted: Option<EpicsValue> = None;
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
+                let published = value.clone();
+                // Built before `posted` is set: a refused post publishes
+                // nothing, so it must not advance `last_posted` either, or the
+                // next cycle's change detector would treat the value as
+                // already delivered and the subscriber would never see it.
+                let Some(snap) = self.make_monitor_snapshot(field, value, backing) else {
+                    return;
+                };
                 if publishes_value {
-                    posted = Some(value.clone());
+                    posted = Some(published);
                 }
-                let mon_snap = Arc::new(self.make_monitor_snapshot(field, value, backing));
+                let mon_snap = Arc::new(snap);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -6872,10 +7186,17 @@ mod metadata_cache_tests {
         assert!(is_metadata_cache_source("ZRST"));
         assert!(is_metadata_cache_source("FFST"));
 
-        // The cache holds no alarm limits — `explicit_alarm_limits` is on the
-        // live `apply_field_metadata_override` path — so HIHI is property-class
-        // without being a cache source.
-        assert!(!is_metadata_cache_source("HIHI"));
+        // Every cell `explicit_alarm_limits` reads, now that the cache holds
+        // its answer: the four bands and the four severities that gate them.
+        assert!(is_metadata_cache_source("HIHI"));
+        assert!(is_metadata_cache_source("HIGH"));
+        assert!(is_metadata_cache_source("LOW"));
+        assert!(is_metadata_cache_source("LOLO"));
+        assert!(is_metadata_cache_source("HHSV"));
+        assert!(is_metadata_cache_source("HSV"));
+        assert!(is_metadata_cache_source("LSV"));
+        assert!(is_metadata_cache_source("LLSV"));
+
         assert!(!is_metadata_cache_source("VAL"));
         assert!(!is_metadata_cache_source("DESC"));
         assert!(!is_metadata_cache_source("SCAN"));
@@ -6938,14 +7259,17 @@ mod metadata_cache_tests {
         }
 
         // The monitor producer shares the same per-field owner.
-        let update = inst.make_monitor_snapshot("RVAL", EpicsValue::Long(7), LinkBacking::none());
+        let update = inst
+            .make_monitor_snapshot("RVAL", EpicsValue::Long(7), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         assert_eq!(
             update.display.expect("ai display").form,
             0,
             "a monitor update on a non-VAL field carries the default form too"
         );
-        let update =
-            inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
+        let update = inst
+            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         assert_eq!(update.display.expect("ai display").form, 4);
     }
 
@@ -7049,7 +7373,9 @@ mod metadata_cache_tests {
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
-        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
+        let mon = inst
+            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         assert_eq!(mon.user_tag, 123_456_700);
         assert_eq!(mon.timestamp.subsec_nanos(), 0);
         assert_eq!(mon.timestamp.unix_secs(), 42);
@@ -7098,7 +7424,9 @@ mod metadata_cache_tests {
             "GET path must serve the record's utag as timeStamp.userTag"
         );
 
-        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none());
+        let mon = inst
+            .make_monitor_snapshot("VAL", EpicsValue::Double(1.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         assert_eq!(
             mon.user_tag, want,
             "MONITOR path must carry the record's utag too"
@@ -7349,13 +7677,16 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_none());
 
         // make_monitor_snapshot should also populate the cache
-        let snap = inst.make_monitor_snapshot("VAL", EpicsValue::Double(42.0), LinkBacking::none());
+        let snap = inst
+            .make_monitor_snapshot("VAL", EpicsValue::Double(42.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         assert!(snap.display.is_some());
         assert!(inst.metadata_cache.lock().unwrap().is_some());
 
         // Subsequent call hits cache
-        let snap2 =
-            inst.make_monitor_snapshot("VAL", EpicsValue::Double(43.0), LinkBacking::none());
+        let snap2 = inst
+            .make_monitor_snapshot("VAL", EpicsValue::Double(43.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         let d1 = snap.display.unwrap();
         let d2 = snap2.display.unwrap();
         assert_eq!(d1.units, d2.units);
@@ -7447,7 +7778,9 @@ mod metadata_cache_tests {
         assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
 
         // SPD via the monitor path: identical override.
-        let snap = inst.make_monitor_snapshot("SPD", EpicsValue::Double(2.0), LinkBacking::none());
+        let snap = inst
+            .make_monitor_snapshot("SPD", EpicsValue::Double(2.0), LinkBacking::none())
+            .expect("nothing was declined: the backing is unresolved, not declined");
         let d = snap.display.unwrap();
         assert_eq!(d.units, "mm/sec");
         assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
@@ -7505,8 +7838,8 @@ mod metadata_cache_tests {
         fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             READBACK_DEADBAND_FIELDS
         }
-        fn monitor_deadband_value(&self) -> Option<EpicsValue> {
-            Some(EpicsValue::Double(self.rbv))
+        fn monitor_deadband_value(&self) -> Option<f64> {
+            Some(self.rbv)
         }
         fn monitor_deadband_field(&self) -> &'static str {
             "RBV"
@@ -7543,12 +7876,8 @@ mod metadata_cache_tests {
                 EventMask::VALUE.bits(),
             )
             .expect("RBV subscriber");
-        let names = |snap: &ProcessSnapshot| {
-            snap.changed_fields
-                .iter()
-                .map(|(n, _, _)| n.clone())
-                .collect::<Vec<_>>()
-        };
+        let names =
+            |snap: &ProcessSnapshot| snap.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>();
 
         // Cycle 1 (first publish): RBV fires via the deadband trigger
         // (MLST starts at the NaN never-posted sentinel). VAL must NOT
@@ -7558,9 +7887,9 @@ mod metadata_cache_tests {
         // it.
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
-        assert!(n.contains(&"RBV".to_string()), "{n:?}");
+        assert!(n.contains(&std::borrow::Cow::Borrowed("RBV")), "{n:?}");
         assert!(
-            !n.contains(&"VAL".to_string()),
+            !n.contains(&std::borrow::Cow::Borrowed("VAL")),
             "VAL unchanged since subscribe must not post: {n:?}"
         );
 
@@ -7568,9 +7897,12 @@ mod metadata_cache_tests {
         // VAL not re-posted.
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
-        assert!(n.contains(&"RBV".to_string()), "RBV crossed MDEL: {n:?}");
         assert!(
-            !n.contains(&"VAL".to_string()),
+            n.contains(&std::borrow::Cow::Borrowed("RBV")),
+            "RBV crossed MDEL: {n:?}"
+        );
+        assert!(
+            !n.contains(&std::borrow::Cow::Borrowed("VAL")),
             "unchanged VAL must not post: {n:?}"
         );
 
@@ -7579,7 +7911,7 @@ mod metadata_cache_tests {
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
         assert!(
-            !n.contains(&"RBV".to_string()),
+            !n.contains(&std::borrow::Cow::Borrowed("RBV")),
             "MDEL must throttle RBV: {n:?}"
         );
 
@@ -7589,11 +7921,11 @@ mod metadata_cache_tests {
         let (snap, _) = inst.process_local().unwrap();
         let n = names(&snap);
         assert!(
-            n.contains(&"VAL".to_string()),
+            n.contains(&std::borrow::Cow::Borrowed("VAL")),
             "changed VAL must post: {n:?}"
         );
         assert!(
-            !n.contains(&"RBV".to_string()),
+            !n.contains(&std::borrow::Cow::Borrowed("RBV")),
             "MDEL must throttle RBV: {n:?}"
         );
     }
@@ -7627,8 +7959,7 @@ mod metadata_cache_tests {
                 EventMask::VALUE.bits(),
             )
             .expect("VAL subscriber");
-        let posts_val =
-            |snap: &ProcessSnapshot| snap.changed_fields.iter().any(|(n, _, _)| n == "VAL");
+        let posts_val = |snap: &ProcessSnapshot| snap.iter().any(|(n, _, _)| n == "VAL");
 
         // A settling scan of the unchanged record: C `do_sub` returns 0 and
         // `process` leaves VAL at 0 (already 0), settling the monitor gate.
@@ -7745,18 +8076,14 @@ mod metadata_cache_tests {
                 EventMask::VALUE.bits(),
             )
             .expect("VAL subscriber");
-        let names = |snap: &ProcessSnapshot| {
-            snap.changed_fields
-                .iter()
-                .map(|(n, _, _)| n.clone())
-                .collect::<Vec<_>>()
-        };
+        let names =
+            |snap: &ProcessSnapshot| snap.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>();
 
         // Cycle 1 (first publish): both DIFF and VAL post — last_posted is
         // empty so change-detection treats every subscribed field as new.
         let (snap1, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap1).contains(&"DIFF".to_string()),
+            names(&snap1).contains(&std::borrow::Cow::Borrowed("DIFF")),
             "DIFF posts on first publish: {:?}",
             names(&snap1)
         );
@@ -7766,19 +8093,18 @@ mod metadata_cache_tests {
         // DBE_VAL_LOG. This is the divergence MOT-1 closes.
         let (snap2, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap2).contains(&"DIFF".to_string()),
+            names(&snap2).contains(&std::borrow::Cow::Borrowed("DIFF")),
             "force-posted DIFF must re-post when unchanged: {:?}",
             names(&snap2)
         );
         assert!(
-            !names(&snap2).contains(&"VAL".to_string()),
+            !names(&snap2).contains(&std::borrow::Cow::Borrowed("VAL")),
             "an unchanged non-force field must not re-post: {:?}",
             names(&snap2)
         );
         // The forced re-post carries DBE_VALUE|DBE_LOG (no alarm bits this
         // cycle), matching C `monitor_mask | DBE_VAL_LOG` with monitor_mask=0.
         let diff_mask = snap2
-            .changed_fields
             .iter()
             .find(|(n, _, _)| n == "DIFF")
             .map(|(_, _, m)| *m)
@@ -7873,35 +8199,24 @@ mod metadata_cache_tests {
                 EventMask::VALUE.bits(),
             )
             .expect("S2 subscriber");
-        let names = |snap: &ProcessSnapshot| {
-            snap.changed_fields
-                .iter()
-                .map(|(n, _, _)| n.clone())
-                .collect::<Vec<_>>()
-        };
-        let count_of = |snap: &ProcessSnapshot, f: &str| {
-            snap.changed_fields
-                .iter()
-                .filter(|(n, _, _)| n == f)
-                .count()
-        };
+        let names =
+            |snap: &ProcessSnapshot| snap.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>();
+        let count_of =
+            |snap: &ProcessSnapshot, f: &str| snap.iter().filter(|(n, _, _)| n == f).count();
         let mask_of = |snap: &ProcessSnapshot, f: &str| {
-            snap.changed_fields
-                .iter()
-                .find(|(n, _, _)| n == f)
-                .map(|(_, _, m)| *m)
+            snap.iter().find(|(n, _, _)| n == f).map(|(_, _, m)| *m)
         };
 
         // Cycle 1: nothing changed since subscribe. S1 (swept) re-posts
         // with DBE_LOG ONLY; S2 (not swept) must NOT re-post.
         let (snap1, _) = inst.process_local().unwrap();
         assert!(
-            names(&snap1).contains(&"S1".to_string()),
+            names(&snap1).contains(&std::borrow::Cow::Borrowed("S1")),
             "log-swept S1 must re-post when unchanged: {:?}",
             names(&snap1)
         );
         assert!(
-            !names(&snap1).contains(&"S2".to_string()),
+            !names(&snap1).contains(&std::borrow::Cow::Borrowed("S2")),
             "unchanged non-swept S2 must not re-post: {:?}",
             names(&snap1)
         );
@@ -7926,10 +8241,9 @@ mod metadata_cache_tests {
             2,
             "a changed swept field posts twice — change post + independent \
              DBE_LOG sweep: {:?}",
-            snap2.changed_fields
+            snap2.iter().collect::<Vec<_>>()
         );
         let s1_masks: Vec<u16> = snap2
-            .changed_fields
             .iter()
             .filter(|(n, _, _)| n == "S1")
             .map(|(_, _, m)| m.bits())
@@ -8055,10 +8369,7 @@ mod metadata_cache_tests {
             )
             .expect("S1 subscriber");
         let mask_of = |snap: &ProcessSnapshot, f: &str| {
-            snap.changed_fields
-                .iter()
-                .find(|(n, _, _)| n == f)
-                .map(|(_, _, m)| *m)
+            snap.iter().find(|(n, _, _)| n == f).map(|(_, _, m)| *m)
         };
 
         // Cycle 1 clears the record's initial UDF/INVALID alarm, which is itself

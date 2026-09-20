@@ -15,8 +15,6 @@
 //! `LNK0..LNKF` are `DBF_FWDLINK` (`dbScanFwdLink`), driving no value and
 //! raising no put alarm.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -26,7 +24,7 @@ use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

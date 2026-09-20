@@ -30,8 +30,6 @@
 //!   * a non-last link fails (the quirk) — selection must still RUN;
 //!   * NVL fails in `Specified` (gates) vs in `High Signal` (never read).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -113,7 +111,7 @@ async fn seed_and_process(db: &PvDatabase, rec: &str, seed: f64) -> f64 {
         .record
         .put_field_internal("VAL", EpicsValue::Double(seed))
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

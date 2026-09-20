@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::server::record::{PiniMode, RecordInstance, ScanList, ScanType};
+use crate::server::record::{PiniMode, RecordCell, ScanList, ScanType};
 
 use super::PvDatabase;
 
@@ -16,39 +16,73 @@ use super::PvDatabase;
 /// the ones a cursor last saw.
 ///
 /// The two live together because the revision is only meaningful as a
-/// statement about these keys: [`ScanCursor`] resumes from a key it was handed
-/// on an earlier step, and the only thing that can invalidate it is a record
-/// entering, leaving, or being re-keyed within THIS bucket. Every such
-/// transition goes through [`PvDatabase::add_to_scan_list`] or
-/// [`PvDatabase::delete_from_scan_list`] (see the module note), so bumping the
-/// revision inside the two methods below is the whole enforcement: a bucket
-/// cannot change without saying so.
-struct Bucket {
-    keys: BTreeSet<super::ScanKey>,
-    revision: u64,
+/// statement about these keys: [`ScanCursor`] walks the list as it stood at a
+/// revision, and the only thing that can invalidate that is a record entering,
+/// leaving, or being re-keyed within THIS bucket. Every such transition goes
+/// through [`ScanBucket::transition`], which moves the revision itself, so a
+/// bucket cannot change without saying so.
+///
+/// The revision sits OUTSIDE the mutex because that is what lets an ordinary
+/// sweep step skip the mutex entirely: while the bucket still reads the value
+/// the cursor holds, the cursor's copy of the list is the list. It is written
+/// only under the mutex and published `Release`, so a cursor that sees a new
+/// value and then takes the mutex sees the keys that produced it.
+struct ScanBucket {
+    revision: std::sync::atomic::AtomicU64,
+    entries: crate::runtime::sync::PriorityInheritanceMutex<Bucket>,
 }
 
-impl Bucket {
+/// The keys themselves, and the ordered form a cursor walks.
+struct Bucket {
+    keys: BTreeSet<super::ScanKey>,
+    /// `keys` in order, materialised on the first ask after a transition and
+    /// shared with every ask until the next one. Written only by
+    /// [`ScanBucket::transition`] and [`ScanBucket::snapshot`].
+    ordered: Option<Arc<[super::ScanKey]>>,
+}
+
+impl ScanBucket {
     fn new() -> Self {
         Self {
-            keys: BTreeSet::new(),
-            revision: 0,
+            revision: std::sync::atomic::AtomicU64::new(0),
+            entries: crate::runtime::sync::PriorityInheritanceMutex::new(Bucket {
+                keys: BTreeSet::new(),
+                ordered: None,
+            }),
         }
     }
 
-    /// C `addToList`'s insertion. Bumps the revision whether or not the key
-    /// was already present: an insert of an equal key is the re-key case, and
-    /// a cursor standing on the old key has to be told.
-    fn insert(&mut self, key: super::ScanKey) {
-        self.revision = self.revision.wrapping_add(1);
-        self.keys.insert(key);
+    /// The ONE way this bucket's keys change — C keeps `addToList` and
+    /// `deleteFromList` `static` in `dbScan.c` for the same reason.
+    ///
+    /// Moving the revision and dropping the now-stale ordered form are this
+    /// method's own writes rather than the caller's, so neither can be
+    /// forgotten and the bucket cannot announce a change while still handing
+    /// out the keys from before it. The revision moves on every call whether
+    /// or not the closure changed anything: an insert of an equal key is the
+    /// re-key case, and a cursor standing on the old key has to be told.
+    fn transition(&self, f: impl FnOnce(&mut BTreeSet<super::ScanKey>)) {
+        let mut entries = self.entries.lock();
+        f(&mut entries.keys);
+        entries.ordered = None;
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// C `deleteFromList`'s removal, by record name — see the caller for why
-    /// the name alone is the match.
-    fn remove_named(&mut self, name: &str) {
-        self.revision = self.revision.wrapping_add(1);
-        self.keys.retain(|k| k.name.as_ref() != name);
+    /// The keys in order, and the revision they are the keys at.
+    fn snapshot(&self) -> (u64, Arc<[super::ScanKey]>) {
+        let mut entries = self.entries.lock();
+        if entries.ordered.is_none() {
+            let ordered: Arc<[super::ScanKey]> = entries.keys.iter().cloned().collect();
+            entries.ordered = Some(ordered);
+        }
+        (
+            // Read under the mutex, beside the keys it describes. A
+            // transition landing after this returns is one the cursor meets
+            // on its next step, which is where C meets it too.
+            self.revision.load(std::sync::atomic::Ordering::Relaxed),
+            entries.ordered.clone().expect("just materialised"),
+        )
     }
 }
 
@@ -60,7 +94,7 @@ pub(super) struct ScanIndex {
     /// freeze the menu before the loader could install one. C reaches the same
     /// point by ordering — `dbLoadDatabase`, then `iocInit` → `initPeriodic`
     /// sizes `papPeriodic`.
-    buckets: std::sync::OnceLock<Box<[crate::runtime::sync::PriorityInheritanceMutex<Bucket>]>>,
+    buckets: std::sync::OnceLock<Box<[ScanBucket]>>,
     /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
     /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
     /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
@@ -79,14 +113,10 @@ impl ScanIndex {
     }
 
     /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
-    fn bucket(&self, list: ScanList) -> &crate::runtime::sync::PriorityInheritanceMutex<Bucket> {
+    fn bucket(&self, list: ScanList) -> &ScanBucket {
         &self
             .buckets
-            .get_or_init(|| {
-                (0..ScanList::count())
-                    .map(|_| crate::runtime::sync::PriorityInheritanceMutex::new(Bucket::new()))
-                    .collect()
-            })
+            .get_or_init(|| (0..ScanList::count()).map(|_| ScanBucket::new()).collect())
             .as_ref()[list.slot()]
     }
 
@@ -108,9 +138,10 @@ impl PvDatabase {
     /// enters a scan bucket.
     ///
     /// C keeps it `static` so that `scanAdd` is the only way in; the port's
-    /// equivalent is this being the only `scan_index.bucket(..).lock()` write
-    /// outside the readers. It takes the bucket lock itself, exactly as C
-    /// takes `psl->lock`, and takes no registration lock: L46 belongs to
+    /// equivalent is [`ScanBucket::transition`], which this and
+    /// [`Self::delete_from_scan_list`] are the only callers of. It takes the
+    /// bucket lock itself, exactly as C takes `psl->lock`, and takes no
+    /// registration lock: L46 belongs to
     /// whichever owner called — [`Self::update_scan_index`], which acquires it,
     /// or `add_record`, which is already inside it. Both used to open-code the
     /// bucket write instead, which is how a transition could bypass its owner.
@@ -129,11 +160,21 @@ impl PvDatabase {
         let Some(list) = scan.scan_list() else {
             return;
         };
-        self.inner
-            .scan_index
-            .bucket(list)
-            .lock()
-            .insert(super::ScanKey::new(phas, record_type, load_order, name));
+        // Resolved once here, where a record enters the list, instead of once
+        // per record per sweep inside the process frame.
+        let handle = self
+            .get_record_no_resolve(name)
+            .map(|rec| std::sync::Arc::downgrade(&rec))
+            .unwrap_or_default();
+        self.inner.scan_index.bucket(list).transition(|keys| {
+            keys.insert(super::ScanKey::new(
+                phas,
+                record_type,
+                load_order,
+                name,
+                handle,
+            ));
+        });
     }
 
     /// C `deleteFromList` (`dbScan.c:1096` at R7.0.10) — the ONE place a
@@ -147,7 +188,10 @@ impl PvDatabase {
         let Some(list) = scan.scan_list() else {
             return;
         };
-        self.inner.scan_index.bucket(list).lock().remove_named(name);
+        self.inner
+            .scan_index
+            .bucket(list)
+            .transition(|keys| keys.retain(|k| k.name.as_ref() != name));
     }
 
     /// Update scan index when a record's SCAN or PHAS field changes.
@@ -264,8 +308,8 @@ impl PvDatabase {
         self.inner
             .scan_index
             .bucket(list)
-            .lock()
-            .keys
+            .snapshot()
+            .1
             .iter()
             .map(|k| k.name.to_string())
             .collect()
@@ -280,14 +324,21 @@ impl PvDatabase {
             (inst.common.phas, inst.record.record_type())
         };
         let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
-        Some(super::ScanKey::new(phas, record_type, seq, name))
+        Some(super::ScanKey::new(
+            phas,
+            record_type,
+            seq,
+            name,
+            std::sync::Arc::downgrade(&rec),
+        ))
     }
 
     /// A cursor over `list` as it stands at each step — see [`ScanCursor`].
     pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor {
         ScanCursor {
             list,
-            at: None,
+            snapshot: None,
+            next: 0,
             revision: 0,
         }
     }
@@ -299,9 +350,21 @@ impl PvDatabase {
     /// `scanList` call.
     pub(crate) async fn scan_list_once(&self, list: ScanList) {
         let mut cursor = self.scan_cursor(list);
-        while let Some(name) = cursor.next(self) {
-            let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(&name, &mut visited).await;
+        // One set for the whole sweep. `run_process_frame` owns the unwind and
+        // takes its own marker back out on every exit, so the set is empty
+        // again when a record's cascade returns — reusing it is the same set a
+        // fresh `HashSet::new()` would be, minus the table allocation each
+        // record was paying for its first insert.
+        let mut visited = crate::server::database::ProcStack::new();
+        while let Some((name, rec)) = cursor.next(self) {
+            let _ = match rec {
+                Some(rec) => self.process_record_with_links_resolved(name, rec, &mut visited),
+                None => self.process_record_with_links_sync(name, &mut visited),
+            };
+            debug_assert!(
+                visited.is_empty(),
+                "a returned process frame left its cycle marker behind"
+            );
         }
     }
 
@@ -341,9 +404,7 @@ impl PvDatabase {
     ///
     /// Snapshots the map under the records read lock and releases it before the
     /// caller takes any per-record lock.
-    async fn records_in_load_order(
-        &self,
-    ) -> Vec<(String, std::sync::Arc<parking_lot::RwLock<RecordInstance>>)> {
+    async fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
         let snapshot: Vec<_> = {
             let records = self.inner.records.read();
             records
@@ -404,6 +465,9 @@ impl PvDatabase {
             // snapshotted up front, so a PHAS that an earlier record's
             // processing changed is honoured — the reason C re-scans rather
             // than sorting once.
+            // See `scan_list_once`: one set per sweep, emptied by each frame's
+            // own unwind.
+            let mut visited = crate::server::database::ProcStack::new();
             for (name, rec) in self.records_in_load_order().await {
                 let (pini, phas) = {
                     let instance = rec.read();
@@ -413,8 +477,12 @@ impl PvDatabase {
                     continue;
                 }
                 if phas == this {
-                    let mut visited = std::collections::HashSet::new();
-                    let _ = self.process_record_with_links(&name, &mut visited).await;
+                    let _ =
+                        self.process_record_with_links_resolved(&name, rec.clone(), &mut visited);
+                    debug_assert!(
+                        visited.is_empty(),
+                        "a returned process frame left its cycle marker behind"
+                    );
                 } else if phas > this && phas < next {
                     next = phas;
                 }
@@ -473,19 +541,25 @@ impl PvDatabase {
         // the walk here exactly as it does on a periodic list. The port keeps
         // one Event list and filters by EVNT at the cursor instead.
         let mut cursor = self.scan_cursor(list);
-        while let Some(name) = cursor.next(self) {
+        // See `scan_list_once`: one set per sweep, emptied by each frame's own
+        // unwind.
+        let mut visited = crate::server::database::ProcStack::new();
+        while let Some((name, rec)) = cursor.next(self) {
             // Read the record's EVNT and compare against the posted
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
-            let evnt = match self.get_record(&name) {
-                Some(rec) => rec.read().common.evnt.clone(),
-                None => continue,
+            let Some(rec) = rec.or_else(|| self.get_record(name)) else {
+                continue;
             };
+            let evnt = rec.read().common.evnt.clone();
             if normalize_event_name(&evnt) != want {
                 continue;
             }
-            let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(&name, &mut visited).await;
+            let _ = self.process_record_with_links_resolved(name, rec, &mut visited);
+            debug_assert!(
+                visited.is_empty(),
+                "a returned process frame left its cycle marker behind"
+            );
         }
     }
 }
@@ -497,6 +571,16 @@ impl PvDatabase {
 /// a cursor-repair walk that exists precisely because `dbProcess` can change
 /// the SCAN field of an arbitrary number of records mid-sweep. A snapshot taken
 /// once at the top of the tick processes records the list no longer holds.
+///
+/// The cursor does hold the list in a `snapshot`, and that does not weaken the
+/// invariant, because the bucket's revision is what the snapshot is read
+/// through: the revision moves on every transition ([`ScanBucket::transition`]),
+/// so while it still reads what the cursor holds, no record has entered, left
+/// or been re-keyed and the snapshot IS the live list. The moment it differs
+/// the snapshot is discarded and the place re-found. What that buys is the
+/// step: an index, against a bucket lock, an ordered-set lookup and a key
+/// clone per record per sweep to learn that a list nothing had touched still
+/// held what it held.
 ///
 /// The port's list is an ordered set, not a linked list, so "my element left
 /// the list" has one answer instead of C's three: the next key strictly greater
@@ -512,65 +596,67 @@ impl PvDatabase {
 /// (`:1023-1029`).
 pub(crate) struct ScanCursor {
     list: ScanList,
-    /// Where the cursor stands: the key of the record it last handed out.
-    at: Option<super::ScanKey>,
-    /// The bucket revision [`Self::at`] was read at.
-    ///
-    /// While it still matches the bucket's, no record has entered, left or
-    /// been re-keyed in this list, so the key in `at` is still the record's
-    /// key and there is nothing to repair. That is the answer the step used to
-    /// reach by rebuilding the key from the record's live PHAS, record type
-    /// and load order and looking the result up — per record, per sweep, to
-    /// learn that a list nothing had touched still held what it held.
+    /// The list as it stood at [`Self::revision`]; `None` before the first
+    /// step, which is the one state in which there is no place to keep.
+    snapshot: Option<Arc<[super::ScanKey]>>,
+    /// Index into `snapshot` of the entry the next step hands out. The entry
+    /// before it is where the cursor stands.
+    next: usize,
+    /// The bucket revision `snapshot` was taken at.
     revision: u64,
 }
 
 impl ScanCursor {
-    /// The next record still in the list, or `None` at its end.
+    /// Where the cursor stands: the entry the last step handed out.
+    fn standing(&self) -> Option<&super::ScanKey> {
+        self.snapshot.as_ref()?.get(self.next.checked_sub(1)?)
+    }
+
+    /// Take the list again and re-find the place in it — C's cursor repair
+    /// (`dbScan.c:1023-1044`), now paid once per transition rather than once
+    /// per record.
     ///
-    /// Takes the bucket lock for the step only, never across processing — C
-    /// holds `psl->lock` for the cursor step and releases it around every
-    /// `dbProcess`.
-    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<Arc<str>> {
-        use std::ops::Bound;
-
-        fn step(bucket: &Bucket, resume: Option<&super::ScanKey>) -> Option<super::ScanKey> {
-            match resume {
-                None => bucket.keys.iter().next().cloned(),
-                Some(at) => bucket
-                    .keys
-                    .range((Bound::Excluded(at), Bound::Unbounded))
-                    .next()
-                    .cloned(),
-            }
-        }
-
-        let was = self.at.take();
-        // One bucket lock answers the whole step whenever the list has not
-        // changed under the cursor, which is every step of an ordinary sweep.
-        {
-            let bucket = db.inner.scan_index.bucket(self.list).lock();
-            if was.is_none() || bucket.revision == self.revision {
-                self.revision = bucket.revision;
-                self.at = step(&bucket, was.as_ref());
-                return self.at.as_ref().map(|k| k.name.clone());
-            }
-        }
-
-        // The list did change, so the record may have moved within it and the
-        // key has to be rebuilt from its live PHAS, record type and load order
-        // — C's cursor repair. `live_scan_key` reads the records map and the
-        // record itself, so the bucket lock is released across it.
-        let was = was.expect("a cursor that is not standing took the branch above");
-        let live = db.live_scan_key(&was.name);
-        let bucket = db.inner.scan_index.bucket(self.list).lock();
+    /// The record last handed out may have moved WITHIN this list, its own
+    /// processing having changed its PHAS, so its key is rebuilt from live
+    /// state before the resume point is looked up. `live_scan_key` reads the
+    /// records map and the record itself, so no bucket lock is held across it.
+    fn resync(&mut self, db: &PvDatabase) {
+        let was = self.standing().cloned();
+        let live = was.as_ref().and_then(|w| db.live_scan_key(&w.name));
+        let (revision, snapshot) = db.inner.scan_index.bucket(self.list).snapshot();
         let resume = match live {
-            Some(k) if bucket.keys.contains(&k) => k,
+            // The rebuilt key is the resume point only if THIS list is where
+            // the record landed; one whose SCAN moved it to another list
+            // resumes the sweep from where it stood.
+            Some(k) if snapshot.binary_search(&k).is_ok() => Some(k),
             _ => was,
         };
-        self.revision = bucket.revision;
-        self.at = step(&bucket, Some(&resume));
-        self.at.as_ref().map(|k| k.name.clone())
+        // The next key strictly greater than the resume point — C's
+        // `ellNext`, and the same answer for a record that left the list as
+        // for one that is still in it.
+        self.next = resume.map_or(0, |r| snapshot.partition_point(|k| *k <= r));
+        self.revision = revision;
+        self.snapshot = Some(snapshot);
+    }
+
+    /// The next record still in the list, or `None` at its end: the name, and
+    /// the instance the list holds beside it (`None` only for a key whose
+    /// record has since been dropped).
+    ///
+    /// Takes no lock while the list is unchanged, and the bucket lock for the
+    /// re-find alone when it is — never across processing, as C releases
+    /// `psl->lock` around every `dbProcess`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<Arc<RecordCell>>)> {
+        let bucket = db.inner.scan_index.bucket(self.list);
+        if self.snapshot.is_none()
+            || bucket.revision.load(std::sync::atomic::Ordering::Acquire) != self.revision
+        {
+            self.resync(db);
+        }
+        let key = self.snapshot.as_ref()?.get(self.next)?;
+        self.next += 1;
+        Some((&key.name, key.handle.upgrade()))
     }
 }
 
@@ -607,6 +693,28 @@ mod tests {
     use super::PvDatabase;
     use super::normalize_event_name;
     use crate::server::record::ScanType;
+
+    /// The cycle guard belongs to the frame that inserted it, and a frame
+    /// that does not run must not insert one. The set is ONE per sweep
+    /// (`scan_list_once`), so a marker left behind by a name that is no
+    /// longer in the database reads as "already on this stack" for every
+    /// later entry in that sweep — silencing every forward link onto it.
+    #[test]
+    fn a_frame_that_finds_no_record_leaves_no_cycle_marker() {
+        let db = PvDatabase::new();
+        let mut visited = crate::server::database::ProcStack::new();
+
+        let result = db.process_record_with_links_sync("NO:SUCH:RECORD", &mut visited);
+
+        assert!(
+            result.is_err(),
+            "a name the database does not hold is an error"
+        );
+        assert!(
+            visited.is_empty(),
+            "the frame left its cycle marker behind: {visited:?}"
+        );
+    }
 
     /// The ordering rule, stated as the thing that must hold rather than as
     /// the record shape that once broke it: **`update_scan_index` takes L46
@@ -684,7 +792,13 @@ mod tests {
     fn every_scan_bucket_transition_moves_the_revision() {
         let db = PvDatabase::new();
         let list = ScanType::SEC01.scan_list().expect("1 second names a list");
-        let revision = || db.inner.scan_index.bucket(list).lock().revision;
+        let revision = || {
+            db.inner
+                .scan_index
+                .bucket(list)
+                .revision
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
 
         let empty = revision();
         db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "R:ONE");

@@ -12,8 +12,6 @@
 //! `init_record`'s own seed (C `:126`), and the two cycles C reaches
 //! `conditional_write` on but the port used to skip.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -55,7 +53,7 @@ async fn a_suppressed_cycle_still_latches_pval_so_the_transition_fires() {
     let db = build().await;
 
     db.put_pv("TOZERO", EpicsValue::Long(5)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TOZERO", &mut visited)
         .await
         .unwrap();
@@ -71,7 +69,7 @@ async fn a_suppressed_cycle_still_latches_pval_so_the_transition_fires() {
     );
 
     db.put_pv("TOZERO", EpicsValue::Long(0)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TOZERO", &mut visited)
         .await
         .unwrap();
@@ -88,7 +86,7 @@ async fn transition_to_non_zero_fires_after_a_suppressed_zero_cycle() {
     let db = build().await;
 
     db.put_pv("TONONZERO", EpicsValue::Long(0)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TONONZERO", &mut visited)
         .await
         .unwrap();
@@ -99,7 +97,7 @@ async fn transition_to_non_zero_fires_after_a_suppressed_zero_cycle() {
     );
 
     db.put_pv("TONONZERO", EpicsValue::Long(3)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TONONZERO", &mut visited)
         .await
         .unwrap();

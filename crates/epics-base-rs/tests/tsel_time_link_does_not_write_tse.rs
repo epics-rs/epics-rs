@@ -21,7 +21,7 @@
 //! The third row is the control: a `TSEL` that is not `.TIME` IS loaded into
 //! `TSE` (`recGbl.c:322`, `dbGetLink(..., &prec->tse, ...)`), and both agree.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -64,7 +64,7 @@ async fn a_time_tsel_leaves_the_declared_tse_alone() {
     }
 
     for rec in ["TSEW_UNDEC", "TSEW_FIVE"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(rec, &mut visited)
             .await
             .unwrap();

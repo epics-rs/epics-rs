@@ -55,8 +55,6 @@
 //! | lnkCalc, asLib ASG | 21           | both allocate `CALCPERFORM_NARGS`     |
 //! | swait              | **12**       | `swaitRecord.c:409` `&pwait->a` = A..L |
 
-use std::collections::HashSet;
-
 use epics_base_rs::calc::{
     ArrayInputs, ArrayStackValue, CALC_NARGS, NumericInputs, ScalcString, StackValue, StringInputs,
     acalc, calc, scalc,
@@ -354,7 +352,7 @@ record(swait, "W:L") {
         .unwrap();
 
     let process = async |name: &str| {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();

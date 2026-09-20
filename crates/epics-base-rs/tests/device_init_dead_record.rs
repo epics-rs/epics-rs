@@ -30,7 +30,7 @@
 //! record kept processing with PACT=0 and drivers worked around it with an
 //! inert `read()`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -116,7 +116,7 @@ fn field(db: &Arc<PvDatabase>, rec: &str, name: &str) -> EpicsValue {
 }
 
 async fn process(db: &Arc<PvDatabase>, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

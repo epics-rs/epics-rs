@@ -17,7 +17,7 @@
 //! not reproduce them: it would silently define a record whose dset said
 //! nothing. Each arm below is one boundary of that pair, not one story.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
@@ -96,7 +96,7 @@ async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, A
         1,
         "a bare record starts undefined, or the arm below proves nothing"
     );
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     database
         .process_record_with_links(REC, &mut visited)
         .await

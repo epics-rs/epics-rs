@@ -15,8 +15,6 @@
 //! `INP : CA_LINK src.[2] NPP NMS`, `STAT: LINK`, `SEVR: INVALID`, `UDF: 1`
 //! and `dbcar` reporting one CA link, none connected.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -54,7 +52,7 @@ async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> 
 }
 
 async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

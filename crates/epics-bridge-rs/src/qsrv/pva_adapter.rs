@@ -932,7 +932,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 )));
             }
             let cn = epics_base_rs::server::database::filters::parse_channel_name(&name);
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             provider
                 .database()
                 .process_record_with_links(&cn.record, &mut visited)

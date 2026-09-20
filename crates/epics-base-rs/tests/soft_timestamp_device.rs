@@ -6,7 +6,7 @@
 //! before `is_soft_dtyp` stopped classifying "Soft Timestamp" as a soft
 //! channel).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -37,7 +37,7 @@ record(ai, "TS_AI") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_AI", &mut visited)
         .await
         .unwrap();
@@ -72,7 +72,7 @@ record(stringin, "TS_SI") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_SI", &mut visited)
         .await
         .unwrap();

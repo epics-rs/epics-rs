@@ -210,7 +210,7 @@ pub struct CalcoutRecord {
     // in `check_alarms`. The OUT link is a common field, not a calcout-owned
     // field, so this is the only in-record path to observe it for OUTV
     // classification (see `check_alarms`).
-    out: String,
+    out: crate::server::record::SparseText,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
     async_ctx: Option<(String, AsyncDbHandle)>,
@@ -325,7 +325,7 @@ impl Default for CalcoutRecord {
             // async context exists.
             in_status: [LINK_CON; 21],
             out_status: LINK_CON,
-            out: String::new(),
+            out: crate::server::record::SparseText::default(),
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
         }
@@ -543,7 +543,7 @@ impl CalcoutRecord {
             .enumerate()
             .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
             .collect();
-        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        links.push(("OUTV", self.out.as_str().to_owned(), LinkRole::Output));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),
@@ -1335,6 +1335,35 @@ impl Record for CalcoutRecord {
         self.multi_input_links()
     }
 
+    /// The 21 `INPA..INPU` texts read straight off the record's own fields, not
+    /// through the default body's 21 name matches on `link_text_ref`.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&[
+            self.inpa.as_str(),
+            self.inpb.as_str(),
+            self.inpc.as_str(),
+            self.inpd.as_str(),
+            self.inpe.as_str(),
+            self.inpf.as_str(),
+            self.inpg.as_str(),
+            self.inph.as_str(),
+            self.inpi.as_str(),
+            self.inpj.as_str(),
+            self.inpk.as_str(),
+            self.inpl.as_str(),
+            self.inpm.as_str(),
+            self.inpn.as_str(),
+            self.inpo.as_str(),
+            self.inpp.as_str(),
+            self.inpq.as_str(),
+            self.inpr.as_str(),
+            self.inps.as_str(),
+            self.inpt.as_str(),
+            self.inpu.as_str(),
+        ])
+    }
+
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
@@ -1424,7 +1453,7 @@ impl Record for CalcoutRecord {
         // `set_async_context` (which ran before the common fields were
         // applied), so capture it here, once the framework has resolved it,
         // and classify so a passive never-processed record already shows OUTV.
-        self.out = common.out.clone();
+        self.out.set(&common.out);
         self.refresh_link_status();
     }
 
@@ -1500,7 +1529,7 @@ impl Record for CalcoutRecord {
         // `init_record`/`checkLinks` OUT classification on any link change
         // (calcoutRecord.c:160-189). Only re-classify when OUT actually moved.
         if self.out != common.out {
-            self.out = common.out.clone();
+            self.out.set(&common.out);
             self.refresh_link_status();
         }
 

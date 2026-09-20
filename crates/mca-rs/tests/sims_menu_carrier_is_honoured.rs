@@ -43,7 +43,7 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::db_loader::{apply_fields, create_record, parse_db};
@@ -109,7 +109,7 @@ async fn simulate(db: &PvDatabase, name: &str) {
     db.put_pv(&format!("{name}.SIMM"), EpicsValue::Short(1))
         .await
         .unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
 

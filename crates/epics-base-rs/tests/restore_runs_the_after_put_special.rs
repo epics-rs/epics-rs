@@ -41,7 +41,7 @@
 //! RPCL), the registry half (SNAM -> subroutine), and the status the after
 //! pass returns (unregistered SNAM -> Err).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -60,7 +60,7 @@ fn writes_val(marker: f64) -> Arc<SubroutineFn> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

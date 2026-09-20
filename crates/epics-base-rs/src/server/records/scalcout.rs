@@ -1237,6 +1237,15 @@ impl Record for ScalcoutRecord {
         self.multi_input_links()
     }
 
+    /// The `INPA..INPL` texts read straight off the record's own array, not
+    /// through the default body's one name match per link. The `INAA..INLL`
+    /// string inputs are a separate declaration (`string_input_links`) and are
+    /// not slots of this list.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_links)
+    }
+
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
@@ -1379,6 +1388,10 @@ impl Record for ScalcoutRecord {
         if link_field == "OUT" {
             self.out_target = target;
         }
+    }
+
+    fn declares_multi_output_links(&self) -> bool {
+        true
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {

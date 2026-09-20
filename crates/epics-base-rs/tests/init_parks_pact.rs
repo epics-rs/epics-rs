@@ -76,7 +76,7 @@ async fn r21_a_parked_sub_never_runs_record_support() {
         .await
         .unwrap();
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("SUB_DEAD", &mut visited).await;
 
     assert_eq!(

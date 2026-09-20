@@ -13,6 +13,7 @@ mod process_passive;
 pub(crate) mod record_instance;
 mod record_trait;
 mod scan;
+mod sparse_text;
 
 // Re-export all public types so existing imports continue to work.
 pub use crate::server::recgbl::EventMask;
@@ -44,18 +45,19 @@ pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;
 pub use record_instance::{
     AlarmAck, AmbientWriteOriginScope, DeferredNotify, DeferredNotifyPut, NotifyWaitSet, PactExit,
-    ProcessCompletion, RecordInstance, ambient_write_origin_scope,
+    ProcessCompletion, RecordCell, RecordInstance, ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{ambient_write_origin, value_as_dbr_string};
+pub(crate) use record_trait::value_gate;
 pub use record_trait::{
-    ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
-    DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc,
-    FieldMetadataOverride, InputFetchPolicy, LinkReadAs, OutTarget, ProcessAction, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special,
-    SubroutineFn, ValuePostGate, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
-    link_value_in_field_shape, put_field_internal_default, put_value_in_field_shape,
-    seed_input_links,
+    AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink,
+    CyclePostMask, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration,
+    FieldDesc, FieldMetadataOverride, InputFetchPolicy, InputLinkRequest, LinkReadAs,
+    MonitorDeadbandCells, OutTarget, ProcessAction, ProcessContext, ProcessOutcome,
+    ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special, SubroutineFn,
+    ValuePostGate, arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field,
+    coerce_put_value, dbput_coerce_value, input_link_slots_of, link_value_in_field_shape,
+    put_field_internal_default, put_value_in_field_shape, seed_input_links,
 };
-pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanList, ScanType, SimModeScan};
+pub use sparse_text::SparseText;

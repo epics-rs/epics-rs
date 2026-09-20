@@ -18,7 +18,6 @@
 //! land between `process()` and the drain. `dbGetField` and this sample answer
 //! from the same `get_field("BUSY")`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -108,7 +107,7 @@ async fn busy_is_still_set_while_the_step_write_is_being_made() {
         .unwrap();
     db.add_record("SS_ORD", Box::new(sseq)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SS_ORD", &mut visited)
         .await
         .unwrap();

@@ -18,8 +18,6 @@
 //! The port gave VAL the framework default `DBE_VALUE | DBE_LOG`, so a
 //! `DBE_LOG`-only archiver was sent the event name on every process.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -38,7 +36,7 @@ async fn subscribe_val(db: &PvDatabase, rec: &str, dbf: DbFieldType) -> EventRea
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

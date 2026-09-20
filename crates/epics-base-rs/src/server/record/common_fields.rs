@@ -2,6 +2,7 @@ use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::scan::{ScanType, SimModeScan};
+use super::sparse_text::SparseText;
 use crate::types::PvString;
 
 /// Common fields shared by all records.
@@ -14,13 +15,13 @@ pub struct CommonFields {
     /// records may attach a human-readable explanation alongside
     /// `stat`/`sevr`. Empty means "no message". Transferred from
     /// `namsg` by `rec_gbl_reset_alarms`.
-    pub amsg: String,
+    pub amsg: SparseText,
     // New alarm state (pending, transferred by rec_gbl_reset_alarms)
     pub nsev: AlarmSeverity,
     pub nsta: u16,
     /// Pending alarm message — set during process(), transferred to
     /// `amsg` by `rec_gbl_reset_alarms` (epics-base PR #566).
-    pub namsg: String,
+    pub namsg: SparseText,
     // Alarm acknowledgement
     pub acks: AlarmSeverity,
     pub ackt: bool,
@@ -73,7 +74,9 @@ pub struct CommonFields {
     pub inp: String,
     pub out: String,
     // Device
-    pub dtyp: String,
+    /// `DTYP` and the soft-channel class it names, taken together — see
+    /// [`Dtyp`](crate::server::device_support::Dtyp).
+    pub dtyp: crate::server::device_support::Dtyp,
     // Timestamp
     pub time: SystemTime,
     pub tse: i16,
@@ -172,7 +175,7 @@ impl CommonFields {
     /// Build a [`ProcessContext`](super::record_trait::ProcessContext)
     /// snapshot of the framework-owned state a record's `process()` or
     /// device support's `read()` needs to observe during the cycle.
-    pub fn process_context(&self) -> super::record_trait::ProcessContext {
+    pub fn process_context(&self) -> super::record_trait::ProcessContext<'_> {
         super::record_trait::ProcessContext {
             udf: self.udf != 0,
             udfs: AlarmSeverity::from_u16(self.udfs as u16),
@@ -180,8 +183,7 @@ impl CommonFields {
             phas: self.phas,
             tse: self.tse,
             time: self.time,
-            tsel: self.tsel.clone(),
-            dtyp: self.dtyp.clone(),
+            dtyp: self.dtyp.as_str(),
             callback_priority: self.callback_priority(),
         }
     }
@@ -204,10 +206,10 @@ impl Default for CommonFields {
             // (`RecordInstance::run_init_passes`, C `iocInit.c:521-523`), which
             // keys off exactly this STAT value.
             stat: crate::server::recgbl::alarm_status::UDF_ALARM,
-            amsg: String::new(),
+            amsg: SparseText::default(),
             nsev: AlarmSeverity::NoAlarm,
             nsta: 0,
-            namsg: String::new(),
+            namsg: SparseText::default(),
             acks: AlarmSeverity::NoAlarm,
             ackt: true,
             udf: 1,
@@ -225,7 +227,7 @@ impl Default for CommonFields {
             flnk: String::new(),
             inp: String::new(),
             out: String::new(),
-            dtyp: String::new(),
+            dtyp: crate::server::device_support::Dtyp::default(),
             // An `epicsTimeStamp {0,0}` — C's never-processed `dbCommon.time`
             // — is the EPICS epoch, not the Unix epoch. Seeding this with
             // `UNIX_EPOCH` made a never-processed record publish

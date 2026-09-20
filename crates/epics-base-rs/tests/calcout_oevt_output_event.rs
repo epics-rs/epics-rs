@@ -14,7 +14,6 @@
 //! because the OUT write and its event are both suppressed (C execOutput
 //! `nsev >= INVALID` → `break`, no `postEvent`).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -103,7 +102,7 @@ async fn calcout_oevt_posts_string_event_on_output() {
     // oopt default 0 = Every_Time → output is due. No OUT link configured.
     db.add_record("CALC_OEVT", Box::new(c)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_OEVT", &mut v)
         .await
         .unwrap();
@@ -134,7 +133,7 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
         .unwrap();
     db.add_record("CALC_DD", Box::new(c)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_DD", &mut v)
         .await
         .unwrap();
@@ -179,7 +178,7 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
     s.oopt = 0; // Every_Time → output is due.
     db.add_record("S_OEVT", Box::new(s)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("S_OEVT", &mut v)
         .await
         .unwrap();
@@ -206,7 +205,7 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
     a.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("A_OEVT", Box::new(a)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("A_OEVT", &mut v)
         .await
         .unwrap();
@@ -236,7 +235,7 @@ async fn swait_oevt_posts_numeric_event_on_output() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("W_OEVT", Box::new(w)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W_OEVT", &mut v)
         .await
         .unwrap();

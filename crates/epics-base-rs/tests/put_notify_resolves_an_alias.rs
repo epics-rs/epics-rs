@@ -129,7 +129,7 @@ async fn a_parked_notify_replays_when_the_release_arrives_by_alias() {
 
     // The release runs no cycle of its own (SNAM is not `pp(TRUE)`), so drive
     // one — by ALIAS, which is the entry under test.
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db
         .process_record_with_links("PARKED:NICK", &mut visited)
         .await;

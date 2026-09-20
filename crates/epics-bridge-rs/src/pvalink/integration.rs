@@ -454,7 +454,7 @@ impl PvaLinkResolver {
             return;
         };
         if scan_target_should_process(&db_handle, record, passive_only) {
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             let _ = db_handle
                 .process_record_with_links(record, &mut visited)
                 .await;
@@ -1170,7 +1170,7 @@ async fn scan_once(
             // `_already_locked` entry; processing it via the
             // gate-acquiring `process_record_with_links` would dead-lock
             // the epoch against itself.
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             let _ = db_handle.process_record_with_links_already_locked(record, &mut visited);
         }
     }
@@ -1186,7 +1186,7 @@ async fn scan_once(
         if !scan_target_should_process(&db_handle, record, *passive_only) {
             continue;
         }
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         let _ = db_handle
             .process_record_with_links(record, &mut visited)
             .await;

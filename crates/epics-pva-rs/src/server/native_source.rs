@@ -827,7 +827,7 @@ async fn channel_snapshot(
 /// `special(SPC_DBADDR)` field and its value's own count is the answer by
 /// construction.
 fn record_channel_shape(
-    rec: &std::sync::Arc<parking_lot::RwLock<epics_base_rs::server::record::RecordInstance>>,
+    rec: &std::sync::Arc<epics_base_rs::server::record::RecordCell>,
     field: &str,
 ) -> ChannelShape {
     ChannelShape::of_record_channel(&rec.read(), field)
@@ -1182,7 +1182,7 @@ impl ChannelSource for PvDatabaseSource {
                 Some(PvEntry::Record(_)) => {
                     // PROCESS targets the whole record, not a field, so it
                     // runs on the resolved record name.
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     db.process_record_with_links(&cn.record, &mut visited)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))

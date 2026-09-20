@@ -26,8 +26,6 @@
 //! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving the same
 //! record definitions over CA.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -69,7 +67,7 @@ async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> 
 }
 
 async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

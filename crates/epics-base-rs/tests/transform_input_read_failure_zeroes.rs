@@ -14,8 +14,6 @@
 //! disconnected INPx source re-drove its OUTx with the last good value where C
 //! drives 0.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -42,7 +40,7 @@ async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     tr.put_field("B", EpicsValue::Double(7.0)).unwrap();
     db.add_record("TR", Box::new(tr)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TR", &mut v).await.unwrap();
 
     let inst = db.get_record("TR").unwrap();

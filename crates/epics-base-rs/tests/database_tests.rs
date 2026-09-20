@@ -45,7 +45,7 @@ async fn test_write_notify_follows_flnk() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC_A", &mut visited)
         .await
         .unwrap();
@@ -69,7 +69,7 @@ async fn test_inp_link_processing() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
@@ -106,7 +106,7 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BROKEN", &mut visited)
         .await
         .unwrap();
@@ -159,7 +159,7 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
         let mut inst = rec.write();
         inst.common.stat = alarm_status::HIHI_ALARM;
         inst.common.sevr = AlarmSeverity::Major;
-        inst.common.amsg = "src-msg".to_string();
+        inst.common.amsg = "src-msg".into();
     }
 
     if let Some(rec) = db.get_record("DST") {
@@ -169,7 +169,7 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
         inst.common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST", &mut visited)
         .await
         .unwrap();
@@ -211,7 +211,7 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
         let mut inst = rec.write();
         inst.common.stat = alarm_status::HIHI_ALARM;
         inst.common.sevr = AlarmSeverity::Major;
-        inst.common.amsg = "src-major".to_string();
+        inst.common.amsg = "src-major".into();
     }
 
     if let Some(rec) = db.get_record("DST") {
@@ -221,7 +221,7 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
         inst.common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST", &mut visited)
         .await
         .unwrap();
@@ -282,7 +282,7 @@ async fn test_out_link_ms_propagates_link_alarm_to_dest() {
         rec.write().common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -339,7 +339,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
         rec.write().common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
         inst.common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PVADST", &mut visited)
         .await
         .unwrap();
@@ -459,7 +459,7 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
         inst.common.udf = 0;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PVAQUIET", &mut visited)
         .await
         .unwrap();
@@ -560,7 +560,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_PVAOUT", &mut visited)
         .await
         .unwrap();
@@ -613,7 +613,7 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     // Must not panic; process completes cleanly.
     db.process_record_with_links("AO_NOLSET", &mut visited)
         .await
@@ -673,7 +673,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
             .expect("the record is free, so the wait-set installs");
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited)
         .await
         .unwrap();
@@ -732,7 +732,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
         let mut inst = rec.write();
         inst.common.stat = alarm_status::HIHI_ALARM;
         inst.common.sevr = AlarmSeverity::Major;
-        inst.common.amsg = "msg1".to_string();
+        inst.common.amsg = "msg1".into();
     }
     // Dest: MSS link to source. Subscribe to AMSG with ALARM mask
     // (C posts AMSG with stat_mask = DBE_ALARM on amsg-only change).
@@ -744,7 +744,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     }
 
     // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST_AMSG", &mut visited)
         .await
         .unwrap();
@@ -761,12 +761,12 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     // Source: keep severity Major, change amsg only.
     if let Some(rec) = db.get_record("SRC_AMSG") {
         let mut inst = rec.write();
-        inst.common.amsg = "msg2".to_string();
+        inst.common.amsg = "msg2".into();
     }
 
     // Cycle 2: dest picks up msg2. sevr stays Major (alarm_changed=false),
     // amsg "msg1"→"msg2" (amsg_changed=true). AMSG event must flow.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST_AMSG", &mut visited)
         .await
         .unwrap();
@@ -818,7 +818,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
         let mut inst = rec.write();
         inst.common.stat = alarm_status::HIHI_ALARM;
         inst.common.sevr = AlarmSeverity::Major;
-        inst.common.amsg = "msg1".to_string();
+        inst.common.amsg = "msg1".into();
     }
     // Dest: MSS link to source.
     if let Some(rec) = db.get_record("DST_MASK") {
@@ -841,7 +841,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
     .expect("VAL subscription must be accepted");
 
     // Cycle 1: value 0→7 (MDEL/ADEL fire) and sevr 0→Major in one pass.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST_MASK", &mut visited)
         .await
         .unwrap();
@@ -866,10 +866,10 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
     // Source: keep severity Major, change amsg only.
     if let Some(rec) = db.get_record("SRC_MASK") {
         let mut inst = rec.write();
-        inst.common.amsg = "msg2".to_string();
+        inst.common.amsg = "msg2".into();
     }
     // Cycle 2: value unchanged (deadband silent), amsg-only alarm update.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DST_MASK", &mut visited)
         .await
         .unwrap();
@@ -954,7 +954,7 @@ async fn test_process_cycle_posts_no_udf_event() {
         let mut inst = rec.write();
         inst.common.udf = 1;
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("UDF_REC", &mut visited)
         .await
         .unwrap();
@@ -1166,7 +1166,7 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
 
     // Drive SRC's process directly. The CP dispatch enumerates TGT
     // and would (pre-fix) set TGT.common.putf=true before processing.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -1319,7 +1319,7 @@ async fn test_simm_raw_input_runs_conversion_chain() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AI:SIMRAW", &mut visited)
         .await
         .unwrap();
@@ -1370,7 +1370,7 @@ async fn test_cycle_detection() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CYCLE_A", &mut visited)
         .await
         .unwrap();
@@ -1426,7 +1426,7 @@ async fn test_ao_omsl_dol() {
     ao.dol = "SOURCE".to_string();
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
@@ -1456,7 +1456,7 @@ async fn test_ao_oif_incremental() {
     ao.init_record(0).unwrap();
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
@@ -1490,7 +1490,7 @@ async fn test_ao_ivoa_dont_drive() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
@@ -1577,7 +1577,7 @@ async fn test_ao_ivoa_set_to_ivov_writes_oval() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -1611,7 +1611,7 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
         inst.common.nsta = epics_base_rs::server::recgbl::alarm_status::SOFT_ALARM;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BO_SRC", &mut visited)
         .await
         .unwrap();
@@ -1660,7 +1660,7 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_SRC", &mut visited)
         .await
         .unwrap();
@@ -1689,7 +1689,7 @@ async fn test_sim_mode_input() {
     ai.sims = 1;
     db.add_record("SIM_AI", Box::new(ai)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI", &mut visited)
         .await
         .unwrap();
@@ -1736,7 +1736,7 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI2", &mut visited)
         .await
         .unwrap();
@@ -1780,7 +1780,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
     db.add_record("SIM_AI3", Box::new(ai)).await.unwrap();
 
     // Cycle 1 commits the NO_ALARM -> MINOR/SIMM transition and VAL=42.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI3", &mut visited)
         .await
         .unwrap();
@@ -1812,7 +1812,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
     };
 
     // Cycle 2: same SIOL value, same alarm state — nothing posts.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI3", &mut visited)
         .await
         .unwrap();
@@ -1871,7 +1871,7 @@ async fn test_sim_alarm_transition_posts_per_field_masks() {
         (v, a, s)
     };
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI4", &mut visited)
         .await
         .unwrap();
@@ -1916,7 +1916,7 @@ async fn test_sim_val_respects_mdel_deadband() {
     db.add_record("SIM_AI5", Box::new(ai)).await.unwrap();
 
     // Cycle 1: VAL 0 -> 42 crosses MDEL, posts, MLST=42.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
@@ -1932,7 +1932,7 @@ async fn test_sim_val_respects_mdel_deadband() {
     db.put_pv("SIM_VAL5", EpicsValue::Double(42.2))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
@@ -1945,7 +1945,7 @@ async fn test_sim_val_respects_mdel_deadband() {
     db.put_pv("SIM_VAL5", EpicsValue::Double(43.0))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
@@ -1979,7 +1979,7 @@ async fn test_sim_mode_toggle() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST_AI", &mut visited)
         .await
         .unwrap();
@@ -1990,7 +1990,7 @@ async fn test_sim_mode_toggle() {
     }
 
     db.put_pv("SIM_SW", EpicsValue::Double(1.0)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST_AI", &mut visited)
         .await
         .unwrap();
@@ -2016,7 +2016,7 @@ async fn test_sim_mode_output() {
     ao.siol = "SIM_OUT".to_string();
     db.add_record("TEST_AO", Box::new(ao)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST_AO", &mut visited)
         .await
         .unwrap();
@@ -2069,7 +2069,7 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     ai.sims = 1;
     db.add_record("SIM_AI_NL", Box::new(ai)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI_NL", &mut visited)
         .await
         .unwrap();
@@ -2112,7 +2112,7 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
     ao.siol = "REMOTE:OUT".to_string();
     db.add_record("TEST_AO_NL", Box::new(ao)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST_AO_NL", &mut visited)
         .await
         .unwrap();
@@ -2161,7 +2161,7 @@ async fn test_sdis_disable_skips_process() {
         inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
@@ -2179,7 +2179,7 @@ async fn test_sdis_disable_skips_process() {
     db.put_pv("DISABLE_SW", EpicsValue::Double(0.0))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
@@ -2222,7 +2222,7 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
             .unwrap();
         inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
@@ -2249,7 +2249,7 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
         inst.put_common_field("SDIS", EpicsValue::String("SRC.VAL".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
@@ -2551,7 +2551,7 @@ async fn test_ca_put_no_double_device_write() {
     let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
     if let Some(rec) = db.get_record("AO_REC") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.device = Some(Box::new(mock));
     }
     db.put_record_field_from_ca("AO_REC", "VAL", EpicsValue::Double(42.0))
@@ -2577,10 +2577,10 @@ async fn test_readback_cycle_runs_device_write_without_callback_contract() {
     let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
     if let Some(rec) = db.get_record("AO_CB1") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.device = Some(Box::new(mock));
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("AO_CB1", &mut visited)
         .await
         .unwrap();
@@ -2608,10 +2608,10 @@ async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
         .with_callback_readback();
     if let Some(rec) = db.get_record("AO_CB2") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.device = Some(Box::new(mock));
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("AO_CB2", &mut visited)
         .await
         .unwrap();
@@ -2645,14 +2645,14 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
         .unwrap();
     if let Some(rec) = db.get_record("BI_RAW") {
         let mut inst = rec.write();
-        inst.common.dtyp = "Raw Soft Channel".to_string();
+        inst.common.dtyp = "Raw Soft Channel".into();
         inst.common.inp = "SRC_LI".to_string();
         inst.parsed_inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
         inst.record
             .put_field("MASK", EpicsValue::Long(0x0F))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BI_RAW", &mut visited)
         .await
         .unwrap();
@@ -2685,10 +2685,10 @@ async fn test_input_record_no_device_write() {
     let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
     if let Some(rec) = db.get_record("AI_REC") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.device = Some(Box::new(mock));
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AI_REC", &mut visited)
         .await
         .unwrap();
@@ -2737,10 +2737,10 @@ async fn test_device_support_utag_adopted_into_common() {
         .unwrap();
     if let Some(rec) = db.get_record("AI_UTAG") {
         let mut inst = rec.write();
-        inst.common.dtyp = "UtagDev".to_string();
+        inst.common.dtyp = "UtagDev".into();
         inst.device = Some(Box::new(UtagDeviceSupport { utag: 0x9000_0000 }));
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AI_UTAG", &mut visited)
         .await
         .unwrap();
@@ -2768,7 +2768,7 @@ async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
     if let Some(rec) = db.get_record("AO_NP") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.common.scan = ScanType::SEC1;
         inst.device = Some(Box::new(mock));
     }
@@ -2782,7 +2782,7 @@ async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     );
 
     // The periodic scan processes the record and writes the new VAL.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_NP", &mut visited)
         .await
         .unwrap();
@@ -2804,7 +2804,7 @@ async fn test_proc_triggers_device_write() {
     let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
     if let Some(rec) = db.get_record("AO_PROC") {
         let mut inst = rec.write();
-        inst.common.dtyp = "MockDev".to_string();
+        inst.common.dtyp = "MockDev".into();
         inst.device = Some(Box::new(mock));
     }
     db.put_record_field_from_ca("AO_PROC", "PROC", EpicsValue::Char(1))
@@ -3090,7 +3090,7 @@ async fn test_async_pending_skips_post_process() {
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC", &mut visited)
         .await
         .unwrap();
@@ -3117,7 +3117,7 @@ async fn test_complete_async_record() {
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC", &mut visited)
         .await
         .unwrap();
@@ -3206,7 +3206,7 @@ async fn test_complete_async_posts_sevr_with_per_field_mask() {
     }
 
     // First cycle: record reports async_pending (PACT set).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_SEVR", &mut visited)
         .await
         .unwrap();
@@ -3283,7 +3283,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     }
 
     // Drive ASYNC_PACT into PACT=true (async pending, lock released).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_PACT", &mut visited)
         .await
         .unwrap();
@@ -3300,7 +3300,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
 
     // Up to MAX_LOCK = 10 re-entries while PACT=true must NOT raise alarm.
     for i in 1..=10 {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("ASYNC_PACT", &mut visited)
             .await
             .unwrap();
@@ -3317,7 +3317,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
 
     // 11th attempt while pact (lcnt==10 before increment >= MAX_LOCK)
     // must raise SCAN_ALARM/INVALID and post VAL monitor.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_PACT", &mut visited)
         .await
         .unwrap();
@@ -3356,7 +3356,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     }
 
     // Cycle 1: drive into PACT.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_TPRO", &mut visited)
         .await
         .unwrap();
@@ -3374,7 +3374,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
     // is emitted as a side effect (eprintln) but the bail outcome
     // matches the non-TPRO case (verified by the silent-bail test).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_TPRO", &mut visited)
         .await
         .unwrap();
@@ -3398,12 +3398,12 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
         .unwrap();
 
     // Cycle 1: kick off async, accumulate lcnt via re-entries.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_RESET", &mut visited)
         .await
         .unwrap();
     for _ in 0..3 {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("ASYNC_RESET", &mut visited)
             .await
             .unwrap();
@@ -3418,7 +3418,7 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
 
     // Next process_record_with_links should reset lcnt (path: enters
     // body since PACT is now false).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_RESET", &mut visited)
         .await
         .unwrap();
@@ -3489,7 +3489,7 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
             let mut inst = rec.write();
             inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
         }
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("CPB_SRC", &mut visited)
             .await
             .unwrap();
@@ -3643,7 +3643,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     .unwrap();
 
     // First process: returns AsyncPending + ReprocessAfter(20ms).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
@@ -3661,7 +3661,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // A foreign caller during the wait must hit the entry guard (bail
     // silently) — proves the guard still protects against FLNK/scan
     // dual-fire while the continuation timer is pending.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
@@ -3712,7 +3712,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // A foreign caller after the continuation completed must actually
     // run `process()` again — proving the PACT entry guard no longer
     // fires (it would if `processing` had leaked true).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
@@ -3910,7 +3910,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
         inst.common.putf = true;
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DIS_TGT", &mut visited)
         .await
         .unwrap();
@@ -3959,7 +3959,7 @@ async fn test_sdis_disable_fires_put_notify_completion() {
             .expect("the record is free, so the wait-set installs");
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DIS_NOT_TGT", &mut visited)
         .await
         .unwrap();
@@ -4423,7 +4423,7 @@ async fn test_sdis_disable_notifies_alarm() {
         )
         .expect("subscribe should not be capped at default")
     };
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
@@ -4440,7 +4440,7 @@ async fn test_udf_cleared_by_process_with_links() {
         .unwrap();
     let rec = db.get_record("REC").unwrap();
     assert!(rec.read().common.udf != 0);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
@@ -4539,7 +4539,7 @@ async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
         .unwrap();
     // Process once so VAL is committed and UDF is clear — the baseline the
     // empty put must not disturb.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("EMPTYPUT", &mut visited)
         .await
         .unwrap();
@@ -4711,7 +4711,7 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LNKAI", &mut visited)
         .await
         .unwrap();
@@ -4996,7 +4996,7 @@ async fn test_ao_asyn_readback_clears_udf_via_framework() {
         g.record.set_device_did_compute(true);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
@@ -5055,7 +5055,7 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
         .unwrap();
     let rec = db.get_record("REC").unwrap();
     assert!(rec.read().common.udf != 0);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
@@ -5103,7 +5103,7 @@ async fn test_constant_inp_link() {
     db.put_pv("AI_CONST", EpicsValue::Double(7.0))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AI_CONST", &mut visited)
         .await
         .unwrap();
@@ -5127,10 +5127,10 @@ async fn test_calc_multi_input_db_links() {
         .await
         .unwrap();
     let mut calc = CalcRecord::new("A+B");
-    calc.inpa = "SRC_A".to_string();
-    calc.inpb = "SRC_B".to_string();
+    calc.set_inp_link(0, "SRC_A");
+    calc.set_inp_link(1, "SRC_B");
     db.add_record("CALC_REC", Box::new(calc)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_REC", &mut visited)
         .await
         .unwrap();
@@ -5161,10 +5161,10 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
 
     // DST: INPA = "PP_SRC PP" (process-passive). CALC="A" copies INPA.
     let mut dst = CalcRecord::new("A");
-    dst.inpa = "PP_SRC PP".to_string();
+    dst.set_inp_link(0, "PP_SRC PP");
     db.add_record("PP_DST", Box::new(dst)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PP_DST", &mut visited)
         .await
         .unwrap();
@@ -5208,7 +5208,7 @@ async fn process_record_fetches_input_links() {
 
     // DST_F: CALC="A+1", INPA="SRC_F" (NPP — read the current source value).
     let mut dst = CalcRecord::new("A+1");
-    dst.inpa = "SRC_F".to_string();
+    dst.set_inp_link(0, "SRC_F");
     db.add_record("DST_F", Box::new(dst)).await.unwrap();
 
     // Direct process via the public API. A=10 must be fetched from SRC_F,
@@ -5237,10 +5237,10 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
     db.add_record("NPP_SRC", Box::new(src)).await.unwrap();
 
     let mut dst = CalcRecord::new("A");
-    dst.inpa = "NPP_SRC NPP".to_string();
+    dst.set_inp_link(0, "NPP_SRC NPP");
     db.add_record("NPP_DST", Box::new(dst)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("NPP_DST", &mut visited)
         .await
         .unwrap();
@@ -5274,7 +5274,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     // legal and the old 4-character cap is gone (dbCommon has `OLDSIMM`).
     assert_eq!(
         epics_base_rs::server::record::parse_link_v2("DIRECT.B0 NPP MS"),
-        ParsedLink::Db(DbLink::new(
+        ParsedLink::db(DbLink::new(
             "DIRECT.B0",
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::Maximize,
@@ -5322,7 +5322,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SINK", &mut visited)
         .await
         .unwrap();
@@ -5363,10 +5363,10 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
 
     let mut dst = CalcRecord::new("A");
     // No modifier — must default to NPP, NOT ProcessPassive.
-    dst.inpa = "BARE_SRC".to_string();
+    dst.set_inp_link(0, "BARE_SRC");
     db.add_record("BARE_DST", Box::new(dst)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BARE_DST", &mut visited)
         .await
         .unwrap();
@@ -5417,16 +5417,16 @@ async fn test_calc_pp_link_cycle_terminates() {
     // CALC_A.INPA = "CALC_B PP", CALC_B.INPA = "CALC_A PP".
     // Both passive, both CALC="A" (copy the input).
     let mut a = CalcRecord::new("A");
-    a.inpa = "CALC_B PP".to_string();
+    a.set_inp_link(0, "CALC_B PP");
     db.add_record("CALC_A", Box::new(a)).await.unwrap();
 
     let mut b = CalcRecord::new("A");
-    b.inpa = "CALC_A PP".to_string();
+    b.set_inp_link(0, "CALC_A PP");
     db.add_record("CALC_B", Box::new(b)).await.unwrap();
 
     // Must return cleanly (Ok) without overflowing the stack — the
     // cycle guard terminates the A->B->A bounce.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let result = db.process_record_with_links("CALC_A", &mut visited).await;
     assert!(
         result.is_ok(),
@@ -5453,10 +5453,10 @@ async fn test_calc_constant_inputs() {
     use epics_base_rs::server::records::calc::CalcRecord;
     let db = PvDatabase::new();
     let mut calc = CalcRecord::new("A+B");
-    calc.inpa = "5".to_string();
-    calc.inpb = "3.5".to_string();
+    calc.set_inp_link(0, "5");
+    calc.set_inp_link(1, "3.5");
     db.add_record("CALC_CONST", Box::new(calc)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_CONST", &mut visited)
         .await
         .unwrap();
@@ -5478,7 +5478,7 @@ async fn test_calc_record_has_analog_alarm_limits() {
 
     let db = PvDatabase::new();
     let mut calc = CalcRecord::new("A");
-    calc.inpa = "15".to_string(); // VAL will compute to 15
+    calc.set_inp_link(0, "15"); // VAL will compute to 15
     db.add_record("CALC_LIM", Box::new(calc)).await.unwrap();
 
     // Configure HIHI=10, HHSV=MAJOR. Put goes through put_record_field_from_ca
@@ -5499,7 +5499,7 @@ async fn test_calc_record_has_analog_alarm_limits() {
     assert_eq!(hihi, 10.0);
 
     // Process — CALC="A" with A=15 → VAL=15 > HIHI=10 → HIHI_ALARM/MAJOR.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_LIM", &mut visited)
         .await
         .unwrap();
@@ -5526,7 +5526,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
 
     let db = PvDatabase::new();
     let mut calc = CalcRecord::new("A");
-    calc.inpa = "1".to_string();
+    calc.set_inp_link(0, "1");
     calc.aftc = 5.0; // 5-second filter time-constant
     db.add_record("CALC_AFTC", Box::new(calc)).await.unwrap();
     db.put_record_field_from_ca("CALC_AFTC", "HIHI", EpicsValue::Double(10.0))
@@ -5537,7 +5537,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
         .unwrap();
 
     // First process — filter seeds with NoAlarm (alarm_range=3, Normal).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_AFTC", &mut visited)
         .await
         .unwrap();
@@ -5552,7 +5552,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
         let mut inst = rec.write();
         let _ = inst.record.put_field("VAL", EpicsValue::Double(15.0));
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CALC_AFTC", &mut visited)
         .await
         .unwrap();
@@ -5581,7 +5581,7 @@ async fn test_fanout_all() {
         tgt.init_record(0).unwrap();
         db.add_record(name, Box::new(tgt)).await.unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("FANOUT", &mut visited)
         .await
         .unwrap();
@@ -5616,7 +5616,7 @@ async fn test_fanout_specified() {
             .put_field("LNK2", EpicsValue::String("T2".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("FANOUT", &mut visited)
         .await
         .unwrap();
@@ -5640,7 +5640,7 @@ async fn test_dfanout_value_write() {
     db.add_record("DEST_B", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DFAN", &mut visited)
         .await
         .unwrap();
@@ -5690,7 +5690,7 @@ async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DFAN_OMSL", &mut visited)
         .await
         .unwrap();
@@ -5731,7 +5731,7 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DFAN_SUP", &mut visited)
         .await
         .unwrap();
@@ -5794,7 +5794,7 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     // `field(VAL,"5")` comes up UDF=0 / NO_ALARM.
     define_val(&db, "DFAN_LINKFAIL").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DFAN_LINKFAIL", &mut visited)
         .await
         .unwrap();
@@ -5836,7 +5836,7 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     // seeded VAL stands for `field(VAL,"5")`, which C loads with UDF=0.
     define_val(&db, "DFAN_OK").await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DFAN_OK", &mut visited)
         .await
         .unwrap();
@@ -5893,7 +5893,7 @@ async fn test_seq_dol_lnk_dispatch() {
     seq.dol2 = "SEQ_SRC2".to_string();
     seq.lnk2 = "SEQ_DEST2".to_string();
     db.add_record("SEQ_REC", Box::new(seq)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEQ_REC", &mut visited)
         .await
         .unwrap();
@@ -5931,7 +5931,7 @@ async fn test_seq_writes_dol_readback_into_don() {
     seq.lnk0 = "SEQ9_DEST".to_string();
     db.add_record("SEQ9_REC", Box::new(seq)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEQ9_REC", &mut visited)
         .await
         .unwrap();
@@ -5971,7 +5971,7 @@ async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
     // lnk0 stays empty — DOL-only group
     db.add_record("SEQ9B_REC", Box::new(seq)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEQ9B_REC", &mut visited)
         .await
         .unwrap();
@@ -6065,7 +6065,7 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     seq.lnk2 = "SEQ_PP_TGT PP".to_string();
     db.add_record("SEQ_NPP_REC", Box::new(seq)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEQ_NPP_REC", &mut visited)
         .await
         .unwrap();
@@ -6150,7 +6150,7 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("WF_PRODUCER", &mut visited)
         .await
         .unwrap();
@@ -6240,7 +6240,7 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
         .unwrap();
     db.add_record("SSEQ_NPP_REC", Box::new(sseq)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SSEQ_NPP_REC", &mut visited)
         .await
         .unwrap();
@@ -6297,7 +6297,7 @@ async fn test_sseq_per_step_dly_delays_step_write() {
     // Kick the sequence. The async machine returns to the caller after the
     // first step is *scheduled* (PACT set); the per-step writes happen in
     // spawned re-entries, so the kick does NOT block until completion.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SSEQ_DLY_REC", &mut visited)
         .await
         .unwrap();
@@ -6335,7 +6335,7 @@ async fn test_sel_nvl_link() {
     sel.b = 20.0;
     sel.c = 30.0;
     db.add_record("SEL_REC", Box::new(sel)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEL_REC", &mut visited)
         .await
         .unwrap();
@@ -6365,7 +6365,7 @@ async fn test_sel_nvl_link_high_index_unsigned() {
     sel.selm = 0;
     sel.nvl = "NVL_SRC_HI".to_string();
     db.add_record("SEL_REC_HI", Box::new(sel)).await.unwrap();
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEL_REC_HI", &mut visited)
         .await
         .unwrap();
@@ -6404,7 +6404,7 @@ async fn test_dol_cp_link_triggers_processing() {
     ao.dol = "SRC CP".to_string();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -6461,7 +6461,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
 
     // The rest of the OUT link's modifiers survive the mask: ` PP` still
     // processes the target (`dbDbLink.c:387-390`).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CPOUT_HOLDER", &mut visited)
         .await
         .unwrap();
@@ -6511,7 +6511,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
         rec_arc.write().common.scan = ScanType::SEC1;
     }
     db.setup_cp_links().await;
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -6539,7 +6539,7 @@ async fn test_cpp_link_processes_passive_target() {
     db.add_record("DST", Box::new(ao)).await.unwrap();
     // DST keeps the default Passive SCAN.
     db.setup_cp_links().await;
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -6570,7 +6570,7 @@ async fn test_cp_link_processes_nonpassive_target() {
         rec_arc.write().common.scan = ScanType::SEC1;
     }
     db.setup_cp_links().await;
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
@@ -6693,7 +6693,7 @@ async fn test_tse_minus1_always_overwrites_via_best_time() {
         inst.common.tse = -1;
         inst.common.time = stale;
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
@@ -6718,7 +6718,7 @@ async fn test_tse_minus2_keeps_time_unchanged() {
         inst.common.tse = -2;
         inst.common.time = fixed_time;
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
@@ -6753,7 +6753,7 @@ async fn test_rpro_causes_reprocessing() {
         inst.put_common_field("INP", EpicsValue::String("SRC".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
@@ -6767,7 +6767,7 @@ async fn test_rpro_causes_reprocessing() {
         let mut inst = rec.write();
         inst.common.rpro = 1;
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
@@ -6835,7 +6835,7 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
         inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_DST", &mut visited)
         .await
         .unwrap();
@@ -6908,7 +6908,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_CADST", &mut visited)
         .await
         .unwrap();
@@ -6984,7 +6984,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_NLDST", &mut visited)
         .await
         .unwrap();
@@ -7209,7 +7209,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
                 .set_val(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
                 .unwrap();
         }
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
@@ -7281,7 +7281,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     // Drive process → AsyncPending early-return, then async completion.
     // DESC value unchanged since subscription, so the gate must
     // suppress the event.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
@@ -7298,7 +7298,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
         inst.put_common_field("DESC", EpicsValue::String("beta".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
@@ -7314,7 +7314,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     );
 
     // And another no-op cycle after the change must again be silent.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
@@ -7469,7 +7469,7 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
         let mut inst = rec.write();
         inst.record.set_val(EpicsValue::Double(7.5)).unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TS_SRC", &mut visited)
         .await
         .unwrap();
@@ -7545,7 +7545,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
     .expect("VAL subscription accepted");
 
     // First half: process → AsyncPending early return; no notify yet.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_TS", &mut visited)
         .await
         .unwrap();
@@ -7616,7 +7616,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
 
     // First cycle: val == pval == 0 satisfies "no change", but the
     // first-output-done guard forces the OUT cascade to fire.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LO_SRC", &mut visited)
         .await
         .unwrap();
@@ -7649,7 +7649,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     // re-process.
     let dst_time_before_second = dst_time_after_first;
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LO_SRC", &mut visited)
         .await
         .unwrap();
@@ -7708,7 +7708,7 @@ async fn test_self_link_out_does_not_loop() {
     // 1-second timeout: if the self-link guard regresses, the
     // process call would never return (infinite recursion via
     // write_db_link_value → process_record_with_links → ...).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let result = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
         db.process_record_with_links("SELF_LO", &mut visited),
@@ -7730,7 +7730,7 @@ async fn test_self_link_out_does_not_loop() {
     // promptly — the RPRO flag from the first call must not have
     // been left set on the record, otherwise the record would
     // reprocess in a loop after every external put.
-    let mut visited2 = HashSet::new();
+    let mut visited2 = epics_base_rs::server::database::ProcStack::new();
     let result2 = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
         db.process_record_with_links("SELF_LO", &mut visited2),
@@ -8397,7 +8397,7 @@ async fn test_lnk_calc_parses_and_evaluates() {
         time_source: Some('A'),
     };
     let parsed = ParsedLink::Calc(calc);
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let value = db
         .read_link_value_soft(&parsed, true, &mut visited)
         .expect("calc link evaluates");
@@ -8465,7 +8465,7 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         time_source: Some('A'),
     };
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let value = db
         .read_link_value_soft(
             &epics_base_rs::server::record::ParsedLink::Calc(calc),
@@ -8595,7 +8595,7 @@ async fn test_simulation_mode_still_fires_forward_link() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM:AI", &mut visited)
         .await
         .unwrap();
@@ -8630,7 +8630,7 @@ async fn test_simulated_mbbi_reads_siol_not_writes_it() {
     mbbi.siol = "MBBISIM:SRC".into();
     db.add_record("MBBISIM:IN", Box::new(mbbi)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("MBBISIM:IN", &mut visited)
         .await
         .unwrap();
@@ -8722,7 +8722,7 @@ async fn test_fanout_resolves_sell_link_into_seln() {
         .unwrap();
     db.add_record("FANSELL:FAN", Box::new(fan)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("FANSELL:FAN", &mut visited)
         .await
         .unwrap();
@@ -8772,7 +8772,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         seq.sell = "SEQALL:SRC".to_string();
         db.add_record("SEQALL:REC", Box::new(seq)).await.unwrap();
 
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("SEQALL:REC", &mut visited)
             .await
             .unwrap();
@@ -8800,7 +8800,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         seq.sell = "SEQSPEC:SRC".to_string();
         db.add_record("SEQSPEC:REC", Box::new(seq)).await.unwrap();
 
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("SEQSPEC:REC", &mut visited)
             .await
             .unwrap();
@@ -8935,7 +8935,7 @@ async fn test_bare_out_link_does_not_process_target() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC_OUT", &mut visited)
         .await
         .unwrap();
@@ -8969,7 +8969,7 @@ async fn test_pp_out_link_processes_passive_target() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC_PP", &mut visited)
         .await
         .unwrap();
@@ -9007,7 +9007,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
         .spawn(async move {
             // Foreign full-processing entry — must block on the gate the
             // epoch holds.
-            let mut visited = HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             let _ = db2
                 .process_record_with_links("MR_R5_MEMBER", &mut visited)
                 .await;
@@ -9052,7 +9052,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     // it holds no `.await` at all, so a regression that put the
     // gate-acquiring entry back would not even compile here; before H6 this
     // was a `tokio::time::timeout` around the same call.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let res = db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited);
     res.expect("owner-path processing of an owned member must succeed");
     // The marker unwinds with the frame (`dbDbLink.c:521-526`), so what a
@@ -9265,7 +9265,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
                 .unwrap();
             inst.common.udf = 0;
         }
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("CADST", &mut visited)
             .await
             .unwrap();
@@ -9352,7 +9352,7 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
 
         // Cycle 1 commits oval/olen for the seeded "hello", so cycle 2 is
         // genuinely unchanged (value_changed == false).
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("LSI_MPST", &mut visited)
             .await
             .unwrap();
@@ -9367,7 +9367,7 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
 
         // Cycle 2: no new value. Without MPST this posts nothing; with
         // MPST == Always it must still post a DBE_VALUE event.
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("LSI_MPST", &mut visited)
             .await
             .unwrap();
@@ -9422,7 +9422,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
     }
 
     // Drive the MAIN engine path (not process_local).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SUBM", &mut visited)
         .await
         .unwrap();
@@ -9474,7 +9474,7 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
     }
 
     for name in ["SUB_HIHI", "SUB_OK"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
@@ -9547,7 +9547,7 @@ async fn sub_record_mdel_gates_val_monitor() {
                 .put_field("VAL", EpicsValue::Double(val))
                 .unwrap();
         }
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("SUB_MDEL", &mut visited)
             .await
             .unwrap();
@@ -9627,7 +9627,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
 
     for name in ["SUB_SOFT", "SUB_OK0"] {
         for _ in 0..2 {
-            let mut visited = HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             db.process_record_with_links(name, &mut visited)
                 .await
                 .unwrap();
@@ -9699,7 +9699,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
     }
 
     for name in ["ASUB_POS", "ASUB_NEG"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
@@ -9851,7 +9851,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     let proc = |db: &PvDatabase| {
         let db = db.clone();
         async move {
-            let mut visited = HashSet::new();
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
             db.process_record_with_links("ASUB_L", &mut visited)
                 .await
                 .unwrap();
@@ -9953,7 +9953,7 @@ record(aSub, "ASUB_S") {
 
     // The routine was wired at init; processing runs it and publishes its
     // return status as VAL (C `aSubRecord.c:224`).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASUB_S", &mut visited)
         .await
         .unwrap();
@@ -10036,7 +10036,7 @@ record(aSub, "ASUB_INIT") {
 
     // SNAM process routine is still wired alongside INAM: aSub publishes its
     // return status as VAL (C `aSubRecord.c:224`).
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASUB_INIT", &mut visited)
         .await
         .unwrap();
@@ -10143,7 +10143,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     db.add_record("AO_INCR_DST", Box::new(dest)).await.unwrap();
 
     // Cycle 1: PVAL=0, DOL=10 -> VAL = 0 + 10 = 10, PVAL becomes 10.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_INCR_DST", &mut visited)
         .await
         .unwrap();
@@ -10172,7 +10172,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
 
     // Cycle 2: increment from PVAL(10), not the caput VAL(100):
     // VAL = 10 + 5 = 15 (C), not 100 + 5 = 105 (pre-fix Rust).
-    let mut visited2 = HashSet::new();
+    let mut visited2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_INCR_DST", &mut visited2)
         .await
         .unwrap();
@@ -10207,7 +10207,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     );
 
     // Process once: the constant must not be re-sourced; VAL stays 7.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_CONST", &mut visited)
         .await
         .unwrap();
@@ -10226,7 +10226,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
             .unwrap();
     }
     // Reprocess: the constant DOL is never re-fetched, so the caput wins.
-    let mut visited2 = HashSet::new();
+    let mut visited2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_CONST", &mut visited2)
         .await
         .unwrap();
@@ -10255,7 +10255,7 @@ async fn ao_constant_dol_incremental_does_not_increment() {
 
     // Process three times: a constant must not accumulate (5, 10, 15...).
     for _ in 0..3 {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("AO_CONST_INCR", &mut visited)
             .await
             .unwrap();
@@ -10295,7 +10295,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
         let mut inst = arc.write();
         inst.record.put_field("VAL", EpicsValue::Long(99)).unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LO_CONST", &mut visited)
         .await
         .unwrap();
@@ -10339,7 +10339,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
             .put_field("VAL", EpicsValue::String("world".into()))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SO_CONST", &mut visited)
         .await
         .unwrap();
@@ -10517,7 +10517,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     // FLNK target must NOT process (C returns before recGblFwdLink). The
     // delaying-cycle FLNK fires synchronously inside process_record_with_links
     // if at all, so this assertion is race-free.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO6_SRC", &mut visited)
         .await
         .unwrap();
@@ -10528,7 +10528,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     );
 
     // Delayed (callback) cycle: C fires recGblFwdLink exactly once here.
-    let mut visited2 = HashSet::new();
+    let mut visited2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("CO6_SRC", &mut visited2)
         .await
         .unwrap();
@@ -10567,7 +10567,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
     sel.inpb = "R7_SRCB PP".to_string();
     db.add_record("R7_SEL", Box::new(sel)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R7_SEL", &mut visited)
         .await
         .unwrap();
@@ -10626,7 +10626,7 @@ async fn sel_high_mode_fetches_all_inputs() {
     sel.inpb = "R7H_SRCB PP".to_string();
     db.add_record("R7H_SEL", Box::new(sel)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R7H_SEL", &mut visited)
         .await
         .unwrap();
@@ -10677,7 +10677,7 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
     sel.inpa = "NO_SUCH_PV".to_string();
     db.add_record("R8_SEL", Box::new(sel)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R8_SEL", &mut visited)
         .await
         .unwrap();
@@ -10714,7 +10714,7 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     sel.inpa = "R8N_SRC".to_string();
     db.add_record("R8N_SEL", Box::new(sel)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R8N_SEL", &mut visited)
         .await
         .unwrap();
@@ -10746,7 +10746,7 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
     // inpa stays empty (unset link)
     db.add_record("R8_SEL_EMPTY", Box::new(sel)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R8_SEL_EMPTY", &mut visited)
         .await
         .unwrap();
@@ -11010,7 +11010,7 @@ async fn test_permissive_oval_oflg_not_monitor_posted() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PERM", &mut visited)
         .await
         .unwrap();
@@ -11067,7 +11067,7 @@ async fn test_state_oval_not_monitor_posted() {
             .unwrap();
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ST", &mut visited)
         .await
         .unwrap();
@@ -11123,7 +11123,7 @@ async fn test_put_time_post_is_the_only_post_for_that_put() {
 
     // The next process cycle re-reads every subscribed field. SVAL has not
     // moved since the put published it, so C's `monitor()` sends nothing.
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PUTPOST", &mut visited)
         .await
         .unwrap();
@@ -11141,7 +11141,7 @@ async fn test_put_time_post_is_the_only_post_for_that_put() {
             .put_field("SVAL", EpicsValue::Double(9.0))
             .unwrap();
     }
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("PUTPOST", &mut visited)
         .await
         .unwrap();

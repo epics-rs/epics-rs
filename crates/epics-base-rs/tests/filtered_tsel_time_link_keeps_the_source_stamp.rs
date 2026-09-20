@@ -15,7 +15,7 @@
 //! its two consumers: C gives `PLAIN.TIME == FILT.TIME == SRC.TIME`, so the
 //! filtered link adopts the stamp exactly as the plain one does.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -36,7 +36,7 @@ record(ai, "TSELF_JSON")  { field(DTYP, "Soft Channel") field(TSEL, "TSELF_SRC.T
 "#;
 
 async fn proc(db: &Db, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

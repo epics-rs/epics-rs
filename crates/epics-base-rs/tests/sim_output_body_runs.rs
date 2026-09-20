@@ -18,8 +18,6 @@
 //!   * `bo` HIGH: the momentary reset arms and (on the timer reprocess) drives
 //!     the simulated output back to 0.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::DelayedCallbackOutcome;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -58,7 +56,7 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .await
         .unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AOROC", &mut v1)
         .await
         .unwrap();
@@ -105,7 +103,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
     db.add_record("BOHI", Box::new(bo)).await.unwrap();
 
     // Fresh cycle: body runs, writes VAL=1 to SIOL, and arms the HIGH reset.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BOHI", &mut v1).await.unwrap();
 
     let tgt = db.get_pv("BOHI_TGT").unwrap();
@@ -126,7 +124,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
             "the arming cycle left a HIGH one-shot for the timer to release"
         );
     }
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("BOHI", &mut v2)
         .await
         .unwrap();
@@ -168,7 +166,7 @@ async fn sim_output_sims_invalid_does_not_veto_siol_write() {
     ao.ivoa = 1; // Don't drive outputs — must NOT fire (own nsev is NoAlarm)
     db.add_record("AOIV", Box::new(ao)).await.unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AOIV", &mut v1).await.unwrap();
 
     // SIMM_ALARM makes the committed SEVR INVALID...
@@ -222,7 +220,7 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
         .await
         .unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BOIV", &mut v1).await.unwrap();
 
     let sevr = db.get_pv("BOIV.SEVR").unwrap();
@@ -280,7 +278,7 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
         .await
         .unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BOTIE", &mut v1)
         .await
         .unwrap();

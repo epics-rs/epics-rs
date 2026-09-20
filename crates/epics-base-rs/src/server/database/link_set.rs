@@ -226,7 +226,25 @@ pub struct LinkDiagnostics {
 /// lock sets, so it must resolve with no record lock held and hand the answer
 /// in; this type is that hand-off.
 #[derive(Clone, Copy)]
-pub struct LinkBacking<'a>(Option<&'a std::collections::HashMap<String, LinkMetadata>>);
+pub struct LinkBacking<'a>(Backing<'a>);
+
+/// The answers a poster's resolve can carry. `Resolved` and `Declined`
+/// used to be the same value — an empty `HashMap` — and that is what left a
+/// window open: a subscriber arriving between the resolve's read lock and the
+/// post's write lock was handed the record's own C seed where the link's
+/// metadata belongs, because nothing downstream could tell "the link answered
+/// nothing" from "nobody had asked, so we never looked".
+///
+/// `Empty` is `Resolved` with nothing in it, as its own value: the resolve
+/// that had no link to walk — every record with no link-backed metadata,
+/// every cycle — answers it without constructing a map to be empty in.
+#[derive(Clone, Copy)]
+enum Backing<'a> {
+    Unresolved,
+    Resolved(&'a std::collections::HashMap<String, LinkMetadata>),
+    Empty,
+    Declined,
+}
 
 impl<'a> LinkBacking<'a> {
     /// Nothing was resolved for this build: the record backs no field's
@@ -236,13 +254,28 @@ impl<'a> LinkBacking<'a> {
     /// CONSTANT link, an unresolvable target, or a link its
     /// `DBLINK_FLAG_VISITED` guard refused.
     pub const fn none() -> Self {
-        Self(None)
+        Self(Backing::Unresolved)
+    }
+
+    /// The resolve DECLINED to run: this record had no subscriber when the
+    /// cycle asked, so nothing would have read the answer. A post that finds
+    /// a subscriber anyway — one that arrived in the window between that read
+    /// lock and this write lock — must NOT serve a link-backed field from it;
+    /// [`RecordInstance::make_monitor_snapshot`](crate::server::record::RecordInstance::make_monitor_snapshot)
+    /// is where that refusal lives.
+    pub(crate) const fn declined() -> Self {
+        Self(Backing::Declined)
     }
 
     /// What the links this record's metadata is backed by resolved to, keyed
     /// by link field (`INPA`, `INPB`, ...), resolved with no record lock held.
     pub const fn resolved(resolved: &'a std::collections::HashMap<String, LinkMetadata>) -> Self {
-        Self(Some(resolved))
+        Self(Backing::Resolved(resolved))
+    }
+
+    /// A resolve that ran and had no link to walk — see [`PostBacking::empty`].
+    pub(crate) const fn empty() -> Self {
+        Self(Backing::Empty)
     }
 
     /// The metadata behind one link field. The *predicate* — whether this
@@ -250,7 +283,10 @@ impl<'a> LinkBacking<'a> {
     /// `Record::link_backed_metadata_field`, so this type answers only the
     /// value and carries one meaning.
     pub(crate) fn metadata(&self, link_field: &str) -> Option<&'a LinkMetadata> {
-        self.0.and_then(|m| m.get(link_field))
+        match self.0 {
+            Backing::Resolved(m) => m.get(link_field),
+            Backing::Empty | Backing::Unresolved | Backing::Declined => None,
+        }
     }
 
     /// True for [`Self::none`] — the caller resolved nothing. Distinct from a
@@ -260,7 +296,56 @@ impl<'a> LinkBacking<'a> {
     /// same field posted through an empty resolve is a link that genuinely
     /// answered nothing and correctly serves its C seed.
     pub(crate) const fn is_unresolved(&self) -> bool {
-        self.0.is_none()
+        matches!(self.0, Backing::Unresolved)
+    }
+
+    /// See [`Self::declined`].
+    pub(crate) const fn is_declined(&self) -> bool {
+        matches!(self.0, Backing::Declined)
+    }
+}
+
+/// What a poster's resolve produced —
+/// [`PvDatabase::resolve_link_backed_metadata_for_posts`](crate::server::database::PvDatabase::resolve_link_backed_metadata_for_posts).
+///
+/// Owns the map so the borrowed [`LinkBacking`] can be taken from it at the
+/// post, and — the reason it exists rather than a bare `HashMap` — carries the
+/// gated door's DECLINE, which a `HashMap` has no room for. A caller cannot
+/// flatten the two: the only way to a `LinkBacking` from here is
+/// [`Self::as_link_backing`], which keeps whichever one it was.
+pub enum PostBacking {
+    /// The resolve ran and walked its links; this is what they answered.
+    Resolved(std::collections::HashMap<String, LinkMetadata>),
+    /// The resolve ran and had no link to walk: no link field was set, or the
+    /// record backs no metadata with one. An answer, not a decline.
+    Empty,
+    /// The resolve declined — see [`LinkBacking::declined`].
+    Declined,
+}
+
+impl PostBacking {
+    /// The resolve ran; this is its answer, empty or not.
+    pub(crate) const fn resolved(map: std::collections::HashMap<String, LinkMetadata>) -> Self {
+        Self::Resolved(map)
+    }
+
+    /// See [`Self::Empty`].
+    pub(crate) const fn empty() -> Self {
+        Self::Empty
+    }
+
+    /// The resolve declined — see [`LinkBacking::declined`].
+    pub(crate) const fn declined() -> Self {
+        Self::Declined
+    }
+
+    /// The borrowed view every poster hands to the record.
+    pub fn as_link_backing(&self) -> LinkBacking<'_> {
+        match self {
+            Self::Resolved(map) => LinkBacking::resolved(map),
+            Self::Empty => LinkBacking::empty(),
+            Self::Declined => LinkBacking::declined(),
+        }
     }
 }
 
@@ -730,5 +815,74 @@ mod tests {
     fn unknown_scheme_returns_none() {
         let reg = LinkSetRegistry::new();
         assert!(reg.get("missing").is_none());
+    }
+
+    /// The window the poster gate opens, and why `Declined` is not an empty
+    /// map. The gate is asked under a read lock the link walk then releases;
+    /// a subscriber can attach before the post takes the write lock. Driven
+    /// by hand here — the interleaving is not reproducible on demand, but a
+    /// declined backing is exactly the state it leaves behind, so the post's
+    /// behaviour on one is the whole of the fix.
+    ///
+    /// C closes this by lock discipline: `db_add_event` takes `dbScanLock`
+    /// on the record's lock set, which `dbProcess` holds across the cycle,
+    /// so a monitor attaching mid-cycle joins after it and first hears from
+    /// the NEXT process. Refusing reproduces that outcome.
+    #[epics_macros_rs::epics_test]
+    async fn a_late_subscriber_is_refused_rather_than_served_the_records_own_seed() {
+        use crate::server::recgbl::EventMask;
+        use crate::types::DbFieldType;
+
+        let db = crate::server::database::PvDatabase::new();
+        // PREC 1 / `mm` deliberately unlike the calc's own PREC 7 / `V`, so
+        // serving the record instead of the link would be visible.
+        let mut src = crate::server::records::ai::AiRecord::new(1.0);
+        src.egu = "mm".into();
+        src.prec = 1;
+        db.add_record("SRC", Box::new(src)).await.unwrap();
+        let mut calc = crate::server::records::calc::CalcRecord::default();
+        calc.egu = "V".into();
+        calc.prec = 7;
+        calc.set_inp_link(0, "SRC");
+        calc.calc = "A+1".into();
+        db.add_record("CALC", Box::new(calc)).await.unwrap();
+        db.ioc_init().await;
+
+        let rec = db.get_record("CALC").expect("record exists");
+
+        // Nobody subscribed: the gate declines. An empty map here would be
+        // indistinguishable from "walked the links and found nothing", which
+        // is what let the seed through.
+        let backing = db.resolve_link_backed_metadata_for_posts(&rec);
+        assert!(
+            backing.as_link_backing().is_declined(),
+            "with no subscribers the poster door declines rather than resolving"
+        );
+
+        // The subscribers arrive inside the window.
+        let full = (EventMask::VALUE | EventMask::LOG).bits();
+        let mut a_rx = rec
+            .write()
+            .add_subscriber("A", 1, DbFieldType::Double, full)
+            .expect("A subscriber");
+        let mut val_rx = rec
+            .write()
+            .add_subscriber("VAL", 2, DbFieldType::Double, full)
+            .expect("VAL subscriber");
+
+        // The post the cycle goes on to make, with the backing it is holding.
+        rec.write()
+            .notify_field_with_origin("A", EventMask::VALUE, 0, backing.as_link_backing());
+        rec.write()
+            .notify_field_with_origin("VAL", EventMask::VALUE, 0, backing.as_link_backing());
+
+        assert!(
+            a_rx.try_recv().is_err(),
+            "A is link-backed and nothing was resolved: the event is refused,              not sent carrying CALC's own PREC 7 where SRC's PREC 1 belongs"
+        );
+        assert!(
+            val_rx.try_recv().is_ok(),
+            "VAL is not link-backed: a declined backing costs it nothing"
+        );
     }
 }

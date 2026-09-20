@@ -6184,7 +6184,7 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     let mut rec = MotorRecord::new();
     rec.pos.rbv = 42.0;
     rec.pos.val = 10.0; // setpoint differs from readback
-    assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(42.0)));
+    assert_eq!(rec.monitor_deadband_value(), Some(42.0));
 }
 
 // --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc
@@ -9049,7 +9049,7 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // Quiescent pass: no alarm transition, DMOV unchanged — no DMOV post.
     let (snap, _) = instance.process_local().unwrap();
     assert!(
-        !snap.changed_fields.iter().any(|(k, _, _)| k == "DMOV"),
+        !snap.iter().any(|(k, _, _)| k == "DMOV"),
         "no alarm and no change: DMOV must not post"
     );
 
@@ -9066,7 +9066,6 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
         .insert(MstaFlags::PROBLEM);
     let (snap, _) = instance.process_local().unwrap();
     let dmov_mask = snap
-        .changed_fields
         .iter()
         .find(|(k, _, _)| k == "DMOV")
         .map(|(_, _, m)| *m);

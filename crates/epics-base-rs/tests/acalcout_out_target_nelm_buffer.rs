@@ -24,7 +24,6 @@
 //! - external target, metadata count > 1    → array buffer
 //! - external target, no metadata (C failed dbCaGetNelements) → scalar
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
@@ -160,7 +159,7 @@ fn invalid_ivov_record(dopt: i16, nelm: u32, out: &str) -> AcalcoutRecord {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
     // An external OUT put is staged on the link-put queue and the record
     // returns (C `dbCaPutLink`, `dbCa.c:593-595`); `dbCaSync`

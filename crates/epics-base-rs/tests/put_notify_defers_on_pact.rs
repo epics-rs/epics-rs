@@ -40,7 +40,6 @@
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -137,7 +136,7 @@ async fn busy_record() -> Fixture {
     .await
     .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASY", &mut visited)
         .await
         .unwrap();
@@ -554,7 +553,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     .await
     .unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ODL", &mut v1).await.unwrap();
     let rec = db.get_record("ODL").unwrap();
     assert!(
@@ -570,7 +569,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
         .expect("a deferred put-notify hands back a receiver");
 
     // The delay expires: the continuation ends the cycle and releases PACT.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("ODL", &mut v2)
         .await
         .unwrap();
@@ -640,7 +639,7 @@ async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
 async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact() {
     let db = sdly_input_record().await;
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMAI", &mut v1)
         .await
         .unwrap();
@@ -657,7 +656,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
         .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v2)
         .await
         .unwrap();
@@ -668,7 +667,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
 
     // The replay's own process re-armed SDLY; its continuation completes the
     // put-notify.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v3)
         .await
         .unwrap();
@@ -693,7 +692,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
     ao.sdly = 100.0;
     db.add_record("SIMAO", Box::new(ao)).await.unwrap();
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMAO", &mut v1)
         .await
         .unwrap();
@@ -710,14 +709,14 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAO", &mut v2)
         .await
         .unwrap();
 
     await_replayed_value(&db, "SIMAO", 7.0).await;
 
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAO", &mut v3)
         .await
         .unwrap();
@@ -733,7 +732,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
 async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pact() {
     let db = sdly_input_record().await;
 
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMAI", &mut v1)
         .await
         .unwrap();
@@ -755,7 +754,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
         inst.record.put_field("SIMM", EpicsValue::Short(7)).unwrap();
     }
 
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v2)
         .await
         .unwrap();
@@ -767,7 +766,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     // The replay's own process re-resolved SIMM from SIML (C `recGblGetSimm`
     // runs on every `!pact` entry), so the record is back in SIMM=YES and
     // re-armed SDLY; its continuation completes the put-notify.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v3)
         .await
         .unwrap();

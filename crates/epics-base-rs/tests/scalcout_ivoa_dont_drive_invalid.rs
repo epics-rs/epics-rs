@@ -12,8 +12,6 @@
 //! `skip_out` path already enforced, closing the family for all INVALID
 //! sources (and for both `scalcout` and `acalcout`).
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::ai::AiRecord;
@@ -50,7 +48,7 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
         .unwrap();
     db.add_record("SC_DD", Box::new(sc)).await.unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC_DD", &mut visited)
         .await
         .unwrap();

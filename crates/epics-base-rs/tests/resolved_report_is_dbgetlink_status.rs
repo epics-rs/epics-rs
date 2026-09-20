@@ -27,7 +27,6 @@
 //! (`motorRecord.cc:3687`, `epidRecord.c:191`, `aaoRecord.c::fetchValue`)
 //! derives its failure from.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
@@ -115,7 +114,7 @@ async fn cycle(lnk: &str) -> (bool, f64, AlarmSeverity) {
     .await
     .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("P", &mut visited).await;
 
     let inst = db.get_record("P").unwrap();

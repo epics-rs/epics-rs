@@ -33,8 +33,6 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -240,7 +238,7 @@ async fn r10_64_a_redundant_start_queues_nothing() {
 async fn r10_64_a_plain_process_cycle_fires_no_special_link() {
     let db = db_with_link_targets().await;
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SCAL", &mut visited)
         .await
         .unwrap();

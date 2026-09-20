@@ -582,6 +582,26 @@ impl Record for SelRecord {
         seeds
     }
 
+    /// The 12 `INPA..INPL` texts read straight off the record's own fields, not
+    /// through the default body's 12 name matches on `link_text_ref`.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&[
+            self.inpa.as_str(),
+            self.inpb.as_str(),
+            self.inpc.as_str(),
+            self.inpd.as_str(),
+            self.inpe.as_str(),
+            self.inpf.as_str(),
+            self.inpg.as_str(),
+            self.inph.as_str(),
+            self.inpi.as_str(),
+            self.inpj.as_str(),
+            self.inpk.as_str(),
+            self.inpl.as_str(),
+        ])
+    }
+
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         SEL_INPUT_LINKS
     }
@@ -596,6 +616,10 @@ impl Record for SelRecord {
     /// `dbGetLink` (`:434-437`), which `process` gates `do_sel` on.
     fn input_fetch_policy(&self) -> crate::server::record::InputFetchPolicy {
         crate::server::record::InputFetchPolicy::ReadAllGateOnLastFailure
+    }
+
+    fn narrows_input_links(&self) -> bool {
+        true
     }
 
     fn select_input_links(

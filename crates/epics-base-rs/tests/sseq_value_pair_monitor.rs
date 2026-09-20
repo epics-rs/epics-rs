@@ -25,7 +25,6 @@
 //! with `DBE_VALUE|DBE_LOG`, unconditionally — an archiver on `STR1` logged a
 //! sample on every `caput DO1` that changed nothing.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -203,7 +202,7 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
         (d, s)
     };
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("VPP", &mut visited)
         .await
         .unwrap();

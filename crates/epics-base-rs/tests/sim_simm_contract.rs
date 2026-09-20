@@ -25,8 +25,6 @@
 //! `NotSimulated` before SIMM was even read whenever SIML and SIOL were both
 //! empty, so the idiom was a complete no-op on every record type.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::longin::LonginRecord;
@@ -51,7 +49,7 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
         .await
         .unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMCONST", &mut v)
         .await
         .unwrap();
@@ -93,7 +91,7 @@ async fn simm_no_with_unset_links_does_not_simulate() {
         .await
         .unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMOFF", &mut v)
         .await
         .unwrap();
@@ -298,7 +296,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
     // severity-less LINK_ALARM we are asserting on.
     db.put_pv("SIMLFAIL", EpicsValue::Long(5)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIMLFAIL", &mut v)
         .await
         .unwrap();
@@ -327,7 +325,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     db.add_record("BUSYFAIL", Box::new(b)).await.unwrap();
     db.put_pv("BUSYFAIL", EpicsValue::Short(0)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BUSYFAIL", &mut v)
         .await
         .unwrap();
@@ -378,7 +376,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     li.sims = 0; // NO_ALARM — the dbd default
     db.add_record("SIOLFAIL", Box::new(li)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLFAIL", &mut v)
         .await
         .unwrap();
@@ -414,7 +412,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     li.sims = 3; // INVALID — same severity as the LINK_ALARM
     db.add_record("SIOLTIE", Box::new(li)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLTIE", &mut v)
         .await
         .unwrap();
@@ -472,7 +470,7 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
     db.put_pv("RAWIN.SVAL", EpicsValue::Long(42)).await.unwrap();
     db.put_pv("RAWIN.SIMM", EpicsValue::Short(2)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("RAWIN", &mut v).await.unwrap();
 
     assert_eq!(
@@ -507,7 +505,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         .unwrap();
     db.put_pv("RAWOUT", EpicsValue::Long(99)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("RAWOUT", &mut v)
         .await
         .unwrap();
@@ -537,7 +535,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
     db.put_pv("BRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
     db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BRAW", &mut v).await.unwrap();
 
     assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
@@ -561,7 +559,7 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
     db.add_record("AIRAW", Box::new(ai)).await.unwrap();
     db.put_pv("AIRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AIRAW", &mut v).await.unwrap();
 
     let rec = db.get_record("AIRAW").unwrap();
@@ -613,7 +611,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
         .unwrap();
     db.put_pv("E5BUSY", EpicsValue::Short(1)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5BUSY", &mut v)
         .await
         .unwrap();
@@ -653,7 +651,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
     db.add_record("E5SBUSY", Box::new(b)).await.unwrap();
     db.put_pv("E5SBUSY", EpicsValue::Short(1)).await.unwrap();
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5SBUSY", &mut v)
         .await
         .unwrap();

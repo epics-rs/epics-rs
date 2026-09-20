@@ -22,8 +22,6 @@
 //! per-cycle fact cannot outlive its cycle: a gated or simulated cycle, which
 //! runs no `calcPerform`, raises nothing.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -37,7 +35,7 @@ const READ_ALARM: u16 = 1;
 const LINK_ALARM: u16 = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
@@ -209,7 +207,7 @@ async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
 
     let mut c = CalcRecord::default();
     c.calc = "1+".into(); // uncompilable -> the empty program fails every cycle
-    c.inpa = "CSRC".into();
+    c.set_inp_link(0, "CSRC");
     db.add_record("C", Box::new(c)).await.unwrap();
 
     process(&db, "C").await;

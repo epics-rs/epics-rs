@@ -25,8 +25,6 @@
 //! which takes no `psresult`, and the numeric `postfix()` element table has no
 //! SVAL token — so neither C nor the port has an SVAL in swait.
 
-use std::collections::HashSet;
-
 use epics_base_rs::calc::{
     CalcError, ExprKind, StackValue, StringInputs, compile, scalc, scalc_compile,
 };
@@ -188,7 +186,7 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
     db.add_record("SW_STR", Box::new(bad)).await.unwrap();
 
     for name in ["SW_NUM", "SW_STR"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
@@ -226,7 +224,7 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
     db.add_record("SC_SVAL", Box::new(sc)).await.unwrap();
 
     for expected in ["x", "xx", "xxx"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("SC_SVAL", &mut visited)
             .await
             .unwrap();
@@ -264,7 +262,7 @@ async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
     // If SVAL in OCAL wrongly read the CALC result, OSV would be "abcZ" on
     // every cycle. Reading the previous OSV makes it grow "Z", "ZZ", "ZZZ".
     for expected in ["Z", "ZZ", "ZZZ"] {
-        let mut visited = HashSet::new();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("SC_OSV", &mut visited)
             .await
             .unwrap();

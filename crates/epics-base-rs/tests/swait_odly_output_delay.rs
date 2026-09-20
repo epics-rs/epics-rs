@@ -19,7 +19,6 @@
 //! scalcout ODLY test does) so the assertion is deterministic and does not race
 //! the real timer (ODLY=100s makes the timer unfireable here).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -102,7 +101,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     }
 
     // Delaying cycle: ODLY>0 defers. OUT not written, OEVT not posted.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W_ODLY", &mut v1)
         .await
         .unwrap();
@@ -120,7 +119,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     );
 
     // Continuation (delayed watchdog cycle): OUT driven to OVAL=42, OEVT posts.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W_ODLY", &mut v2)
         .await
         .unwrap();
@@ -177,7 +176,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     }
 
     // Delaying cycle: PACT held, output deferred.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W3_ODLY", &mut v1)
         .await
         .unwrap();
@@ -189,7 +188,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
 
     // Foreign dbProcess DURING the delay (is_continuation=false): must bail at
     // the PACT entry guard, NOT fire the deferred output early.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W3_ODLY", &mut v2)
         .await
         .unwrap();
@@ -207,7 +206,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     );
 
     // Continuation (bypasses the PACT guard): fires the deferred output once.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W3_ODLY", &mut v3)
         .await
         .unwrap();
@@ -271,7 +270,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
         .expect("VAL subscription");
 
     // Delaying cycle: ODLY>0 defers the OUTPUT, but the value side posts NOW.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W4_ODLY", &mut v1)
         .await
         .unwrap();
@@ -301,7 +300,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     // Continuation: drives OUT, but must NOT re-post VAL (C execOutput posts no
     // monitors; the value was already posted at delay-start, so VAL is unchanged
     // and the framework's change-detection skips it).
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W4_ODLY", &mut v2)
         .await
         .unwrap();
@@ -361,7 +360,7 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     }
 
     // Delaying cycle: FLNK must NOT fire (C defers recGblFwdLink to execOutput).
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W5_ODLY", &mut v1)
         .await
         .unwrap();
@@ -374,7 +373,7 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     );
 
     // Continuation: FLNK fires exactly once, at delay-end.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W5_ODLY", &mut v2)
         .await
         .unwrap();
@@ -412,7 +411,7 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
             .unwrap();
     }
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W2_ODLY", &mut v)
         .await
         .unwrap();

@@ -32,8 +32,6 @@
 //! record(ai,"A1"){}   (a type that DOES clear)               UDF 0  NO_ALARM NO_ALARM
 //! ```
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -45,7 +43,7 @@ use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

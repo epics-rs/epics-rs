@@ -14,7 +14,6 @@
 //! carries a `ReprocessAfter`) — so a foreign `dbProcess` during the delay
 //! bails at the PACT entry guard instead of firing the deferred OUT early.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -91,7 +90,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     db.add_record("AC", Box::new(a)).await.unwrap();
 
     // Delaying cycle: ODLY>0 defers, sets DLYA=1, OUT not written.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("AC").unwrap().read().record.get_field("DLYA"),
@@ -107,7 +106,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     // Foreign dbProcess DURING the delay (is_continuation=false): must BAIL at
     // the PACT entry guard, NOT re-enter process() while dlya==1 and fire the
     // deferred OUT early.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v2).await.unwrap();
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -117,7 +116,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     );
 
     // Continuation (bypasses the PACT guard): fires the deferred output once.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("AC", &mut v3).await.unwrap();
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -181,7 +180,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
 
     // Delaying cycle: IVOA=Set + OOPT-fires + ODLY>0 still defers (DLYA=1), and
     // IVOV must NOT be substituted into VAL yet.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v1).await.unwrap();
     {
         let rec = db.get_record("AC").unwrap();
@@ -202,7 +201,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
 
     // Continuation: the framework IVOA dispatch substitutes IVOV and OUT fires
     // with it.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("AC", &mut v3).await.unwrap();
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -254,7 +253,7 @@ async fn acalcout_odly_dont_drive_still_defers() {
 
     // Delaying cycle: must STILL defer (DLYA=1) even though the OUT write is
     // vetoed — C gates the defer on the OOPT decision, not IVOA.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("AC").unwrap().read().record.get_field("DLYA"),
@@ -270,7 +269,7 @@ async fn acalcout_odly_dont_drive_still_defers() {
 
     // Continuation: completes (DLYA cleared); Don't_drive suppresses the OUT
     // write, so it never fires.
-    let mut v3 = HashSet::new();
+    let mut v3 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("AC", &mut v3).await.unwrap();
     assert_eq!(
         db.get_record("AC").unwrap().read().record.get_field("DLYA"),

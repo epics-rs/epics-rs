@@ -24,8 +24,6 @@
 //! on a cycle whose output fires (ODLY delay-end included), so a non-firing
 //! cycle neither refreshes DOLD nor posts it.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -74,7 +72,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
 async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
     let db = swait_db(1, "W_SRC", 0, 0.0).await;
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
     assert_eq!(
@@ -92,7 +90,7 @@ async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
 
     // The fetch is live on EVERY firing cycle: move the source, re-process.
     db.put_pv("W_SRC", EpicsValue::Double(6.5)).await.unwrap();
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
     assert_eq!(
         db.get_pv("W_TGT").unwrap().to_f64(),
@@ -107,7 +105,7 @@ async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
 async fn r9_65_use_val_never_reads_the_dol_link() {
     let db = swait_db(0, "W_SRC", 0, 0.0).await;
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
     assert_eq!(
@@ -128,7 +126,7 @@ async fn r9_65_use_val_never_reads_the_dol_link() {
 async fn r9_65_use_dol_without_a_link_writes_the_client_put_dold() {
     let db = swait_db(1, "", 0, 0.0).await;
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
     assert_eq!(
@@ -145,7 +143,7 @@ async fn r9_65_use_dol_without_a_link_writes_the_client_put_dold() {
 async fn r9_65_non_firing_cycle_does_not_refresh_dold() {
     let db = swait_db(1, "W_SRC", 6, 0.0).await; // OOPT=6 = "Never"
 
-    let mut v = HashSet::new();
+    let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
     assert_eq!(
@@ -168,7 +166,7 @@ async fn r9_65_odly_fetches_dol_at_delay_end_not_delay_start() {
     let db = swait_db(1, "W_SRC", 0, 100.0).await;
 
     // Delaying cycle: C defers execOutput — no fetch, no write.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v1).await.unwrap();
     assert_eq!(
         field(&db, "W", "DOLD").await,
@@ -186,7 +184,7 @@ async fn r9_65_odly_fetches_dol_at_delay_end_not_delay_start() {
     db.put_pv("W_SRC", EpicsValue::Double(8.0)).await.unwrap();
 
     // Continuation (watchdog cycle) = C's execOutput: fetch DOL, then write.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W", &mut v2).await.unwrap();
     assert_eq!(
         field(&db, "W", "DOLD").await,

@@ -210,7 +210,7 @@ impl Record for CountingTarget {
 /// after the first step is *scheduled* (PACT set); the per-step work runs
 /// in spawned re-entries.
 async fn kick(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

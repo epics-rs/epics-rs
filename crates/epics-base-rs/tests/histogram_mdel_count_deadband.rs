@@ -38,8 +38,6 @@
 //! it is finally delivered. The port's queue does the same, so a burst of posts
 //! shows up as one held entry plus `ncollapse`.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
@@ -66,7 +64,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

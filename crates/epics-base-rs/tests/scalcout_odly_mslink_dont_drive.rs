@@ -18,8 +18,6 @@
 //! severity is NOT lost, and neutralizing the gate drives the target to OVAL,
 //! proving the suppression is the gate's doing.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::ai::AiRecord;
@@ -67,7 +65,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     db.add_record("SC", Box::new(sc)).await.unwrap();
 
     // Bring SRC to INVALID (finite VAL=200 over HIHI=100, HHSV=INVALID).
-    let mut v0 = HashSet::new();
+    let mut v0 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut v0).await.unwrap();
     assert_eq!(
         db.get_record("SRC").unwrap().read().common.sevr,
@@ -76,7 +74,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     );
 
     // SC delaying cycle: ODLY>0 defers; OUT must NOT be written yet.
-    let mut v1 = HashSet::new();
+    let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
@@ -92,7 +90,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     // SC continuation (delayed cycle): the carried nsev commits to
     // sevr==INVALID and the §4.6 IVOA=Don't_drive gate suppresses the OUT
     // write — the target keeps its 0.0 sentinel.
-    let mut v2 = HashSet::new();
+    let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SC", &mut v2).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().common.sevr,

@@ -17,7 +17,6 @@
 //! One test per boundary of that switch, plus the failed-store path the read
 //! owner used to discard silently.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -36,7 +35,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// lands after the DOL read in the same Fire cycle, so a settled destination
 /// means the read is done).
 async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(sseq, &mut visited)
         .await
         .unwrap();
@@ -354,7 +353,7 @@ async fn rejected_link_store_raises_link_invalid() {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SS_REJECT", &mut visited)
         .await
         .unwrap();

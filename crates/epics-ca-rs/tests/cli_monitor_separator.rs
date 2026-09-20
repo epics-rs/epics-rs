@@ -75,7 +75,7 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
     // Process once so the record is DEFINED: a never-processed record carries
     // the initial UDF severity (C `iocInit.c:523-524` — STAT=UDF SEVR=INVALID),
     // which would fill the two alarm columns this test wants empty.
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     server
         .database()
         .process_record_with_links(pv, &mut visited)

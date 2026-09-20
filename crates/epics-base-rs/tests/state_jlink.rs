@@ -22,8 +22,6 @@
 //! name any link mentions, all FALSE. See `an_untouched_state_reads_false`
 //! and `every_named_state_exists_after_ioc_init`.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::filters::sync::db_state_registry;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -52,7 +50,7 @@ async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> 
 }
 
 async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

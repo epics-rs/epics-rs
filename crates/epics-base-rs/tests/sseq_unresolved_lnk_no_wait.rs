@@ -28,7 +28,6 @@
 //! any path where that completion is not delivered, a step waiting forever on a
 //! put that was never made.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -39,7 +38,7 @@ use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn kick(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

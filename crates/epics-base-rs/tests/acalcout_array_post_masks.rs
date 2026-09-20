@@ -42,8 +42,6 @@
 //! port's queue does the same (`event_queue`'s latest-only rule), keeping the
 //! newer snapshot and OR-ing the displaced mask into it.
 
-use std::collections::HashSet;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -52,7 +50,7 @@ use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

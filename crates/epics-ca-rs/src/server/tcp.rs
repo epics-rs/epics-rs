@@ -267,14 +267,14 @@ use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry};
 use epics_base_rs::server::pv::ProcessVariable;
-use epics_base_rs::server::record::{FieldDeclaration, RecordInstance};
+use epics_base_rs::server::record::{FieldDeclaration, RecordCell};
 use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr_into, native_type_for_dbr};
 
 #[derive(Clone)]
 pub(crate) enum ChannelTarget {
     SimplePv(Arc<ProcessVariable>),
     RecordField {
-        record: Arc<parking_lot::RwLock<RecordInstance>>,
+        record: Arc<RecordCell>,
         field: String,
     },
 }
@@ -5081,7 +5081,7 @@ impl PendingWriteNotify {
 /// dropped before return — the read is fully synchronous.
 fn record_field_snapshot_scan_locked(
     db: &PvDatabase,
-    record: &Arc<parking_lot::RwLock<RecordInstance>>,
+    record: &Arc<RecordCell>,
     field: &str,
     string_view: bool,
 ) -> Option<epics_base_rs::server::snapshot::Snapshot> {

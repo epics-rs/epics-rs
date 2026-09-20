@@ -1404,7 +1404,7 @@ fn test_no_bumpless_readback_when_no_edge() {
 // ============================================================
 use epics_base_rs::server::record::ProcessContext;
 
-fn ctx_with_udf(udf: bool) -> ProcessContext {
+fn ctx_with_udf(udf: bool) -> ProcessContext<'static> {
     ProcessContext {
         udf,
         udfs: AlarmSeverity::Invalid,
@@ -1412,13 +1412,12 @@ fn ctx_with_udf(udf: bool) -> ProcessContext {
         phas: 0,
         tse: 0,
         time: std::time::SystemTime::UNIX_EPOCH,
-        tsel: String::new(),
-        dtyp: String::new(),
+        dtyp: "",
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
 
-fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
+fn ctx_with_dtyp(dtyp: &str) -> ProcessContext<'_> {
     ProcessContext {
         udf: false,
         udfs: AlarmSeverity::Invalid,
@@ -1426,8 +1425,7 @@ fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
         phas: 0,
         tse: 0,
         time: std::time::SystemTime::UNIX_EPOCH,
-        tsel: String::new(),
-        dtyp: dtyp.to_string(),
+        dtyp,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }

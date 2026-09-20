@@ -19,7 +19,7 @@
 //! `std::env::set_var` is race-free here: nextest runs each `#[test]` in its own
 //! process, so the variable set below is private to this test's process.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -53,7 +53,7 @@ record(stringin, "GETENV_SI") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("GETENV_SI", &mut visited)
         .await
         .unwrap();
@@ -130,7 +130,7 @@ record(stringin, "GETENV_UNSET") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("GETENV_UNSET", &mut visited)
         .await
         .unwrap();
@@ -186,7 +186,7 @@ record(stringin, "GETENV_UDFS") {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("GETENV_UDFS", &mut visited)
         .await
         .unwrap();

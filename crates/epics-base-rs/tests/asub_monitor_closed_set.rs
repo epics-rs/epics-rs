@@ -31,7 +31,7 @@
 //! set: each `EFLG` arm crossed with the input side, the output side, and the
 //! deadband field.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -61,7 +61,7 @@ fn copy_a_to_vala() -> Arc<SubroutineFn> {
 }
 
 async fn process(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

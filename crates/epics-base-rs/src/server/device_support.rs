@@ -66,6 +66,85 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
     classify_soft(dtyp).is_some()
 }
 
+/// A record's `DTYP` together with the soft-channel class it names.
+///
+/// C reads `prec->dtyp` as an index into the record type's device menu and
+/// never compares the string at process time; a link's `lset` was chosen at
+/// iocInit. This port asks [`classify_soft`] instead, and a scan cycle asks it
+/// three times — the input stage, the RVAL convert and the soft-output value
+/// — so a `calc` that names no device support paid three out-of-line `bcmp`
+/// calls per cycle to re-derive an answer fixed when DTYP was written.
+///
+/// The classification is stored WITH the name and the fields are private, so
+/// the two cannot disagree: [`Self::new`] is the only constructor and it is
+/// the only place [`classify_soft`] runs.
+#[derive(Clone, Debug)]
+pub struct Dtyp {
+    name: String,
+    soft: Option<SoftDtyp>,
+}
+
+impl Dtyp {
+    /// Classify `name` once and keep the answer beside it.
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let soft = classify_soft(&name);
+        Self { name, soft }
+    }
+
+    /// The DTYP text, as a client put it or the `.db` declared it.
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    /// The soft-channel flavour this DTYP names — [`classify_soft`]'s answer,
+    /// taken when the name was set.
+    pub fn soft(&self) -> Option<SoftDtyp> {
+        self.soft
+    }
+
+    /// [`is_soft_dtyp`] for a DTYP that already carries its class.
+    pub fn is_soft(&self) -> bool {
+        self.soft.is_some()
+    }
+}
+
+impl Default for Dtyp {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl From<&str> for Dtyp {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<String> for Dtyp {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+impl std::fmt::Display for Dtyp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+impl PartialEq<str> for Dtyp {
+    fn eq(&self, other: &str) -> bool {
+        self.name == other
+    }
+}
+
+impl PartialEq<&str> for Dtyp {
+    fn eq(&self, other: &&str) -> bool {
+        self.name == *other
+    }
+}
+
 /// Handle for waiting on asynchronous write completion.
 /// Returned by [`DeviceSupport::write_begin`] when the write is submitted
 /// to a worker queue rather than executed synchronously.
@@ -735,7 +814,7 @@ mod tests {
     /// Wire a probe with `verdict` onto a fresh ai and hand back the instance.
     fn wire(verdict: InitVerdict) -> RecordInstance {
         let mut instance = RecordInstance::new("TEST:DEAD".to_string(), AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".to_string();
+        instance.common.dtyp = "ProbeDev".into();
         wire_device_to_record(
             &mut instance,
             Box::new(ProbeDev {
@@ -805,7 +884,7 @@ mod tests {
     #[test]
     fn wire_device_init_failure_flags_record_invalid() {
         let mut instance = RecordInstance::new("TEST:AI".to_string(), AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".to_string();
+        instance.common.dtyp = "ProbeDev".into();
         let obs = Arc::new(Mutex::new(WireObservation::default()));
         let dev = Box::new(ProbeDev {
             obs: obs.clone(),
@@ -838,7 +917,7 @@ mod tests {
     #[test]
     fn wire_device_applies_info_and_record_info_before_init() {
         let mut instance = RecordInstance::new("TEST:AI2".to_string(), AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".to_string();
+        instance.common.dtyp = "ProbeDev".into();
         instance.set_info("asyn:READBACK", "1");
         let obs = Arc::new(Mutex::new(WireObservation::default()));
         let dev = Box::new(ProbeDev {
@@ -860,5 +939,35 @@ mod tests {
             o.info_at_init.iter().any(|k| k == "asyn:READBACK"),
             "info(...) tags must be visible inside init()"
         );
+    }
+
+    /// The stored class must be the classifier's answer for every route into
+    /// `Dtyp` — the whole point of keeping the two together is that a reader
+    /// may trust `soft()` without re-deriving it.
+    #[test]
+    fn a_dtyp_carries_the_class_its_name_classifies_to() {
+        let names = [
+            "",
+            "Soft Channel",
+            "Raw Soft Channel",
+            "Async Soft Channel",
+            "Soft Timestamp",
+            "asynInt32",
+            "Db State",
+        ];
+        for name in names {
+            for built in [
+                Dtyp::new(name),
+                Dtyp::from(name),
+                Dtyp::from(name.to_string()),
+            ] {
+                assert_eq!(built.as_str(), name);
+                assert_eq!(built.soft(), classify_soft(name), "{name:?}");
+                assert_eq!(built.is_soft(), is_soft_dtyp(name), "{name:?}");
+                assert_eq!(built.clone().soft(), classify_soft(name), "{name:?} clone");
+            }
+        }
+        assert_eq!(Dtyp::default().as_str(), "");
+        assert_eq!(Dtyp::default().soft(), classify_soft(""));
     }
 }

@@ -244,7 +244,7 @@ fn acalcout_alarms_every_process_on_an_empty_or_broken_calc() {
 fn a_valid_calc_is_untouched() {
     let mut rec = CalcRecord::default();
     rec.calc = "A+1".into();
-    rec.a = 41.0;
+    rec.vars[0] = 41.0;
     rec.init_record(0).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.val, 42.0);

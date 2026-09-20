@@ -31,7 +31,7 @@
 //! the scalar inputs that had already been read were left applied without a
 //! calc behind them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -82,7 +82,7 @@ async fn build() -> Db {
 }
 
 async fn process(db: &Db, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

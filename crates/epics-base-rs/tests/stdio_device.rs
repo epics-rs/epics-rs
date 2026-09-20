@@ -14,7 +14,7 @@
 //! `can_device_write()`, so a "not INVALID" assertion alone would pass even
 //! when nothing is printed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -79,7 +79,7 @@ async fn build_and_process(db_content: &str, record: &str) -> AlarmSeverity {
         .await
         .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(record, &mut visited)
         .await
         .unwrap();
@@ -145,7 +145,7 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
     .await
     .unwrap();
 
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LSO_ERR", &mut visited)
         .await
         .unwrap();

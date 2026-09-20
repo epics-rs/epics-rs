@@ -30,7 +30,7 @@
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::EpicsValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DB: &str = r#"
@@ -65,7 +65,7 @@ async fn build() -> Arc<epics_base_rs::server::database::PvDatabase> {
 }
 
 async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

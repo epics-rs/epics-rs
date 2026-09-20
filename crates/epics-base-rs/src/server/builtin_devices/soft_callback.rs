@@ -84,9 +84,7 @@ pub(crate) fn add_record(instance: &RecordInstance, name: &str) {
     // is the hook's own, not its caller's — the init owner calls the hook for
     // every record at C's `doResolveLinks` point and each hook answers for
     // itself, the way C's `pdsxt` is either present on the dset or not.
-    if crate::server::device_support::classify_soft(&instance.common.dtyp)
-        != Some(crate::server::device_support::SoftDtyp::Async)
-    {
+    if instance.common.dtyp.soft() != Some(crate::server::device_support::SoftDtyp::Async) {
         return;
     }
     let Some(dset) = callback_dset(instance.record.record_type()) else {

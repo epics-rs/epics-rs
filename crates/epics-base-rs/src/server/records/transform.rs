@@ -1097,6 +1097,13 @@ impl Record for TransformRecord {
         crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
     }
 
+    /// The `INPA..INPP` texts read straight off the record's own array, not
+    /// through the default body's one name match per link.
+    /// See [`Record::set_input_link_slots`].
+    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
+        crate::server::record::input_link_slots_of(&self.inp_links)
+    }
+
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

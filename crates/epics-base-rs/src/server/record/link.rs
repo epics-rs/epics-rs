@@ -273,7 +273,11 @@ impl HwLink {
 pub enum ParsedLink {
     None,
     Constant(String),
-    Db(DbLink),
+    /// Shared, not owned: a parsed DB link is immutable after `parse_link_v2`
+    /// and the cycle clones the record's `parsed_inp` every process, so the
+    /// clone is one atomic increment instead of the link's three heap copies,
+    /// and the enum moves as 16 bytes instead of `DbLink`'s 160.
+    Db(std::sync::Arc<DbLink>),
     Ca(CaLink),
     /// PVA (`pvalink`) link whose payload is a verbatim channel name —
     /// the string shorthand `{pva:"name"}` or the `pva://name` scheme
@@ -588,6 +592,17 @@ pub struct DbLink {
     field: String,
     pub policy: LinkProcessPolicy,
     pub monitor_switch: MonitorSwitch,
+    /// [`Self::pvname`] resolved, computed ONCE here because
+    /// [`Self::new`] is the only way to make a `DbLink` — so the two cannot
+    /// drift, and no reader pays for the resolution.
+    ///
+    /// It used to be re-derived on every [`Self::target`] call: the name
+    /// reassembled out of the halves above and handed back to
+    /// `parse_channel_name`, five string allocations to recover a split this
+    /// struct had already made. A process cycle asks it several times per
+    /// link — the value read, the self-link test, the out-target resolve —
+    /// where C dereferences a `dbAddr` it filled in at `dbInitLink`.
+    channel: crate::server::database::filters::ChannelName,
 }
 
 impl DbLink {
@@ -605,11 +620,20 @@ impl DbLink {
             Some((record, field)) => (record.to_string(), field),
             None => (pvname.to_string(), "VAL".to_string()),
         };
+        // From the REASSEMBLED name, not the caller's: `src.VAL` and `src`
+        // split alike but are not the same `record_path`, and `pvname` is
+        // what every reader of this link addresses.
+        let channel = crate::server::database::filters::parse_channel_name(&if field == "VAL" {
+            record.clone()
+        } else {
+            format!("{record}.{field}")
+        });
         Self {
             record,
             field,
             policy,
             monitor_switch,
+            channel,
         }
     }
 
@@ -639,8 +663,8 @@ impl DbLink {
     /// owns it for CA CREATE_CHANNEL and both PVA sources, and owning it
     /// for links too is what keeps "where does the name stop and the
     /// filter begin" one answer instead of four.
-    pub fn target(&self) -> crate::server::database::filters::ChannelName {
-        crate::server::database::filters::parse_channel_name(&self.pvname())
+    pub fn target(&self) -> &crate::server::database::filters::ChannelName {
+        &self.channel
     }
 }
 
@@ -966,6 +990,11 @@ pub fn check_link_assignment(
 }
 
 impl ParsedLink {
+    /// A DB link, shared behind the `Arc` [`ParsedLink::Db`] carries.
+    pub fn db(link: DbLink) -> Self {
+        ParsedLink::Db(std::sync::Arc::new(link))
+    }
+
     /// The static [`DbLinkType`] this link's text parses to — C's
     /// `dbLinkInfo::ltype` as `dbParseLink` sets it.
     ///
@@ -2490,7 +2519,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // `dbFindFieldPart`'s "absent field name" branch,
     // `dbStaticLib.c:1802-1811`, which resolves to `pvalFldDes`). Both live
     // in `DbLink::new`.
-    ParsedLink::Db(DbLink::new(link_part, policy, ms))
+    ParsedLink::db(DbLink::new(link_part, policy, ms))
 }
 
 /// Split a link target into `(record, FIELD)`, mirroring C `dbNameToAddr`
@@ -3130,12 +3159,11 @@ mod json_link_tests {
         // registering the holder in the CP trigger registry.
         assert_eq!(
             parse_link_v2("REC CP NPP"),
-            ParsedLink::Db(DbLink {
-                record: "REC".to_string(),
-                field: "VAL".to_string(),
-                policy: LinkProcessPolicy::NoProcess,
-                monitor_switch: MonitorSwitch::NoMaximize,
-            })
+            ParsedLink::db(DbLink::new(
+                "REC",
+                LinkProcessPolicy::NoProcess,
+                MonitorSwitch::NoMaximize,
+            ))
         );
         // "OTHER:PV CP CA" → CA is matched BEFORE CP, so it is pvlOptCA alone:
         // a plain CA link whose holder never processes. Pre-fix this was a Ca
@@ -3154,35 +3182,25 @@ mod json_link_tests {
         // Pre-fix this became an external CA channel.
         assert_eq!(
             parse_link_v2("REC PP CA"),
-            ParsedLink::Db(DbLink {
-                record: "REC".to_string(),
-                field: "VAL".to_string(),
-                policy: LinkProcessPolicy::ProcessPassive,
-                monitor_switch: MonitorSwitch::NoMaximize,
-            })
+            ParsedLink::db(DbLink::new(
+                "REC",
+                LinkProcessPolicy::ProcessPassive,
+                MonitorSwitch::NoMaximize,
+            ))
         );
         // CPP is matched before PP, and CP only after CA.
         assert!(matches!(
             parse_link_v2("REC CPP"),
-            ParsedLink::Db(DbLink {
-                policy: LinkProcessPolicy::ChannelProcessPassive,
-                ..
-            })
+            ParsedLink::Db(l) if l.policy == LinkProcessPolicy::ChannelProcessPassive
         ));
         assert!(matches!(
             parse_link_v2("REC CP"),
-            ParsedLink::Db(DbLink {
-                policy: LinkProcessPolicy::ChannelProcess,
-                ..
-            })
+            ParsedLink::Db(l) if l.policy == LinkProcessPolicy::ChannelProcess
         ));
         // Exactly one class: a modifier-less link is NPP.
         assert!(matches!(
             parse_link_v2("REC"),
-            ParsedLink::Db(DbLink {
-                policy: LinkProcessPolicy::NoProcess,
-                ..
-            })
+            ParsedLink::Db(l) if l.policy == LinkProcessPolicy::NoProcess
         ));
     }
 
@@ -3194,12 +3212,11 @@ mod json_link_tests {
     fn modifiers_are_substring_matched_not_space_delimited() {
         assert_eq!(
             parse_link_v2("REC QQCPPXMSITT"),
-            ParsedLink::Db(DbLink {
-                record: "REC".to_string(),
-                field: "VAL".to_string(),
-                policy: LinkProcessPolicy::ChannelProcessPassive,
-                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
-            })
+            ParsedLink::db(DbLink::new(
+                "REC",
+                LinkProcessPolicy::ChannelProcessPassive,
+                MonitorSwitch::MaximizeIfInvalid,
+            ))
         );
     }
 

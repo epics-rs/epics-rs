@@ -33,7 +33,7 @@
 //! different defect (the funnel splits the fetch from the conversion, so
 //! no conversion status reaches the link), and is not claimed here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -67,7 +67,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();

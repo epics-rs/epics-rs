@@ -146,7 +146,7 @@ record(mbbiDirect, "M") {
         .await
         .unwrap();
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("M", &mut visited)
         .await
         .unwrap();

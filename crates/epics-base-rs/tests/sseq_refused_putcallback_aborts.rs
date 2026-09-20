@@ -35,7 +35,6 @@
 //! resolved a class takes C's `default:` arm instead, makes no put at all and
 //! raises nothing — that boundary is `sseq_unresolved_lnk_no_wait.rs`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,7 +80,7 @@ impl LinkSet for AdmissionLset {
 }
 
 async fn kick(db: &PvDatabase, name: &str) {
-    let mut visited = HashSet::new();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();

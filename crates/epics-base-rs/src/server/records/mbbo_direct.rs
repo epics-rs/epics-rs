@@ -274,7 +274,7 @@ impl Record for MbboDirectRecord {
     /// (empty namsg). So a PVA read of an undefined mbboDirect serves
     /// `alarm.message = "UDFS"` (pvxs `iocsource.cpp:230-236` prefers the
     /// non-empty amsg), not the "UDF" condition string.
-    fn udf_alarm_message(&self) -> &str {
+    fn udf_alarm_message(&self) -> &'static str {
         "UDFS"
     }
 

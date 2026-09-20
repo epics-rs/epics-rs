@@ -79,6 +79,7 @@ use epics_base_rs::runtime::task::Reactor;
 
 use super::blocking::BlockingPvaServer;
 use super::config::PvaServerConfig;
+#[cfg(unix)]
 use super::reactor::ReactorPvaServer;
 use super::source::DynSource;
 use crate::error::PvaResult;
@@ -145,6 +146,7 @@ impl PvaServerDriver for BlockingPvaServer {
     }
 }
 
+#[cfg(unix)]
 impl PvaServerDriver for ReactorPvaServer {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         ReactorPvaServer::local_addr(self)
@@ -178,13 +180,22 @@ impl PvaServerDriver for ReactorPvaServer {
 /// Which driver to build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DriverKind {
-    /// One thread per connection.
+    /// One thread per connection. The only driver where the readiness layer
+    /// does not build (Windows), and so the default there.
+    #[cfg_attr(not(unix), default)]
     Blocking,
     /// One readiness poller for all connections. The default; see the module
     /// doc for the measurement that chose it.
+    #[cfg(unix)]
     #[default]
     Reactor,
 }
+
+/// The names [`DriverKind::parse`] accepts, for its error message.
+#[cfg(unix)]
+const ACCEPTED: &str = "`blocking` or `reactor`";
+#[cfg(not(unix))]
+const ACCEPTED: &str = "`blocking` (the `reactor` driver is unix-only)";
 
 impl DriverKind {
     /// Read [`DRIVER_ENV`].
@@ -206,10 +217,9 @@ impl DriverKind {
             // a boot command line is often written as the empty assignment.
             "" => Ok(Self::default()),
             "blocking" => Ok(Self::Blocking),
+            #[cfg(unix)]
             "reactor" => Ok(Self::Reactor),
-            other => Err(format!(
-                "{DRIVER_ENV}={other}: expected `blocking` or `reactor`"
-            )),
+            other => Err(format!("{DRIVER_ENV}={other}: expected {ACCEPTED}")),
         }
     }
 
@@ -217,6 +227,7 @@ impl DriverKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Blocking => "blocking",
+            #[cfg(unix)]
             Self::Reactor => "reactor",
         }
     }
@@ -235,6 +246,7 @@ pub fn bind<A: ToSocketAddrs>(
 ) -> io::Result<Arc<dyn PvaServerDriver>> {
     Ok(match kind {
         DriverKind::Blocking => Arc::new(BlockingPvaServer::bind(addr, source, config)?),
+        #[cfg(unix)]
         DriverKind::Reactor => Arc::new(ReactorPvaServer::bind(addr, source, config)?),
     })
 }
@@ -245,6 +257,7 @@ mod tests {
     use crate::server_native::blocking::tests::{isolated_config, test_source};
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[cfg(unix)]
     #[test]
     fn an_unset_variable_selects_the_measured_driver() {
         assert_eq!(DriverKind::parse(None), Ok(DriverKind::Reactor));
@@ -252,8 +265,20 @@ mod tests {
         assert_eq!(DriverKind::parse(Some("   ")), Ok(DriverKind::Reactor));
     }
 
+    /// Where the readiness layer does not build, the name of the driver that
+    /// needs it is refused like any other unknown name — not defaulted.
+    #[cfg(not(unix))]
+    #[test]
+    fn without_a_readiness_layer_the_blocking_driver_is_the_only_one() {
+        assert_eq!(DriverKind::parse(None), Ok(DriverKind::Blocking));
+        assert_eq!(DriverKind::parse(Some("")), Ok(DriverKind::Blocking));
+        let err = DriverKind::parse(Some("reactor")).expect_err("reactor is refused");
+        assert!(err.contains(DRIVER_ENV) && err.contains("reactor"), "{err}");
+    }
+
     #[test]
     fn both_names_are_accepted_in_any_case() {
+        #[cfg(unix)]
         for raw in ["reactor", "Reactor", "  REACTOR  "] {
             assert_eq!(
                 DriverKind::parse(Some(raw)),
@@ -287,7 +312,10 @@ mod tests {
     /// caller holds one type.
     #[test]
     fn the_factory_builds_either_driver_behind_one_handle() {
-        for kind in [DriverKind::Blocking, DriverKind::Reactor] {
+        let mut kinds = vec![DriverKind::Blocking];
+        #[cfg(unix)]
+        kinds.push(DriverKind::Reactor);
+        for kind in kinds {
             let server = bind(
                 kind,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),

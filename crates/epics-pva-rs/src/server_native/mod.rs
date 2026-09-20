@@ -55,7 +55,9 @@ pub mod runtime;
 // The readiness-poller driver — the third beside `accept` and `blocking`, for
 // targets with no tokio reactor that can still afford one of their own. Owns
 // sockets, so it belongs to the I/O layer; host-compiled and host-tested for
-// the same reason `blocking` is.
+// the same reason `blocking` is. Gated as the readiness layer it sits on is:
+// `unix` only, so Windows keeps `accept` and `blocking`.
+#[cfg(unix)]
 pub mod reactor;
 pub mod search;
 // One UDP datagram's worth of SEARCH decode on top of [`search`]: chained

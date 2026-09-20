@@ -312,9 +312,10 @@ mod tests {
     /// caller holds one type.
     #[test]
     fn the_factory_builds_either_driver_behind_one_handle() {
-        let mut kinds = vec![DriverKind::Blocking];
         #[cfg(unix)]
-        kinds.push(DriverKind::Reactor);
+        let kinds = [DriverKind::Blocking, DriverKind::Reactor];
+        #[cfg(not(unix))]
+        let kinds = [DriverKind::Blocking];
         for kind in kinds {
             let server = bind(
                 kind,

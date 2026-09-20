@@ -44,9 +44,13 @@
 # selection in epics-rtems-boot reads that version with pvxs's rule
 # "kqueue from 6.3" - true for 7.0.0, false for 6.0.0. So a series-6 prefix,
 # although this script verified the fixes are in its tree, would be gated to
-# the blocking driver by its version alone; epics-rs-env.sh therefore exports
+# the select backend by its version alone; epics-rs-env.sh therefore exports
 # EPICS_RTEMS_KQUEUE=1 for series 6, which is the override that gate takes.
-# Series 7 needs no override.
+# Series 7 needs no override. The gate reads the variable in the TARGET
+# process, so what carries it there is the image's boot command line:
+# epics-rtems-boot's build.rs forwards this export into that line, which is
+# why sourcing this file before scripts/embedded-image.sh is what turns
+# kqueue on and exporting it before booting the emulator is not.
 #
 # PINS
 #

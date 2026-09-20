@@ -96,9 +96,14 @@ extern int main(int argc, char **argv);
  * EPICS_CA_ADDR_LIST was ignored with no error.
  *
  * Compile-time default, overridden at run time by the DHCP option
- * `rtems_cmdline` exactly as base overrides its own (base :762). Build with
+ * `rtems_cmdline` exactly as base overrides its own (base :762). The define is
+ * made by `build.rs` from the build environment, so an image is configured by
  *
- *     -DEPICS_RTEMS_CMDLINE="EPICS_CA_ADDR_LIST=10.0.2.2 /db/site.db"
+ *     EPICS_RTEMS_CMDLINE="EPICS_CA_ADDR_LIST=10.0.2.2 /db/site.db" \
+ *         scripts/embedded-image.sh rtems ca
+ *
+ * and not by anything the emulator or the boot loader passes: QEMU's `-append`
+ * does not reach this buffer.
  *
  * The buffer is larger than base's 128: base holds one pathname, this holds a
  * site's whole environment. It is never truncated — a half-copied

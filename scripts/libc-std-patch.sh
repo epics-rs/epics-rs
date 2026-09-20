@@ -49,11 +49,22 @@
 # fail loudly at compile — that is the trip-wire to rebase the fork branch
 # and bump the manifest rev.
 #
+# A VERSION LABEL IS A CLAIM ABOUT API, so the relabel is only half the job:
+# std is compiled against the version the checkout says it is, and names the
+# libc fields of that version directly. Where the fork carries a rename that
+# no 0.2 release has published yet, the checkout must present the published
+# spelling or std fails on the field it cannot find. `STD_STAT_SPELLING`
+# below reads which spelling std itself uses and reconciles the checkout to
+# it — by NAME only, never by layout, since the pinned content is the one
+# that matches the BSP header — so the reconciliation retires on its own
+# once the rename ships.
+#
 # Usage: scripts/libc-std-patch.sh <toolchain>
 #   Checkouts are cached under
-#   $CARGO_TARGET_DIR/libc-std-patch/<rev>-<version>, one per (rev, version)
-#   pair, so a toolchain bump prepares a fresh one instead of relabelling in
-#   place.
+#   $CARGO_TARGET_DIR/libc-std-patch/<rev>-<version>, keyed on (rev, version,
+#   spelling), so a toolchain bump prepares a fresh one instead of relabelling
+#   in place — including when it moves the spelling without moving the
+#   version, which the directory name cannot show.
 
 set -euo pipefail
 
@@ -85,17 +96,79 @@ if [[ -z "$STD_LIBC_VER" ]]; then
     exit 1
 fi
 
+# The spelling that toolchain's std reads for the newlib `stat` timestamps.
+# `os/rtems/fs.rs` names the libc fields in the body of its accessors, so
+# std's own source answers it without guessing from a version number.
+STD_RTEMS_FS="$SYSROOT/lib/rustlib/src/rust/library/std/src/os/rtems/fs.rs"
+if [[ ! -f "$STD_RTEMS_FS" ]]; then
+    echo "error: $STD_RTEMS_FS not found - is the rust-src component installed for '$TOOLCHAIN'?" >&2
+    exit 1
+fi
+if grep -q 'as_inner()\.st_atime as' "$STD_RTEMS_FS"; then
+    STD_STAT_SPELLING=st_atime
+elif grep -q 'as_inner()\.st_atim\.tv_sec' "$STD_RTEMS_FS"; then
+    STD_STAT_SPELLING=st_atim
+else
+    echo "error: $STD_RTEMS_FS reads the stat timestamps in neither spelling this" >&2
+    echo "       script knows (st_atime, st_atim.tv_sec); teach it the new one." >&2
+    exit 1
+fi
+
 DEST="${CARGO_TARGET_DIR:-target}/libc-std-patch/$LIBC_REV-$STD_LIBC_VER"
 case "$DEST" in
     /*) : ;;
     *) DEST="$REPO_ROOT/$DEST" ;;
 esac
 
-# `.fork-version` is checked alongside `.ready`: both are written by this
-# script, and a directory carrying one without the other is a checkout an
-# older revision of this script prepared — rebuild it rather than failing
-# on the missing marker.
-if [[ ! -f "$DEST/.ready" || ! -f "$DEST/.fork-version" ]]; then
+# Give the newlib `stat` timestamps the names std reads WITHOUT moving a
+# byte. The BSP header is the authority
+# (`$RTEMS_BSP_PREFIX/arm-rtems6/include/sys/stat.h:41-49`): on `__rtems__`
+# the three timestamps ARE `struct timespec`, `st_blksize`/`st_blocks`
+# follow them, there is no `st_spare4`, and C code reaches the old names
+# through `#define st_atime st_atim.tv_sec`. A macro is what Rust cannot
+# have, which is the whole of this mismatch: the pinned fork spells the
+# fields `st_atim`/`st_mtim`/`st_ctim` (27fe099a, a backport of PR #5132,
+# merged and unreleased) and std, compiled against the version this checkout
+# is relabelled to, names `st_atime`.
+#
+# So the rewrite splits each `timespec` into its two members and pads the
+# group back to `size_of::<timespec>()`. The padding is what the flat
+# published spelling gets wrong and must not be dropped: on a 32-bit target
+# `timespec` is `i64 + i32` in 16 bytes, and three flat `time_t + c_long`
+# pairs end four bytes early, which walks `st_blksize` and `st_blocks` off
+# their offsets. `NEWLIB_TIMESPEC_PAD` derives the width from the types
+# rather than the triple, so it is 4 where `c_long` is 32-bit and 0 where it
+# is 64-bit. std reads the seconds only — `st_*_nsec()` is hardcoded to 0 —
+# so the nsec member keeps its value and just answers to a Rust name.
+relabel_newlib_stat() {
+    local file="$1"
+    cat >> "$file" <<'RS'
+
+// Injected by scripts/libc-std-patch.sh: the tail padding `struct timespec`
+// carries wherever `c_long` is narrower than `time_t`. See that script.
+const NEWLIB_TIMESPEC_PAD: usize = core::mem::size_of::<crate::timespec>()
+    - core::mem::size_of::<crate::time_t>()
+    - core::mem::size_of::<c_long>();
+RS
+    sed -E -i \
+        -e 's/^( *)pub st_atim: crate::timespec,$/\1pub st_atime: crate::time_t,\n\1pub st_atime_nsec: c_long,\n\1__pad_st_atim: [u8; NEWLIB_TIMESPEC_PAD],/' \
+        -e 's/^( *)pub st_mtim: crate::timespec,$/\1pub st_mtime: crate::time_t,\n\1pub st_mtime_nsec: c_long,\n\1__pad_st_mtim: [u8; NEWLIB_TIMESPEC_PAD],/' \
+        -e 's/^( *)pub st_ctim: crate::timespec,$/\1pub st_ctime: crate::time_t,\n\1pub st_ctime_nsec: c_long,\n\1__pad_st_ctim: [u8; NEWLIB_TIMESPEC_PAD],/' \
+        "$file"
+    if grep -qE '^ *pub st_[amc]tim: crate::timespec,$' "$file"; then
+        echo "error: $file still declares the unreleased st_atim/st_mtim/st_ctim" >&2
+        echo "       spelling after the rewrite - the struct has moved." >&2
+        exit 1
+    fi
+}
+
+# `.fork-version` and `.stat-spelling` are checked alongside `.ready`: all
+# three are written by this script, and a directory carrying one without the
+# others is a checkout an older revision of this script prepared — rebuild it
+# rather than failing on the missing marker. A spelling that no longer
+# matches the toolchain's std rebuilds it too.
+if [[ ! -f "$DEST/.ready" || ! -f "$DEST/.fork-version" ||
+      "$(cat "$DEST/.stat-spelling" 2>/dev/null)" != "$STD_STAT_SPELLING" ]]; then
     rm -rf "$DEST"
     mkdir -p "$DEST"
     git -C "$DEST" init -q
@@ -104,8 +177,12 @@ if [[ ! -f "$DEST/.ready" || ! -f "$DEST/.fork-version" ]]; then
     rm -rf "$DEST/.git"
     sed -n 's/^version = "\(.*\)"/\1/p' "$DEST/Cargo.toml" | head -1 > "$DEST/.fork-version"
     sed -E -i "s/^version = \"[0-9.]+\"/version = \"$STD_LIBC_VER\"/" "$DEST/Cargo.toml"
+    if [[ "$STD_STAT_SPELLING" == st_atime ]]; then
+        relabel_newlib_stat "$DEST/src/unix/newlib/mod.rs"
+    fi
+    echo "$STD_STAT_SPELLING" > "$DEST/.stat-spelling"
     touch "$DEST/.ready"
-    echo "libc-std-patch: prepared $LIBC_REV as libc $STD_LIBC_VER at $DEST" >&2
+    echo "libc-std-patch: prepared $LIBC_REV as libc $STD_LIBC_VER ($STD_STAT_SPELLING) at $DEST" >&2
 fi
 FORK_VER=$(cat "$DEST/.fork-version")
 

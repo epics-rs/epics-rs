@@ -16,7 +16,9 @@
 //!    [`IocBuilder`](epics_base_rs::server::ioc_builder::IocBuilder), driven to completion with
 //!    [`block_on_sync`](epics_base_rs::runtime::task::block_on_sync), which on
 //!    a plain thread with no runtime entered selects `park_on`.
-//! 3. **PVA front-end** — [`BlockingPvaServer`](epics_pva_rs::server_native::blocking::BlockingPvaServer) over a
+//! 3. **PVA front-end** — one of the two native drivers, selected by
+//!    [`EPICS_PVA_RS_DRIVER`](epics_pva_rs::server_native::driver::DRIVER_ENV)
+//!    and defaulting to the reactor, over a
 //!    [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource) carrying two sources: the
 //!    [`PvDatabaseSource`](epics_pva_rs::server::PvDatabaseSource) as `qsrvSingle` at order 0 and the QSRV
 //!    bridge as `qsrvGroup` at order 1. The TCP accept loop runs on one
@@ -70,7 +72,7 @@
 //!   reuse group and SEARCHes are load-balanced away. A successful UDP bind is
 //!   therefore not proof of exclusive ownership; `pvxlist` is.
 //! * The GUID is not a configuration field the caller fills in.
-//!   [`BlockingPvaServer::bind`](epics_pva_rs::server_native::blocking::BlockingPvaServer::bind) stamps it from
+//!   [`driver::bind`](epics_pva_rs::server_native::driver::bind) stamps it from
 //!   [`random_guid`](epics_pva_rs::server_native::search_engine::random_guid)
 //!   at construction, so there is no window in which this binary could
 //!   advertise the all-zero GUID a freshly-`Default`ed [`PvaServerConfig`](epics_pva_rs::server_native::config::PvaServerConfig)
@@ -285,9 +287,10 @@ mod ioc {
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
     use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
-    use epics_pva_rs::server_native::blocking::{BlockingPvaServer, bind_udp_search};
+    use epics_pva_rs::server_native::blocking::bind_udp_search;
     use epics_pva_rs::server_native::composite::CompositeSource;
     use epics_pva_rs::server_native::config::PvaServerConfig;
+    use epics_pva_rs::server_native::driver::{self, DriverKind};
 
     use crate::demo_db::DEMO_DB;
 
@@ -775,19 +778,36 @@ mod ioc {
         //     registered below are ordinary records, so they answer from
         //     order 0, and with QSRV2 disabled they do not answer at all.
 
-        let server =
-            match BlockingPvaServer::bind(SocketAddr::new(bind_ip, tcp_port), composite, config) {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    // Not "cannot bind": `BlockingPvaServer::bind` also calls
-                    // `local_addr`, and on RTEMS that is the call that fails
-                    // (the libc `sockaddr` length byte). The inner error says which.
-                    eprintln!(
-                        "realtime-pva-ioc: cannot start the PVA TCP server on port {tcp_port}: {e}"
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
+        //     Which driver serves it is read from the environment, defaulting
+        //     to the reactor — the one the bring-up box measured at 38,483 B a
+        //     connection against the thread-per-connection driver's 1,559,487 B.
+        //     A value that is neither name is fatal rather than defaulted: an
+        //     IOC that quietly ran the driver the operator thought they had
+        //     turned off would be measured as the one they asked for.
+        let driver_kind = match DriverKind::from_env() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("realtime-pva-ioc: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let server = match driver::bind(
+            driver_kind,
+            SocketAddr::new(bind_ip, tcp_port),
+            composite,
+            config,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // Not "cannot bind": both drivers' `bind` also call
+                // `local_addr`, and on RTEMS that is the call that fails
+                // (the libc `sockaddr` length byte). The inner error says which.
+                eprintln!(
+                    "realtime-pva-ioc: cannot start the PVA TCP server on port {tcp_port}: {e}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
         let bound_tcp = server.tcp_port();
 
         // (3b) The UDP search responder, bound wildcard rather than to
@@ -903,9 +923,10 @@ mod ioc {
 
         println!(
             "realtime-pva-ioc: serving {} records on PVA TCP port {bound_tcp} ({search_status}), \
-             GUID {}, RTEMS execution model, no tokio runtime",
+             GUID {}, {} driver, RTEMS execution model, no tokio runtime",
             names.len(),
             guid_hex(server.guid()),
+            driver_kind.as_str(),
         );
         println!(
             "realtime-pva-ioc: QSRV2 {}",
@@ -1378,7 +1399,7 @@ mod tests {
 
     /// The server config comes from the constructor that fills the GUID.
     ///
-    /// `BlockingPvaServer::bind` stamps the GUID from `random_guid`; a config
+    /// `driver::bind` stamps the GUID from `random_guid`; a config
     /// assembled field-by-field from `PvaServerConfig::default()` without
     /// `with_env` — or a struct literal — ships the all-zero GUID, which
     /// degrades silently on every consumer rather than failing.

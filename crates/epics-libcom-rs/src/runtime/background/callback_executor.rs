@@ -558,6 +558,128 @@ impl Default for CallbackPool {
     }
 }
 
+/// A task executor of a server's own, at a priority the server chooses.
+///
+/// # Why this exists beside [`CallbackPool`]
+///
+/// `CallbackPool` is the port of `callback.c`, so its three bands carry C's
+/// thread priorities and nothing else: `epicsThreadPriorityScanLow - 1`, `+ 4`,
+/// `epicsThreadPriorityScanHigh + 1` — 59, 64, 71. That ladder is parity, not a
+/// preference, and it must not become configurable.
+///
+/// A network server's band is set against the *other servers* in the IOC, not
+/// against record processing: pvxs runs its TCP reactor at `CAServerLow-2` =
+/// 18, CA's rsrv its own ladder from `caservertask.c`. Before this type the
+/// only executor a future could be spawned onto was the callback pool, so
+/// every server's connection future ran at 64 — in the band C reserves for
+/// deferred record processing, sharing its rings. Two consequences, and the
+/// second is the one that bites: the pvxs band layout was not reproduced, and
+/// a slow connection and a deferred record tail could starve each other.
+///
+/// # One ring, whatever band is named
+///
+/// A dedicated executor has one priority by construction, so the
+/// [`CallbackPriority`] a caller names on [`handle`](Self::handle) selects
+/// nothing — all three slots are the same ring. That is deliberate: it keeps
+/// the handle type shared with the callback pool, so
+/// [`spawn_future`](crate::runtime::background::spawn_future) needs no second
+/// form, and it makes naming a band here impossible to get wrong rather than
+/// silently routing work to a ring with no worker.
+pub struct DedicatedExecutor {
+    queue: Arc<PriorityQueue>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl DedicatedExecutor {
+    /// Start `threads` workers named `name` at `priority`.
+    ///
+    /// Fallible, unlike [`CallbackPool`]'s `MandatoryThread` workers: this
+    /// executor belongs to one server, so a thread that cannot start is that
+    /// server's `bind` failing, not the process aborting. `threads` is clamped
+    /// to at least 1 — an executor with no worker is a queue whose tasks never
+    /// run.
+    pub fn new(name: &str, priority: ThreadPriority, threads: usize) -> std::io::Result<Self> {
+        let threads = threads.max(1);
+        let queue = Arc::new(PriorityQueue::new(
+            CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed).max(1),
+        ));
+        let mut workers = Vec::with_capacity(threads);
+        for j in 0..threads {
+            // `callback.c:324-327`'s naming rule, applied to this executor's
+            // own name: bare when single, `-<n>` when parallel.
+            let worker_name = if threads > 1 {
+                format!("{name}-{j}")
+            } else {
+                name.to_string()
+            };
+            let pq = Arc::clone(&queue);
+            let watched_name = worker_name.clone();
+            let spawned = crate::runtime::task::spawn_dedicated_thread(
+                worker_name,
+                priority,
+                StackSizeClass::Big,
+                move || {
+                    let _watched = crate::runtime::taskwd::taskwd_insert(
+                        watched_name,
+                        crate::runtime::taskwd::CheckIn::Unbounded,
+                        None,
+                    );
+                    run_facility_loop(
+                        FACILITY,
+                        || worker_loop(&pq),
+                        || recover(FACILITY, pq.state.lock()).shutdown = true,
+                    );
+                },
+            );
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    // The workers already started have to go before the error
+                    // leaves, or they outlive the executor nobody now holds.
+                    let mut partial = DedicatedExecutor { queue, workers };
+                    partial.shutdown();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(DedicatedExecutor { queue, workers })
+    }
+
+    /// A submission handle. Every band names the same ring — see the type doc.
+    pub fn handle(&self) -> CallbackHandle {
+        CallbackHandle {
+            queues: [
+                Arc::clone(&self.queue),
+                Arc::clone(&self.queue),
+                Arc::clone(&self.queue),
+            ],
+        }
+    }
+
+    /// Stop the workers and join them. Idempotent; [`Drop`] calls it.
+    pub fn shutdown(&mut self) {
+        recover(FACILITY, self.queue.state.lock()).shutdown = true;
+        self.queue.wake.notify_all();
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+impl std::fmt::Debug for DedicatedExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DedicatedExecutor")
+            .field("workers", &self.workers.len())
+            .finish()
+    }
+}
+
+impl Drop for DedicatedExecutor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl Drop for CallbackPool {
     fn drop(&mut self) {
         self.shutdown();
@@ -572,6 +694,95 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// The property the type exists for: work submitted to a dedicated
+    /// executor runs on a thread at the priority its owner asked for, not on
+    /// C's `cbMedium` band.
+    #[test]
+    fn a_dedicated_executor_runs_its_work_at_the_priority_it_was_given() {
+        let exec = DedicatedExecutor::new("TESTEXEC", ThreadPriority::Custom(18), 1)
+            .expect("executor starts");
+        let (tx, rx) = mpsc::channel();
+        exec.handle()
+            .request(
+                CallbackPriority::Medium,
+                Box::new(move || {
+                    let name = std::thread::current()
+                        .name()
+                        .unwrap_or_default()
+                        .to_string();
+                    tx.send(name).expect("send");
+                }),
+            )
+            .expect("enqueue");
+        assert_eq!(rx.recv_timeout(T).expect("callback ran"), "TESTEXEC");
+    }
+
+    /// Naming a band on a dedicated executor selects nothing — all three reach
+    /// the one ring. A band that silently had no worker would hang instead.
+    #[test]
+    fn every_band_on_a_dedicated_executor_names_the_same_ring() {
+        let exec = DedicatedExecutor::new("BANDEXEC", ThreadPriority::Custom(18), 1)
+            .expect("executor starts");
+        for band in CallbackPriority::ALL {
+            let (tx, rx) = mpsc::channel();
+            exec.handle()
+                .request(band, Box::new(move || tx.send(()).expect("send")))
+                .expect("enqueue");
+            rx.recv_timeout(T)
+                .unwrap_or_else(|_| panic!("{band:?} reached a worker"));
+        }
+    }
+
+    /// Parallel workers get C's `callbackTask` naming rule, and all of them
+    /// drain the one ring.
+    #[test]
+    fn parallel_workers_share_the_ring_and_are_numbered() {
+        let exec = DedicatedExecutor::new("PAREXEC", ThreadPriority::Custom(18), 2)
+            .expect("executor starts");
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            exec.handle()
+                .request(
+                    CallbackPriority::Medium,
+                    Box::new(move || {
+                        let name = std::thread::current()
+                            .name()
+                            .unwrap_or_default()
+                            .to_string();
+                        tx.send(name).expect("send");
+                    }),
+                )
+                .expect("enqueue");
+        }
+        drop(tx);
+        let names: Vec<String> = rx.iter().take(8).collect();
+        assert_eq!(names.len(), 8, "every task ran");
+        for name in &names {
+            assert!(
+                name == "PAREXEC-0" || name == "PAREXEC-1",
+                "unexpected worker {name}"
+            );
+        }
+    }
+
+    /// `shutdown` is what `Drop` calls, so a second call must not hang on
+    /// workers that are already joined.
+    #[test]
+    fn shutting_a_dedicated_executor_down_twice_is_a_no_op() {
+        let mut exec = DedicatedExecutor::new("DUPEXEC", ThreadPriority::Custom(18), 1)
+            .expect("executor starts");
+        exec.shutdown();
+        exec.shutdown();
+        // A request after shutdown is dropped, not an error — C's rule for a
+        // stopped pool (`callback.c:237-284`).
+        assert!(
+            exec.handle()
+                .request(CallbackPriority::Medium, Box::new(|| {}))
+                .is_ok()
+        );
+    }
 
     /// Boundary: a callback that panics. It runs on the band's own worker, so
     /// before this one panicking callback silently retired the band and every

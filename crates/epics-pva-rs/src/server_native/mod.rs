@@ -36,6 +36,10 @@ pub mod accept;
 // hosted behaviour can be shown unchanged.
 pub mod blocking;
 pub mod composite;
+// Which of the two native drivers an image runs. The two have one runtime
+// surface, so the fork belongs at one call site rather than at every consumer
+// of a server handle.
+pub mod driver;
 // The server config record. No socket, no async — see the module doc for why
 // it is not part of [`runtime`].
 pub mod config;
@@ -48,6 +52,11 @@ pub mod peers;
 pub mod runtime;
 // SEARCH parse / name-match / response framing. Protocol only — both the UDP
 // responders and the TCP-circuit handler feed it bytes they read themselves.
+// The readiness-poller driver — the third beside `accept` and `blocking`, for
+// targets with no tokio reactor that can still afford one of their own. Owns
+// sockets, so it belongs to the I/O layer; host-compiled and host-tested for
+// the same reason `blocking` is.
+pub mod reactor;
 pub mod search;
 // One UDP datagram's worth of SEARCH decode on top of [`search`]: chained
 // message drain, ORIGIN_TAG forward decision, reply-destination resolution,

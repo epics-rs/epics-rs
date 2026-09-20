@@ -66,9 +66,12 @@ records the revisions in the prefix's `epics-rs-env.sh`. A prefix assembled
 by hand matches no upstream tip and cannot be named in a bug report.
 
 Series 7 is the default: a `main` tree reports 7.0.0 in `cpuopts.h`, so the
-version-based driver gate the `kqueue` reactor will use reads it as usable
-with no override. A 6-branch tree reports 6.0.0 until the 6.3 tag exists, so
-the series-6 `epics-rs-env.sh` also exports `EPICS_RTEMS_KQUEUE=1`. The
+version-based readiness-backend gate reads it as usable with no override. A
+6-branch tree reports 6.0.0 until the 6.3 tag exists, so the series-6
+`epics-rs-env.sh` also exports `EPICS_RTEMS_KQUEUE=1`; that gate runs in the
+target, so `build.rs` forwards the export into the image's boot command line
+(see `EPICS_RTEMS_CMDLINE` below) — sourcing the file before the image build
+is what carries it, not exporting it around the emulator. The
 toolchain target (`arm-rtems6` / `arm-rtems7`) is read off the prefix's
 directory tree, by `contract::tool_target_in` in this crate and by
 `scripts/rtems-tool-target.sh` in the build scripts; it is never configured.
@@ -94,6 +97,24 @@ documents why each one is the target's configuration (in short:
 `--no-default-features` keeps `ring`/`getrandom` off a target that cannot
 compile them, and the named features put the record-link resolvers on the
 image).
+
+## The boot command line
+
+The image has no startup script and no filesystem to hold one, so its `st.cmd`
+is `argv` — `NAME=VALUE` is `epicsEnvSet`, anything else is a file to load
+(`src/boot_args.rs`). A DHCP site sets the `rtems_cmdline` option and the image
+takes it at boot. Everywhere else the line is compiled in, from the build
+environment:
+
+```bash
+EPICS_RTEMS_CMDLINE="EPICS_CA_ADDR_LIST=10.0.2.2 EPICS_PVA_RS_DRIVER=reactor" \
+    scripts/embedded-image.sh rtems pva
+```
+
+`build.rs` makes the define and prepends `EPICS_RTEMS_KQUEUE` when the build
+environment has it, so an assignment of the same name in `EPICS_RTEMS_CMDLINE`
+still wins. QEMU's `-append` reaches none of this — the buffer it would have
+to write is `csrc/rtems_init.c`'s, and nothing outside DHCP writes that.
 
 ## The target spec (applied automatically)
 

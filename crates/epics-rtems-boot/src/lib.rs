@@ -318,6 +318,54 @@ pub const RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT: bool =
         && core::mem::offset_of!(libc::sockaddr_in6, sin6_family) == 1
         && core::mem::offset_of!(libc::sockaddr_storage, ss_family) == 1;
 
+/// Whether this build's `libc` puts the `stat` timestamps where the BSP's
+/// header does.
+///
+/// **False on a stock `libc`.** `arm-rtems6/include/sys/stat.h:41-49` gives
+/// `struct stat` three `struct timespec` timestamps, then `st_blksize` and
+/// `st_blocks`, and — uniquely on `__rtems__` — no `st_spare4`. C code still
+/// writes `st_atime`, because line 54 of that header is
+/// `#define st_atime st_atim.tv_sec`. Rust has no such macro, which is why
+/// `libc` carried the flat `time_t st_atime; long st_spare1;` spelling for so
+/// long: it reads the same seconds at the same offset. What it does not
+/// reproduce is `timespec`'s tail padding — 16 bytes for `i64 + i32` — so
+/// three flat pairs end four bytes early and walk `st_blksize` and
+/// `st_blocks` off theirs. `libc` commit 27fe099a fixes it; this workspace
+/// pins that content, and `scripts/libc-std-patch.sh` reshapes it for a `std`
+/// still compiled against the released spelling. Both shapes have to land on
+/// the same offsets, and this is what says so.
+///
+/// # What that costs at runtime
+///
+/// `Metadata::blksize()` and `blocks()` read the four bytes of `st_ctim`'s
+/// padding and the low half of the real `st_blksize` instead. `std` reads the
+/// timestamps at the right offset either way, so nothing about time breaks —
+/// which is precisely why this one is silent.
+///
+/// # Which fields are checked
+///
+/// Only fields BOTH spellings declare. Naming `st_atime` would be a compile
+/// error against the pinned content and would take the toolchain-free
+/// portability gate down with it, the same trade the socket predicate states
+/// above. `st_blksize` at 96 is the property that matters: it can only sit
+/// there if the three timestamps occupy 48..96, whichever way they are
+/// spelled.
+///
+/// Not checked: `size_of::<libc::stat>()`. `libc` declares `st_spare4` on
+/// every newlib target including RTEMS, so its `stat` is 112 where the
+/// target's is 104. The field is trailing and nothing reads it — `stat()`
+/// fills the first 104 bytes and leaves ours alone — so the size difference
+/// is inert, and asserting it would fail for a reason that is not a defect.
+#[cfg(target_os = "rtems")]
+pub const RTEMS_LIBC_STAT_LAYOUT_IS_CORRECT: bool =
+    // The head, so a wrong scalar width earlier in the struct is not read as
+    // a timestamp defect.
+    core::mem::offset_of!(libc::stat, st_size) == 40
+        // The anchor: 96 is reachable only if the three timestamps fill
+        // 48..96, which is the property the two spellings must share.
+        && core::mem::offset_of!(libc::stat, st_blksize) == 96
+        && core::mem::offset_of!(libc::stat, st_blocks) == 100;
+
 /// The refusal. Sited on the same `rtems_boot_linked` arm as the boot shim
 /// itself, so **bootable implies checked, by construction**: an image built
 /// without [`contract::BSP_PREFIX_ENV`] has no `POSIX_Init` and cannot link at
@@ -366,6 +414,24 @@ const _RTEMS_LIBC_SOCKET_LAYOUT: () = assert!(
      patch libc's newlib/arm `sockaddr_in`/`sockaddr_in6`/`sockaddr_storage` \
      to carry the leading length byte, in BOTH this workspace and the copy \
      -Zbuild-std compiles for std. See RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT."
+);
+
+/// The stat-layout refusal, on the same arm and for the same reason.
+#[cfg(all(target_os = "rtems", rtems_boot_linked))]
+const _RTEMS_LIBC_STAT_LAYOUT: () = assert!(
+    RTEMS_LIBC_STAT_LAYOUT_IS_CORRECT,
+    "RTEMS libc layout bug: this build's `libc` ends the `stat` timestamps \
+     four bytes early. arm-rtems6/include/sys/stat.h:41-49 declares them as \
+     three `struct timespec`, which is 16 bytes each because `c_long` is \
+     narrower than `time_t` here; a flat `time_t st_atime; long st_spare1;` \
+     pair is 12 and carries no tail padding, so st_blksize and st_blocks land \
+     at 92 and 96 instead of 96 and 100. The timestamps themselves still read \
+     correctly, which is why this is invisible: only Metadata::blksize() and \
+     blocks() are wrong, and they are wrong quietly. WORKAROUND: take libc \
+     27fe099a (st_atim/st_mtim/st_ctim as timespec), in BOTH this workspace \
+     and the copy -Zbuild-std compiles for std; where std still names \
+     st_atime, scripts/libc-std-patch.sh splits each timespec into its \
+     members and pads the group back. See RTEMS_LIBC_STAT_LAYOUT_IS_CORRECT."
 );
 
 /// Pulls this crate — and with it the boot shim and the RTEMS libraries — into
@@ -480,7 +546,8 @@ mod tests {
             guarded,
             vec![
                 "const _RTEMS_LIBC_TIME_LAYOUT",
-                "const _RTEMS_LIBC_SOCKET_LAYOUT"
+                "const _RTEMS_LIBC_SOCKET_LAYOUT",
+                "const _RTEMS_LIBC_STAT_LAYOUT"
             ],
             "that cfg guards the layout refusals and nothing else: an image that \
              links has a boot shim, and an image without one cannot link at all"
@@ -530,6 +597,28 @@ mod tests {
                 src.contains(required),
                 "the RTEMS socket layout predicate lost `{required}`; the target's \
                  sockaddr_in leads with sin_len, so the family sits at offset 1"
+            );
+        }
+    }
+
+    /// The stat predicate, pinned the same way.
+    ///
+    /// 96 is the whole claim: `st_blksize` can only sit there if the three
+    /// timestamps fill 48..96, which the flat spelling without `timespec`'s
+    /// tail padding does not. Relaxing it to 92 is the mutation that accepts
+    /// the broken shape while every host build stays green.
+    #[test]
+    fn the_stat_predicate_pins_the_end_of_the_timestamps() {
+        let src = item_body("pub const RTEMS_LIBC_STAT_LAYOUT_IS_CORRECT: bool =");
+        for required in [
+            "offset_of!(libc::stat, st_size) == 40",
+            "offset_of!(libc::stat, st_blksize) == 96",
+            "offset_of!(libc::stat, st_blocks) == 100",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS stat layout predicate lost `{required}`; the target's \
+                 timestamps are three 16-byte timespecs ending at 96"
             );
         }
     }

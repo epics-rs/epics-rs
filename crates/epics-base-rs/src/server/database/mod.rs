@@ -779,6 +779,20 @@ pub(super) fn registration_gate_held() -> bool {
     REGISTRATION_GATE_HELD.with(|h| h.get().is_some())
 }
 
+thread_local! {
+    /// How many [`RecursiveReadLock`] read guards this thread holds. Read by
+    /// `LockSet::lock_fresh` (`record_lock.rs`) in debug builds.
+    static MAP_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds a read guard on the records map or the alias
+/// table — the other half of the check a fresh lock-set acquisition makes
+/// in debug builds (`record_lock.rs`, `LockSet::lock_fresh`), beside
+/// [`registration_gate_held`].
+pub(super) fn map_read_held() -> bool {
+    MAP_READ_DEPTH.with(|d| d.get() > 0)
+}
+
 /// A reader-writer lock whose readers never queue behind a waiting writer.
 ///
 /// The records map and the alias table are read from inside a record's lock
@@ -787,10 +801,19 @@ pub(super) fn registration_gate_held() -> bool {
 /// a writer waits is parked, and that parks a thread holding a lock set: if
 /// the reader the writer is waiting on then wants that same set (a
 /// registration-path walk that reads records), the three are wedged. With
-/// `read_recursive` a reader is parked only by an ACTIVE writer, and no
-/// writer of these maps takes a lock set (`record_lock.rs`, acquisition
-/// order), so the cycle cannot close. This is the one place readers of
-/// these two maps are handed out, which is what makes that rule structural.
+/// `read_recursive` a reader is parked only by an ACTIVE writer, so a
+/// reader that already holds a set is never wedged by a writer.
+///
+/// The writer side needs the converse rule. `remove_record_entry` holds the
+/// removed record's lock set while it takes the write lock — its `destroy`
+/// must be exclusive against a process cycle — so a reader that takes a
+/// FRESH lock set under its read guard can be the reader that writer waits
+/// on, each holding what the other wants. **A read guard MUST NOT be held
+/// across a lock-set acquisition**: clone the `Arc<RecordCell>` out under
+/// the guard, drop the guard, then lock the record. This is the one place
+/// readers of these two maps are handed out, and every guard it hands out
+/// counts itself on the thread, so `LockSet::lock_fresh` can fail on the
+/// thread that broke the rule instead of wedging two threads later.
 pub(crate) struct RecursiveReadLock<T> {
     lock: parking_lot::RwLock<T>,
     /// Bumped under every write lock, so a reader can tell whether the map
@@ -808,8 +831,10 @@ impl<T> RecursiveReadLock<T> {
         }
     }
 
-    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, T> {
-        self.lock.read_recursive()
+    pub(crate) fn read(&self) -> MapReadGuard<'_, T> {
+        let guard = self.lock.read_recursive();
+        MAP_READ_DEPTH.with(|d| d.set(d.get() + 1));
+        MapReadGuard { guard }
     }
 
     /// Bumps the revision once the write lock is held, so a reader that
@@ -824,6 +849,25 @@ impl<T> RecursiveReadLock<T> {
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A [`RecursiveReadLock`] read guard, counted on the thread that holds it
+/// for as long as it lives — see [`map_read_held`].
+pub(crate) struct MapReadGuard<'a, T> {
+    guard: parking_lot::RwLockReadGuard<'a, T>,
+}
+
+impl<T> std::ops::Deref for MapReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> Drop for MapReadGuard<'_, T> {
+    fn drop(&mut self) {
+        MAP_READ_DEPTH.with(|d| d.set(d.get() - 1));
     }
 }
 

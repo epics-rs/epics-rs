@@ -1862,8 +1862,13 @@ impl PvDatabase {
                 // fires on real changes, not no-op writes).
                 instance.notify_field_written_if_changed(&field, old_value.as_ref(), link_backing);
 
-                // Post monitor events if value or alarm changed
-                let new_value = instance.record.get_field(&field);
+                // Post monitor events if value or alarm changed. Read
+                // through the SAME reader the pre-value came from: a field
+                // this port stores on `CommonFields` (the analog-alarm
+                // ladder, DESC) is `None` to `Record::get_field` alone, and
+                // `Some` != `None` made every unchanged put to it restamp
+                // the record and post.
+                let new_value = instance.resolve_field_stored(&field);
                 let value_changed = old_value != new_value;
                 let alarm_changed =
                     old_stat != instance.common.stat || old_sevr != instance.common.sevr;
@@ -3269,14 +3274,10 @@ impl PvDatabase {
         // not evidence about THIS put. Fall through to the guarded
         // clear; its `!is_processing()` gate already preserves PUTF
         // across an async-pending device round-trip.
-        let originating_pending = want_notify && {
-            let rec = self.inner.records.read();
-            if let Some(rec_arc) = rec.get(record_name) {
-                rec_arc.read().notify.is_some()
-            } else {
-                false
-            }
-        };
+        let originating_pending = want_notify
+            && self
+                .get_record_no_resolve(record_name)
+                .is_some_and(|rec_arc| rec_arc.read().notify.is_some());
 
         // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
         // the forward-link dispatch — the marker only lives for the
@@ -3988,6 +3989,47 @@ mod tests {
         assert!(
             alarm_rx.try_recv().is_err(),
             "unchanged ACKT must post nothing"
+        );
+    }
+
+    /// A put that leaves a field's stored value unchanged posts nothing and
+    /// does not restamp the record — C `dbPut` posts only what the record's
+    /// `special`/monitor path posts, and a CommonFields-stored field (the
+    /// analog-alarm ladder, DESC) is one whose value `Record::get_field`
+    /// alone cannot see. Boundary: unchanged vs changed, on such a field.
+    #[epics_macros_rs::epics_test]
+    async fn noop_put_to_a_common_stored_field_posts_nothing() {
+        use crate::server::recgbl::EventMask;
+        use crate::server::records::ai::AiRecord;
+        use crate::types::DbFieldType;
+
+        let db = PvDatabase::new();
+        db.add_record("NP:REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("NP:REC").expect("record exists");
+        let mut hihi_rx = rec
+            .write()
+            .add_subscriber("HIHI", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("HIHI subscriber");
+
+        db.put_pv_and_post("NP:REC.HIHI", EpicsValue::Double(10.0))
+            .await
+            .expect("first HIHI put");
+        assert!(hihi_rx.try_recv().is_ok(), "a changed HIHI must post");
+        let stamped = rec.read().common.time;
+
+        db.put_pv_and_post("NP:REC.HIHI", EpicsValue::Double(10.0))
+            .await
+            .expect("unchanged HIHI put");
+        assert!(
+            hihi_rx.try_recv().is_err(),
+            "an unchanged HIHI must not post"
+        );
+        assert_eq!(
+            rec.read().common.time,
+            stamped,
+            "an unchanged put must not restamp the record"
         );
     }
 

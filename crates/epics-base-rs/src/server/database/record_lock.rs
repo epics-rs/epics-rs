@@ -51,7 +51,11 @@
 //! one pointing at the **bootstrap set** ([`bootstrap_set`], id 0, never on
 //! the active or free list) — C's null `lset` made lockable — until the
 //! registry adopts the cell at registration ([`Registry::adopt`]) and moves
-//! it onto a set of its own ([`Registry::mint_for`]).
+//! it onto a set of its own ([`Registry::mint_for`]). After `iocInit` the
+//! two happen together: a record the registry adopts once
+//! [`PvDatabase::build_lock_sets`] has run is minted a set before it is
+//! published, so no registered record is ever on the bootstrap set then and
+//! no set-taker after `iocInit` needs to reach for id 0.
 //!
 //! * A plain CA/PVA write (`put_record_field_from_ca`, `put_pv`,
 //!   `process_record`) takes the target record's set for the duration of the
@@ -228,8 +232,10 @@
 //! >    `ProcessVariable::subscribers` (all `PriorityInheritanceMutex`), plus
 //! >    the `records` map and `aliases` (each a `RecursiveReadLock`, whose
 //! >    readers never queue behind a waiting writer, so a reader under L1
-//! >    cannot be wedged by a writer that is itself waiting for L1). A
-//! >    record's data has no lock of its own: it is behind L1.
+//! >    cannot be wedged by a writer that is itself waiting for L1; and
+//! >    whose readers never take L1 fresh under the guard, so a writer
+//! >    under L1 — `remove_record_entry` — cannot be wedged by a reader).
+//! >    A record's data has no lock of its own: it is behind L1.
 //! >
 //! > Every rung is a blocking lock. There is no async lock left anywhere on
 //! > the put/process path, which is what makes the order a MUST rather than a
@@ -649,6 +655,17 @@ impl LockSet {
              gate (L46); record data is behind L1 and must be read before the \
              gate is taken, or through a set this thread already holds"
         );
+        // The records map and the alias table are leaves too, and
+        // `remove_record_entry` writes them while holding the removed
+        // record's set: a fresh set taken under a read guard on either is
+        // the reader that writer can be waiting on. Clone the cell out, drop
+        // the guard, then lock (`RecursiveReadLock`, `mod.rs`).
+        debug_assert!(
+            !super::map_read_held(),
+            "a lock set (L1) was taken while this thread holds a read guard on \
+             the records map or the alias table; clone the record handle out \
+             under the guard and drop it before locking the record"
+        );
         let guard = self.lock.lock();
         // SAFETY: this thread holds `lock`, so it is the only one allowed at
         // `held` (see the `Sync` impl).
@@ -848,6 +865,20 @@ impl Registry {
             .filter(|set| !std::ptr::eq(*set, bootstrap_set()))
     }
 
+    /// [`Self::real_set_of`] for a relink after `iocInit`, where a name the
+    /// link graph reaches either has a real set or is no longer registered
+    /// at all — it was removed between the graph read and this call, and
+    /// its cell went with it. A registered name still on the bootstrap set
+    /// is the invariant [`Self::adopt`] keeps, broken.
+    fn set_of_registered(&self, name: &str) -> Option<Set> {
+        let set = self.real_set_of(name);
+        debug_assert!(
+            set.is_some() || !self.of_record.contains_key(name),
+            "registered record {name} is on the bootstrap set after iocInit"
+        );
+        set
+    }
+
     /// The cell a NAME reaches, minting a one-member set for a name that has
     /// none — C `createLockRecord` (`dbLock.c:505-527`) for
     /// [`PvDatabase::lock_records`]' callers, which may name a record that
@@ -882,6 +913,15 @@ impl Registry {
     /// A name that was many-locked before its record existed already has a
     /// registry-only cell with a real set; the record's cell takes that set
     /// over, so the epoch that holds it goes on excluding the record.
+    ///
+    /// After [`PvDatabase::build_lock_sets`] the cell is minted a set here as
+    /// well — `createLockRecord` at the only moment C could not reach it —
+    /// so that a registered record is never on the bootstrap set once the
+    /// IOC is initialised. That is what lets every set-taker after `iocInit`
+    /// ([`Registry::every_set`], [`PvDatabase::relink_lock_sets`]) leave the
+    /// bootstrap set alone: a `LinkEdit` relink runs under a put that already
+    /// holds the seed's set, and reaching for id 0 from there would invert
+    /// the id order a `Membership` relink takes the sets in.
     fn adopt(&mut self, name: &str, lr: &Arc<LockRecord>) {
         match self.of_record.get(name) {
             Some(existing) if Arc::ptr_eq(existing, lr) => {}
@@ -892,14 +932,20 @@ impl Registry {
             }
             None => {
                 self.of_record.insert(name.to_string(), lr.clone());
+                if self.built {
+                    self.mint_for(name, lr);
+                }
             }
         }
     }
 
     /// Give a bootstrap cell a set of its own — `dbLockInitRecords`'
     /// `createLockRecord` for one record. **The caller holds the bootstrap
-    /// set**: the cell is being moved out of it, and [`Self::place`]'s rule
-    /// is that a mover holds the set it moves a record out of.
+    /// set, or nothing can hold the cell yet**: the cell is being moved out
+    /// of the bootstrap set, and [`Self::place`]'s rule is that a mover holds
+    /// the set it moves a record out of. [`Self::adopt`] is the one caller
+    /// that holds nothing — it runs before the record is in the records map,
+    /// so no thread can be inside the record's data through the cell.
     fn mint_for(&mut self, name: &str, lr: &Arc<LockRecord>) {
         if !lr.is_bootstrap() {
             return;
@@ -1141,15 +1187,13 @@ impl Registry {
         self.revision += 1;
     }
 
-    /// Every set a record can be behind right now: the active ones plus the
-    /// bootstrap set, which is where a record added after `iocInit` waits
-    /// until its relink runs.
+    /// Every set a registered record can be behind after `iocInit`: the
+    /// active ones. Not the bootstrap set — [`Self::adopt`] mints a set for
+    /// every record registered after [`PvDatabase::build_lock_sets`], and
+    /// [`PvDatabase::init_sets`] for every one registered before it, so no
+    /// record a relink can reach is on id 0.
     fn every_set(&self) -> Vec<Set> {
-        self.active
-            .values()
-            .map(|state| state.set)
-            .chain(std::iter::once(bootstrap_set()))
-            .collect()
+        self.active.values().map(|state| state.set).collect()
     }
 
     fn info(&self, id: u64, rows: &HashMap<u64, MutexInfo>) -> LockSetInfo {
@@ -1284,12 +1328,27 @@ impl PvDatabase {
     /// one set per record, before any link has merged anything. The
     /// bootstrap set is held across the whole pass, because every record
     /// given a set here is being moved out of it.
+    ///
+    /// Every cell the registry has adopted is minted, not only `names`: a
+    /// record adopted after `names` was read is registered but unnamed, and
+    /// `built` promises that no registered record is on the bootstrap set
+    /// from here on ([`Registry::every_set`]).
     fn init_sets(&self, names: &[String]) {
         let _out_of = bootstrap_set().acquire(false);
         let mut registry = self.inner.record_locks.lock();
         for name in names {
             let lr = registry.lock_record_of(name);
             registry.mint_for(name, &lr);
+        }
+        let mut adopted: Vec<(String, Arc<LockRecord>)> = registry
+            .of_record
+            .iter()
+            .filter(|(_, lr)| lr.is_bootstrap())
+            .map(|(name, lr)| (name.clone(), lr.clone()))
+            .collect();
+        adopted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, lr) in &adopted {
+            registry.mint_for(name, lr);
         }
         registry.built = true;
     }
@@ -1334,9 +1393,10 @@ impl PvDatabase {
 
     /// Move `lr` off the bootstrap set onto one of its own, if it is still
     /// there — `createLockRecord` for a record that reached a lock before
-    /// `iocInit`, or that was added after it. The bootstrap set is taken
-    /// first and the registry under it: a mover holds the set it moves out
-    /// of, and no set is ever taken under the registry lock.
+    /// `iocInit`; after it [`Registry::adopt`] has already done this. The
+    /// bootstrap set is taken first and the registry under it: a mover holds
+    /// the set it moves out of, and no set is ever taken under the registry
+    /// lock.
     fn ensure_set_for(&self, name: &str, lr: &Arc<LockRecord>) {
         if !lr.is_bootstrap() {
             return;
@@ -1487,24 +1547,23 @@ impl PvDatabase {
     ///   partition invariant puts every OTHER link of the region inside it;
     ///   a target found outside is an invariant already broken, and the loop
     ///   widens the region to it rather than move a record it does not hold.
-    /// * [`RelinkScope::Membership`] — every set, bootstrap included. A
-    ///   record added, removed or newly reachable through an alias can join
-    ///   or leave a component from anywhere, and the links that name it can
-    ///   be in any set. Registration-path only, with no set held by the
-    ///   caller, so taking them all in id order is the plain
-    ///   `dbScanLockMany` discipline.
+    /// * [`RelinkScope::Membership`] — every active set. A record added,
+    ///   removed or newly reachable through an alias can join or leave a
+    ///   component from anywhere, and the links that name it can be in any
+    ///   set. Registration-path only, with no set held by the caller, so
+    ///   taking them all in id order is the plain `dbScanLockMany`
+    ///   discipline.
+    ///
+    /// Neither scope takes the bootstrap set: after `iocInit` no registered
+    /// record is on it ([`Registry::adopt`] mints the set before the record
+    /// is published), and a `LinkEdit` relink, entered under the seed's set,
+    /// could not take id 0 in id order anyway — a `Membership` relink that
+    /// held it first would be waiting on the seed's set.
     ///
     /// Sets are taken first and the registry lock under them, never the
     /// reverse; [`Registry::revision`] proves, under that lock, that the sets
     /// held are still the ones the region's records are behind.
     fn relink_lock_sets(&self, record: &str, scope: RelinkScope) {
-        if self.get_record_no_resolve(record).is_some() {
-            // A record added after `iocInit` is still on the bootstrap set.
-            // C's `dbCreateRecord` cannot run then at all; the port allows
-            // it, so the record is given its own set exactly as
-            // `createLockRecord` would have, and the components fold it in.
-            self.ensure_set(record);
-        }
         let mut region: Vec<Set> = Vec::new();
         loop {
             let revision = {
@@ -1525,7 +1584,9 @@ impl PvDatabase {
                 let targets = self.db_link_targets(record);
                 let registry = self.inner.record_locks.lock();
                 for target in &targets {
-                    let set = registry.real_set_of(target).unwrap_or_else(bootstrap_set);
+                    let Some(set) = registry.set_of_registered(target) else {
+                        continue;
+                    };
                     if !region.iter().any(|held| std::ptr::eq(*held, set)) {
                         region.push(set);
                     }
@@ -1555,7 +1616,7 @@ impl PvDatabase {
             let outside: Vec<Set> = adjacency
                 .values()
                 .flatten()
-                .map(|name| registry.real_set_of(name).unwrap_or_else(bootstrap_set))
+                .filter_map(|name| registry.set_of_registered(name))
                 .filter(|set| !region.iter().any(|held| std::ptr::eq(*held, *set)))
                 .collect();
             if !outside.is_empty() {
@@ -2067,5 +2128,111 @@ mod tests {
         // And a disjoint pair may be held together on one thread.
         let _a = db.lock_record("RE:ONE");
         let _b = db.lock_record("RE:TWO");
+    }
+
+    /// A record cell as `add_loaded_record` hands it to the registry:
+    /// adopted, not yet in the records map, no lock taken through it.
+    fn adopted_cell(db: &PvDatabase, name: &str) -> Arc<crate::server::record::RecordCell> {
+        use crate::server::record::{RecordCell, RecordInstance};
+        use crate::server::records::calc::CalcRecord;
+        let cell = Arc::new(RecordCell::new(RecordInstance::new(
+            name.into(),
+            CalcRecord::default(),
+        )));
+        db.inner.record_locks.adopt(name, cell.lock_record());
+        cell
+    }
+
+    /// Boundary `built == false`: a record adopted before `iocInit` waits on
+    /// the bootstrap set, as C's null `lset` does until `dbLockInitRecords`.
+    #[test]
+    fn adopt_before_build_leaves_the_record_on_the_bootstrap_set() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "AD:PRE");
+        assert!(cell.lock_record().is_bootstrap());
+        assert_eq!(db.inner.record_locks.set_id_of("AD:PRE"), None);
+    }
+
+    /// Boundary `built == true`: a record adopted after `iocInit` has a real
+    /// set before anything can lock it, so no relink has to reach for the
+    /// bootstrap set on its behalf.
+    #[test]
+    fn adopt_after_build_mints_the_record_s_set() {
+        let db = PvDatabase::new();
+        db.build_lock_sets();
+        let cell = adopted_cell(&db, "AD:POST");
+        assert!(!cell.lock_record().is_bootstrap());
+        assert_eq!(
+            db.inner.record_locks.set_id_of("AD:POST"),
+            Some(cell.lock_record().set().id)
+        );
+    }
+
+    /// A cell adopted before `build_lock_sets` but absent from the records
+    /// map it reads its names from is still minted by `init_sets`: `built`
+    /// promises no registered record is on the bootstrap set.
+    #[test]
+    fn build_lock_sets_mints_every_adopted_cell() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "AD:STRAGGLER");
+        assert!(cell.lock_record().is_bootstrap());
+        db.build_lock_sets();
+        assert!(!cell.lock_record().is_bootstrap());
+        assert!(db.inner.record_locks.set_id_of("AD:STRAGGLER").is_some());
+    }
+
+    /// Boundary: a fresh set taken under a records-map read guard is the
+    /// reader `remove_record_entry` can be waiting on while it holds that
+    /// set. Debug builds fail on the offending thread.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "read guard on the records map")]
+    fn a_fresh_set_under_the_map_read_guard_is_refused() {
+        let db = PvDatabase::new();
+        let _map = db.inner.records.read();
+        let _g = db.lock_record("MR:FRESH");
+    }
+
+    /// Boundary: the same under the alias table's guard.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "read guard on the records map")]
+    fn a_fresh_set_under_the_alias_read_guard_is_refused() {
+        let db = PvDatabase::new();
+        let _map = db.inner.aliases.read();
+        let _g = db.lock_record("MR:ALIAS");
+    }
+
+    /// Boundary: a set this thread already holds is re-entered, not taken,
+    /// so reading the map inside a held set and reaching the same record
+    /// again — every `get_record` on the process path — is untouched. And
+    /// once the guard is dropped, a fresh set is ordinary again.
+    #[test]
+    fn re_entry_under_the_map_read_guard_and_a_fresh_set_after_it_are_fine() {
+        let db = PvDatabase::new();
+        let _held = db.lock_record("MR:HELD");
+        {
+            let _map = db.inner.records.read();
+            drop(db.lock_record("MR:HELD"));
+        }
+        drop(db.lock_record("MR:OTHER"));
+    }
+
+    /// The set a `Membership` relink takes never includes the bootstrap set,
+    /// so no relink can invert id order against a `LinkEdit` relink that
+    /// enters already holding a seed's set.
+    #[test]
+    fn every_set_after_build_excludes_the_bootstrap_set() {
+        let db = PvDatabase::new();
+        adopted_cell(&db, "AD:ES1");
+        db.build_lock_sets();
+        adopted_cell(&db, "AD:ES2");
+        let registry = db.inner.record_locks.lock();
+        let sets = registry.every_set();
+        assert_eq!(sets.len(), 2);
+        assert!(
+            sets.iter().all(|set| !std::ptr::eq(*set, bootstrap_set())),
+            "every_set() must not hand a relink the bootstrap set"
+        );
     }
 }

@@ -5782,25 +5782,36 @@ impl RecordInstance {
         // is welded to the `oraw = rval` that follows its `db_post_events`.
         // Decided by the record's own old copy, not this walk's `last_posted`
         // change detection, and taken whether or not anyone is subscribed —
-        // so the bookkeeping must not depend on who is watching. The posts
-        // themselves land after the walk below, in the order C emits them.
+        // so the bookkeeping must not depend on who is watching. Decided
+        // HERE, before the walk reads any field, so the record's old copies
+        // are already advanced by the time the walk looks at the record;
+        // the posts themselves land after the walk, in the order C emits
+        // them. Which fields fired is kept as a bit per `value_masked` index
+        // rather than a list, so the cycle allocates nothing for it.
         let forced_mask = (!secondary_guard.is_empty())
             .then_some(secondary_guard | EventMask::VALUE | EventMask::LOG);
+        let mut forced_fired: u64 = 0;
+        if forced_mask.is_some() {
+            debug_assert!(
+                value_masked.len() <= u64::BITS as usize,
+                "fields_posted_with_value_mask is wider than the fired bitmask"
+            );
+            for (index, (name, gate)) in value_masked.iter().enumerate() {
+                if *gate == ValuePostGate::OnChangeForced
+                    && self.record.take_secondary_value_change(name)
+                {
+                    forced_fired |= 1 << index;
+                }
+            }
+        }
         // Nothing is subscribed, so the walk below has no field to reach and
         // the forced posts have nowhere to land either — both are gated on a
         // field having a subscriber. The record's declared post sets are the
         // walk's inputs alone, so asking for them, six more trips through the
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
-        // advance — still runs.
+        // advance — has already run.
         if self.subscribers.is_empty() {
-            if forced_mask.is_some() {
-                for (name, gate) in value_masked {
-                    if *gate == ValuePostGate::OnChangeForced {
-                        self.record.take_secondary_value_change(name);
-                    }
-                }
-            }
             return;
         }
         // Every post this walk adds sits at or past this index, so the
@@ -5861,7 +5872,7 @@ impl RecordInstance {
                 let post = match gate {
                     ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
                     ValuePostGate::WithValue => include_val,
-                    // Decided once per cycle in `forced_posts` above, against
+                    // Decided once per cycle in `forced_fired` above, against
                     // the record's own old copy — never here, where the answer
                     // would depend on this loop's `last_posted` cache and on
                     // the field having a subscriber.
@@ -5934,13 +5945,11 @@ impl RecordInstance {
         // A guarded secondary post reaches the snapshot only if the field has
         // a subscriber, exactly as every other branch of the walk above; C's
         // `db_post_events` with no subscriber delivers nothing either. The
-        // record's old copy has already advanced regardless — that is the
-        // half that must not depend on who is watching.
+        // record's old copy advanced before the walk regardless — that is
+        // the half that must not depend on who is watching.
         if let Some(forced_mask) = forced_mask {
-            for (name, gate) in value_masked {
-                if *gate != ValuePostGate::OnChangeForced
-                    || !self.record.take_secondary_value_change(name)
-                {
+            for (index, (name, _)) in value_masked.iter().enumerate() {
+                if forced_fired & (1 << index) == 0 {
                     continue;
                 }
                 if self.subscribers.get(*name).is_some_and(|s| !s.is_empty()) {
@@ -10161,5 +10170,61 @@ mod unanswerable_notify_tests {
             "the stale name must not evict the live notify"
         );
         assert!(target.has_notify());
+    }
+}
+
+#[cfg(test)]
+mod forced_secondary_post_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::records::ao::AoRecord;
+    use crate::types::DbFieldType;
+
+    /// An ao whose output moved this cycle (`omod`) with `oraw != rval`,
+    /// the state C's `aoRecord.c:541` posts RVAL from.
+    fn ao_with_moved_rval(rval: i32) -> RecordInstance {
+        let mut rec = AoRecord::default();
+        rec.rval = rval;
+        rec.omod = true;
+        RecordInstance::new("AO:FORCED".to_string(), rec)
+    }
+
+    /// One guarded monitor cycle; the fields it posted, in order.
+    fn guarded_cycle(inst: &mut RecordInstance) -> Vec<String> {
+        let mut snapshot = ProcessSnapshot::new();
+        inst.collect_subscriber_posts(&mut snapshot, EventMask::VALUE, EventMask::NONE, true);
+        snapshot
+            .iter()
+            .map(|(field, _, _)| field.to_string())
+            .collect()
+    }
+
+    /// Boundary `oraw != rval` with a subscriber: RVAL posts once and the
+    /// old copy advances; boundary `oraw == rval` on the next guarded
+    /// cycle: nothing.
+    #[test]
+    fn a_changed_rval_posts_once_then_not_again() {
+        let mut inst = ao_with_moved_rval(7);
+        let _rx = inst
+            .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            .expect("RVAL subscriber");
+        let posted = guarded_cycle(&mut inst);
+        assert_eq!(
+            posted.iter().filter(|f| *f == "RVAL").count(),
+            1,
+            "{posted:?}"
+        );
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+        let posted = guarded_cycle(&mut inst);
+        assert!(!posted.iter().any(|f| f == "RVAL"), "{posted:?}");
+    }
+
+    /// Boundary no subscriber: the old copy still advances, and nothing is
+    /// posted — the bookkeeping must not depend on who is watching.
+    #[test]
+    fn a_changed_rval_advances_oraw_with_no_subscriber() {
+        let mut inst = ao_with_moved_rval(7);
+        assert!(guarded_cycle(&mut inst).is_empty());
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
     }
 }

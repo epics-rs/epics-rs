@@ -2112,8 +2112,7 @@ impl PvDatabase {
     /// for a record. `name` must be the canonical record name (the value
     /// of `RecordInstance::name`). Returns `None` if the record is absent.
     pub fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
-        let records = self.inner.records.read();
-        let rec = records.get(name)?;
+        let rec = self.get_record_no_resolve(name)?;
         let generation = rec.read().reprocess_generation.clone();
         let epoch = generation.fetch_add(1, Ordering::AcqRel) + 1;
         Some(AsyncToken {
@@ -2129,8 +2128,7 @@ impl PvDatabase {
     /// `fire` is a no-op. A subsequent [`Self::mint_async_token`] produces a
     /// fresh, current token. No-op if the record is absent.
     pub fn cancel_async_reentry(&self, name: &str) {
-        let records = self.inner.records.read();
-        if let Some(rec) = records.get(name) {
+        if let Some(rec) = self.get_record_no_resolve(name) {
             rec.read()
                 .reprocess_generation
                 .fetch_add(1, Ordering::AcqRel);
@@ -2148,8 +2146,7 @@ impl PvDatabase {
     /// instead. A record that is gone answers `Low`, the band an unwritten
     /// `PRIO` already has; the work being scheduled for it is a no-op anyway.
     pub fn record_callback_priority(&self, name: &str) -> crate::runtime::task::CallbackPriority {
-        let records = self.inner.records.read();
-        match records.get(name) {
+        match self.get_record_no_resolve(name) {
             Some(rec) => rec.read().common.callback_priority(),
             None => crate::runtime::task::CallbackPriority::Low,
         }
@@ -2255,8 +2252,9 @@ impl PvDatabase {
     /// nothing.
     pub(crate) fn arm_watchdog(&self, name: &str) {
         let (rec, generation, epoch, prio) = {
-            let records = self.inner.records.read();
-            let Some(rec) = records.get(name) else { return };
+            let Some(rec) = self.get_record_no_resolve(name) else {
+                return;
+            };
             let instance = rec.read();
             if instance.record.watchdog_interval().is_none() {
                 // Bumping the generation still cancels a watchdog left running
@@ -2269,7 +2267,8 @@ impl PvDatabase {
             let generation = instance.watchdog_generation.clone();
             let epoch = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
             let prio = instance.common.callback_priority();
-            (rec.clone(), generation, epoch, prio)
+            drop(instance);
+            (rec, generation, epoch, prio)
         };
 
         let is_soft = {

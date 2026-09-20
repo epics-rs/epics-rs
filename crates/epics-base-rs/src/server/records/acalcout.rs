@@ -1984,7 +1984,8 @@ impl Record for AcalcoutRecord {
                 Ok(())
             }
             // SPC_NOMOD trackers — accept the framework's internal deadband/
-            // alarm writes (put_coerced "MLST"/"ALST", check_alarms "LALM").
+            // alarm writes (`store_monitor_last_posted` "MLST"/"ALST",
+            // `store_analog_lalm` "LALM").
             "LALM" => {
                 self.lalm = value
                     .to_f64()

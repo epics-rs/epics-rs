@@ -7899,8 +7899,8 @@ fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's
     // deadband owner performs that write through put_field
-    // (put_coerced); the arms must accept it even though the fields
-    // stay SPC_NOMOD toward CA. Pre-fix the write was FieldNotFound
+    // (`store_monitor_last_posted`); the arms must accept it even though
+    // the fields stay SPC_NOMOD toward CA. Pre-fix the write was FieldNotFound
     // (silently swallowed) and the anchor read 0.0 forever.
     let mut rec = MotorRecord::new();
     rec.put_field("MLST", EpicsValue::Double(3.5)).unwrap();

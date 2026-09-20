@@ -511,9 +511,9 @@ impl EpidRecord {
         // `epidRecord.c:346-374` `monitor()` computes `delta = mlst - val`,
         // posts VAL when `delta > mdel`, and only THEN sets `mlst = val`
         // — the post and the advance are one owner. In Rust that owner is
-        // the framework's `check_deadband_ext`
-        // (`record_instance.rs:2180-2203`): it reads MLST, fires the VAL
-        // monitor, then advances `mlst`/`alst` via `put_coerced`. Advancing
+        // the framework's `check_deadband_ext`: it reads MLST, fires the
+        // VAL monitor, then advances `mlst`/`alst` via
+        // `store_monitor_last_posted`. Advancing
         // them here (before that runs) made the framework see a zero delta
         // and silently suppress every VAL post. `update_monitors` owns only
         // the epid-specific previous-value fields above (`pp`/`ip`/`dp`/

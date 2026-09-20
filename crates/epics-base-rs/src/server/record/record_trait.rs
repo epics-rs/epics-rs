@@ -3179,6 +3179,24 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// The SCALAR half is deliberately NOT inert: its loop (`:1068-1071`) has
     /// no status test and `return`s at the first failing `dbGetLink`.
+    /// The text of a link field as the record stores it, lent rather than
+    /// copied.
+    ///
+    /// C reads a link off `dbCommon` as a `struct link` and copies nothing; a
+    /// scan cycle that asks [`Self::get_field`] instead pays a `String` clone,
+    /// a [`PvString`](crate::types::PvString) wrap, an
+    /// [`EpicsValue`](crate::types::EpicsValue) construction and a drop for
+    /// every link the type declares — 21 of them per `calc` cycle, whether or
+    /// not a single one is wired.
+    ///
+    /// `Some("")` is a declared link that is unset, which is what an unwired
+    /// `INPA` holds. `None` is this type declining to lend the field, and the
+    /// caller falls back to the owned [`Self::get_field`] path, so a type that
+    /// does not override this loses nothing.
+    fn link_text_ref(&self, _link_field: &str) -> Option<&str> {
+        None
+    }
+
     fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {
         false
     }
@@ -3781,7 +3799,7 @@ pub trait Record: Send + Sync + 'static {
 
     /// Return multi-input link field pairs: (link_field, value_field).
     /// Override in calc, calcout, sel, sub to return INPA..INPL → A..L mappings.
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[]
     }
 
@@ -3897,7 +3915,7 @@ pub trait Record: Send + Sync + 'static {
     fn select_input_links(
         &self,
         _selector: Option<u16>,
-    ) -> Option<Vec<(&'static str, &'static str)>> {
+    ) -> Option<&'static [(&'static str, &'static str)]> {
         None
     }
 

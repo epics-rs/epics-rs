@@ -625,9 +625,9 @@ impl Record for SwaitRecord {
     fn select_input_links(
         &self,
         _selector: Option<u16>,
-    ) -> Option<Vec<(&'static str, &'static str)>> {
+    ) -> Option<&'static [(&'static str, &'static str)]> {
         if self.simulation_active {
-            Some(Vec::new())
+            Some(&[])
         } else {
             None
         }
@@ -844,6 +844,17 @@ impl Record for SwaitRecord {
         Some(EpicsValue::Double(self.val))
     }
 
+    /// C reads `pwait->inan..inln` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 12 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp_names.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -1033,7 +1044,7 @@ impl Record for SwaitRecord {
         Ok(())
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INAN", "A"),
             ("INBN", "B"),

@@ -799,6 +799,39 @@ impl Record for CalcoutRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 21 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        Some(match slot {
+            b'A' => &self.inpa,
+            b'B' => &self.inpb,
+            b'C' => &self.inpc,
+            b'D' => &self.inpd,
+            b'E' => &self.inpe,
+            b'F' => &self.inpf,
+            b'G' => &self.inpg,
+            b'H' => &self.inph,
+            b'I' => &self.inpi,
+            b'J' => &self.inpj,
+            b'K' => &self.inpk,
+            b'L' => &self.inpl,
+            b'M' => &self.inpm,
+            b'N' => &self.inpn,
+            b'O' => &self.inpo,
+            b'P' => &self.inpp,
+            b'Q' => &self.inpq,
+            b'R' => &self.inpr,
+            b'S' => &self.inps,
+            b'T' => &self.inpt,
+            b'U' => &self.inpu,
+            _ => return None,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -1302,7 +1335,7 @@ impl Record for CalcoutRecord {
         self.multi_input_links()
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
             ("INPB", "B"),

@@ -326,7 +326,10 @@
 // so none of them needs a reactor and there is nothing to account for.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+use crate::server::record::RecordInstance;
 
 use crate::runtime::sync::{
     MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
@@ -372,6 +375,51 @@ struct LockSet {
 /// C keeps its emptied sets on `lockSetsFree` for the same reason and frees
 /// them only in `dbLockCleanupRecords` (`dbLock.c:563-576`).
 type Set = &'static LockSet;
+
+/// C's `lockRecord` (`dbLockPvt.h:52-60`) — the cell `dbCommon::lset` points
+/// at, and the ONLY way a record reaches its lock set.
+///
+/// C's `dbScanLock` is `precord->lset` → `lr->plockSet` → `lock`: two pointer
+/// derefs, no name anywhere. The port had the same association spelled as a
+/// name-keyed map, so taking a record's gate cost an alias lookup plus two
+/// hashes of the record name under the registry mutex — 0.85 us of a 11.5 us
+/// calc cycle, measured. A record that owns its cell pays neither.
+///
+/// `plock_set` is the association C guards with the `lockRecord`'s spinlock
+/// (`dbLockPvt.h:53-57`): written only by [`Registry`], which holds the
+/// registry mutex, and read with no lock at all, exactly as C reads it under
+/// either lock. A stale read is not a hazard — it is what the `retry:` loop in
+/// [`PvDatabase::acquire_through`] exists to catch.
+pub(crate) struct LockRecord {
+    plock_set: AtomicPtr<LockSet>,
+}
+
+impl LockRecord {
+    fn new(set: Set) -> Arc<Self> {
+        Arc::new(Self {
+            plock_set: AtomicPtr::new(Self::as_ptr(set)),
+        })
+    }
+
+    fn as_ptr(set: Set) -> *mut LockSet {
+        set as *const LockSet as *mut LockSet
+    }
+
+    /// C `lr->plockSet`.
+    fn set(&self) -> Set {
+        let p = self.plock_set.load(Ordering::Acquire);
+        // SAFETY: every pointer stored here came from [`Registry::make_set`],
+        // which leaks its `LockSet`, so the referent is live for `'static`;
+        // a merge only ever moves the set onto `Registry::free`, which keeps
+        // the allocation. The cell is constructed with a set and `store` is
+        // the only other writer, so it is never null.
+        unsafe { &*p }
+    }
+
+    fn store(&self, set: Set) {
+        self.plock_set.store(Self::as_ptr(set), Ordering::Release);
+    }
+}
 
 /// C's `next_id` starts at 1 and `makeSet` uses the POST-increment
 /// (`dbLock.c:70`, `:87`), so C's first lock set is number 2. Matching it
@@ -481,9 +529,14 @@ struct Registry {
     /// is why C's free count is not simply "sets that ever existed minus live
     /// ones". `ellGet` takes the head, so this is a queue.
     free: VecDeque<Set>,
-    /// C's `dbCommon::lset` → `lockRecord::plockSet` chain, by canonical
-    /// record name.
-    of_record: HashMap<String, u64>,
+    /// C's `dbCommon::lset` by canonical record name — the port's answer for
+    /// the callers that have only a name: [`PvDatabase::lock_records`] accepts
+    /// names that were never records, and the reports below print by name.
+    ///
+    /// The [`LockRecord`] here is the SAME cell the record instance holds, so
+    /// there is one association and not two: everything that moves a record
+    /// between sets moves it by storing into this cell.
+    of_record: HashMap<String, Arc<LockRecord>>,
     next_id: u64,
 }
 
@@ -548,11 +601,20 @@ impl Registry {
     /// all, so a missing set is created here exactly as `createLockRecord`
     /// (`:505-527`) would have created it.
     fn set_of(&mut self, record: &str) -> Set {
-        if let Some(id) = self.of_record.get(record) {
-            return self.active[id].set;
+        self.lock_record_of(record).set()
+    }
+
+    /// [`Self::set_of`]'s cell rather than its set — C `createLockRecord`
+    /// (`dbLock.c:505-527`), which is what hands a record the `lset` it then
+    /// locks through for the rest of its life. The cell survives every merge
+    /// and split; only the set it points at changes.
+    fn lock_record_of(&mut self, record: &str) -> Arc<LockRecord> {
+        if let Some(lr) = self.of_record.get(record) {
+            return lr.clone();
         }
         let set = self.make_set();
-        self.of_record.insert(record.to_string(), set.id);
+        let lr = LockRecord::new(set);
+        self.of_record.insert(record.to_string(), lr.clone());
         self.active.insert(
             set.id,
             SetState {
@@ -560,7 +622,21 @@ impl Registry {
                 members: BTreeSet::from([record.to_string()]),
             },
         );
-        set
+        lr
+    }
+
+    /// Move every member of `component` behind `set` — the ONE way a record
+    /// changes lock set, so the cell a record holds and the `of_record` entry
+    /// a name reaches can never disagree.
+    fn place(&mut self, names: impl IntoIterator<Item = String>, set: Set) {
+        for name in names {
+            match self.of_record.get(&name) {
+                Some(lr) => lr.store(set),
+                None => {
+                    self.of_record.insert(name, LockRecord::new(set));
+                }
+            }
+        }
     }
 
     /// C `dbLockSetMerge` (`dbLock.c:580-666`): every record behind
@@ -580,9 +656,8 @@ impl Registry {
             .active
             .remove(&b)
             .expect("every id in of_record names an active set");
-        for name in &moved.members {
-            self.of_record.insert(name.clone(), a);
-        }
+        let survivor = self.active[&a].set;
+        self.place(moved.members.iter().cloned(), survivor);
         let target = self
             .active
             .get_mut(&a)
@@ -608,10 +683,10 @@ impl Registry {
         let seed_id = if adjacency.contains_key(seed) {
             self.set_of(seed).id
         } else {
-            let Some(id) = self.of_record.get(seed).copied() else {
+            let Some(lr) = self.of_record.get(seed) else {
                 return;
             };
-            id
+            lr.set().id
         };
 
         let mut affected: BTreeSet<String> = BTreeSet::new();
@@ -623,7 +698,7 @@ impl Registry {
             if let Some(targets) = adjacency.get(&name) {
                 work.extend(targets.iter().cloned());
             }
-            if let Some(id) = self.of_record.get(&name).copied() {
+            if let Some(id) = self.of_record.get(&name).map(|lr| lr.set().id) {
                 work.extend(self.active[&id].members.iter().cloned());
             }
         }
@@ -632,12 +707,20 @@ impl Registry {
         // re-used for one of the new components or returned to the free list.
         let touched: BTreeSet<u64> = affected
             .iter()
-            .filter_map(|name| self.of_record.get(name).copied())
+            .filter_map(|name| self.of_record.get(name).map(|lr| lr.set().id))
             .collect();
 
         // A record the database no longer has leaves the partition with it —
         // `dbDeleteRecord` frees the `lockRecord` — so it is dropped here
         // rather than being carried into a component of one.
+        //
+        // An instance still alive behind someone's `Arc` keeps its cell, which
+        // goes on pointing at the set it had. C's does too, until
+        // `dbLockCleanupRecords`. The set may later be re-minted off the free
+        // list for another component, so such a gate can end up sharing a
+        // mutex with live records — it over-locks a record nothing processes,
+        // and can never under-lock one, because every LIVE record was placed
+        // into its component's set above.
         for name in &affected {
             if !adjacency.contains_key(name) {
                 self.of_record.remove(name);
@@ -689,7 +772,7 @@ impl Registry {
             }
             let mut ids = component
                 .iter()
-                .map(|name| self.of_record.get(name).copied());
+                .map(|name| self.of_record.get(name).map(|lr| lr.set().id));
             let first = ids.next().flatten();
             let uniform =
                 first.filter(|id| !keeps.contains(id) && ids.all(|other| other == Some(*id)));
@@ -717,9 +800,7 @@ impl Registry {
                     .next()
                     .expect("one fresh set per unassigned component"),
             };
-            for name in &component {
-                self.of_record.insert(name.clone(), set.id);
-            }
+            self.place(component.iter().cloned(), set);
             self.active.insert(
                 set.id,
                 SetState {
@@ -824,6 +905,11 @@ impl RecordLockRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Which set `record` is behind right now, without creating one.
+    fn set_id_of(&self, record: &str) -> Option<u64> {
+        self.lock().of_record.get(record).map(|lr| lr.set().id)
+    }
+
     /// The set `record` locks through, created on first use.
     ///
     /// The registry lock is released before the caller takes the set — it is
@@ -832,11 +918,6 @@ impl RecordLockRegistry {
     /// writer.
     fn set_of(&self, record: &str) -> Set {
         self.lock().set_of(record)
-    }
-
-    /// Which set `record` is behind right now, without creating one.
-    fn set_id_of(&self, record: &str) -> Option<u64> {
-        self.lock().of_record.get(record).copied()
     }
 }
 
@@ -856,7 +937,13 @@ impl PvDatabase {
     /// free-list count, which a components-first construction would report as
     /// zero.
     pub fn build_lock_sets(&self) {
-        let mut names: Vec<String> = self.inner.records.read().keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .inner
+            .records
+            .read()
+            .keys()
+            .map(|n| n.to_string())
+            .collect();
         names.sort();
         // Every edge is collected BEFORE the registry lock is taken:
         // `record_link_fields` reads the record map and each record's own
@@ -933,7 +1020,7 @@ impl PvDatabase {
             .unwrap_or_else(|| record.to_string());
         let rows = lock_set_mutex_rows();
         let registry = self.inner.record_locks.lock();
-        let id = registry.of_record.get(&canonical).copied()?;
+        let id = registry.of_record.get(&canonical)?.set().id;
         Some(registry.info(id, &rows))
     }
 
@@ -1018,7 +1105,13 @@ impl PvDatabase {
     /// record's own links (`dbLock.c:735-770`) for the same reason. A record
     /// that is only ever pointed AT is as much a member as the one pointing.
     fn db_link_adjacency(&self) -> HashMap<String, BTreeSet<String>> {
-        let names: Vec<String> = self.inner.records.read().keys().cloned().collect();
+        let names: Vec<String> = self
+            .inner
+            .records
+            .read()
+            .keys()
+            .map(|n| n.to_string())
+            .collect();
         let mut adjacency: HashMap<String, BTreeSet<String>> = HashMap::new();
         for name in &names {
             adjacency.entry(name.clone()).or_default();
@@ -1083,8 +1176,12 @@ impl PvDatabase {
     /// Acquire the lock set of a single record — the `dbScanLock(precord)`
     /// analogue.
     ///
-    /// `record` is alias-resolved internally, so an alias and its target
-    /// always reach the same set.
+    /// `record` is alias-resolved here and nowhere else: this is the single
+    /// owner of "which lock set does this name name", so an alias and its
+    /// target always reach the same set and no caller has to resolve first to
+    /// make that true. Resolution borrows — a name that is not an alias, which
+    /// is every name in a database that declares none, reaches the lookup
+    /// without a copy of itself being made.
     ///
     /// **Blocks the calling thread** when another thread holds the set. A
     /// thread that already holds it recurses, as C's recursive `epicsMutex`
@@ -1092,16 +1189,60 @@ impl PvDatabase {
     /// because processing a record and then its link target takes one mutex
     /// twice.
     pub fn lock_record(&self, record: &str) -> RecordWriteGuard {
-        let canonical = self
-            .resolve_alias(record)
-            .unwrap_or_else(|| record.to_string());
+        let resolved = self.resolve_alias(record);
+        let canonical: &str = resolved.as_deref().unwrap_or(record);
+        let lr = self.inner.record_locks.lock().lock_record_of(canonical);
+        Self::acquire_through(&lr)
+    }
+
+    /// C `dbScanLock(precord)` itself — the gate taken by a caller that
+    /// already holds the record, which in C is the only form there is.
+    ///
+    /// Prefer it to [`Self::lock_record`] wherever the record is in hand. It
+    /// reads the record's own cell and takes the set's mutex, and does
+    /// nothing else; reaching the same set by name costs an alias lookup plus
+    /// a hash of the record name under the registry mutex, twice. On the
+    /// process path — which always has the record, having just read it out of
+    /// the records map — that was 0.85 us of a 11.5 us calc cycle, measured
+    /// on 2000 records at 10 Hz.
+    pub fn lock_instance(
+        &self,
+        rec: &Arc<parking_lot::RwLock<RecordInstance>>,
+    ) -> RecordWriteGuard {
+        // The read guard is dropped BEFORE the set is taken, and the binding
+        // is what forces that: a guard still live across `acquire_through`
+        // would invert this file's one lock order — the process body holds the
+        // set and then takes `rec.write()`, so a thread holding a read and
+        // waiting for the set closes a cycle against it.
+        let attached = { rec.read().lock_record() };
+        if let Some(lr) = attached {
+            return Self::acquire_through(&lr);
+        }
+        // First gate this record has ever been given. C mints the cell in
+        // `dbLockInitRecords` before anything can lock; the port allows a
+        // database with no `iocInit` at all, so the cell is minted on demand
+        // here — once per record, off every later pass.
+        let lr = {
+            let name = rec.read().name.clone();
+            self.inner.record_locks.lock().lock_record_of(&name)
+        };
+        rec.write().attach_lock_record(lr.clone());
+        Self::acquire_through(&lr)
+    }
+
+    /// C `dbScanLock`'s body (`dbLock.c:184-213`) — take the set the cell
+    /// names, then check the cell still names it.
+    ///
+    /// The re-check is not optional: a merge running concurrently moves the
+    /// record behind another mutex, and the one just taken would guard
+    /// nothing. C compares `lockSet` pointers under the record's spinlock;
+    /// the cell's store is `Release` and the load `Acquire`, which is the same
+    /// publication.
+    fn acquire_through(lr: &LockRecord) -> RecordWriteGuard {
         loop {
-            let set = self.inner.record_locks.set_of(&canonical);
+            let set = lr.set();
             let guard = set.acquire(false);
-            // C `dbScanLock`'s `retry:` (`dbLock.c:194-213`): a merge can move
-            // the record to another set between the lookup and the
-            // acquisition, and the set just taken would then guard nothing.
-            if self.inner.record_locks.set_id_of(&canonical) == Some(set.id) {
+            if std::ptr::eq(lr.set(), set) {
                 return RecordWriteGuard { _guard: guard };
             }
             drop(guard);

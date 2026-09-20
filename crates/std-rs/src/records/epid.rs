@@ -1297,7 +1297,7 @@ impl Record for EpidRecord {
         )]
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         // INP -> CVAL is always resolved.
         // STPL -> VAL is only resolved when SMSL == closed_loop (1).
         // In supervisory mode (SMSL=0), the operator sets VAL directly

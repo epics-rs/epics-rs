@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::server::record::{PiniMode, RecordInstance, ScanList, ScanType};
 
@@ -11,6 +12,46 @@ use super::PvDatabase;
 /// `addToList`/`deleteFromList` are `static` in `dbScan.c` and `scanAdd` /
 /// `scanDelete` (`dbScan.c:240`/`:308` at R7.0.10) are the whole public
 /// surface.
+/// One scan list's records, and the revision that says whether they are still
+/// the ones a cursor last saw.
+///
+/// The two live together because the revision is only meaningful as a
+/// statement about these keys: [`ScanCursor`] resumes from a key it was handed
+/// on an earlier step, and the only thing that can invalidate it is a record
+/// entering, leaving, or being re-keyed within THIS bucket. Every such
+/// transition goes through [`PvDatabase::add_to_scan_list`] or
+/// [`PvDatabase::delete_from_scan_list`] (see the module note), so bumping the
+/// revision inside the two methods below is the whole enforcement: a bucket
+/// cannot change without saying so.
+struct Bucket {
+    keys: BTreeSet<super::ScanKey>,
+    revision: u64,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            keys: BTreeSet::new(),
+            revision: 0,
+        }
+    }
+
+    /// C `addToList`'s insertion. Bumps the revision whether or not the key
+    /// was already present: an insert of an equal key is the re-key case, and
+    /// a cursor standing on the old key has to be told.
+    fn insert(&mut self, key: super::ScanKey) {
+        self.revision = self.revision.wrapping_add(1);
+        self.keys.insert(key);
+    }
+
+    /// C `deleteFromList`'s removal, by record name — see the caller for why
+    /// the name alone is the match.
+    fn remove_named(&mut self, name: &str) {
+        self.revision = self.revision.wrapping_add(1);
+        self.keys.retain(|k| k.name.as_ref() != name);
+    }
+}
+
 pub(super) struct ScanIndex {
     /// One bucket per scan list. Sized from the LOADED `menuScan`
     /// ([`ScanList::count`]), not from a compile-time rate list, and built on
@@ -19,9 +60,7 @@ pub(super) struct ScanIndex {
     /// freeze the menu before the loader could install one. C reaches the same
     /// point by ordering — `dbLoadDatabase`, then `iocInit` → `initPeriodic`
     /// sizes `papPeriodic`.
-    buckets: std::sync::OnceLock<
-        Box<[crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<super::ScanKey>>]>,
-    >,
+    buckets: std::sync::OnceLock<Box<[crate::runtime::sync::PriorityInheritanceMutex<Bucket>]>>,
     /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
     /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
     /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
@@ -40,15 +79,12 @@ impl ScanIndex {
     }
 
     /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
-    fn bucket(
-        &self,
-        list: ScanList,
-    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<super::ScanKey>> {
+    fn bucket(&self, list: ScanList) -> &crate::runtime::sync::PriorityInheritanceMutex<Bucket> {
         &self
             .buckets
             .get_or_init(|| {
                 (0..ScanList::count())
-                    .map(|_| crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new()))
+                    .map(|_| crate::runtime::sync::PriorityInheritanceMutex::new(Bucket::new()))
                     .collect()
             })
             .as_ref()[list.slot()]
@@ -111,11 +147,7 @@ impl PvDatabase {
         let Some(list) = scan.scan_list() else {
             return;
         };
-        self.inner
-            .scan_index
-            .bucket(list)
-            .lock()
-            .retain(|k| k.name != name);
+        self.inner.scan_index.bucket(list).lock().remove_named(name);
     }
 
     /// Update scan index when a record's SCAN or PHAS field changes.
@@ -233,8 +265,9 @@ impl PvDatabase {
             .scan_index
             .bucket(list)
             .lock()
+            .keys
             .iter()
-            .map(|k| k.name.clone())
+            .map(|k| k.name.to_string())
             .collect()
     }
 
@@ -252,7 +285,11 @@ impl PvDatabase {
 
     /// A cursor over `list` as it stands at each step — see [`ScanCursor`].
     pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor {
-        ScanCursor { list, at: None }
+        ScanCursor {
+            list,
+            at: None,
+            revision: 0,
+        }
     }
 
     /// Sweep one scan list, processing every record still in it — C `scanList`
@@ -311,14 +348,20 @@ impl PvDatabase {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(n, r)| (n.clone(), r.clone()))
+                .map(|(n, r)| (n.to_string(), r.clone()))
                 .collect()
         };
         let mut keyed: Vec<_> = {
             let load_order = self.inner.load_order.load();
             snapshot
                 .into_iter()
-                .map(|(name, rec)| (load_order.get(&name).copied().unwrap_or(0), name, rec))
+                .map(|(name, rec)| {
+                    (
+                        load_order.get(name.as_str()).copied().unwrap_or(0),
+                        name,
+                        rec,
+                    )
+                })
                 .collect()
         };
         keyed.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -471,6 +514,15 @@ pub(crate) struct ScanCursor {
     list: ScanList,
     /// Where the cursor stands: the key of the record it last handed out.
     at: Option<super::ScanKey>,
+    /// The bucket revision [`Self::at`] was read at.
+    ///
+    /// While it still matches the bucket's, no record has entered, left or
+    /// been re-keyed in this list, so the key in `at` is still the record's
+    /// key and there is nothing to repair. That is the answer the step used to
+    /// reach by rebuilding the key from the record's live PHAS, record type
+    /// and load order and looking the result up — per record, per sweep, to
+    /// learn that a list nothing had touched still held what it held.
+    revision: u64,
 }
 
 impl ScanCursor {
@@ -479,37 +531,46 @@ impl ScanCursor {
     /// Takes the bucket lock for the step only, never across processing — C
     /// holds `psl->lock` for the cursor step and releases it around every
     /// `dbProcess`.
-    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<String> {
+    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<Arc<str>> {
         use std::ops::Bound;
 
-        let resume = match self.at.take() {
-            None => None,
-            Some(was) => {
-                let live = db.live_scan_key(&was.name);
-                let moved_but_present = match &live {
-                    Some(k) => db.inner.scan_index.bucket(self.list).lock().contains(k),
-                    None => false,
-                };
-                Some(if moved_but_present {
-                    live.expect("checked present")
-                } else {
-                    was
-                })
-            }
-        };
-
-        let next = {
-            let bucket = db.inner.scan_index.bucket(self.list).lock();
-            match &resume {
-                None => bucket.iter().next().cloned(),
+        fn step(bucket: &Bucket, resume: Option<&super::ScanKey>) -> Option<super::ScanKey> {
+            match resume {
+                None => bucket.keys.iter().next().cloned(),
                 Some(at) => bucket
-                    .range((Bound::Excluded(at.clone()), Bound::Unbounded))
+                    .keys
+                    .range((Bound::Excluded(at), Bound::Unbounded))
                     .next()
                     .cloned(),
             }
+        }
+
+        let was = self.at.take();
+        // One bucket lock answers the whole step whenever the list has not
+        // changed under the cursor, which is every step of an ordinary sweep.
+        {
+            let bucket = db.inner.scan_index.bucket(self.list).lock();
+            if was.is_none() || bucket.revision == self.revision {
+                self.revision = bucket.revision;
+                self.at = step(&bucket, was.as_ref());
+                return self.at.as_ref().map(|k| k.name.clone());
+            }
+        }
+
+        // The list did change, so the record may have moved within it and the
+        // key has to be rebuilt from its live PHAS, record type and load order
+        // — C's cursor repair. `live_scan_key` reads the records map and the
+        // record itself, so the bucket lock is released across it.
+        let was = was.expect("a cursor that is not standing took the branch above");
+        let live = db.live_scan_key(&was.name);
+        let bucket = db.inner.scan_index.bucket(self.list).lock();
+        let resume = match live {
+            Some(k) if bucket.keys.contains(&k) => k,
+            _ => was,
         };
-        self.at = next.clone();
-        next.map(|k| k.name)
+        self.revision = bucket.revision;
+        self.at = step(&bucket, Some(&resume));
+        self.at.as_ref().map(|k| k.name.clone())
     }
 }
 
@@ -612,6 +673,33 @@ mod tests {
             panic!("unwind with the gate live");
         }));
         drop(db.lock_registration("after_unwind"));
+    }
+
+    /// A cursor skips its repair walk for as long as the bucket revision it
+    /// carries still matches, so the revision has to move on every transition
+    /// that can invalidate a key it holds — including an insert of a key the
+    /// bucket already has, which is how a re-key that keeps the same PHAS
+    /// arrives.
+    #[test]
+    fn every_scan_bucket_transition_moves_the_revision() {
+        let db = PvDatabase::new();
+        let list = ScanType::SEC01.scan_list().expect("1 second names a list");
+        let revision = || db.inner.scan_index.bucket(list).lock().revision;
+
+        let empty = revision();
+        db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "R:ONE");
+        let added = revision();
+        assert_ne!(added, empty, "an insert is a transition");
+
+        db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "R:ONE");
+        let re_added = revision();
+        assert_ne!(
+            re_added, added,
+            "re-inserting a key the bucket already holds is a transition too"
+        );
+
+        db.delete_from_scan_list(ScanType::SEC01, "R:ONE");
+        assert_ne!(revision(), re_added, "a removal is a transition");
     }
 
     #[test]

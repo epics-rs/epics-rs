@@ -1185,9 +1185,8 @@ impl PvDatabase {
     /// the body — a map read, and records are never removed once loaded.
     fn acquire_put_gate(&self, name: &str) -> Option<super::record_lock::RecordWriteGuard> {
         let (base, _) = super::parse_pv_name(name);
-        self.get_record(base)?;
-        let canonical: String = self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-        Some(self.lock_record(&canonical))
+        let rec = self.get_record(base)?;
+        Some(self.lock_instance(&rec))
     }
 
     /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
@@ -1647,15 +1646,18 @@ impl PvDatabase {
             // `put_record_field_from_ca`, or a gateway/sequencer
             // write through this helper can still land between the
             // member writes of a QSRV atomic group or a pvalink
-            // atomic scan epoch holding `lock_records`. `base` is
-            // alias-resolved to the canonical record name so an alias
-            // and its target share one gate. Held until return — same
-            // reasoning as `put_pv_inner`'s gate: C's `dbScanLock` covers
-            // `dbPut` including `dbPutSpecial(paddr, 1)` and the scan-list
-            // move, so both tails below stay inside the window.
+            // atomic scan epoch holding `lock_records`. Taken on the
+            // record, so an alias and its target share one gate for the
+            // reason C's do — one `dbCommon`, one `lset`. Held until
+            // return — same reasoning as
+            // `put_pv_inner`'s gate: C's `dbScanLock` covers `dbPut`
+            // including `dbPutSpecial(paddr, 1)` and the scan-list move, so
+            // both tails below stay inside the window.
+            let _record_gate = self.lock_instance(&rec);
+            // The canonical name itself is wanted further down, by
+            // `update_scan_index` and `run_special_actions`.
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            let _record_gate = self.lock_record(&canonical_base);
 
             // Guarded: the value write + monitor post. The record's DATA guard
             // is released at the block close before the tails below, which
@@ -2080,10 +2082,7 @@ impl PvDatabase {
         let rec = self
             .get_record(record_name)
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
-        let canonical: String = self
-            .resolve_alias(record_name)
-            .unwrap_or_else(|| record_name.to_string());
-        let _record_gate = self.lock_record(&canonical);
+        let _record_gate = self.lock_instance(&rec);
 
         // Resolved before the record lock: the record-wide `DBE_ALARM` post
         // below reaches every subscribed field, a link-backed one included.
@@ -3248,12 +3247,15 @@ impl PvDatabase {
             // (autosave restore). It must take the advisory write gate
             // (`dbScanLock` analogue) so an autosave restore cannot
             // land between the member writes of a QSRV atomic group or
-            // a pvalink atomic scan epoch holding `lock_records`.
-            // `base` is alias-resolved so an alias and its target
-            // share one gate. Held until return.
+            // a pvalink atomic scan epoch holding `lock_records`. Taken
+            // on the record, so an alias and its target share one gate
+            // for the reason C's do — one `dbCommon`, one `lset`. Held
+            // until return.
+            let _record_gate = self.lock_instance(&rec);
+            // The canonical name itself is wanted further down, by
+            // `update_scan_index` and `run_special_actions`.
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            let _record_gate = self.lock_record(&canonical_base);
 
             // C reads a link-backed field's metadata live inside the rset,
             // under the TARGET record's lock; every poster below holds THIS

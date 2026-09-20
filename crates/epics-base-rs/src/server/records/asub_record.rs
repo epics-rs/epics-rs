@@ -429,6 +429,17 @@ impl Record for ASubRecord {
         }
     }
 
+    /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 21 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Long(self.val)),
@@ -708,7 +719,7 @@ impl Record for ASubRecord {
         seeds
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         use std::sync::OnceLock;
         static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
         PAIRS.get_or_init(|| {

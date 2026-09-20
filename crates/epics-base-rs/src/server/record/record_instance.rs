@@ -855,6 +855,15 @@ pub enum AlarmAck {
 pub struct RecordInstance {
     pub name: String,
     pub record: Box<dyn Record>,
+    /// C `dbCommon::lset` — the cell this record locks through
+    /// (`dbLockPvt.h:52`). `None` until the record has been given a gate,
+    /// which is C's null `lset` before `dbLockInitRecords`.
+    ///
+    /// PRIVATE: `PvDatabase::lock_instance` is the only writer, through
+    /// [`Self::attach_lock_record`], because the cell a record holds must be
+    /// the one the lock-set registry hands out for its name — a second cell
+    /// would be a second answer to "which set is this record in".
+    lock_record: Option<std::sync::Arc<crate::server::database::LockRecord>>,
     pub common: CommonFields,
     pub subscribers: HashMap<String, Vec<Subscriber>>,
     /// Terminal destruction marker, the [`crate::server::pv::ProcessVariable`]
@@ -987,6 +996,24 @@ pub struct RecordInstance {
     /// statement, so the two cannot drift the way the central
     /// `match rtype` list they replace drifted away from `aSub`.
     link_backed_metadata_links: Vec<String>,
+    /// Where each of those links sits in [`Record::multi_input_links`] — the
+    /// list a process cycle reads once at its top. Both lists are properties
+    /// of the record TYPE, so the mapping is fixed here and cannot drift;
+    /// `None` marks a metadata link the multi-input fetch does not cover,
+    /// which the cycle then reads for itself. Taken once because the
+    /// alternative is searching the pre-read list by name, per link, per pass.
+    link_backed_metadata_input_slot: Vec<Option<usize>>,
+    /// Does this record type's `.dbd` declare a simulation block — i.e. the
+    /// SIMM field C's `readValue`/`writeValue` dispatch on?
+    ///
+    /// `dbCommon` declares none of SIMM/SIML/SIOL/SIMS/SDLY, so the answer is
+    /// a property of the record TYPE, and for 18 of the 41 types this port
+    /// carries (calc, calcout, sub, aSub, sel, seq, fanout, compress,
+    /// subArray, ...) it is `false`: their C record support has no
+    /// `readValue`/`writeValue` at all. Taken once here because the process
+    /// cycle asks it on every pass, where resolving SIMM by name costs a
+    /// scan of the record's declared field list and `dbCommon`'s.
+    declares_simulation: bool,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -1263,6 +1290,24 @@ impl RecordInstance {
         Self::new_boxed(name, Box::new(record))
     }
 
+    /// C `precord->lset` — the lock-set cell this record locks through, or
+    /// `None` before it has ever been given a gate.
+    pub(crate) fn lock_record(
+        &self,
+    ) -> Option<std::sync::Arc<crate::server::database::LockRecord>> {
+        self.lock_record.clone()
+    }
+
+    /// Install the cell. `PvDatabase::lock_instance` is the only caller, and
+    /// it passes the cell the lock-set registry holds for this record's name,
+    /// so record and registry name the same set by construction.
+    pub(crate) fn attach_lock_record(
+        &mut self,
+        lr: std::sync::Arc<crate::server::database::LockRecord>,
+    ) {
+        self.lock_record = Some(lr);
+    }
+
     /// The raw text of one `COMMON_LINK_FIELDS` entry, or `None` for any
     /// other field name.
     pub fn common_link_text(&self, field: &str) -> Option<&str> {
@@ -1301,6 +1346,40 @@ impl RecordInstance {
         &self.link_backed_metadata_links
     }
 
+    /// Where each [`Self::link_backed_metadata_links`] entry sits in the
+    /// record's multi-input link list, in that same order. See the field.
+    pub(crate) fn link_backed_metadata_input_slots(&self) -> &[Option<usize>] {
+        &self.link_backed_metadata_input_slot
+    }
+
+    /// Does this record's `.dbd` declare the simulation block — the gate C's
+    /// `readValue`/`writeValue` exist behind. See the field.
+    pub(crate) fn declares_simulation(&self) -> bool {
+        self.declares_simulation
+    }
+
+    /// The text of a link field, `None` when the link is unset.
+    ///
+    /// A declared link is unset far more often than set — a `calc` declares 21
+    /// inputs and a stock database wires none of them — and the process cycle
+    /// asks every declared link on every pass, so the unset answer is the one
+    /// that has to be cheap. Returning `Option` rather than an empty `String`
+    /// is what makes it so at the call sites: there is no empty text to test,
+    /// so nothing the caller wants only for a set link — a cloned field name,
+    /// a parse, a `Vec` entry — can be built before the answer is known. Each
+    /// of the six link reads this replaced did build something first and throw
+    /// it away.
+    #[inline]
+    pub(crate) fn link_text(&self, field: &str) -> Option<String> {
+        if let Some(text) = self.record.link_text_ref(field) {
+            return (!text.is_empty()).then(|| text.to_owned());
+        }
+        match self.record.get_field(field)? {
+            EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         // The reverse index of `Record::link_backed_metadata_field`, built once
@@ -1318,6 +1397,18 @@ impl RecordInstance {
             links.dedup();
             links
         };
+        // See the field's own doc: fixed by the record TYPE, both sides of it.
+        let link_backed_metadata_input_slot: Vec<Option<usize>> = link_backed_metadata_links
+            .iter()
+            .map(|lf| {
+                record
+                    .multi_input_links()
+                    .iter()
+                    .position(|(mf, _)| mf == lf)
+            })
+            .collect();
+        // The gate on the whole simulation block — see the field's own doc.
+        let declares_simulation = field_desc_of(record.as_ref(), "SIMM").is_some();
         let analog_alarm = match rtype {
             // C parity: every record type whose dbd carries
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
@@ -1351,6 +1442,7 @@ impl RecordInstance {
             destroyed: false,
             name,
             record,
+            lock_record: None,
             common,
             subscribers: HashMap::new(),
             parsed_inp: ParsedLink::None,
@@ -1367,6 +1459,8 @@ impl RecordInstance {
             last_posted: HashMap::new(),
             declared_overrides: HashMap::new(),
             link_backed_metadata_links,
+            link_backed_metadata_input_slot,
+            declares_simulation,
             array_hash_changed: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -8732,6 +8826,168 @@ mod declaration_gate_tests {
         let calc = inst("C:GOOD", Box::new(CalcRecord::default()));
         assert_eq!(calc.resolve_string_view_field("OUT"), None);
         assert!(calc.resolve_string_view_field("CALC").is_some());
+    }
+
+    /// `declares_simulation` replaced `resolve_field("SIMM").is_some()` as the
+    /// gate on `PvDatabase::check_simulation_mode`, so it must answer the same
+    /// thing for every record type the port carries — a type that gained the
+    /// simulation block while the flag said otherwise would silently stop
+    /// simulating, and one that lost it would resolve SIML/SIOL by name on
+    /// every process cycle again.
+    #[test]
+    fn the_simulation_gate_agrees_with_resolving_simm_on_every_record_type() {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        let mut declared = 0usize;
+        for rtype in RECORD_TYPE_ORDER {
+            let Ok(record) = crate::server::db_loader::create_record(rtype) else {
+                continue;
+            };
+            let instance = inst(&format!("SIM:{rtype}"), record);
+            assert_eq!(
+                instance.declares_simulation(),
+                instance.resolve_field("SIMM").is_some(),
+                "{rtype}"
+            );
+            declared += usize::from(instance.declares_simulation());
+        }
+        // Both arms have to be populated or the equality above is vacuous.
+        assert!(declared > 0, "no record type declared a simulation block");
+        assert!(
+            declared < RECORD_TYPE_ORDER.len(),
+            "every record type declared one"
+        );
+    }
+
+    /// The two arms by name, so the gate's meaning is readable without
+    /// running the sweep above: `ai` is `readValue`-bearing, `calc` has no
+    /// `readValue` in C at all.
+    /// The slot index is what lets the cycle take a pre-read link's text
+    /// without searching for it by name, so it has to name the same link the
+    /// search would have found — on every record type, not just the calc
+    /// class it was measured on.
+    #[test]
+    fn the_metadata_link_slots_name_the_same_links_a_search_would_find() {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        let mut with_slots = 0usize;
+        for rtype in RECORD_TYPE_ORDER {
+            let Ok(record) = crate::server::db_loader::create_record(rtype) else {
+                continue;
+            };
+            let instance = inst(&format!("S:{rtype}"), record);
+            let links = instance.link_backed_metadata_links();
+            let slots = instance.link_backed_metadata_input_slots();
+            assert_eq!(links.len(), slots.len(), "{rtype}");
+            for (lf, slot) in links.iter().zip(slots) {
+                let multi = instance.record.multi_input_links();
+                assert_eq!(
+                    *slot,
+                    multi.iter().position(|(mf, _)| mf == lf),
+                    "{rtype}.{lf}"
+                );
+                if let Some(i) = *slot {
+                    assert_eq!(multi[i].0, lf.as_str(), "{rtype}.{lf}");
+                    with_slots += 1;
+                }
+            }
+        }
+        assert!(
+            with_slots > 0,
+            "no record type maps a metadata link onto its multi-input list"
+        );
+    }
+
+    /// `link_text` replaced a materialise-then-test shape at six link-read
+    /// sites, so what it owes them is that boundary: a link that reads empty
+    /// is `None`, and every other answer is the text itself.
+    #[test]
+    fn link_text_answers_none_exactly_where_a_link_reads_empty() {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        for rtype in RECORD_TYPE_ORDER {
+            let Ok(record) = crate::server::db_loader::create_record(rtype) else {
+                continue;
+            };
+            let instance = inst(&format!("L:{rtype}"), record);
+            let declared: Vec<&'static str> = instance
+                .record
+                .multi_input_links()
+                .iter()
+                .chain(instance.record.string_input_links())
+                .map(|(lf, _)| *lf)
+                .collect();
+            for lf in declared {
+                let materialised = match instance.record.get_field(lf) {
+                    Some(EpicsValue::String(text)) => text.as_str_lossy().into_owned(),
+                    _ => String::new(),
+                };
+                assert_eq!(
+                    instance.link_text(lf),
+                    (!materialised.is_empty()).then_some(materialised),
+                    "{rtype}.{lf}"
+                );
+            }
+        }
+    }
+
+    /// A record that lends a link text must lend the SAME text its
+    /// `get_field` materialises — the two paths are one answer, and a slot
+    /// mapping that drifts by one would otherwise hand the cycle a
+    /// neighbouring link's target.
+    #[test]
+    fn a_lent_link_text_is_the_one_get_field_materialises() {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        for rtype in RECORD_TYPE_ORDER {
+            let Ok(mut record) = crate::server::db_loader::create_record(rtype) else {
+                continue;
+            };
+            let declared: Vec<&'static str> = record
+                .multi_input_links()
+                .iter()
+                .chain(record.string_input_links())
+                .map(|(lf, _)| *lf)
+                .collect();
+            // Distinct per slot, so a mapping off by one cannot agree.
+            for (slot, lf) in declared.iter().enumerate() {
+                let text = format!("SRC:{rtype}:{slot}.VAL CP");
+                let _ = record.put_field(lf, EpicsValue::String(text.as_str().into()));
+            }
+            for lf in &declared {
+                let Some(lent) = record.link_text_ref(lf) else {
+                    continue;
+                };
+                let materialised = match record.get_field(lf) {
+                    Some(EpicsValue::String(text)) => text.as_str_lossy().into_owned(),
+                    _ => String::new(),
+                };
+                assert_eq!(
+                    lent, materialised,
+                    "{rtype}.{lf} lent a text its get_field does not hold"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_text_reads_a_wired_link_and_refuses_what_is_not_one() {
+        let mut instance = inst("C:GOOD", Box::new(CalcRecord::default()));
+        assert_eq!(instance.link_text("INPA"), None, "an unwired INPA");
+        instance
+            .record
+            .put_field("INPA", EpicsValue::String("SRC:ONE.VAL CP".into()))
+            .expect("INPA takes a link string");
+        assert_eq!(
+            instance.link_text("INPA").as_deref(),
+            Some("SRC:ONE.VAL CP")
+        );
+        // A numeric field is not a link, and neither is one the type does not
+        // declare: both have to read as "no link", not as an empty one.
+        assert_eq!(instance.link_text("A"), None);
+        assert_eq!(instance.link_text("NOSUCH"), None);
+    }
+
+    #[test]
+    fn a_record_type_without_readvalue_declares_no_simulation_block() {
+        assert!(!inst("C:GOOD", Box::new(CalcRecord::default())).declares_simulation());
+        assert!(inst("B:ONE", Box::new(BiRecord::default())).declares_simulation());
     }
 }
 

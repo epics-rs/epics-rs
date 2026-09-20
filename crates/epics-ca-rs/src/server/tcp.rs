@@ -5085,8 +5085,7 @@ fn record_field_snapshot_scan_locked(
     field: &str,
     string_view: bool,
 ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
-    let name = record.read().name.clone();
-    let _scan_lock = db.lock_record(&name);
+    let _scan_lock = db.lock_instance(record);
     db.channel_snapshot_for_field(record, field, string_view)
 }
 

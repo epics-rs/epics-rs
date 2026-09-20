@@ -84,6 +84,20 @@ fn set_scan(db: &PvDatabase, name: &str, scan: ScanType) {
     db.update_scan_index(name, old, scan, phas, phas);
 }
 
+/// Move `name` to another PHAS without leaving its list, the way a put to the
+/// PHAS field does — C `dbAccess.c`'s `SPC_SCAN` reaches `scanDelete`/`scanAdd`
+/// for PHAS exactly as it does for SCAN.
+fn set_phas(db: &PvDatabase, name: &str, phas: i16) {
+    let (scan, old) = {
+        let rec = db.get_record(name).expect("record present");
+        let mut inst = rec.write();
+        let old = inst.common.phas;
+        inst.common.phas = phas;
+        (inst.common.scan, old)
+    };
+    db.update_scan_index(name, scan, scan, old, phas);
+}
+
 /// Add an Event-scanned probe at `phas`, returning its process counter.
 async fn probe(
     db: &Arc<PvDatabase>,
@@ -250,4 +264,78 @@ async fn a_record_removed_at_the_cursor_does_not_stall_the_sweep() {
         1,
         "the sweep resumes past a cursor whose own element left the list"
     );
+}
+
+/// BOUNDARY: re-keyed WITHIN the same list, ahead of the cursor. `M` (PHAS 0)
+/// moves `V` from PHAS 1 to PHAS 5 while both stay on the Event list — the one
+/// case the cursor cannot answer by asking whether a key is still present,
+/// because `V`'s is, at another place. C `scanList` re-reads `ellNext` under
+/// `psl->lock` on the next step (`dbScan.c:1023-1029`), so a record that only
+/// moved is still reached.
+#[epics_macros_rs::epics_test]
+async fn a_record_re_keyed_ahead_of_the_cursor_is_still_processed() {
+    let db = Arc::new(PvDatabase::new());
+    let mutator = probe(
+        &db,
+        "M",
+        0,
+        Some(Box::new(|db: &PvDatabase| {
+            set_phas(db, "V", 5);
+        })),
+    )
+    .await;
+    let moved = probe(&db, "V", 1, None).await;
+
+    db.post_event().await;
+
+    assert_eq!(mutator.load(Ordering::SeqCst), 1, "the mutator itself runs");
+    assert_eq!(
+        moved.load(Ordering::SeqCst),
+        1,
+        "a record that moved within the list, not off it, is still reached"
+    );
+}
+
+/// BOUNDARY: re-keyed WITHIN the same list, behind the cursor. The same move in
+/// the other direction — `V` lands at PHAS 0, where the cursor has already
+/// been — and a sweep must not walk backwards to it.
+#[epics_macros_rs::epics_test]
+async fn a_record_re_keyed_behind_the_cursor_does_not_process() {
+    let db = Arc::new(PvDatabase::new());
+    let mutator = probe(
+        &db,
+        "M",
+        2,
+        Some(Box::new(|db: &PvDatabase| {
+            set_phas(db, "V", 0);
+        })),
+    )
+    .await;
+    let moved = probe(&db, "V", 3, None).await;
+
+    db.post_event().await;
+
+    assert_eq!(mutator.load(Ordering::SeqCst), 1, "the mutator itself runs");
+    assert_eq!(
+        moved.load(Ordering::SeqCst),
+        0,
+        "a record moved behind the cursor is behind it, and the sweep ends"
+    );
+}
+
+/// BOUNDARY: nothing changes. The sweep the whole IOC spends its time in is
+/// the one where no record touches the list, and there the cursor has nothing
+/// to repair — every record still has to come out exactly once.
+#[epics_macros_rs::epics_test]
+async fn an_untouched_list_hands_out_every_record_exactly_once() {
+    let db = Arc::new(PvDatabase::new());
+    let a = probe(&db, "A", 2, None).await;
+    let b = probe(&db, "B", 0, None).await;
+    let c = probe(&db, "C", 1, None).await;
+
+    db.post_event().await;
+
+    for (name, count) in [("A", &a), ("B", &b), ("C", &c)] {
+        assert_eq!(count.load(Ordering::SeqCst), 1, "{name} processed once");
+    }
 }

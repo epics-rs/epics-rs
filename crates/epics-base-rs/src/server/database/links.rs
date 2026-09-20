@@ -520,7 +520,7 @@ impl PvDatabase {
     pub(crate) fn read_link_value(
         &self,
         link: &crate::server::record::ParsedLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::None => None,
@@ -594,7 +594,7 @@ impl PvDatabase {
         &self,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> crate::server::recgbl::simm::LinkFetch {
         use crate::server::recgbl::simm::LinkFetch;
         let Some(value) = self.read_link_value(link, visited) else {
@@ -1431,7 +1431,7 @@ impl PvDatabase {
     pub(crate) fn process_passive_db_source(
         &self,
         db: &crate::server::record::DbLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
@@ -1457,7 +1457,7 @@ impl PvDatabase {
         &self,
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> Option<EpicsValue> {
         match link {
             // A CONSTANT input link delivers NOTHING at process time. C
@@ -1544,7 +1544,7 @@ impl PvDatabase {
         gate: ProcessTargetGate,
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) {
         let Some(target_rec) = self.get_record(target_name) else {
             return;
@@ -1604,7 +1604,7 @@ impl PvDatabase {
         link: &crate::server::record::DbLink,
         value: EpicsValue,
         src: OutLinkSrc<'_>,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> bool {
         let target = link.target();
         let target_name = local_pv_name(&target);
@@ -2148,7 +2148,7 @@ impl PvDatabase {
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         src: OutLinkSrc<'_>,
         skip_out: bool,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) {
         let pairs = {
             let instance = rec.read();
@@ -2256,7 +2256,7 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
         src: OutLinkSrc<'_>,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> bool {
         let failed = match link {
             crate::server::record::ParsedLink::Db(db) => {
@@ -2489,7 +2489,7 @@ impl PvDatabase {
         &self,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         phase: MultiOutPhase,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) -> MultiOutDispatch {
         // Phase gate, keyed on what the record's links ARE (see
         // `multi_out_phase_of`), not on which argument the caller passed.
@@ -2816,7 +2816,7 @@ impl PvDatabase {
                                 // C `processCallback`'s `dbScanLock` /
                                 // `dbScanUnlock` pair (`seqRecord.c:252`,
                                 // `:274`) — held for this group alone.
-                                let _gate = db.lock_record(&rec_name);
+                                let _gate = db.lock_instance(&rec);
                                 let mut visited = HashSet::new();
                                 db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited);
                             }
@@ -2892,7 +2892,7 @@ impl PvDatabase {
         rec_name: &str,
         groups: &[SeqGroup],
         idx: usize,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<Arc<str>>,
     ) {
         // DOn value-storage field names (`linkGrp.dov`), index-aligned with
         // the LNKn/DOLn groups.

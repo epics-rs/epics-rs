@@ -15,7 +15,8 @@ pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
     LinkSetRegistry, PutAdmission, RemoteAlarm,
 };
-pub use processing::{AsyncDbHandle, AsyncToken};
+pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts};
+pub(crate) use record_lock::LockRecord;
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
@@ -355,7 +356,11 @@ struct ScanKey {
     /// so its types join `recordTypeList` behind base's.
     record_type: u32,
     load_order: u64,
-    name: String,
+    /// An `Arc` and not a `String` because the cursor hands this name out once
+    /// per record per scan cycle, and a `String` there made every sweep
+    /// allocate — twice, since the cursor step clones the key as well.
+    /// `Ord` on `Arc<str>` is `str`'s, so the sort rule above is unchanged.
+    name: Arc<str>,
 }
 
 impl ScanKey {
@@ -368,7 +373,7 @@ impl ScanKey {
                 .position(|t| *t == record_type)
                 .unwrap_or(RECORD_TYPE_ORDER.len()) as u32,
             load_order,
-            name: name.to_string(),
+            name: Arc::from(name),
         }
     }
 }
@@ -424,7 +429,14 @@ struct PvDatabaseInner {
     /// a `.{filter}` suffix on the client's channel name cannot make the
     /// match miss the way a name comparison would.
     pv_destroyed_tx: tokio::sync::broadcast::Sender<()>,
-    records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
+    /// Every registered record, keyed by its canonical name.
+    ///
+    /// The key is an `Arc<str>` because it is the ONE allocation of that name:
+    /// `PvDatabase::lookup_record` hands it out and every hop of a process
+    /// chain — the cycle guard, the scan key, the lock-set lookup — carries a
+    /// share of it rather than a copy. A name-keyed map that owned `String`s
+    /// made a scan step allocate the name of every record it touched.
+    records: parking_lot::RwLock<HashMap<Arc<str>, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
     /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
@@ -2473,13 +2485,7 @@ impl PvDatabase {
                         LinkBacking::none(),
                     );
                 }
-                Some(link_field) => match inst.record.get_field(&link_field) {
-                    Some(EpicsValue::String(text)) => {
-                        let text = text.as_str_lossy().into_owned();
-                        (!text.is_empty()).then_some((link_field, text))
-                    }
-                    _ => None,
-                },
+                Some(link_field) => inst.link_text(&link_field).map(|text| (link_field, text)),
             }
         };
 
@@ -2514,6 +2520,23 @@ impl PvDatabase {
         &self,
         record: &Arc<parking_lot::RwLock<RecordInstance>>,
     ) -> HashMap<String, LinkMetadata> {
+        self.resolve_link_backed_metadata_with(record, &InputLinkTexts::none())
+    }
+
+    /// [`Self::resolve_link_backed_metadata`] for a caller that has already
+    /// read some of this record's link fields this cycle.
+    ///
+    /// A record's link-backed metadata links are, for the calc class, exactly
+    /// its `INPA`..`INPL` — the same twelve the process cycle's multi-input
+    /// fetch reads a few stages later. Reading a field by name is a linear
+    /// search of the record type's declared names, so asking for all twelve
+    /// twice was the single most expensive thing in the cycle. The caller that
+    /// has them passes them in; anything not covered is still read here.
+    pub fn resolve_link_backed_metadata_with(
+        &self,
+        record: &Arc<parking_lot::RwLock<RecordInstance>>,
+        prefetched: &InputLinkTexts,
+    ) -> HashMap<String, LinkMetadata> {
         let links: Vec<(String, String)> = {
             let inst = record.read();
             if inst.link_backed_metadata_links().is_empty() {
@@ -2521,12 +2544,15 @@ impl PvDatabase {
             }
             inst.link_backed_metadata_links()
                 .iter()
-                .filter_map(|lf| match inst.record.get_field(lf) {
-                    Some(EpicsValue::String(text)) => {
-                        let text = text.as_str_lossy().into_owned();
-                        (!text.is_empty()).then_some((lf.clone(), text))
-                    }
-                    _ => None,
+                // The field name is cloned only for a link that is actually
+                // set: `then_some` took its argument eagerly, so every declared
+                // link paid a `String` allocation per cycle — and the map this
+                // builds is empty for the unwired record that is the common
+                // case.
+                .zip(inst.link_backed_metadata_input_slots())
+                .filter_map(|(lf, slot)| {
+                    let text = prefetched.text_at(*slot, &inst, lf)?;
+                    Some((lf.clone(), text))
                 })
                 .collect()
         };
@@ -2759,7 +2785,7 @@ impl PvDatabase {
         self.inner
             .records
             .write()
-            .insert(name.to_string(), rec_arc.clone());
+            .insert(Arc::from(name), rec_arc.clone());
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
@@ -3054,7 +3080,7 @@ impl PvDatabase {
         // to a canonical record name. Look up the real record after
         // translating the base.
         if let Some(target) = self.inner.aliases.read().get(base).cloned() {
-            if let Some(rec) = self.inner.records.read().get(&target) {
+            if let Some(rec) = self.inner.records.read().get(target.as_str()) {
                 return Some(PvEntry::Record(rec.clone()));
             }
         }
@@ -3171,7 +3197,7 @@ impl PvDatabase {
             // Alias entry exists and points to a live record
             // (epics-base PR #336).
             let target = self.inner.aliases.read().get(base).cloned();
-            target.and_then(|t| self.inner.records.read().get(&t).cloned())
+            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
         });
         let Some(rec) = rec else {
             return false;
@@ -3311,7 +3337,40 @@ impl PvDatabase {
             return Some(rec);
         }
         let target = self.inner.aliases.read().get(name).cloned()?;
-        self.inner.records.read().get(&target).cloned()
+        self.inner.records.read().get(target.as_str()).cloned()
+    }
+
+    /// The record behind `name` AND the canonical name it is registered
+    /// under — the one place a caller's `&str` becomes the shared `Arc<str>`
+    /// that a process chain then carries from hop to hop.
+    ///
+    /// The records map is asked first and the alias table only on a miss. A
+    /// canonical name is the overwhelming common case, and the two namespaces
+    /// are disjoint — `add_loaded_record` refuses a name an alias already
+    /// holds — so asking the alias table first would hash, on every scan step
+    /// of every record, a name that is never in it.
+    ///
+    /// The `Arc` handed back is the map's own KEY, so nothing downstream
+    /// allocates the name again: the cycle guard, the scan key and the
+    /// lock-set lookup all share this one allocation, made when the record was
+    /// registered. Alias-aware for the same reason
+    /// [`Self::get_record`] is (epics-base PR #336) — and the name it returns
+    /// for an alias is the TARGET's, which is what `visited` must key on if
+    /// alias and canonical are not to count as two different records.
+    pub(crate) fn lookup_record(
+        &self,
+        name: &str,
+    ) -> Option<(Arc<str>, Arc<parking_lot::RwLock<RecordInstance>>)> {
+        {
+            let records = self.inner.records.read();
+            if let Some((canonical, rec)) = records.get_key_value(name) {
+                return Some((canonical.clone(), rec.clone()));
+            }
+        }
+        let target = self.inner.aliases.read().get(name).cloned()?;
+        let records = self.inner.records.read();
+        let (canonical, rec) = records.get_key_value(target.as_str())?;
+        Some((canonical.clone(), rec.clone()))
     }
 
     /// Strict variant of [`Self::get_record`] — does NOT consult the
@@ -3364,11 +3423,11 @@ impl PvDatabase {
         // concurrent add/remove regardless.
         let mut names: Vec<String> = {
             let records = self.inner.records.read();
-            records.keys().cloned().collect()
+            records.keys().map(|n| n.to_string()).collect()
         };
         let load_order = self.inner.load_order.load();
         names.sort_by(|a, b| {
-            let seq = |n: &String| load_order.get(n).copied().unwrap_or(u64::MAX);
+            let seq = |n: &String| load_order.get(n.as_str()).copied().unwrap_or(u64::MAX);
             seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))
         });
         names
@@ -3394,7 +3453,7 @@ impl PvDatabase {
             records
                 .keys()
                 .map(|name| DbNode {
-                    name: name.clone(),
+                    name: name.to_string(),
                     alias_of: None,
                 })
                 .collect()
@@ -4258,7 +4317,7 @@ mod tests {
         );
 
         let mut seeded = std::collections::HashSet::new();
-        seeded.insert("TARGET".to_string());
+        seeded.insert(std::sync::Arc::<str>::from("TARGET"));
         db.process_record_with_links("ALIAS", &mut seeded)
             .await
             .unwrap();

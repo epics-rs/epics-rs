@@ -753,6 +753,17 @@ impl Record for TransformRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// C reads `ptran->inpa..inpp` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 16 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'A')?);
+        self.inp_links.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if name == "VAL" {
             // The dummy result field — never written by process()/monitor().
@@ -1086,7 +1097,7 @@ impl Record for TransformRecord {
         crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
             ("INPB", "B"),

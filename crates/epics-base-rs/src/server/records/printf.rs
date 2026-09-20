@@ -862,6 +862,17 @@ impl Record for PrintfRecord {
         Some(EpicsValue::CharArray(self.val.as_bytes().to_vec()))
     }
 
+    /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
+    /// `get_field` path hands back an owned `EpicsValue` per link, which is
+    /// 10 clones on every cycle of a record that wires none of them.
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
+            return None;
+        };
+        let slot = usize::from(slot.checked_sub(b'0')?);
+        self.inp_links.get(slot).map(String::as_str)
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
@@ -989,7 +1000,7 @@ impl Record for PrintfRecord {
         })
     }
 
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("INP0", "A"),
             ("INP1", "B"),

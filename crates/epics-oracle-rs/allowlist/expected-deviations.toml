@@ -256,7 +256,14 @@ bucket = "DESIGN-DIVERGENCE"
 upstream = "calc / sCalcoutRecord (epics-modules/calc#42)"
 record_types = ["scalcout"]
 fields = ["PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL"]
-surface = ["declared_type", "value_marking"]
+surface = [
+    "declared_type",
+    "value_marking",
+    "element_count",
+    "access_rights",
+    "value_string",
+    "value_numeric",
+]
 why = """
 sCalcoutRecord's cvt_dbaddr, for fieldIndex scalcoutRecordPAA through
 scalcoutRecordPLL, sets no_elements = STRING_SIZE (40) and then UNCONDITIONALLY
@@ -274,15 +281,18 @@ string and pvxget reads the scalar value, where the C side declares and serves a
 defect. It will vanish the day calc#42 lands in the reference tree, at which
 point the row goes STALE and must be deleted.
 
-Matched on the PVA declared-type (pvxinfo) and value/marking (pvxget) contracts,
-scoped to exactly scalcout PAA..PLL. The two shape contracts are not raised for
+Matched on the PVA declared-type (pvxinfo) and value/marking (pvxget) contracts
+and on the CA read surfaces the same shape shows through -- cainfo's element
+count and access rights (40 read/write elements against one read-only), and the
+caget string and numeric renderings of that array against the scalar -- scoped
+to exactly scalcout PAA..PLL. The two PVA shape contracts are not raised for
 these fields -- the .dbd marks them special(SPC_DBADDR), so NtShape::expected
-declines to predict -- so declared_type and value_marking are the whole surface
-of this deviation.
+declines to predict -- and the CA native type agrees (DBF_STRING on both), so
+these six are the whole surface of this deviation.
 
-Expect: on ORACLE:SCALCOUT.PAA..PLL the C softIocPVX declares and serves a
-40-element DBF_STRING array, and the port declares and serves a scalar read-only
-DBF_STRING.
+Expect: on ORACLE:SCALCOUT.PAA..PLL the C softIoc and softIocPVX declare and
+serve a 40-element DBF_STRING array, and the port declares and serves a scalar
+read-only DBF_STRING, on CA and PVA alike.
 """
 
 # --------------------------------------------------------------------------

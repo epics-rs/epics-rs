@@ -10,7 +10,7 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 
-use crate::driver::ndarray_driver::{init_read_only_params, refresh_pool_stats};
+use crate::driver::ndarray_driver::{DriverAttributes, init_read_only_params, refresh_pool_stats};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ad_driver::ADDriverParams;
@@ -28,6 +28,8 @@ pub struct ADDriverBase {
     /// Most recently prepared array (C++ `pArrays[0]`), used as the template
     /// for `preAllocateBuffers`.
     pub last_array: Option<Arc<NDArray>>,
+    /// The `NDAttributesFile` attribute set (C++ `pAttributeList`).
+    pub attributes: DriverAttributes,
 }
 
 impl ADDriverBase {
@@ -103,6 +105,7 @@ impl ADDriverBase {
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
             last_array: None,
+            attributes: DriverAttributes::new(),
         })
     }
 
@@ -120,13 +123,16 @@ impl ADDriverBase {
     ///
     /// This function does NOT publish the array — the caller is responsible
     /// for that in an async context. Returns `None` when callbacks are disabled.
-    pub fn prepare_array(&mut self, array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
+    pub fn prepare_array(&mut self, mut array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
         let counter = self
             .port_base
             .get_int32_param(self.params.base.array_counter, 0)?
             + 1;
         self.port_base
             .set_int32_param(self.params.base.array_counter, 0, counter)?;
+
+        // C++ `getAttributes(pArray->pAttributeList)` before the callback.
+        self.attributes.attach(&self.port_base, &mut array);
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -239,6 +245,26 @@ impl ADDriverBase {
             param_index,
             template.as_deref(),
         )
+    }
+
+    /// The octet-write branches of C++ `asynNDArrayDriver::writeOctet`
+    /// (`NDAttributesFile` / `NDAttributesMacros` reload, `FilePath` check).
+    /// The caller has already stored `value`; returns `true` when
+    /// `param_index` was one of those parameters.
+    pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
+        crate::driver::ndarray_driver::handle_write_octet(
+            &mut self.port_base,
+            &self.params.base,
+            &mut self.attributes,
+            param_index,
+            value,
+        )
+    }
+
+    /// C++ `asynNDArrayDriver::getAttributes`, for a driver that fills the
+    /// array's attribute list itself before publishing.
+    pub fn attach_attributes(&mut self, array: &mut Arc<NDArray>) {
+        self.attributes.attach(&self.port_base, array);
     }
 
     /// Write `ADAcquire` and drive `ADAcquireBusy` accordingly.
@@ -425,6 +451,41 @@ mod tests {
                 .unwrap(),
             b""
         );
+    }
+
+    /// An `NDAttributesFile` write loads the set, and every prepared array
+    /// carries it with `PARAM` values read at that moment — C++
+    /// `asynNDArrayDriver::writeOctet` and `getAttributes`, which `ADDriver`
+    /// inherits.
+    #[test]
+    fn test_attributes_file_write_reaches_the_prepared_array() {
+        use crate::attributes::NDAttrValue;
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Gain" type="PARAM" source="GAIN" datatype="DOUBLE"/>
+        </Attributes>"#;
+        let file = ad.params.base.attributes_file;
+        ad.port_base.set_string_param(file, 0, xml).unwrap();
+        assert!(ad.write_octet(file, xml).unwrap());
+        assert!(!ad.write_octet(ad.params.string_to_server, "x").unwrap());
+
+        for gain in [2.5, 4.0] {
+            ad.port_base
+                .set_float64_param(ad.params.gain, 0, gain)
+                .unwrap();
+            let arr = ad
+                .pool
+                .alloc(
+                    vec![crate::ndarray::NDDimension::new(8)],
+                    crate::ndarray::NDDataType::UInt8,
+                )
+                .unwrap();
+            let out = ad.prepare_array(Arc::new(arr)).unwrap().unwrap();
+            assert_eq!(
+                out.attributes.get("Gain").unwrap().value,
+                NDAttrValue::Float64(gain)
+            );
+        }
     }
 
     #[test]

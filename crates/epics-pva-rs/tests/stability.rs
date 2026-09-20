@@ -1401,25 +1401,30 @@ async fn create_channel_multi_name_emits_one_reply_per_name() {
     frame_bytes.extend_from_slice(&body);
     sock.write_all(&frame_bytes).unwrap();
 
-    // Read two CREATE_CHANNEL response frames back. Order = arrival
-    // order = A then B.
-    let resp_a = reader.read(&mut sock);
-    assert_eq!(resp_a.header.command, CMD_CREATE_CHANNEL);
-    let mut cur = resp_a.cursor();
-    let cid_a = cur.get_u32(order).unwrap();
-    let _sid_a = cur.get_u32(order).unwrap();
-    let status_a = Status::decode(&mut cur, order).unwrap();
-    assert_eq!(cid_a, 101);
-    assert!(status_a.is_success(), "first reply failed: {status_a:?}");
-
-    let resp_b = reader.read(&mut sock);
-    assert_eq!(resp_b.header.command, CMD_CREATE_CHANNEL);
-    let mut cur = resp_b.cursor();
-    let cid_b = cur.get_u32(order).unwrap();
-    let _sid_b = cur.get_u32(order).unwrap();
-    let status_b = Status::decode(&mut cur, order).unwrap();
-    assert_eq!(cid_b, 202);
-    assert!(status_b.is_success(), "second reply failed: {status_b:?}");
+    // The two replies complete in resolution order, not request order:
+    // resolver workers run concurrently and the peer matches each by cid
+    // (see `spawn_create_channel_resolvers`). Collect both and assert one
+    // success per name regardless of arrival order — the invariant is "no
+    // pair dropped, none duplicated", not a fixed A-then-B sequence.
+    let mut cids = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let resp = reader.read(&mut sock);
+        assert_eq!(resp.header.command, CMD_CREATE_CHANNEL);
+        let mut cur = resp.cursor();
+        let cid = cur.get_u32(order).unwrap();
+        let _sid = cur.get_u32(order).unwrap();
+        let status = Status::decode(&mut cur, order).unwrap();
+        assert!(
+            status.is_success(),
+            "reply for cid {cid} failed: {status:?}"
+        );
+        assert!(cids.insert(cid), "duplicate reply for cid {cid}");
+    }
+    assert_eq!(
+        cids,
+        std::collections::BTreeSet::from([101_u32, 202]),
+        "expected exactly one reply per name (cids 101 and 202)"
+    );
 
     h.abort();
 }

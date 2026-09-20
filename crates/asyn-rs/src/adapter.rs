@@ -2068,6 +2068,10 @@ impl DeviceSupport for AsynDeviceSupport {
                         if let Some(buf) = st.buf.as_mut() {
                             buf.clear();
                         }
+                        // C `memset(pwf->bptr, 0, pwf->nelm*sizeof(EPICS_TYPE))`
+                        // (devAsynXXXTimeSeries.h:139-141): a VAL put leaves
+                        // the elements past its own length alone.
+                        wf.reallocate_val();
                         st.busy = true;
                     }
                     2 => st.busy = false,
@@ -2931,22 +2935,26 @@ impl DeviceSupport for AsynDeviceSupport {
             return None;
         }
 
-        // Subscribe to the enum param's interrupts. In asyn-rs the enum value
-        // (index) and the enum table (choices) live on one `ParamValue::Enum`
-        // param, so both a value change and a `set_enum_choices` change arrive
-        // here; C separates them across the asynInt32 and asynEnum interfaces.
-        // The bridge below recovers that separation by posting only when the
-        // *choices* differ from the last-applied table (seeded with the init
-        // table) — so an int32 value change fires no DBE_PROPERTY, matching C.
+        // Subscribe to the enum param's interrupts. On a `ParamType::Enum`
+        // param the enum value (index) and the enum table (choices) live on one
+        // `ParamValue::Enum`, so both a value change and a `set_enum_choices`
+        // change arrive here; C separates them across the asynInt32 and
+        // asynEnum interfaces. The bridge below recovers that separation by
+        // posting only when the *choices* differ from the last-applied table
+        // (seeded with the init table) — so an int32 value change fires no
+        // DBE_PROPERTY, matching C.
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.addr),
             uint32_mask: None,
-            // The enum table is re-propagated via the untyped
-            // `call_param_callbacks` path (iface `None`), which matches any
-            // filter; tagging with this record's interface stays consistent
-            // with the other subscriptions and never gates those fires out.
-            iface: self.iface,
+            // This IS the record's asynEnum interrupt client (C
+            // `registerInterruptUser` on the asynEnum interface,
+            // devAsynInt32.c:318): a table fired for a param of any other type
+            // comes tagged asynEnum (`PortDriverBase::do_callbacks_enum`),
+            // which the record's own value interface would gate out. The
+            // untyped `call_param_callbacks` fire of an Enum param matches any
+            // filter.
+            iface: Some(crate::interfaces::InterfaceType::Enum),
         };
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
         self.enum_interrupt_sub = Some(sub);
@@ -4196,8 +4204,7 @@ mod tests {
     /// samples that follow start at index 0. C does the wipe explicitly with
     /// `pPvt->nord = 0` plus `memset(pwf->bptr, 0, pwf->nelm*sizeof(EPICS_TYPE))`
     /// (devAsynXXXTimeSeries.h:139-141); the port clears the accumulator and
-    /// commits it, and waveform's own reallocation zero-fills, so the residue
-    /// a client could reach with a NORD-exceeding request is identical.
+    /// wipes the record array with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn time_series_rearm_discards_the_previous_acquisition() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -5379,6 +5386,14 @@ mod tests {
     /// carrying `choices`. `init()` reads this table and pushes it onto the
     /// bound record's state fields.
     fn make_enum_adapter(choices: std::sync::Arc<[crate::param::EnumEntry]>) -> AsynDeviceSupport {
+        make_enum_adapter_as(choices, "asynEnum")
+    }
+
+    /// The same port, bound through `dtyp`.
+    fn make_enum_adapter_as(
+        choices: std::sync::Arc<[crate::param::EnumEntry]>,
+        dtyp: &str,
+    ) -> AsynDeviceSupport {
         struct EnumPort {
             base: PortDriverBase,
         }
@@ -5411,7 +5426,7 @@ mod tests {
             timeout: Some(Duration::from_secs(1)),
             drv_info: "MODE".into(),
         };
-        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynEnum");
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, dtyp);
         ads.set_record_info("TEST:ENUM", ScanType::Passive);
         ads
     }
@@ -8211,5 +8226,49 @@ mod tests {
             sequence.lock().unwrap().is_empty(),
             "empty command must perform no driver I/O"
         );
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
+    /// A table fired on the asynEnum interface (`do_callbacks_enum` for a param
+    /// that is not an `Enum`) reaches an `asynInt32` record's property
+    /// callback: that callback is the record's asynEnum client, not a second
+    /// asynInt32 one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn property_post_receiver_takes_a_table_fired_on_the_enum_interface() {
+        use crate::interrupt::InterruptValue;
+        use crate::param::{EnumEntry, ParamValue};
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+        let init_choices: Arc<[EnumEntry]> =
+            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
+        let mut ads = make_enum_adapter_as(init_choices, "asynInt32");
+        let mut rec = MbbiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let mut rx = ads
+            .property_post_receiver()
+            .expect("enum record arms the property callback");
+
+        ads.handle.interrupts().notify(InterruptValue {
+            reason: ads.reason,
+            addr: ads.addr,
+            value: ParamValue::Enum {
+                index: 0,
+                choices: Arc::from(vec![enum_entry("LOW", 0, 0), enum_entry("HIGH", 5, 0)]),
+            },
+            iface: Some(crate::interfaces::InterfaceType::Enum),
+            ..Default::default()
+        });
+
+        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("property post must arrive within timeout")
+            .expect("channel open");
+        let onst = post
+            .writes
+            .iter()
+            .find(|(f, _)| f == "ONST")
+            .map(|(_, v)| v);
+        assert_eq!(onst, Some(&EpicsValue::String("HIGH".into())));
     }
 }

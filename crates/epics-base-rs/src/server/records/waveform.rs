@@ -370,14 +370,24 @@ impl WaveformRecord {
         let converted = value.convert_to(self.ftvl_element_type());
         // NORD is capped at the buffer capacity (C bounds every request to the
         // allocated element count, so NORD <= capacity by construction) and the
-        // buffer is resized to that capacity to preserve the CA channel element
-        // count.
+        // buffer keeps that capacity to preserve the CA channel element count.
         macro_rules! land {
             ($src:expr, $variant:ident, $zero:expr) => {{
                 let mut arr = $src;
-                self.nord = arr.len().min(cap) as i32;
-                arr.resize(cap, $zero);
-                self.val = EpicsValue::$variant(arr);
+                let n = arr.len().min(cap);
+                self.nord = n as i32;
+                match &mut self.val {
+                    // The buffer already has its shape: copy the head in and
+                    // leave the rest alone, as C's conversion into `bptr` does.
+                    // The elements past NORD are served to nobody.
+                    EpicsValue::$variant(buf) if buf.len() == cap => {
+                        buf[..n].clone_from_slice(&arr[..n]);
+                    }
+                    _ => {
+                        arr.resize(cap, $zero);
+                        self.val = EpicsValue::$variant(arr);
+                    }
+                }
                 Ok(())
             }};
         }
@@ -454,9 +464,10 @@ impl WaveformRecord {
         }
     }
 
-    /// Reallocate VAL buffer to match current FTVL and [`Self::val_capacity`] —
-    /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`.
-    fn reallocate_val(&mut self) {
+    /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
+    /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`. Also what device
+    /// support that wipes the array (`nord = 0` + `memset(bptr, 0, ...)`) calls.
+    pub fn reallocate_val(&mut self) {
         self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
     }
@@ -476,7 +487,9 @@ impl WaveformRecord {
             EpicsValue::CharArray(v) => v.resize(n, 0),
             EpicsValue::UCharArray(v) => v.resize(n, 0),
             EpicsValue::ShortArray(v) => v.resize(n, 0),
+            EpicsValue::UShortArray(v) => v.resize(n, 0),
             EpicsValue::LongArray(v) => v.resize(n, 0),
+            EpicsValue::ULongArray(v) => v.resize(n, 0),
             EpicsValue::Int64Array(v) => v.resize(n, 0),
             EpicsValue::UInt64Array(v) => v.resize(n, 0),
             EpicsValue::FloatArray(v) => v.resize(n, 0.0),
@@ -1047,9 +1060,7 @@ impl Record for WaveformRecord {
                 // Return only NORD valid elements, not the full NELM buffer.
                 // CA clients use the returned element count to interpret the
                 // data (e.g. PyDMImageView computes height = count / width).
-                let mut val = self.val.clone();
-                val.truncate(self.served_element_count());
-                Some(val)
+                Some(self.val.head(self.served_element_count()))
             }
             // The DBF types are the `.dbd.pod`'s (see `array_field_list!`): NELM
             // is DBF_ULONG on all four kinds, NORD is DBF_ULONG on
@@ -2021,6 +2032,74 @@ mod array_kind_tests {
     /// (NORD = NELM, the previously over-reported case). Exercised here
     /// on a plain waveform — the cap lives in the shared put_field VAL
     /// arm, so it covers aao DOL pulls and every other internal delivery.
+    /// C converts a put into the `bptr` it allocated once. A put that
+    /// reallocates costs NELM per put whatever the source length, which on an
+    /// image-sized NELM is the whole budget of the callback band.
+    #[test]
+    fn a_val_put_lands_in_the_allocated_buffer() {
+        fn buffer(wf: &WaveformRecord) -> (*const i32, usize) {
+            match &wf.val {
+                EpicsValue::LongArray(v) => (v.as_ptr(), v.len()),
+                other => panic!("VAL is {other:?}"),
+            }
+        }
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        wf.kind = ArrayKind::Waveform;
+        let allocated = buffer(&wf);
+
+        for src in [vec![1, 2, 3, 4], vec![9], vec![], vec![5, 6, 7, 8, 9]] {
+            let served: Vec<i32> = src.iter().copied().take(4).collect();
+            wf.put_field("VAL", EpicsValue::LongArray(src)).unwrap();
+            assert_eq!(
+                buffer(&wf),
+                allocated,
+                "the buffer is neither moved nor resized"
+            );
+            assert_eq!(wf.get_field("VAL"), Some(EpicsValue::LongArray(served)));
+        }
+    }
+
+    /// An NELM change keeps the elements already loaded, whatever the FTVL.
+    #[test]
+    fn an_nelm_resize_keeps_unsigned_elements() {
+        for (ftvl, loaded, grown) in [
+            (
+                DbFieldType::UShort,
+                EpicsValue::UShortArray(vec![1, 2]),
+                EpicsValue::UShortArray(vec![1, 2, 0, 0]),
+            ),
+            (
+                DbFieldType::ULong,
+                EpicsValue::ULongArray(vec![1, 2]),
+                EpicsValue::ULongArray(vec![1, 2, 0, 0]),
+            ),
+        ] {
+            let mut wf = WaveformRecord::new(2, ftvl);
+            wf.kind = ArrayKind::Waveform;
+            wf.put_field("VAL", loaded).unwrap();
+            wf.put_field("NELM", EpicsValue::Long(4)).unwrap();
+            assert_eq!(wf.val, grown);
+            assert_eq!(wf.nord, 2);
+        }
+    }
+
+    /// A buffer that is not yet the FTVL-typed NELM array is replaced by one.
+    #[test]
+    fn a_val_put_rebuilds_a_misshapen_buffer() {
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        wf.kind = ArrayKind::Waveform;
+        for misshapen in [
+            EpicsValue::LongArray(vec![0; 2]),
+            EpicsValue::DoubleArray(vec![0.0; 4]),
+        ] {
+            wf.val = misshapen;
+            wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))
+                .unwrap();
+            assert_eq!(wf.val, EpicsValue::LongArray(vec![1, 2, 0, 0]));
+            assert_eq!(wf.nord, 2);
+        }
+    }
+
     #[test]
     fn put_val_caps_nord_at_nelm() {
         // FTVL=LONG: the buffer's element type is what the source converts INTO

@@ -987,7 +987,11 @@ impl PortActor {
             // reach for *because* the port is down must not be the one the down
             // port refuses (W10-D6). The one state C will not report on is a
             // destroyed port, handled in the dispatch arm (:1038-1042).
-            | RequestOp::Report { .. } => CDispatch::Direct,
+            | RequestOp::Report { .. }
+            // `asynPortDriver::lock()` (asynPortDriver.cpp:3858) is a mutex take
+            // on the driver's own thread: no `queueRequest`, no connected or
+            // enabled check. The actor's serial ownership is that mutex.
+            | RequestOp::WithDriver(_) => CDispatch::Direct,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT put,
@@ -2018,6 +2022,16 @@ impl PortActor {
                 self.report_port(*level);
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::WithDriver(call) => match call.take() {
+                Some(f) => {
+                    f(self.driver.as_mut());
+                    Ok(RequestResult::write_ok())
+                }
+                None => Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "driver call carries no closure".into(),
+                }),
+            },
             RequestOp::SetInputEos { eos } => {
                 // C parity: asynRecord IEOS write at asynRecord.c:1964-1967
                 // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.

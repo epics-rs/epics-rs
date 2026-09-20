@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.29.3 — 2026-09-16
+
+Patch release. A record's monitor state advances on every value-class post
+now, whether or not the field has a subscriber: C `db_post_events` on an
+empty `mlis` still leaves `monitor()`'s state advanced, so a move that
+finished with no `.DMOV` monitor left `last_posted` holding the move-start
+0, and the next subscriber's 1→0 transition compared equal and was
+dropped — ophyd `EpicsMotor.mv` never returned. The same pass also stops
+change-detecting the deadband field against `last_posted`, which
+`deadband_post` never advances: `collect_notify_posts` routes motor RBV
+through `value_include_classes`/`deadband_post`, as C `monitor()` does on
+the move-start pass (motorRecord.cc:1507, :3468-3507), so a move start no
+longer re-posts the previous readback and MLST tracks the readback rather
+than the setpoint. A PVA test that asserted a fixed reply order for
+concurrent CREATE_CHANNEL resolution matches by cid instead, and the
+README links repics and drops the "No C dependencies. No libca. No
+libCom." tagline, which the `epics-ca-rs` and `epics-libcom-rs` crates
+contradict.
+
 ## v0.29.2 — 2026-09-15
 
 Patch release. SNL programs start through `spawn_program`, which awaits

@@ -896,6 +896,27 @@ impl EpicsValue {
         })
     }
 
+    /// A copy of at most the first `max` elements of an array value; a scalar
+    /// is cloned whole. Unlike `clone` + [`truncate`](Self::truncate) the cost
+    /// is the elements kept, not the elements held.
+    pub fn head(&self, max: usize) -> Self {
+        match self {
+            Self::ShortArray(arr) => Self::ShortArray(arr[..arr.len().min(max)].to_vec()),
+            Self::FloatArray(arr) => Self::FloatArray(arr[..arr.len().min(max)].to_vec()),
+            Self::EnumArray(arr) => Self::EnumArray(arr[..arr.len().min(max)].to_vec()),
+            Self::DoubleArray(arr) => Self::DoubleArray(arr[..arr.len().min(max)].to_vec()),
+            Self::LongArray(arr) => Self::LongArray(arr[..arr.len().min(max)].to_vec()),
+            Self::Int64Array(arr) => Self::Int64Array(arr[..arr.len().min(max)].to_vec()),
+            Self::UInt64Array(arr) => Self::UInt64Array(arr[..arr.len().min(max)].to_vec()),
+            Self::UShortArray(arr) => Self::UShortArray(arr[..arr.len().min(max)].to_vec()),
+            Self::ULongArray(arr) => Self::ULongArray(arr[..arr.len().min(max)].to_vec()),
+            Self::UCharArray(arr) => Self::UCharArray(arr[..arr.len().min(max)].to_vec()),
+            Self::CharArray(arr) => Self::CharArray(arr[..arr.len().min(max)].to_vec()),
+            Self::StringArray(arr) => Self::StringArray(arr[..arr.len().min(max)].to_vec()),
+            other => other.clone(),
+        }
+    }
+
     /// Truncate an array value to at most `max` elements. Scalars are unchanged.
     pub fn truncate(&mut self, max: usize) {
         match self {

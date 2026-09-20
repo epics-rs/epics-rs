@@ -1663,6 +1663,18 @@ impl ProcessSnapshot {
         self.head.iter().chain(self.rest.iter())
     }
 
+    /// Keep only the posts `keep` accepts; `keep` sees every post once, in
+    /// the order they were added.
+    pub fn retain(&mut self, mut keep: impl FnMut(&FieldPost) -> bool) {
+        if self.head.as_ref().is_some_and(|post| !keep(post)) {
+            self.head = None;
+        }
+        self.rest.retain(|post| keep(post));
+        if self.head.is_none() && !self.rest.is_empty() {
+            self.head = Some(self.rest.remove(0));
+        }
+    }
+
     /// The union of every `DBE_*` class this cycle actually published — the
     /// port's answer to "what did `db_post_events` send for this record".
     ///
@@ -3520,8 +3532,6 @@ pub trait Record: Send + Sync + 'static {
     /// crossed — C `monitor()`'s `prec->mlst = prec->val` /
     /// `prec->alst = prec->val`.
     ///
-    /// The coercion is
-    /// [`RecordInstance::put_coerced`](crate::server::record::RecordInstance)'s:
     /// C declares MLST/ALST with the record's VAL type, so the double is
     /// converted to whatever the cell holds. Same one-question reason as
     /// [`Self::monitor_deadband_cells`] — this is four more vtable calls
@@ -3585,10 +3595,8 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Arm C's `prec->lalm` latch, coerced to the type the cell is declared
-    /// with — the same coercion
-    /// [`RecordInstance::put_coerced`](crate::server::record::RecordInstance)
-    /// makes, and for the same reason: C declares LALM with the record's VAL
-    /// type, so an `epicsInt64` latch must not round through a double.
+    /// with: C declares LALM with the record's VAL type, so an `epicsInt64`
+    /// latch must not round through a double.
     fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
         let target = self
             .get_field("LALM")

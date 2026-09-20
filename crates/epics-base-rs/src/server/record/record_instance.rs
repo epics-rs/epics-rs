@@ -1815,7 +1815,9 @@ pub struct RecordInstance {
     /// A field's value MUST NOT be published twice by the framework.
     /// Concretely: every value-class post (a `db_post_events` carrying
     /// `DBE_VALUE` and/or `DBE_LOG`) MUST advance this map for the field it
-    /// posts; an alarm-only / property-only post MUST NOT (those classes do
+    /// posts, whether or not that field has a subscriber (C's `monitor()`
+    /// state advances on a post to an empty `mlis`, and a later subscriber
+    /// inherits it); an alarm-only / property-only post MUST NOT (those classes do
     /// not deliver the value to a `DBE_VALUE`/`DBE_LOG` subscriber, so the
     /// change is still owed to them).
     ///
@@ -5721,7 +5723,9 @@ impl RecordInstance {
     /// ([`AuxPostMask`], [`crate::server::record::value_gate`]) were already
     /// single-owned for the same reason — this is the loop around them.
     ///
-    /// It also UPDATES `last_posted` for everything it emits, and it TAKES the
+    /// It also UPDATES `last_posted` for every post the cycle makes — including
+    /// a post to a field nobody subscribes to, which it does not return — and
+    /// it TAKES the
     /// record's per-cycle post mask ([`Record::take_cycle_posted_fields`]), so
     /// it must run exactly once per cycle.
     ///
@@ -5804,14 +5808,14 @@ impl RecordInstance {
                 }
             }
         }
-        // Nothing is subscribed, so the walk below has no field to reach and
-        // the forced posts have nowhere to land either — both are gated on a
-        // field having a subscriber. The record's declared post sets are the
-        // walk's inputs alone, so asking for them, six more trips through the
+        // Nothing is subscribed, nothing has ever been published and no
+        // forced post fired, so the walk below has no field to reach and
+        // nothing to advance. The record's declared post sets are the walk's
+        // inputs alone, so asking for them, six more trips through the
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
         // advance — has already run.
-        if self.subscribers.is_empty() {
+        if self.subscribers.is_empty() && self.last_posted.is_empty() && forced_fired == 0 {
             return;
         }
         // Every post this walk adds sits at or past this index, so the
@@ -5836,9 +5840,23 @@ impl RecordInstance {
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
 
-        for (field, subs) in &self.subscribers {
-            if subs.is_empty()
-                || field == deadband_field
+        // The walk covers every field whose published value is tracked — each
+        // subscribed field, and each field a post has already published — not
+        // only the fields someone watches now. C `monitor()` decides from the
+        // record's own state and `db_post_events` with no subscriber leaves
+        // that state advanced, so what the record has published must not
+        // depend on who is watching: a move finished with no `.DMOV` monitor
+        // left `last_posted` at the move-start 0 while the field read 1, and
+        // the next subscriber's move-start 0 compared equal and was dropped.
+        // A field with no entry has never been published; `add_subscriber`
+        // seeds it from the value the subscriber is handed.
+        let tracked = self.subscribers.keys().chain(
+            self.last_posted
+                .keys()
+                .filter(|field| !self.subscribers.contains_key(*field)),
+        );
+        for field in tracked {
+            if field == deadband_field
                 // SEVR/STAT/AMSG/ACKS are posted by `recGblResetAlarms` itself,
                 // each with its own C mask (recGbl.c:202-222) — the caller emits
                 // them from `alarm_field_posts`. A second, change-detected copy
@@ -5942,28 +5960,86 @@ impl RecordInstance {
                 snapshot.push((field.clone().into(), val, EventMask::LOG | alarm_bits));
             }
         }
-        // A guarded secondary post reaches the snapshot only if the field has
-        // a subscriber, exactly as every other branch of the walk above; C's
-        // `db_post_events` with no subscriber delivers nothing either. The
-        // record's old copy advanced before the walk regardless — that is
-        // the half that must not depend on who is watching.
+        // A guarded secondary post lands whether or not the field has a
+        // subscriber, exactly as C calls `db_post_events` (aoRecord.c:541);
+        // the ones nobody watches are dropped below, after the published
+        // values have advanced.
         if let Some(forced_mask) = forced_mask {
             for (index, (name, _)) in value_masked.iter().enumerate() {
                 if forced_fired & (1 << index) == 0 {
                     continue;
                 }
-                if self.subscribers.get(*name).is_some_and(|s| !s.is_empty()) {
-                    if let Some(val) = self.resolve_field(name) {
-                        snapshot.push((Cow::Borrowed(name), val, forced_mask));
-                    }
+                if let Some(val) = self.resolve_field(name) {
+                    snapshot.push((Cow::Borrowed(name), val, forced_mask));
                 }
             }
         }
-        // `snapshot` is the caller's, not a field of `self`, so the walk's
-        // pushes and this advance do not contend for the record.
+        // Every post the cycle made is published whether or not anyone
+        // watches the field: advance the published values first, then hand on
+        // only the posts a subscriber receives. C's `db_post_events` with no
+        // subscriber delivers nothing, and still leaves the record's state
+        // advanced. `snapshot` is the caller's, not a field of `self`, so the
+        // walk's pushes and this advance do not contend for the record.
         for (field, val, _) in snapshot.iter().skip(first_post) {
             self.record_value_post(field, val.clone());
         }
+        let mut index = 0;
+        snapshot.retain(|(field, _, _)| {
+            let walked = index >= first_post;
+            index += 1;
+            !walked
+                || self
+                    .subscribers
+                    .get(field.as_ref())
+                    .is_some_and(|subs| !subs.is_empty())
+        });
+    }
+
+    /// The posts an `AsyncPendingNotify` pass publishes — the single owner both
+    /// dispatch paths call (`processing.rs`'s engine and [`Self::process_local`]),
+    /// so a mid-async post cannot obey one rule on one path and another rule on
+    /// the other.
+    ///
+    /// Each post carries `DBE_VALUE|DBE_LOG`: C motor's mid-move
+    /// `db_post_events` calls use `DBE_VAL_LOG` (motorRecord.cc:2606 DMOV, and
+    /// every other `do_work` post), and no alarm transition ran on this pending
+    /// pass.
+    ///
+    /// The deadband field is NOT change-detected against `last_posted` here.
+    /// Whether it posts, with which mask, and where MLST/ALST land belong to
+    /// [`Self::value_include_classes`] and [`Self::deadband_post`] on this pass
+    /// as on every other — C motor `monitor()` runs on the move-start pass too
+    /// (motorRecord.cc:1507) and posts RBV only on an MDEL/ADEL crossing,
+    /// moving `mlst` to RBV (motorRecord.cc:3468-3507). `deadband_post`
+    /// deliberately does not advance `last_posted`: MLST/ALST are where that
+    /// field's published value lives, so change-detecting it here compared
+    /// against a cache nothing maintains and re-posted the PREVIOUS readback at
+    /// every move start.
+    pub(crate) fn collect_notify_posts(
+        &mut self,
+        fields: Vec<(String, EpicsValue)>,
+    ) -> ProcessSnapshot {
+        let deadband_field = self.record.monitor_deadband_field();
+        let mut posts = ProcessSnapshot::new();
+        for (name, val) in fields {
+            if name == deadband_field {
+                // The record's own value, not the notify's copy of it: C posts
+                // the field itself (`db_post_events(pmr, &pmr->rbv, ...)`).
+                let (include_val, include_archive) = self.value_include_classes();
+                // No alarm bits: `recGblResetAlarms` has not run on this pending
+                // pass, so the post carries only the classes MDEL/ADEL fired.
+                let deadband = self.deadband_post(EventMask::NONE, include_val, include_archive);
+                if let Some((field, value)) = deadband.field {
+                    posts.push((field.into(), value, deadband.mask));
+                }
+                continue;
+            }
+            if self.posted_value(&name).is_none_or(|prev| prev != &val) {
+                self.record_value_post(&name, val.clone());
+                posts.push((name.into(), val, EventMask::VALUE | EventMask::LOG));
+            }
+        }
+        posts
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
@@ -6200,29 +6276,9 @@ impl RecordInstance {
             // Unlike AsyncPending, we DO release the processing flag so
             // subsequent I/O Intr cycles can continue processing normally.
             self.common.time = crate::runtime::general_time::get_current();
-            // Filter out fields that haven't actually changed, and update
-            // MLST/last_posted for those that have. Each intermediate
-            // post carries DBE_VALUE|DBE_LOG — C motor's mid-move
-            // `db_post_events` calls use `DBE_VAL_LOG`
-            // (motorRecord.cc:2606 DMOV, and every other do_work post);
-            // no alarm transition ran on this pending pass.
-            let mut changed_fields = crate::server::record::ProcessSnapshot::new();
-            for (name, val) in fields {
-                let changed = match self.posted_value(&name) {
-                    Some(prev) => prev != &val,
-                    None => true,
-                };
-                if changed {
-                    if name == "VAL" {
-                        if let Some(f) = val.to_f64() {
-                            self.put_coerced("MLST", EpicsValue::Double(f));
-                            self.common.mlst = Some(f);
-                        }
-                    }
-                    self.record_value_post(&name, val.clone());
-                    changed_fields.push((name.into(), val, EventMask::VALUE | EventMask::LOG));
-                }
-            }
+            // The pass's posts, through the owner this path shares with the
+            // engine (`Self::collect_notify_posts`).
+            let changed_fields = self.collect_notify_posts(fields);
             // _guard drops here, clearing the processing flag
             return Ok((changed_fields, Vec::new()));
         }
@@ -6277,27 +6333,6 @@ impl RecordInstance {
         } = self.monitor_cycle();
 
         Ok((snapshot, alarm_posts.to_vec()))
-    }
-
-    /// **The single owner of "write a value into a record field in the type
-    /// that field stores"** — a `put_field` arm binds ONE variant and silently
-    /// drops the rest, and the trackers this writes differ in type per record:
-    /// C declares LALM/ALST/MLST with the record's VAL type, `DBF_INT64` on
-    /// int64in/int64out (`int64inRecord.dbd.pod:233-243`), `DBF_LONG` on
-    /// longin/longout, `DBF_DOUBLE` elsewhere.
-    ///
-    /// Takes the value in the CALLER's domain rather than an `f64`: the alarm
-    /// ladder's `alev` is an `epicsInt64` on the int64 records and going
-    /// through a double would have rounded the very threshold LALM exists to
-    /// remember.
-    pub(crate) fn put_coerced(&mut self, field: &str, val: EpicsValue) {
-        let target_type = self
-            .record
-            .get_field(field)
-            .map(|v| v.db_field_type())
-            .unwrap_or(crate::types::DbFieldType::Double);
-        let coerced = val.convert_to(target_type);
-        let _ = self.record.put_field(field, coerced);
     }
 
     /// Check MDEL/ADEL deadbands for VAL monitor/archive filtering.
@@ -7395,64 +7430,72 @@ impl RecordInstance {
         let publishes_value = mask.intersects(
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
         );
-        let mut posted: Option<EpicsValue> = None;
-        if let Some(subs) = self.subscribers.get(field) {
-            if let Some(value) = self.resolve_field(field) {
-                let published = value.clone();
-                // Built before `posted` is set: a refused post publishes
-                // nothing, so it must not advance `last_posted` either, or the
-                // next cycle's change detector would treat the value as
-                // already delivered and the subscriber would never see it.
-                let Some(snap) = self.make_monitor_snapshot(field, value, backing) else {
-                    return;
-                };
-                if publishes_value {
-                    posted = Some(published);
+        let subs = self.subscribers.get(field).filter(|subs| !subs.is_empty());
+        if subs.is_none() && !publishes_value {
+            return;
+        }
+        let Some(value) = self.resolve_field(field) else {
+            return;
+        };
+        // With no subscriber the post is value-class (the return above), and
+        // the value goes straight to the owner.
+        let Some(subs) = subs else {
+            self.record_value_post(field, value);
+            return;
+        };
+        let posted = publishes_value.then(|| value.clone());
+        // A refused post publishes nothing, so it must not advance
+        // `last_posted` either, or the next cycle's change detector would
+        // treat the value as already delivered and the subscriber would never
+        // see it: `posted` dies with this return.
+        let Some(snap) = self.make_monitor_snapshot(field, value, backing) else {
+            return;
+        };
+        {
+            let mon_snap = Arc::new(snap);
+            for sub in subs {
+                // Paused subscriber (`db_event_disable`): suppress at
+                // the source — no delivery, no coalesce.
+                if !sub.active {
+                    continue;
                 }
-                let mon_snap = Arc::new(snap);
-                for sub in subs {
-                    // Paused subscriber (`db_event_disable`): suppress at
-                    // the source — no delivery, no coalesce.
-                    if !sub.active {
+                // Same single owner as the snapshot path: gate and
+                // narrow are one operation (C `dbEvent.c:896-900`).
+                if let Some(mask) = sub.delivered_mask(mask) {
+                    let event = MonitorEvent {
+                        snapshot: mon_snap.clone(),
+                        origin,
+                        mask,
+                    };
+                    // Server-side filter chain (3.15.7). Empty
+                    // chain (the default for every subscriber
+                    // until a `.{filter:opts}` PV-name suffix
+                    // parser wires one in) is the identity, so
+                    // existing subscribers see no behaviour
+                    // change. A filter returning `None` silences
+                    // this event for this subscriber only.
+                    let filtered = if sub.filters.is_empty() {
+                        Some(event)
+                    } else {
+                        sub.filters
+                            .apply(FilteredMonitorEvent::new(event))
+                            .map(|fe| fe.event)
+                    };
+                    let Some(event) = filtered else {
                         continue;
-                    }
-                    // Same single owner as the snapshot path: gate and
-                    // narrow are one operation (C `dbEvent.c:896-900`).
-                    if let Some(mask) = sub.delivered_mask(mask) {
-                        let event = MonitorEvent {
-                            snapshot: mon_snap.clone(),
-                            origin,
-                            mask,
-                        };
-                        // Server-side filter chain (3.15.7). Empty
-                        // chain (the default for every subscriber
-                        // until a `.{filter:opts}` PV-name suffix
-                        // parser wires one in) is the identity, so
-                        // existing subscribers see no behaviour
-                        // change. A filter returning `None` silences
-                        // this event for this subscriber only.
-                        let filtered = if sub.filters.is_empty() {
-                            Some(event)
-                        } else {
-                            sub.filters
-                                .apply(FilteredMonitorEvent::new(event))
-                                .map(|fe| fe.event)
-                        };
-                        let Some(event) = filtered else {
-                            continue;
-                        };
-                        // Same single post owner as the snapshot path.
-                        sub.post(event);
-                    }
+                    };
+                    // Same single post owner as the snapshot path.
+                    sub.post(event);
                 }
             }
         }
-        // The value is now published to this field's value-class subscribers:
-        // hand it to the `last_posted` owner so the change detector does not
-        // publish it again. Delivery to any individual subscriber may have
-        // been filtered out, exactly as C's `db_post_events` may find an empty
-        // `mlis` — C still leaves `monitor()`'s `*_lst` state advanced by the
-        // cycle that ran, so the post, not the delivery, is what counts.
+        // The value is now published: hand it to the `last_posted` owner so
+        // the change detector does not publish it again. Delivery to any
+        // individual subscriber may have been filtered out, and the field may
+        // have no subscriber at all, exactly as C's `db_post_events` may find
+        // an empty `mlis` — C still leaves `monitor()`'s `*_lst` state
+        // advanced by the cycle that ran, so the post, not the delivery, is
+        // what counts.
         if let Some(value) = posted {
             self.record_value_post(field, value);
         }
@@ -7525,9 +7568,12 @@ impl RecordInstance {
             filters: crate::server::database::filters::FilterChain::new(),
             active: true,
         });
-        // Initialize last_posted with current value so the first process cycle
-        // doesn't treat it as "changed" (the initial value is already sent
-        // to the client as part of EVENT_ADD response).
+        // A field with no `last_posted` entry has never been published: seed it
+        // with the value the client is handed in the EVENT_ADD response, so the
+        // first process cycle does not treat it as changed. An existing entry
+        // is left alone — every post advances it whether or not anyone was
+        // subscribed, so it is what was last published, and a change since
+        // then is still owed to the field's other subscribers.
         if !self.last_posted.contains_key(&field_str) {
             if let Some(val) = self.resolve_field(&field_str) {
                 self.last_posted.insert(field_str, val);

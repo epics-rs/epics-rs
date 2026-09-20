@@ -4871,34 +4871,9 @@ impl PvDatabase {
                     }
                     let inst = &mut *instance;
                     tsel.stamp(&inst.name, &mut inst.common, is_soft);
-                    // Filter out fields that haven't changed, update MLST/last_posted.
-                    // Each intermediate post carries DBE_VALUE|DBE_LOG — C motor's
-                    // mid-move `db_post_events` calls use `DBE_VAL_LOG`
-                    // (motorRecord.cc:2606 DMOV, and every other do_work post);
-                    // no alarm transition ran on this pending pass, so no
-                    // DBE_ALARM bit.
-                    let mut changed_fields = crate::server::record::ProcessSnapshot::new();
-                    for (name, val) in fields {
-                        let changed = match instance.posted_value(&name) {
-                            Some(prev) => prev != &val,
-                            None => true,
-                        };
-                        if changed {
-                            if name == "VAL" {
-                                if let Some(f) = val.to_f64() {
-                                    instance.put_coerced("MLST", EpicsValue::Double(f));
-                                    instance.common.mlst = Some(f);
-                                }
-                            }
-                            instance.record_value_post(&name, val.clone());
-                            changed_fields.push((
-                                name.into(),
-                                val,
-                                crate::server::recgbl::EventMask::VALUE
-                                    | crate::server::recgbl::EventMask::LOG,
-                            ));
-                        }
-                    }
+                    // The pass's posts, through the owner this path shares with
+                    // `RecordInstance::process_local`.
+                    let changed_fields = instance.collect_notify_posts(fields);
                     // C parity (calcoutRecord.c:277-282, sCalcoutRecord.c:400-404):
                     // a record that defers its output by ODLY via a timer
                     // (`callbackRequestProcessCallbackDelayed`) keeps `pact=TRUE`

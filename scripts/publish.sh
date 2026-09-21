@@ -23,6 +23,7 @@
 #
 # Prerequisites: a crates.io token (~/.cargo/credentials.toml or
 # CARGO_REGISTRY_TOKEN), a clean tree at the release commit, and the tag pushed.
+# The version itself is moved beforehand by ./scripts/bump-version.sh.
 
 set -euo pipefail
 

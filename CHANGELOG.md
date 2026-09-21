@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.30.0 — 2026-09-21
+
+Minor release. Workspace 0.29.3 -> 0.30.0; the 18
+`[workspace.dependencies]` pins and the hand-written `epics-pva-rs` pin
+in `epics-bridge-rs` move in lockstep. The breaking changes:
+`PvDatabase::get_record` and `get_record_no_resolve` return
+`Arc<RecordCell>` rather than `Arc<RwLock<RecordInstance>>`;
+`CommonFields::amsg` and `namsg` are `SparseText`, `bkpt` is `BkptFlag`
+and `dtyp` is `Dtyp`; `ProcessContext<'a>` carries a lifetime and drops
+`tsel` and `changed_fields`; `NDArrayDriverBase::attributes` and
+`attr_functions` fold into one `DriverAttributes`. macLib moves to
+`epics_libcom_rs::runtime::mac_lib`, with every name re-exported at its
+old `epics-base-rs` path.
+
+### Readiness poller and the PVA reactor driver
+
+One poll thread owns a libevent-style changelist over select(2) (kqueue
+on RTEMS behind `EPICS_RTEMS_KQUEUE`), `ReadyStream` splits into a reader
+and a writer half, and `epics-pva-rs` gains a reactor server driver on it
+that is the default on unix; `EPICS_PVA_RS_DRIVER=blocking` keeps the
+thread-per-connection driver. The poller is select over raw fds, so
+Windows keeps the tokio reactor and refuses `reactor` like any unknown
+name. In the blocking pumps the wait owns every park on every target:
+Windows never returns a `recv` parked on a socket another thread shut
+down, so its socket timeout is armed to at most 100 ms and a shutdown is
+seen on the next call, which lets the nine tests gated on the POSIX wake
+run there.
+
+### Allocation-free process cycle
+
+The type-static questions a cycle asked the record vtable every pass
+(dispatch, input, output, alarm and monitor gates) are settled once in
+`ProcessPlan`; one `DataGuard` spans the cycle body, `monitor()` has one
+owner in `RecordInstance::monitor_cycle`, the cycle marker is a stack,
+and the snapshot, actions and alarm posts travel inline instead of in
+`Vec`s. A record's alias, input link texts, multi-input list and lock set
+are read once per cycle; each multi-input link's parse and target are
+cached in `LinkTargetHandle` and the fetch lands through
+`Record::put_slot_f64`. On 2000 calc records at 10 Hz a process cycle
+costs 0.65 us of CPU where v0.29.3 spent 7.7 us, against 0.40 us for C
+softIoc on the same box. `remove_record` releases every link target
+handle, a post-iocInit record's lock set is minted in `Registry::adopt`,
+and no lock set is taken under the records-map read guard.
+
+### areaDetector and asyn
+
+`DriverAttributes` (the list, the function registry and the CA monitors)
+is owned by `NDArrayDriverBase` and `ADDriverBase` alike, so a detector
+driver on `ADDriverBase` can load an attributes file at all;
+`DriverAttributes::read_file` expands `NDAttributesMacros` as C
+`readNDAttributesFile` does. `PortHandle::with_driver` runs a closure
+against the concrete driver outside the actor, where C takes
+`lock()`/`unlock()`, which is why `PortDriver` gains `Any` as a
+supertrait. `PortDriverBase::do_callbacks_enum` publishes an enum table
+for a parameter of any type, and `asynReport` walks the manager's port
+list so a hand-registered port prints. A waveform VAL put lands in the
+allocated buffer as C copies into `bptr` (a 50M-element image waveform
+no longer pays O(NELM) per frame), and an NELM change keeps USHORT and
+ULONG elements. `Task::enqueue` no longer takes a callback-ring slot: the
+asyn boot flush overflowed the 2000-slot ring about one boot in six and
+left I/O Intr records permanently without updates.
+
 ## v0.29.3 — 2026-09-16
 
 Patch release. A record's monitor state advances on every value-class post

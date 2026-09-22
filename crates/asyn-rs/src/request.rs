@@ -231,6 +231,14 @@ pub enum RequestOp {
     ConnectAddr,
     /// Disconnect a specific device address (multi-device ports).
     DisconnectAddr,
+    /// Bind a user to the device its addr names — the port-side half of C
+    /// `pasynManager->connectDevice` (asynManager.c:1349-1352), which is
+    /// `locateDevice(pport, addr, TRUE)`: on an `ASYN_MULTIDEVICE` port the
+    /// device's dpCommon is created at connect time, so it exists for
+    /// `asynReport`'s `nDevices` count and per-device block before anything
+    /// I/Os on it. A direct manager call under `asynManagerLock`: no queue,
+    /// no enabled/connected gate.
+    ConnectUser,
     /// Enable / disable — C `pasynManager->enable(pasynUser, enable)`
     /// (`asynManager.c::enable` :2224-2251, fired by asynRecord `ENBL` writes
     /// at `asynRecord.c:484-486`).

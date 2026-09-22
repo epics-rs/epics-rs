@@ -1097,6 +1097,19 @@ impl PortHandle {
 
     // --- Multi-device convenience methods ---
 
+    /// The port-side half of C `pasynManager->connectDevice(pasynUser, port,
+    /// addr)` (asynManager.c:1324-1355): create the device's dpCommon on a
+    /// multi-device port (`locateDevice(..., TRUE)`) so it is counted and
+    /// reported from the moment a user binds to it. Every user bind — a
+    /// record's device support at init, `asynRecord`'s PORT/ADDR connect —
+    /// goes through here; it is not the transport `connect` of
+    /// [`Self::connect_addr_blocking`].
+    pub fn connect_device_blocking(&self, addr: i32) -> AsynResult<()> {
+        let user = AsynUser::new(0).with_addr(addr);
+        self.submit_blocking(RequestOp::ConnectUser, user)?;
+        Ok(())
+    }
+
     pub fn connect_addr_blocking(&self, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
         self.submit_blocking(RequestOp::ConnectAddr, user)?;

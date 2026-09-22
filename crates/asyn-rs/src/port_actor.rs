@@ -956,6 +956,9 @@ impl PortActor {
             | RequestOp::GetEnable
             | RequestOp::GetAutoConnect
             | RequestOp::GetConnected
+            // `connectDevice` (asynManager.c:1324-1355) takes `asynManagerLock`
+            // and calls `locateDevice(pport, addr, TRUE)`: no queue, no gate.
+            | RequestOp::ConnectUser
             | RequestOp::PushEchoInterpose
             | RequestOp::PushDelayInterpose { .. }
             | RequestOp::PushEosInterpose { .. }
@@ -1616,6 +1619,10 @@ impl PortActor {
             }
             RequestOp::DisconnectAddr => {
                 self.driver.disconnect_addr(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::ConnectUser => {
+                self.driver.base_mut().connect_user(user.addr);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetEnable { yes } => {

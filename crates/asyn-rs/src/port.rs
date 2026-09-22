@@ -1103,6 +1103,21 @@ impl PortDriverBase {
         self.device_states.entry(addr).or_insert(seed)
     }
 
+    /// C `connectDevice`'s `locateDevice(pport, addr, TRUE)`
+    /// (asynManager.c:1349-1352, :576-589): a user binding to a device on a
+    /// multi-device port creates that device's dpCommon, seeded from the
+    /// port's, if it is not there yet. The resolution is [`Self::dp_addr`]'s:
+    /// a single-device port and an `addr < 0` bind to the port's own
+    /// dpCommon and allocate nothing, as C's `locateDevice` returns null for
+    /// both. This is what makes `asynReport`'s `nDevices` and per-device
+    /// block count a device the moment a record or `asynRecord` connects
+    /// to it, before any I/O or connection transition touches it.
+    pub fn connect_user(&mut self, addr: i32) {
+        if let Some(addr) = self.dp_addr(addr) {
+            self.device_state(addr);
+        }
+    }
+
     /// Check if a specific device address is connected.
     pub fn is_device_connected(&self, addr: i32) -> bool {
         self.dp_connected(addr)

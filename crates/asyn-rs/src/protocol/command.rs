@@ -213,6 +213,10 @@ pub enum PortCommand {
     GpibRen {
         enable: bool,
     },
+    /// Bind a user to a device address — C `pasynManager->connectDevice`'s
+    /// `locateDevice(..., TRUE)`. Appended last: the variant order is the
+    /// wire encoding.
+    ConnectUser,
 }
 
 #[cfg(test)]
@@ -299,6 +303,7 @@ mod tests {
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
             PortCommand::WithDriver,
+            PortCommand::ConnectUser,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

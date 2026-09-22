@@ -340,6 +340,16 @@ impl DeviceUser {
                 self.fail("asynManager:connectDevice already connected to device".to_string())
             );
         }
+        // C :1349-1352 under `asynManagerLock`: `locateDevice(pport, addr,
+        // TRUE)` creates the device on a multi-device port. The port owns
+        // its device list, so the creation is the port actor's; C's call
+        // cannot fail, and the one way this one can - the actor is gone -
+        // is a port that is no longer the one the registry answered with.
+        if let Err(e) = entry.handle.connect_device_blocking(addr) {
+            return Err(self.fail(format!(
+                "asynManager:connectDevice port {port_name} not found: {e}"
+            )));
+        }
         self.device = Some(entry.clone());
         self.addr = addr;
         Ok(entry)
@@ -515,6 +525,64 @@ mod tests {
         );
 
         mgr.unregister_port("devuser_port_1");
+    }
+
+    /// C `connectDevice` is where a multi-device port's device comes into
+    /// being (`locateDevice(pport, addr, TRUE)`, asynManager.c:1349-1352):
+    /// `asynReport` counts it in `nDevices` and prints its block from that
+    /// moment. The boundaries: a multi-device port with `addr >= 0` allocates;
+    /// `addr < 0` on the same port binds the port's own dpCommon (:1349
+    /// `if(addr>=0)`); a single-device port allocates nothing whatever the
+    /// addr (:576 `!(attributes&ASYN_MULTIDEVICE)`).
+    #[test]
+    fn connect_device_creates_the_device_on_a_multi_device_port() {
+        let mgr = PortManager::new();
+        let mut multi = DummyDriver::new("devuser_multi");
+        multi.base.flags.multi_device = true;
+        multi.base.create_param("VAL", ParamType::Int32).unwrap();
+        mgr.register_port(multi).unwrap();
+        let mut single = DummyDriver::new("devuser_single");
+        single.base.create_param("VAL", ParamType::Int32).unwrap();
+        mgr.register_port(single).unwrap();
+
+        let devices = |port: &str| {
+            crate::registry::get_port(port)
+                .unwrap()
+                .handle
+                .with_driver_blocking(|d: &mut DummyDriver| {
+                    let mut addrs: Vec<i32> = d.base.device_states.keys().copied().collect();
+                    addrs.sort_unstable();
+                    addrs
+                })
+                .unwrap()
+        };
+        assert!(devices("devuser_multi").is_empty(), "nothing bound yet");
+
+        let mut user = DeviceUser::default();
+        user.connect_device("devuser_multi", 3).unwrap();
+        assert_eq!(
+            devices("devuser_multi"),
+            vec![3],
+            "the bound address is a device now"
+        );
+
+        let mut port_user = DeviceUser::default();
+        port_user.connect_device("devuser_multi", -1).unwrap();
+        assert_eq!(
+            devices("devuser_multi"),
+            vec![3],
+            "addr -1 is the port's own dpCommon"
+        );
+
+        let mut single_user = DeviceUser::default();
+        single_user.connect_device("devuser_single", 3).unwrap();
+        assert!(
+            devices("devuser_single").is_empty(),
+            "a single-device port has no device list to add to"
+        );
+
+        mgr.unregister_port("devuser_multi");
+        mgr.unregister_port("devuser_single");
     }
 
     /// A bound user answers the queries from the port and leaves the buffer

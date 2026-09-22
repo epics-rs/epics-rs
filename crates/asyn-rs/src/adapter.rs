@@ -1722,6 +1722,24 @@ impl DeviceSupport for AsynDeviceSupport {
         if record.record_type() == "busy" {
             self.set_asyn_readback(true);
         }
+        // C `initCommon` (devAsynInt32.c:249-262): `pasynManager->connectDevice`
+        // before `findInterface`/`drvUser->create`, and it is that call which
+        // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
+        // asynManager.c:1349-1352) - so `asynReport` counts an address the
+        // moment a record binds to it. C fails the record when the connect
+        // fails (:255-259, `goto bad`); here the connect fails only when the
+        // port's actor is gone.
+        if let Err(e) = self.handle.connect_device_blocking(self.addr) {
+            eprintln!(
+                "[asyn] init FAILED: port='{}' addr={} connectDevice failed, {e}",
+                self.handle.port_name(),
+                self.addr
+            );
+            return Ok(DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ));
+        }
         if !self.reason_set {
             // C calls drvUser->create only when the port registered asynDrvUser
             // **and** the record named a userParam (`if (pasynInterface &&

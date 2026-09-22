@@ -14,7 +14,7 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
 use asyn_rs::services::PortServices;
-use asyn_rs::trace::{TraceFile, TraceManager, TraceMask};
+use asyn_rs::trace::{TraceFile, TraceMask};
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::record::ScanType;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -46,11 +46,12 @@ struct Fixture {
 fn fixture(port: &str) -> Fixture {
     let mut base = PortDriverBase::new(port, 1, PortFlags::default());
     base.create_param("VAL", ParamType::Float64).unwrap();
-    let trace = Arc::new(TraceManager::new());
+    let services = PortServices::new();
+    let trace = services.trace().clone();
     let (runtime, _actor) = create_port_runtime(
         TestPort { base },
         RuntimeConfig {
-            services: PortServices::new(trace.clone()),
+            services,
             ..RuntimeConfig::default()
         },
     )

@@ -134,6 +134,10 @@ name = "ip_server_port_accepts"
 required-features = ["epics"]
 
 [[test]]
+name = "non_blocking_write_reaches_the_driver_once"
+required-features = ["epics"]
+
+[[test]]
 name = "port_runtime_lifetime"
 required-features = ["epics"]
 

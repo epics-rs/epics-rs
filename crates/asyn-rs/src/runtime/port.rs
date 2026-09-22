@@ -654,11 +654,12 @@ mod tests {
     #[test]
     fn the_registry_publishes_the_trace_the_driver_was_bound_to() {
         const PORT: &str = "trace_from_handle";
-        let trace = Arc::new(crate::trace::TraceManager::new());
+        let services = crate::services::PortServices::new();
+        let trace = services.trace().clone();
         let (runtime, _actor) = create_port_runtime(
             TestPort::new(PORT),
             RuntimeConfig {
-                services: crate::services::PortServices::new(trace.clone()),
+                services,
                 ..RuntimeConfig::default()
             },
         )

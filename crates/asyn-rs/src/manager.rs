@@ -28,7 +28,7 @@ pub struct PortManager {
 
 impl PortManager {
     pub fn new() -> Self {
-        Self::with_trace_manager(Arc::new(TraceManager::new()))
+        Self::with_services(PortServices::new())
     }
 
     /// The process's one port table — C's `pasynBase->asynPortList`, which
@@ -44,17 +44,6 @@ impl PortManager {
         GLOBAL
             .get_or_init(|| Arc::new(PortManager::with_services(PortServices::global())))
             .clone()
-    }
-
-    /// Build a manager that shares an existing [`TraceManager`].
-    ///
-    /// The `asynSetTrace*` iocsh commands mutate the trace manager reached
-    /// through [`Self::trace_manager`]. An IOC whose ports and drivers were
-    /// registered against a trace manager it built itself (e.g. `AdIoc`) must
-    /// hand that same instance here, or those commands would mutate a trace
-    /// manager nothing reads and silently do nothing.
-    pub fn with_trace_manager(trace: Arc<TraceManager>) -> Self {
-        Self::with_services(PortServices::new(trace))
     }
 
     /// Build a manager on an existing [`PortServices`] — the form that shares

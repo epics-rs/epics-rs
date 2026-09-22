@@ -24,7 +24,6 @@ use asyn_rs::iocsh::build_asyn_commands;
 use asyn_rs::manager::PortManager;
 use asyn_rs::services::PortServices;
 use asyn_rs::sync_io::SyncIOHandle;
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext, CommandDef};
 use named_port::on_a_named_port;
@@ -54,7 +53,7 @@ fn find<'a>(cmds: &'a [CommandDef], name: &str) -> &'a CommandDef {
 /// reach the child port that owns the slot.
 #[test]
 fn an_iocsh_configured_server_port_accepts_a_client() {
-    let services = PortServices::new(Arc::new(TraceManager::new()));
+    let services = PortServices::new();
     let mgr = Arc::new(PortManager::with_services(services));
     let cmds = build_asyn_commands(mgr);
     let ctx = make_ctx();
@@ -165,7 +164,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
 /// socket and destroy every connection it accepted.
 #[test]
 fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
-    let services = PortServices::new(Arc::new(TraceManager::new()));
+    let services = PortServices::new();
     let mgr = Arc::new(PortManager::with_services(services));
     let cmds = build_asyn_commands(mgr);
     let ctx = make_ctx();

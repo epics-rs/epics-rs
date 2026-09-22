@@ -36,12 +36,18 @@ pub struct PortServices {
 }
 
 impl PortServices {
-    /// Build services around an existing [`TraceManager`].
+    /// Build a fresh trace configuration and exception list, wired so the
+    /// `asynSetTrace*` setters announce `asynExceptionTrace*` on that list
+    /// (asynManager.c:2790/2832/2874/2923/2956) — C `asynInit` building
+    /// `pasynBase` (asynManager.c:236-260).
     ///
-    /// The trace manager is wired to the new exception list so the
-    /// `asynSetTrace*` setters announce `asynExceptionTrace*`
-    /// (asynManager.c:2790/2832/2874/2923/2956).
-    pub fn new(trace: Arc<TraceManager>) -> Self {
+    /// The trace is created here rather than taken from the caller because a
+    /// trace has one exception sink: services built on a trace that other
+    /// services already own moved its announcements to a list those services'
+    /// subscribers never saw. Services that share a trace are clones of one
+    /// `PortServices`.
+    pub fn new() -> Self {
+        let trace = Arc::new(TraceManager::new());
         let exceptions = Arc::new(ExceptionManager::new());
         trace.set_exception_sink(exceptions.clone());
         Self { trace, exceptions }
@@ -53,9 +59,7 @@ impl PortServices {
     /// gets.
     pub fn global() -> Self {
         static GLOBAL: OnceLock<PortServices> = OnceLock::new();
-        GLOBAL
-            .get_or_init(|| PortServices::new(Arc::new(TraceManager::new())))
-            .clone()
+        GLOBAL.get_or_init(PortServices::new).clone()
     }
 
     pub fn trace(&self) -> &Arc<TraceManager> {
@@ -84,5 +88,26 @@ impl Default for PortServices {
 impl std::fmt::Debug for PortServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortServices").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trace announces on the exception list of the services it was
+    /// born with, and building further services cannot move it: `new` owns
+    /// its trace, so there is no way to hand it one that is already bound.
+    #[test]
+    fn a_trace_announces_on_its_own_services_exception_list() {
+        let global = PortServices::global();
+        let _other = PortServices::new();
+        for services in [&global, &PortServices::new()] {
+            let sink = services
+                .trace()
+                .exception_manager()
+                .expect("the trace is wired to a sink");
+            assert!(Arc::ptr_eq(&sink, services.exceptions()));
+        }
     }
 }

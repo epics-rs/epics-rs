@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion};
+use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion, WriteStart};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::ao::AoRecord;
@@ -42,11 +42,8 @@ impl DeviceSupport for AsyncDevice {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         unreachable!("write_begin always submits")
     }
-    fn write_begin(
-        &mut self,
-        _record: &mut dyn Record,
-    ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-        Ok(Some(Box::new(Completion {
+    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+        Ok(WriteStart::Pending(Box::new(Completion {
             fails: self.fails.load(Ordering::SeqCst),
         })))
     }

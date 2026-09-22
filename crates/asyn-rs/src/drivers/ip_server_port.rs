@@ -2537,8 +2537,8 @@ mod tests {
         use crate::trace::TraceIoMask;
         use std::net::TcpStream as ClientStream;
 
-        let trace = Arc::new(TraceManager::new());
-        let services = PortServices::new(trace.clone());
+        let services = PortServices::new();
+        let trace = services.trace().clone();
         let mut srv = DrvAsynIPServerPort::new("srv_trace", "127.0.0.1:0").unwrap();
         services.bind(srv.base_mut());
 

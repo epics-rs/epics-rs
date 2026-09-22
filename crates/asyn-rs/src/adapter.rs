@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::device_support::WriteStart;
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost, WriteCompletion,
 };
@@ -1545,6 +1546,32 @@ impl AsynDeviceSupport {
         self.last_process_status = status;
     }
 
+    /// The one synchronous write — C `processCallbackOutput`
+    /// (devAsynInt32.c:511-528): submit, then report the outcome at
+    /// `ASYN_TRACEIO_DEVICE` or `ASYN_TRACE_ERROR`. Both `write()` and the
+    /// non-blocking branch of `write_begin` end here, so the trace line and
+    /// the alarm mapping cannot differ between them.
+    fn write_now(&mut self, op: RequestOp, val: &EpicsValue) -> CaResult<()> {
+        let user = AsynUser::new(self.reason)
+            .with_addr(self.addr)
+            .with_timeout_opt(self.timeout);
+        match self.handle.submit_blocking(op, user) {
+            Ok(_) => {
+                self.trace_process(
+                    "processCallbackOutput",
+                    "write",
+                    AsynStatus::Success,
+                    Ok(&format_args!(" {val}")),
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.trace_process("processCallbackOutput", "write", e.status(), Err(&e));
+                Err(asyn_to_ca_error(e))
+            }
+        }
+    }
+
     /// Store a freshly-read scalar value into the record and report whether
     /// the record's built-in RVAL→VAL conversion should be **skipped**
     /// (`true`) or **run** (`false`). This mirrors C device support's
@@ -2553,21 +2580,7 @@ impl DeviceSupport for AsynDeviceSupport {
         }
         if let Some(val) = self.device_output_value(record) {
             if let Some(op) = self.write_op(&val) {
-                let user = AsynUser::new(self.reason)
-                    .with_addr(self.addr)
-                    .with_timeout_opt(self.timeout);
-                match self.handle.submit_blocking(op, user) {
-                    Ok(_) => self.trace_process(
-                        "processCallbackOutput",
-                        "write",
-                        AsynStatus::Success,
-                        Ok(&format_args!(" {val}")),
-                    ),
-                    Err(e) => {
-                        self.trace_process("processCallbackOutput", "write", e.status(), Err(&e));
-                        return Err(asyn_to_ca_error(e));
-                    }
-                }
+                self.write_now(op, &val)?;
             }
         }
         Ok(())
@@ -2628,38 +2641,35 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn write_begin(
-        &mut self,
-        record: &mut dyn Record,
-    ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
+    fn write_begin(&mut self, record: &mut dyn Record) -> CaResult<WriteStart> {
         // Same raw-output anchor as the synchronous write() — the async path
         // (blocking ports, e.g. motors) must not bypass the RVAL/OVAL anchor.
         let val = match self.device_output_value(record) {
             Some(v) => v,
-            None => return Ok(None),
+            None => return Ok(WriteStart::Synchronous),
         };
         let op = match self.write_op(&val) {
             Some(op) => op,
-            None => return Ok(None),
+            None => return Ok(WriteStart::Synchronous),
         };
+
+        // A port that cannot block (C `ASYN_CANBLOCK` clear) writes inside
+        // this dbProcess call, as C's `processCallbackOutput` runs from the
+        // record's own `process` on such a port, so CP chain targets see the
+        // value at once. It is the whole write: `Completed`, never
+        // `Synchronous`, or the framework would run `write()` and the driver
+        // would see the value twice (a USB-CTR pulse generator restarted
+        // twice per put).
+        if !self.handle.can_block() {
+            self.write_now(op, &val)?;
+            return Ok(WriteStart::Completed);
+        }
+
         let user = AsynUser::new(self.reason)
             .with_addr(self.addr)
             .with_timeout_opt(self.timeout);
-
-        // For non-blocking ports, use synchronous submit to match C EPICS behavior:
-        // the write completes within the same dbProcess call, so CP chain targets
-        // see the updated value immediately. This prevents actor channel overflow
-        // and stale reads during fast motor moves.
-        if !self.handle.can_block() {
-            let _ = self
-                .handle
-                .submit_blocking(op, user)
-                .map_err(asyn_to_ca_error)?;
-            return Ok(None); // completed synchronously, no async completion needed
-        }
-
         let completion = self.handle.try_submit(op, user).map_err(asyn_to_ca_error)?;
-        Ok(Some(Box::new(AsynAsyncWriteCompletion {
+        Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion {
             handle: parking_lot::Mutex::new(Some(completion)),
         })))
     }

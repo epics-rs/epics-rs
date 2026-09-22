@@ -54,7 +54,7 @@ pub mod ioc_support {
     use super::*;
     use epics_base_rs::error::CaResult;
     use epics_base_rs::server::device_support::{
-        DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteCompletion,
+        DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
     };
     use epics_base_rs::server::record::{Record, ScanType};
 
@@ -114,11 +114,8 @@ pub mod ioc_support {
             Ok(())
         }
 
-        fn write_begin(
-            &mut self,
-            _record: &mut dyn Record,
-        ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-            Ok(None)
+        fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+            Ok(WriteStart::Synchronous)
         }
 
         fn last_alarm(&self) -> Option<(u16, u16)> {

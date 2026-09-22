@@ -1219,12 +1219,9 @@ impl IocBuild {
                 .iter()
                 .map(|r| cfg.resolve_save_file(&r.filename))
                 .collect();
-            let builder = if !cfg.monitor_sets.is_empty() || !cfg.triggered_sets.is_empty() {
-                Some(cfg.into_builder())
-            } else {
-                None
-            };
-            (pass0, pass1, builder)
+            // Built even with no set yet: a `create_monitor_set` after
+            // `iocInit` adds to this manager (C `create_data_set`).
+            (pass0, pass1, Some(cfg.into_builder()))
         } else {
             (Vec::new(), Vec::new(), None)
         };
@@ -1576,9 +1573,12 @@ impl IocBuild {
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // one bad `.req` file no longer costs the IOC every other set.
-            let mgr = builder.build().await;
+            let mgr = Arc::new(builder.build().await);
             eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
-            Some(Arc::new(mgr))
+            if let Some(ref config) = autosave_startup {
+                config.lock().unwrap().manager = Some(mgr.clone());
+            }
+            Some(mgr)
         } else {
             None
         };

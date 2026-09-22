@@ -11,7 +11,7 @@ use crate::server::iocsh::registry::{
 use super::backup::BackupConfig;
 use super::format::CompatMode;
 use super::macros::MacroContext;
-use super::manager::AutosaveBuilder;
+use super::manager::{AutosaveBuilder, AutosaveManager};
 use super::save_set::{SaveSetConfig, SaveStrategy, TriggerMode};
 
 /// Definition of a monitor save set from st.cmd (`create_monitor_set`).
@@ -103,6 +103,11 @@ pub struct AutosaveStartupConfig {
     /// to [`CompatMode::CRead`] (via the `save_restoreSet_CompatMode`
     /// iocsh command) so a C IOC can read the produced `.sav` files.
     pub compat: CompatMode,
+    /// The manager `iocInit` built from this config. Set by `iocInit`;
+    /// from then on `create_monitor_set` / `create_triggered_set` add
+    /// their set to it instead of to the lists above, which C's
+    /// `create_data_set` does at any time (`save_restore.c`).
+    pub manager: Option<Arc<AutosaveManager>>,
 }
 
 impl AutosaveStartupConfig {
@@ -124,6 +129,72 @@ impl AutosaveStartupConfig {
         }
     }
 
+    /// The set a `create_monitor_set` line describes (periodic strategy).
+    pub fn monitor_set_config(&self, def: &MonitorSetDef) -> SaveSetConfig {
+        self.set_config(
+            def.filename.clone(),
+            &def.filename,
+            &def.macros,
+            SaveStrategy::Periodic {
+                interval: def.period,
+            },
+        )
+    }
+
+    /// The set a `create_triggered_set` line describes. C-autosave
+    /// `create_triggered_set` saves the set whenever its trigger PV
+    /// changes — mapped to the real `SaveStrategy::Triggered` (trigger-PV
+    /// watcher), NOT `OnChange` polling of every member PV.
+    pub fn triggered_set_config(&self, def: &TriggeredSetDef) -> SaveSetConfig {
+        self.set_config(
+            format!("{}_triggered", def.filename),
+            &def.filename,
+            &def.macros,
+            SaveStrategy::Triggered {
+                trigger_pv: def.trigger_pv.clone(),
+                mode: TriggerMode::AnyChange,
+                poll_interval: TRIGGER_POLL_INTERVAL,
+            },
+        )
+    }
+
+    fn set_config(
+        &self,
+        name: String,
+        filename: &str,
+        macros: &str,
+        strategy: SaveStrategy,
+    ) -> SaveSetConfig {
+        // The NAME, not a pre-resolved path.
+        // `SaveSet::load_entries` hands it to
+        // `load_request_file_with_search_paths`, which searches
+        // `search_paths` (the same `request_file_paths`) and returns
+        // `AutosaveError::RequestFile` when nothing matches, so
+        // `build()` refuses the set. Pre-resolving here turned that
+        // failure into `request_file: None`, which is this field's
+        // OTHER meaning — "this set has no request file, its members
+        // are `request_pvs`" — and the set then built with zero
+        // entries and overwrote a good `.sav` with a two-line file on
+        // its first tick.
+        let request_file = Some(PathBuf::from(filename));
+        let save_path = self.resolve_save_file(filename);
+        let macros = if macros.is_empty() {
+            HashMap::new()
+        } else {
+            MacroContext::parse_inline(macros)
+        };
+        SaveSetConfig {
+            name,
+            save_path,
+            strategy,
+            request_file,
+            request_pvs: Vec::new(),
+            backup: BackupConfig::default(),
+            macros,
+            search_paths: self.request_file_paths.clone(),
+        }
+    }
+
     /// Build an AutosaveBuilder from the collected configuration.
     pub fn into_builder(&self) -> AutosaveBuilder {
         let mut builder = AutosaveBuilder::new().compat(self.compat);
@@ -132,73 +203,35 @@ impl AutosaveStartupConfig {
             builder = builder.status_prefix(prefix);
         }
 
-        // Add monitor sets (periodic strategy)
         for def in &self.monitor_sets {
-            // The NAME, not a pre-resolved path.
-            // `SaveSet::load_entries` hands it to
-            // `load_request_file_with_search_paths`, which searches
-            // `search_paths` (the same `request_file_paths`) and returns
-            // `AutosaveError::RequestFile` when nothing matches, so
-            // `build()` refuses the set. Pre-resolving here turned that
-            // failure into `request_file: None`, which is this field's
-            // OTHER meaning — "this set has no request file, its members
-            // are `request_pvs`" — and the set then built with zero
-            // entries and overwrote a good `.sav` with a two-line file on
-            // its first tick.
-            let request_file = Some(PathBuf::from(&def.filename));
-            let save_path = self.resolve_save_file(&def.filename);
-            let macros = if def.macros.is_empty() {
-                HashMap::new()
-            } else {
-                MacroContext::parse_inline(&def.macros)
-            };
-            builder = builder.add_set(SaveSetConfig {
-                name: def.filename.clone(),
-                save_path,
-                strategy: SaveStrategy::Periodic {
-                    interval: def.period,
-                },
-                request_file,
-                request_pvs: Vec::new(),
-                backup: BackupConfig::default(),
-                macros,
-                search_paths: self.request_file_paths.clone(),
-            });
+            builder = builder.add_set(self.monitor_set_config(def));
         }
-
-        // Add triggered sets. C-autosave `create_triggered_set`
-        // saves the set whenever its trigger PV changes — mapped to
-        // the real `SaveStrategy::Triggered` (trigger-PV watcher),
-        // NOT `OnChange` polling of every member PV.
         for def in &self.triggered_sets {
-            // Same as the monitor loop above: the name travels, so an
-            // unresolvable request file fails the build instead of
-            // impersonating an inline-PV set.
-            let request_file = Some(PathBuf::from(&def.filename));
-            let save_path = self.resolve_save_file(&def.filename);
-            let macros = if def.macros.is_empty() {
-                HashMap::new()
-            } else {
-                MacroContext::parse_inline(&def.macros)
-            };
-            let strategy = SaveStrategy::Triggered {
-                trigger_pv: def.trigger_pv.clone(),
-                mode: TriggerMode::AnyChange,
-                poll_interval: TRIGGER_POLL_INTERVAL,
-            };
-            builder = builder.add_set(SaveSetConfig {
-                name: format!("{}_triggered", def.filename),
-                save_path,
-                strategy,
-                request_file,
-                request_pvs: Vec::new(),
-                backup: BackupConfig::default(),
-                macros,
-                search_paths: self.request_file_paths.clone(),
-            });
+            builder = builder.add_set(self.triggered_set_config(def));
         }
 
         builder
+    }
+
+    /// `create_monitor_set` / `create_triggered_set` after `iocInit`:
+    /// the set goes straight to the running manager, as C's
+    /// `create_data_set` appends to its live list. Before `iocInit` the
+    /// caller keeps the definition for `into_builder`.
+    fn add_to_running(
+        holder: &Mutex<Self>,
+        ctx: &CommandContext,
+        config: impl FnOnce(&Self) -> SaveSetConfig,
+    ) -> Result<bool, String> {
+        let (mgr, cfg) = {
+            let cfg = holder.lock().unwrap();
+            match cfg.manager.clone() {
+                Some(mgr) => (mgr, config(&cfg)),
+                None => return Ok(false),
+            }
+        };
+        ctx.block_on(mgr.add_set(cfg))
+            .map(|()| true)
+            .map_err(|e| e.to_string())
     }
 
     /// Register the 7 autosave iocsh commands that populate this config.
@@ -296,7 +329,7 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "create_monitor_set(filename, period, macrostring) - Create periodic save set",
-                move |args: &[ArgValue], _ctx: &CommandContext| {
+                move |args: &[ArgValue], ctx: &CommandContext| {
                     let filename = match &args[0] {
                         ArgValue::String(s) => s.clone(),
                         _ => return Err("filename argument required".into()),
@@ -313,11 +346,14 @@ impl AutosaveStartupConfig {
                         "create_monitor_set: {filename}, period={}s",
                         period.as_secs()
                     );
-                    h.lock().unwrap().monitor_sets.push(MonitorSetDef {
+                    let def = MonitorSetDef {
                         filename,
                         period,
                         macros,
-                    });
+                    };
+                    if !Self::add_to_running(&h, ctx, |cfg| cfg.monitor_set_config(&def))? {
+                        h.lock().unwrap().monitor_sets.push(def);
+                    }
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -349,7 +385,7 @@ impl AutosaveStartupConfig {
                 ],
                 "create_triggered_set(filename, trigger_channel, macrostring) - \
                  Create triggered save set (saves when trigger_channel changes)",
-                move |args: &[ArgValue], _ctx: &CommandContext| {
+                move |args: &[ArgValue], ctx: &CommandContext| {
                     let filename = match &args[0] {
                         ArgValue::String(s) => s.clone(),
                         _ => return Err("filename argument required".into()),
@@ -372,11 +408,14 @@ impl AutosaveStartupConfig {
                         _ => String::new(),
                     };
                     eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
-                    h.lock().unwrap().triggered_sets.push(TriggeredSetDef {
+                    let def = TriggeredSetDef {
                         filename,
                         trigger_pv: trigger_channel,
                         macros,
-                    });
+                    };
+                    if !Self::add_to_running(&h, ctx, |cfg| cfg.triggered_set_config(&def))? {
+                        h.lock().unwrap().triggered_sets.push(def);
+                    }
                     Ok(CommandOutcome::Continue)
                 },
             ));

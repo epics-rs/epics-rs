@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(44): checked, not waived — all 44 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(45): checked, not waived — all 45 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// --all-features`, 1106/1106). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -379,9 +379,9 @@ pub struct AsynDeviceSupport {
     /// samples (devAsynInt32.c:673-702, see `AverageState::num_to_average`).
     average: Option<Arc<AverageState>>,
     /// RAII handle for the averaging synchronous interrupt callback — dropping
-    /// unregisters it. Distinct from `interrupt_sub` (the mailbox/value path):
-    /// averaging needs every sample, so it registers a synchronous callback
-    /// (C `registerInterruptUser`), not a coalescing mailbox subscription.
+    /// unregisters it. Distinct from `interrupt_sub` (the value path into
+    /// the ring): averaging accumulates every sample itself and pushes one
+    /// decimated mean (C `registerInterruptUser`).
     average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// `Some` ⟹ time-series device support (`asynInt32TimeSeries` /
     /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`, all waveform-only). The
@@ -394,8 +394,14 @@ pub struct AsynDeviceSupport {
     /// dropping unregisters it (mirrors `average_callback_sub`; the time-series
     /// support also needs every sample, so a synchronous callback, not a mailbox).
     time_series_sub: Option<crate::interrupt::SyncCallbackSubscription>,
-    /// RAII interrupt subscription — dropping unsubscribes.
-    interrupt_sub: Option<InterruptSubscription>,
+    /// RAII handle for the `SCAN="I/O Intr"` synchronous interrupt callback —
+    /// dropping unregisters it. Synchronous like the averaging and time-series
+    /// callbacks: the C ring (`interruptCallbackInput`, devAsynInt32.c:564-576)
+    /// holds every callback the record has not processed yet, so the values
+    /// go straight from the driver's callback into `interrupt_fifo`. A
+    /// latest-only mailbox in between kept one value per record-process and
+    /// dropped the rest silently, which is not the ring's overflow count.
+    interrupt_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
     /// I/O Intr forwarding task pushes; `read()` pops the oldest
     /// entry. C parity: `devAsynInt32.c::ringBuffer` (DEFAULT 10,
@@ -2560,8 +2566,8 @@ impl DeviceSupport for AsynDeviceSupport {
         // Time-series device support (asynInt32/Float64/Int64TimeSeries):
         // register an ALWAYS-ON synchronous accumulating callback (C
         // `registerInterruptUser(interruptCallback)`, devAsynXXXTimeSeries.h:159).
-        // Like averaging it must observe EVERY sample, so a sync callback, not a
-        // coalescing mailbox. The callback appends to the buffer only while BUSY
+        // Like averaging it observes EVERY sample through a sync callback.
+        // The callback appends to the buffer only while BUSY
         // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
         // the record to process (C `callbackRequestProcessCallback`,
         // devAsynXXXTimeSeries.h:202-212). Process registration/cancellation by
@@ -2640,10 +2646,9 @@ impl DeviceSupport for AsynDeviceSupport {
         // `getIoIntInfo` then leaves it alone — "for aiAverage we don't enable
         // callbacks here, because they are always enabled in any scan mode",
         // `if (!pPvt->isAiAverage)` (:385-394).
-        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
-        // not a mailbox subscription: averaging must observe every sample, and
-        // the mailbox coalesces rapid updates to the latest — which would drop
-        // samples and corrupt the mean.
+        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser):
+        // averaging must observe every sample, and it pushes the mean itself
+        // rather than the sample the plain I/O Intr path would ring.
         if let Some(acc) = self.average.clone() {
             let filter = InterruptFilter {
                 reason: Some(self.reason),
@@ -2796,18 +2801,15 @@ impl DeviceSupport for AsynDeviceSupport {
             iface: self.iface,
         };
 
-        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
-        self.interrupt_sub = Some(sub);
-
-        // Bridge mailbox-based InterruptReceiver to the mpsc<()> wakeup channel
-        // consumed by setup_io_intr(). The mailbox already coalesces intermediate
-        // updates, so no data is lost even if the record processes slowly.
+        // Every callback lands in the ring, inline in the driver's notify()
+        // like C's interruptCallbackInput; the mpsc<()> is only the
+        // scanIoRequest wakeup that setup_io_intr() consumes.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let fifo = self.interrupt_fifo.clone();
-        // The pump only moves values between channels, so it places cleanly on
-        // whichever executor `runtime::task` resolves to.
-        crate::runtime::task::spawn(async move {
-            while let Some(iv) = intr_rx.recv().await {
+        let sub = self
+            .handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
                 // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
@@ -2816,14 +2818,14 @@ impl DeviceSupport for AsynDeviceSupport {
                 // @asynMask nbits mask + sign-extend (devAsynInt32.c:537-540),
                 // matching the polled `result_to_value` path. Other values
                 // pass through.
-                let value = match iv.value {
+                let value = match &iv.value {
                     crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
                         crate::param::ParamValue::UInt32Digital(v & mask)
                     }
                     crate::param::ParamValue::Int32(v) => {
-                        crate::param::ParamValue::Int32(int32_mask.map_or(v, |m| m.apply(v)))
+                        crate::param::ParamValue::Int32(int32_mask.map_or(*v, |m| m.apply(*v)))
                     }
-                    other => other,
+                    other => other.clone(),
                 };
                 let entry = CachedInterrupt {
                     value,
@@ -2850,11 +2852,14 @@ impl DeviceSupport for AsynDeviceSupport {
                     let mut g = fifo.lock().unwrap();
                     g.push_with_overflow(entry)
                 };
-                if was_fresh_add && tx.send(()).await.is_err() {
-                    break;
+                // try_send: inline in the driver's notify(), so it must not
+                // block; a full wakeup channel means a process is already
+                // pending and will drain the ring.
+                if was_fresh_add {
+                    let _ = tx.try_send(());
                 }
-            }
-        });
+            });
+        self.interrupt_sub = Some(sub);
         Some(rx)
     }
 
@@ -4612,6 +4617,56 @@ mod tests {
             ),
             "non-UInt32 interrupt must pass through ungated and unmasked"
         );
+    }
+
+    /// C `interruptCallbackInput` (devAsynInt32.c:564-576): every callback
+    /// the record has not processed yet sits in the ring, in order, and only
+    /// a full ring drops one - counted in `overflows`. The mailbox that used
+    /// to sit between the driver and the ring kept the latest value per
+    /// record-process and dropped the rest without a count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_intr_rings_every_callback_before_the_record_reads() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_uint32_io_intr_adapter(0xFF);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        let mut rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        for v in [1u32, 2, 3] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::UInt32Digital(v),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0x01,
+                ..Default::default()
+            });
+        }
+
+        // The callback is inline in notify(): the ring is complete on return.
+        let ringed: Vec<u32> = {
+            let mut g = fifo.lock().unwrap();
+            std::iter::from_fn(|| g.pop())
+                .map(|e| match e.value {
+                    crate::param::ParamValue::UInt32Digital(v) => v,
+                    other => panic!("expected UInt32Digital, got {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            ringed,
+            vec![1, 2, 3],
+            "every callback before the record reads is in the ring, oldest first"
+        );
+        assert_eq!(fifo.lock().unwrap().take_overflows(), 0);
+        // One scanIoRequest per fresh add (C: no request only on overflow).
+        for _ in 0..3 {
+            rx.try_recv()
+                .expect("a process request per ringed callback");
+        }
     }
 
     #[test]

@@ -1715,11 +1715,7 @@ fn publish_configured_port<D: PortDriver>(
             return None;
         }
     };
-    if let Err(e) = crate::asyn_record::register_port(
-        port,
-        handle.port_handle().clone(),
-        services.trace().clone(),
-    ) {
+    if let Err(e) = crate::asyn_record::register_port(port, handle.port_handle().clone()) {
         ctx.println(&format!("{command}: {e}"));
         handle.shutdown();
         return None;
@@ -3205,12 +3201,7 @@ mod tests {
             crate::runtime::config::RuntimeConfig::default(),
         )
         .unwrap();
-        crate::registry::register_port(
-            PORT,
-            runtime.port_handle().clone(),
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
 
         let mgr = Arc::new(PortManager::new());
         report_ports(&mgr, 0, Some(PORT));

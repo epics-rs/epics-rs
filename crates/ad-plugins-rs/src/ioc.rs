@@ -15,6 +15,7 @@ use ad_core_rs::ioc::{
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::manager::PortManager;
+use asyn_rs::services::PortServices;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
@@ -938,13 +939,15 @@ pub struct AdIoc {
 impl AdIoc {
     /// Create a new AdIoc with default configuration.
     pub fn new() -> Self {
-        let trace = Arc::new(TraceManager::new());
-        let mgr = PluginManager::new(trace.clone());
-        // The asyn iocsh commands resolve ports and mutate trace state through
-        // this manager, so it shares the IOC's `TraceManager` — a manager with
-        // a `TraceManager` of its own would make `asynSetTrace*` mutate state
-        // that no driver or plugin ever reads.
-        let ports = Arc::new(PortManager::with_trace_manager(trace.clone()));
+        // The plugin and detector ports are built with `RuntimeConfig::default()`,
+        // which binds them to `PortServices::global()`. The asyn iocsh commands
+        // mutate trace state through this manager, so it is the same services:
+        // a manager with a `TraceManager` of its own made `asynSetTrace*` set
+        // masks no driver or plugin ever read.
+        let services = PortServices::global();
+        let trace = services.trace().clone();
+        let mgr = PluginManager::new();
+        let ports = Arc::new(PortManager::with_services(services));
 
         asyn_rs::asyn_record::register_asyn_record_type();
 
@@ -1008,7 +1011,8 @@ impl AdIoc {
         &self.ports
     }
 
-    /// Access the shared `TraceManager`.
+    /// The `TraceManager` every port of this IOC is bound to — the global
+    /// services' (see `AdIoc::new`).
     pub fn trace(&self) -> &Arc<TraceManager> {
         &self.trace
     }

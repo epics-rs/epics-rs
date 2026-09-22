@@ -7,9 +7,6 @@
 // The default build still lints the file in full.
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-use std::sync::Arc;
-
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
@@ -37,7 +34,6 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    let trace = Arc::new(TraceManager::new());
     let handle = epics_base_rs::runtime::task::runtime_handle();
 
     // The server port comes from `IocApplication::new()`, which resolves
@@ -49,7 +45,7 @@ async fn main() -> CaResult<()> {
     app = asyn_rs::adapter::register_asyn_device_support(app);
 
     // Register MQTT iocsh commands (mqttDriverConfigure)
-    app = mqtt_rs::ioc::register_mqtt_commands(app, handle, trace);
+    app = mqtt_rs::ioc::register_mqtt_commands(app, handle);
 
     // Register Z2M device type builders
     app = mqtt_rs::z2m::register_z2m_commands(app);

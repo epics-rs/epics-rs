@@ -26,7 +26,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The child is this same binary, re-exec'd; these three variables are both the
@@ -259,10 +258,9 @@ fn be_the_ioc() -> ! {
         .expect("failed to build tokio runtime");
 
     let outcome = runtime.block_on(async move {
-        let trace = Arc::new(asyn_rs::trace::TraceManager::new());
         let handle = epics_base_rs::runtime::task::runtime_handle();
         let app = epics_ca_rs::server::ioc_app::IocApplication::new();
-        let app = mqtt_rs::ioc::register_mqtt_commands(app, handle, trace);
+        let app = mqtt_rs::ioc::register_mqtt_commands(app, handle);
         app.startup_script(&script)
             .run(move |_config| async move {
                 // The broker has CONNACKed by the time this byte arrives.

@@ -353,7 +353,13 @@ pub fn create_port_runtime_boxed(
         let _ = waiter.wait(config.auto_connect_timeout);
     }
 
-    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts, actor_id);
+    let mut port_handle = PortHandle::new(
+        tx,
+        port_name.clone(),
+        handle_interrupts,
+        actor_id,
+        config.services.trace().clone(),
+    );
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
     port_handle.set_interfaces(interfaces);
@@ -640,6 +646,52 @@ mod tests {
     /// only there. On macOS/BSD it limits `fork` alone — `pthread_create`
     /// succeeds regardless, so the refusal cannot be provoked (measured: both
     /// macOS CI runners fail the child's "registration must fail" assertion).
+    /// The registry publishes the trace manager the driver was bound to at
+    /// `create_port_runtime`, not one the registering caller picked: a mask
+    /// set by port name through the registry (`asynSetTraceMask`, asynRecord
+    /// `TMSK`) must be the mask the driver's `trace_print` reads. C reaches
+    /// the one `tracePvt` through the port (asynManager.c:449-459).
+    #[test]
+    fn the_registry_publishes_the_trace_the_driver_was_bound_to() {
+        const PORT: &str = "trace_from_handle";
+        let trace = Arc::new(crate::trace::TraceManager::new());
+        let (runtime, _actor) = create_port_runtime(
+            TestPort::new(PORT),
+            RuntimeConfig {
+                services: crate::services::PortServices::new(trace.clone()),
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+
+        let entry = crate::registry::get_port(PORT).expect("published");
+        assert!(
+            Arc::ptr_eq(entry.handle.trace(), &trace),
+            "the entry's trace is the one bound into the driver"
+        );
+        // Through the registry entry, as the trace commands do, into the
+        // driver's own view.
+        entry
+            .handle
+            .trace()
+            .set_trace_mask(Some(PORT), crate::trace::TraceMask::FLOW);
+        let driver_sees_flow = runtime
+            .port_handle()
+            .with_driver_blocking(|d: &mut TestPort| {
+                d.base
+                    .trace
+                    .as_ref()
+                    .is_some_and(|t| t.is_enabled(PORT, crate::trace::TraceMask::FLOW))
+            })
+            .unwrap();
+        assert!(
+            driver_sees_flow,
+            "the driver reads the mask the registry set"
+        );
+        crate::registry::unregister_port(PORT);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_port_whose_thread_cannot_be_created_is_not_registered() {

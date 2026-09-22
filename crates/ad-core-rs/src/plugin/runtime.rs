@@ -2700,7 +2700,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             asyn_rs::asyn_record::get_port(&sender_port_name)
                                         {
                                             asyn_rs::asyn_trace!(
-                                                entry.trace,
+                                                entry.handle.trace(),
                                                 sender_port_name.as_str(),
                                                 asyn_rs::trace::TraceMask::WARNING,
                                                 "plugin {sender_port_name}: ProcessPlugin \

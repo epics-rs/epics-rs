@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
@@ -58,14 +57,12 @@ fn env_i32(name: &str, default: i32) -> i32 {
 
 struct BeamlineHolder {
     xrt_runtime: std::sync::Mutex<Option<XrtDetectorRuntime>>,
-    trace: Arc<TraceManager>,
 }
 
 impl BeamlineHolder {
-    fn new(trace: Arc<TraceManager>) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
             xrt_runtime: std::sync::Mutex::new(None),
-            trace,
         })
     }
 }
@@ -90,9 +87,8 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    let trace = Arc::new(TraceManager::new());
-    let mgr = PluginManager::new(trace.clone());
-    let holder = BeamlineHolder::new(trace.clone());
+    let mgr = PluginManager::new();
+    let holder = BeamlineHolder::new();
 
     let autosave_config = Arc::new(std::sync::Mutex::new(
         epics_base_rs::server::autosave::startup::AutosaveStartupConfig::new(),
@@ -154,7 +150,7 @@ async fn main() -> CaResult<()> {
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("XRT", xrt_handle, h.trace.clone())
+                asyn_rs::asyn_record::register_port("XRT", xrt_handle)
                     .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(

@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
@@ -38,7 +37,6 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    let trace = Arc::new(TraceManager::new());
     let handle = epics_base_rs::runtime::task::runtime_handle();
 
     // The server port comes from `IocApplication::new()`, which resolves
@@ -55,7 +53,7 @@ async fn main() -> CaResult<()> {
     app = asyn_rs::iocsh::register_asyn_commands(app, port_manager);
 
     // Modbus iocsh commands: modbusInterposeConfig, drvModbusAsynConfigure.
-    app = modbus_rs::ioc::register_modbus_commands(app, handle, trace);
+    app = modbus_rs::ioc::register_modbus_commands(app, handle);
 
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`

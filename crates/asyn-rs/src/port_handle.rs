@@ -28,6 +28,7 @@ use crate::interrupt::InterruptManager;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorMessage};
 use crate::request::{CancelToken, DriverCall, RequestOp, RequestResult};
+use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
 /// Park the calling thread until `fut` resolves or `deadline` passes, from
@@ -246,6 +247,13 @@ pub struct PortHandle {
     /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
     /// driver cannot gain or lose an interface after `registerInterface`.
     interfaces: Arc<[Capability]>,
+    /// The trace manager the port's driver was bound to
+    /// (`PortServices::bind` at `create_port_runtime`) — C's per-port
+    /// `tracePvt`, reached through the port. The registry publishes this one
+    /// for `asynSetTraceMask` / asynRecord `TMSK`, so a mask set by name lands
+    /// in the manager the driver's `trace_print` reads; handing the registry
+    /// a second manager at registration is what made those masks silent.
+    trace: Arc<TraceManager>,
 }
 
 impl PortHandle {
@@ -257,6 +265,7 @@ impl PortHandle {
         port_name: String,
         interrupts: Arc<InterruptManager>,
         actor: ActorId,
+        trace: Arc<TraceManager>,
     ) -> Self {
         Self {
             tx,
@@ -267,7 +276,13 @@ impl PortHandle {
             multi_device: false,
             max_addr: 1,
             interfaces: crate::interfaces::default_capabilities().into(),
+            trace,
         }
+    }
+
+    /// The port's trace manager — see the field.
+    pub fn trace(&self) -> &Arc<TraceManager> {
+        &self.trace
     }
 
     /// Record the driver's declared interface set — see `Self::interfaces`.
@@ -1396,7 +1411,13 @@ mod tests {
             .name("test-handle-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        PortHandle::new(tx, "handle_test".into(), interrupts, actor_id)
+        PortHandle::new(
+            tx,
+            "handle_test".into(),
+            interrupts,
+            actor_id,
+            Arc::new(TraceManager::new()),
+        )
     }
 
     /// `with_driver` hands the closure the driver's concrete type, runs it on

@@ -19,7 +19,6 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt = driver_runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "simDetectorConfig",
@@ -46,7 +45,7 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
 
                 let port_handle = runtime.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(&port_name, port_handle, trace.clone())
+                asyn_rs::asyn_record::register_port(&port_name, port_handle)
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

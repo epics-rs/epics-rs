@@ -121,11 +121,7 @@ impl PortManager {
         // claim means a concurrent registrant won between the pre-flight
         // and here: drop the runtime we just built and report the
         // duplicate.
-        if let Err(e) = crate::registry::register_port(
-            &name,
-            handle.port_handle().clone(),
-            self.services.trace().clone(),
-        ) {
+        if let Err(e) = crate::registry::register_port(&name, handle.port_handle().clone()) {
             handle.shutdown();
             return Err(e);
         }
@@ -729,13 +725,9 @@ mod tests {
             "extowned".to_string(),
             Arc::new(crate::interrupt::InterruptManager::new(4)),
             crate::port_actor::ActorId::new(),
-        );
-        crate::registry::register_port(
-            "extowned",
-            ext,
             Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        );
+        crate::registry::register_port("extowned", ext).unwrap();
 
         let mgr = PortManager::new();
         match mgr.register_port(DummyDriver::new("extowned")) {

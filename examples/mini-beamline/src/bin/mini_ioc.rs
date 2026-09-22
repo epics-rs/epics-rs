@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
@@ -79,17 +78,15 @@ struct BeamlineHolder {
     beam_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pd_runtimes: std::sync::Mutex<HashMap<String, PointDetectorRuntime>>,
     md_runtime: std::sync::Mutex<Option<MovingDotRuntime>>,
-    trace: Arc<TraceManager>,
 }
 
 impl BeamlineHolder {
-    fn new(trace: Arc<TraceManager>) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
             beam_value: Arc::new(BeamCurrentValue::new()),
             beam_rx: std::sync::Mutex::new(None),
             pd_runtimes: std::sync::Mutex::new(HashMap::new()),
             md_runtime: std::sync::Mutex::new(None),
-            trace,
         })
     }
 }
@@ -128,9 +125,8 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    let trace = Arc::new(TraceManager::new());
-    let mgr = PluginManager::new(trace.clone());
-    let holder = BeamlineHolder::new(trace.clone());
+    let mgr = PluginManager::new();
+    let holder = BeamlineHolder::new();
 
     // Enable autosave startup commands (set_savefile_path, create_monitor_set, etc.)
     let autosave_config = Arc::new(std::sync::Mutex::new(
@@ -201,7 +197,7 @@ async fn main() -> CaResult<()> {
                     let rt = point_detector::create_point_detector(port, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(port, port_handle, h.trace.clone())
+                    asyn_rs::asyn_record::register_port(port, port_handle)
                         .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
@@ -238,7 +234,7 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("DOT", dot_handle, h.trace.clone())
+                asyn_rs::asyn_record::register_port("DOT", dot_handle)
                     .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain

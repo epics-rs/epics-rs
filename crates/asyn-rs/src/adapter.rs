@@ -3724,7 +3724,13 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, _rx) = tokio::sync::mpsc::channel(256);
             (
-                PortHandle::new(tx, name.into(), interrupts, ActorId::new()),
+                PortHandle::new(
+                    tx,
+                    name.into(),
+                    interrupts,
+                    ActorId::new(),
+                    std::sync::Arc::new(crate::trace::TraceManager::new()),
+                ),
                 _rx,
             )
         };
@@ -3753,7 +3759,13 @@ mod tests {
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
+        let handle = PortHandle::new(
+            tx,
+            "p".into(),
+            interrupts,
+            ActorId::new(),
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
@@ -3781,7 +3793,13 @@ mod tests {
 
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
+        let handle = PortHandle::new(
+            tx,
+            "p".into(),
+            interrupts,
+            ActorId::new(),
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
@@ -3913,7 +3931,13 @@ mod tests {
             .name("test-bounds-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_bounds".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_bounds".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_bounds".into(),
             addr: 0,
@@ -3935,7 +3959,13 @@ mod tests {
             .name("test-adapter-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
 
         let link = AsynLink {
             port_name: "test".into(),
@@ -3971,7 +4001,13 @@ mod tests {
             .name("test-seeded-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -3999,7 +4035,13 @@ mod tests {
             .name("test-average-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4037,7 +4079,13 @@ mod tests {
             .name("test-ts-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4448,13 +4496,14 @@ mod tests {
             .name("ts-factory-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts, actor_id);
-        crate::asyn_record::register_port(
-            "ts_factory",
-            handle,
+        let handle = PortHandle::new(
+            tx,
+            "ts_factory".into(),
+            interrupts,
+            actor_id,
             Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        );
+        crate::asyn_record::register_port("ts_factory", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynInt32TimeSeries",
@@ -4500,7 +4549,13 @@ mod tests {
             .name("test-u32-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -5492,7 +5547,13 @@ mod tests {
             .name("test-enum-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_enum".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_enum".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_enum".into(),
             addr: 0,
@@ -5984,7 +6045,13 @@ mod tests {
                 .name("cap-actor".into())
                 .spawn(move || actor.run())
                 .unwrap();
-            let handle = PortHandle::new(tx, "capport".into(), interrupts, actor_id);
+            let handle = PortHandle::new(
+                tx,
+                "capport".into(),
+                interrupts,
+                actor_id,
+                std::sync::Arc::new(crate::trace::TraceManager::new()),
+            );
             let link = AsynLink {
                 port_name: "capport".into(),
                 addr: 0,
@@ -6184,7 +6251,13 @@ mod tests {
                 .name("ondemand-actor".into())
                 .spawn(move || actor.run())
                 .unwrap();
-            let handle = PortHandle::new(tx, "ondemand".into(), interrupts, actor_id);
+            let handle = PortHandle::new(
+                tx,
+                "ondemand".into(),
+                interrupts,
+                actor_id,
+                std::sync::Arc::new(crate::trace::TraceManager::new()),
+            );
             let link = AsynLink {
                 port_name: "ondemand".into(),
                 addr: 0,
@@ -6559,7 +6632,13 @@ mod tests {
             .name("test-arr-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -7149,7 +7228,13 @@ mod tests {
             .name("test-f64-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_f64".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_f64".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_f64".into(),
             addr: 0,
@@ -7582,7 +7667,13 @@ mod tests {
             .name("binwrite-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            name.into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         (handle, writes)
     }
 
@@ -7596,12 +7687,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_wb");
-        crate::asyn_record::register_port(
-            "binwrite_wb",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("binwrite_wb", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWriteBinary",
@@ -7633,12 +7719,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_text");
-        crate::asyn_record::register_port(
-            "binwrite_text",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("binwrite_text", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWrite",
@@ -7790,7 +7871,13 @@ mod tests {
             .name("cmdresp-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            name.into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         (handle, (writes, sequence))
     }
 
@@ -7969,7 +8056,13 @@ mod tests {
         );
         let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "octet_partial".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
 
         let link = AsynLink {
             port_name: "octet_partial".into(),
@@ -8010,12 +8103,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
-        crate::asyn_record::register_port(
-            "cmdresp_factory",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_factory", handle).unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -8067,12 +8155,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
-        crate::asyn_record::register_port(
-            "cmdresp_nul",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_nul", handle).unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -8106,12 +8189,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
-        crate::asyn_record::register_port(
-            "cmdresp_lnul",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_lnul", handle).unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty

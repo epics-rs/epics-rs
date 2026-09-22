@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use asyn_rs::trace::TraceManager;
-
 use crate::plugin::runtime::PluginRuntimeHandle;
 use crate::plugin::wiring::WiringRegistry;
 
@@ -17,17 +15,15 @@ pub struct PluginManager {
     driver: parking_lot::Mutex<Option<Arc<dyn DriverContext>>>,
     plugin_handles: parking_lot::Mutex<Vec<PluginRuntimeHandle>>,
     port_runtimes: parking_lot::Mutex<Vec<asyn_rs::runtime::port::PortRuntimeHandle>>,
-    trace: Arc<TraceManager>,
     wiring: Arc<WiringRegistry>,
 }
 
 impl PluginManager {
-    pub fn new(trace: Arc<TraceManager>) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             driver: parking_lot::Mutex::new(None),
             plugin_handles: parking_lot::Mutex::new(Vec::new()),
             port_runtimes: parking_lot::Mutex::new(Vec::new()),
-            trace,
             wiring: Arc::new(WiringRegistry::new()),
         })
     }
@@ -50,11 +46,6 @@ impl PluginManager {
             .ok_or_else(|| "driver must be configured first".into())
     }
 
-    /// The shared TraceManager for port registration.
-    pub fn trace(&self) -> &Arc<TraceManager> {
-        &self.trace
-    }
-
     /// Register a plugin. The port is registered in the global asyn port registry
     /// so the universal asyn device support factory can find it.
     ///
@@ -72,7 +63,7 @@ impl PluginManager {
 
         // Claim the port name first: a duplicate must not leave a wiring
         // output or a parked handle behind for a plugin that was refused.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, self.trace.clone())?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle)?;
 
         // Register this plugin's output in the wiring registry
         self.wiring
@@ -94,7 +85,7 @@ impl PluginManager {
     ) -> asyn_rs::error::AsynResult<()> {
         let port_handle = runtime.port_handle().clone();
         let port_name = port_handle.port_name().to_string();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, self.trace.clone())?;
+        asyn_rs::asyn_record::register_port(&port_name, port_handle)?;
         self.port_runtimes.lock().push(runtime);
         Ok(())
     }

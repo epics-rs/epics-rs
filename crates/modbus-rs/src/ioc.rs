@@ -48,7 +48,7 @@ use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, Por
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::sync_io::SyncIOHandle;
-use asyn_rs::trace::{TraceManager, TraceMask};
+use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
 
@@ -1910,7 +1910,6 @@ fn parse_interpose_args(args: &[ArgValue]) -> Result<(String, InterposeSettings)
 /// length dataType pollMsec plcType` — port of the C `drvModbusAsynConfigure`.
 pub fn drv_modbus_asyn_configure_command(
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 ) -> CommandDef {
     CommandDef::new(
         "drvModbusAsynConfigure",
@@ -1953,13 +1952,12 @@ pub fn drv_modbus_asyn_configure_command(
             },
         ],
         "drvModbusAsynConfigure portName octetPort slave function startAddr length dataType pollMsec plcType",
-        ModbusConfigHandler { handle, trace },
+        ModbusConfigHandler { handle },
     )
 }
 
 struct ModbusConfigHandler {
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 }
 
 /// Parse the `drvModbusAsynConfigure` positional arguments into a
@@ -2072,9 +2070,7 @@ impl CommandHandler for ModbusConfigHandler {
         let (runtime, _jh) =
             create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime.port_handle().clone();
-        if let Err(e) =
-            asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
-        {
+        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
             // Nothing published this port, so ask the actor to stop.
             runtime.shutdown();
             return Err(e.to_string());
@@ -2186,15 +2182,15 @@ async fn read_poller(
 pub fn register_modbus_commands(
     app: epics_ca_rs::server::ioc_app::IocApplication,
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 ) -> epics_ca_rs::server::ioc_app::IocApplication {
     app.register_startup_command(modbus_interpose_config_command())
-        .register_startup_command(drv_modbus_asyn_configure_command(handle, trace))
+        .register_startup_command(drv_modbus_asyn_configure_command(handle))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::trace::TraceManager;
 
     fn args(v: Vec<ArgValue>) -> Vec<ArgValue> {
         v
@@ -3335,19 +3331,13 @@ mod tests {
         };
         let (octet_rt, _jh) =
             create_port_runtime(octet, RuntimeConfig::default()).expect("octet runtime must start");
-        let trace = Arc::new(TraceManager::new());
-        asyn_rs::asyn_record::register_port(
-            "OCTET_LATESTART",
-            octet_rt.port_handle().clone(),
-            Arc::clone(&trace),
-        )
-        .expect("the octet port must publish");
+        asyn_rs::asyn_record::register_port("OCTET_LATESTART", octet_rt.port_handle().clone())
+            .expect("the octet port must publish");
 
         // `drvModbusAsynConfigure MB_LATESTART OCTET_LATESTART 1 3 0 4 UINT16 0`
         // — the last argument is C's `pollMsec`.
         let handler = ModbusConfigHandler {
             handle: tokio::runtime::Handle::current(),
-            trace,
         };
         handler
             .call(

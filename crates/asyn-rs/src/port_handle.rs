@@ -28,6 +28,7 @@ use crate::interrupt::InterruptManager;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorMessage};
 use crate::request::{CancelToken, DriverCall, RequestOp, RequestResult};
+use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
 /// Park the calling thread until `fut` resolves or `deadline` passes, from
@@ -246,6 +247,13 @@ pub struct PortHandle {
     /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
     /// driver cannot gain or lose an interface after `registerInterface`.
     interfaces: Arc<[Capability]>,
+    /// The trace manager the port's driver was bound to
+    /// (`PortServices::bind` at `create_port_runtime`) — C's per-port
+    /// `tracePvt`, reached through the port. The registry publishes this one
+    /// for `asynSetTraceMask` / asynRecord `TMSK`, so a mask set by name lands
+    /// in the manager the driver's `trace_print` reads; handing the registry
+    /// a second manager at registration is what made those masks silent.
+    trace: Arc<TraceManager>,
 }
 
 impl PortHandle {
@@ -257,6 +265,7 @@ impl PortHandle {
         port_name: String,
         interrupts: Arc<InterruptManager>,
         actor: ActorId,
+        trace: Arc<TraceManager>,
     ) -> Self {
         Self {
             tx,
@@ -267,6 +276,23 @@ impl PortHandle {
             multi_device: false,
             max_addr: 1,
             interfaces: crate::interfaces::default_capabilities().into(),
+            trace,
+        }
+    }
+
+    /// The port's trace manager — see the field.
+    pub fn trace(&self) -> &Arc<TraceManager> {
+        &self.trace
+    }
+
+    /// The trace linkage a user connected to this port carries — what
+    /// `PortActor` stamps on every request it runs, made
+    /// available to a layer that prints on the port's behalf without a
+    /// request in flight (device support, C `pPvt->pasynUser`).
+    pub fn user_trace(&self) -> crate::user::UserTrace {
+        crate::user::UserTrace {
+            manager: self.trace.clone(),
+            port: self.port_name.clone(),
         }
     }
 
@@ -1097,6 +1123,19 @@ impl PortHandle {
 
     // --- Multi-device convenience methods ---
 
+    /// The port-side half of C `pasynManager->connectDevice(pasynUser, port,
+    /// addr)` (asynManager.c:1324-1355): create the device's dpCommon on a
+    /// multi-device port (`locateDevice(..., TRUE)`) so it is counted and
+    /// reported from the moment a user binds to it. Every user bind — a
+    /// record's device support at init, `asynRecord`'s PORT/ADDR connect —
+    /// goes through here; it is not the transport `connect` of
+    /// [`Self::connect_addr_blocking`].
+    pub fn connect_device_blocking(&self, addr: i32) -> AsynResult<()> {
+        let user = AsynUser::new(0).with_addr(addr);
+        self.submit_blocking(RequestOp::ConnectUser, user)?;
+        Ok(())
+    }
+
     pub fn connect_addr_blocking(&self, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
         self.submit_blocking(RequestOp::ConnectAddr, user)?;
@@ -1383,7 +1422,13 @@ mod tests {
             .name("test-handle-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        PortHandle::new(tx, "handle_test".into(), interrupts, actor_id)
+        PortHandle::new(
+            tx,
+            "handle_test".into(),
+            interrupts,
+            actor_id,
+            Arc::new(TraceManager::new()),
+        )
     }
 
     /// `with_driver` hands the closure the driver's concrete type, runs it on

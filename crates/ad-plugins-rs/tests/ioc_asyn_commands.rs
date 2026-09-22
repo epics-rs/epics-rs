@@ -66,6 +66,22 @@ fn ad_ioc_startup_shell_carries_the_asyn_command_set() {
     }
 }
 
+/// The plugin and detector ports are built with `RuntimeConfig::default()`,
+/// which binds them to `PortServices::global()`. `asynSetTraceMask` mutates
+/// the trace state of the manager `AdIoc` handed `register_asyn_commands`, so
+/// that manager must sit on the same services — with a `TraceManager` of its
+/// own, every mask an st.cmd set went to state no plugin ever read.
+#[test]
+fn ad_ioc_trace_commands_reach_the_services_the_ports_are_bound_to() {
+    let ioc = AdIoc::new();
+    let global = asyn_rs::services::PortServices::global();
+    assert!(std::sync::Arc::ptr_eq(
+        ioc.ports().services().trace(),
+        global.trace()
+    ));
+    assert!(std::sync::Arc::ptr_eq(ioc.trace(), global.trace()));
+}
+
 /// End to end: run the detector-style st.cmd prologue against the shell AdIoc
 /// actually builds. Creating the port and then configuring it must both work,
 /// and the port must be resolvable through the IOC's `PortManager` afterwards.

@@ -5578,13 +5578,32 @@ impl PvDatabase {
                                         let db = self.clone();
                                         let prio = instance.common.callback_priority();
                                         crate::runtime::task::spawn_background(prio, async move {
-                                            let _ =
+                                            // The write's outcome travels to the
+                                            // completing pass, which raises the
+                                            // WRITE alarm the synchronous branch
+                                            // below raises in place — C carries
+                                            // it as `pPvt->result.status` from
+                                            // `processCallbackOutput` to the
+                                            // record's `process()` re-entry
+                                            // (devAsynFloat64.c:668). A wait the
+                                            // pool never ran is an unknown
+                                            // outcome, reported the same way.
+                                            let outcome =
                                                 crate::runtime::task::spawn_blocking_background(
                                                     prio,
                                                     move || completion.wait(timeout),
                                                 )
+                                                .await
+                                                .unwrap_or_else(|e| {
+                                                    Err(CaError::Protocol(format!(
+                                                        "device write completion not awaited: {e}"
+                                                    )))
+                                                });
+                                            let _ = db
+                                                .complete_async_record_with_outcome(
+                                                    &rec_name, outcome,
+                                                )
                                                 .await;
-                                            let _ = db.complete_async_record(&rec_name).await;
                                         });
                                         // Not an end: `complete_async_record_inner`
                                         // owns this cycle's tail now, and mints its own
@@ -6601,6 +6620,21 @@ impl PvDatabase {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        self.complete_async_record_with_outcome(name, Ok(()))
+    }
+
+    /// [`Self::complete_async_record`] for an async device write, carrying
+    /// the write's outcome: an `Err` raises `WRITE_ALARM`/`INVALID` on the
+    /// completing pass, as the synchronous `write()` branch raises it in
+    /// place and as C's `processCallbackOutput` carries `result.status` to
+    /// the record's re-entry (devAsynFloat64.c:668). The only way to end an
+    /// async write cycle is through here, so a failed write cannot complete
+    /// `NO_ALARM`.
+    pub fn complete_async_record_with_outcome<'a>(
+        &'a self,
+        name: &'a str,
+        outcome: CaResult<()>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
             // Alias-aware entry — same pattern as
             // `process_record_with_links_inner`. `name` may arrive as an alias
@@ -6624,7 +6658,7 @@ impl PvDatabase {
             };
             let _record_gate = self.lock_instance(&rec);
             let mut visited = ProcStack::new();
-            self.complete_async_record_inner(canonical, rec, &mut visited)
+            self.complete_async_record_inner(canonical, rec, outcome.err(), &mut visited)
         })
     }
 
@@ -6632,6 +6666,7 @@ impl PvDatabase {
         &self,
         canonical: Arc<str>,
         rec: Arc<RecordCell>,
+        write_error: Option<CaError>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         // Seed the cycle guard with this record's own name — mirrors
@@ -6673,6 +6708,19 @@ impl PvDatabase {
                 // so `recGblCheckUDF` raises UDF_ALARM this cycle.
                 if instance.record.clears_udf() {
                     instance.common.udf = instance.record.value_is_undefined() as u8;
+                }
+                // A failed async device write — the same pending raise the
+                // synchronous branch makes, ahead of `checkAlarms` as C's
+                // device support raises it ahead of the record's own
+                // (devAsynFloat64.c:668-671), so on an INVALID tie the WRITE
+                // status is the one that reaches STAT.
+                if let Some(e) = &write_error {
+                    eprintln!("device write error on {name}: {e}");
+                    crate::server::recgbl::rec_gbl_set_sevr(
+                        &mut instance.common,
+                        crate::server::recgbl::alarm_status::WRITE_ALARM,
+                        crate::server::record::AlarmSeverity::Invalid,
+                    );
                 }
                 // Per-record alarm hook (C `checkAlarms()`).
                 {

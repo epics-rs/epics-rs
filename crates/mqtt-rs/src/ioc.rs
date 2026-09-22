@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::server::iocsh::registry::*;
 
 use crate::address::TopicAddress;
@@ -46,7 +45,6 @@ fn take_pending_topics(port_name: &str) -> Vec<TopicAddress> {
 /// link.
 pub fn mqtt_driver_configure_command(
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 ) -> CommandDef {
     CommandDef::new(
         "mqttDriverConfigure",
@@ -73,7 +71,7 @@ pub fn mqtt_driver_configure_command(
             },
         ],
         "mqttDriverConfigure portName brokerUrl clientId [qos] [connPvName] - Create MQTT driver",
-        MqttConfigHandler { handle, trace },
+        MqttConfigHandler { handle },
     )
 }
 
@@ -93,7 +91,6 @@ fn resolve_iocsh_qos(arg: &ArgValue) -> QoS {
 
 struct MqttConfigHandler {
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 }
 
 impl CommandHandler for MqttConfigHandler {
@@ -166,9 +163,7 @@ impl CommandHandler for MqttConfigHandler {
             create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime_handle.port_handle().clone();
 
-        if let Err(e) =
-            asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
-        {
+        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
             // Nothing published this port, so ask the actor to stop.
             runtime_handle.shutdown();
             return Err(e.to_string());
@@ -258,14 +253,13 @@ impl CommandHandler for MqttConfigHandler {
 ///
 /// Call this in your IOC's main function:
 /// ```ignore
-/// app = mqtt_rs::ioc::register_mqtt_commands(app, handle, trace);
+/// app = mqtt_rs::ioc::register_mqtt_commands(app, handle);
 /// ```
 pub fn register_mqtt_commands(
     app: epics_ca_rs::server::ioc_app::IocApplication,
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 ) -> epics_ca_rs::server::ioc_app::IocApplication {
-    app.register_startup_command(mqtt_driver_configure_command(handle, trace))
+    app.register_startup_command(mqtt_driver_configure_command(handle))
 }
 
 #[cfg(test)]

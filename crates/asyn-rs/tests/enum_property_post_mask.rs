@@ -39,7 +39,6 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
-use asyn_rs::trace::TraceManager;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -98,7 +97,7 @@ async fn enum_ioc(
         create_port_runtime(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
-    register_port(port, handle.clone(), Arc::new(TraceManager::new())).expect("port name is free");
+    register_port(port, handle.clone()).expect("port name is free");
     drop(runtime);
 
     let db_text = format!(

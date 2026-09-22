@@ -20,7 +20,6 @@
 //! `DrvAsynSerialPort`, whose `Drop` runs `disconnect` and must release the tty.
 
 use std::io::Read;
-use std::sync::Arc;
 use std::sync::mpsc::{Sender, TryRecvError};
 use std::time::Duration;
 
@@ -30,7 +29,6 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::PortRegistry;
 use asyn_rs::runtime::port::PortRuntimeHandle;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
-use asyn_rs::trace::TraceManager;
 
 /// A driver whose entire teardown is observable: it reports its own `Drop`.
 /// Stands in for every driver with a protocol goodbye to send.
@@ -72,11 +70,7 @@ impl Drop for TeardownDriver {
 /// its own and prove nothing about who stopped it.
 fn publish(registry: &PortRegistry, name: &str, port: &PortRuntimeHandle) {
     registry
-        .register(
-            name,
-            port.port_handle().clone(),
-            Arc::new(TraceManager::new()),
-        )
+        .register(name, port.port_handle().clone())
         .expect("port name is free");
 }
 

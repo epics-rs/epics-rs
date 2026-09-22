@@ -16,7 +16,6 @@ use epics_base_rs::runtime::sync::Notify;
 
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use asyn_rs::trace::TraceManager;
 use scope_ioc::driver::*;
 
 use epics_base_rs::error::CaResult;
@@ -44,7 +43,6 @@ impl DriverHolder {
 struct ConfigHandler {
     holder: Arc<DriverHolder>,
     handle: epics_base_rs::runtime::task::RuntimeHandle,
-    trace: Arc<TraceManager>,
 }
 
 impl CommandHandler for ConfigHandler {
@@ -66,7 +64,7 @@ impl CommandHandler for ConfigHandler {
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone())
             .map_err(|e| e.to_string())?;
 
         // Start background simulation task using the PortHandle API
@@ -168,7 +166,6 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    let trace = Arc::new(TraceManager::new());
     let holder = DriverHolder::new();
     let holder_for_config = holder.clone();
     let holder_for_report = holder.clone();
@@ -192,7 +189,6 @@ async fn main() -> CaResult<()> {
         ConfigHandler {
             holder: holder_for_config,
             handle,
-            trace,
         },
     ));
 

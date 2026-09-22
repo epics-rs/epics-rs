@@ -956,6 +956,9 @@ impl PortActor {
             | RequestOp::GetEnable
             | RequestOp::GetAutoConnect
             | RequestOp::GetConnected
+            // `connectDevice` (asynManager.c:1324-1355) takes `asynManagerLock`
+            // and calls `locateDevice(pport, addr, TRUE)`: no queue, no gate.
+            | RequestOp::ConnectUser
             | RequestOp::PushEchoInterpose
             | RequestOp::PushDelayInterpose { .. }
             | RequestOp::PushEosInterpose { .. }
@@ -1287,6 +1290,18 @@ impl PortActor {
         // is the single owner of the linkage: an interpose has no other handle on
         // the port, and a user that never reached a port traces nothing.
         user.trace = self.user_trace();
+        // C `portThread` announces the callback it is about to run
+        // (asynManager.c:904) — the FLOW line an operator watches to see a
+        // request reach the driver.
+        user.print(
+            crate::trace::TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "asynManager::portThread port={} callback",
+                self.driver.base().port_name
+            ),
+        );
 
         // Dispatch
         let result = self.dispatch_io(&mut user, &op);
@@ -1616,6 +1631,10 @@ impl PortActor {
             }
             RequestOp::DisconnectAddr => {
                 self.driver.disconnect_addr(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::ConnectUser => {
+                self.driver.base_mut().connect_user(user.addr);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetEnable { yes } => {

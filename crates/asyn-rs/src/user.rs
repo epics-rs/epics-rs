@@ -165,6 +165,37 @@ pub struct UserTrace {
     pub port: std::sync::Arc<str>,
 }
 
+impl UserTrace {
+    /// C `asynPrint(pasynUser, mask, format, …)` — `tracePrintSource`
+    /// (asynManager.c:3049-3057): print through the trace config of the
+    /// device `addr` on this port, if `mask` is enabled there. `file`/`line`
+    /// are the caller's, as for [`AsynUser::print_io`].
+    ///
+    /// The message is formatted only when the mask is enabled, so a print
+    /// on a hot path costs one config lookup while tracing is off.
+    pub fn print(
+        &self,
+        addr: i32,
+        reason: i32,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        if self.manager.is_enabled_device(&self.port, addr, mask) {
+            self.manager.output_device_with_source(
+                &self.port,
+                Some(addr),
+                reason,
+                mask,
+                file,
+                line,
+                &args.to_string(),
+            );
+        }
+    }
+}
+
 impl Default for AsynUser {
     fn default() -> Self {
         Self {
@@ -269,6 +300,22 @@ impl AsynUser {
     pub fn with_queue_timeout(mut self, queue_timeout: Duration) -> Self {
         self.queue_timeout = Some(queue_timeout);
         self
+    }
+
+    /// C `asynPrint(pasynUser, mask, format, …)`: print through the trace
+    /// config of the port/device this user is connected to, if `mask` is
+    /// enabled there. Silent for a user with no port. `file`/`line` are the
+    /// caller's — see [`Self::print_io`].
+    pub fn print(
+        &self,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        if let Some(t) = &self.trace {
+            t.print(self.addr, self.reason as i32, mask, file, line, args);
+        }
     }
 
     /// C `asynPrintIO(pasynUser, mask, data, len, format, …)` — `tracePrintIO`

@@ -15,6 +15,7 @@ use ad_core_rs::ioc::{
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::manager::PortManager;
+use asyn_rs::services::PortServices;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
@@ -938,13 +939,15 @@ pub struct AdIoc {
 impl AdIoc {
     /// Create a new AdIoc with default configuration.
     pub fn new() -> Self {
-        let trace = Arc::new(TraceManager::new());
-        let mgr = PluginManager::new(trace.clone());
-        // The asyn iocsh commands resolve ports and mutate trace state through
-        // this manager, so it shares the IOC's `TraceManager` — a manager with
-        // a `TraceManager` of its own would make `asynSetTrace*` mutate state
-        // that no driver or plugin ever reads.
-        let ports = Arc::new(PortManager::with_trace_manager(trace.clone()));
+        // The plugin and detector ports are built with `RuntimeConfig::default()`,
+        // which binds them to `PortServices::global()`, and the asyn iocsh
+        // commands `register_asyn_device_support` brings act on the process's
+        // one port table, `PortManager::global()`. This IOC's ports are that
+        // table: a manager of its own made `asynReport` list ports the shell
+        // did not create and `asynSetTrace*` set masks nothing read.
+        let trace = PortServices::global().trace().clone();
+        let mgr = PluginManager::new();
+        let ports = PortManager::global();
 
         asyn_rs::asyn_record::register_asyn_record_type();
 
@@ -969,15 +972,14 @@ impl AdIoc {
         app = app.autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
 
         // Universal asyn device support — handles all standard asyn DTYPs
-        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links.
+        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links —
+        // and with it the asyn iocsh command set: port creation
+        // (`drvAsynIPPortConfigure` and friends), `asynOctetSetInputEos` /
+        // `asynOctetSetOutputEos`, `asynSetOption`, `asynReport` and the trace
+        // mutators, on the startup shell as well as the interactive one. A
+        // socket detector's st.cmd creates its port and sets the EOS before
+        // `iocInit`.
         app = asyn_rs::adapter::register_asyn_device_support(app);
-
-        // The asyn iocsh command set: port creation (`drvAsynIPPortConfigure`
-        // and friends), `asynOctetSetInputEos` / `asynOctetSetOutputEos`,
-        // `asynSetOption`, `asynReport` and the trace mutators — on the startup
-        // shell as well as the interactive one. A socket detector's st.cmd
-        // creates its port and sets the EOS before `iocInit`.
-        app = asyn_rs::iocsh::register_asyn_commands(app, ports.clone());
 
         // `busy` and `sseq` — the record types every AD plugin's templates
         // need — are registered inside `register_all_plugins` above, so an
@@ -1008,7 +1010,8 @@ impl AdIoc {
         &self.ports
     }
 
-    /// Access the shared `TraceManager`.
+    /// The `TraceManager` every port of this IOC is bound to — the global
+    /// services' (see `AdIoc::new`).
     pub fn trace(&self) -> &Arc<TraceManager> {
         &self.trace
     }

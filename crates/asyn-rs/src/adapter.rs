@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(44): checked, not waived — all 44 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(45): checked, not waived — all 45 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// --all-features`, 1106/1106). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -15,7 +15,7 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
-use crate::error::AsynError;
+use crate::error::{AsynError, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
 use crate::port::DrvUserRequest;
@@ -324,6 +324,10 @@ pub struct AsynDeviceSupport {
     last_alarm_status: u16,
     last_alarm_severity: u16,
     last_ts: Option<SystemTime>,
+    /// C `pPvt->lastStatus`: the status of the last record process, so the
+    /// `ASYN_TRACE_ERROR` line for a failing read/write prints once per
+    /// change of status, not once per scan (devAsynInt32.c:494-500, :519-525).
+    last_process_status: AsynStatus,
     record_name: String,
     scan: ScanType,
     /// Maximum number of array elements for array read operations.
@@ -379,9 +383,9 @@ pub struct AsynDeviceSupport {
     /// samples (devAsynInt32.c:673-702, see `AverageState::num_to_average`).
     average: Option<Arc<AverageState>>,
     /// RAII handle for the averaging synchronous interrupt callback — dropping
-    /// unregisters it. Distinct from `interrupt_sub` (the mailbox/value path):
-    /// averaging needs every sample, so it registers a synchronous callback
-    /// (C `registerInterruptUser`), not a coalescing mailbox subscription.
+    /// unregisters it. Distinct from `interrupt_sub` (the value path into
+    /// the ring): averaging accumulates every sample itself and pushes one
+    /// decimated mean (C `registerInterruptUser`).
     average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// `Some` ⟹ time-series device support (`asynInt32TimeSeries` /
     /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`, all waveform-only). The
@@ -394,8 +398,14 @@ pub struct AsynDeviceSupport {
     /// dropping unregisters it (mirrors `average_callback_sub`; the time-series
     /// support also needs every sample, so a synchronous callback, not a mailbox).
     time_series_sub: Option<crate::interrupt::SyncCallbackSubscription>,
-    /// RAII interrupt subscription — dropping unsubscribes.
-    interrupt_sub: Option<InterruptSubscription>,
+    /// RAII handle for the `SCAN="I/O Intr"` synchronous interrupt callback —
+    /// dropping unregisters it. Synchronous like the averaging and time-series
+    /// callbacks: the C ring (`interruptCallbackInput`, devAsynInt32.c:564-576)
+    /// holds every callback the record has not processed yet, so the values
+    /// go straight from the driver's callback into `interrupt_fifo`. A
+    /// latest-only mailbox in between kept one value per record-process and
+    /// dropped the rest silently, which is not the ring's overflow count.
+    interrupt_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
     /// I/O Intr forwarding task pushes; `read()` pops the oldest
     /// entry. C parity: `devAsynInt32.c::ringBuffer` (DEFAULT 10,
@@ -690,6 +700,7 @@ impl AsynDeviceSupport {
             last_alarm_status: 0,
             last_alarm_severity: 0,
             last_ts: None,
+            last_process_status: AsynStatus::Success,
             record_name: String::new(),
             scan: ScanType::Passive,
             initial_readback: false,
@@ -1469,6 +1480,71 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// C `asynPrint(pPvt->pasynUser, …)` from device support: the record's
+    /// user is connected to this port and address, so the print resolves the
+    /// device's trace config (`findTracePvt`, asynManager.c:546-551).
+    fn dev_print(
+        &self,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        self.handle
+            .user_trace()
+            .print(self.addr, self.reason as i32, mask, file, line, args);
+    }
+
+    /// C's `driverName` for this interface's device support, less the
+    /// `devAsyn` every one of them starts with: `Int32` for `asynInt32`.
+    fn dset_suffix(&self) -> &str {
+        self.iface_type
+            .strip_prefix("asyn")
+            .unwrap_or(&self.iface_type)
+    }
+
+    /// The tail of C `processCallbackInput`/`processCallbackOutput`
+    /// (devAsynInt32.c:493-503, :518-528): a success prints the value at
+    /// `ASYN_TRACEIO_DEVICE`; a failure prints at `ASYN_TRACE_ERROR` only
+    /// when its status differs from the last process's.
+    fn trace_process(
+        &mut self,
+        function_name: &str,
+        verb: &str,
+        status: AsynStatus,
+        outcome: Result<&dyn std::fmt::Display, &dyn std::fmt::Display>,
+    ) {
+        match outcome {
+            Ok(value) => self.dev_print(
+                crate::trace::TraceMask::IO_DEVICE,
+                file!(),
+                line!(),
+                format_args!(
+                    "{} devAsyn{}::{} process value{}",
+                    self.record_name,
+                    self.dset_suffix(),
+                    function_name,
+                    value
+                ),
+            ),
+            Err(message) if status != self.last_process_status => self.dev_print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{} devAsyn{}::{} process {} error {}",
+                    self.record_name,
+                    self.dset_suffix(),
+                    function_name,
+                    verb,
+                    message
+                ),
+            ),
+            Err(_) => {}
+        }
+        self.last_process_status = status;
+    }
+
     /// Store a freshly-read scalar value into the record and report whether
     /// the record's built-in RVAL→VAL conversion should be **skipped**
     /// (`true`) or **run** (`false`). This mirrors C device support's
@@ -1715,6 +1791,24 @@ impl DeviceSupport for AsynDeviceSupport {
         // here, not info-gated: a C db's busy records carry no info tag.
         if record.record_type() == "busy" {
             self.set_asyn_readback(true);
+        }
+        // C `initCommon` (devAsynInt32.c:249-262): `pasynManager->connectDevice`
+        // before `findInterface`/`drvUser->create`, and it is that call which
+        // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
+        // asynManager.c:1349-1352) - so `asynReport` counts an address the
+        // moment a record binds to it. C fails the record when the connect
+        // fails (:255-259, `goto bad`); here the connect fails only when the
+        // port's actor is gone.
+        if let Err(e) = self.handle.connect_device_blocking(self.addr) {
+            eprintln!(
+                "[asyn] init FAILED: port='{}' addr={} connectDevice failed, {e}",
+                self.handle.port_name(),
+                self.addr
+            );
+            return Ok(DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ));
         }
         if !self.reason_set {
             // C calls drvUser->create only when the port registered asynDrvUser
@@ -2389,11 +2483,24 @@ impl DeviceSupport for AsynDeviceSupport {
                     // are applied unconditionally (C maps the alarm and
                     // recGblSetSevr's it before the status gate, :844-847) — same
                     // store-only gate as the I/O Intr ring.
-                    if result.aux_status == crate::error::AsynStatus::Success {
+                    if result.aux_status == AsynStatus::Success {
                         if let Some(val) = self.result_to_value(&result) {
+                            self.trace_process(
+                                "processCallbackInput",
+                                "read",
+                                AsynStatus::Success,
+                                Ok(&format_args!("={val}")),
+                            );
                             let wrote_val = self.store_read_value(record, val);
                             read_outcome = stored(wrote_val);
                         }
+                    } else {
+                        self.trace_process(
+                            "processCallbackInput",
+                            "read",
+                            result.aux_status,
+                            Err(&result.message),
+                        );
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -2432,6 +2539,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
                     self.last_alarm_status = alarm_status;
                     self.last_alarm_severity = alarm_severity;
+                    self.trace_process("processCallbackInput", "read", e.status(), Err(&e));
                 }
             }
         }
@@ -2448,9 +2556,18 @@ impl DeviceSupport for AsynDeviceSupport {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
                     .with_timeout_opt(self.timeout);
-                self.handle
-                    .submit_blocking(op, user)
-                    .map_err(asyn_to_ca_error)?;
+                match self.handle.submit_blocking(op, user) {
+                    Ok(_) => self.trace_process(
+                        "processCallbackOutput",
+                        "write",
+                        AsynStatus::Success,
+                        Ok(&format_args!(" {val}")),
+                    ),
+                    Err(e) => {
+                        self.trace_process("processCallbackOutput", "write", e.status(), Err(&e));
+                        return Err(asyn_to_ca_error(e));
+                    }
+                }
             }
         }
         Ok(())
@@ -2560,8 +2677,8 @@ impl DeviceSupport for AsynDeviceSupport {
         // Time-series device support (asynInt32/Float64/Int64TimeSeries):
         // register an ALWAYS-ON synchronous accumulating callback (C
         // `registerInterruptUser(interruptCallback)`, devAsynXXXTimeSeries.h:159).
-        // Like averaging it must observe EVERY sample, so a sync callback, not a
-        // coalescing mailbox. The callback appends to the buffer only while BUSY
+        // Like averaging it observes EVERY sample through a sync callback.
+        // The callback appends to the buffer only while BUSY
         // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
         // the record to process (C `callbackRequestProcessCallback`,
         // devAsynXXXTimeSeries.h:202-212). Process registration/cancellation by
@@ -2640,10 +2757,9 @@ impl DeviceSupport for AsynDeviceSupport {
         // `getIoIntInfo` then leaves it alone — "for aiAverage we don't enable
         // callbacks here, because they are always enabled in any scan mode",
         // `if (!pPvt->isAiAverage)` (:385-394).
-        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
-        // not a mailbox subscription: averaging must observe every sample, and
-        // the mailbox coalesces rapid updates to the latest — which would drop
-        // samples and corrupt the mean.
+        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser):
+        // averaging must observe every sample, and it pushes the mean itself
+        // rather than the sample the plain I/O Intr path would ring.
         if let Some(acc) = self.average.clone() {
             let filter = InterruptFilter {
                 reason: Some(self.reason),
@@ -2796,18 +2912,15 @@ impl DeviceSupport for AsynDeviceSupport {
             iface: self.iface,
         };
 
-        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
-        self.interrupt_sub = Some(sub);
-
-        // Bridge mailbox-based InterruptReceiver to the mpsc<()> wakeup channel
-        // consumed by setup_io_intr(). The mailbox already coalesces intermediate
-        // updates, so no data is lost even if the record processes slowly.
+        // Every callback lands in the ring, inline in the driver's notify()
+        // like C's interruptCallbackInput; the mpsc<()> is only the
+        // scanIoRequest wakeup that setup_io_intr() consumes.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let fifo = self.interrupt_fifo.clone();
-        // The pump only moves values between channels, so it places cleanly on
-        // whichever executor `runtime::task` resolves to.
-        crate::runtime::task::spawn(async move {
-            while let Some(iv) = intr_rx.recv().await {
+        let sub = self
+            .handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
                 // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
@@ -2816,14 +2929,14 @@ impl DeviceSupport for AsynDeviceSupport {
                 // @asynMask nbits mask + sign-extend (devAsynInt32.c:537-540),
                 // matching the polled `result_to_value` path. Other values
                 // pass through.
-                let value = match iv.value {
+                let value = match &iv.value {
                     crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
                         crate::param::ParamValue::UInt32Digital(v & mask)
                     }
                     crate::param::ParamValue::Int32(v) => {
-                        crate::param::ParamValue::Int32(int32_mask.map_or(v, |m| m.apply(v)))
+                        crate::param::ParamValue::Int32(int32_mask.map_or(*v, |m| m.apply(*v)))
                     }
-                    other => other,
+                    other => other.clone(),
                 };
                 let entry = CachedInterrupt {
                     value,
@@ -2850,11 +2963,14 @@ impl DeviceSupport for AsynDeviceSupport {
                     let mut g = fifo.lock().unwrap();
                     g.push_with_overflow(entry)
                 };
-                if was_fresh_add && tx.send(()).await.is_err() {
-                    break;
+                // try_send: inline in the driver's notify(), so it must not
+                // block; a full wakeup channel means a process is already
+                // pending and will drain the ring.
+                if was_fresh_add {
+                    let _ = tx.try_send(());
                 }
-            }
-        });
+            });
+        self.interrupt_sub = Some(sub);
         Some(rx)
     }
 
@@ -3212,11 +3328,22 @@ pub fn universal_asyn_factory(
 /// This is the Rust equivalent of C EPICS's standard asyn device support
 /// registration. Call this BEFORE registering plugin or driver-specific
 /// factories so they take precedence (dynamic factories chain last-registered-first).
+///
+/// It is also what brings the asyn iocsh commands: loading `asyn.dbd` runs
+/// the `asynRegister` registrar (asynShellCommands.c:1349-1382) beside the
+/// `device()` lines, so a C IOC that has asyn device support has
+/// `asynSetTraceMask`, `asynReport`, `drvAsynIPPortConfigure` and the rest
+/// with no further step. They act on [`crate::manager::PortManager::global`], the port table
+/// every port built with `RuntimeConfig::default()` traces through. An IOC
+/// that registered the commands itself on a manager it built kept a table
+/// the drivers' ports were not in — `asynSetTraceMask` on such a port set a
+/// mask nothing read — and an IOC that did not was missing the commands.
 pub fn register_asyn_device_support(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::server::ioc_app::IocApplication {
     register_asyn_device_menus();
-    app.register_dynamic_device_support(universal_asyn_factory)
+    let app = app.register_dynamic_device_support(universal_asyn_factory);
+    crate::iocsh::register_asyn_commands(app, crate::manager::PortManager::global())
 }
 
 /// Contribute asyn's device-support DTYP menus to base's `DTYP` choice lists.
@@ -3250,7 +3377,9 @@ pub fn register_asyn_device_menus() {
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
 /// installs the universal asyn factory on the pure-Rust build path
-/// (added `register_dynamic_device_support` to IocBuilder).
+/// (added `register_dynamic_device_support` to IocBuilder). An
+/// `IocBuilder` has no command table, so the iocsh commands are the
+/// `IocApplication` path's alone.
 /// Without this helper, callers using `IocBuilder` instead of
 /// `IocApplication` would have to wire `universal_asyn_factory`
 /// manually; that asymmetry is exactly what `register_asyn_device_support`
@@ -3701,7 +3830,13 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, _rx) = tokio::sync::mpsc::channel(256);
             (
-                PortHandle::new(tx, name.into(), interrupts, ActorId::new()),
+                PortHandle::new(
+                    tx,
+                    name.into(),
+                    interrupts,
+                    ActorId::new(),
+                    std::sync::Arc::new(crate::trace::TraceManager::new()),
+                ),
                 _rx,
             )
         };
@@ -3730,7 +3865,13 @@ mod tests {
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
+        let handle = PortHandle::new(
+            tx,
+            "p".into(),
+            interrupts,
+            ActorId::new(),
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
@@ -3758,7 +3899,13 @@ mod tests {
 
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
+        let handle = PortHandle::new(
+            tx,
+            "p".into(),
+            interrupts,
+            ActorId::new(),
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
@@ -3890,7 +4037,13 @@ mod tests {
             .name("test-bounds-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_bounds".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_bounds".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_bounds".into(),
             addr: 0,
@@ -3912,7 +4065,13 @@ mod tests {
             .name("test-adapter-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
 
         let link = AsynLink {
             port_name: "test".into(),
@@ -3948,7 +4107,13 @@ mod tests {
             .name("test-seeded-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -3976,7 +4141,13 @@ mod tests {
             .name("test-average-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4014,7 +4185,13 @@ mod tests {
             .name("test-ts-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4425,13 +4602,14 @@ mod tests {
             .name("ts-factory-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts, actor_id);
-        crate::asyn_record::register_port(
-            "ts_factory",
-            handle,
+        let handle = PortHandle::new(
+            tx,
+            "ts_factory".into(),
+            interrupts,
+            actor_id,
             Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        );
+        crate::asyn_record::register_port("ts_factory", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynInt32TimeSeries",
@@ -4477,7 +4655,13 @@ mod tests {
             .name("test-u32-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4612,6 +4796,56 @@ mod tests {
             ),
             "non-UInt32 interrupt must pass through ungated and unmasked"
         );
+    }
+
+    /// C `interruptCallbackInput` (devAsynInt32.c:564-576): every callback
+    /// the record has not processed yet sits in the ring, in order, and only
+    /// a full ring drops one - counted in `overflows`. The mailbox that used
+    /// to sit between the driver and the ring kept the latest value per
+    /// record-process and dropped the rest without a count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_intr_rings_every_callback_before_the_record_reads() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_uint32_io_intr_adapter(0xFF);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        let mut rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        for v in [1u32, 2, 3] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::UInt32Digital(v),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0x01,
+                ..Default::default()
+            });
+        }
+
+        // The callback is inline in notify(): the ring is complete on return.
+        let ringed: Vec<u32> = {
+            let mut g = fifo.lock().unwrap();
+            std::iter::from_fn(|| g.pop())
+                .map(|e| match e.value {
+                    crate::param::ParamValue::UInt32Digital(v) => v,
+                    other => panic!("expected UInt32Digital, got {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            ringed,
+            vec![1, 2, 3],
+            "every callback before the record reads is in the ring, oldest first"
+        );
+        assert_eq!(fifo.lock().unwrap().take_overflows(), 0);
+        // One scanIoRequest per fresh add (C: no request only on overflow).
+        for _ in 0..3 {
+            rx.try_recv()
+                .expect("a process request per ringed callback");
+        }
     }
 
     #[test]
@@ -5419,7 +5653,13 @@ mod tests {
             .name("test-enum-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_enum".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_enum".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_enum".into(),
             addr: 0,
@@ -5911,7 +6151,13 @@ mod tests {
                 .name("cap-actor".into())
                 .spawn(move || actor.run())
                 .unwrap();
-            let handle = PortHandle::new(tx, "capport".into(), interrupts, actor_id);
+            let handle = PortHandle::new(
+                tx,
+                "capport".into(),
+                interrupts,
+                actor_id,
+                std::sync::Arc::new(crate::trace::TraceManager::new()),
+            );
             let link = AsynLink {
                 port_name: "capport".into(),
                 addr: 0,
@@ -6111,7 +6357,13 @@ mod tests {
                 .name("ondemand-actor".into())
                 .spawn(move || actor.run())
                 .unwrap();
-            let handle = PortHandle::new(tx, "ondemand".into(), interrupts, actor_id);
+            let handle = PortHandle::new(
+                tx,
+                "ondemand".into(),
+                interrupts,
+                actor_id,
+                std::sync::Arc::new(crate::trace::TraceManager::new()),
+            );
             let link = AsynLink {
                 port_name: "ondemand".into(),
                 addr: 0,
@@ -6486,7 +6738,13 @@ mod tests {
             .name("test-arr-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -7076,7 +7334,13 @@ mod tests {
             .name("test-f64-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_f64".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "test_f64".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         let link = AsynLink {
             port_name: "test_f64".into(),
             addr: 0,
@@ -7509,7 +7773,13 @@ mod tests {
             .name("binwrite-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            name.into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         (handle, writes)
     }
 
@@ -7523,12 +7793,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_wb");
-        crate::asyn_record::register_port(
-            "binwrite_wb",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("binwrite_wb", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWriteBinary",
@@ -7560,12 +7825,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_text");
-        crate::asyn_record::register_port(
-            "binwrite_text",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("binwrite_text", handle).unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWrite",
@@ -7717,7 +7977,13 @@ mod tests {
             .name("cmdresp-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            name.into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
         (handle, (writes, sequence))
     }
 
@@ -7896,7 +8162,13 @@ mod tests {
         );
         let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts, actor_id);
+        let handle = PortHandle::new(
+            tx,
+            "octet_partial".into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
 
         let link = AsynLink {
             port_name: "octet_partial".into(),
@@ -7937,12 +8209,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
-        crate::asyn_record::register_port(
-            "cmdresp_factory",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_factory", handle).unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -7994,12 +8261,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
-        crate::asyn_record::register_port(
-            "cmdresp_nul",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_nul", handle).unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -8033,12 +8295,7 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
-        crate::asyn_record::register_port(
-            "cmdresp_lnul",
-            handle,
-            Arc::new(crate::trace::TraceManager::new()),
-        )
-        .unwrap();
+        crate::asyn_record::register_port("cmdresp_lnul", handle).unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty

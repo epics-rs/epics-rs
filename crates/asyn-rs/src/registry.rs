@@ -31,11 +31,11 @@ use crate::error::{AsynError, AsynResult};
 use crate::port_handle::PortHandle;
 use crate::trace::TraceManager;
 
-/// Entry in the port registry.
+/// Entry in the port registry. The port's trace manager is
+/// [`PortHandle::trace`]: one owner, the handle the driver was bound with.
 #[derive(Clone)]
 pub struct PortEntry {
     pub handle: PortHandle,
-    pub trace: Arc<TraceManager>,
 }
 
 /// Shared port registry — can be injected into multiple IOC instances.
@@ -64,12 +64,14 @@ impl PortRegistry {
     /// handle: its runtime keeps running while the name resolves to the
     /// new port, silently shadowing legitimate I/O. To replace a port,
     /// [`Self::remove`] it first.
-    pub fn register(
-        &self,
-        name: &str,
-        handle: PortHandle,
-        trace: Arc<TraceManager>,
-    ) -> AsynResult<()> {
+    ///
+    /// The entry's trace manager is the handle's own — the one the driver was
+    /// bound to at `create_port_runtime` — so a mask set through the registry
+    /// (`asynSetTraceMask`, asynRecord `TMSK`) is the mask the driver's
+    /// `trace_print` reads. C has one `tracePvt` per port, reached through
+    /// the port (asynManager.c:449-459); a registration that named a second
+    /// manager published masks nothing printed against.
+    pub fn register(&self, name: &str, handle: PortHandle) -> AsynResult<()> {
         let mut reg = self.inner.lock().unwrap();
         match reg.entry(name.to_string()) {
             Entry::Occupied(_) => Err(AsynError::PortAlreadyRegistered(name.to_string())),
@@ -80,8 +82,8 @@ impl PortRegistry {
                 // never be asked about a port whose `ASYN_MULTIDEVICE` bit it
                 // does not know. This is the one site that claims a name in
                 // this process, so it is the one place that has to say so.
-                trace.register_port(name, handle.is_multi_device());
-                slot.insert(PortEntry { handle, trace });
+                handle.trace().register_port(name, handle.is_multi_device());
+                slot.insert(PortEntry { handle });
                 Ok(())
             }
         }
@@ -125,8 +127,8 @@ fn global_registry() -> &'static PortRegistry {
 ///
 /// Errors with [`AsynError::PortAlreadyRegistered`] on a duplicate name —
 /// see [`PortRegistry::register`].
-pub fn register_port(name: &str, handle: PortHandle, trace: Arc<TraceManager>) -> AsynResult<()> {
-    global_registry().register(name, handle, trace)?;
+pub fn register_port(name: &str, handle: PortHandle) -> AsynResult<()> {
+    global_registry().register(name, handle)?;
     arm_boot_flush();
     Ok(())
 }
@@ -210,6 +212,7 @@ mod tests {
             name.to_string(),
             Arc::new(InterruptManager::new(4)),
             crate::port_actor::ActorId::new(),
+            Arc::new(TraceManager::new()),
         )
     }
 
@@ -219,17 +222,8 @@ mod tests {
     #[test]
     fn register_rejects_duplicate_name() {
         let reg = PortRegistry::new();
-        reg.register(
-            "regdup",
-            dummy_handle("regdup"),
-            Arc::new(TraceManager::new()),
-        )
-        .unwrap();
-        match reg.register(
-            "regdup",
-            dummy_handle("regdup"),
-            Arc::new(TraceManager::new()),
-        ) {
+        reg.register("regdup", dummy_handle("regdup")).unwrap();
+        match reg.register("regdup", dummy_handle("regdup")) {
             Err(AsynError::PortAlreadyRegistered(name)) => assert_eq!(name, "regdup"),
             other => panic!("expected PortAlreadyRegistered, got {other:?}"),
         }
@@ -241,20 +235,12 @@ mod tests {
     #[test]
     fn removed_name_can_be_reregistered() {
         let reg = PortRegistry::new();
-        reg.register(
-            "regrecycle",
-            dummy_handle("regrecycle"),
-            Arc::new(TraceManager::new()),
-        )
-        .unwrap();
+        reg.register("regrecycle", dummy_handle("regrecycle"))
+            .unwrap();
         reg.remove("regrecycle");
         assert!(
-            reg.register(
-                "regrecycle",
-                dummy_handle("regrecycle"),
-                Arc::new(TraceManager::new())
-            )
-            .is_ok(),
+            reg.register("regrecycle", dummy_handle("regrecycle"))
+                .is_ok(),
             "re-register after remove must succeed"
         );
     }

@@ -15,7 +15,7 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
-use crate::error::AsynError;
+use crate::error::{AsynError, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
 use crate::port::DrvUserRequest;
@@ -324,6 +324,10 @@ pub struct AsynDeviceSupport {
     last_alarm_status: u16,
     last_alarm_severity: u16,
     last_ts: Option<SystemTime>,
+    /// C `pPvt->lastStatus`: the status of the last record process, so the
+    /// `ASYN_TRACE_ERROR` line for a failing read/write prints once per
+    /// change of status, not once per scan (devAsynInt32.c:494-500, :519-525).
+    last_process_status: AsynStatus,
     record_name: String,
     scan: ScanType,
     /// Maximum number of array elements for array read operations.
@@ -696,6 +700,7 @@ impl AsynDeviceSupport {
             last_alarm_status: 0,
             last_alarm_severity: 0,
             last_ts: None,
+            last_process_status: AsynStatus::Success,
             record_name: String::new(),
             scan: ScanType::Passive,
             initial_readback: false,
@@ -1473,6 +1478,71 @@ impl AsynDeviceSupport {
             }
             _ => None,
         }
+    }
+
+    /// C `asynPrint(pPvt->pasynUser, …)` from device support: the record's
+    /// user is connected to this port and address, so the print resolves the
+    /// device's trace config (`findTracePvt`, asynManager.c:546-551).
+    fn dev_print(
+        &self,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        self.handle
+            .user_trace()
+            .print(self.addr, self.reason as i32, mask, file, line, args);
+    }
+
+    /// C's `driverName` for this interface's device support, less the
+    /// `devAsyn` every one of them starts with: `Int32` for `asynInt32`.
+    fn dset_suffix(&self) -> &str {
+        self.iface_type
+            .strip_prefix("asyn")
+            .unwrap_or(&self.iface_type)
+    }
+
+    /// The tail of C `processCallbackInput`/`processCallbackOutput`
+    /// (devAsynInt32.c:493-503, :518-528): a success prints the value at
+    /// `ASYN_TRACEIO_DEVICE`; a failure prints at `ASYN_TRACE_ERROR` only
+    /// when its status differs from the last process's.
+    fn trace_process(
+        &mut self,
+        function_name: &str,
+        verb: &str,
+        status: AsynStatus,
+        outcome: Result<&dyn std::fmt::Display, &dyn std::fmt::Display>,
+    ) {
+        match outcome {
+            Ok(value) => self.dev_print(
+                crate::trace::TraceMask::IO_DEVICE,
+                file!(),
+                line!(),
+                format_args!(
+                    "{} devAsyn{}::{} process value{}",
+                    self.record_name,
+                    self.dset_suffix(),
+                    function_name,
+                    value
+                ),
+            ),
+            Err(message) if status != self.last_process_status => self.dev_print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{} devAsyn{}::{} process {} error {}",
+                    self.record_name,
+                    self.dset_suffix(),
+                    function_name,
+                    verb,
+                    message
+                ),
+            ),
+            Err(_) => {}
+        }
+        self.last_process_status = status;
     }
 
     /// Store a freshly-read scalar value into the record and report whether
@@ -2413,11 +2483,24 @@ impl DeviceSupport for AsynDeviceSupport {
                     // are applied unconditionally (C maps the alarm and
                     // recGblSetSevr's it before the status gate, :844-847) — same
                     // store-only gate as the I/O Intr ring.
-                    if result.aux_status == crate::error::AsynStatus::Success {
+                    if result.aux_status == AsynStatus::Success {
                         if let Some(val) = self.result_to_value(&result) {
+                            self.trace_process(
+                                "processCallbackInput",
+                                "read",
+                                AsynStatus::Success,
+                                Ok(&format_args!("={val}")),
+                            );
                             let wrote_val = self.store_read_value(record, val);
                             read_outcome = stored(wrote_val);
                         }
+                    } else {
+                        self.trace_process(
+                            "processCallbackInput",
+                            "read",
+                            result.aux_status,
+                            Err(&result.message),
+                        );
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -2456,6 +2539,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
                     self.last_alarm_status = alarm_status;
                     self.last_alarm_severity = alarm_severity;
+                    self.trace_process("processCallbackInput", "read", e.status(), Err(&e));
                 }
             }
         }
@@ -2472,9 +2556,18 @@ impl DeviceSupport for AsynDeviceSupport {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
                     .with_timeout_opt(self.timeout);
-                self.handle
-                    .submit_blocking(op, user)
-                    .map_err(asyn_to_ca_error)?;
+                match self.handle.submit_blocking(op, user) {
+                    Ok(_) => self.trace_process(
+                        "processCallbackOutput",
+                        "write",
+                        AsynStatus::Success,
+                        Ok(&format_args!(" {val}")),
+                    ),
+                    Err(e) => {
+                        self.trace_process("processCallbackOutput", "write", e.status(), Err(&e));
+                        return Err(asyn_to_ca_error(e));
+                    }
+                }
             }
         }
         Ok(())

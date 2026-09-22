@@ -285,6 +285,17 @@ impl PortHandle {
         &self.trace
     }
 
+    /// The trace linkage a user connected to this port carries — what
+    /// `PortActor` stamps on every request it runs, made
+    /// available to a layer that prints on the port's behalf without a
+    /// request in flight (device support, C `pPvt->pasynUser`).
+    pub fn user_trace(&self) -> crate::user::UserTrace {
+        crate::user::UserTrace {
+            manager: self.trace.clone(),
+            port: self.port_name.clone(),
+        }
+    }
+
     /// Record the driver's declared interface set — see `Self::interfaces`.
     /// Called by the runtime layer at handle construction, from the driver's own
     /// [`crate::port::PortDriver::capabilities`].

@@ -545,6 +545,25 @@ impl PortDriverBase {
         }
     }
 
+    /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::write*` prints
+    /// once a value is in the parameter library (asynPortDriver.cpp:2038,
+    /// :2177, :2318, :2565, :2681): `driverName:functionName: function=N,
+    /// name=PARAM, value=V`, through the user's device-level trace config.
+    fn trace_write(&self, user: &AsynUser, function_name: &str, value: std::fmt::Arguments<'_>) {
+        user.print(
+            crate::trace::TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!(
+                "asynPortDriver:{}: function={}, name={}, value={}",
+                function_name,
+                user.reason,
+                self.params.param_name(user.reason).unwrap_or(""),
+                value
+            ),
+        );
+    }
+
     /// Single owner-API for the port-level `connected` transition.
     ///
     /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and
@@ -1907,11 +1926,22 @@ pub trait PortDriver: Any + Send + Sync {
         self.base().params.get_int32_strict(user.reason, user.addr)
     }
 
+    // The default typed writes are C `asynPortDriver::write*`
+    // (asynPortDriver.cpp:2016-2040, :2155-2179, :2296-2320, :2544-2568,
+    // :2659-2683): set the parameter, run the callbacks, and report the
+    // write at `ASYN_TRACEIO_DRIVER` — the line `asynSetTraceMask port -1
+    // 0x2` shows for every value a driver accepted. `writeFloat64` alone
+    // prints its failure at `ASYN_TRACE_ERROR` (:2561-2563); the others put
+    // it in `errorMessage`, which is the `Err` here.
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base_mut()
             .params
             .set_int32(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        self.base_mut().call_param_callbacks(user.addr)?;
+        self.base()
+            .trace_write(user, "writeInt32", format_args!("{value}"));
+        Ok(())
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
@@ -1922,7 +1952,10 @@ pub trait PortDriver: Any + Send + Sync {
         self.base_mut()
             .params
             .set_int64(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        self.base_mut().call_param_callbacks(user.addr)?;
+        self.base()
+            .trace_write(user, "writeInt64", format_args!("{value}"));
+        Ok(())
     }
 
     /// C `asynInt32Base.c:99` default: report `low = high = 0` so a
@@ -1945,10 +1978,29 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.base_mut()
+        let status = self
+            .base_mut()
             .params
-            .set_float64(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)
+            .set_float64(user.reason, user.addr, value)
+            .and_then(|()| self.base_mut().call_param_callbacks(user.addr));
+        let base = self.base();
+        if let Err(e) = &status {
+            user.print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "asynPortDriver:writeFloat64: error, status={}, function={}, name={}, value={}",
+                    e.status() as i32,
+                    user.reason,
+                    base.params.param_name(user.reason).unwrap_or(""),
+                    value
+                ),
+            );
+            return status;
+        }
+        base.trace_write(user, "writeFloat64", format_args!("{value}"));
+        Ok(())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
@@ -1966,6 +2018,11 @@ pub trait PortDriver: Any + Send + Sync {
             .params
             .set_string(user.reason, user.addr, data.to_vec())?;
         self.base_mut().call_param_callbacks(user.addr)?;
+        self.base().trace_write(
+            user,
+            "writeOctet",
+            format_args!("{}", String::from_utf8_lossy(data)),
+        );
         Ok(data.len())
     }
 
@@ -1988,7 +2045,10 @@ pub trait PortDriver: Any + Send + Sync {
         self.base_mut()
             .params
             .set_uint32(user.reason, user.addr, value, mask, 0)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        self.base_mut().call_param_callbacks(user.addr)?;
+        self.base()
+            .trace_write(user, "writeUInt32Digital", format_args!("{value}"));
+        Ok(())
     }
 
     /// Configure rising / falling interrupt masks for a

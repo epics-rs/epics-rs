@@ -153,6 +153,25 @@ pub trait WriteCompletion: Send + 'static {
     fn wait(&self, timeout: std::time::Duration) -> CaResult<()>;
 }
 
+/// What [`DeviceSupport::write_begin`] did with the record's output.
+///
+/// Three answers, each its own variant: the two that end with the value at
+/// the device — `Completed` and `Pending` — and the one that has not written
+/// anything, `Synchronous`. The framework runs [`DeviceSupport::write`] only
+/// on `Synchronous`; a device support that has already written must say
+/// `Completed`, or the framework writes the same value a second time.
+pub enum WriteStart {
+    /// This device support has no submit-only path: the framework runs
+    /// [`DeviceSupport::write`] now, under the record lock.
+    Synchronous,
+    /// The write ran to completion inside `write_begin` (a port that cannot
+    /// block, C `ASYN_CANBLOCK` clear); nothing remains to be done.
+    Completed,
+    /// The write was submitted to a worker queue; the framework waits on
+    /// the handle outside the record lock and ends the cycle when it lands.
+    Pending(Box<dyn WriteCompletion>),
+}
+
 /// What a device support `read()` produced.
 ///
 /// This is one half of C's dset contract; [`DeviceUdf`] is the other. C's
@@ -607,15 +626,11 @@ pub trait DeviceSupport: Send + Sync + 'static {
         false
     }
 
-    /// Begin an asynchronous write (submit only, no blocking).
-    /// Returns `Some(handle)` if the write was submitted to a worker queue —
-    /// the caller should wait on the handle outside any record lock.
-    /// Returns `None` to fall back to synchronous [`write()`](DeviceSupport::write).
-    fn write_begin(
-        &mut self,
-        _record: &mut dyn Record,
-    ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-        Ok(None)
+    /// Begin the record's output write — see [`WriteStart`] for the three
+    /// outcomes. The default has no submit-only path and asks for
+    /// [`write()`](DeviceSupport::write).
+    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+        Ok(WriteStart::Synchronous)
     }
 
     /// Handle a named command from the record's process() via

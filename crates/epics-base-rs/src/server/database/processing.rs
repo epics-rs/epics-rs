@@ -5566,8 +5566,9 @@ impl PvDatabase {
                         } else {
                             if let Some(mut dev) = instance.device.take() {
                                 // Try async write_begin() first
+                                use crate::server::device_support::WriteStart;
                                 match dev.write_begin(&mut *instance.record) {
-                                    Ok(Some(completion)) => {
+                                    Ok(WriteStart::Pending(completion)) => {
                                         // Async write submitted -- set PACT, return early.
                                         // complete_async_record will handle deadband, snapshot,
                                         // notification, and FLNK when the write completes.
@@ -5611,8 +5612,10 @@ impl PvDatabase {
                                         cycle_end.hand_off_to_async_completion();
                                         return Ok(());
                                     }
-                                    Ok(None) => {
-                                        // No async support -- fall back to synchronous write
+                                    // The value is at the device; the cycle goes on
+                                    // as after a synchronous write.
+                                    Ok(WriteStart::Completed) => {}
+                                    Ok(WriteStart::Synchronous) => {
                                         if let Err(e) = dev.write(&mut *instance.record) {
                                             eprintln!(
                                                 "device write error on {}: {e}",

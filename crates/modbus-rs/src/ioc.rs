@@ -2190,7 +2190,6 @@ pub fn register_modbus_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asyn_rs::trace::TraceManager;
 
     fn args(v: Vec<ArgValue>) -> Vec<ArgValue> {
         v
@@ -4616,7 +4615,8 @@ mod tests {
             "modbus_MB_TRACE_CLEAN_{}.trace",
             std::process::id()
         ));
-        let trace = Arc::new(TraceManager::new());
+        let services = PortServices::new();
+        let trace = services.trace().clone();
         // Named, not global. C `tracePvtInit` (asynManager.c:449-459) gives
         // every port its own `tracePvt` — `traceFileStderr`, mask
         // ASYN_TRACE_ERROR — and copies nothing from `pasynBase->trace`, so a
@@ -4634,7 +4634,7 @@ mod tests {
         let (runtime, _jh) = create_port_runtime(
             driver,
             RuntimeConfig {
-                services: PortServices::new(Arc::clone(&trace)),
+                services,
                 ..RuntimeConfig::default()
             },
         )
@@ -4760,7 +4760,8 @@ mod tests {
             "modbus_MB_TRACE_NARROW_{}.trace",
             std::process::id()
         ));
-        let trace = Arc::new(TraceManager::new());
+        let services = PortServices::new();
+        let trace = services.trace().clone();
         // Named, not global. C `tracePvtInit` (asynManager.c:449-459) gives
         // every port its own `tracePvt` — `traceFileStderr`, mask
         // ASYN_TRACE_ERROR — and copies nothing from `pasynBase->trace`, so a
@@ -4778,7 +4779,7 @@ mod tests {
         let (runtime, _jh) = create_port_runtime(
             driver,
             RuntimeConfig {
-                services: PortServices::new(Arc::clone(&trace)),
+                services,
                 ..RuntimeConfig::default()
             },
         )

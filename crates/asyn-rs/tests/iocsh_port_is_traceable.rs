@@ -27,7 +27,7 @@ use asyn_rs::exception::AsynException;
 use asyn_rs::iocsh::build_asyn_commands;
 use asyn_rs::manager::PortManager;
 use asyn_rs::services::PortServices;
-use asyn_rs::trace::{TraceFile, TraceManager};
+use asyn_rs::trace::TraceFile;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext, CommandDef};
 
@@ -80,7 +80,7 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
     let path = dir.path().join("asyn_r18_57.log");
     let file = std::fs::File::create(&path).unwrap();
 
-    let services = PortServices::new(Arc::new(TraceManager::new()));
+    let services = PortServices::new();
     let events: Arc<Mutex<Vec<AsynException>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let sink = events.clone();

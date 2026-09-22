@@ -3429,8 +3429,7 @@ mod tests {
     /// host info (no connect), so no live server is needed.
     #[test]
     fn drv_asyn_ip_port_configure_registers_port() {
-        let cmd =
-            drv_asyn_ip_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = drv_asyn_ip_port_configure_command(PortServices::new());
         assert_eq!(cmd.name, "drvAsynIPPortConfigure");
         assert_eq!(cmd.args.len(), 5);
 
@@ -3476,9 +3475,7 @@ mod tests {
     #[cfg(asyn_serial_backend)]
     #[test]
     fn drv_asyn_serial_port_configure_registers_port() {
-        let cmd = drv_asyn_serial_port_configure_command(PortServices::new(Arc::new(
-            TraceManager::new(),
-        )));
+        let cmd = drv_asyn_serial_port_configure_command(PortServices::new());
         assert_eq!(cmd.name, "drvAsynSerialPortConfigure");
         assert_eq!(cmd.args.len(), 5);
 
@@ -3500,8 +3497,7 @@ mod tests {
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_ip_port_configure_rejects_missing_host() {
-        let cmd =
-            drv_asyn_ip_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = drv_asyn_ip_port_configure_command(PortServices::new());
         let ctx = make_ctx();
         let result = cmd
             .handler
@@ -3517,9 +3513,7 @@ mod tests {
     /// args (portName, host, priority, noAutoConnect); priority is dropped.
     #[test]
     fn drv_asyn_prologix_port_configure_registers_port() {
-        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new(Arc::new(
-            TraceManager::new(),
-        )));
+        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new());
         assert_eq!(cmd.name, "prologixGPIBConfigure");
         assert_eq!(cmd.args.len(), 4);
 
@@ -3541,9 +3535,7 @@ mod tests {
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_prologix_port_configure_rejects_missing_host() {
-        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new(Arc::new(
-            TraceManager::new(),
-        )));
+        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new());
         let ctx = make_ctx();
         let result = cmd.handler.call(
             &[ArgValue::String("iocsh_prologix_cfg_nohost".into())],
@@ -3559,8 +3551,7 @@ mod tests {
     /// absent USB device.
     #[test]
     fn iocsh_ftdi_port_configure_creates_the_port_an_st_cmd_names() {
-        let cmd =
-            drv_asyn_ftdi_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
         assert_eq!(cmd.name, "drvAsynFTDIPortConfigure");
         assert_eq!(cmd.args.len(), 9);
 
@@ -3588,7 +3579,7 @@ mod tests {
     /// (drvVxi11.c:1789-1802) and publishes the port under its name.
     #[test]
     fn iocsh_vxi11_configure_creates_the_port_an_st_cmd_names() {
-        let cmd = vxi11_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = vxi11_configure_command(PortServices::new());
         assert_eq!(cmd.name, "vxi11Configure");
         assert_eq!(cmd.args.len(), 7);
 
@@ -3616,7 +3607,7 @@ mod tests {
     /// `hostName` in `vxiInit` and cannot proceed without it.
     #[test]
     fn iocsh_vxi11_configure_rejects_missing_host() {
-        let cmd = vxi11_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = vxi11_configure_command(PortServices::new());
         let ctx = make_ctx();
         let result = cmd
             .handler
@@ -3632,7 +3623,7 @@ mod tests {
     /// instrument plugged in, and does not stop the port from existing.
     #[test]
     fn iocsh_usbtmc_configure_creates_the_port_an_st_cmd_names() {
-        let cmd = usbtmc_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let cmd = usbtmc_configure_command(PortServices::new());
         assert_eq!(cmd.name, "usbtmcConfigure");
         assert_eq!(cmd.args.len(), 6);
 

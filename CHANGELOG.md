@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.30.1 — 2026-09-22
+
+Patch release. Seven defects filed against 0.30.0, none introduced by it.
+A failed async device write ends its cycle in `WRITE_ALARM`/`INVALID`; the
+completion task dropped the outcome of `WriteCompletion::wait`.
+`create_monitor_set` after `iocInit` adds a running set to the autosave
+manager, as C `create_data_set` does, instead of queuing a definition
+nothing reads. A plain `SCAN="I/O Intr"` record rings every driver
+callback, overflow counted, where a mailbox kept the latest value per
+process. `connectDevice` creates the device on a multi-device port, so its
+trace masks and enable state exist before the first request.
+`register_port` publishes the trace the driver was bound to, taken from
+the `PortHandle`, so `asynSetTraceMask` sets the mask the driver reads;
+`PortHandle::new` and `register_port(name, handle)` drop the separate
+trace argument. The request path prints C's trace lines: `portThread`'s
+FLOW callback line, `asynPortDriver`'s TRACEIO_DRIVER write lines and
+device support's TRACEIO_DEVICE process lines, a failing scan reported at
+TRACE_ERROR once per status change. `register_asyn_device_support`
+registers the asyn iocsh commands on `PortManager::global()`, the way
+loading `asyn.dbd` runs `asynRegister`, so an IOC with asyn device support
+has `asynSetTraceMask` and `drvAsynIPPortConfigure` without a port manager
+of its own. Workspace, the 18 dependency pins and the `epics-bridge-rs`
+`epics-pva-rs` pin move to 0.30.1 in lockstep.
+
 ## v0.30.0 — 2026-09-21
 
 Minor release. Workspace 0.29.3 -> 0.30.0; the 18

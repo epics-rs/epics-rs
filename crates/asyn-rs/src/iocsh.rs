@@ -73,6 +73,22 @@ pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) ->
     app
 }
 
+/// The trace a trace-setting command acts on. C connects an `asynUser` to
+/// the named port first (asynShellCommands.c:645-651) and `setTrace*` then
+/// writes that port's own `dpCommon` (asynManager.c:2774-2802), whichever
+/// manager the command was registered with; a port that does not exist is
+/// the `connectDevice` failure C prints and returns on. With no port named
+/// the setter writes the global config (C `pasynUser == NULL`), which lives
+/// on the manager's trace.
+fn trace_for(mgr: &PortManager, port: Option<&str>) -> Result<Arc<TraceManager>, String> {
+    match port {
+        Some(p) => crate::registry::get_port(p)
+            .map(|entry| entry.handle.trace().clone())
+            .ok_or_else(|| format!("asynManager:connectDevice port {p} not found")),
+        None => Ok(mgr.trace_manager().clone()),
+    }
+}
+
 fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
     match args.get(i) {
         Some(ArgValue::Int(v)) => Some(*v),
@@ -745,11 +761,17 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 },
             ],
             "asynSetTraceIOTruncateSize portName addr size - bytes of each I/O to trace",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0).filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
                 let size = arg_int(args, 2).unwrap_or(0).max(0) as usize;
-                let trace = mgr_r.trace_manager();
+                let trace = match trace_for(&mgr_r, port.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.println(&e);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 // Same addr routing as the trace-mask setters: C connects the
                 // asynUser to (port, addr) first, so `addr >= 0` writes the
                 // device's dpCommon and `addr < 0` the port's
@@ -1050,7 +1072,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
                 match TraceMask::from_symbolic(&mask_str) {
                     Ok(m) => {
-                        let trace = mgr_r.trace_manager();
+                        let trace = match trace_for(&mgr_r, port.as_deref()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                ctx.println(&e);
+                                return Ok(CommandOutcome::Continue);
+                            }
+                        };
                         if let Some(p) = port.as_deref() {
                             if addr >= 0 {
                                 trace.set_device_trace_mask(p, addr, m);
@@ -1097,7 +1125,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
                 match TraceIoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
-                        let trace = mgr_r.trace_manager();
+                        let trace = match trace_for(&mgr_r, port.as_deref()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                ctx.println(&e);
+                                return Ok(CommandOutcome::Continue);
+                            }
+                        };
                         // C parity: asynShellCommands.c:734-754 calls
                         // `connectDevice(pasynUser, portName, addr)`
                         // before `setTraceIOMask`. When `addr >= 0` the
@@ -1152,7 +1186,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
                 match TraceInfoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
-                        let trace = mgr_r.trace_manager();
+                        let trace = match trace_for(&mgr_r, port.as_deref()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                ctx.println(&e);
+                                return Ok(CommandOutcome::Continue);
+                            }
+                        };
                         // C parity: asynShellCommands.c:799-820 routes
                         // through `connectDevice(pasynUser, portName, addr)`.
                         // `setTraceInfoMask` (asynManager.c:2872-2875)
@@ -1214,7 +1254,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         }
                     },
                 };
-                let trace = mgr_r.trace_manager();
+                let trace = match trace_for(&mgr_r, port.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.println(&e);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 // C parity: asynShellCommands.c:858-892 routes through
                 // `connectDevice(pasynUser, portName, addr)`. The
                 // `setTraceFile` resolver (asynManager.c:2898-2926)
@@ -3227,6 +3273,72 @@ mod tests {
         let ctx = CommandContext::new(db, bridge);
         std::mem::forget(rt);
         ctx
+    }
+
+    /// `asynSetTraceMask PORT …` writes the trace PORT is bound to — C
+    /// connects an `asynUser` to the port before `setTraceMask`
+    /// (asynShellCommands.c:645-651) — whichever manager registered the
+    /// command. A command set built on a manager of its own
+    /// (`register_asyn_commands(app, Arc::new(PortManager::new()))`) set
+    /// masks on that manager's trace, which no driver port read. A port
+    /// that does not exist is C's `connectDevice` failure: printed, and
+    /// no trace written.
+    #[test]
+    fn asyn_set_trace_mask_writes_the_named_ports_own_trace() {
+        const PORT: &str = "iocsh_foreign_mgr_port";
+        let (runtime, _actor) = crate::runtime::create_port_runtime(
+            DummyDriver::new(PORT),
+            crate::runtime::RuntimeConfig::default(),
+        )
+        .unwrap();
+        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        let foreign = Arc::new(PortManager::new());
+        let cmds = build_asyn_commands(foreign.clone());
+        let cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynSetTraceMask")
+            .expect("asynSetTraceMask must be registered");
+        let ctx = make_ctx();
+
+        cmd.handler
+            .call(
+                &[
+                    ArgValue::String(PORT.into()),
+                    ArgValue::Int(-1),
+                    ArgValue::String("FLOW".into()),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .port_handle()
+                .trace()
+                .is_enabled(PORT, TraceMask::FLOW),
+            "the port's own trace carries the mask"
+        );
+        assert!(
+            !foreign.trace_manager().is_enabled(PORT, TraceMask::FLOW),
+            "the registering manager's trace is not the port's"
+        );
+
+        cmd.handler
+            .call(
+                &[
+                    ArgValue::String("iocsh_no_such_port".into()),
+                    ArgValue::Int(-1),
+                    ArgValue::String("FLOW".into()),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            !foreign
+                .trace_manager()
+                .is_enabled("iocsh_no_such_port", TraceMask::FLOW),
+            "an unknown port is refused, not configured ahead of creation"
+        );
+        crate::registry::unregister_port(PORT);
     }
 
     /// `asynSetTraceIOMask` / `asynSetTraceInfoMask` /

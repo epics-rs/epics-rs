@@ -11,8 +11,6 @@
 // The default build still lints the file in full.
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-use std::sync::Arc;
-
 use epics_base_rs::error::CaResult;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
@@ -44,13 +42,9 @@ async fn main() -> CaResult<()> {
     // `envGetInetPortConfigParam` (`runtime::net::cas_server_port`).
     let mut app = IocApplication::new();
 
-    // Universal asyn record device support.
+    // Universal asyn record device support, and with it the asyn iocsh
+    // commands — `drvAsynIPPortConfigure` creates the underlying octet port.
     app = asyn_rs::adapter::register_asyn_device_support(app);
-
-    // Standard asyn iocsh commands — this also registers
-    // `drvAsynIPPortConfigure`, used to create the underlying octet port.
-    let port_manager = std::sync::Arc::new(asyn_rs::manager::PortManager::new());
-    app = asyn_rs::iocsh::register_asyn_commands(app, port_manager);
 
     // Modbus iocsh commands: modbusInterposeConfig, drvModbusAsynConfigure.
     app = modbus_rs::ioc::register_modbus_commands(app, handle);

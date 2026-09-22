@@ -3328,11 +3328,22 @@ pub fn universal_asyn_factory(
 /// This is the Rust equivalent of C EPICS's standard asyn device support
 /// registration. Call this BEFORE registering plugin or driver-specific
 /// factories so they take precedence (dynamic factories chain last-registered-first).
+///
+/// It is also what brings the asyn iocsh commands: loading `asyn.dbd` runs
+/// the `asynRegister` registrar (asynShellCommands.c:1349-1382) beside the
+/// `device()` lines, so a C IOC that has asyn device support has
+/// `asynSetTraceMask`, `asynReport`, `drvAsynIPPortConfigure` and the rest
+/// with no further step. They act on [`crate::manager::PortManager::global`], the port table
+/// every port built with `RuntimeConfig::default()` traces through. An IOC
+/// that registered the commands itself on a manager it built kept a table
+/// the drivers' ports were not in — `asynSetTraceMask` on such a port set a
+/// mask nothing read — and an IOC that did not was missing the commands.
 pub fn register_asyn_device_support(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::server::ioc_app::IocApplication {
     register_asyn_device_menus();
-    app.register_dynamic_device_support(universal_asyn_factory)
+    let app = app.register_dynamic_device_support(universal_asyn_factory);
+    crate::iocsh::register_asyn_commands(app, crate::manager::PortManager::global())
 }
 
 /// Contribute asyn's device-support DTYP menus to base's `DTYP` choice lists.
@@ -3366,7 +3377,9 @@ pub fn register_asyn_device_menus() {
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
 /// installs the universal asyn factory on the pure-Rust build path
-/// (added `register_dynamic_device_support` to IocBuilder).
+/// (added `register_dynamic_device_support` to IocBuilder). An
+/// `IocBuilder` has no command table, so the iocsh commands are the
+/// `IocApplication` path's alone.
 /// Without this helper, callers using `IocBuilder` instead of
 /// `IocApplication` would have to wire `universal_asyn_factory`
 /// manually; that asymmetry is exactly what `register_asyn_device_support`

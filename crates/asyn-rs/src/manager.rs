@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -29,6 +29,21 @@ pub struct PortManager {
 impl PortManager {
     pub fn new() -> Self {
         Self::with_trace_manager(Arc::new(TraceManager::new()))
+    }
+
+    /// The process's one port table — C's `pasynBase->asynPortList`, which
+    /// every `registerPort` adds to and every shell command reads
+    /// (asynManager.c:2018-2070). It is bound to [`PortServices::global`],
+    /// the services a port built with `RuntimeConfig::default()` gets, so a
+    /// port created from a driver's own configure command and one created by
+    /// `drvAsynIPPortConfigure` share the trace file, the masks and the
+    /// exception list. [`crate::adapter::register_asyn_device_support`]
+    /// registers the asyn iocsh commands on this manager.
+    pub fn global() -> Arc<PortManager> {
+        static GLOBAL: OnceLock<Arc<PortManager>> = OnceLock::new();
+        GLOBAL
+            .get_or_init(|| Arc::new(PortManager::with_services(PortServices::global())))
+            .clone()
     }
 
     /// Build a manager that shares an existing [`TraceManager`].

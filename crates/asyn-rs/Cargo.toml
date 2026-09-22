@@ -118,6 +118,10 @@ harness = false
 # the framework and are auto-discovered unchanged; `tools/target-cfg-gate`
 # holds the two lists to each other, for every crate rather than this one.
 [[test]]
+name = "device_support_brings_the_shell_commands"
+required-features = ["epics"]
+
+[[test]]
 name = "enum_property_post_mask"
 required-features = ["epics"]
 

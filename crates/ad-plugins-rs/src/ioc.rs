@@ -940,14 +940,14 @@ impl AdIoc {
     /// Create a new AdIoc with default configuration.
     pub fn new() -> Self {
         // The plugin and detector ports are built with `RuntimeConfig::default()`,
-        // which binds them to `PortServices::global()`. The asyn iocsh commands
-        // mutate trace state through this manager, so it is the same services:
-        // a manager with a `TraceManager` of its own made `asynSetTrace*` set
-        // masks no driver or plugin ever read.
-        let services = PortServices::global();
-        let trace = services.trace().clone();
+        // which binds them to `PortServices::global()`, and the asyn iocsh
+        // commands `register_asyn_device_support` brings act on the process's
+        // one port table, `PortManager::global()`. This IOC's ports are that
+        // table: a manager of its own made `asynReport` list ports the shell
+        // did not create and `asynSetTrace*` set masks nothing read.
+        let trace = PortServices::global().trace().clone();
         let mgr = PluginManager::new();
-        let ports = Arc::new(PortManager::with_services(services));
+        let ports = PortManager::global();
 
         asyn_rs::asyn_record::register_asyn_record_type();
 
@@ -972,15 +972,14 @@ impl AdIoc {
         app = app.autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
 
         // Universal asyn device support — handles all standard asyn DTYPs
-        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links.
+        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links —
+        // and with it the asyn iocsh command set: port creation
+        // (`drvAsynIPPortConfigure` and friends), `asynOctetSetInputEos` /
+        // `asynOctetSetOutputEos`, `asynSetOption`, `asynReport` and the trace
+        // mutators, on the startup shell as well as the interactive one. A
+        // socket detector's st.cmd creates its port and sets the EOS before
+        // `iocInit`.
         app = asyn_rs::adapter::register_asyn_device_support(app);
-
-        // The asyn iocsh command set: port creation (`drvAsynIPPortConfigure`
-        // and friends), `asynOctetSetInputEos` / `asynOctetSetOutputEos`,
-        // `asynSetOption`, `asynReport` and the trace mutators — on the startup
-        // shell as well as the interactive one. A socket detector's st.cmd
-        // creates its port and sets the EOS before `iocInit`.
-        app = asyn_rs::iocsh::register_asyn_commands(app, ports.clone());
 
         // `busy` and `sseq` — the record types every AD plugin's templates
         // need — are registered inside `register_all_plugins` above, so an

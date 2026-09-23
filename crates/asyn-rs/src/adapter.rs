@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(45): checked, not waived — all 45 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(46): checked, not waived — all 46 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1106/1106). asyn-rs became a census subject when its
@@ -3119,6 +3119,18 @@ impl DeviceSupport for AsynDeviceSupport {
 
 // ===== Universal asyn device support =====
 
+/// Whether a DTYP name fixes the record as an output on its own, so that an
+/// `@asyn` link in INP still means "write". C binds these dsets to
+/// `&pwf->inp` with `isOutput=1`: every `asynXxxArrayWfOut`
+/// (`MAKE_DEVSUP(asynInt8ArrayWfOut, waveformRecord, inp, ..., true)`,
+/// devAsynXXXArray.cpp:475-505,512 and the Int16/32/64/Float32/Float64
+/// siblings), `asynOctetWrite` and `asynOctetWriteBinary` (initWfWrite /
+/// initWfWriteBinary, devAsynOctet.c:1065,1080). Every other DTYP takes its
+/// direction from the link field it was given.
+fn dtyp_is_output(dtyp: &str) -> bool {
+    dtyp.ends_with("ArrayOut") || dtyp == "asynOctetWrite" || dtyp == "asynOctetWriteBinary"
+}
+
 /// Normalize array DTYP names by stripping "In"/"Out" direction suffixes.
 ///
 /// C EPICS uses distinct DTYPs for input vs output array records
@@ -3208,18 +3220,17 @@ pub fn universal_asyn_factory(
         return Some(Box::new(crate::asyn_record::AsynRecordDevice::new()));
     }
 
-    // Try @asyn() link in INP or OUT
-    let (link_str, is_output) = if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
-        (ctx.out, true)
-    } else if ctx.inp.contains("@asyn") || ctx.inp.contains("@asynMask") {
-        // asynOctetWrite / asynOctetWriteBinary use the INP field for output
-        // (C waveform-output-via-INP convention; initWfWrite / initWfWriteBinary
-        // both pass &pwf->inp with isOutput=1, devAsynOctet.c:1065,1080).
-        let is_write_dtyp = ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary";
-        (ctx.inp, is_write_dtyp)
-    } else {
-        return None;
-    };
+    // Try @asyn() link in INP or OUT. An OUT link is always an output; an INP
+    // link is an output only when the DTYP itself names the direction.
+    let (link_str, is_output, output_via_inp) =
+        if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
+            (ctx.out, true, false)
+        } else if ctx.inp.contains("@asyn") || ctx.inp.contains("@asynMask") {
+            let out = dtyp_is_output(ctx.dtyp);
+            (ctx.inp, out, out)
+        } else {
+            return None;
+        };
 
     // Parse the link
     let link = if link_str.contains("@asynMask") {
@@ -3293,10 +3304,13 @@ pub fn universal_asyn_factory(
     }
 
     if is_output {
-        if ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary" {
-            // asynOctetWrite / asynOctetWriteBinary are write-only — no reads
-            // allowed. Reading would replace the waveform CharArray with a String,
-            // breaking element_count.
+        if output_via_inp {
+            // An output DTYP bound through INP sits on a waveform, an input
+            // record type whose process calls read(): the write runs there
+            // (`write_only`), and no read ever replaces VAL — for asynOctet it
+            // would turn the CharArray into a String and break element_count.
+            // C registers no ASYN_INIT readback for any of these dsets
+            // (devAsynXXXArray.cpp:97-200, devAsynOctet.c initWfWrite).
             adapter.write_only = true;
             // asynOctetWriteBinary writes the full NORD bytes with NO NUL-trim
             // (C callbackWfWriteBinary, devAsynOctet.c:1086-1091), unlike
@@ -7855,6 +7869,131 @@ mod tests {
             vec![vec![0x01]],
             "text write must trim at the first NUL"
         );
+    }
+
+    /// Mock array port: records every float32 array write and accepts any
+    /// DRVINFO as a param. Reads return zeros, so a record mis-classified as an
+    /// input would read 2048 zeros back instead of writing.
+    struct Float32ArrayPort {
+        base: PortDriverBase,
+        writes: Arc<std::sync::Mutex<Vec<Vec<f32>>>>,
+    }
+    impl PortDriver for Float32ArrayPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn drv_user_create(
+            &mut self,
+            _req: &DrvUserRequest,
+        ) -> AsynResult<crate::port::DrvUserInfo> {
+            Ok(crate::port::DrvUserInfo::from_reason(0))
+        }
+        fn read_float32_array(&mut self, _user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
+            buf.fill(0.0);
+            Ok(buf.len())
+        }
+        fn write_float32_array(&mut self, _user: &AsynUser, data: &[f32]) -> AsynResult<()> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    fn spawn_float32_array_port(name: &str) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<f32>>>>) {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = Float32ArrayPort {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            writes: writes.clone(),
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(port), rx);
+        let actor_id = actor.id();
+        std::thread::Builder::new()
+            .name("f32array-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(
+            tx,
+            name.into(),
+            interrupts,
+            actor_id,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
+        (handle, writes)
+    }
+
+    /// `waveform` + `DTYP asynFloat32ArrayOut` + INP (the C measComp
+    /// `WaveGen<n>UserWF` form) is an output: processing writes the NORD
+    /// elements through `write_float32_array` and leaves VAL as put. The
+    /// factory used to admit only the two asynOctet write DTYPs as INP-bound
+    /// outputs, so this record read the driver instead and VAL came back as
+    /// NELM zeros. C: `MAKE_DEVSUP(asynFloat32ArrayWfOut, waveformRecord, inp,
+    /// ..., true)`, devAsynXXXArray.cpp:570 via the macro at :475-505.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_out_dtyp_on_inp_link_writes_the_driver() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, writes) = spawn_float32_array_port("f32arr_out");
+        crate::asyn_record::register_port("f32arr_out", handle).unwrap();
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynFloat32ArrayOut",
+            inp: "@asyn(f32arr_out,0)USER_WF",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = WaveformRecord::new(2048, DbFieldType::Float);
+        rec.put_field("VAL", EpicsValue::FloatArray(vec![0.5, 0.25, 0.125]))
+            .unwrap();
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![vec![0.5, 0.25, 0.125]],
+            "the driver must receive the NORD elements once"
+        );
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::FloatArray(vec![0.5, 0.25, 0.125])),
+            "VAL must keep the put values, not the driver readback"
+        );
+    }
+
+    /// The direction a DTYP fixes by name: every `asynXxxArrayOut` and the two
+    /// asynOctet write dsets are INP-bound outputs; direction-agnostic scalar
+    /// DTYPs and the `In` array forms are not.
+    #[test]
+    fn dtyp_is_output_names_every_inp_bound_output_dset() {
+        for d in [
+            "asynInt8ArrayOut",
+            "asynInt16ArrayOut",
+            "asynInt32ArrayOut",
+            "asynInt64ArrayOut",
+            "asynFloat32ArrayOut",
+            "asynFloat64ArrayOut",
+            "asynOctetWrite",
+            "asynOctetWriteBinary",
+        ] {
+            assert!(dtyp_is_output(d), "{d} is an output");
+        }
+        for d in [
+            "asynFloat32ArrayIn",
+            "asynInt32ArrayIn",
+            "asynOctetRead",
+            "asynOctetCmdResponse",
+            "asynInt32",
+            "asynFloat64",
+            "asynInt32TimeSeries",
+        ] {
+            assert!(!dtyp_is_output(d), "{d} takes its direction from the link");
+        }
     }
 
     /// binary_write_op emits a plain OctetWrite (EOS-appending), NOT

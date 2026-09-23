@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.30.2 — 2026-09-23
+
+Patch release. Six fixes, two of them to `universal_asyn_factory`. A
+waveform with `DTYP asynXxxArrayOut` and an `@asyn` INP link is an
+output, as C binds every `asynXxxArrayWfOut` dset to `&pwf->inp` with
+`isOutput=1`; only the two asynOctet write DTYPs were admitted that way,
+so a measComp `WaveGen<n>UserWF` was read instead of written. The factory
+binds only a (record type, DTYP) pair asyn's `.dbd` declares, the refusal
+C makes at db load, where a `calcout` with `DTYP asynInt32` loaded, computed
+OVAL and wrote nothing; `DeviceSupportContext` gains `record_type`.
+`DeviceSupport::write_begin` returns `WriteStart`, one variant per
+outcome, where `Ok(None)` meant both "done synchronously" and "done, skip
+the completion". `asynSetTrace*` on a named port write that port's own
+trace, not the manager's. `PortServices::new()` builds its own trace and
+exception managers; `PortManager::with_trace_manager` is gone.
+Workspace, the 18 dependency pins and the `epics-bridge-rs` `epics-pva-rs`
+pin move to 0.30.2 in lockstep.
+
 ## v0.30.1 — 2026-09-22
 
 Patch release. Seven defects filed against 0.30.0, none introduced by it.

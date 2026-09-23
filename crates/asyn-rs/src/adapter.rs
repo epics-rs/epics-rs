@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(46): checked, not waived — all 46 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(47): checked, not waived — all 47 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1106/1106). asyn-rs became a census subject when its
@@ -3220,6 +3220,22 @@ pub fn universal_asyn_factory(
         return Some(Box::new(crate::asyn_record::AsynRecordDevice::new()));
     }
 
+    // C declares each dset per record type (`device(ao, INST_IO, asynAoInt32,
+    // "asynInt32")`), and a DTYP put admits only a choice of THAT record
+    // type's device menu: `dbPutStringNum` answers `S_db_badChoice` "no such
+    // device support for 'calcout' record type" (dbStaticRun.c:485-502), so
+    // `record(calcout) { field(DTYP, "asynInt32") }` fails at db load with
+    // `Can't set 'X.DTYP' to 'asynInt32'` (dbLexRoutines.c:1405-1414). This
+    // factory stands in for every one of those dsets at once, so it makes
+    // the same refusal here: a pair no `device()` line declares gets no
+    // device, and base reports the record as having no device support,
+    // instead of binding a dset the record type never calls (a calcout
+    // never invokes write(), so the record loaded, computed OVAL and wrote
+    // nothing to the driver).
+    if !asyn_device_menu(ctx.record_type).is_some_and(|menu| menu.contains(&ctx.dtyp)) {
+        return None;
+    }
+
     // Try @asyn() link in INP or OUT. An OUT link is always an output; an INP
     // link is an output only when the DTYP itself names the direction.
     let (link_str, is_output, output_via_inp) =
@@ -3386,17 +3402,42 @@ pub fn register_asyn_device_support(
 /// into a process-global table (the menu is per record TYPE, as in C), so one
 /// call suffices for every IOC in the process.
 pub fn register_asyn_device_menus() {
-    for &record_type in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
-        if let Some(choices) = crate::dbd_generated::device_menu(record_type) {
+    for &record_type in ASYN_DEVICE_MENU_RECORD_TYPES {
+        if let Some(choices) = asyn_device_menu(record_type) {
             epics_base_rs::server::record::register_device_menu(record_type, choices);
         }
     }
-    // The busy record's asyn binding comes from the busy MODULE, not asyn's own
-    // .dbd (busySupport_withASYN.dbd: `device(busy,INST_IO,asynBusyInt32,
-    // "asynInt32")`), so it is registered here rather than in the generated
-    // table above. The binding itself is the universal factory + the
-    // unconditional readback forced in `init` (devBusyAsyn.c parity).
-    epics_base_rs::server::record::register_device_menu("busy", &["asynInt32"]);
+}
+
+/// The record types [`asyn_device_menu`] answers for: the generated table plus
+/// `busy`.
+static ASYN_DEVICE_MENU_RECORD_TYPES: &[&str] = &{
+    const N: usize = crate::dbd_generated::DEVICE_MENU_RECORD_TYPES.len() + 1;
+    let mut all = [""; N];
+    let mut i = 0;
+    while i < N - 1 {
+        all[i] = crate::dbd_generated::DEVICE_MENU_RECORD_TYPES[i];
+        i += 1;
+    }
+    all[N - 1] = "busy";
+    all
+};
+
+/// The asyn DTYP choices `device()` declares for a record type — the single
+/// source both [`register_asyn_device_menus`] (what base lists) and
+/// [`universal_asyn_factory`] (what it agrees to bind) read, so the two can
+/// never disagree. `None` for a record type asyn's `.dbd` never names.
+///
+/// The busy record's asyn binding comes from the busy MODULE, not asyn's own
+/// .dbd (busySupport_withASYN.dbd: `device(busy,INST_IO,asynBusyInt32,
+/// "asynInt32")`), so it is added here rather than in the generated table.
+/// The binding itself is the universal factory + the unconditional readback
+/// forced in `init` (devBusyAsyn.c parity).
+fn asyn_device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+    if record_type == "busy" {
+        return Some(&["asynInt32"]);
+    }
+    crate::dbd_generated::device_menu(record_type)
 }
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
@@ -4636,6 +4677,7 @@ mod tests {
         crate::asyn_record::register_port("ts_factory", handle).unwrap();
 
         let ctx = DeviceSupportContext {
+            record_type: "waveform",
             dtyp: "asynInt32TimeSeries",
             inp: "@asyn(ts_factory,0)VAL",
             out: "",
@@ -7820,6 +7862,7 @@ mod tests {
         crate::asyn_record::register_port("binwrite_wb", handle).unwrap();
 
         let ctx = DeviceSupportContext {
+            record_type: "waveform",
             dtyp: "asynOctetWriteBinary",
             inp: "@asyn(binwrite_wb,0)REG",
             out: "",
@@ -7852,6 +7895,7 @@ mod tests {
         crate::asyn_record::register_port("binwrite_text", handle).unwrap();
 
         let ctx = DeviceSupportContext {
+            record_type: "waveform",
             dtyp: "asynOctetWrite",
             inp: "@asyn(binwrite_text,0)REG",
             out: "",
@@ -7869,6 +7913,67 @@ mod tests {
             vec![vec![0x01]],
             "text write must trim at the first NUL"
         );
+    }
+
+    /// A (record type, DTYP) pair no asyn `device()` line declares gets no
+    /// device from the universal factory, so base reports the record as
+    /// having no device support — C's `Can't set 'X.DTYP'` at db load. A
+    /// `calcout` with `DTYP asynInt32` and an `@asyn` OUT used to bind an
+    /// asynInt32 output dset the record type never calls, so it loaded
+    /// cleanly, computed OVAL and wrote nothing to the driver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn factory_refuses_a_record_type_its_dbd_never_declares() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+
+        let (handle, _writes) = spawn_binary_write_port("undeclared_rt");
+        crate::asyn_record::register_port("undeclared_rt", handle).unwrap();
+
+        let bind = |record_type: &str, dtyp: &str| {
+            universal_asyn_factory(&DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp: "",
+                out: "@asyn(undeclared_rt,0)NUM_POINTS",
+            })
+            .is_some()
+        };
+        assert!(
+            !bind("calcout", "asynInt32"),
+            "no device(calcout, ...) line"
+        );
+        assert!(
+            bind("longout", "asynInt32"),
+            "the control: device(longout, INST_IO, asynLoInt32, \"asynInt32\")"
+        );
+        // The rule is the pair, not the record type alone: ao declares no
+        // asynOctetWrite, busy (from the busy module) declares asynInt32.
+        assert!(
+            !bind("ao", "asynOctetWrite"),
+            "no device(ao, ..., \"asynOctetWrite\") line"
+        );
+        assert!(
+            bind("busy", "asynInt32"),
+            "busySupport_withASYN.dbd declares it"
+        );
+    }
+
+    /// The factory's gate and the menus base lists read one table: every
+    /// choice `register_asyn_device_menus` publishes for a record type is a
+    /// pair the factory binds, and the record types are the generated list
+    /// plus busy.
+    #[test]
+    fn asyn_device_menu_is_the_generated_table_plus_busy() {
+        for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
+            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::device_menu(rt));
+            assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&rt));
+        }
+        assert_eq!(asyn_device_menu("busy"), Some(&["asynInt32"][..]));
+        assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&"busy"));
+        assert_eq!(
+            ASYN_DEVICE_MENU_RECORD_TYPES.len(),
+            crate::dbd_generated::DEVICE_MENU_RECORD_TYPES.len() + 1
+        );
+        assert_eq!(asyn_device_menu("calcout"), None);
     }
 
     /// Mock array port: records every float32 array write and accepts any
@@ -7942,6 +8047,7 @@ mod tests {
         crate::asyn_record::register_port("f32arr_out", handle).unwrap();
 
         let ctx = DeviceSupportContext {
+            record_type: "waveform",
             dtyp: "asynFloat32ArrayOut",
             inp: "@asyn(f32arr_out,0)USER_WF",
             out: "",
@@ -8363,6 +8469,7 @@ mod tests {
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
         let ctx = DeviceSupportContext {
+            record_type: "stringin",
             dtyp: "asynOctetCmdResponse",
             inp: "@asyn(cmdresp_factory,0)*IDN?\\r\\n",
             out: "",
@@ -8415,6 +8522,7 @@ mod tests {
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
         let ctx = DeviceSupportContext {
+            record_type: "stringin",
             dtyp: "asynOctetCmdResponse",
             inp: "@asyn(cmdresp_nul,0)AB\\000CD",
             out: "",
@@ -8450,6 +8558,7 @@ mod tests {
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty
         // command -> C writes 0 bytes then reads.
         let ctx = DeviceSupportContext {
+            record_type: "stringin",
             dtyp: "asynOctetCmdResponse",
             inp: "@asyn(cmdresp_lnul,0)\\000CD",
             out: "",

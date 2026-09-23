@@ -523,6 +523,10 @@ pub fn db_load_group_startup_command() -> CommandDef {
 
 /// Context passed to dynamic device support factories during iocInit wiring.
 pub struct DeviceSupportContext<'a> {
+    /// The record type name (`"ao"`, `"calcout"`, ...). C's `device()` lines
+    /// are declared per record type, so a factory that stands in for a set of
+    /// them needs the type to refuse a DTYP its `.dbd` never declared for it.
+    pub record_type: &'a str,
     pub dtyp: &'a str,
     pub inp: &'a str,
     pub out: &'a str,
@@ -2575,6 +2579,7 @@ pub(crate) fn attach_device_support(
         return false;
     }
     let ctx = DeviceSupportContext {
+        record_type: instance.record.record_type(),
         dtyp: &dtyp,
         inp: &instance.common.inp,
         out: &instance.common.out,

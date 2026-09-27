@@ -257,6 +257,44 @@ impl NDDataBuffer {
             }
         }
     }
+
+    /// Every element as f64, converted on the typed slice: the per-frame form
+    /// of [`get_as_f64`](Self::get_as_f64), for a plugin that works in
+    /// `double` as C's `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` does.
+    pub fn to_f64_vec(&self) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.copy_to_f64(&mut out);
+        out
+    }
+
+    /// [`to_f64_vec`](Self::to_f64_vec) into a buffer the caller keeps: `out`
+    /// is emptied and refilled, so a plugin that converts every frame reuses
+    /// the mapping instead of faulting in a fresh frame-sized allocation
+    /// each time (at 2048x2048 the fault-in costs several times the
+    /// conversion).
+    pub fn copy_to_f64(&self, out: &mut Vec<f64>) {
+        out.clear();
+        crate::with_buffer!(self, |v| out
+            .extend(v.iter().map(|&x| crate::pixel_cast::PixelCast::to_f64(x))));
+    }
+
+    /// A buffer of `data_type` holding `values`, each cast as
+    /// [`set_from_f64`](Self::set_from_f64) casts it: `as`, which truncates,
+    /// saturates the integer types and takes a NaN to 0.
+    pub fn from_f64(data_type: NDDataType, values: &[f64]) -> Self {
+        match data_type {
+            NDDataType::Int8 => Self::I8(values.iter().map(|&x| x as i8).collect()),
+            NDDataType::UInt8 => Self::U8(values.iter().map(|&x| x as u8).collect()),
+            NDDataType::Int16 => Self::I16(values.iter().map(|&x| x as i16).collect()),
+            NDDataType::UInt16 => Self::U16(values.iter().map(|&x| x as u16).collect()),
+            NDDataType::Int32 => Self::I32(values.iter().map(|&x| x as i32).collect()),
+            NDDataType::UInt32 => Self::U32(values.iter().map(|&x| x as u32).collect()),
+            NDDataType::Int64 => Self::I64(values.iter().map(|&x| x as i64).collect()),
+            NDDataType::UInt64 => Self::U64(values.iter().map(|&x| x as u64).collect()),
+            NDDataType::Float32 => Self::F32(values.iter().map(|&x| x as f32).collect()),
+            NDDataType::Float64 => Self::F64(values.to_vec()),
+        }
+    }
 }
 
 /// A single dimension of an NDArray.
@@ -765,5 +803,59 @@ mod tests {
         });
         let cloned = arr.clone();
         assert_eq!(cloned.codec.as_ref().unwrap().compressed_size, 42);
+    }
+
+    /// `to_f64_vec` is `get_as_f64` over every index, and `from_f64` is
+    /// `set_from_f64` at every index, for every element type — including
+    /// the values the `as` cast saturates or zeroes.
+    #[test]
+    fn frame_wide_f64_conversions_match_the_per_element_ones() {
+        let values = [
+            -3.7,
+            -0.2,
+            0.0,
+            0.6,
+            1.4,
+            200.5,
+            70_000.9,
+            5e9,
+            -5e9,
+            1e300,
+            f64::NAN,
+        ];
+        for data_type in (0..10).map(|o| NDDataType::from_ordinal(o).unwrap()) {
+            let from = NDDataBuffer::from_f64(data_type, &values);
+            let mut set = NDDataBuffer::zeros(data_type, values.len());
+            for (i, &v) in values.iter().enumerate() {
+                set.set_from_f64(i, v);
+            }
+            assert_eq!(
+                from.as_u8_slice(),
+                set.as_u8_slice(),
+                "{data_type:?} from_f64"
+            );
+            let to = from.to_f64_vec();
+            let mut reused = vec![7.0; 3];
+            let capacity_before = {
+                reused.reserve(values.len());
+                reused.capacity()
+            };
+            from.copy_to_f64(&mut reused);
+            assert_eq!(reused.capacity(), capacity_before, "{data_type:?} reused");
+            assert_eq!(reused.len(), to.len());
+            assert!(
+                reused
+                    .iter()
+                    .zip(&to)
+                    .all(|(a, b)| a == b || (a.is_nan() && b.is_nan()))
+            );
+            for (i, &got) in to.iter().enumerate() {
+                let want = from.get_as_f64(i).unwrap();
+                assert!(
+                    got == want || (got.is_nan() && want.is_nan()),
+                    "{data_type:?}[{i}]: {got} vs {want}"
+                );
+            }
+        }
     }
 }

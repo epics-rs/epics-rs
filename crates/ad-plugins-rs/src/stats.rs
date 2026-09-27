@@ -171,7 +171,7 @@ pub fn compute_stats(
 /// (exact, and a plain integer add the compiler vectorizes), `f64` for the
 /// 64-bit integers and the floats (C sums every type in `double`,
 /// NDPluginStats.cpp:137).
-trait StatsElem: Copy + PartialOrd + 'static {
+pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     /// The total's type.
     type Acc: Copy + Default + std::ops::Add<Output = Self::Acc>;
     /// The per-lane running sum, flushed into `Acc` every [`FLUSH`] chunks:
@@ -402,10 +402,10 @@ const PAR_CHUNK: usize = 1 << 16;
 
 /// Extremes and total of one slice, by value; the positions come later from
 /// [`first_index`] so this pass is a pure reduction.
-struct Range<T> {
-    min: T,
-    max: T,
-    total: f64,
+pub(crate) struct Range<T> {
+    pub(crate) min: T,
+    pub(crate) max: T,
+    pub(crate) total: f64,
 }
 
 /// One pass: per-lane min, max and sum, then a lane fold. Strict `<`/`>`
@@ -874,8 +874,7 @@ mod simd_kernels {
 }
 
 /// Merge two partial ranges; ties keep `a`, the earlier slice.
-#[cfg(feature = "parallel")]
-fn merge_range<T: StatsElem>(a: Range<T>, b: Range<T>) -> Range<T> {
+pub(crate) fn merge_range<T: StatsElem>(a: Range<T>, b: Range<T>) -> Range<T> {
     Range {
         min: T::lower(a.min, b.min),
         max: T::upper(a.max, b.max),

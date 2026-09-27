@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-// Not gated on `parallel`: `should_parallelize` is the whole decision now
-// and this file asks it on both arms.
+#[cfg(feature = "parallel")]
 use crate::par_util;
 use parking_lot::Mutex;
 #[cfg(feature = "parallel")]
@@ -12,28 +11,20 @@ use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
-/// Simple Bayer demosaic using bilinear interpolation.
+/// Bayer demosaic to RGB1 by bilinear interpolation, in the element type.
+///
+/// C runs `convertColor<epicsType>` on the pixels themselves and interpolates
+/// in `unsigned int` (NDPluginColorConvert.cpp:262-289): a neighbour sum
+/// divided by 4 or 2, truncating, which an 8- or 16-bit value never
+/// overflows. Only the pixels not touching a border are interpolated
+/// (`:267`); a border pixel keeps its native channel and zero in the other
+/// two.
 pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> {
     if src.dims.len() != 2 {
         return None;
     }
     let w = src.dims[0].size;
     let h = src.dims[1].size;
-
-    // Read dimension offsets to adjust the bayer phase when offset is odd
-    let offset_x = src.dims[0].offset;
-    let offset_y = src.dims[1].offset;
-
-    // Pre-compute source values into a flat f64 vec for efficient random access
-    let n = w * h;
-    let src_vals: Vec<f64> = (0..n)
-        .map(|i| src.data.get_as_f64(i).unwrap_or(0.0))
-        .collect();
-    let get_val = |x: usize, y: usize| -> f64 { src_vals[y * w + x] };
-
-    let mut r = vec![0.0f64; n];
-    let mut g = vec![0.0f64; n];
-    let mut b = vec![0.0f64; n];
 
     // Which rows and columns hold the red pixels. C adds the pattern's low
     // bit to the row and its high bit to the column before testing both for
@@ -47,137 +38,20 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         NDBayerPattern::GRBG => (true, false),
         NDBayerPattern::BGGR => (false, false),
     };
-    if offset_x % 2 != 0 {
+    if src.dims[0].offset % 2 != 0 {
         r_col_even = !r_col_even;
     }
-    if offset_y % 2 != 0 {
+    if src.dims[1].offset % 2 != 0 {
         r_row_even = !r_row_even;
     }
-
-    // Helper to demosaic a single row into (r, g, b) slices.
-    //
-    // C interpolates only pixels not touching a border
-    // (NDPluginColorConvert.cpp:305): a pixel with x in 0/rowSize-1 or y in
-    // 0/numRows-1 keeps only its native Bayer channel, the other two stay 0.
-    // Interior pixels always have all 8 neighbours, so C's fixed divisors
-    // (/4 for the red/blue arms, /2 for green) apply directly.
-    let demosaic_row = |y: usize, r_row: &mut [f64], g_row: &mut [f64], b_row: &mut [f64]| {
-        let even_row = (y % 2 == 0) == r_row_even;
-        for x in 0..w {
-            let val = get_val(x, y);
-            let even_col = (x % 2 == 0) == r_col_even;
-            let interior = x > 0 && x + 1 < w && y > 0 && y + 1 < h;
-
-            match (even_row, even_col) {
-                (true, true) => {
-                    // Red pixel: green = orthogonal mean, blue = diagonal mean
-                    // (NDPluginColorConvert.cpp:308-309).
-                    r_row[x] = val;
-                    if interior {
-                        g_row[x] = (get_val(x - 1, y)
-                            + get_val(x + 1, y)
-                            + get_val(x, y - 1)
-                            + get_val(x, y + 1))
-                            / 4.0;
-                        b_row[x] = (get_val(x - 1, y - 1)
-                            + get_val(x + 1, y - 1)
-                            + get_val(x - 1, y + 1)
-                            + get_val(x + 1, y + 1))
-                            / 4.0;
-                    }
-                }
-                (true, false) | (false, true) => {
-                    // Green pixel.
-                    g_row[x] = val;
-                    if interior {
-                        if even_row {
-                            // Green next to red: red horizontal, blue vertical
-                            // (NDPluginColorConvert.cpp:313-314).
-                            r_row[x] = (get_val(x - 1, y) + get_val(x + 1, y)) / 2.0;
-                            b_row[x] = (get_val(x, y - 1) + get_val(x, y + 1)) / 2.0;
-                        } else {
-                            // Green next to blue: blue horizontal, red vertical
-                            // (NDPluginColorConvert.cpp:318-319).
-                            b_row[x] = (get_val(x - 1, y) + get_val(x + 1, y)) / 2.0;
-                            r_row[x] = (get_val(x, y - 1) + get_val(x, y + 1)) / 2.0;
-                        }
-                    }
-                }
-                (false, false) => {
-                    // Blue pixel: green = orthogonal mean, red = diagonal mean
-                    // (NDPluginColorConvert.cpp:308-309, blue branch).
-                    b_row[x] = val;
-                    if interior {
-                        g_row[x] = (get_val(x - 1, y)
-                            + get_val(x + 1, y)
-                            + get_val(x, y - 1)
-                            + get_val(x, y + 1))
-                            / 4.0;
-                        r_row[x] = (get_val(x - 1, y - 1)
-                            + get_val(x + 1, y - 1)
-                            + get_val(x - 1, y + 1)
-                            + get_val(x + 1, y + 1))
-                            / 4.0;
-                    }
-                }
-            }
-        }
+    let phase = BayerPhase {
+        r_row_even,
+        r_col_even,
     };
 
-    let use_parallel = par_util::should_parallelize(n);
-
-    if use_parallel {
-        #[cfg(feature = "parallel")]
-        {
-            // Split r, g, b into per-row mutable slices and process in parallel
-            let r_rows: Vec<&mut [f64]> = r.chunks_mut(w).collect();
-            let g_rows: Vec<&mut [f64]> = g.chunks_mut(w).collect();
-            let b_rows: Vec<&mut [f64]> = b.chunks_mut(w).collect();
-
-            par_util::thread_pool().install(|| {
-                r_rows
-                    .into_par_iter()
-                    .zip(g_rows.into_par_iter())
-                    .zip(b_rows.into_par_iter())
-                    .enumerate()
-                    .for_each(|(y, ((r_row, g_row), b_row))| {
-                        demosaic_row(y, r_row, g_row, b_row);
-                    });
-            });
-        }
-    } else {
-        for y in 0..h {
-            let row_start = y * w;
-            let row_end = row_start + w;
-            demosaic_row(
-                y,
-                &mut r[row_start..row_end],
-                &mut g[row_start..row_end],
-                &mut b[row_start..row_end],
-            );
-        }
-    }
-
-    // Build RGB1 interleaved output
-    let out_data = match src.data.data_type() {
-        NDDataType::UInt8 => {
-            let mut out = vec![0u8; n * 3];
-            for i in 0..n {
-                out[i * 3] = r[i].clamp(0.0, 255.0) as u8;
-                out[i * 3 + 1] = g[i].clamp(0.0, 255.0) as u8;
-                out[i * 3 + 2] = b[i].clamp(0.0, 255.0) as u8;
-            }
-            NDDataBuffer::U8(out)
-        }
-        NDDataType::UInt16 => {
-            let mut out = vec![0u16; n * 3];
-            for i in 0..n {
-                out[i * 3] = r[i].clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 1] = g[i].clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 2] = b[i].clamp(0.0, 65535.0) as u16;
-            }
-            NDDataBuffer::U16(out)
-        }
+    let out_data = match &src.data {
+        NDDataBuffer::U8(v) => NDDataBuffer::U8(demosaic(v, w, h, phase)),
+        NDDataBuffer::U16(v) => NDDataBuffer::U16(demosaic(v, w, h, phase)),
         _ => return None,
     };
 
@@ -192,6 +66,146 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
     arr.timestamp = src.timestamp;
     arr.attributes = src.attributes.clone();
     Some(arr)
+}
+
+/// Where the red pixels of a frame lie, after the pattern and the offsets.
+#[derive(Clone, Copy)]
+struct BayerPhase {
+    r_row_even: bool,
+    r_col_even: bool,
+}
+
+/// A pixel type C's Bayer interpolation runs on: its values fit an
+/// `unsigned int`, and so does any mean of them.
+trait BayerPixel: Copy + Default + Send + Sync {
+    fn to_u32(self) -> u32;
+    fn from_u32(v: u32) -> Self;
+}
+
+macro_rules! bayer_pixel {
+    ($($t:ty),*) => {$(
+        impl BayerPixel for $t {
+            #[inline(always)]
+            fn to_u32(self) -> u32 {
+                self as u32
+            }
+            #[inline(always)]
+            fn from_u32(v: u32) -> Self {
+                v as $t
+            }
+        }
+    )*};
+}
+bayer_pixel!(u8, u16);
+
+/// The RGB1 frame of `src` (`w * h` pixels, zero-padded if shorter), row by
+/// row across the pool when the frame is large enough.
+fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase) -> Vec<T> {
+    let n = w * h;
+    let padded: Vec<T>;
+    let src = if src.len() >= n {
+        &src[..n]
+    } else {
+        padded = src
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(T::default()))
+            .take(n)
+            .collect();
+        &padded
+    };
+    let mut out = vec![T::default(); n * 3];
+    let row = |y: usize, out_row: &mut [T]| demosaic_row(src, w, h, phase, y, out_row);
+
+    #[cfg(feature = "parallel")]
+    if par_util::should_parallelize(n) && w > 0 {
+        par_util::thread_pool().install(|| {
+            out.par_chunks_mut(w * 3)
+                .enumerate()
+                .for_each(|(y, out_row)| row(y, out_row));
+        });
+        return out;
+    }
+    if w > 0 {
+        for (y, out_row) in out.chunks_mut(w * 3).enumerate() {
+            row(y, out_row);
+        }
+    }
+    out
+}
+
+/// Row `y` of the RGB1 output — C's per-pixel arithmetic
+/// (NDPluginColorConvert.cpp:262-289) with the row above and below in hand.
+fn demosaic_row<T: BayerPixel>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    phase: BayerPhase,
+    y: usize,
+    out_row: &mut [T],
+) {
+    let row = &src[y * w..(y + 1) * w];
+    let interior_y = y > 0 && y + 1 < h;
+    // Only read when `interior_y`; any row does for the type.
+    let above = if interior_y {
+        &src[(y - 1) * w..y * w]
+    } else {
+        row
+    };
+    let below = if interior_y {
+        &src[(y + 1) * w..(y + 2) * w]
+    } else {
+        row
+    };
+    let at = |r: &[T], x: usize| r[x].to_u32();
+    let even_row = (y % 2 == 0) == phase.r_row_even;
+    for (x, px) in out_row.chunks_exact_mut(3).enumerate() {
+        let val = at(row, x);
+        let even_col = (x % 2 == 0) == phase.r_col_even;
+        let interior = interior_y && x > 0 && x + 1 < w;
+        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+        // The four orthogonal and four diagonal neighbours, each over 4
+        // (`:269-270`, `:274-275`); the two horizontal and the two vertical
+        // ones, each over 2 (`:279-280`, `:284-285`).
+        let orthogonal = || (at(row, x - 1) + at(row, x + 1) + at(above, x) + at(below, x)) / 4;
+        let diagonal =
+            || (at(above, x - 1) + at(above, x + 1) + at(below, x - 1) + at(below, x + 1)) / 4;
+        let horizontal = || (at(row, x - 1) + at(row, x + 1)) / 2;
+        let vertical = || (at(above, x) + at(below, x)) / 2;
+        match (even_row, even_col) {
+            (true, true) => {
+                r = val;
+                if interior {
+                    g = orthogonal();
+                    b = diagonal();
+                }
+            }
+            (true, false) | (false, true) => {
+                g = val;
+                if interior {
+                    if even_row {
+                        // Green next to red.
+                        r = horizontal();
+                        b = vertical();
+                    } else {
+                        // Green next to blue.
+                        b = horizontal();
+                        r = vertical();
+                    }
+                }
+            }
+            (false, false) => {
+                b = val;
+                if interior {
+                    g = orthogonal();
+                    r = diagonal();
+                }
+            }
+        }
+        px[0] = T::from_u32(r);
+        px[1] = T::from_u32(g);
+        px[2] = T::from_u32(b);
+    }
 }
 
 /// Rainbow false-color lookup table (`falseColor == 1`), 256 RGB entries.
@@ -1062,6 +1076,116 @@ mod tests {
         // All eight surrounding pixels are border: native channel only.
         assert_eq!(rgb1_pixel(&rgb, 3, 0, 0), [200, 0, 0]); // red
         assert_eq!(rgb1_pixel(&rgb, 3, 1, 0), [0, 40, 0]); // green
+    }
+
+    /// C `convertColor<epicsType>`'s Bayer branch (NDPluginColorConvert.cpp
+    /// :235-289) in `unsigned int`, pixel by pixel from the nine pointers.
+    fn reference_bayer(
+        src: &[u32],
+        w: usize,
+        h: usize,
+        off: (usize, usize),
+        pattern: u32,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; w * h * 3];
+        for ipixel in 0..w * h {
+            let (x, y) = (ipixel % w, ipixel / w);
+            let bx = x + off.0 + ((pattern >> 1) & 1) as usize;
+            let by = y + off.1 + (pattern & 1) as usize;
+            let p = |dx: isize, dy: isize| {
+                src[((y as isize + dy) * w as isize + x as isize + dx) as usize]
+            };
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            let colour = if bx % 2 == 0 && by % 2 == 0 {
+                r = p(0, 0);
+                0
+            } else if bx % 2 == 1 && by % 2 == 1 {
+                b = p(0, 0);
+                2
+            } else {
+                g = p(0, 0);
+                1
+            };
+            if x > 0 && x < w - 1 && y > 0 && y < h - 1 {
+                let diag = (p(-1, -1) + p(1, -1) + p(-1, 1) + p(1, 1)) / 4;
+                let orth = (p(0, -1) + p(-1, 0) + p(1, 0) + p(0, 1)) / 4;
+                if colour == 0 {
+                    b = diag;
+                    g = orth;
+                }
+                if colour == 2 {
+                    r = diag;
+                    g = orth;
+                }
+                if colour == 1 && bx % 2 == 1 {
+                    r = (p(-1, 0) + p(1, 0)) / 2;
+                    b = (p(0, -1) + p(0, 1)) / 2;
+                }
+                if colour == 1 && bx % 2 == 0 {
+                    b = (p(-1, 0) + p(1, 0)) / 2;
+                    r = (p(0, -1) + p(0, 1)) / 2;
+                }
+            }
+            out[ipixel * 3] = r;
+            out[ipixel * 3 + 1] = g;
+            out[ipixel * 3 + 2] = b;
+        }
+        out
+    }
+
+    /// Every pattern and offset parity on frames from a single pixel up to
+    /// one past the parallel threshold, for both element types.
+    #[test]
+    fn bayer_to_rgb1_matches_the_c_pixel_arithmetic() {
+        let patterns = [
+            NDBayerPattern::RGGB,
+            NDBayerPattern::GBRG,
+            NDBayerPattern::GRBG,
+            NDBayerPattern::BGGR,
+        ];
+        for (w, h) in [(1, 1), (2, 3), (3, 3), (5, 4), (16, 9), (100, 50)] {
+            let vals: Vec<u32> = (0..w * h).map(|i| (i * 7919 + 13) as u32 % 65536).collect();
+            for off in [(0, 0), (1, 0), (0, 1), (3, 5)] {
+                for pattern in patterns {
+                    let want = reference_bayer(&vals, w, h, off, pattern as u32);
+                    let mut dims = vec![NDDimension::new(w), NDDimension::new(h)];
+                    dims[0].offset = off.0;
+                    dims[1].offset = off.1;
+                    let u16s = NDArray::with_data(
+                        dims.clone(),
+                        NDDataBuffer::U16(vals.iter().map(|&v| v as u16).collect()),
+                    );
+                    let got = bayer_to_rgb1(&u16s, pattern).unwrap();
+                    let NDDataBuffer::U16(got) = &got.data else {
+                        panic!("u16 in, u16 out");
+                    };
+                    assert_eq!(got.len(), want.len(), "{w}x{h} {off:?} {pattern:?}");
+                    assert!(
+                        got.iter().zip(&want).all(|(&g, &w)| g as u32 == w),
+                        "u16 {w}x{h} {off:?} {pattern:?}"
+                    );
+                    let want8 = reference_bayer(
+                        &vals.iter().map(|&v| v & 0xff).collect::<Vec<_>>(),
+                        w,
+                        h,
+                        off,
+                        pattern as u32,
+                    );
+                    let u8s = NDArray::with_data(
+                        dims,
+                        NDDataBuffer::U8(vals.iter().map(|&v| v as u8).collect()),
+                    );
+                    let got = bayer_to_rgb1(&u8s, pattern).unwrap();
+                    let NDDataBuffer::U8(got) = &got.data else {
+                        panic!("u8 in, u8 out");
+                    };
+                    assert!(
+                        got.iter().zip(&want8).all(|(&g, &w)| g as u32 == w),
+                        "u8 {w}x{h} {off:?} {pattern:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

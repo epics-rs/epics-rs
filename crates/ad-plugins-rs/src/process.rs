@@ -130,9 +130,7 @@ impl Default for ProcessConfig {
 /// C++ `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` reduced to what the
 /// background / flat-field buffers actually need: the elements as f64.
 fn elements_as_f64(array: &NDArray) -> Vec<f64> {
-    (0..array.data.len())
-        .map(|i| array.data.get_as_f64(i).unwrap_or(0.0))
-        .collect()
+    array.data.to_f64_vec()
 }
 
 /// State for the process plugin (holds background, flat field, and filter state).
@@ -172,7 +170,7 @@ pub struct ProcessState {
     /// that actually emits an array — a filter-suppressed frame leaves C's
     /// `doCallbacks = 0`, so `endProcessCallbacks` never runs and `pArrays[0]`
     /// keeps the previous output.
-    last_output: Option<NDArray>,
+    last_output: Option<Arc<NDArray>>,
 }
 
 /// C's recursive-filter term: `if (coef) acc += coef * term`
@@ -210,7 +208,7 @@ impl ProcessState {
     /// The plugin's last output array — C++ `this->pArrays[0]`. `None` until the
     /// first frame is emitted.
     pub fn last_output(&self) -> Option<&NDArray> {
-        self.last_output.as_ref()
+        self.last_output.as_deref()
     }
 
     /// C++ `NDPluginProcess::writeInt32(NDPluginProcessSaveBackground)`
@@ -264,15 +262,17 @@ impl ProcessState {
         }
         let mut min_val = f64::MAX;
         let mut max_val = f64::MIN;
-        for i in 0..n {
-            let v = array.data.get_as_f64(i).unwrap_or(0.0);
-            if v < min_val {
-                min_val = v;
+        ad_core_rs::with_buffer!(&array.data, |v| {
+            for &e in v.iter() {
+                let v = ad_core_rs::pixel_cast::PixelCast::to_f64(e);
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
             }
-            if v > max_val {
-                max_val = v;
-            }
-        }
+        });
         let range = max_val - min_val;
         if range > 0.0 {
             // C++: maxScale = pow(2, bytesPerElement*8) - 1
@@ -558,7 +558,7 @@ impl ProcessState {
     /// Close a frame: arm auto offset/scale from it and cache the emitted
     /// array as C's `pArrays[0]`. Runs under the lock, on the emitting path
     /// only.
-    fn end_frame(&mut self, frame: &ProcessFrame, src: &NDArray, arr: &NDArray) {
+    fn end_frame(&mut self, frame: &ProcessFrame, src: &NDArray, arr: &Arc<NDArray>) {
         // Arm auto offset/scale from THIS frame's data for the NEXT frame
         // (C NDPluginProcess.cpp:238-250 runs after the output array is built).
         // Only on the emitted-output path: a suppressed frame produces no output
@@ -570,8 +570,10 @@ impl ProcessState {
         // C `endProcessCallbacks` caches the emitted array in pArrays[0]
         // (NDPluginDriver.cpp:262-277). It runs only on this path — a
         // filter-suppressed frame returned above and leaves the previous output
-        // in place. This is the ONLY writer of `last_output`.
-        self.last_output = Some(arr.clone());
+        // in place. This is the ONLY writer of `last_output`. The emitted
+        // array is shared, not copied: it is immutable once built, and C
+        // likewise keeps a reference (`pArray->reserve()`), not a copy.
+        self.last_output = Some(Arc::clone(arr));
     }
 
     /// Process an array through the configured pipeline.
@@ -583,14 +585,14 @@ impl ProcessState {
     /// This is the single-threaded composition. `process_array` drives the
     /// same steps itself so it can hold the state lock for `begin_frame`,
     /// `run_filter` and `end_frame` only.
-    pub fn process(&mut self, src: &NDArray) -> Option<NDArray> {
+    pub fn process(&mut self, src: &NDArray) -> Option<Arc<NDArray>> {
         let mut values = elements_as_f64(src);
         let frame = self.begin_frame(values.len());
         frame.apply_element_ops(&mut values);
         if !self.run_filter(&frame, &mut values) {
             return None;
         }
-        let arr = frame.build_output(src, &values);
+        let arr = Arc::new(frame.build_output(src, &values));
         self.end_frame(&frame, src, &arr);
         Some(arr)
     }
@@ -705,16 +707,9 @@ impl ProcessFrame {
     /// released; C likewise converts to the output data type with the lock
     /// down and only re-takes it at NDPluginProcess.cpp:254.
     fn build_output(&self, src: &NDArray, values: &[f64]) -> NDArray {
-        let n = values.len();
-        // Build output
         let out_type = self.config.output_type.unwrap_or(src.data.data_type());
-        let mut out_data = NDDataBuffer::zeros(out_type, n);
-        for i in 0..n {
-            out_data.set_from_f64(i, values[i]);
-        }
-
         let mut arr = NDArray::new(src.dims.clone(), out_type);
-        arr.data = out_data;
+        arr.data = NDDataBuffer::from_f64(out_type, values);
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
@@ -766,6 +761,10 @@ struct ProcParamIndices {
 /// ProcessProcessor wraps existing ProcessState.
 pub struct ProcessProcessor {
     state: Mutex<ProcessState>,
+    /// The frame's f64 working copy, kept between frames: C works in a
+    /// pool-recycled NDFloat64 array, and a fresh frame-sized Vec per frame
+    /// spends more on faulting its pages in than on the conversion.
+    scratch: Mutex<Vec<f64>>,
     params: ProcParamIndices,
 }
 
@@ -773,6 +772,7 @@ impl ProcessProcessor {
     pub fn new(config: ProcessConfig) -> Self {
         Self {
             state: Mutex::new(ProcessState::new(config)),
+            scratch: Mutex::new(Vec::new()),
             params: ProcParamIndices::default(),
         }
     }
@@ -792,7 +792,8 @@ impl NDPluginProcess for ProcessProcessor {
         // to post the readbacks. Drive `ProcessState`'s steps here rather than
         // calling `process`, so the two frame-sized loops -- the element-wise
         // pass and the output conversion -- run with the lock down.
-        let mut values = elements_as_f64(array);
+        let mut values = self.scratch.lock();
+        array.data.copy_to_f64(&mut values);
         let frame = self.state.lock().begin_frame(values.len());
         frame.apply_element_ops(&mut values);
 
@@ -803,7 +804,7 @@ impl NDPluginProcess for ProcessProcessor {
         };
 
         let out = if emitted {
-            let arr = frame.build_output(array, &values);
+            let arr = Arc::new(frame.build_output(array, &values));
             self.state.lock().end_frame(&frame, array, &arr);
             Some(arr)
         } else {
@@ -813,7 +814,7 @@ impl NDPluginProcess for ProcessProcessor {
         // A suppressed frame (filter_callbacks) produces no output array but
         // still publishes readback params.
         let mut result = match out {
-            Some(arr) => ProcessResult::arrays(vec![Arc::new(arr)]),
+            Some(arr) => ProcessResult::arrays(vec![arr]),
             None => ProcessResult::sink(vec![]),
         };
 
@@ -1115,13 +1116,13 @@ mod tests {
     /// Put `arr` in C's `pArrays[0]` and write SaveBackground — the only route by
     /// which C ever fills pBackground (NDPluginProcess.cpp:293-297).
     fn seed_background(state: &mut ProcessState, arr: &NDArray) {
-        state.last_output = Some(arr.clone());
+        state.last_output = Some(Arc::new(arr.clone()));
         state.save_background();
     }
 
     /// Same for the flat field (NDPluginProcess.cpp:304-308).
     fn seed_flat_field(state: &mut ProcessState, arr: &NDArray) {
-        state.last_output = Some(arr.clone());
+        state.last_output = Some(Arc::new(arr.clone()));
         state.save_flat_field();
     }
 

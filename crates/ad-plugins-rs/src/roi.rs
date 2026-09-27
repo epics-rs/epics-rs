@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::pixel_cast::PixelCast;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
@@ -75,14 +76,21 @@ fn find_centroid_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize
     let mut cx = 0.0f64;
     let mut cy = 0.0f64;
     let mut total = 0.0f64;
-    for iy in 0..y_size {
-        for ix in 0..x_size {
-            let val = data.get_as_f64(iy * x_size + ix).unwrap_or(0.0);
-            total += val;
-            cx += val * ix as f64;
-            cy += val * iy as f64;
+    ad_core_rs::with_buffer!(data, |v| {
+        let v = &v[..(x_size * y_size).min(v.len())];
+        for (iy, row) in v.chunks(x_size).enumerate() {
+            let mut row_total = 0.0f64;
+            let mut row_cx = 0.0f64;
+            for (ix, &e) in row.iter().enumerate() {
+                let val = PixelCast::to_f64(e);
+                row_total += val;
+                row_cx += val * ix as f64;
+            }
+            total += row_total;
+            cx += row_cx;
+            cy += row_total * iy as f64;
         }
-    }
+    });
     if total > 0.0 {
         ((cx / total) as usize, (cy / total) as usize)
     } else {
@@ -95,16 +103,19 @@ fn find_peak_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, us
     let mut max_val = f64::NEG_INFINITY;
     let mut max_x = 0;
     let mut max_y = 0;
-    for iy in 0..y_size {
-        for ix in 0..x_size {
-            let val = data.get_as_f64(iy * x_size + ix).unwrap_or(0.0);
-            if val > max_val {
-                max_val = val;
-                max_x = ix;
-                max_y = iy;
+    ad_core_rs::with_buffer!(data, |v| {
+        let v = &v[..(x_size * y_size).min(v.len())];
+        for (iy, row) in v.chunks(x_size).enumerate() {
+            for (ix, &e) in row.iter().enumerate() {
+                let val = PixelCast::to_f64(e);
+                if val > max_val {
+                    max_val = val;
+                    max_x = ix;
+                    max_y = iy;
+                }
             }
         }
-    }
+    });
     (max_x, max_y)
 }
 

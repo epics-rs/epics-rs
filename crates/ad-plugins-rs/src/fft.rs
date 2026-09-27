@@ -87,6 +87,7 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     }
     let scale = 1.0 / padded as f64;
 
+    let vals = src.data.to_f64_vec();
     let mut magnitudes = vec![0.0f64; n_freq * height];
     let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
 
@@ -96,7 +97,7 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
             *c = Complex::new(0.0, 0.0);
         }
         for i in 0..width {
-            row_buf[i] = Complex::new(src.data.get_as_f64(row * width + i).unwrap_or(0.0), 0.0);
+            row_buf[i] = Complex::new(vals.get(row * width + i).copied().unwrap_or(0.0), 0.0);
         }
 
         fft.process(&mut row_buf);
@@ -146,6 +147,7 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let fft_col = planner.plan_fft_forward(h);
 
     // Step 1: Row FFTs — build a padded w×h complex buffer (zero-padded).
+    let vals = src.data.to_f64_vec();
     let mut data = vec![Complex::new(0.0, 0.0); w * h];
     let mut row_buf = vec![Complex::new(0.0, 0.0); w];
 
@@ -154,7 +156,7 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
             *c = Complex::new(0.0, 0.0);
         }
         for i in 0..src_w {
-            row_buf[i] = Complex::new(src.data.get_as_f64(row * src_w + i).unwrap_or(0.0), 0.0);
+            row_buf[i] = Complex::new(vals.get(row * src_w + i).copied().unwrap_or(0.0), 0.0);
         }
         fft_row.process(&mut row_buf);
         data[row * w..(row * w + w)].copy_from_slice(&row_buf);
@@ -400,9 +402,10 @@ impl FFTFrame<'_> {
         // The first row, zero-extended to the padded length nTimeX. C posts the
         // padded series (calloc'd to nTimeX, the input copied into [0,width)),
         // so FFTTimeSeries and FFTTimeAxis are nTimeX long, not width long.
+        let vals = src.data.to_f64_vec();
         let mut time_series = vec![0.0f64; padded];
         for (i, slot) in time_series.iter_mut().enumerate().take(width) {
-            *slot = src.data.get_as_f64(i).unwrap_or(0.0);
+            *slot = vals.get(i).copied().unwrap_or(0.0);
         }
 
         let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
@@ -476,6 +479,7 @@ impl FFTFrame<'_> {
         }
         let scale = 1.0 / padded as f64;
 
+        let vals = src.data.to_f64_vec();
         let mut magnitudes = vec![0.0f64; n_freq * height];
         let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
 
@@ -484,7 +488,7 @@ impl FFTFrame<'_> {
                 *c = Complex::new(0.0, 0.0);
             }
             for i in 0..width {
-                row_buf[i] = Complex::new(src.data.get_as_f64(row * width + i).unwrap_or(0.0), 0.0);
+                row_buf[i] = Complex::new(vals.get(row * width + i).copied().unwrap_or(0.0), 0.0);
             }
             fft.process(&mut row_buf);
             for i in 0..n_freq {
@@ -530,12 +534,13 @@ impl FFTFrame<'_> {
         // An inverse transform of a real-valued spectrum yields signed real
         // samples: take the real part, not the modulus, so negative samples
         // survive a forward->inverse round trip.
+        let vals = src.data.to_f64_vec();
         let mut samples = vec![0.0f64; width * height];
         let mut row_buf = vec![Complex::new(0.0, 0.0); width];
 
         for row in 0..height {
             for i in 0..width {
-                row_buf[i] = Complex::new(src.data.get_as_f64(row * width + i).unwrap_or(0.0), 0.0);
+                row_buf[i] = Complex::new(vals.get(row * width + i).copied().unwrap_or(0.0), 0.0);
             }
             if suppress_dc {
                 row_buf[0] = Complex::new(0.0, 0.0);
@@ -574,6 +579,7 @@ impl FFTFrame<'_> {
         let fft_row = self.plan_forward(w);
         let fft_col = self.plan_forward(h);
 
+        let vals = src.data.to_f64_vec();
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
         let mut row_buf = vec![Complex::new(0.0, 0.0); w];
 
@@ -582,7 +588,7 @@ impl FFTFrame<'_> {
                 *c = Complex::new(0.0, 0.0);
             }
             for i in 0..src_w {
-                row_buf[i] = Complex::new(src.data.get_as_f64(row * src_w + i).unwrap_or(0.0), 0.0);
+                row_buf[i] = Complex::new(vals.get(row * src_w + i).copied().unwrap_or(0.0), 0.0);
             }
             fft_row.process(&mut row_buf);
             data[row * w..(row * w + w)].copy_from_slice(&row_buf);
@@ -643,9 +649,10 @@ impl FFTFrame<'_> {
         let fft_col = self.plan_inverse(h);
         let scale = 1.0 / (w * h) as f64;
 
+        let vals = src.data.to_f64_vec();
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
         for i in 0..w * h {
-            data[i] = Complex::new(src.data.get_as_f64(i).unwrap_or(0.0), 0.0);
+            data[i] = Complex::new(vals.get(i).copied().unwrap_or(0.0), 0.0);
         }
 
         if suppress_dc {

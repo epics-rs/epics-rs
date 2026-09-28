@@ -173,6 +173,9 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
                     let sv = arr.get(idx as usize)?.clone();
                     Some(Cow::Owned(PvField::Scalar(sv)))
                 }
+                PvField::ScalarArrayTyped(arr) => {
+                    Some(Cow::Owned(PvField::Scalar(arr.get(idx as usize)?)))
+                }
                 PvField::StructureArray(items) => {
                     // A null element resolves to no value.
                     let element = items.get(idx as usize)?.clone()?;
@@ -4863,7 +4866,7 @@ mod tests {
             .await
             .expect("group GET");
         assert!(
-            matches!(val.get_field("w"), Some(PvField::ScalarArray(_))),
+            matches!(val.get_field("w"), Some(PvField::ScalarArrayTyped(_))),
             "plain waveform member GET value must be a scalar array, got {:?}",
             val.get_field("w")
         );
@@ -5981,7 +5984,7 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
         let pv = channel.read_group().await.expect("filtered group GET");
         match get_nested_field(&pv, "w").as_deref() {
-            Some(PvField::ScalarArray(v)) => assert_eq!(
+            Some(PvField::ScalarArrayTyped(v)) => assert_eq!(
                 v.len(),
                 2,
                 "`[1:2]` must slice the member to 2 elements, got {v:?}"

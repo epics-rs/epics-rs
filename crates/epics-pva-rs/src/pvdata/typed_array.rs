@@ -12,15 +12,18 @@
 //! `memcpy` when the host endian matches the wire endian.
 //!
 //! [`TypedScalarArray`] is the matching representation: a sum type
-//! over `Arc<[T]>` for each fixed-width PVA primitive, plus
-//! `Arc<[String]>` and `Arc<[bool]>` for the variable-length / non-POD
-//! variants. The key properties:
+//! over [`PvArray<T>`] for each fixed-width PVA primitive, plus
+//! `PvArray<PvString>` and `PvArray<bool>` for the variable-length /
+//! non-POD variants. The key properties:
 //!
-//! - **`Arc<[T]>` (= reference-counted contiguous array)**: cloning
+//! - **`PvArray<T>` (= reference-counted contiguous array)**: cloning
 //!   the array bumps a refcount instead of allocating + memcpying N×T
 //!   bytes. Subscriber fan-out (one upstream MONITOR event delivered
 //!   to N downstream subscribers) collapses to N refcount bumps, not
-//!   N copies.
+//!   N copies. A `Vec<T>` moves in without a copy, and a buffer some
+//!   other `Arc` owns can be borrowed as it is
+//!   ([`PvArray::from_owner`]), which is how a detector frame is
+//!   published without being copied.
 //! - **`bytemuck::cast_slice`-friendly**: `T: Pod` for every numeric
 //!   variant, so encode can take `&[T]` → `&[u8]` and call
 //!   `Vec::extend_from_slice` once. LLVM lowers that to SIMD memcpy.
@@ -36,14 +39,14 @@
 //! `Vec<ScalarValue>` blowup. Encoders / decoders accept both.
 
 use std::fmt;
-use std::sync::Arc;
 
 use epics_base_rs::types::PvString;
 
+use super::pv_array::PvArray;
 use super::scalar::{ScalarType, ScalarValue};
 
-/// Typed, reference-counted scalar array. Each variant wraps an
-/// `Arc<[T]>` so cloning is O(1).
+/// Typed, reference-counted scalar array. Each variant wraps a
+/// [`PvArray<T>`] so cloning is O(1).
 ///
 /// Choose variants directly when the source data is already typed
 /// (e.g. a Rust `Vec<f64>` from numerical code). For untyped /
@@ -52,18 +55,18 @@ use super::scalar::{ScalarType, ScalarValue};
 /// encoder will fall back to the per-element loop in that case.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedScalarArray {
-    Boolean(Arc<[bool]>),
-    Byte(Arc<[i8]>),
-    UByte(Arc<[u8]>),
-    Short(Arc<[i16]>),
-    UShort(Arc<[u16]>),
-    Int(Arc<[i32]>),
-    UInt(Arc<[u32]>),
-    Long(Arc<[i64]>),
-    ULong(Arc<[u64]>),
-    Float(Arc<[f32]>),
-    Double(Arc<[f64]>),
-    String(Arc<[PvString]>),
+    Boolean(PvArray<bool>),
+    Byte(PvArray<i8>),
+    UByte(PvArray<u8>),
+    Short(PvArray<i16>),
+    UShort(PvArray<u16>),
+    Int(PvArray<i32>),
+    UInt(PvArray<u32>),
+    Long(PvArray<i64>),
+    ULong(PvArray<u64>),
+    Float(PvArray<f32>),
+    Double(PvArray<f64>),
+    String(PvArray<PvString>),
 }
 
 impl TypedScalarArray {
@@ -83,6 +86,24 @@ impl TypedScalarArray {
             Self::Double(_) => ScalarType::Double,
             Self::String(_) => ScalarType::String,
         }
+    }
+
+    /// Element `i` as a [`ScalarValue`], `None` past the end.
+    pub fn get(&self, i: usize) -> Option<ScalarValue> {
+        Some(match self {
+            Self::Boolean(a) => ScalarValue::Boolean(*a.get(i)?),
+            Self::Byte(a) => ScalarValue::Byte(*a.get(i)?),
+            Self::UByte(a) => ScalarValue::UByte(*a.get(i)?),
+            Self::Short(a) => ScalarValue::Short(*a.get(i)?),
+            Self::UShort(a) => ScalarValue::UShort(*a.get(i)?),
+            Self::Int(a) => ScalarValue::Int(*a.get(i)?),
+            Self::UInt(a) => ScalarValue::UInt(*a.get(i)?),
+            Self::Long(a) => ScalarValue::Long(*a.get(i)?),
+            Self::ULong(a) => ScalarValue::ULong(*a.get(i)?),
+            Self::Float(a) => ScalarValue::Float(*a.get(i)?),
+            Self::Double(a) => ScalarValue::Double(*a.get(i)?),
+            Self::String(a) => ScalarValue::String(a.get(i)?.clone()),
+        })
     }
 
     /// Length in elements.
@@ -282,11 +303,11 @@ mod tests {
 
     #[test]
     fn arc_clone_is_refcount_only() {
-        let a = TypedScalarArray::Double(Arc::from(vec![1.0, 2.0, 3.0]));
+        let a = TypedScalarArray::Double(vec![1.0, 2.0, 3.0].into());
         let b = a.clone();
         // Both should share the same allocation.
         if let (TypedScalarArray::Double(x), TypedScalarArray::Double(y)) = (&a, &b) {
-            assert_eq!(Arc::strong_count(x), 2);
+            assert!(x.ptr_eq(y));
             assert_eq!(x.as_ptr(), y.as_ptr());
         } else {
             panic!("variant lost");
@@ -312,7 +333,7 @@ mod tests {
 
     #[test]
     fn round_trip_via_scalar_values() {
-        let arr = TypedScalarArray::Double(Arc::from(vec![1.5, 2.5, 3.5]));
+        let arr = TypedScalarArray::Double(vec![1.5, 2.5, 3.5].into());
         let v = arr.to_scalar_values();
         let arr2 = TypedScalarArray::from_scalar_values(&v, ScalarType::Double).unwrap();
         assert_eq!(arr.as_doubles().unwrap(), arr2.as_doubles().unwrap());

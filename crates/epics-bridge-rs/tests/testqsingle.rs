@@ -466,7 +466,7 @@ async fn waveform_array_round_trips() {
     let result = ch.get(&empty_request()).await.expect("get");
     let value = extract_value(&result).expect("NTScalarArray.value");
     let len = match value {
-        PvField::ScalarArray(arr) => arr.len(),
+        PvField::ScalarArrayTyped(arr) => arr.len(),
         other => panic!("expected scalar array, got {other:?}"),
     };
     assert!(
@@ -583,13 +583,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
 
     let doubles = |s: &PvStructure| -> Vec<f64> {
         match extract_value(s).expect("value") {
-            PvField::ScalarArray(a) => a
-                .iter()
-                .map(|v| match v {
-                    ScalarValue::Double(d) => *d,
-                    other => panic!("expected double element, got {other:?}"),
-                })
-                .collect(),
+            PvField::ScalarArrayTyped(a) => a.as_doubles().expect("double array").to_vec(),
             other => panic!("expected scalar array, got {other:?}"),
         }
     };
@@ -670,13 +664,7 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
 
     let doubles = |s: &PvStructure| -> Vec<f64> {
         match extract_value(s).expect("value") {
-            PvField::ScalarArray(a) => a
-                .iter()
-                .map(|v| match v {
-                    ScalarValue::Double(d) => *d,
-                    other => panic!("expected double element, got {other:?}"),
-                })
-                .collect(),
+            PvField::ScalarArrayTyped(a) => a.as_doubles().expect("double array").to_vec(),
             other => panic!("expected scalar array, got {other:?}"),
         }
     };

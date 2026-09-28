@@ -47,24 +47,25 @@
 // nt_nd_array_desc()/pvxs nt.cpp:196-251 — it had drifted to a stale
 // pre-fix shape (trailing descriptor+display, 5-field attribute).
 use crate::pvdata::{
-    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray, VariantValue,
+    FieldDesc, PvArray, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
+    VariantValue,
 };
 
 /// Per-array data buffer. Caller chooses one variant; the builder produces
 /// the corresponding union selector.
 #[derive(Debug, Clone)]
 pub enum NdArrayBuffer {
-    Boolean(Vec<bool>),
-    Byte(Vec<i8>),
-    UByte(Vec<u8>),
-    Short(Vec<i16>),
-    UShort(Vec<u16>),
-    Int(Vec<i32>),
-    UInt(Vec<u32>),
-    Long(Vec<i64>),
-    ULong(Vec<u64>),
-    Float(Vec<f32>),
-    Double(Vec<f64>),
+    Boolean(PvArray<bool>),
+    Byte(PvArray<i8>),
+    UByte(PvArray<u8>),
+    Short(PvArray<i16>),
+    UShort(PvArray<u16>),
+    Int(PvArray<i32>),
+    UInt(PvArray<u32>),
+    Long(PvArray<i64>),
+    ULong(PvArray<u64>),
+    Float(PvArray<f32>),
+    Double(PvArray<f64>),
 }
 
 impl NdArrayBuffer {
@@ -152,11 +153,8 @@ impl NdArrayBuffer {
         PvField::ScalarArrayTyped(self.into_typed_scalar_array())
     }
 
-    /// Borrowing counterpart of [`Self::into_scalar_array`].
-    ///
-    /// Lets a caller holding `&NtNdArray` build the value without cloning the
-    /// pixel buffer first -- `Arc::from(&[T])` copies once either way, so the
-    /// intermediate `Vec` clone was pure overhead.
+    /// Borrowing counterpart of [`Self::into_scalar_array`]: a refcount bump,
+    /// the elements are shared.
     pub fn to_scalar_array(&self) -> PvField {
         PvField::ScalarArrayTyped(self.to_typed_scalar_array())
     }
@@ -164,34 +162,34 @@ impl NdArrayBuffer {
     /// Move the buffer into a [`TypedScalarArray`].
     pub fn into_typed_scalar_array(self) -> TypedScalarArray {
         match self {
-            Self::Boolean(v) => TypedScalarArray::Boolean(v.into()),
-            Self::Byte(v) => TypedScalarArray::Byte(v.into()),
-            Self::UByte(v) => TypedScalarArray::UByte(v.into()),
-            Self::Short(v) => TypedScalarArray::Short(v.into()),
-            Self::UShort(v) => TypedScalarArray::UShort(v.into()),
-            Self::Int(v) => TypedScalarArray::Int(v.into()),
-            Self::UInt(v) => TypedScalarArray::UInt(v.into()),
-            Self::Long(v) => TypedScalarArray::Long(v.into()),
-            Self::ULong(v) => TypedScalarArray::ULong(v.into()),
-            Self::Float(v) => TypedScalarArray::Float(v.into()),
-            Self::Double(v) => TypedScalarArray::Double(v.into()),
+            Self::Boolean(v) => TypedScalarArray::Boolean(v),
+            Self::Byte(v) => TypedScalarArray::Byte(v),
+            Self::UByte(v) => TypedScalarArray::UByte(v),
+            Self::Short(v) => TypedScalarArray::Short(v),
+            Self::UShort(v) => TypedScalarArray::UShort(v),
+            Self::Int(v) => TypedScalarArray::Int(v),
+            Self::UInt(v) => TypedScalarArray::UInt(v),
+            Self::Long(v) => TypedScalarArray::Long(v),
+            Self::ULong(v) => TypedScalarArray::ULong(v),
+            Self::Float(v) => TypedScalarArray::Float(v),
+            Self::Double(v) => TypedScalarArray::Double(v),
         }
     }
 
-    /// Copy the buffer into a [`TypedScalarArray`] without consuming it.
+    /// Share the buffer with a [`TypedScalarArray`] without consuming it.
     pub fn to_typed_scalar_array(&self) -> TypedScalarArray {
         match self {
-            Self::Boolean(v) => TypedScalarArray::Boolean(v.as_slice().into()),
-            Self::Byte(v) => TypedScalarArray::Byte(v.as_slice().into()),
-            Self::UByte(v) => TypedScalarArray::UByte(v.as_slice().into()),
-            Self::Short(v) => TypedScalarArray::Short(v.as_slice().into()),
-            Self::UShort(v) => TypedScalarArray::UShort(v.as_slice().into()),
-            Self::Int(v) => TypedScalarArray::Int(v.as_slice().into()),
-            Self::UInt(v) => TypedScalarArray::UInt(v.as_slice().into()),
-            Self::Long(v) => TypedScalarArray::Long(v.as_slice().into()),
-            Self::ULong(v) => TypedScalarArray::ULong(v.as_slice().into()),
-            Self::Float(v) => TypedScalarArray::Float(v.as_slice().into()),
-            Self::Double(v) => TypedScalarArray::Double(v.as_slice().into()),
+            Self::Boolean(v) => TypedScalarArray::Boolean(v.clone()),
+            Self::Byte(v) => TypedScalarArray::Byte(v.clone()),
+            Self::UByte(v) => TypedScalarArray::UByte(v.clone()),
+            Self::Short(v) => TypedScalarArray::Short(v.clone()),
+            Self::UShort(v) => TypedScalarArray::UShort(v.clone()),
+            Self::Int(v) => TypedScalarArray::Int(v.clone()),
+            Self::UInt(v) => TypedScalarArray::UInt(v.clone()),
+            Self::Long(v) => TypedScalarArray::Long(v.clone()),
+            Self::ULong(v) => TypedScalarArray::ULong(v.clone()),
+            Self::Float(v) => TypedScalarArray::Float(v.clone()),
+            Self::Double(v) => TypedScalarArray::Double(v.clone()),
         }
     }
 
@@ -589,9 +587,8 @@ fn codec_value(c: &NdCodec) -> PvField {
 /// [`nt_nd_array_desc`]. Field order mirrors pvxs `nt.cpp:196-251`.
 pub fn nt_nd_array_value(nt: &NtNdArray) -> PvField {
     let mut s = PvStructure::new("epics:nt/NTNDArray:1.0");
-    // Borrow rather than clone: `to_scalar_array` copies the pixels straight
-    // into the `Arc<[T]>`, so the intermediate `Vec` clone this used to make
-    // was a second full-frame copy for nothing.
+    // `to_scalar_array` shares the `PvArray` buffer, so building the union
+    // costs one reference count bump, not a frame copy.
     let union = PvField::Union {
         selector: nt.value.selector(),
         variant_name: nt.value.variant_name().to_string(),
@@ -665,7 +662,7 @@ mod tests {
         use std::io::Cursor;
 
         let nt = NtNdArray {
-            value: NdArrayBuffer::UByte(vec![1, 2, 3, 4]),
+            value: NdArrayBuffer::UByte(vec![1, 2, 3, 4].into()),
             codec: NdCodec::default(),
             compressed_size: 4,
             uncompressed_size: 4,
@@ -716,7 +713,7 @@ mod tests {
         };
 
         let nt = NtNdArray {
-            value: NdArrayBuffer::UByte(vec![0]),
+            value: NdArrayBuffer::UByte(vec![0].into()),
             codec: NdCodec::default(),
             compressed_size: 1,
             uncompressed_size: 1,

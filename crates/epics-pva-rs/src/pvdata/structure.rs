@@ -172,27 +172,27 @@ impl fmt::Display for PvField {
 }
 
 impl PvField {
-    /// Construct a typed `Double` scalar array. Wraps `data` in
-    /// `Arc<[f64]>` so subsequent clones are refcount bumps.
-    pub fn scalar_array_double(data: impl Into<std::sync::Arc<[f64]>>) -> Self {
+    /// Construct a typed `Double` scalar array. Wraps `data` in a
+    /// [`PvArray<f64>`](super::PvArray) so subsequent clones are refcount bumps.
+    pub fn scalar_array_double(data: impl Into<super::PvArray<f64>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Double(data.into()))
     }
-    pub fn scalar_array_float(data: impl Into<std::sync::Arc<[f32]>>) -> Self {
+    pub fn scalar_array_float(data: impl Into<super::PvArray<f32>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Float(data.into()))
     }
-    pub fn scalar_array_int(data: impl Into<std::sync::Arc<[i32]>>) -> Self {
+    pub fn scalar_array_int(data: impl Into<super::PvArray<i32>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Int(data.into()))
     }
-    pub fn scalar_array_long(data: impl Into<std::sync::Arc<[i64]>>) -> Self {
+    pub fn scalar_array_long(data: impl Into<super::PvArray<i64>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Long(data.into()))
     }
-    pub fn scalar_array_short(data: impl Into<std::sync::Arc<[i16]>>) -> Self {
+    pub fn scalar_array_short(data: impl Into<super::PvArray<i16>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Short(data.into()))
     }
-    pub fn scalar_array_byte(data: impl Into<std::sync::Arc<[i8]>>) -> Self {
+    pub fn scalar_array_byte(data: impl Into<super::PvArray<i8>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::Byte(data.into()))
     }
-    pub fn scalar_array_ubyte(data: impl Into<std::sync::Arc<[u8]>>) -> Self {
+    pub fn scalar_array_ubyte(data: impl Into<super::PvArray<u8>>) -> Self {
         Self::ScalarArrayTyped(super::TypedScalarArray::UByte(data.into()))
     }
 

@@ -1577,6 +1577,7 @@ pub(crate) fn alarm_condition_string(condition: u16) -> &'static str {
 mod tests {
     use super::*;
     use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
+    use epics_pva_rs::pvdata::TypedScalarArray;
     use std::time::UNIX_EPOCH;
 
     /// the single-record QSRV PUT conversion chain. A native
@@ -1753,15 +1754,11 @@ mod tests {
         let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray);
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         match pv.get_field("value") {
-            Some(PvField::ScalarArray(arr)) => {
-                assert!(
-                    matches!(arr[2], ScalarValue::UByte(200)),
-                    "element 200 must stay unsigned 200, got {:?}",
-                    arr[2]
-                );
-                assert!(matches!(arr[3], ScalarValue::UByte(255)));
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::UByte(arr))) => {
+                assert_eq!(arr[2], 200, "element 200 must stay unsigned 200");
+                assert_eq!(arr[3], 255);
             }
-            other => panic!("expected ubyte ScalarArray value, got {other:?}"),
+            other => panic!("expected ubyte array value, got {other:?}"),
         }
 
         // The descriptor advertises `value` as ubyte[], matching the GET.
@@ -1977,7 +1974,7 @@ mod tests {
         let pv = snapshot_to_nt_scalar_array(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
-        if let Some(PvField::ScalarArray(arr)) = pv.get_field("value") {
+        if let Some(PvField::ScalarArrayTyped(arr)) = pv.get_field("value") {
             assert_eq!(arr.len(), 3);
         } else {
             panic!("expected value array");
@@ -2046,7 +2043,7 @@ mod tests {
         assert_eq!(array.desc(), FieldDesc::ScalarArray(ScalarType::Double));
         assert_eq!(
             array.value(&EpicsValue::DoubleArray(vec![1.0, 2.0])),
-            PvField::ScalarArray(vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)])
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.0, 2.0].into()))
         );
     }
 
@@ -2333,10 +2330,10 @@ mod tests {
 
         // value is a ulong array
         match pv.get_field("value") {
-            Some(PvField::ScalarArray(vs)) => {
-                assert!(matches!(vs[0], ScalarValue::ULong(11111111111111111)));
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::ULong(vs))) => {
+                assert_eq!(vs[0], 11111111111111111);
             }
-            other => panic!("expected ulong ScalarArray, got {other:?}"),
+            other => panic!("expected ulong array, got {other:?}"),
         }
 
         // display.limitLow typed as ULong, not Double

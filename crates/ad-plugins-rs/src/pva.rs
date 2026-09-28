@@ -128,7 +128,7 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
 
     let (value, compressed_size, codec_name) = match &array.codec {
         Some(c) => (
-            NdArrayBuffer::UByte(array.data.as_u8_slice().to_vec()),
+            NdArrayBuffer::UByte(array.data.as_u8_slice().to_vec().into()),
             c.compressed_size as i64,
             codec_name_to_string(c.name),
         ),
@@ -214,16 +214,16 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
 
 fn ndbuffer_to_buffer(buf: &NDDataBuffer) -> NdArrayBuffer {
     match buf {
-        NDDataBuffer::I8(v) => NdArrayBuffer::Byte(v.clone()),
-        NDDataBuffer::U8(v) => NdArrayBuffer::UByte(v.clone()),
-        NDDataBuffer::I16(v) => NdArrayBuffer::Short(v.clone()),
-        NDDataBuffer::U16(v) => NdArrayBuffer::UShort(v.clone()),
-        NDDataBuffer::I32(v) => NdArrayBuffer::Int(v.clone()),
-        NDDataBuffer::U32(v) => NdArrayBuffer::UInt(v.clone()),
-        NDDataBuffer::I64(v) => NdArrayBuffer::Long(v.clone()),
-        NDDataBuffer::U64(v) => NdArrayBuffer::ULong(v.clone()),
-        NDDataBuffer::F32(v) => NdArrayBuffer::Float(v.clone()),
-        NDDataBuffer::F64(v) => NdArrayBuffer::Double(v.clone()),
+        NDDataBuffer::I8(v) => NdArrayBuffer::Byte(v.clone().into()),
+        NDDataBuffer::U8(v) => NdArrayBuffer::UByte(v.clone().into()),
+        NDDataBuffer::I16(v) => NdArrayBuffer::Short(v.clone().into()),
+        NDDataBuffer::U16(v) => NdArrayBuffer::UShort(v.clone().into()),
+        NDDataBuffer::I32(v) => NdArrayBuffer::Int(v.clone().into()),
+        NDDataBuffer::U32(v) => NdArrayBuffer::UInt(v.clone().into()),
+        NDDataBuffer::I64(v) => NdArrayBuffer::Long(v.clone().into()),
+        NDDataBuffer::U64(v) => NdArrayBuffer::ULong(v.clone().into()),
+        NDDataBuffer::F32(v) => NdArrayBuffer::Float(v.clone().into()),
+        NDDataBuffer::F64(v) => NdArrayBuffer::Double(v.clone().into()),
     }
 }
 
@@ -579,7 +579,7 @@ mod tests {
         let proc = PvaProcessor::new("TEST:Pva1:Image".into());
         let pool = NDArrayPool::new(1_000_000);
         let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert!(proc.handle().current_value().is_some());
     }

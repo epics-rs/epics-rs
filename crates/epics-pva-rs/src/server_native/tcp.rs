@@ -9584,9 +9584,7 @@ mod tests {
         use epics_base_rs::types::EpicsValue;
 
         let big = (i64::MAX as u64) + 5;
-        let typed = PvField::ScalarArrayTyped(TypedScalarArray::ULong(std::sync::Arc::from(
-            vec![big, 2u64].as_slice(),
-        )));
+        let typed = PvField::ScalarArrayTyped(TypedScalarArray::ULong(vec![big, 2u64].into()));
         assert_eq!(
             crate::leaf_convert::pv_leaf_to_epics_value(&typed),
             Some(EpicsValue::UInt64Array(vec![big, 2])),

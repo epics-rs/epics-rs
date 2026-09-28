@@ -1859,7 +1859,9 @@ async fn r18_26_plain_char_waveform_without_qform_stays_a_byte_array() {
 
     let got = ch.get(&empty_request()).await.expect("get");
     match find_field(&got, "raw") {
-        Some(PvField::ScalarArray(a)) => assert_eq!(a.len(), 3, "the NUL is a value, not a stop"),
+        Some(PvField::ScalarArrayTyped(a)) => {
+            assert_eq!(a.len(), 3, "the NUL is a value, not a stop")
+        }
         other => panic!("expected a byte array, got {other:?}"),
     }
 }

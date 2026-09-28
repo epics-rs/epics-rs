@@ -3698,7 +3698,7 @@ ASG(LOCKED) {
         let values: Vec<u64> = vec![1, 0xDEAD_BEEF_0000_0001, u64::MAX, 0];
         // Wire-decoded shape: `decode_pv_field` produces the typed,
         // refcount-shared array — not `PvField::ScalarArray`.
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::ULong(Arc::from(values.as_slice())));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::ULong(values.as_slice().into()));
         source
             .put_value_ctx("UL:WFT", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3802,7 +3802,7 @@ ASG(LOCKED) {
         let source = PvDatabaseSource::new(db.clone());
 
         let values: Vec<u32> = vec![1, 0x8000_0001, u32::MAX, 0];
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::UInt(Arc::from(values.as_slice())));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::UInt(values.as_slice().into()));
         source
             .put_value_ctx("UI:WFT", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3908,7 +3908,7 @@ ASG(LOCKED) {
         .unwrap();
         let source = PvDatabaseSource::new(db.clone());
 
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::Double(Arc::from([] as [f64; 0])));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Double(Vec::<f64>::new().into()));
         source
             .put_value_ctx("EMPTY:DBL", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3938,7 +3938,7 @@ ASG(LOCKED) {
         let source = PvDatabaseSource::new(db.clone());
 
         let put =
-            PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from([] as [PvString; 0])));
+            PvField::ScalarArrayTyped(TypedScalarArray::String(Vec::<PvString>::new().into()));
         source
             .put_value_ctx("EMPTY:STR", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3968,7 +3968,7 @@ ASG(LOCKED) {
         let source = PvDatabaseSource::new(db.clone());
 
         // PVA `int` (i32) → `EpicsValue::LongArray` (the i32 array family).
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::Int(Arc::from([] as [i32; 0])));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Int(Vec::<i32>::new().into()));
         source
             .put_value_ctx("EMPTY:INT", put, make_ctx("h", "anyone", "anonymous"))
             .await

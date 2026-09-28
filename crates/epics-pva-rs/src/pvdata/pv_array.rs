@@ -13,6 +13,8 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use epics_base_rs::types::SharedArray;
+
 /// A `[T]` that lives as long as any clone of the `PvArray` holding it.
 enum Inner<T: 'static> {
     Slice(Arc<[T]>),
@@ -97,6 +99,36 @@ impl<T: 'static> From<Arc<[T]>> for PvArray<T> {
     fn from(a: Arc<[T]>) -> Self {
         Self {
             inner: Inner::Slice(a),
+        }
+    }
+}
+
+/// A `SharedArray` whose view is its whole buffer is adopted as the
+/// `Arc<[T]>` it already is; a shorter view (a record's `NORD` below
+/// `NELM`) is borrowed through the view itself. Nothing is copied.
+impl<T: Send + Sync + 'static> From<SharedArray<T>> for PvArray<T> {
+    fn from(a: SharedArray<T>) -> Self {
+        if a.len() == a.buffer().len() {
+            Self::from(Arc::clone(a.buffer()))
+        } else {
+            Self::from_owner(Arc::new(a))
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> From<&SharedArray<T>> for PvArray<T> {
+    fn from(a: &SharedArray<T>) -> Self {
+        Self::from(a.clone())
+    }
+}
+
+impl<T: Clone + 'static> PvArray<T> {
+    /// The elements as a `SharedArray`: the same buffer when this is an
+    /// `Arc<[T]>`, one copy when it borrows from another owner.
+    pub fn to_shared(&self) -> SharedArray<T> {
+        match self.as_arc() {
+            Some(arc) => SharedArray::from(Arc::clone(arc)),
+            None => self.as_slice().into(),
         }
     }
 }

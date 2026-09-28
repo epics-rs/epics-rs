@@ -2100,23 +2100,13 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
         PvField::ScalarArrayTyped(arr) => {
             use epics_pva_rs::pvdata::TypedScalarArray;
             match arr {
-                TypedScalarArray::Double(a) => {
-                    Some(EpicsValue::DoubleArray(crate::convert::shared_array(a)))
-                }
-                TypedScalarArray::Float(a) => {
-                    Some(EpicsValue::FloatArray(crate::convert::shared_array(a)))
-                }
-                TypedScalarArray::Int(a) => {
-                    Some(EpicsValue::LongArray(crate::convert::shared_array(a)))
-                }
+                TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_shared())),
+                TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_shared())),
+                TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_shared())),
                 // a remote `long[]` is 64-bit per element;
                 // preserve the full width as `Int64Array`.
-                TypedScalarArray::Long(a) => {
-                    Some(EpicsValue::Int64Array(crate::convert::shared_array(a)))
-                }
-                TypedScalarArray::Short(a) => {
-                    Some(EpicsValue::ShortArray(crate::convert::shared_array(a)))
-                }
+                TypedScalarArray::Long(a) => Some(EpicsValue::Int64Array(a.to_shared())),
+                TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_shared())),
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
@@ -2128,18 +2118,12 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 )),
                 // a remote `ulong[]` is 64-bit per element;
                 // preserve the full width as `UInt64Array`.
-                TypedScalarArray::ULong(a) => {
-                    Some(EpicsValue::UInt64Array(crate::convert::shared_array(a)))
-                }
+                TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_shared())),
                 TypedScalarArray::Byte(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
-                TypedScalarArray::UByte(a) => {
-                    Some(EpicsValue::CharArray(crate::convert::shared_array(a)))
-                }
-                TypedScalarArray::String(a) => {
-                    Some(EpicsValue::StringArray(crate::convert::shared_array(a)))
-                }
+                TypedScalarArray::UByte(a) => Some(EpicsValue::CharArray(a.to_shared())),
+                TypedScalarArray::String(a) => Some(EpicsValue::StringArray(a.to_shared())),
                 TypedScalarArray::Boolean(a) => Some(EpicsValue::LongArray(
                     a.iter().map(|v| if *v { 1 } else { 0 }).collect(),
                 )),

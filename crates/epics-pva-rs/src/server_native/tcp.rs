@@ -9601,6 +9601,7 @@ mod tests {
     /// Tested by invariant boundary, not by scenario.
     mod filter_bridge_fail_closed {
         use super::*;
+        use crate::pvdata::TypedScalarArray;
         use epics_base_rs::server::database::filters::{FilterChain, parse_filter_chain};
 
         fn nt_scalar_value(sv: ScalarValue) -> PvField {
@@ -9767,8 +9768,7 @@ mod tests {
                         .find_map(|(k, v)| (k == "value").then_some(v))
                         .expect("transformed frame keeps a value leaf");
                     assert!(
-                        matches!(leaf, PvField::ScalarArray(items)
-                            if items.iter().all(|x| matches!(x, ScalarValue::Byte(_)))),
+                        matches!(leaf, PvField::ScalarArrayTyped(TypedScalarArray::Byte(_))),
                         "sliced DBF_CHAR[] must re-emit a signed byte[] leaf, got {leaf:?}",
                     );
                 }

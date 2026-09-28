@@ -11,9 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::channel_shape::ChannelShape;
 use crate::nt::NTScalar;
-use crate::pvdata::{
-    FieldDesc, PvArray, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
-};
+use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::{PutOptions, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 
@@ -1628,12 +1626,6 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
     }
 }
 
-/// Adopt a typed array's buffer as an `EpicsValue` array payload: an
-/// `Arc`-owned `PvArray` is shared, any other owner is copied once.
-fn shared_array<T: Clone + 'static>(a: &PvArray<T>) -> epics_base_rs::types::SharedArray<T> {
-    a.as_slice().into()
-}
-
 /// Convert a wire-decoded [`TypedScalarArray`] directly to the matching
 /// [`EpicsValue`] array, preserving the element type at every length
 /// (including zero). The per-variant element mapping mirrors
@@ -1642,27 +1634,27 @@ fn shared_array<T: Clone + 'static>(a: &PvArray<T>) -> epics_base_rs::types::Sha
 /// length boundary where the rule changes.
 fn typed_array_to_epics(t: &TypedScalarArray) -> EpicsValue {
     match t {
-        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(shared_array(a)),
-        TypedScalarArray::Float(a) => EpicsValue::FloatArray(shared_array(a)),
-        TypedScalarArray::Int(a) => EpicsValue::LongArray(shared_array(a)),
-        TypedScalarArray::Long(a) => EpicsValue::Int64Array(shared_array(a)),
+        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_shared()),
+        TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_shared()),
+        TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_shared()),
+        TypedScalarArray::Long(a) => EpicsValue::Int64Array(a.to_shared()),
         // PVA `uint`/`uint[]` carries the full `epicsUInt32` range; the
         // Rust value model has no unsigned-32 scalar, so `Int64Array`
         // is the lossless carrier (same rule as the scalar `UInt` arm).
         TypedScalarArray::UInt(a) => EpicsValue::Int64Array(a.iter().map(|x| *x as i64).collect()),
         // PVA `ulong[]` → `UInt64Array` keeps the full unsigned 64-bit width.
-        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(shared_array(a)),
-        TypedScalarArray::Short(a) => EpicsValue::ShortArray(shared_array(a)),
+        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_shared()),
+        TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_shared()),
         // Byte/UByte → Char (bit-preserving), UShort/Boolean → Enum —
         // the same element rules `scalar_to_epics` applies to the
         // corresponding scalars.
         TypedScalarArray::Byte(a) => EpicsValue::CharArray(a.iter().map(|x| *x as u8).collect()),
-        TypedScalarArray::UByte(a) => EpicsValue::CharArray(shared_array(a)),
-        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(shared_array(a)),
+        TypedScalarArray::UByte(a) => EpicsValue::CharArray(a.to_shared()),
+        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(a.to_shared()),
         TypedScalarArray::Boolean(a) => {
             EpicsValue::EnumArray(a.iter().map(|b| u16::from(*b)).collect())
         }
-        TypedScalarArray::String(a) => EpicsValue::StringArray(shared_array(a)),
+        TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_shared()),
     }
 }
 
@@ -2833,16 +2825,13 @@ mod tests {
         let PvField::Structure(a) = snapshot_to_pv_field(&asnap) else {
             panic!("structure");
         };
-        let Some(PvField::ScalarArray(arr)) = a.get_field("value") else {
-            panic!("DBF_CHAR[] value must be a scalar array");
+        let Some(PvField::ScalarArrayTyped(TypedScalarArray::Byte(arr))) = a.get_field("value")
+        else {
+            panic!("DBF_CHAR[] value must be a signed byte array");
         };
         assert_eq!(
-            arr,
-            &vec![
-                ScalarValue::Byte(-56),
-                ScalarValue::Byte(0),
-                ScalarValue::Byte(127),
-            ],
+            arr.as_slice(),
+            &[-56i8, 0, 127],
             "DBF_CHAR[] must serve as signed byte[]"
         );
         let FieldDesc::Structure {

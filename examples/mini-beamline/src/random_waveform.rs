@@ -254,13 +254,13 @@ pub mod ioc_support {
         }
 
         fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-            record.put_field("VAL", EpicsValue::DoubleArray(self.current_data().to_vec()))?;
+            record.put_field("VAL", EpicsValue::DoubleArray(self.current_data().into()))?;
             Ok(DeviceInitOutcome::Live)
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
             let data = self.update_data();
-            record.put_field("VAL", EpicsValue::DoubleArray(data.to_vec()))?;
+            record.put_field("VAL", EpicsValue::DoubleArray(data.into()))?;
             if let Some(index) = self.index {
                 self.shared.mark_processed(index);
             }

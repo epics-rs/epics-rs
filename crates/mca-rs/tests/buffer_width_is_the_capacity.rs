@@ -81,20 +81,26 @@ record(mca, "MCA1") {
 async fn a_short_background_write_keeps_the_full_nmax_width() {
     let db = loaded(LONG_MCA).await;
 
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]))
-        .await
-        .unwrap();
-    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![5, 5]))
+    db.put_pv(
+        "MCA1",
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
+    )
+    .await
+    .unwrap();
+    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![5, 5].into()))
         .await
         .unwrap();
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(2));
 
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "MCA1",
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         db.get_pv("MCA1.BG").unwrap(),
-        EpicsValue::LongArray(vec![5, 5, 0, 0, 0, 0, 0, 0])
+        EpicsValue::LongArray(vec![5, 5, 0, 0, 0, 0, 0, 0].into())
     );
 }
 
@@ -107,23 +113,23 @@ async fn a_short_double_background_write_keeps_the_full_nmax_width() {
 
     db.put_pv(
         "MCA1",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into()),
     )
     .await
     .unwrap();
-    db.put_pv("MCA1.BG", EpicsValue::DoubleArray(vec![5.0, 5.0]))
+    db.put_pv("MCA1.BG", EpicsValue::DoubleArray(vec![5.0, 5.0].into()))
         .await
         .unwrap();
     db.put_pv(
         "MCA1",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into()),
     )
     .await
     .unwrap();
 
     assert_eq!(
         db.get_pv("MCA1.BG").unwrap(),
-        EpicsValue::DoubleArray(vec![5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        EpicsValue::DoubleArray(vec![5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].into())
     );
 }
 
@@ -141,13 +147,13 @@ fn a_short_spectrum_write_survives_a_read_that_reports_more_channels() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))
+    rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2].into()))
         .unwrap();
     rec.land_channel_count(8);
 
     assert_eq!(
         rec.get_field("VAL").unwrap(),
-        EpicsValue::LongArray(vec![1, 2, 0, 0, 0, 0, 0, 0])
+        EpicsValue::LongArray(vec![1, 2, 0, 0, 0, 0, 0, 0].into())
     );
 }
 
@@ -161,13 +167,16 @@ async fn a_non_positive_nmax_is_floored_to_one_channel() {
         let db = loaded(&text).await;
 
         assert_eq!(db.get_pv("MCA1.NMAX").unwrap(), EpicsValue::Long(1));
-        assert_eq!(db.get_pv("MCA1").unwrap(), EpicsValue::LongArray(vec![0]));
-        db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![7]))
+        assert_eq!(
+            db.get_pv("MCA1").unwrap(),
+            EpicsValue::LongArray(vec![0].into())
+        );
+        db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![7].into()))
             .await
             .unwrap();
         assert_eq!(
             db.get_pv("MCA1.BG").unwrap(),
-            EpicsValue::LongArray(vec![7])
+            EpicsValue::LongArray(vec![7].into())
         );
     }
 }

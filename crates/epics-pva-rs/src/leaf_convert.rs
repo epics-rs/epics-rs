@@ -356,11 +356,11 @@ mod tests {
             PvField::Scalar(ScalarValue::UByte(200)),
         );
         assert_eq!(
-            epics_value_to_pv_leaf(&EpicsValue::CharArray(vec![200, 0])),
+            epics_value_to_pv_leaf(&EpicsValue::CharArray(vec![200, 0].into())),
             PvField::ScalarArray(vec![ScalarValue::Byte(-56), ScalarValue::Byte(0)]),
         );
         assert_eq!(
-            epics_value_to_pv_leaf(&EpicsValue::UCharArray(vec![200])),
+            epics_value_to_pv_leaf(&EpicsValue::UCharArray(vec![200].into())),
             PvField::ScalarArray(vec![ScalarValue::UByte(200)]),
         );
         // serve descriptor (EpicsValue → FieldDesc)
@@ -373,11 +373,11 @@ mod tests {
             FieldDesc::Scalar(ScalarType::UByte),
         );
         assert_eq!(
-            epics_value_to_field_desc_leaf(&EpicsValue::CharArray(vec![])),
+            epics_value_to_field_desc_leaf(&EpicsValue::CharArray(vec![].into())),
             FieldDesc::ScalarArray(ScalarType::Byte),
         );
         assert_eq!(
-            epics_value_to_field_desc_leaf(&EpicsValue::UCharArray(vec![])),
+            epics_value_to_field_desc_leaf(&EpicsValue::UCharArray(vec![].into())),
             FieldDesc::ScalarArray(ScalarType::UByte),
         );
         // monitor forward (PvField → EpicsValue)

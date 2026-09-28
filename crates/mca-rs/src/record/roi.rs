@@ -72,7 +72,7 @@ impl McaRecord {
         use epics_base_rs::types::EpicsValue as V;
         macro_rules! put {
             ($v:expr, $t:ty) => {
-                if let Some(slot) = $v.get_mut(i) {
+                if let Some(slot) = $v.make_mut().get_mut(i) {
                     *slot = x as $t;
                 }
             };

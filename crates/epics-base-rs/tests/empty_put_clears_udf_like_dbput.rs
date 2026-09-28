@@ -66,7 +66,7 @@ async fn a_zero_length_put_into_a_scalar_still_clears_udf() {
     load(&db, "A", "ai", &[]).await;
     assert_eq!(udf(&db, "A"), 1, "a record with no value is born UDF");
 
-    db.put_pv("A.VAL", EpicsValue::DoubleArray(vec![]))
+    db.put_pv("A.VAL", EpicsValue::DoubleArray(vec![].into()))
         .await
         .expect("`dbPut` returns 0");
 
@@ -85,7 +85,7 @@ async fn a_zero_length_put_into_a_dbaddr_scalar_clears_udf() {
     load(&db, "M", "mbbo", &[]).await;
     assert_eq!(udf(&db, "M"), 1, "a record with no value is born UDF");
 
-    db.put_pv("M.VAL", EpicsValue::DoubleArray(vec![]))
+    db.put_pv("M.VAL", EpicsValue::DoubleArray(vec![].into()))
         .await
         .expect("`dbPut` returns 0");
 

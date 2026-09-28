@@ -138,12 +138,12 @@ async fn an_empty_array_is_not_an_array_holding_an_empty_element() {
 #[epics_macros_rs::epics_test]
 async fn numeric_array_text_is_unchanged() {
     assert_eq!(
-        value_to_save_str(&EpicsValue::LongArray(vec![1, 2, 3])),
+        value_to_save_str(&EpicsValue::LongArray(vec![1, 2, 3].into())),
         "[1,2,3]"
     );
-    let parsed = parse_save_value("[1,2,3]", &EpicsValue::LongArray(vec![])).unwrap();
-    assert_eq!(parsed, EpicsValue::LongArray(vec![1, 2, 3]));
+    let parsed = parse_save_value("[1,2,3]", &EpicsValue::LongArray(vec![].into())).unwrap();
+    assert_eq!(parsed, EpicsValue::LongArray(vec![1, 2, 3].into()));
     // Hand-written spacing still reads.
-    let spaced = parse_save_value("[1, 2, 3]", &EpicsValue::LongArray(vec![])).unwrap();
-    assert_eq!(spaced, EpicsValue::LongArray(vec![1, 2, 3]));
+    let spaced = parse_save_value("[1, 2, 3]", &EpicsValue::LongArray(vec![].into())).unwrap();
+    assert_eq!(spaced, EpicsValue::LongArray(vec![1, 2, 3].into()));
 }

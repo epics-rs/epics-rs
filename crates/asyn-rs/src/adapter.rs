@@ -557,10 +557,10 @@ impl TsBuf {
     /// `put_field("VAL")` then sets `NORD = len` (C `pwf->nord = pPvt->nord`).
     fn to_epics_value(&self) -> EpicsValue {
         match self {
-            Self::Long(v) => EpicsValue::LongArray(v.clone()),
-            Self::Int64(v) => EpicsValue::Int64Array(v.clone()),
-            Self::UInt64(v) => EpicsValue::UInt64Array(v.clone()),
-            Self::Double(v) => EpicsValue::DoubleArray(v.clone()),
+            Self::Long(v) => EpicsValue::LongArray(v.as_slice().into()),
+            Self::Int64(v) => EpicsValue::Int64Array(v.as_slice().into()),
+            Self::UInt64(v) => EpicsValue::UInt64Array(v.as_slice().into()),
+            Self::Double(v) => EpicsValue::DoubleArray(v.as_slice().into()),
         }
     }
 }
@@ -993,15 +993,16 @@ fn convert_param_array_to_iface(
     // matching `copy_ccast`/`copy_convert` in the plugin runtime.
     macro_rules! cast_vec {
         ($t:ty) => {{
-            match pv {
-                ParamValue::Int8Array(a) => a.iter().map(|&x| x as $t).collect::<Vec<$t>>(),
+            let v: epics_base_rs::types::SharedArray<$t> = match pv {
+                ParamValue::Int8Array(a) => a.iter().map(|&x| x as $t).collect(),
                 ParamValue::Int16Array(a) => a.iter().map(|&x| x as $t).collect(),
                 ParamValue::Int32Array(a) => a.iter().map(|&x| x as $t).collect(),
                 ParamValue::Int64Array(a) => a.iter().map(|&x| x as $t).collect(),
                 ParamValue::Float32Array(a) => a.iter().map(|&x| x as $t).collect(),
                 ParamValue::Float64Array(a) => a.iter().map(|&x| x as $t).collect(),
                 _ => return None,
-            }
+            };
+            v
         }};
     }
     match iface_type {
@@ -1327,18 +1328,32 @@ impl AsynDeviceSupport {
             }),
             "asynUInt32Digital" => result.uint_val.map(|v| EpicsValue::Long(v as i32)),
             "asynEnum" => result.enum_index.map(|v| EpicsValue::Enum(v as u16)),
+            // One copy each, straight into the shared buffer: cloning the
+            // `Vec` first would copy it a second time on the way in.
             "asynInt8Array" => result
                 .int8_array
-                .clone()
+                .as_deref()
                 .map(|v| EpicsValue::CharArray(v.iter().map(|&x| x as u8).collect())),
-            "asynInt16Array" => result.int16_array.clone().map(EpicsValue::ShortArray),
-            "asynInt32Array" => result.int32_array.clone().map(EpicsValue::LongArray),
+            "asynInt16Array" => result
+                .int16_array
+                .as_deref()
+                .map(|v| EpicsValue::ShortArray(v.into())),
+            "asynInt32Array" => result
+                .int32_array
+                .as_deref()
+                .map(|v| EpicsValue::LongArray(v.into())),
             "asynInt64Array" => result
                 .int64_array
-                .clone()
+                .as_deref()
                 .map(|v| EpicsValue::LongArray(v.iter().map(|&x| x as i32).collect())),
-            "asynFloat32Array" => result.float32_array.clone().map(EpicsValue::FloatArray),
-            "asynFloat64Array" => result.float64_array.clone().map(EpicsValue::DoubleArray),
+            "asynFloat32Array" => result
+                .float32_array
+                .as_deref()
+                .map(|v| EpicsValue::FloatArray(v.into())),
+            "asynFloat64Array" => result
+                .float64_array
+                .as_deref()
+                .map(|v| EpicsValue::DoubleArray(v.into())),
             _ => None,
         }
     }
@@ -1462,20 +1477,24 @@ impl AsynDeviceSupport {
             ("asynInt8Array", EpicsValue::CharArray(data)) => Some(RequestOp::Int8ArrayWrite {
                 data: data.iter().map(|&x| x as i8).collect(),
             }),
-            ("asynInt16Array", EpicsValue::ShortArray(data)) => {
-                Some(RequestOp::Int16ArrayWrite { data: data.clone() })
-            }
-            ("asynInt32Array", EpicsValue::LongArray(data)) => {
-                Some(RequestOp::Int32ArrayWrite { data: data.clone() })
-            }
+            ("asynInt16Array", EpicsValue::ShortArray(data)) => Some(RequestOp::Int16ArrayWrite {
+                data: data.clone().to_vec(),
+            }),
+            ("asynInt32Array", EpicsValue::LongArray(data)) => Some(RequestOp::Int32ArrayWrite {
+                data: data.clone().to_vec(),
+            }),
             ("asynInt64Array", EpicsValue::LongArray(data)) => Some(RequestOp::Int64ArrayWrite {
                 data: data.iter().map(|&x| x as i64).collect(),
             }),
             ("asynFloat32Array", EpicsValue::FloatArray(data)) => {
-                Some(RequestOp::Float32ArrayWrite { data: data.clone() })
+                Some(RequestOp::Float32ArrayWrite {
+                    data: data.clone().to_vec(),
+                })
             }
             ("asynFloat64Array", EpicsValue::DoubleArray(data)) => {
-                Some(RequestOp::Float64ArrayWrite { data: data.clone() })
+                Some(RequestOp::Float64ArrayWrite {
+                    data: data.clone().to_vec(),
+                })
             }
             _ => None,
         }
@@ -1673,7 +1692,7 @@ impl AsynDeviceSupport {
         // refuses for any non-numeric reply.
         if self.iface_type == "asynOctet" && record.val().is_some_and(|v| v.is_array()) {
             let bytes = match val {
-                EpicsValue::String(s) => EpicsValue::CharArray(s.as_bytes().to_vec()),
+                EpicsValue::String(s) => EpicsValue::CharArray(s.as_bytes().into()),
                 other => other,
             };
             let _ = record.set_val(bytes);
@@ -4008,11 +4027,11 @@ mod tests {
 
         assert_eq!(
             convert_param_array_to_iface("asynInt16Array", &f64arr),
-            Some(EpicsValue::ShortArray(vec![1, 2, -3])),
+            Some(EpicsValue::ShortArray(vec![1, 2, -3].into())),
         );
         assert_eq!(
             convert_param_array_to_iface("asynFloat64Array", &f64arr),
-            Some(EpicsValue::DoubleArray(vec![1.7, 2.9, -3.1])),
+            Some(EpicsValue::DoubleArray(vec![1.7, 2.9, -3.1].into())),
         );
 
         // Integer narrowing is a truncating C cast, matching the polled ccast
@@ -4020,7 +4039,7 @@ mod tests {
         let i32arr = ParamValue::Int32Array(std::sync::Arc::from([40000i32].as_slice()));
         assert_eq!(
             convert_param_array_to_iface("asynInt16Array", &i32arr),
-            Some(EpicsValue::ShortArray(vec![-25536])),
+            Some(EpicsValue::ShortArray(vec![-25536].into())),
         );
 
         // asynInt8Array goes through i8 then reinterprets to u8 (300.0 -> i8
@@ -4028,7 +4047,7 @@ mod tests {
         let over = ParamValue::Float64Array(std::sync::Arc::from([300.0f64].as_slice()));
         assert_eq!(
             convert_param_array_to_iface("asynInt8Array", &over),
-            Some(EpicsValue::CharArray(vec![127])),
+            Some(EpicsValue::CharArray(vec![127].into())),
         );
 
         // Scalar interfaces are not array interfaces: returns None so the caller
@@ -6323,7 +6342,7 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"HELLO".to_vec())),
+            Some(EpicsValue::CharArray(b"HELLO".to_vec().into())),
             "the record is bound and reads from the transport"
         );
     }
@@ -6836,7 +6855,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         ads.read(&mut rec).unwrap();
-        assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![1, 2, 3])));
+        assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![1, 2, 3].into())));
 
         // A transport-error array interrupt carrying different data.
         let bad = std::sync::Arc::from([9i32, 9, 9].as_slice());
@@ -6853,7 +6872,7 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(
             rec.val(),
-            Some(EpicsValue::LongArray(vec![1, 2, 3])),
+            Some(EpicsValue::LongArray(vec![1, 2, 3].into())),
             "transport error must keep the prior array (C devAsynXXXArray.cpp:317)"
         );
         assert_eq!(
@@ -7871,7 +7890,7 @@ mod tests {
 
         let mut rec = WaveformRecord::new(64, DbFieldType::Char);
         // NORD = 3, with an interior NUL; asynOctetWrite would trim at the NUL.
-        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02].into()))
             .unwrap();
         dev.init(&mut rec).unwrap();
         dev.read(&mut rec).unwrap();
@@ -7903,7 +7922,7 @@ mod tests {
         let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
 
         let mut rec = WaveformRecord::new(64, DbFieldType::Char);
-        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02].into()))
             .unwrap();
         dev.init(&mut rec).unwrap();
         dev.read(&mut rec).unwrap();
@@ -8055,7 +8074,7 @@ mod tests {
         let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
 
         let mut rec = WaveformRecord::new(2048, DbFieldType::Float);
-        rec.put_field("VAL", EpicsValue::FloatArray(vec![0.5, 0.25, 0.125]))
+        rec.put_field("VAL", EpicsValue::FloatArray(vec![0.5, 0.25, 0.125].into()))
             .unwrap();
         dev.init(&mut rec).unwrap();
         dev.read(&mut rec).unwrap();
@@ -8067,7 +8086,7 @@ mod tests {
         );
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::FloatArray(vec![0.5, 0.25, 0.125])),
+            Some(EpicsValue::FloatArray(vec![0.5, 0.25, 0.125].into())),
             "VAL must keep the put values, not the driver readback"
         );
     }
@@ -8120,7 +8139,7 @@ mod tests {
         let ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
 
         let mut rec = WaveformRecord::new(64, DbFieldType::Char);
-        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02].into()))
             .unwrap();
         let val = rec.val().unwrap();
         let op = ads.binary_write_op(&rec, &val);
@@ -8160,7 +8179,7 @@ mod tests {
         ads.set_record_info("TEST:WFAIL", ScanType::Passive);
 
         let mut rec = WaveformRecord::new(64, DbFieldType::Char);
-        rec.put_field("VAL", EpicsValue::CharArray(vec![0x41, 0x42]))
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x41, 0x42].into()))
             .unwrap();
         ads.read(&mut rec).unwrap();
 
@@ -8316,7 +8335,7 @@ mod tests {
         }
 
         // CharArray write (waveform FTVL=CHAR) is capped on the same path.
-        match ads.write_op(&EpicsValue::CharArray(b"ABCDEFG".to_vec())) {
+        match ads.write_op(&EpicsValue::CharArray(b"ABCDEFG".to_vec().into())) {
             Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABC".to_vec()),
             other => panic!("expected OctetWrite, got {other:?}"),
         }
@@ -8360,7 +8379,7 @@ mod tests {
         // Array-interface CharArray reads are NOT octet-capped (bounded by
         // max_array_elements elsewhere).
         let long = vec![1u8; 10];
-        match ads.cap_octet_read_value(EpicsValue::CharArray(long.clone())) {
+        match ads.cap_octet_read_value(EpicsValue::CharArray(long.clone().into())) {
             EpicsValue::CharArray(v) => assert_eq!(v, long),
             other => panic!("expected CharArray, got {other:?}"),
         }
@@ -8621,7 +8640,7 @@ mod tests {
         assert_eq!(writes.lock().unwrap().clone(), vec![b"PING\x0d".to_vec()]);
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"PONG".to_vec())),
+            Some(EpicsValue::CharArray(b"PONG".to_vec().into())),
             "reply bytes must populate the waveform CHAR VAL"
         );
     }
@@ -8654,7 +8673,7 @@ mod tests {
         // CharArray (matching the waveform CHAR shape, not a fixed String).
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec())),
+            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec().into())),
             "reply must populate the lsi VAL"
         );
     }
@@ -8689,7 +8708,7 @@ mod tests {
 
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(reply.clone())),
+            Some(EpicsValue::CharArray(reply.clone().into())),
             "all 50 reply bytes must land — SIZV is the bound, not MAX_STRING_SIZE"
         );
         assert_eq!(

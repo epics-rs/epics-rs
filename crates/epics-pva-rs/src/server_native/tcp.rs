@@ -9587,7 +9587,7 @@ mod tests {
         let typed = PvField::ScalarArrayTyped(TypedScalarArray::ULong(vec![big, 2u64].into()));
         assert_eq!(
             crate::leaf_convert::pv_leaf_to_epics_value(&typed),
-            Some(EpicsValue::UInt64Array(vec![big, 2])),
+            Some(EpicsValue::UInt64Array(vec![big, 2].into())),
             "ulong[] monitor value must convert to UInt64Array, not fall through to None",
         );
     }

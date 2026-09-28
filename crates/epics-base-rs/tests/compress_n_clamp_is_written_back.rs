@@ -75,9 +75,12 @@ fn n(db: &Db, rec: &str) -> i64 {
 }
 
 async fn feed_array(db: &Db) {
-    db.put_pv("SRC", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "SRC",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .await
+    .unwrap();
 }
 
 /// `array_average` — C `compressRecord.c:255-256`.

@@ -72,7 +72,7 @@ fn probe(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Probe {
 }
 
 async fn seed_and_process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    db.put_pv(rec, EpicsValue::DoubleArray(SEED.to_vec()))
+    db.put_pv(rec, EpicsValue::DoubleArray(SEED.to_vec().into()))
         .await
         .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -129,9 +129,12 @@ async fn a_put_to_val_re_establishes_a_failed_subarray() {
     seed_and_process(&db, "SA:DEAD").await;
     assert_eq!(probe(&db, "SA:DEAD").served, 0);
 
-    db.put_pv("SA:DEAD", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "SA:DEAD",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+    )
+    .await
+    .unwrap();
     let p = probe(&db, "SA:DEAD");
     assert_eq!(p.udf, 0, "dbPut clears UDF on a value field");
     assert_eq!(p.served, 3, "the freshly written buffer is servable data");

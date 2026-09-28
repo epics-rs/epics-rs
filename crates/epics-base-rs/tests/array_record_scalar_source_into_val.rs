@@ -30,12 +30,12 @@ fn scalar_put_lands_in_element_zero_of_the_typed_buffer() {
     assert_eq!(wf.nord, 1, "a scalar source is ONE element (C nReq = 1)");
     assert_eq!(
         wf.val,
-        EpicsValue::DoubleArray(vec![7.5, 0.0, 0.0, 0.0]),
+        EpicsValue::DoubleArray(vec![7.5, 0.0, 0.0, 0.0].into()),
         "the FTVL-typed NELM buffer survives; the scalar lands in bptr[0]"
     );
     assert_eq!(
         wf.get_field("VAL"),
-        Some(EpicsValue::DoubleArray(vec![7.5])),
+        Some(EpicsValue::DoubleArray(vec![7.5].into())),
         "clients see NORD=1 elements"
     );
 }
@@ -48,7 +48,7 @@ fn scalar_put_converts_to_the_ftvl_element_type() {
     wf.put_field("VAL", EpicsValue::Double(42.9)).unwrap();
 
     assert_eq!(wf.nord, 1);
-    assert_eq!(wf.val, EpicsValue::LongArray(vec![42, 0, 0]));
+    assert_eq!(wf.val, EpicsValue::LongArray(vec![42, 0, 0].into()));
 }
 
 /// With the array invariant intact, the On-Change hash tracks successive
@@ -116,7 +116,7 @@ record(aao, "AAO:CL") {
 
     assert_eq!(
         db.get_pv("AAO:CL").unwrap(),
-        EpicsValue::DoubleArray(vec![3.5]),
+        EpicsValue::DoubleArray(vec![3.5].into()),
         "a scalar DOL lands as element 0 of the array (NORD=1), not a scalar VAL"
     );
     assert_eq!(
@@ -126,7 +126,7 @@ record(aao, "AAO:CL") {
     );
     assert_eq!(
         db.get_pv("AAO:TGT").unwrap(),
-        EpicsValue::DoubleArray(vec![3.5]),
+        EpicsValue::DoubleArray(vec![3.5].into()),
         "the OUT target receives an ARRAY, not the scalar"
     );
 }
@@ -141,12 +141,12 @@ fn buffer_survives_scalar_then_array_updates() {
     aao.put_field("VAL", EpicsValue::Double(9.0)).unwrap();
     assert_eq!(aao.nord, 1);
 
-    aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+    aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .unwrap();
     assert_eq!(aao.nord, 3, "an array source refills the buffer head");
     assert_eq!(
         aao.get_field("VAL"),
-        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
     );
 
     // NELM resize still preserves data (it found no array variant before).
@@ -154,7 +154,7 @@ fn buffer_survives_scalar_then_array_updates() {
     assert_eq!(aao.nord, 3, "resize preserves NORD");
     assert_eq!(
         aao.get_field("VAL"),
-        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])),
+        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())),
         "resize preserves the element data"
     );
 }

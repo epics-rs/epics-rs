@@ -140,7 +140,7 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
     // put path (which accepts a `CharArray`) rather than a static db field.
     db.put_pv_no_process(
         "LSO_ERR.VAL",
-        EpicsValue::CharArray(b"lso to errlog".to_vec()),
+        EpicsValue::CharArray(b"lso to errlog".to_vec().into()),
     )
     .await
     .unwrap();

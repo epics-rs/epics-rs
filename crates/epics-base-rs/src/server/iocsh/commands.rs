@@ -1459,8 +1459,8 @@ fn cmd_dbpf() -> CommandDef {
                     bytes.truncate(capacity.saturating_sub(1));
                     bytes.push(0);
                     Some(match dbr {
-                        DbFieldType::UChar => EpicsValue::UCharArray(bytes),
-                        _ => EpicsValue::CharArray(bytes),
+                        DbFieldType::UChar => EpicsValue::UCharArray(bytes.into()),
+                        _ => EpicsValue::CharArray(bytes.into()),
                     })
                 }
                 Some((capacity, dbr)) => {
@@ -2730,20 +2730,20 @@ fn ca_zero_fill(value: EpicsValue, no_elements: usize) -> EpicsValue {
     }
     let n = no_elements;
     match value {
-        V::ShortArray(v) => V::ShortArray(pad(v, n)),
-        V::FloatArray(v) => V::FloatArray(pad(v, n)),
-        V::EnumArray(v) => V::EnumArray(pad(v, n)),
-        V::DoubleArray(v) => V::DoubleArray(pad(v, n)),
-        V::LongArray(v) => V::LongArray(pad(v, n)),
-        V::CharArray(v) => V::CharArray(pad(v, n)),
-        V::StringArray(v) => V::StringArray(pad(v, n)),
-        V::Short(v) => V::ShortArray(pad(vec![v], n)),
-        V::Float(v) => V::FloatArray(pad(vec![v], n)),
-        V::Enum(v) => V::EnumArray(pad(vec![v], n)),
-        V::Double(v) => V::DoubleArray(pad(vec![v], n)),
-        V::Long(v) => V::LongArray(pad(vec![v], n)),
-        V::Char(v) => V::CharArray(pad(vec![v], n)),
-        V::String(v) => V::StringArray(pad(vec![v], n)),
+        V::ShortArray(v) => V::ShortArray(pad(v.to_vec(), n).into()),
+        V::FloatArray(v) => V::FloatArray(pad(v.to_vec(), n).into()),
+        V::EnumArray(v) => V::EnumArray(pad(v.to_vec(), n).into()),
+        V::DoubleArray(v) => V::DoubleArray(pad(v.to_vec(), n).into()),
+        V::LongArray(v) => V::LongArray(pad(v.to_vec(), n).into()),
+        V::CharArray(v) => V::CharArray(pad(v.to_vec(), n).into()),
+        V::StringArray(v) => V::StringArray(pad(v.to_vec(), n).into()),
+        V::Short(v) => V::ShortArray(pad(vec![v], n).into()),
+        V::Float(v) => V::FloatArray(pad(vec![v], n).into()),
+        V::Enum(v) => V::EnumArray(pad(vec![v], n).into()),
+        V::Double(v) => V::DoubleArray(pad(vec![v], n).into()),
+        V::Long(v) => V::LongArray(pad(vec![v], n).into()),
+        V::Char(v) => V::CharArray(pad(vec![v], n).into()),
+        V::String(v) => V::StringArray(pad(vec![v], n).into()),
         // Not a family a CA request converts to, so there is no buffer of
         // this shape for C to have filled.
         other => other,
@@ -9233,7 +9233,7 @@ mod tests {
             db.put_record_field_from_ca_no_notify(
                 "R:WFC",
                 "VAL",
-                EpicsValue::CharArray(b"ABCDEFGHIJKLMNO".to_vec()),
+                EpicsValue::CharArray(b"ABCDEFGHIJKLMNO".to_vec().into()),
             )
             .await
             .unwrap();
@@ -10147,7 +10147,7 @@ BO_REC
     #[test]
     fn printbuffer_char_keys_on_no_elements_and_stops_at_the_nul() {
         let render = |bytes: Vec<u8>| {
-            native_readback_lines(DbfCode::Char, &EpicsValue::CharArray(bytes))[0]
+            native_readback_lines(DbfCode::Char, &EpicsValue::CharArray(bytes.into()))[0]
                 .trim_end()
                 .to_string()
         };

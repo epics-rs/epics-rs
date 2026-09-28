@@ -1474,37 +1474,37 @@ mod wire_format_tests {
             (
                 DbFieldType::String,
                 EpicsValue::String("x".into()),
-                EpicsValue::StringArray(vec!["x".into(), "y".into(), "z".into()]),
+                EpicsValue::StringArray(vec!["x".into(), "y".into(), "z".into()].into()),
             ),
             (
                 DbFieldType::Short,
                 EpicsValue::Short(7),
-                EpicsValue::ShortArray(vec![1, 2, 3]),
+                EpicsValue::ShortArray(vec![1, 2, 3].into()),
             ),
             (
                 DbFieldType::Float,
                 EpicsValue::Float(1.5),
-                EpicsValue::FloatArray(vec![1.0, 2.0, 3.0]),
+                EpicsValue::FloatArray(vec![1.0, 2.0, 3.0].into()),
             ),
             (
                 DbFieldType::Enum,
                 EpicsValue::Enum(2),
-                EpicsValue::EnumArray(vec![0, 1, 2]),
+                EpicsValue::EnumArray(vec![0, 1, 2].into()),
             ),
             (
                 DbFieldType::Char,
                 EpicsValue::Char(9),
-                EpicsValue::CharArray(vec![1, 2, 3]),
+                EpicsValue::CharArray(vec![1, 2, 3].into()),
             ),
             (
                 DbFieldType::Long,
                 EpicsValue::Long(11),
-                EpicsValue::LongArray(vec![1, 2, 3]),
+                EpicsValue::LongArray(vec![1, 2, 3].into()),
             ),
             (
                 DbFieldType::Double,
                 EpicsValue::Double(2.5),
-                EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+                EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
             ),
         ];
         let now = SystemTime::now();
@@ -1752,10 +1752,10 @@ mod r58_enum_label_tests {
 
     #[test]
     fn enum_array_renders_labels() {
-        let s = snap_with_enum(EpicsValue::EnumArray(vec![0, 1, 0]), &["Off", "On"]);
+        let s = snap_with_enum(EpicsValue::EnumArray(vec![0, 1, 0].into()), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s).unwrap(),
-            EpicsValue::StringArray(vec!["Off".into(), "On".into(), "Off".into()])
+            EpicsValue::StringArray(vec!["Off".into(), "On".into(), "Off".into()].into())
         );
     }
 

@@ -1,5 +1,5 @@
-use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_pva_rs::pvdata::{PvField, ScalarType, ScalarValue, TypedScalarArray};
+use epics_base_rs::types::{DbFieldType, EpicsValue, SharedArray};
+use epics_pva_rs::pvdata::{PvArray, PvField, ScalarType, ScalarValue, TypedScalarArray};
 
 /// Convert EPICS DBF type to PVA ScalarType.
 ///
@@ -305,33 +305,48 @@ pub fn enum_index_to_string(choices: &[String], index: u16) -> String {
 
 /// Convert EpicsValue to PvField (scalar or array).
 ///
-/// An array becomes a [`PvField::ScalarArrayTyped`] over one buffer copy;
-/// the per-element `Vec<ScalarValue>` form cost a 32-byte enum per
-/// element to build and again to encode.
+/// An array becomes a [`PvField::ScalarArrayTyped`] reading the
+/// `EpicsValue`'s own buffer: the record, its snapshot and the wire
+/// encoder share one `SharedArray`, the way pvxs hands a monitor the
+/// record's `shared_array` (`iocsource.cpp` `getValue`). Only `CharArray`
+/// copies, since u8 storage cannot alias the signed `byte[]` it serves.
 pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
     let typed = match val {
-        EpicsValue::ShortArray(a) => TypedScalarArray::Short(a.as_slice().into()),
-        EpicsValue::FloatArray(a) => TypedScalarArray::Float(a.as_slice().into()),
-        EpicsValue::EnumArray(a) => TypedScalarArray::UShort(a.as_slice().into()),
-        EpicsValue::DoubleArray(a) => TypedScalarArray::Double(a.as_slice().into()),
-        EpicsValue::LongArray(a) => TypedScalarArray::Int(a.as_slice().into()),
+        EpicsValue::ShortArray(a) => TypedScalarArray::Short(pv_array(a)),
+        EpicsValue::FloatArray(a) => TypedScalarArray::Float(pv_array(a)),
+        EpicsValue::EnumArray(a) => TypedScalarArray::UShort(pv_array(a)),
+        EpicsValue::DoubleArray(a) => TypedScalarArray::Double(pv_array(a)),
+        EpicsValue::LongArray(a) => TypedScalarArray::Int(pv_array(a)),
         // DBF_CHAR ↔ pvByte (signed): the storage byte reinterpreted.
         EpicsValue::CharArray(a) => TypedScalarArray::Byte(a.iter().map(|&v| v as i8).collect()),
-        EpicsValue::StringArray(a) => TypedScalarArray::String(a.as_slice().into()),
-        EpicsValue::Int64Array(a) => TypedScalarArray::Long(a.as_slice().into()),
-        EpicsValue::UInt64Array(a) => TypedScalarArray::ULong(a.as_slice().into()),
+        EpicsValue::StringArray(a) => TypedScalarArray::String(pv_array(a)),
+        EpicsValue::Int64Array(a) => TypedScalarArray::Long(pv_array(a)),
+        EpicsValue::UInt64Array(a) => TypedScalarArray::ULong(pv_array(a)),
         // DBF_USHORT[]/DBF_ULONG[] serve as PVA ushort[]/uint[]. These MUST be
         // explicit: the `other =>` scalar fallback below would collapse the
         // array to its first element (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShortArray(a) => TypedScalarArray::UShort(a.as_slice().into()),
-        EpicsValue::ULongArray(a) => TypedScalarArray::UInt(a.as_slice().into()),
+        EpicsValue::UShortArray(a) => TypedScalarArray::UShort(pv_array(a)),
+        EpicsValue::ULongArray(a) => TypedScalarArray::UInt(pv_array(a)),
         // DBF_UCHAR[] serves as PVA ubyte[] (unsigned), unlike CHAR[]'s signed
         // byte[] above (pvxs `ioc/typeutils.cpp:34-35` DBR_UCHAR→UInt8). MUST
         // be explicit: the `other =>` scalar fallback would collapse it.
-        EpicsValue::UCharArray(a) => TypedScalarArray::UByte(a.as_slice().into()),
+        EpicsValue::UCharArray(a) => TypedScalarArray::UByte(pv_array(a)),
         other => return PvField::Scalar(epics_to_scalar(other)),
     };
     PvField::ScalarArrayTyped(typed)
+}
+
+/// The `SharedArray`'s buffer as a `PvArray`, no elements copied: the
+/// whole buffer is adopted as the `Arc<[T]>` it already is, and a shorter
+/// view (`NORD` below `NELM`) is borrowed through the view itself.
+fn pv_array<T: Clone + Send + Sync + 'static>(a: &SharedArray<T>) -> PvArray<T> {
+    PvArray::from(a.to_vec())
+}
+
+/// The `PvArray`'s buffer as a `SharedArray`: adopted as is when it is an
+/// `Arc<[T]>`, copied once when it borrows from another owner.
+pub(crate) fn shared_array<T: Clone + 'static>(a: &PvArray<T>) -> SharedArray<T> {
+    a.as_slice().into()
 }
 
 /// The `EpicsValue` carrier for a typed PVA array, one variant per wire
@@ -343,18 +358,18 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
 /// the signed `CharArray`.
 fn typed_array_to_epics(arr: &TypedScalarArray) -> EpicsValue {
     match arr {
-        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_vec()),
-        TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_vec()),
-        TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_vec()),
-        TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_vec()),
+        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(shared_array(a)),
+        TypedScalarArray::Float(a) => EpicsValue::FloatArray(shared_array(a)),
+        TypedScalarArray::Short(a) => EpicsValue::ShortArray(shared_array(a)),
+        TypedScalarArray::Int(a) => EpicsValue::LongArray(shared_array(a)),
         TypedScalarArray::Byte(a) => EpicsValue::CharArray(a.iter().map(|&v| v as u8).collect()),
-        TypedScalarArray::UByte(a) => EpicsValue::UCharArray(a.to_vec()),
-        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(a.to_vec()),
-        TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_vec()),
+        TypedScalarArray::UByte(a) => EpicsValue::UCharArray(shared_array(a)),
+        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(shared_array(a)),
+        TypedScalarArray::String(a) => EpicsValue::StringArray(shared_array(a)),
         TypedScalarArray::UInt(a) => {
             EpicsValue::Int64Array(a.iter().map(|&v| i64::from(v)).collect())
         }
-        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_vec()),
+        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(shared_array(a)),
         TypedScalarArray::Long(a) => EpicsValue::DoubleArray(a.iter().map(|&v| v as f64).collect()),
         TypedScalarArray::Boolean(a) => {
             EpicsValue::DoubleArray(a.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect())
@@ -379,7 +394,7 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                 // so `double[]` is the only available carrier. Typed
                 // empty arrays never reach here — they are resolved from
                 // their tag by `empty_typed_array` above.
-                return Some(EpicsValue::DoubleArray(vec![]));
+                return Some(EpicsValue::DoubleArray(vec![].into()));
             }
             // Numeric arms dispatch on the homogeneous element type, so a
             // `String` element never reaches `scalar_to_{f64,i64,u64}`
@@ -510,7 +525,7 @@ mod tests {
         assert_eq!(ev, EpicsValue::UInt64(big));
 
         // Array path: UInt64Array ↔ ulong[] round-trip, full range
-        let arr = EpicsValue::UInt64Array(vec![0, big, i64::MAX as u64 + 1]);
+        let arr = EpicsValue::UInt64Array(vec![0, big, i64::MAX as u64 + 1].into());
         let pf = epics_to_pv_field(&arr);
         match &pf {
             PvField::ScalarArrayTyped(TypedScalarArray::ULong(vs)) => assert_eq!(vs[1], big),
@@ -556,7 +571,7 @@ mod tests {
         let ev = pv_field_to_epics(&pf).unwrap();
         assert_eq!(
             ev,
-            EpicsValue::Int64Array(vec![0, 2_147_483_648, 4_294_967_295])
+            EpicsValue::Int64Array(vec![0, 2_147_483_648, 4_294_967_295].into())
         );
     }
 
@@ -626,7 +641,7 @@ mod tests {
 
     #[test]
     fn double_array_roundtrip() {
-        let orig = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]);
+        let orig = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into());
         let pf = epics_to_pv_field(&orig);
         let back = pv_field_to_epics(&pf).unwrap();
         assert_eq!(orig, back);
@@ -751,7 +766,7 @@ mod tests {
     #[test]
     fn f9_dbf_char_array_signed_roundtrip() {
         // Array path mirrors the scalar path: bit-preserving Byte mapping.
-        let orig = EpicsValue::CharArray(vec![0u8, 1, 0xFE, 0xFF]); // 0,1,-2,-1 as i8
+        let orig = EpicsValue::CharArray(vec![0u8, 1, 0xFE, 0xFF].into()); // 0,1,-2,-1 as i8
         let pf = epics_to_pv_field(&orig);
         if let PvField::ScalarArrayTyped(TypedScalarArray::Byte(arr)) = &pf {
             assert_eq!(arr.as_slice(), [0i8, 1, -2, -1]);
@@ -779,7 +794,7 @@ mod tests {
         // FTVL=UCHAR waveform serves as PVA ubyte[] (unsigned). Element 200
         // stays 200, and the full array round-trips back to UCharArray —
         // never collapsing into the signed DBF_CHAR (Byte) space.
-        let orig = EpicsValue::UCharArray(vec![0u8, 1, 200, 0xFF]);
+        let orig = EpicsValue::UCharArray(vec![0u8, 1, 200, 0xFF].into());
         let pf = epics_to_pv_field(&orig);
         if let PvField::ScalarArrayTyped(TypedScalarArray::UByte(arr)) = &pf {
             assert_eq!(arr.as_slice(), [0u8, 1, 200, 255]);
@@ -833,7 +848,7 @@ mod tests {
     /// its declared element type instead of collapsing to `double[]`.
     /// Before the fix every empty array — typed or not — was funneled
     /// through the untyped `ScalarArray` path and returned
-    /// `EpicsValue::DoubleArray(vec![])`, silently retyping a string /
+    /// `EpicsValue::DoubleArray(vec![].into())`, silently retyping a string /
     /// int / float waveform carrier on an empty PUT. pvxs keeps the
     /// descriptor element type at zero count (dataencode.cpp:315-352)
     /// and selects the DBR type from `original_type()`
@@ -846,35 +861,35 @@ mod tests {
         let cases: &[(TypedScalarArray, EpicsValue)] = &[
             (
                 TypedScalarArray::String(Vec::<PvString>::new().into()),
-                EpicsValue::StringArray(vec![]),
+                EpicsValue::StringArray(vec![].into()),
             ),
             (
                 TypedScalarArray::Int(Vec::<i32>::new().into()),
-                EpicsValue::LongArray(vec![]),
+                EpicsValue::LongArray(vec![].into()),
             ),
             (
                 TypedScalarArray::Float(Vec::<f32>::new().into()),
-                EpicsValue::FloatArray(vec![]),
+                EpicsValue::FloatArray(vec![].into()),
             ),
             (
                 TypedScalarArray::Double(Vec::<f64>::new().into()),
-                EpicsValue::DoubleArray(vec![]),
+                EpicsValue::DoubleArray(vec![].into()),
             ),
             (
                 TypedScalarArray::Byte(Vec::<i8>::new().into()),
-                EpicsValue::CharArray(vec![]),
+                EpicsValue::CharArray(vec![].into()),
             ),
             (
                 TypedScalarArray::Short(Vec::<i16>::new().into()),
-                EpicsValue::ShortArray(vec![]),
+                EpicsValue::ShortArray(vec![].into()),
             ),
             (
                 TypedScalarArray::UInt(Vec::<u32>::new().into()),
-                EpicsValue::Int64Array(vec![]),
+                EpicsValue::Int64Array(vec![].into()),
             ),
             (
                 TypedScalarArray::ULong(Vec::<u64>::new().into()),
-                EpicsValue::UInt64Array(vec![]),
+                EpicsValue::UInt64Array(vec![].into()),
             ),
         ];
 
@@ -971,21 +986,39 @@ mod tests {
     #[test]
     fn epics_arrays_become_typed_arrays_of_their_wire_type() {
         let cases = [
-            (EpicsValue::ShortArray(vec![-1, 2]), ScalarType::Short),
-            (EpicsValue::FloatArray(vec![1.5]), ScalarType::Float),
-            (EpicsValue::EnumArray(vec![3]), ScalarType::UShort),
-            (EpicsValue::DoubleArray(vec![2.5, 3.5]), ScalarType::Double),
-            (EpicsValue::LongArray(vec![-7]), ScalarType::Int),
-            (EpicsValue::CharArray(vec![0xFF]), ScalarType::Byte),
             (
-                EpicsValue::StringArray(vec!["x".into()]),
+                EpicsValue::ShortArray(vec![-1, 2].into()),
+                ScalarType::Short,
+            ),
+            (EpicsValue::FloatArray(vec![1.5].into()), ScalarType::Float),
+            (EpicsValue::EnumArray(vec![3].into()), ScalarType::UShort),
+            (
+                EpicsValue::DoubleArray(vec![2.5, 3.5].into()),
+                ScalarType::Double,
+            ),
+            (EpicsValue::LongArray(vec![-7].into()), ScalarType::Int),
+            (EpicsValue::CharArray(vec![0xFF].into()), ScalarType::Byte),
+            (
+                EpicsValue::StringArray(vec!["x".into()].into()),
                 ScalarType::String,
             ),
-            (EpicsValue::Int64Array(vec![i64::MIN]), ScalarType::Long),
-            (EpicsValue::UInt64Array(vec![u64::MAX]), ScalarType::ULong),
-            (EpicsValue::UShortArray(vec![u16::MAX]), ScalarType::UShort),
-            (EpicsValue::ULongArray(vec![u32::MAX]), ScalarType::UInt),
-            (EpicsValue::UCharArray(vec![200]), ScalarType::UByte),
+            (
+                EpicsValue::Int64Array(vec![i64::MIN].into()),
+                ScalarType::Long,
+            ),
+            (
+                EpicsValue::UInt64Array(vec![u64::MAX].into()),
+                ScalarType::ULong,
+            ),
+            (
+                EpicsValue::UShortArray(vec![u16::MAX].into()),
+                ScalarType::UShort,
+            ),
+            (
+                EpicsValue::ULongArray(vec![u32::MAX].into()),
+                ScalarType::UInt,
+            ),
+            (EpicsValue::UCharArray(vec![200].into()), ScalarType::UByte),
         ];
         for (value, wire) in cases {
             let PvField::ScalarArrayTyped(typed) = epics_to_pv_field(&value) else {

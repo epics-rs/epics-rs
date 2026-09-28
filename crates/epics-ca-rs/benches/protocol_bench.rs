@@ -87,7 +87,7 @@ fn bench_dbr_encode_decode(c: &mut Criterion) {
 
     // Array encode/decode
     let array_snap = Snapshot::new(
-        EpicsValue::DoubleArray(vec![1.0; 1024]),
+        EpicsValue::DoubleArray(vec![1.0; 1024].into()),
         0,
         0,
         std::time::SystemTime::now(),

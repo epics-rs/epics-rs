@@ -52,7 +52,7 @@ fn asub_channels_announce_nox_and_novx() {
 
     // A subroutine writes 3 elements; NEVA follows, the announced count must
     // not.
-    rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+    rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .unwrap();
     assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
     assert_eq!(
@@ -62,7 +62,7 @@ fn asub_channels_announce_nox_and_novx() {
     );
 
     // An input link delivers 2 elements into an 8-wide cell.
-    rec.put_field("A", EpicsValue::DoubleArray(vec![4.0, 5.0]))
+    rec.put_field("A", EpicsValue::DoubleArray(vec![4.0, 5.0].into()))
         .unwrap();
     assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(2)));
     assert_eq!(rec.field_native_count("A"), Some(8));
@@ -86,7 +86,7 @@ fn compress_val_announces_nsam() {
     assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(3)));
     assert_eq!(
         rec.get_field("VAL"),
-        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])),
+        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())),
         "get_array_info serves NUSE elements"
     );
     assert_eq!(

@@ -193,7 +193,7 @@ async fn acalcout_reseeds_numeric_inputs_only() {
     assert_eq!(field(&db, "AC", "B").await, EpicsValue::Double(7.0));
     assert_eq!(
         field(&db, "AC", "AA").await,
-        EpicsValue::DoubleArray(vec![0.0; 4]),
+        EpicsValue::DoubleArray(vec![0.0; 4].into()),
         "C's fieldIndex <= INPL guard excludes the array inputs from the re-seed"
     );
 }

@@ -484,22 +484,52 @@ pub fn zero_dbr_value(base: DbFieldType, count: u32) -> EpicsValue {
     match base {
         DbFieldType::String => pick(
             EpicsValue::String(PvString::from("")),
-            EpicsValue::StringArray(vec![PvString::from(""); n]),
+            EpicsValue::StringArray(vec![PvString::from(""); n].into()),
         ),
-        DbFieldType::Short => pick(EpicsValue::Short(0), EpicsValue::ShortArray(vec![0; n])),
-        DbFieldType::Float => pick(EpicsValue::Float(0.0), EpicsValue::FloatArray(vec![0.0; n])),
-        DbFieldType::Enum => pick(EpicsValue::Enum(0), EpicsValue::EnumArray(vec![0; n])),
-        DbFieldType::Char => pick(EpicsValue::Char(0), EpicsValue::CharArray(vec![0; n])),
-        DbFieldType::Long => pick(EpicsValue::Long(0), EpicsValue::LongArray(vec![0; n])),
+        DbFieldType::Short => pick(
+            EpicsValue::Short(0),
+            EpicsValue::ShortArray(vec![0; n].into()),
+        ),
+        DbFieldType::Float => pick(
+            EpicsValue::Float(0.0),
+            EpicsValue::FloatArray(vec![0.0; n].into()),
+        ),
+        DbFieldType::Enum => pick(
+            EpicsValue::Enum(0),
+            EpicsValue::EnumArray(vec![0; n].into()),
+        ),
+        DbFieldType::Char => pick(
+            EpicsValue::Char(0),
+            EpicsValue::CharArray(vec![0; n].into()),
+        ),
+        DbFieldType::Long => pick(
+            EpicsValue::Long(0),
+            EpicsValue::LongArray(vec![0; n].into()),
+        ),
         DbFieldType::Double => pick(
             EpicsValue::Double(0.0),
-            EpicsValue::DoubleArray(vec![0.0; n]),
+            EpicsValue::DoubleArray(vec![0.0; n].into()),
         ),
-        DbFieldType::Int64 => pick(EpicsValue::Int64(0), EpicsValue::Int64Array(vec![0; n])),
-        DbFieldType::UInt64 => pick(EpicsValue::UInt64(0), EpicsValue::UInt64Array(vec![0; n])),
-        DbFieldType::UShort => pick(EpicsValue::UShort(0), EpicsValue::UShortArray(vec![0; n])),
-        DbFieldType::ULong => pick(EpicsValue::ULong(0), EpicsValue::ULongArray(vec![0; n])),
-        DbFieldType::UChar => pick(EpicsValue::UChar(0), EpicsValue::UCharArray(vec![0; n])),
+        DbFieldType::Int64 => pick(
+            EpicsValue::Int64(0),
+            EpicsValue::Int64Array(vec![0; n].into()),
+        ),
+        DbFieldType::UInt64 => pick(
+            EpicsValue::UInt64(0),
+            EpicsValue::UInt64Array(vec![0; n].into()),
+        ),
+        DbFieldType::UShort => pick(
+            EpicsValue::UShort(0),
+            EpicsValue::UShortArray(vec![0; n].into()),
+        ),
+        DbFieldType::ULong => pick(
+            EpicsValue::ULong(0),
+            EpicsValue::ULongArray(vec![0; n].into()),
+        ),
+        DbFieldType::UChar => pick(
+            EpicsValue::UChar(0),
+            EpicsValue::UCharArray(vec![0; n].into()),
+        ),
     }
 }
 
@@ -1228,7 +1258,7 @@ mod tests {
 
     #[test]
     fn array_renders_count_then_values() {
-        let v = EpicsValue::DoubleArray(vec![1.0, 2.5, 3.0]);
+        let v = EpicsValue::DoubleArray(vec![1.0, 2.5, 3.0].into());
         let s = fv(&v, &fmt_default(), None, false);
         // C: `3 1 2.5 3` (count + space-separated %g values)
         assert_eq!(s, "3 1 2.5 3");
@@ -1239,13 +1269,13 @@ mod tests {
     /// value, no `1 ` prefix.
     #[test]
     fn single_element_array_omits_count_without_req_elems() {
-        let v = EpicsValue::DoubleArray(vec![2.5]);
+        let v = EpicsValue::DoubleArray(vec![2.5].into());
         // No `-#` on the command line → no count prefix.
         assert_eq!(fv(&v, &fmt_default(), None, false), "2.5");
         // `-#` supplied → count prefix returns even for 1 element.
         assert_eq!(fv(&v, &fmt_default(), None, true), "1 2.5");
         // Multi-element always carries the count prefix.
-        let v2 = EpicsValue::DoubleArray(vec![1.0, 2.5]);
+        let v2 = EpicsValue::DoubleArray(vec![1.0, 2.5].into());
         assert_eq!(fv(&v2, &fmt_default(), None, false), "2 1 2.5");
     }
 
@@ -1261,7 +1291,7 @@ mod tests {
     #[test]
     fn specified_dbr_value_line_never_leads_with_the_count() {
         let f = fmt_default();
-        let arr = EpicsValue::LongArray(vec![10, 20, 30]);
+        let arr = EpicsValue::LongArray(vec![10, 20, 30].into());
         assert_eq!(format_value(&arr, &f, None, CountPrefix::Never), "10 20 30");
         // `-#` cannot bring the prefix back on this block either — C's loop
         // has no gate to enable.
@@ -1274,7 +1304,7 @@ mod tests {
         // Every array carrier, not just the integer one.
         assert_eq!(
             format_value(
-                &EpicsValue::StringArray(vec!["a".into(), "b".into()]),
+                &EpicsValue::StringArray(vec!["a".into(), "b".into()].into()),
                 &f,
                 None,
                 CountPrefix::Never
@@ -1284,7 +1314,7 @@ mod tests {
         let strs: Vec<PvString> = vec!["off".into(), "on".into()];
         assert_eq!(
             format_value(
-                &EpicsValue::EnumArray(vec![1, 0]),
+                &EpicsValue::EnumArray(vec![1, 0].into()),
                 &f,
                 Some(&strs),
                 CountPrefix::Never
@@ -1309,7 +1339,7 @@ mod tests {
     fn specified_dbr_still_honours_req_elems_for_the_long_string_gate() {
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
-        let one = EpicsValue::CharArray(b"A".to_vec());
+        let one = EpicsValue::CharArray(b"A".to_vec().into());
         let mut req = fmt.clone();
         req.req_elems = 1;
         assert_eq!(
@@ -1402,7 +1432,7 @@ mod tests {
 
     #[test]
     fn char_array_long_string_strips_at_nul() {
-        let v = EpicsValue::CharArray(b"hello\0xxxx".to_vec());
+        let v = EpicsValue::CharArray(b"hello\0xxxx".to_vec().into());
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
         assert_eq!(fv(&v, &fmt, None, false), "hello");
@@ -1430,12 +1460,12 @@ mod tests {
             "x\\ty"
         );
         // StringArray elements escaped; count prefix preserved.
-        let a = EpicsValue::StringArray(vec!["a\nb".into(), "c".into()]);
+        let a = EpicsValue::StringArray(vec!["a\nb".into(), "c".into()].into());
         assert_eq!(fv(&a, &fmt_default(), None, false), "2 a\\nb c");
         // `-S` long-string: escape the printable prefix up to NUL.
         let mut sfmt = fmt_default();
         sfmt.char_array_as_string = true;
-        let cv = EpicsValue::CharArray(b"hi\tthere\0junk".to_vec());
+        let cv = EpicsValue::CharArray(b"hi\tthere\0junk".to_vec().into());
         assert_eq!(fv(&cv, &sfmt, None, true), "hi\\tthere");
     }
 
@@ -1503,12 +1533,22 @@ mod tests {
                 "the wire CHAR carrier takes the same val2str narrowing ({style:?})"
             );
             assert_eq!(
-                fv(&EpicsValue::CharArray(vec![255, 1]), &fmt, None, false),
+                fv(
+                    &EpicsValue::CharArray(vec![255, 1].into()),
+                    &fmt,
+                    None,
+                    false
+                ),
                 "2 -1 1",
                 "a CHAR array renders every element via the same %d arm ({style:?})"
             );
             assert_eq!(
-                fv(&EpicsValue::UCharArray(vec![255, 1]), &fmt, None, false),
+                fv(
+                    &EpicsValue::UCharArray(vec![255, 1].into()),
+                    &fmt,
+                    None,
+                    false
+                ),
                 "2 -1 1",
                 "a wire CHAR array likewise ({style:?})"
             );
@@ -1520,7 +1560,7 @@ mod tests {
         assert_eq!(fv(&EpicsValue::Short(-1), &hex, None, false), "0xFFFFFFFF");
         assert_eq!(fv(&EpicsValue::Long(-1), &hex, None, false), "0xFFFFFFFF");
         assert_eq!(
-            fv(&EpicsValue::LongArray(vec![-1]), &hex, None, true),
+            fv(&EpicsValue::LongArray(vec![-1].into()), &hex, None, true),
             "1 0xFFFFFFFF"
         );
     }
@@ -1798,7 +1838,7 @@ mod tests {
     ///   `caget -# -3 TST:LO` → `TST:LO   1 200`   (count prefix, all elems)
     #[test]
     fn req_elems_zero_means_all_elements_not_none() {
-        let v = EpicsValue::LongArray(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let v = EpicsValue::LongArray(vec![0, 1, 2, 3, 4, 5, 6, 7].into());
         let mut fmt = fmt_default();
 
         fmt.req_elems = 0; // `-# 0`, `-# abc`, and no `-#` at all
@@ -1816,7 +1856,7 @@ mod tests {
         );
 
         // The one-element case is where the count prefix distinguishes them.
-        let one = EpicsValue::LongArray(vec![200]);
+        let one = EpicsValue::LongArray(vec![200].into());
         fmt.req_elems = 0;
         assert_eq!(
             format_value(&one, &fmt, None, CountPrefix::IfRequestedOrArray),

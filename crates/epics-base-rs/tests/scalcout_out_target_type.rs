@@ -92,7 +92,7 @@ async fn r14_61_char_array_target_receives_sval_bytes() {
     want.resize(12, 0);
     assert_eq!(
         db.get_pv("WF_TGT").unwrap(),
-        EpicsValue::CharArray(want),
+        EpicsValue::CharArray(want.into()),
         "a DBF_CHAR array target takes DBF_CHAR from SVAL (devsCalcoutSoft.c:136-138)"
     );
 }

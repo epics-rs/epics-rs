@@ -41,7 +41,7 @@ record(waveform,"USH"){ field(FTVL,"USHORT") field(NELM,"4") field(INP,"SRC") }
 "#;
 
 fn one_byte() -> EpicsValue {
-    EpicsValue::CharArray(vec![BYTE])
+    EpicsValue::CharArray(vec![BYTE].into())
 }
 
 #[test]
@@ -50,39 +50,39 @@ fn every_numeric_target_promotes_the_byte_through_epicsint8() {
     // extension is named individually rather than hidden behind a sibling.
     assert_eq!(
         one_byte().convert_to(DbFieldType::Enum),
-        EpicsValue::EnumArray(vec![AS_ENUM])
+        EpicsValue::EnumArray(vec![AS_ENUM].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::UShort),
-        EpicsValue::UShortArray(vec![AS_ENUM])
+        EpicsValue::UShortArray(vec![AS_ENUM].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Short),
-        EpicsValue::ShortArray(vec![-56])
+        EpicsValue::ShortArray(vec![-56].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Long),
-        EpicsValue::LongArray(vec![-56])
+        EpicsValue::LongArray(vec![-56].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::ULong),
-        EpicsValue::ULongArray(vec![0xFFFF_FFC8])
+        EpicsValue::ULongArray(vec![0xFFFF_FFC8].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Double),
-        EpicsValue::DoubleArray(vec![-56.0])
+        EpicsValue::DoubleArray(vec![-56.0].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Float),
-        EpicsValue::FloatArray(vec![-56.0])
+        EpicsValue::FloatArray(vec![-56.0].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Int64),
-        EpicsValue::Int64Array(vec![-56])
+        EpicsValue::Int64Array(vec![-56].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::UInt64),
-        EpicsValue::UInt64Array(vec![0xFFFF_FFFF_FFFF_FFC8])
+        EpicsValue::UInt64Array(vec![0xFFFF_FFFF_FFFF_FFC8].into())
     );
 }
 
@@ -93,11 +93,11 @@ fn the_byte_carriers_stay_byte_identical() {
     // to the Enum row is not "helpfully" spread onto them.
     assert_eq!(
         one_byte().convert_to(DbFieldType::UChar),
-        EpicsValue::UCharArray(vec![BYTE])
+        EpicsValue::UCharArray(vec![BYTE].into())
     );
     assert_eq!(
         one_byte().convert_to(DbFieldType::Char),
-        EpicsValue::CharArray(vec![BYTE])
+        EpicsValue::CharArray(vec![BYTE].into())
     );
 }
 
@@ -108,7 +108,7 @@ fn a_one_element_array_agrees_with_the_scalar() {
     let scalar = EpicsValue::Char(BYTE).convert_to(DbFieldType::Enum);
     assert_eq!(scalar, EpicsValue::Enum(AS_ENUM));
     let array = one_byte().convert_to(DbFieldType::Enum);
-    assert_eq!(array, EpicsValue::EnumArray(vec![AS_ENUM]));
+    assert_eq!(array, EpicsValue::EnumArray(vec![AS_ENUM].into()));
 }
 
 #[epics_macros_rs::epics_test]
@@ -122,7 +122,7 @@ async fn a_char_waveform_linked_into_an_enum_waveform_lands_signed() {
         .build()
         .await
         .expect("build ioc");
-    db.put_pv("SRC", EpicsValue::CharArray(vec![BYTE]))
+    db.put_pv("SRC", EpicsValue::CharArray(vec![BYTE].into()))
         .await
         .expect("seed SRC");
 
@@ -131,12 +131,12 @@ async fn a_char_waveform_linked_into_an_enum_waveform_lands_signed() {
 
     assert_eq!(
         db.get_pv("DST").expect("DST"),
-        EpicsValue::EnumArray(vec![AS_ENUM]),
+        EpicsValue::EnumArray(vec![AS_ENUM].into()),
         "FTVL=ENUM must land what C's getCharEnum lands"
     );
     assert_eq!(
         db.get_pv("USH").expect("USH"),
-        EpicsValue::UShortArray(vec![AS_ENUM]),
+        EpicsValue::UShortArray(vec![AS_ENUM].into()),
         "the neighbouring FTVL must not disagree with it"
     );
 }

@@ -181,8 +181,11 @@ async fn r10_65_fetched_string_is_capped_at_the_c_field_width() {
     let db = PvDatabase::new();
     let long = "x".repeat(50);
     let mut wf = WaveformRecord::new(64, DbFieldType::Char);
-    wf.put_field("VAL", EpicsValue::CharArray(long.clone().into_bytes()))
-        .unwrap();
+    wf.put_field(
+        "VAL",
+        EpicsValue::CharArray(long.clone().into_bytes().into()),
+    )
+    .unwrap();
     db.add_record("WF", Box::new(wf)).await.unwrap();
 
     let mut c = scalcout("AA");

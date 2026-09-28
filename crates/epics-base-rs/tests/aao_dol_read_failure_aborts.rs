@@ -101,11 +101,11 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 async fn dead_dol_writes_nothing_out_and_does_not_fire_flnk() {
     let db = build().await;
     // A value a client left in the aao — the stale VAL C refuses to write out.
-    db.put_pv("AAO:DEAD", EpicsValue::DoubleArray(vec![5.0, 6.0]))
+    db.put_pv("AAO:DEAD", EpicsValue::DoubleArray(vec![5.0, 6.0].into()))
         .await
         .unwrap();
     // A sentinel the FLNK target would pick up through its own INP if it ran.
-    db.put_pv("FLNK:SRC", EpicsValue::DoubleArray(vec![42.0]))
+    db.put_pv("FLNK:SRC", EpicsValue::DoubleArray(vec![42.0].into()))
         .await
         .unwrap();
 
@@ -113,12 +113,12 @@ async fn dead_dol_writes_nothing_out_and_does_not_fire_flnk() {
 
     assert_eq!(
         db.get_pv("DEAD:OUT").unwrap(),
-        EpicsValue::DoubleArray(vec![]),
+        EpicsValue::DoubleArray(vec![].into()),
         "C returns BEFORE writeValue: a stale VAL must not reach the OUT target"
     );
     assert_eq!(
         db.get_pv("DEAD:FLNK").unwrap(),
-        EpicsValue::DoubleArray(vec![]),
+        EpicsValue::DoubleArray(vec![].into()),
         "C returns BEFORE recGblFwdLink: the forward link must not fire"
     );
 }
@@ -162,7 +162,7 @@ async fn dead_dol_raises_a_pending_link_alarm() {
 #[epics_macros_rs::epics_test]
 async fn live_dol_completes_the_cycle() {
     let db = build().await;
-    db.put_pv("FLNK:SRC", EpicsValue::DoubleArray(vec![42.0]))
+    db.put_pv("FLNK:SRC", EpicsValue::DoubleArray(vec![42.0].into()))
         .await
         .unwrap();
 
@@ -170,17 +170,17 @@ async fn live_dol_completes_the_cycle() {
 
     assert_eq!(
         db.get_pv("AAO:LIVE").unwrap(),
-        EpicsValue::DoubleArray(vec![2.5]),
+        EpicsValue::DoubleArray(vec![2.5].into()),
         "the DOL value lands in VAL (one element, NORD=1)"
     );
     assert_eq!(
         db.get_pv("LIVE:OUT").unwrap(),
-        EpicsValue::DoubleArray(vec![2.5]),
+        EpicsValue::DoubleArray(vec![2.5].into()),
         "writeValue runs"
     );
     assert_eq!(
         db.get_pv("LIVE:FLNK").unwrap(),
-        EpicsValue::DoubleArray(vec![42.0]),
+        EpicsValue::DoubleArray(vec![42.0].into()),
         "recGblFwdLink runs — the FLNK target processed and pulled its own INP"
     );
 }
@@ -193,7 +193,7 @@ async fn cycle_resumes_when_the_dol_source_returns() {
     process(&db, "AAO:DEAD").await;
     assert_eq!(
         db.get_pv("DEAD:OUT").unwrap(),
-        EpicsValue::DoubleArray(vec![])
+        EpicsValue::DoubleArray(vec![].into())
     );
 
     // The DOL target appears (a soft IOC restarting the source record).
@@ -204,11 +204,11 @@ async fn cycle_resumes_when_the_dol_source_returns() {
 
     assert_eq!(
         db.get_pv("AAO:DEAD").unwrap(),
-        EpicsValue::DoubleArray(vec![3.0])
+        EpicsValue::DoubleArray(vec![3.0].into())
     );
     assert_eq!(
         db.get_pv("DEAD:OUT").unwrap(),
-        EpicsValue::DoubleArray(vec![3.0]),
+        EpicsValue::DoubleArray(vec![3.0].into()),
         "the recovered fetch runs the full cycle again"
     );
 }

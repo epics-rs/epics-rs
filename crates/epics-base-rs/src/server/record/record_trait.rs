@@ -5206,18 +5206,18 @@ pub fn dbput_coerce_value<R: Record + ?Sized>(
 /// `dbPutConvertRoutine` row over the request afterwards, array to array.
 fn one_element_buffer(value: &EpicsValue) -> Option<EpicsValue> {
     Some(match value {
-        EpicsValue::Short(v) => EpicsValue::ShortArray(vec![*v]),
-        EpicsValue::Float(v) => EpicsValue::FloatArray(vec![*v]),
-        EpicsValue::Enum(v) => EpicsValue::EnumArray(vec![*v]),
-        EpicsValue::Double(v) => EpicsValue::DoubleArray(vec![*v]),
-        EpicsValue::Long(v) => EpicsValue::LongArray(vec![*v]),
-        EpicsValue::Int64(v) => EpicsValue::Int64Array(vec![*v]),
-        EpicsValue::UInt64(v) => EpicsValue::UInt64Array(vec![*v]),
-        EpicsValue::UShort(v) => EpicsValue::UShortArray(vec![*v]),
-        EpicsValue::ULong(v) => EpicsValue::ULongArray(vec![*v]),
-        EpicsValue::UChar(v) => EpicsValue::UCharArray(vec![*v]),
-        EpicsValue::Char(v) => EpicsValue::CharArray(vec![*v]),
-        EpicsValue::String(v) => EpicsValue::StringArray(vec![v.clone()]),
+        EpicsValue::Short(v) => EpicsValue::ShortArray(vec![*v].into()),
+        EpicsValue::Float(v) => EpicsValue::FloatArray(vec![*v].into()),
+        EpicsValue::Enum(v) => EpicsValue::EnumArray(vec![*v].into()),
+        EpicsValue::Double(v) => EpicsValue::DoubleArray(vec![*v].into()),
+        EpicsValue::Long(v) => EpicsValue::LongArray(vec![*v].into()),
+        EpicsValue::Int64(v) => EpicsValue::Int64Array(vec![*v].into()),
+        EpicsValue::UInt64(v) => EpicsValue::UInt64Array(vec![*v].into()),
+        EpicsValue::UShort(v) => EpicsValue::UShortArray(vec![*v].into()),
+        EpicsValue::ULong(v) => EpicsValue::ULongArray(vec![*v].into()),
+        EpicsValue::UChar(v) => EpicsValue::UCharArray(vec![*v].into()),
+        EpicsValue::Char(v) => EpicsValue::CharArray(vec![*v].into()),
+        EpicsValue::String(v) => EpicsValue::StringArray(vec![v.clone()].into()),
         // Not a stored value; `convert_to` collapses it to a bare index.
         EpicsValue::EnumWithChoices { .. } => return None,
         // Already a buffer.

@@ -4545,7 +4545,7 @@ async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
         .unwrap();
 
     let result = db
-        .put_record_field_from_ca("EMPTYPUT", "VAL", EpicsValue::DoubleArray(vec![]))
+        .put_record_field_from_ca("EMPTYPUT", "VAL", EpicsValue::DoubleArray(vec![].into()))
         .await;
     assert!(
         result.is_ok(),
@@ -4587,7 +4587,7 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
     db.add_record("EMPTYWF", Box::new(wf)).await.unwrap();
 
     let result = db
-        .put_record_field_from_ca("EMPTYWF", "VAL", EpicsValue::DoubleArray(vec![]))
+        .put_record_field_from_ca("EMPTYWF", "VAL", EpicsValue::DoubleArray(vec![].into()))
         .await;
     assert!(result.is_ok(), "empty array into a waveform must succeed");
 
@@ -4623,7 +4623,7 @@ async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
         .put_record_field_from_ca(
             "ARRPUT",
             "VAL",
-            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
         )
         .await;
     assert!(
@@ -4652,12 +4652,16 @@ async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
     );
     db.add_record("ARRWF", Box::new(wf)).await.unwrap();
 
-    db.put_record_field_from_ca("ARRWF", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-        .await
-        .expect("an array into an array field must succeed");
+    db.put_record_field_from_ca(
+        "ARRWF",
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+    )
+    .await
+    .expect("an array into an array field must succeed");
     assert_eq!(
         db.get_pv("ARRWF.VAL").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
         "an array destination must NOT be clamped to element 0"
     );
 }
@@ -4673,7 +4677,7 @@ async fn r6_10_single_element_array_into_scalar_writes_that_element() {
         .await
         .unwrap();
 
-    db.put_record_field_from_ca("ONEPUT", "VAL", EpicsValue::DoubleArray(vec![7.0]))
+    db.put_record_field_from_ca("ONEPUT", "VAL", EpicsValue::DoubleArray(vec![7.0].into()))
         .await
         .expect("a one-element array into a scalar must succeed");
     match db.get_pv("ONEPUT.VAL").unwrap() {
@@ -4697,9 +4701,12 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
         epics_base_rs::types::DbFieldType::Double,
     );
     db.add_record("LNKWF", Box::new(wf)).await.unwrap();
-    db.put_pv("LNKWF.VAL", EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "LNKWF.VAL",
+        EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0].into()),
+    )
+    .await
+    .unwrap();
 
     db.add_record("LNKAI", Box::new(AiRecord::new(0.0)))
         .await
@@ -7206,7 +7213,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         if let Some(rec) = db.get_record(name) {
             let mut inst = rec.write();
             inst.record
-                .set_val(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+                .set_val(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
                 .unwrap();
         }
         let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -7379,9 +7386,12 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
 
     // Drive the gateway-style put: VAL update via put_pv_and_post,
     // no record processing. NORD must be reported alongside.
-    db.put_pv_and_post("WF_GW", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .await
-        .unwrap();
+    db.put_pv_and_post(
+        "WF_GW",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .await
+    .unwrap();
 
     let val_event = val_rx
         .try_recv()
@@ -7404,9 +7414,12 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
 
     // No-op re-put with the same array: NORD didn't change, so no
     // duplicate NORD event.
-    db.put_pv_and_post("WF_GW", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .await
-        .unwrap();
+    db.put_pv_and_post(
+        "WF_GW",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .await
+    .unwrap();
     assert!(
         nord_rx.try_recv().is_err(),
         "NORD unchanged → no duplicate NORD event"
@@ -7788,7 +7801,7 @@ async fn test_compress_res_write_posts_val_monitor() {
         // the concrete CompressRecord state.
         // CompressRecord's process() pushes from INP — we don't have
         // an INP, so instead manually populate a few VAL entries.
-        let arr = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let arr = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0].into());
         let _ = inst.record.put_field("VAL", arr);
     }
 
@@ -8089,7 +8102,7 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     db.put_record_field_from_ca(
         "CVT_WFS",
         "VAL",
-        EpicsValue::DoubleArray(vec![1.7, 2.2, -3.9, 70000.0, 5.0, 6.0]),
+        EpicsValue::DoubleArray(vec![1.7, 2.2, -3.9, 70000.0, 5.0, 6.0].into()),
     )
     .await
     .unwrap();
@@ -9762,7 +9775,7 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
         let out2 = out.clone();
         let sub_fn: SubroutineFn = Box::new(move |record: &mut dyn Record| {
             let v = out2.lock().unwrap().clone();
-            record.put_field("VALA", EpicsValue::DoubleArray(v))?;
+            record.put_field("VALA", EpicsValue::DoubleArray(v.into()))?;
             Ok(0)
         });
         inst.subroutine = Some(Arc::new(sub_fn));
@@ -10415,7 +10428,7 @@ async fn init_applies_constant_dol_across_record_types() {
         let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"hello".to_vec())),
+            Some(EpicsValue::CharArray(b"hello".to_vec().into())),
             "lso JSON const DOL → VAL"
         );
         assert_eq!(

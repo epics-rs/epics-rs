@@ -221,8 +221,8 @@ impl Default for McaRecord {
         // from a `.db`, rather than in a zeroed state no C record ever has.
         Self {
             vers: 1.0,
-            val: EpicsValue::LongArray(Vec::new()),
-            bg: EpicsValue::LongArray(Vec::new()),
+            val: EpicsValue::LongArray(Vec::new().into()),
+            bg: EpicsValue::LongArray(Vec::new().into()),
             hopr: 0.0,
             lopr: 0.0,
             nmax: 1,
@@ -341,18 +341,18 @@ impl McaRecord {
     fn zeroed_buffer(&self) -> EpicsValue {
         let n = self.capacity();
         match self.ftvl {
-            Ftype::String => EpicsValue::StringArray(vec![PvString::new(); n]),
-            Ftype::Char => EpicsValue::CharArray(vec![0; n]),
-            Ftype::UChar => EpicsValue::UCharArray(vec![0; n]),
-            Ftype::Short => EpicsValue::ShortArray(vec![0; n]),
-            Ftype::UShort => EpicsValue::UShortArray(vec![0; n]),
-            Ftype::Long => EpicsValue::LongArray(vec![0; n]),
-            Ftype::ULong => EpicsValue::ULongArray(vec![0; n]),
-            Ftype::Int64 => EpicsValue::Int64Array(vec![0; n]),
-            Ftype::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
-            Ftype::Float => EpicsValue::FloatArray(vec![0.0; n]),
-            Ftype::Double => EpicsValue::DoubleArray(vec![0.0; n]),
-            Ftype::Enum => EpicsValue::EnumArray(vec![0; n]),
+            Ftype::String => EpicsValue::StringArray(vec![PvString::new(); n].into()),
+            Ftype::Char => EpicsValue::CharArray(vec![0; n].into()),
+            Ftype::UChar => EpicsValue::UCharArray(vec![0; n].into()),
+            Ftype::Short => EpicsValue::ShortArray(vec![0; n].into()),
+            Ftype::UShort => EpicsValue::UShortArray(vec![0; n].into()),
+            Ftype::Long => EpicsValue::LongArray(vec![0; n].into()),
+            Ftype::ULong => EpicsValue::ULongArray(vec![0; n].into()),
+            Ftype::Int64 => EpicsValue::Int64Array(vec![0; n].into()),
+            Ftype::UInt64 => EpicsValue::UInt64Array(vec![0; n].into()),
+            Ftype::Float => EpicsValue::FloatArray(vec![0.0; n].into()),
+            Ftype::Double => EpicsValue::DoubleArray(vec![0.0; n].into()),
+            Ftype::Enum => EpicsValue::EnumArray(vec![0; n].into()),
         }
     }
 
@@ -372,7 +372,7 @@ impl McaRecord {
         macro_rules! clear {
             ($v:expr, $zero:expr) => {{
                 let end = n.min($v.len());
-                $v[..end].fill($zero);
+                $v.make_mut()[..end].fill($zero);
             }};
         }
         match &mut self.val {
@@ -442,7 +442,7 @@ impl McaRecord {
                 let mut arr = $src;
                 let written = arr.len().min(cap);
                 arr.resize(cap, $zero);
-                Ok((EpicsValue::$variant(arr), written))
+                Ok((EpicsValue::$variant(arr.into()), written))
             }};
         }
         match converted {
@@ -1037,7 +1037,7 @@ mod tests {
         };
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
-        rec.put_field("VAL", EpicsValue::LongArray(spectrum.to_vec()))
+        rec.put_field("VAL", EpicsValue::LongArray(spectrum.to_vec().into()))
             .unwrap();
         rec
     }
@@ -1109,7 +1109,7 @@ mod tests {
 
         rec.apply_status(status(false));
         assert_eq!(rec.acqg, 1, "still 1 — the spectrum has not landed yet");
-        rec.land_spectrum_read(EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]))
+        rec.land_spectrum_read(EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()))
             .unwrap();
         assert_eq!(rec.acqg, 1);
         rec.process().unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
         rec.nord = 8;
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::LongArray(vec![0, 0, 0, 0, 5, 6, 7, 8]))
+            Some(EpicsValue::LongArray(vec![0, 0, 0, 0, 5, 6, 7, 8].into()))
         );
     }
 
@@ -1393,9 +1393,9 @@ mod tests {
         assert_eq!(rec.roi[0].net, 21.0, "R0N");
         assert_eq!(
             rec.get_field("BG"),
-            Some(EpicsValue::LongArray(vec![
-                0, 0, 30, 13, 16, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]))
+            Some(EpicsValue::LongArray(
+                vec![0, 0, 30, 13, 16, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].into()
+            ))
         );
     }
 

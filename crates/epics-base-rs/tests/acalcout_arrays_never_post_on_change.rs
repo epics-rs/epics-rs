@@ -55,8 +55,11 @@ async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
     a.put_field("CALC", EpicsValue::String("AA:=BB*2;SUM(AA)".into()))
         .unwrap();
     a.special("CALC", true).unwrap();
-    a.put_field("BB", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
+    a.put_field(
+        "BB",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .unwrap();
     db.add_record("A6", Box::new(a)).await.unwrap();
 
     let inst = db.get_record("A6").unwrap();
@@ -76,9 +79,12 @@ async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
 
     // A client caput to CC. This posts the put's value — the subscriber has
     // already heard it.
-    db.put_pv("A6.CC", EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0, 7.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "A6.CC",
+        EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0, 7.0].into()),
+    )
+    .await
+    .unwrap();
     while cc_rx.try_recv().is_ok() {}
 
     // The next process stores nothing into CC and fetches nothing into it, so

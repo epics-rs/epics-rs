@@ -1320,7 +1320,7 @@ fn constant_array_value(inner: &str) -> EpicsValue {
     // report the link uninitialized so the field keeps its default
     // (`dbConstLink.c:208-211`). Zero elements is that state; the diagnostic
     // line has no route out of this signature.
-    EpicsValue::DoubleArray(Vec::new())
+    EpicsValue::DoubleArray(Vec::new().into())
 }
 
 /// C `epicsParseDouble(pstr, &value, NULL)` — the ONE test that decides whether

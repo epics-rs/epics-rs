@@ -1312,7 +1312,7 @@ mod tests {
         arr[0] = v as f64;
         MonitorEvent {
             snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::DoubleArray(arr),
+                EpicsValue::DoubleArray(arr.into()),
                 0,
                 0,
                 std::time::SystemTime::UNIX_EPOCH,

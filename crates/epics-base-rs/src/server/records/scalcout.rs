@@ -1451,7 +1451,7 @@ impl Record for ScalcoutRecord {
                 let src = if async_put { &self.osv } else { &self.sval };
                 let mut buf = src.as_bytes().to_vec();
                 buf.resize(n, 0);
-                EpicsValue::CharArray(buf)
+                EpicsValue::CharArray(buf.into())
             }
             _ => staged,
         }
@@ -2107,7 +2107,7 @@ mod tests {
                 staged,
                 &out_target(Some(DbFieldType::Char), 12, false)
             ),
-            EpicsValue::CharArray(want)
+            EpicsValue::CharArray(want.into())
         );
     }
 
@@ -2126,7 +2126,7 @@ mod tests {
                 staged,
                 &out_target(Some(DbFieldType::Char), 12, true)
             ),
-            EpicsValue::CharArray(want)
+            EpicsValue::CharArray(want.into())
         );
     }
 
@@ -2146,7 +2146,7 @@ mod tests {
                 staged,
                 &out_target(Some(DbFieldType::Char), 12, false)
             ),
-            EpicsValue::CharArray(want)
+            EpicsValue::CharArray(want.into())
         );
     }
 

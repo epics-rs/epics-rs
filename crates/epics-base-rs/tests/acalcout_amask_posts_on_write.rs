@@ -42,8 +42,11 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
     a.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
     a.special("CALC", true).unwrap();
-    a.put_field("BB", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
+    a.put_field(
+        "BB",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .unwrap();
     db.add_record(name, Box::new(a)).await.unwrap();
 }
 
@@ -73,7 +76,7 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
     let first = aa_rx.try_recv().expect("AA moved on the first process");
     assert_eq!(
         first.snapshot.value,
-        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0])
+        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into())
     );
 
     // Second process: identical inputs, identical store, identical value.
@@ -84,7 +87,7 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
         .expect("AMASK bit 0 is set again, so afterCalc posts AA again (:294-298)");
     assert_eq!(
         second.snapshot.value,
-        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0])
+        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into())
     );
     assert_eq!(
         second.mask,

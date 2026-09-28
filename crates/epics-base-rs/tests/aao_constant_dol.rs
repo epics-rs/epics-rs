@@ -66,7 +66,7 @@ async fn constant_array_dol_is_loaded_at_init() {
 
     assert_eq!(
         db.get_pv("CL:ARRAY").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
         "C `dbLoadLinkArray(&prec->dol, ...)` at init_record pass 1"
     );
     assert_eq!(db.get_pv("CL:ARRAY.NORD").unwrap().to_f64(), Some(3.0));
@@ -84,7 +84,7 @@ async fn constant_scalar_dol_is_one_element() {
 
     assert_eq!(
         db.get_pv("CL:SCALAR").unwrap(),
-        EpicsValue::DoubleArray(vec![7.5])
+        EpicsValue::DoubleArray(vec![7.5].into())
     );
     assert_eq!(db.get_pv("CL:SCALAR.NORD").unwrap().to_f64(), Some(1.0));
 }
@@ -97,7 +97,7 @@ async fn supervisory_mode_ignores_the_constant_dol() {
 
     assert_eq!(
         db.get_pv("SUP:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![]),
+        EpicsValue::DoubleArray(vec![].into()),
         "supervisory: DOL is not a value source"
     );
     assert!(
@@ -118,11 +118,11 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
         .unwrap();
     assert_eq!(
         db.get_pv("TGT").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
         "the init-loaded constant is what gets written out"
     );
 
-    db.put_pv("CL:ARRAY", EpicsValue::DoubleArray(vec![9.0, 9.0]))
+    db.put_pv("CL:ARRAY", EpicsValue::DoubleArray(vec![9.0, 9.0].into()))
         .await
         .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -131,11 +131,11 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
         .unwrap();
     assert_eq!(
         db.get_pv("CL:ARRAY").unwrap(),
-        EpicsValue::DoubleArray(vec![9.0, 9.0]),
+        EpicsValue::DoubleArray(vec![9.0, 9.0].into()),
         "C `!init && !isConst`: a constant DOL is NOT re-fetched per cycle"
     );
     assert_eq!(
         db.get_pv("TGT").unwrap(),
-        EpicsValue::DoubleArray(vec![9.0, 9.0])
+        EpicsValue::DoubleArray(vec![9.0, 9.0].into())
     );
 }

@@ -34,7 +34,7 @@ fn strs(v: &[&str]) -> EpicsValue {
 
 #[test]
 fn char_array_get_converts_one_string_slot_per_element() {
-    let wf = EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec());
+    let wf = EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec().into());
     assert_eq!(
         wf.get_convert(DbFieldType::String).unwrap(),
         strs(&["65", "66", "67", "68", "69", "70", "71", "72", "73", "74"])
@@ -44,13 +44,13 @@ fn char_array_get_converts_one_string_slot_per_element() {
 #[test]
 fn char_array_element_is_signed_and_uchar_is_not() {
     assert_eq!(
-        EpicsValue::CharArray(vec![0xFF, 0x80, 0x7F])
+        EpicsValue::CharArray(vec![0xFF, 0x80, 0x7F].into())
             .get_convert(DbFieldType::String)
             .unwrap(),
         strs(&["-1", "-128", "127"])
     );
     assert_eq!(
-        EpicsValue::UCharArray(vec![0xFF, 0x80, 0x7F])
+        EpicsValue::UCharArray(vec![0xFF, 0x80, 0x7F].into())
             .get_convert(DbFieldType::String)
             .unwrap(),
         strs(&["255", "128", "127"])
@@ -60,7 +60,7 @@ fn char_array_element_is_signed_and_uchar_is_not() {
 #[test]
 fn dbr_string_payload_is_forty_bytes_per_element() {
     let snap = Snapshot::new(
-        EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec()),
+        EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec().into()),
         0,
         0,
         SystemTime::UNIX_EPOCH,
@@ -90,7 +90,7 @@ fn the_whole_buffer_projection_is_still_reachable_by_its_own_name() {
     // `convert_to` keeps the put/projection contract — the long-string
     // presentation depends on it — so the split has to leave it alone.
     assert_eq!(
-        EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec()).convert_to(DbFieldType::String),
+        EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec().into()).convert_to(DbFieldType::String),
         EpicsValue::String(PvString::from("ABCDEFGHIJ".to_string()))
     );
 }

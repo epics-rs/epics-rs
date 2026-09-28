@@ -7,6 +7,7 @@ mod value;
 
 pub use codec::*;
 pub use dbr::*;
+pub use epics_libcom_rs::SharedArray;
 pub use pv_string::*;
 pub use value::*;
 // `WallTime` moved down into `epics-libcom-rs` with the rest of the libCom

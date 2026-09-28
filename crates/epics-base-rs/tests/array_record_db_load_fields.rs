@@ -164,9 +164,12 @@ async fn loaded_sdly_defers_the_simulated_aai_read() {
         .unwrap();
 
     // Sentinel array in the SIOL source.
-    db.put_pv("ARR:SRC", EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "ARR:SRC",
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()),
+    )
+    .await
+    .unwrap();
     // C `recGblGetSimm` re-reads SIMM from SIML on every non-PACT entry, so the
     // switch record — not the loaded `field(SIMM,"YES")` — decides the mode at
     // process time. Drive it YES.
@@ -180,14 +183,14 @@ async fn loaded_sdly_defers_the_simulated_aai_read() {
     // SDLY=0.25 -> the read is deferred; VAL is still the empty (NORD=0) buffer.
     assert_eq!(
         field(&db, "ARR:AAI").await,
-        EpicsValue::DoubleArray(vec![]),
+        EpicsValue::DoubleArray(vec![].into()),
         "SDLY >= 0 must defer the simulated SIOL read (PACT held)"
     );
 
     // After the delay the deferred continuation lands the SIOL array.
     for _ in 0..200 {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
-        if field(&db, "ARR:AAI").await == EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]) {
+        if field(&db, "ARR:AAI").await == EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()) {
             return;
         }
     }

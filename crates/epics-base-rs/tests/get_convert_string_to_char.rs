@@ -96,21 +96,27 @@ fn unparseable_text_is_a_get_failure_not_its_first_byte() {
 
 #[test]
 fn a_string_waveform_parses_element_by_element() {
-    let src = EpicsValue::StringArray(vec![
-        PvString::from("65".to_string()),
-        PvString::from("".to_string()),
-        PvString::from("-2".to_string()),
-    ]);
+    let src = EpicsValue::StringArray(
+        vec![
+            PvString::from("65".to_string()),
+            PvString::from("".to_string()),
+            PvString::from("-2".to_string()),
+        ]
+        .into(),
+    );
     assert_eq!(
         src.get_convert(DbFieldType::Char).unwrap(),
-        EpicsValue::CharArray(vec![65, 0, 0xFE])
+        EpicsValue::CharArray(vec![65, 0, 0xFE].into())
     );
     // The first failing element aborts the whole get, as C returns the status
     // from inside `getStringChar`'s loop.
-    let bad = EpicsValue::StringArray(vec![
-        PvString::from("65".to_string()),
-        PvString::from("nope".to_string()),
-    ]);
+    let bad = EpicsValue::StringArray(
+        vec![
+            PvString::from("65".to_string()),
+            PvString::from("nope".to_string()),
+        ]
+        .into(),
+    );
     assert!(matches!(
         bad.get_convert(DbFieldType::Char),
         Err(CaError::GetConvertFailed(_))
@@ -121,6 +127,6 @@ fn a_string_waveform_parses_element_by_element() {
 fn the_text_byte_projection_stays_on_convert_to() {
     assert_eq!(
         s("hello").convert_to(DbFieldType::Char),
-        EpicsValue::CharArray(b"hello".to_vec())
+        EpicsValue::CharArray(b"hello".to_vec().into())
     );
 }

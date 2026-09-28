@@ -1604,7 +1604,7 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
     // Cycle 1: write [1,2,3] → hash changes → VAL and HASH post.
     instance
         .record
-        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
@@ -1628,7 +1628,7 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
     // Cycle 2: same content → hash unchanged → neither VAL nor HASH post.
     instance
         .record
-        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
@@ -1643,7 +1643,7 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
     // Cycle 3: new content → hash changes → VAL and HASH post again.
     instance
         .record
-        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 4]))
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 4].into()))
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(
@@ -1674,7 +1674,7 @@ fn test_waveform_always_mode_never_posts_hash() {
 
     instance
         .record
-        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
         .unwrap();
     let (snap, _) = instance.process_local().unwrap();
     assert!(

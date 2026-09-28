@@ -38,14 +38,17 @@ async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
     // SIOL source carries a distinctive sentinel array; a simulated aai must
     // read it inward into VAL (and must NOT overwrite the source).
     let mut siol_src = WaveformRecord::new(8, DbFieldType::Double);
-    let _ = siol_src.put_field("VAL", EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]));
+    let _ = siol_src.put_field(
+        "VAL",
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()),
+    );
     db.add_record("AAI_SIOL", Box::new(siol_src)).await.unwrap();
 
     let mut aai = WaveformRecord::new(8, DbFieldType::Double);
     aai.kind = ArrayKind::Aai;
     // VAL sentinel, distinct from the SIOL source array, to show it is replaced
     // by the inward SIOL read (not left stale, not written out).
-    let _ = aai.put_field("VAL", EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0]));
+    let _ = aai.put_field("VAL", EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0].into()));
     aai.siml = "AAI_SW".to_string();
     aai.siol = "AAI_SIOL".to_string();
     aai.sims = MINOR;

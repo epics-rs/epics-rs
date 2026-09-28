@@ -61,9 +61,12 @@ async fn acquired() -> PvDatabase {
             .await
             .unwrap();
     }
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "MCA1",
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
+    )
+    .await
+    .unwrap();
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(8));
     db
 }
@@ -74,18 +77,18 @@ async fn acquired() -> PvDatabase {
 async fn a_shorter_background_write_shortens_nord() {
     let db = acquired().await;
 
-    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![5, 5]))
+    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![5, 5].into()))
         .await
         .unwrap();
 
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(2));
     assert_eq!(
         db.get_pv("MCA1.BG").unwrap(),
-        EpicsValue::LongArray(vec![5, 5])
+        EpicsValue::LongArray(vec![5, 5].into())
     );
     assert_eq!(
         db.get_pv("MCA1").unwrap(),
-        EpicsValue::LongArray(vec![1, 2])
+        EpicsValue::LongArray(vec![1, 2].into())
     );
 }
 
@@ -94,7 +97,7 @@ async fn a_shorter_background_write_shortens_nord() {
 async fn a_full_length_background_write_leaves_nord_alone() {
     let db = acquired().await;
 
-    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![9; 8]))
+    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![9; 8].into()))
         .await
         .unwrap();
 
@@ -107,7 +110,7 @@ async fn a_full_length_background_write_leaves_nord_alone() {
 async fn an_over_long_background_write_clamps_nord_to_nmax() {
     let db = acquired().await;
 
-    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![3; 12]))
+    db.put_pv("MCA1.BG", EpicsValue::LongArray(vec![3; 12].into()))
         .await
         .unwrap();
 
@@ -119,7 +122,7 @@ async fn an_over_long_background_write_clamps_nord_to_nmax() {
 async fn a_shorter_spectrum_write_shortens_nord() {
     let db = acquired().await;
 
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![7, 7, 7]))
+    db.put_pv("MCA1", EpicsValue::LongArray(vec![7, 7, 7].into()))
         .await
         .unwrap();
 

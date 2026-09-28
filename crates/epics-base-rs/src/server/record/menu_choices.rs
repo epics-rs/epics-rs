@@ -169,18 +169,18 @@ impl Ftype {
     /// `callocMustSucceed(n, dbValueSize(ftvl))`.
     pub fn zeroed(self, n: usize) -> EpicsValue {
         match self {
-            Self::String => EpicsValue::StringArray(vec![PvString::new(); n]),
-            Self::Char => EpicsValue::CharArray(vec![0; n]),
-            Self::UChar => EpicsValue::UCharArray(vec![0; n]),
-            Self::Short => EpicsValue::ShortArray(vec![0; n]),
-            Self::UShort => EpicsValue::UShortArray(vec![0; n]),
-            Self::Long => EpicsValue::LongArray(vec![0; n]),
-            Self::ULong => EpicsValue::ULongArray(vec![0; n]),
-            Self::Int64 => EpicsValue::Int64Array(vec![0; n]),
-            Self::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
-            Self::Float => EpicsValue::FloatArray(vec![0.0; n]),
-            Self::Double => EpicsValue::DoubleArray(vec![0.0; n]),
-            Self::Enum => EpicsValue::EnumArray(vec![0; n]),
+            Self::String => EpicsValue::StringArray(vec![PvString::new(); n].into()),
+            Self::Char => EpicsValue::CharArray(vec![0; n].into()),
+            Self::UChar => EpicsValue::UCharArray(vec![0; n].into()),
+            Self::Short => EpicsValue::ShortArray(vec![0; n].into()),
+            Self::UShort => EpicsValue::UShortArray(vec![0; n].into()),
+            Self::Long => EpicsValue::LongArray(vec![0; n].into()),
+            Self::ULong => EpicsValue::ULongArray(vec![0; n].into()),
+            Self::Int64 => EpicsValue::Int64Array(vec![0; n].into()),
+            Self::UInt64 => EpicsValue::UInt64Array(vec![0; n].into()),
+            Self::Float => EpicsValue::FloatArray(vec![0.0; n].into()),
+            Self::Double => EpicsValue::DoubleArray(vec![0.0; n].into()),
+            Self::Enum => EpicsValue::EnumArray(vec![0; n].into()),
         }
     }
 }

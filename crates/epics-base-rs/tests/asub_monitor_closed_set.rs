@@ -70,7 +70,7 @@ async fn process(db: &PvDatabase, name: &str) {
 /// Drive the waveform source and settle it, so the aSub's next cycle fetches
 /// the new content and the new NORD.
 async fn drive(db: &PvDatabase, v: Vec<f64>) {
-    db.put_record_field_from_ca("SRC", "VAL", EpicsValue::DoubleArray(v))
+    db.put_record_field_from_ca("SRC", "VAL", EpicsValue::DoubleArray(v.into()))
         .await
         .unwrap();
     process(db, "SRC").await;
@@ -134,7 +134,7 @@ async fn asub_input_channels_never_post_from_a_process_cycle() {
             let g = inst.read();
             assert_eq!(
                 g.record.get_field("A"),
-                Some(EpicsValue::DoubleArray(vec![7.0, 8.0])),
+                Some(EpicsValue::DoubleArray(vec![7.0, 8.0].into())),
                 "EFLG={eflg}: the cycles really did move the input channel"
             );
             assert_eq!(
@@ -201,7 +201,7 @@ async fn asub_output_pairs_follow_the_eflg_switch() {
         process(&db, "X").await;
         assert_eq!(
             db.get_record("X").unwrap().read().record.get_field("VALA"),
-            Some(EpicsValue::DoubleArray(vec![7.0, 8.0])),
+            Some(EpicsValue::DoubleArray(vec![7.0, 8.0].into())),
             "the subroutine did write VALA"
         );
         assert!(vala_rx.try_recv().is_err(), "aSubEFLG_NEVER posts nothing");

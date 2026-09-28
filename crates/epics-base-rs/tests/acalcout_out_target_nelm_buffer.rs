@@ -76,7 +76,7 @@ impl Record for ArrayProbe {
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::DoubleArray(vec![0.0; 3])),
+            "VAL" => Some(EpicsValue::DoubleArray(vec![0.0; 3].into())),
             _ => None,
         }
     }
@@ -206,7 +206,7 @@ async fn ivov_bypasses_an_array_target_under_use_ocal() {
 
     assert_eq!(
         *last.lock().unwrap(),
-        Some(EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0])),
+        Some(EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0].into())),
         "array target ⇒ oav buffer ⇒ stale OCAL result, NOT IVOV"
     );
 }
@@ -257,7 +257,7 @@ async fn a_single_element_source_picks_the_scalar_buffer() {
     // asserts.
     assert_eq!(
         *last.lock().unwrap(),
-        Some(EpicsValue::DoubleArray(vec![42.0])),
+        Some(EpicsValue::DoubleArray(vec![42.0].into())),
         "source count 1 ⇒ nelm==1 ⇒ &oval, whatever the target"
     );
 }
@@ -284,7 +284,7 @@ async fn an_external_array_target_gets_the_array_buffer() {
 
     assert_eq!(
         *last_put.lock().unwrap(),
-        Some(EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0])),
+        Some(EpicsValue::DoubleArray(vec![7.0, 7.0, 7.0].into())),
         "connected CA array target ⇒ oav buffer ⇒ stale OCAL result"
     );
 }

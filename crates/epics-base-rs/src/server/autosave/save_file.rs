@@ -616,39 +616,39 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         EpicsValue::Char(_) => s.parse::<u8>().ok().map(EpicsValue::Char),
         EpicsValue::UChar(_) => s.parse::<u8>().ok().map(EpicsValue::UChar),
         EpicsValue::DoubleArray(_) => {
-            parse_array_str(s, |v| v.parse::<f64>().ok()).map(EpicsValue::DoubleArray)
+            parse_array_str(s, |v| v.parse::<f64>().ok()).map(|v| EpicsValue::DoubleArray(v.into()))
         }
         EpicsValue::LongArray(_) => {
-            parse_array_str(s, |v| v.parse::<i32>().ok()).map(EpicsValue::LongArray)
+            parse_array_str(s, |v| v.parse::<i32>().ok()).map(|v| EpicsValue::LongArray(v.into()))
         }
         EpicsValue::CharArray(_) => {
-            parse_array_str(s, |v| v.parse::<u8>().ok()).map(EpicsValue::CharArray)
+            parse_array_str(s, |v| v.parse::<u8>().ok()).map(|v| EpicsValue::CharArray(v.into()))
         }
         EpicsValue::ShortArray(_) => {
-            parse_array_str(s, |v| v.parse::<i16>().ok()).map(EpicsValue::ShortArray)
+            parse_array_str(s, |v| v.parse::<i16>().ok()).map(|v| EpicsValue::ShortArray(v.into()))
         }
         EpicsValue::FloatArray(_) => {
-            parse_array_str(s, |v| v.parse::<f32>().ok()).map(EpicsValue::FloatArray)
+            parse_array_str(s, |v| v.parse::<f32>().ok()).map(|v| EpicsValue::FloatArray(v.into()))
         }
         EpicsValue::EnumArray(_) => {
-            parse_array_str(s, |v| v.parse::<u16>().ok()).map(EpicsValue::EnumArray)
+            parse_array_str(s, |v| v.parse::<u16>().ok()).map(|v| EpicsValue::EnumArray(v.into()))
         }
         EpicsValue::Int64Array(_) => {
-            parse_array_str(s, |v| v.parse::<i64>().ok()).map(EpicsValue::Int64Array)
+            parse_array_str(s, |v| v.parse::<i64>().ok()).map(|v| EpicsValue::Int64Array(v.into()))
         }
         EpicsValue::UInt64Array(_) => {
-            parse_array_str(s, |v| v.parse::<u64>().ok()).map(EpicsValue::UInt64Array)
+            parse_array_str(s, |v| v.parse::<u64>().ok()).map(|v| EpicsValue::UInt64Array(v.into()))
         }
         EpicsValue::UShort(_) => s.parse::<u16>().ok().map(EpicsValue::UShort),
         EpicsValue::ULong(_) => s.parse::<u32>().ok().map(EpicsValue::ULong),
         EpicsValue::UShortArray(_) => {
-            parse_array_str(s, |v| v.parse::<u16>().ok()).map(EpicsValue::UShortArray)
+            parse_array_str(s, |v| v.parse::<u16>().ok()).map(|v| EpicsValue::UShortArray(v.into()))
         }
         EpicsValue::ULongArray(_) => {
-            parse_array_str(s, |v| v.parse::<u32>().ok()).map(EpicsValue::ULongArray)
+            parse_array_str(s, |v| v.parse::<u32>().ok()).map(|v| EpicsValue::ULongArray(v.into()))
         }
         EpicsValue::UCharArray(_) => {
-            parse_array_str(s, |v| v.parse::<u8>().ok()).map(EpicsValue::UCharArray)
+            parse_array_str(s, |v| v.parse::<u8>().ok()).map(|v| EpicsValue::UCharArray(v.into()))
         }
         EpicsValue::StringArray(_) => Some(EpicsValue::StringArray(
             decode_array_text(s).into_iter().map(Into::into).collect(),
@@ -683,7 +683,7 @@ mod tests {
     /// IOC can parse — not the native `[v,v,v]` form.
     #[test]
     fn c_format_array_uses_at_array_form() {
-        let v = EpicsValue::LongArray(vec![1, 2, 3]);
+        let v = EpicsValue::LongArray(vec![1, 2, 3].into());
         assert_eq!(value_to_save_str_c(&v), "@array@ { \"1\" \"2\" \"3\" }");
         assert_eq!(value_to_save_str(&v), "[1,2,3]");
     }
@@ -705,7 +705,7 @@ mod tests {
             },
             SaveEntry {
                 pv_name: "PV:ARRAY".to_string(),
-                value: value_to_save_str_c(&EpicsValue::LongArray(vec![10, 20])),
+                value: value_to_save_str_c(&EpicsValue::LongArray(vec![10, 20].into())),
                 connected: true,
             },
         ];
@@ -729,8 +729,8 @@ mod tests {
         assert_eq!(read.len(), 2);
         let arr = read.iter().find(|e| e.pv_name == "PV:ARRAY").unwrap();
         assert_eq!(arr.value, "[10,20]");
-        let parsed = parse_save_value(&arr.value, &EpicsValue::LongArray(vec![])).unwrap();
-        assert_eq!(parsed, EpicsValue::LongArray(vec![10, 20]));
+        let parsed = parse_save_value(&arr.value, &EpicsValue::LongArray(vec![].into())).unwrap();
+        assert_eq!(parsed, EpicsValue::LongArray(vec![10, 20].into()));
     }
 
     /// M6: native mode still writes the autosave-rs banner.

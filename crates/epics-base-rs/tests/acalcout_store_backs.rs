@@ -39,10 +39,16 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
     a.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
     a.special("CALC", true).unwrap();
-    a.put_field("AA", EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0]))
-        .unwrap();
-    a.put_field("BB", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
+    a.put_field(
+        "AA",
+        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0].into()),
+    )
+    .unwrap();
+    a.put_field(
+        "BB",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .unwrap();
     db.add_record(name, Box::new(a)).await.unwrap();
 }
 
@@ -57,7 +63,7 @@ async fn r11_9_array_store_writes_the_record_field_and_sets_amask() {
 
     assert_eq!(
         field(&db, "S1", "AA").await,
-        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0]),
+        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into()),
         "the store must land in the record's AA"
     );
     assert_eq!(
@@ -81,7 +87,7 @@ async fn r11_9_a_scalar_stored_into_an_array_variable_is_broadcast() {
 
     assert_eq!(
         field(&db, "S2", "AA").await,
-        EpicsValue::DoubleArray(vec![5.0, 5.0, 5.0, 5.0])
+        EpicsValue::DoubleArray(vec![5.0, 5.0, 5.0, 5.0].into())
     );
     assert_eq!(field(&db, "S2", "VAL").await.to_f64().unwrap(), 20.0);
     assert_eq!(
@@ -102,11 +108,11 @@ async fn r11_9_amask_carries_one_bit_per_stored_array() {
 
     assert_eq!(
         field(&db, "S3", "CC").await,
-        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0])
+        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0].into())
     );
     assert_eq!(
         field(&db, "S3", "DD").await,
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
     assert_eq!(
         field(&db, "S3", "AMASK").await,
@@ -179,7 +185,7 @@ async fn r11_9_stores_survive_a_failing_expression() {
 
     assert_eq!(
         field(&db, "S6", "AA").await,
-        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0]),
+        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0].into()),
         "the store landed before the domain error, and C never rolls it back"
     );
     assert_eq!(field(&db, "S6", "AMASK").await, EpicsValue::ULong(0x1));

@@ -1394,7 +1394,7 @@ mod tests {
         }
         // Synchronous array: C zeroes every one of the nElems it sized with.
         match plain(false, Some(DbFieldType::Long), 3) {
-            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::LongArray(vec![0, 0, 0])),
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::LongArray(vec![0, 0, 0].into())),
             other => panic!("sync array timeout must zero every element, got {other:?}"),
         }
         // An ENUM substituted to its label form is a DBR_*_STRING get, so its
@@ -1802,7 +1802,7 @@ mod tests {
     #[test]
     fn specified_report_value_line_has_no_count_prefix() {
         let snap = Snapshot::new(
-            EpicsValue::LongArray(vec![10, 20, 30]),
+            EpicsValue::LongArray(vec![10, 20, 30].into()),
             0,
             0,
             SystemTime::UNIX_EPOCH,

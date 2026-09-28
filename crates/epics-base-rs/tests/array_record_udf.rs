@@ -153,6 +153,6 @@ async fn an_undefined_waveform_carries_the_initial_udf_severity() {
     );
     assert_eq!(
         db.get_pv("UDF:WF").unwrap(),
-        EpicsValue::DoubleArray(vec![])
+        EpicsValue::DoubleArray(vec![].into())
     );
 }

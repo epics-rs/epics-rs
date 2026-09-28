@@ -4730,8 +4730,8 @@ mod tests {
             EpicsValue::UChar(b'S'),
             // Same test with a longer buffer: the LAST element must be the NUL,
             // an interior one does not save it.
-            EpicsValue::CharArray(b"SRC.VAL".to_vec()),
-            EpicsValue::CharArray(b"SRC\0VAL".to_vec()),
+            EpicsValue::CharArray(b"SRC.VAL".to_vec().into()),
+            EpicsValue::CharArray(b"SRC\0VAL".to_vec().into()),
         ] {
             let ca = db
                 .put_record_field_from_ca_no_notify("TY:CALC", "SDIS", bad.clone())
@@ -4761,7 +4761,7 @@ mod tests {
         db.put_record_field_from_ca_no_notify(
             "TY:CALC",
             "SDIS",
-            EpicsValue::CharArray(b"OTHER.VAL\0".to_vec()),
+            EpicsValue::CharArray(b"OTHER.VAL\0".to_vec().into()),
         )
         .await
         .expect("a NUL-terminated DBR_CHAR buffer is accepted");

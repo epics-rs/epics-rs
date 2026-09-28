@@ -98,7 +98,7 @@ async fn load(db: &PvDatabase) {
     }
     db.put_pv(
         "SIM:SPEC",
-        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
     )
     .await
     .unwrap();

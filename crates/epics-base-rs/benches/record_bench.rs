@@ -56,7 +56,7 @@ fn bench_epics_value(c: &mut Criterion) {
     });
 
     c.bench_function("epics_value_double_array_to_bytes", |b| {
-        let val = EpicsValue::DoubleArray(vec![1.0; 1024]);
+        let val = EpicsValue::DoubleArray(vec![1.0; 1024].into());
         b.iter(|| black_box(&val).to_bytes())
     });
 

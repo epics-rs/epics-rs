@@ -272,7 +272,7 @@ async fn a_cvt_dbaddr_retyped_no_access_field_still_reads() {
     )
     .await
     .unwrap();
-    db.put_pv_and_post("T:WF", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+    db.put_pv_and_post("T:WF", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
         .await
         .unwrap();
 

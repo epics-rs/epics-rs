@@ -37,7 +37,8 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 
 async fn wf_source(db: &PvDatabase, name: &str, data: Vec<f64>) {
     let mut wf = WaveformRecord::new(data.len() as i32, DbFieldType::Double);
-    wf.put_field("VAL", EpicsValue::DoubleArray(data)).unwrap();
+    wf.put_field("VAL", EpicsValue::DoubleArray(data.into()))
+        .unwrap();
     db.add_record(name, Box::new(wf)).await.unwrap();
 }
 
@@ -61,7 +62,7 @@ async fn r11_61_array_input_link_populates_aa() {
 
     assert_eq!(
         field(&db, "ACALC", "AA").await,
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
         "INAA must deliver the whole waveform into AA"
     );
     assert_eq!(field(&db, "ACALC", "VAL").await.to_f64().unwrap(), 15.0);
@@ -87,7 +88,7 @@ async fn r11_61_short_array_source_zero_fills_the_tail() {
 
     assert_eq!(
         field(&db, "ACALC2", "AA").await,
-        EpicsValue::DoubleArray(vec![7.0, 8.0, 0.0, 0.0, 0.0])
+        EpicsValue::DoubleArray(vec![7.0, 8.0, 0.0, 0.0, 0.0].into())
     );
     assert_eq!(field(&db, "ACALC2", "VAL").await.to_f64().unwrap(), 15.0);
 }

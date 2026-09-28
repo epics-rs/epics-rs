@@ -451,9 +451,12 @@ async fn waveform_array_round_trips() {
     .await
     .unwrap();
     // Seed an initial array via direct DB put.
-    db.put_pv("TEST:wf", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-        .await
-        .expect("seed");
+    db.put_pv(
+        "TEST:wf",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+    )
+    .await
+    .expect("seed");
 
     let ch = BridgeChannel::from_cached(
         db.clone(),
@@ -564,7 +567,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     .unwrap();
     db.put_pv(
         "TEST:filt_wf",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0].into()),
     )
     .await
     .expect("seed");
@@ -655,7 +658,7 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
     .unwrap();
     db.put_pv(
         "TEST:rng_wf",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0].into()),
     )
     .await
     .expect("seed");
@@ -1334,7 +1337,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
         let rec = db.get_record("TEST:lstr").expect("record");
         rec.write().set_info("Q:form", "String");
     }
-    db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec()))
+    db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec().into()))
         .await
         .expect("seed");
 
@@ -1404,7 +1407,7 @@ async fn r17_31_char_waveform_without_qform_stays_a_byte_array() {
     )
     .await
     .unwrap();
-    db.put_pv("TEST:bytes", EpicsValue::CharArray(b"abc".to_vec()))
+    db.put_pv("TEST:bytes", EpicsValue::CharArray(b"abc".to_vec().into()))
         .await
         .expect("seed");
 

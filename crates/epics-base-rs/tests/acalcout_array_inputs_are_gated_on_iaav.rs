@@ -137,7 +137,7 @@ async fn a_local_array_link_is_still_read() {
     let db = build().await;
     db.put_pv(
         "WF",
-        epics_base_rs::types::EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0]),
+        epics_base_rs::types::EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0].into()),
     )
     .await
     .unwrap();

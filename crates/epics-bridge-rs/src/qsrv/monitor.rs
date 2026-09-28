@@ -561,7 +561,7 @@ mod tests {
         .unwrap();
         db.put_pv(
             "WF_ARR.VAL",
-            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         )
         .await
         .unwrap();

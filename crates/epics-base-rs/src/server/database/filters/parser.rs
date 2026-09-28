@@ -1656,10 +1656,10 @@ mod tests {
         use crate::types::EpicsValue;
         let chain = try_parse_filter_chain(json).expect("{json} must parse");
         let out = chain
-            .apply(conv_ev(EpicsValue::DoubleArray(input)))
+            .apply(conv_ev(EpicsValue::DoubleArray(input.into())))
             .expect("value event must survive an arr filter");
         match Arc::unwrap_or_clone(out.event.snapshot).value {
-            EpicsValue::DoubleArray(v) => v,
+            EpicsValue::DoubleArray(v) => v.to_vec(),
             other => panic!("expected DoubleArray, got {other:?}"),
         }
     }

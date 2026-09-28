@@ -244,13 +244,13 @@ impl Record for LsiRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes()))
+        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes())),
-            "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes())),
+            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes().into())),
+            "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes().into())),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "LEN" => Some(EpicsValue::ULong(self.len)),
             "OLEN" => Some(EpicsValue::ULong(self.olen)),

@@ -85,7 +85,7 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
     }
     // Seed over the wire, so the record holds exactly the bytes a C IOC
     // would: the server's own WRITE path already puts DBR_CHAR unsigned.
-    src.put(&EpicsValue::CharArray(WIRE.to_vec()))
+    src.put(&EpicsValue::CharArray(WIRE.to_vec().into()))
         .await
         .expect("seed CHAR waveform");
     (client, src, dst)
@@ -97,7 +97,7 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
 async fn round_trip(dst: &CaChannel, value: &EpicsValue) -> Vec<i32> {
     dst.put(value).await.expect("put into LONG waveform");
     match dst.get().await.expect("read back LONG waveform").1 {
-        EpicsValue::LongArray(v) => v,
+        EpicsValue::LongArray(v) => v.to_vec(),
         other => panic!("expected a LONG waveform readback, got {other:?}"),
     }
 }

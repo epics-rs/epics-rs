@@ -4014,7 +4014,7 @@ mod tests {
     #[test]
     fn write_notify_payload_shorter_than_declared_count_drops_silently() {
         let (db, mut state, outbox, mut drain) =
-            write_test_session("WR:ARR", EpicsValue::DoubleArray(vec![1.0, 2.0]));
+            write_test_session("WR:ARR", EpicsValue::DoubleArray(vec![1.0, 2.0].into()));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
         // count=2 doubles declared, 8-byte payload (one double).
@@ -4051,7 +4051,7 @@ mod tests {
         // The put never ran.
         assert_eq!(
             simple_pv(&db, "WR:ARR").get(),
-            EpicsValue::DoubleArray(vec![1.0, 2.0])
+            EpicsValue::DoubleArray(vec![1.0, 2.0].into())
         );
     }
 

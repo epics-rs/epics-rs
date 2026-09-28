@@ -200,13 +200,54 @@ trait StatsElem: Copy + PartialOrd + 'static {
     fn variance(v: &[Self], mean: f64) -> f64 {
         variance_pass(v, mean)
     }
+    /// One row of a [`Projection`]: `col_sum` and `col_thr` gain the row's
+    /// values and threshold values column by column, and the row's own
+    /// Σvalue, Σthreshold value and Σthreshold value·ix come back. The lane
+    /// loop below, or, with the `simd` feature, [`simd_kernels`] for every
+    /// type but the 64-bit integers.
+    fn project_row(
+        row: &[Self],
+        threshold: f64,
+        col_sum: &mut [f64],
+        col_thr: &mut [f64],
+    ) -> [f64; 3] {
+        project_row_pass(row, threshold, col_sum, col_thr)
+    }
+    /// `Some(n)` when the type has only `n` values, few enough that a
+    /// histogram maps them through a table of slots built once per frame;
+    /// `None` for the wider types, which run the bin formula per element.
+    const TABLE_LEN: Option<usize> = None;
+    /// This value's index into that table, and the value at an index; both
+    /// unused by a type without a table.
+    fn table_index(self) -> usize {
+        0
+    }
+    fn table_value(_index: usize) -> f64 {
+        0.0
+    }
+    /// The formula path of a histogram: every value of `v` counted into
+    /// `slots` (the bins, then the below and above slots). The element loop
+    /// below, or, with the `simd` feature, [`simd_kernels`] for the 32-bit
+    /// integers and the floats.
+    fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
+        formula_count_pass(v, f, slots)
+    }
 }
 
 macro_rules! stats_elem {
-    (int: $($t:ty => $lane:ty => $acc:ty [$range:ident, $variance:ident]),* $(,)?) => {$(
+    (int: $($t:ty => $lane:ty => $acc:ty [$range:ident, $variance:ident, $project:ident $(, hist $hist:ident)?] $table:expr),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = $acc;
             type Lane = $lane;
+            const TABLE_LEN: Option<usize> = $table;
+            #[inline(always)]
+            fn table_index(self) -> usize {
+                (self as i64 - <$t>::MIN as i64) as usize
+            }
+            #[inline(always)]
+            fn table_value(index: usize) -> f64 {
+                (index as i64 + <$t>::MIN as i64) as f64
+            }
             #[cfg(feature = "simd")]
             fn range(v: &[Self]) -> Range<Self> {
                 fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$range(s, v))
@@ -215,6 +256,16 @@ macro_rules! stats_elem {
             fn variance(v: &[Self], mean: f64) -> f64 {
                 fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$variance(s, v, mean))
             }
+            #[cfg(feature = "simd")]
+            fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
+                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
+            }
+            $(
+            #[cfg(feature = "simd")]
+            fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
+                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$hist(s, v, f, slots))
+            }
+            )?
             #[inline(always)]
             fn to_lane(self) -> $lane {
                 self as $lane
@@ -279,10 +330,18 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (float: $($t:ty),* $(,)?) => {$(
+    (float: $($t:ty [$project:ident, $hist:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = f64;
             type Lane = f64;
+            #[cfg(feature = "simd")]
+            fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
+                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
+            }
+            #[cfg(feature = "simd")]
+            fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
+                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$hist(s, v, f, slots))
+            }
             #[inline(always)]
             fn to_lane(self) -> f64 {
                 self as f64
@@ -315,15 +374,15 @@ macro_rules! stats_elem {
     )*};
 }
 stats_elem! {
-    int: i8 => i32 => i64 [range_i8, variance_i8],
-    i16 => i32 => i64 [range_i16, variance_i16],
-    i32 => i64 => i64 [range_i32, variance_i32],
-    u8 => u32 => u64 [range_u8, variance_u8],
-    u16 => u32 => u64 [range_u16, variance_u16],
-    u32 => u64 => u64 [range_u32, variance_u32],
+    int: i8 => i32 => i64 [range_i8, variance_i8, project_i8] Some(1 << 8),
+    i16 => i32 => i64 [range_i16, variance_i16, project_i16] Some(1 << 16),
+    i32 => i64 => i64 [range_i32, variance_i32, project_i32, hist hist_i32] None,
+    u8 => u32 => u64 [range_u8, variance_u8, project_u8] Some(1 << 8),
+    u16 => u32 => u64 [range_u16, variance_u16, project_u16] Some(1 << 16),
+    u32 => u64 => u64 [range_u32, variance_u32, project_u32, hist hist_u32] None,
 }
 stats_elem!(wide: i64 => f64 => f64, u64 => f64 => f64);
-stats_elem!(float: f32, f64);
+stats_elem!(float: f32 [project_f32, hist_f32], f64 [project_f64, hist_f64]);
 
 /// Independent accumulators per reduction. Fixing the association this way is
 /// what lets the compiler vectorize a floating-point sum at all — an IEEE sum
@@ -440,21 +499,135 @@ fn first_index<T: PartialEq + Copy>(v: &[T], x: T) -> usize {
         .map_or(0, |i| base + i)
 }
 
-/// [`range_pass`] and [`variance_pass`] on explicit vectors, one level per
-/// CPU the binary may run on. The lane loops above only reach the baseline
-/// the binary was compiled for (SSE2 on x86_64, where an unsigned 16-bit
-/// min does not even exist); `fearless_simd` picks AVX2/AVX-512/NEON at run
-/// time, and its `Fallback` level is the lane loop again on anything else.
-/// Integer types only: their extremes are exact under any lane order, and
-/// their sums are integer adds. The floats and the 64-bit integers keep
-/// the lane loops, whose float min/max the compiler already lowers to
-/// packed compares with C's strict semantics.
+/// [`range_pass`], [`variance_pass`] and [`project_row_pass`] on explicit
+/// vectors, one level per CPU the binary may run on. The lane loops above
+/// only reach the baseline the binary was compiled for (SSE2 on x86_64,
+/// where an unsigned 16-bit min does not even exist); `fearless_simd` picks
+/// AVX2/AVX-512/NEON at run time, and its `Fallback` level is the lane loop
+/// again on anything else. The range kernels are for the integer types
+/// only: their extremes are exact under any lane order, and their sums are
+/// integer adds. The floats and the 64-bit integers keep the lane loops,
+/// whose float min/max the compiler already lowers to packed compares with
+/// C's strict semantics. The projection is `f64` arithmetic whatever the
+/// element, so every type that widens to `f64` vectors gets a kernel.
 #[cfg(feature = "simd")]
 mod simd_kernels {
-    use super::{FLUSH, Range};
+    use super::{FLUSH, Formula, Range};
     use fearless_simd::{Level, Simd, prelude::*};
     use fearless_simd_macros::simd;
     use std::sync::OnceLock;
+
+    /// [`super::project_row_pass`] on vectors: `$to_f64` splits a chunk of
+    /// `$vec` into its `f64` vectors in element order, and each of those
+    /// updates one stretch of the column vectors.
+    macro_rules! project_kernel {
+        ($t:ty, $vec:ident, $project:ident, |$y:ident| $to_f64:expr) => {
+            #[simd]
+            pub(super) fn $project<S: Simd>(
+                simd: S,
+                row: &[$t],
+                threshold: f64,
+                col_sum: &mut [f64],
+                col_thr: &mut [f64],
+            ) -> [f64; 3] {
+                let n = S::f64s::LEN;
+                let thr = S::f64s::splat(simd, threshold);
+                let zero = S::f64s::splat(simd, 0.0);
+                let step = S::f64s::splat(simd, n as f64);
+                let mut idx = zero;
+                for (l, x) in idx.as_mut_slice().iter_mut().enumerate() {
+                    *x = l as f64;
+                }
+                let (mut sum, mut thr_sum, mut m10) = (zero, zero, zero);
+                let mut chunks = row.chunks_exact(S::$vec::LEN);
+                let mut base = 0;
+                for c in &mut chunks {
+                    let $y = S::$vec::from_slice(simd, c);
+                    for val in $to_f64 {
+                        let masked = val.simd_ge(thr).select(val, zero);
+                        let cs = &mut col_sum[base..base + n];
+                        cs.copy_from_slice((S::f64s::from_slice(simd, cs) + val).as_slice());
+                        let ct = &mut col_thr[base..base + n];
+                        ct.copy_from_slice((S::f64s::from_slice(simd, ct) + masked).as_slice());
+                        sum += val;
+                        thr_sum += masked;
+                        m10 = masked.mul_add(idx, m10);
+                        idx += step;
+                        base += n;
+                    }
+                }
+                let mut out = [sum.reduce_sum(), thr_sum.reduce_sum(), m10.reduce_sum()];
+                super::project_tail(
+                    chunks.remainder(),
+                    base,
+                    threshold,
+                    col_sum,
+                    col_thr,
+                    &mut out,
+                );
+                out
+            }
+        };
+    }
+
+    project_kernel!(f32, f32s, project_f32, |y| {
+        let (a, b) = y.widen();
+        [a, b]
+    });
+    project_kernel!(f64, f64s, project_f64, |y| [y]);
+
+    /// [`super::formula_count_pass`] on vectors: C's bin arithmetic on `f64`
+    /// lanes, each lane classified before the truncation so that it lands
+    /// where [`super::slot`] puts it. `bin < 0` is `t <= -1`, `bin > last`
+    /// is `t >= last + 1` (a saturated cast falls on the same side), and a
+    /// NaN truncates to 0 as `as i64` does. The increments stay scalar; a
+    /// histogram scatter has no vector form.
+    macro_rules! hist_kernel {
+        ($t:ty, $vec:ident, $hist:ident, |$y:ident| $to_f64:expr) => {
+            #[simd]
+            pub(super) fn $hist<S: Simd>(simd: S, v: &[$t], f: &Formula, slots: &mut [u64]) {
+                let hist_size = slots.len() - 2;
+                let min = S::f64s::splat(simd, f.hist_min);
+                let max = S::f64s::splat(simd, f.hist_max);
+                let scale = S::f64s::splat(simd, f.scale);
+                let half = S::f64s::splat(simd, 0.5);
+                let zero = S::f64s::splat(simd, 0.0);
+                let neg_one = S::f64s::splat(simd, -1.0);
+                let end = S::f64s::splat(simd, (f.last + 1) as f64);
+                let below_slot = S::i64s::splat(simd, hist_size as i64);
+                let above_slot = S::i64s::splat(simd, hist_size as i64 + 1);
+                let mut chunks = v.chunks_exact(S::$vec::LEN);
+                for c in &mut chunks {
+                    let $y = S::$vec::from_slice(simd, c);
+                    for val in $to_f64 {
+                        let t = (val - min) * scale + half;
+                        let below = t.simd_le(neg_one) | val.simd_lt(min);
+                        let above = t.simd_ge(end) | val.simd_gt(max);
+                        let bin = S::i64s::truncate_from(t.simd_eq(t).select(t, zero));
+                        let slot = below.select(below_slot, above.select(above_slot, bin));
+                        for &i in slot.as_slice() {
+                            slots[i as usize] += 1;
+                        }
+                    }
+                }
+                super::formula_count_pass(chunks.remainder(), f, slots);
+            }
+        };
+    }
+
+    hist_kernel!(f32, f32s, hist_f32, |y| {
+        let (a, b) = y.widen();
+        [a, b]
+    });
+    hist_kernel!(f64, f64s, hist_f64, |y| [y]);
+    hist_kernel!(i32, i32s, hist_i32, |y| {
+        let (p0, p1) = y.widen();
+        [S::f64s::float_from(p0), S::f64s::float_from(p1)]
+    });
+    hist_kernel!(u32, u32s, hist_u32, |y| {
+        let (p0, p1) = y.widen();
+        [S::f64s::float_from(p0), S::f64s::float_from(p1)]
+    });
 
     /// The detected level, once per process.
     pub(super) fn level() -> Level {
@@ -468,8 +641,10 @@ mod simd_kernels {
     /// accumulator into the `$acc` total without overflowing a 32-bit lane
     /// sum, and `$to_f64` splits a chunk into its `f64` vectors.
     macro_rules! int_kernels {
-        ($t:ty, $vec:ident, $lanes:ident, $acc:ty, $range:ident, $variance:ident,
+        ($t:ty, $vec:ident, $lanes:ident, $acc:ty, $range:ident, $variance:ident, $project:ident,
          |$x:ident| $widen:expr, |$a:ident| $flush:expr, |$y:ident| $to_f64:expr) => {
+            project_kernel!($t, $vec, $project, |$y| $to_f64);
+
             #[simd]
             pub(super) fn $range<S: Simd>(simd: S, v: &[$t]) -> Range<$t> {
                 let mut chunks = v.chunks_exact(S::$vec::LEN);
@@ -535,6 +710,7 @@ mod simd_kernels {
         u64,
         range_u8,
         variance_u8,
+        project_u8,
         |x| {
             let (a, b) = x.widen();
             let (a0, a1) = a.widen();
@@ -572,6 +748,7 @@ mod simd_kernels {
         i64,
         range_i8,
         variance_i8,
+        project_i8,
         |x| {
             let (a, b) = x.widen();
             let (a0, a1) = a.widen();
@@ -609,6 +786,7 @@ mod simd_kernels {
         u64,
         range_u16,
         variance_u16,
+        project_u16,
         |x| {
             let (a, b) = x.widen();
             a + b
@@ -636,6 +814,7 @@ mod simd_kernels {
         i64,
         range_i16,
         variance_i16,
+        project_i16,
         |x| {
             let (a, b) = x.widen();
             a + b
@@ -663,6 +842,7 @@ mod simd_kernels {
         u64,
         range_u32,
         variance_u32,
+        project_u32,
         |x| {
             let (a, b) = x.widen();
             a + b
@@ -680,6 +860,7 @@ mod simd_kernels {
         i64,
         range_i32,
         variance_i32,
+        project_i32,
         |x| {
             let (a, b) = x.widen();
             a + b
@@ -897,66 +1078,93 @@ impl Projection {
 }
 
 /// Project a band of whole rows (`v.len()` a multiple of `x_size`).
-///
-/// A row is walked `LANES` columns at a time so that the column vectors are
-/// updated as vectors and the row's own sums are kept in per-lane
-/// accumulators, folded once per row; the threshold test is a select, not a
-/// branch, so the whole body vectorizes.
 fn project_band<T: StatsElem>(v: &[T], x_size: usize, threshold: f64) -> Projection {
     let mut p = Projection::zeroed(x_size, v.len() / x_size);
     for (iy, row) in v.chunks_exact(x_size).enumerate() {
-        let mut sum = [0.0f64; LANES];
-        let mut thr = [0.0f64; LANES];
-        let mut m10 = [0.0f64; LANES];
-        let mut cols = row.chunks_exact(LANES);
-        let mut base = 0;
-        // The column index as a vector of f64, stepped by LANES per chunk:
-        // converting `base + l` in the loop would need a packed usize->f64,
-        // which the baseline target lacks, and the loop would scalarize.
-        let mut idx = [0.0f64; LANES];
-        for (l, x) in idx.iter_mut().enumerate() {
-            *x = l as f64;
-        }
-        for c in cols.by_ref() {
-            let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES elements");
-            let cs: &mut [f64; LANES] = (&mut p.col_sum[base..base + LANES])
-                .try_into()
-                .expect("LANES columns");
-            let ct: &mut [f64; LANES] = (&mut p.col_thr[base..base + LANES])
-                .try_into()
-                .expect("LANES columns");
-            for l in 0..LANES {
-                let val = c[l].to_f64();
-                let masked = if val >= threshold { val } else { 0.0 };
-                cs[l] += val;
-                ct[l] += masked;
-                sum[l] += val;
-                thr[l] += masked;
-                m10[l] += masked * idx[l];
-            }
-            for x in idx.iter_mut() {
-                *x += LANES as f64;
-            }
-            base += LANES;
-        }
-        let mut row_sum: f64 = sum.iter().sum();
-        let mut row_thr: f64 = thr.iter().sum();
-        let mut row_m10: f64 = m10.iter().sum();
-        for (l, &e) in cols.remainder().iter().enumerate() {
-            let ix = base + l;
-            let val = e.to_f64();
-            let masked = if val >= threshold { val } else { 0.0 };
-            p.col_sum[ix] += val;
-            p.col_thr[ix] += masked;
-            row_sum += val;
-            row_thr += masked;
-            row_m10 += masked * ix as f64;
-        }
-        p.row_sum[iy] = row_sum;
-        p.row_thr[iy] = row_thr;
-        p.row_m10[iy] = row_m10;
+        let [sum, thr, m10] = T::project_row(row, threshold, &mut p.col_sum, &mut p.col_thr);
+        p.row_sum[iy] = sum;
+        p.row_thr[iy] = thr;
+        p.row_m10[iy] = m10;
     }
     p
+}
+
+/// [`StatsElem::project_row`] as a lane loop: the row is walked `LANES`
+/// columns at a time so that the column vectors are updated as vectors and
+/// the row's own sums are kept in per-lane accumulators, folded once per
+/// row; the threshold test is a select, not a branch, so the whole body
+/// vectorizes.
+fn project_row_pass<T: StatsElem>(
+    row: &[T],
+    threshold: f64,
+    col_sum: &mut [f64],
+    col_thr: &mut [f64],
+) -> [f64; 3] {
+    let mut sum = [0.0f64; LANES];
+    let mut thr = [0.0f64; LANES];
+    let mut m10 = [0.0f64; LANES];
+    let mut cols = row.chunks_exact(LANES);
+    let mut base = 0;
+    // The column index as a vector of f64, stepped by LANES per chunk:
+    // converting `base + l` in the loop would need a packed usize->f64,
+    // which the baseline target lacks, and the loop would scalarize.
+    let mut idx = [0.0f64; LANES];
+    for (l, x) in idx.iter_mut().enumerate() {
+        *x = l as f64;
+    }
+    for c in cols.by_ref() {
+        let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES elements");
+        let cs: &mut [f64; LANES] = (&mut col_sum[base..base + LANES])
+            .try_into()
+            .expect("LANES columns");
+        let ct: &mut [f64; LANES] = (&mut col_thr[base..base + LANES])
+            .try_into()
+            .expect("LANES columns");
+        for l in 0..LANES {
+            let val = c[l].to_f64();
+            let masked = if val >= threshold { val } else { 0.0 };
+            cs[l] += val;
+            ct[l] += masked;
+            sum[l] += val;
+            thr[l] += masked;
+            m10[l] += masked * idx[l];
+        }
+        for x in idx.iter_mut() {
+            *x += LANES as f64;
+        }
+        base += LANES;
+    }
+    let mut out = [sum.iter().sum(), thr.iter().sum(), m10.iter().sum()];
+    project_tail(
+        cols.remainder(),
+        base,
+        threshold,
+        col_sum,
+        col_thr,
+        &mut out,
+    );
+    out
+}
+
+/// The columns from `base` on that no vector covered, one at a time.
+fn project_tail<T: StatsElem>(
+    rest: &[T],
+    base: usize,
+    threshold: f64,
+    col_sum: &mut [f64],
+    col_thr: &mut [f64],
+    [sum, thr, m10]: &mut [f64; 3],
+) {
+    for (l, &e) in rest.iter().enumerate() {
+        let ix = base + l;
+        let val = e.to_f64();
+        let masked = if val >= threshold { val } else { 0.0 };
+        col_sum[ix] += val;
+        col_thr[ix] += masked;
+        *sum += val;
+        *thr += masked;
+        *m10 += masked * ix as f64;
+    }
 }
 
 /// Project the first `x_size * y_size` elements of `v` as a 2-D frame, in
@@ -1140,7 +1348,7 @@ pub fn compute_histogram(
     }
 
     let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(v, hist_size, hist_min, hist_max));
-    let histogram: Vec<f64> = counts.bins.iter().map(|&c| c as f64).collect();
+    let histogram: Vec<f64> = counts.bins().iter().map(|&c| c as f64).collect();
 
     // Compute entropy matching C++: -sum(count * ln(count)) / nElements
     // Zero-count bins are treated as count=1 (so ln(1)=0, effectively skipped)
@@ -1156,62 +1364,152 @@ pub fn compute_histogram(
         0.0
     };
 
-    (histogram, counts.below as f64, counts.above as f64, entropy)
+    (
+        histogram,
+        counts.below() as f64,
+        counts.above() as f64,
+        entropy,
+    )
 }
 
-/// Bin counts of one histogram pass, or of several merged.
+/// Slot counts of one histogram pass, or of several merged: the bins, then
+/// the count below the range and the count above it.
 struct HistCounts {
-    bins: Vec<u64>,
-    below: u64,
-    above: u64,
+    slots: Vec<u64>,
 }
 
 impl HistCounts {
     fn zeroed(hist_size: usize) -> Self {
         Self {
-            bins: vec![0; hist_size],
-            below: 0,
-            above: 0,
+            slots: vec![0; hist_size + 2],
         }
+    }
+
+    fn bins(&self) -> &[u64] {
+        &self.slots[..self.slots.len() - 2]
+    }
+
+    fn below(&self) -> u64 {
+        self.slots[self.slots.len() - 2]
+    }
+
+    fn above(&self) -> u64 {
+        self.slots[self.slots.len() - 1]
     }
 
     #[cfg(feature = "parallel")]
     fn merge(mut self, other: Self) -> Self {
-        for (a, b) in self.bins.iter_mut().zip(&other.bins) {
+        for (a, b) in self.slots.iter_mut().zip(&other.slots) {
             *a += b;
         }
-        self.below += other.below;
-        self.above += other.above;
         self
     }
 }
 
-/// Count `v` into `acc`. The bin index is formed exactly as C does, so the
-/// two agree bin for bin, including which side of an edge a value falls on.
-fn histogram_into<T: StatsElem>(acc: &mut HistCounts, v: &[T], hist_min: f64, hist_max: f64) {
-    let last = acc.bins.len() as i64 - 1;
-    let scale = last as f64 / (hist_max - hist_min);
+/// How the values of `T` map onto the slots of one histogram: through the
+/// bin formula per element, or, for a type with few enough values, through
+/// a table of every value's slot.
+enum SlotMap {
+    Formula(Formula),
+    Table(Vec<u32>),
+}
+
+/// The bin formula's constants for one histogram.
+#[derive(Clone, Copy)]
+pub(crate) struct Formula {
+    pub(crate) hist_min: f64,
+    pub(crate) hist_max: f64,
+    pub(crate) scale: f64,
+    pub(crate) last: i64,
+}
+
+/// One pass of the formula path: `slots` holds the bins, then the below
+/// slot, then the above slot.
+fn formula_count_pass<T: StatsElem>(v: &[T], f: &Formula, slots: &mut [u64]) {
+    // The two out-of-range counts stay in registers: routing them through
+    // the slot vector like the bins costs a fifth of the pass.
+    let (mut below, mut above) = (0u64, 0u64);
     for &e in v {
-        let value = e.to_f64();
-        let bin = ((value - hist_min) * scale + 0.5) as i64;
-        if bin < 0 || value < hist_min {
-            acc.below += 1;
-        } else if bin > last || value > hist_max {
-            acc.above += 1;
-        } else {
-            acc.bins[bin as usize] += 1;
+        match slot(e.to_f64(), f.hist_min, f.hist_max, f.scale, f.last) {
+            Slot::Below => below += 1,
+            Slot::Above => above += 1,
+            Slot::Bin(bin) => slots[bin] += 1,
+        }
+    }
+    let n = slots.len();
+    slots[n - 2] += below;
+    slots[n - 1] += above;
+}
+
+impl SlotMap {
+    fn new<T: StatsElem>(hist_size: usize, hist_min: f64, hist_max: f64) -> Self {
+        let last = hist_size as i64 - 1;
+        let scale = last as f64 / (hist_max - hist_min);
+        match T::TABLE_LEN {
+            Some(len) => Self::Table(
+                (0..len)
+                    .map(
+                        |i| match slot(T::table_value(i), hist_min, hist_max, scale, last) {
+                            Slot::Below => hist_size as u32,
+                            Slot::Above => hist_size as u32 + 1,
+                            Slot::Bin(bin) => bin as u32,
+                        },
+                    )
+                    .collect(),
+            ),
+            None => Self::Formula(Formula {
+                hist_min,
+                hist_max,
+                scale,
+                last,
+            }),
+        }
+    }
+
+    /// Count `v` into `acc`.
+    fn count<T: StatsElem>(&self, acc: &mut HistCounts, v: &[T]) {
+        match self {
+            Self::Formula(f) => T::formula_count(v, f, &mut acc.slots),
+            Self::Table(table) => {
+                for &e in v {
+                    acc.slots[table[e.table_index()] as usize] += 1;
+                }
+            }
         }
     }
 }
 
+/// Where one value counts.
+enum Slot {
+    Below,
+    Above,
+    Bin(usize),
+}
+
+/// The slot of `value`, its bin formed exactly as C `doComputeHistogramT`
+/// forms it (NDPluginStats.cpp:46-54), so the two agree bin for bin,
+/// including which side of an edge a value falls on.
+#[inline(always)]
+fn slot(value: f64, hist_min: f64, hist_max: f64, scale: f64, last: i64) -> Slot {
+    let bin = ((value - hist_min) * scale + 0.5) as i64;
+    if bin < 0 || value < hist_min {
+        Slot::Below
+    } else if bin > last || value > hist_max {
+        Slot::Above
+    } else {
+        Slot::Bin(bin as usize)
+    }
+}
+
 /// The histogram of `v`, counted across the pool when it is large enough:
-/// one set of bins per worker, merged at the end.
+/// one set of slots per worker, merged at the end.
 fn histogram_of<T: StatsElem + Sync>(
     v: &[T],
     hist_size: usize,
     hist_min: f64,
     hist_max: f64,
 ) -> HistCounts {
+    let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
     #[cfg(feature = "parallel")]
     if par_util::should_parallelize(v.len()) {
         return par_util::thread_pool().install(|| {
@@ -1219,7 +1517,7 @@ fn histogram_of<T: StatsElem + Sync>(
                 .fold(
                     || HistCounts::zeroed(hist_size),
                     |mut acc, chunk| {
-                        histogram_into(&mut acc, chunk, hist_min, hist_max);
+                        map.count(&mut acc, chunk);
                         acc
                     },
                 )
@@ -1227,7 +1525,7 @@ fn histogram_of<T: StatsElem + Sync>(
         });
     }
     let mut acc = HistCounts::zeroed(hist_size);
-    histogram_into(&mut acc, v, hist_min, hist_max);
+    map.count(&mut acc, v);
     acc
 }
 
@@ -3077,6 +3375,68 @@ mod tests {
                 assert_eq!(above, want_above, "{what} above");
             }
         }
+    }
+
+    /// The formula path on the values the bin arithmetic treats specially:
+    /// NaN, the infinities, magnitudes beyond `i64`, and values sitting on
+    /// the range limits and on the `.5` rounding edges of the bins.
+    #[test]
+    fn histogram_formula_edges_match_the_scalar_rule() {
+        let (lo, hi, bins) = (-3.0, 5.0, 7usize);
+        let scale = (bins - 1) as f64 / (hi - lo);
+        let mut vals: Vec<f64> = vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e300,
+            -1e300,
+            lo,
+            hi,
+            lo - 1e-9,
+            hi + 1e-9,
+            lo - 1.0 / scale,
+            -0.0,
+            0.0,
+        ];
+        for b in 0..bins {
+            let edge = lo + (b as f64 - 0.5) / scale;
+            vals.extend([edge, edge - 1e-9, edge + 1e-9]);
+        }
+        // Enough copies to fill several vectors plus a remainder.
+        let vals: Vec<f64> = vals
+            .iter()
+            .cycle()
+            .take(vals.len() * 5 + 3)
+            .copied()
+            .collect();
+        let (want, want_below, want_above) = reference_histogram(&vals, bins, lo, hi);
+        assert!(want_below > 0.0 && want_above > 0.0 && want.iter().any(|&c| c > 0.0));
+
+        let (got, below, above, _) =
+            compute_histogram(&NDDataBuffer::F64(vals.clone()), bins, lo, hi);
+        assert_eq!(
+            (got, below, above),
+            (want.clone(), want_below, want_above),
+            "f64"
+        );
+
+        let f32s: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        let as_f64: Vec<f64> = f32s.iter().map(|&v| v as f64).collect();
+        let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
+        let (got, below, above, _) = compute_histogram(&NDDataBuffer::F32(f32s), bins, lo, hi);
+        assert_eq!((got, below, above), (want, want_below, want_above), "f32");
+
+        let ints: Vec<i32> = vec![i32::MIN, -4, -3, -2, 0, 4, 5, 6, i32::MAX];
+        let ints: Vec<i32> = ints
+            .iter()
+            .cycle()
+            .take(ints.len() * 5 + 3)
+            .copied()
+            .collect();
+        let as_f64: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
+        let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
+        let (got, below, above, _) = compute_histogram(&NDDataBuffer::I32(ints), bins, lo, hi);
+        assert_eq!((got, below, above), (want, want_below, want_above), "i32");
     }
 
     #[test]

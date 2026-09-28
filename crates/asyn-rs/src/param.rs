@@ -803,10 +803,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_float64_array(&mut self, index: usize, addr: i32, data: Vec<f64>) -> AsynResult<()> {
+    pub fn set_float64_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[f64]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Float64Array(_)) {
-            entry.value = ParamValue::Float64Array(Arc::from(data));
+            entry.value = ParamValue::Float64Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())
@@ -828,10 +833,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_int32_array(&mut self, index: usize, addr: i32, data: Vec<i32>) -> AsynResult<()> {
+    pub fn set_int32_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[i32]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int32Array(_)) {
-            entry.value = ParamValue::Int32Array(Arc::from(data));
+            entry.value = ParamValue::Int32Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())
@@ -853,10 +863,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_int8_array(&mut self, index: usize, addr: i32, data: Vec<i8>) -> AsynResult<()> {
+    pub fn set_int8_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[i8]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int8Array(_)) {
-            entry.value = ParamValue::Int8Array(Arc::from(data));
+            entry.value = ParamValue::Int8Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())
@@ -878,10 +893,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_int16_array(&mut self, index: usize, addr: i32, data: Vec<i16>) -> AsynResult<()> {
+    pub fn set_int16_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[i16]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int16Array(_)) {
-            entry.value = ParamValue::Int16Array(Arc::from(data));
+            entry.value = ParamValue::Int16Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())
@@ -903,10 +923,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_int64_array(&mut self, index: usize, addr: i32, data: Vec<i64>) -> AsynResult<()> {
+    pub fn set_int64_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[i64]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int64Array(_)) {
-            entry.value = ParamValue::Int64Array(Arc::from(data));
+            entry.value = ParamValue::Int64Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())
@@ -928,10 +953,15 @@ impl ParamList {
         }
     }
 
-    pub fn set_float32_array(&mut self, index: usize, addr: i32, data: Vec<f32>) -> AsynResult<()> {
+    pub fn set_float32_array(
+        &mut self,
+        index: usize,
+        addr: i32,
+        data: impl Into<Arc<[f32]>>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Float32Array(_)) {
-            entry.value = ParamValue::Float32Array(Arc::from(data));
+            entry.value = ParamValue::Float32Array(data.into());
             entry.value_changed = true;
             entry.defined = true;
             Ok(())

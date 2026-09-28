@@ -991,15 +991,26 @@ fn convert_param_array_to_iface(
     // `src as $t` is exactly the polled converter: integer->integer is a
     // truncating C cast, float->integer saturates, and casts to float round —
     // matching `copy_ccast`/`copy_convert` in the plugin runtime.
+    /// The parameter's buffer as `T` elements: shared as it is when the
+    /// parameter already holds `T`, cast element by element otherwise.
+    fn share_or_cast<S: Copy + 'static, T: Copy + 'static>(
+        a: &Arc<[S]>,
+        cast: impl Fn(S) -> T,
+    ) -> epics_base_rs::types::SharedArray<T> {
+        match (a as &dyn std::any::Any).downcast_ref::<Arc<[T]>>() {
+            Some(same) => epics_base_rs::types::SharedArray::from(Arc::clone(same)),
+            None => a.iter().map(|&x| cast(x)).collect(),
+        }
+    }
     macro_rules! cast_vec {
         ($t:ty) => {{
             let v: epics_base_rs::types::SharedArray<$t> = match pv {
-                ParamValue::Int8Array(a) => a.iter().map(|&x| x as $t).collect(),
-                ParamValue::Int16Array(a) => a.iter().map(|&x| x as $t).collect(),
-                ParamValue::Int32Array(a) => a.iter().map(|&x| x as $t).collect(),
-                ParamValue::Int64Array(a) => a.iter().map(|&x| x as $t).collect(),
-                ParamValue::Float32Array(a) => a.iter().map(|&x| x as $t).collect(),
-                ParamValue::Float64Array(a) => a.iter().map(|&x| x as $t).collect(),
+                ParamValue::Int8Array(a) => share_or_cast(a, |x| x as $t),
+                ParamValue::Int16Array(a) => share_or_cast(a, |x| x as $t),
+                ParamValue::Int32Array(a) => share_or_cast(a, |x| x as $t),
+                ParamValue::Int64Array(a) => share_or_cast(a, |x| x as $t),
+                ParamValue::Float32Array(a) => share_or_cast(a, |x| x as $t),
+                ParamValue::Float64Array(a) => share_or_cast(a, |x| x as $t),
                 _ => return None,
             };
             v
@@ -1330,30 +1341,20 @@ impl AsynDeviceSupport {
             "asynEnum" => result.enum_index.map(|v| EpicsValue::Enum(v as u16)),
             // One copy each, straight into the shared buffer: cloning the
             // `Vec` first would copy it a second time on the way in.
+            // The driver's read buffer becomes the record's: same element
+            // type shares it, a cast (i8 -> u8, i64 -> i32) copies once.
             "asynInt8Array" => result
                 .int8_array
-                .as_deref()
+                .as_ref()
                 .map(|v| EpicsValue::CharArray(v.iter().map(|&x| x as u8).collect())),
-            "asynInt16Array" => result
-                .int16_array
-                .as_deref()
-                .map(|v| EpicsValue::ShortArray(v.into())),
-            "asynInt32Array" => result
-                .int32_array
-                .as_deref()
-                .map(|v| EpicsValue::LongArray(v.into())),
+            "asynInt16Array" => result.int16_array.clone().map(EpicsValue::ShortArray),
+            "asynInt32Array" => result.int32_array.clone().map(EpicsValue::LongArray),
             "asynInt64Array" => result
                 .int64_array
-                .as_deref()
+                .as_ref()
                 .map(|v| EpicsValue::LongArray(v.iter().map(|&x| x as i32).collect())),
-            "asynFloat32Array" => result
-                .float32_array
-                .as_deref()
-                .map(|v| EpicsValue::FloatArray(v.into())),
-            "asynFloat64Array" => result
-                .float64_array
-                .as_deref()
-                .map(|v| EpicsValue::DoubleArray(v.into())),
+            "asynFloat32Array" => result.float32_array.clone().map(EpicsValue::FloatArray),
+            "asynFloat64Array" => result.float64_array.clone().map(EpicsValue::DoubleArray),
             _ => None,
         }
     }
@@ -4015,6 +4016,23 @@ mod tests {
             "the interrupt read must apply the same @asynMask as the polled read \
              (C interruptCallbackInput, devAsynInt32.c:537-539)"
         );
+    }
+
+    /// An array parameter already of the interface's element type reaches
+    /// the record as the same buffer; only a differing element type is cast.
+    #[test]
+    fn an_array_of_the_interface_type_shares_the_parameter_buffer() {
+        use crate::param::ParamValue;
+        let arc: std::sync::Arc<[f64]> = std::sync::Arc::from([1.5f64, 2.5].as_slice());
+        let f64arr = ParamValue::Float64Array(std::sync::Arc::clone(&arc));
+        match convert_param_array_to_iface("asynFloat64Array", &f64arr) {
+            Some(EpicsValue::DoubleArray(a)) => assert!(std::ptr::eq(a.as_ptr(), arc.as_ptr())),
+            other => panic!("{other:?}"),
+        }
+        match convert_param_array_to_iface("asynFloat32Array", &f64arr) {
+            Some(EpicsValue::FloatArray(a)) => assert_eq!(a, vec![1.5f32, 2.5]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

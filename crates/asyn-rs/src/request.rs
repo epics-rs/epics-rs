@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use epics_libcom_rs::SharedArray;
+
 use crate::error::AsynStatus;
 use crate::param::ParamValue;
 use crate::port::PortDriver;
@@ -491,17 +493,17 @@ pub struct RequestResult {
     /// see `devAsynInt32.c::initCommon` (298-324) / `setEnums` (415-435).
     pub enum_entries: Option<Arc<[crate::param::EnumEntry]>>,
     /// i32 array data (from Int32ArrayRead).
-    pub int32_array: Option<Vec<i32>>,
+    pub int32_array: Option<SharedArray<i32>>,
     /// f64 array data (from Float64ArrayRead).
-    pub float64_array: Option<Vec<f64>>,
+    pub float64_array: Option<SharedArray<f64>>,
     /// i8 array data (from Int8ArrayRead).
-    pub int8_array: Option<Vec<i8>>,
+    pub int8_array: Option<SharedArray<i8>>,
     /// i16 array data (from Int16ArrayRead).
-    pub int16_array: Option<Vec<i16>>,
+    pub int16_array: Option<SharedArray<i16>>,
     /// i64 array data (from Int64ArrayRead).
-    pub int64_array: Option<Vec<i64>>,
+    pub int64_array: Option<SharedArray<i64>>,
     /// f32 array data (from Float32ArrayRead).
-    pub float32_array: Option<Vec<f32>>,
+    pub float32_array: Option<SharedArray<f32>>,
     /// Alarm status from the driver param store (populated on reads).
     pub alarm_status: u16,
     /// Alarm severity from the driver param store (populated on reads).
@@ -654,44 +656,44 @@ impl RequestResult {
         }
     }
 
-    pub fn int32_array_read(data: Vec<i32>) -> Self {
+    pub fn int32_array_read(data: impl Into<SharedArray<i32>>) -> Self {
         Self {
-            int32_array: Some(data),
+            int32_array: Some(data.into()),
             ..Self::base()
         }
     }
 
-    pub fn float64_array_read(data: Vec<f64>) -> Self {
+    pub fn float64_array_read(data: impl Into<SharedArray<f64>>) -> Self {
         Self {
-            float64_array: Some(data),
+            float64_array: Some(data.into()),
             ..Self::base()
         }
     }
 
-    pub fn int8_array_read(data: Vec<i8>) -> Self {
+    pub fn int8_array_read(data: impl Into<SharedArray<i8>>) -> Self {
         Self {
-            int8_array: Some(data),
+            int8_array: Some(data.into()),
             ..Self::base()
         }
     }
 
-    pub fn int16_array_read(data: Vec<i16>) -> Self {
+    pub fn int16_array_read(data: impl Into<SharedArray<i16>>) -> Self {
         Self {
-            int16_array: Some(data),
+            int16_array: Some(data.into()),
             ..Self::base()
         }
     }
 
-    pub fn int64_array_read(data: Vec<i64>) -> Self {
+    pub fn int64_array_read(data: impl Into<SharedArray<i64>>) -> Self {
         Self {
-            int64_array: Some(data),
+            int64_array: Some(data.into()),
             ..Self::base()
         }
     }
 
-    pub fn float32_array_read(data: Vec<f32>) -> Self {
+    pub fn float32_array_read(data: impl Into<SharedArray<f32>>) -> Self {
         Self {
-            float32_array: Some(data),
+            float32_array: Some(data.into()),
             ..Self::base()
         }
     }

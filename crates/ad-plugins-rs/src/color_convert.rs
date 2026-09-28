@@ -35,11 +35,16 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
     let mut g = vec![0.0f64; n];
     let mut b = vec![0.0f64; n];
 
-    // Determine which color each pixel position has, flipping phase for odd offsets
+    // Which rows and columns hold the red pixels. C adds the pattern's low
+    // bit to the row and its high bit to the column before testing both for
+    // even (NDPluginColorConvert.cpp:244-246, 262): GBRG (1) puts red on the
+    // odd rows, GRBG (2) on the odd columns, as their names read line by
+    // line (NDArray.h:52-55). Odd dimension offsets flip the phase the same
+    // way.
     let (mut r_row_even, mut r_col_even) = match pattern {
         NDBayerPattern::RGGB => (true, true),
-        NDBayerPattern::GBRG => (true, false),
-        NDBayerPattern::GRBG => (false, true),
+        NDBayerPattern::GBRG => (false, true),
+        NDBayerPattern::GRBG => (true, false),
         NDBayerPattern::BGGR => (false, false),
     };
     if offset_x % 2 != 0 {
@@ -968,6 +973,43 @@ mod tests {
             [v[i], v[i + 1], v[i + 2]]
         } else {
             panic!("expected UInt8 RGB1 output");
+        }
+    }
+
+    /// The pattern names read line by line (NDArray.h:52-55): GBRG has red
+    /// on the second line, GRBG on the first line's second pixel. C derives
+    /// that from the enum's bits (NDPluginColorConvert.cpp:244-246); the
+    /// port had the two swapped.
+    #[test]
+    fn bayer_pattern_names_place_red_where_c_does() {
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, p) in v.iter_mut().enumerate() {
+                *p = 10 + i as u8;
+            }
+        }
+        // (pattern, a red border pixel, a blue border pixel) as (x, y).
+        for (pattern, red, blue) in [
+            (NDBayerPattern::RGGB, (0, 0), (3, 3)),
+            (NDBayerPattern::GBRG, (0, 1), (3, 0)),
+            (NDBayerPattern::GRBG, (1, 0), (0, 3)),
+            (NDBayerPattern::BGGR, (3, 3), (0, 0)),
+        ] {
+            let rgb = bayer_to_rgb1(&arr, pattern).unwrap();
+            let at = |(x, y): (usize, usize)| 10 + (y * 4 + x) as u8;
+            assert_eq!(
+                rgb1_pixel(&rgb, 4, red.0, red.1),
+                [at(red), 0, 0],
+                "{pattern:?} red"
+            );
+            assert_eq!(
+                rgb1_pixel(&rgb, 4, blue.0, blue.1),
+                [0, 0, at(blue)],
+                "{pattern:?} blue"
+            );
         }
     }
 

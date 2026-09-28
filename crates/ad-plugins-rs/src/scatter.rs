@@ -2,6 +2,7 @@ use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Scatter method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +49,8 @@ impl Default for ScatterProcessor {
 }
 
 impl NDPluginProcess for ScatterProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let _ = array;
-        ProcessResult::scatter()
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        ProcessResult::scatter(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -95,6 +95,7 @@ mod tests {
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = 42;
+        let arr = Arc::new(arr);
 
         for _ in 0..4 {
             let r = proc.process_array(&arr, &pool);
@@ -102,8 +103,11 @@ mod tests {
                 r.scatter,
                 "scatter processor must mark the frame as scatter"
             );
-            assert!(r.forward_input, "the input frame itself is scattered");
-            assert!(r.output_arrays.is_empty());
+            assert!(
+                Arc::ptr_eq(&r.output_arrays[0], &arr),
+                "the input frame itself is scattered"
+            );
+            assert_eq!(r.output_arrays.len(), 1);
         }
     }
 }

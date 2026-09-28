@@ -722,7 +722,7 @@ impl Default for FFTProcessor {
 }
 
 impl NDPluginProcess for FFTProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         // C processes only 1-D and 2-D inputs (NDPluginFFT.cpp:298-315); any
@@ -1089,7 +1089,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
             // suppress_dc: DC should be 0
@@ -1125,14 +1125,14 @@ mod tests {
             }
         }
 
-        let r1 = proc.process_array(&arr1, &pool);
+        let r1 = proc.process_array(&Arc::new(arr1), &pool);
         assert_eq!(r1.output_arrays.len(), 1);
         // After 1 frame: exponential avg with N=1, so output = 2.0
         if let NDDataBuffer::F64(ref v) = r1.output_arrays[0].data {
             assert!((v[0] - 2.0).abs() < 1e-10, "partial avg DC = {}", v[0]);
         }
 
-        let r2 = proc.process_array(&arr2, &pool);
+        let r2 = proc.process_array(&Arc::new(arr2), &pool);
         assert_eq!(r2.output_arrays.len(), 1);
         // After 2 frames: exp avg = 2.0*(1-1/2) + 4.0*(1/2) = 1.0 + 2.0 = 3.0
         if let NDDataBuffer::F64(ref v) = r2.output_arrays[0].data {
@@ -1157,7 +1157,7 @@ mod tests {
                 v[i] = 1.0;
             }
         }
-        let _ = proc.process_array(&arr1, &pool);
+        let _ = proc.process_array(&Arc::new(arr1), &pool);
         assert_eq!(proc.state.lock().avg_count, 1);
 
         // Frame 2: width=4 — dimension change should reset
@@ -1167,7 +1167,7 @@ mod tests {
                 v[i] = 1.0;
             }
         }
-        let _ = proc.process_array(&arr2, &pool);
+        let _ = proc.process_array(&Arc::new(arr2), &pool);
         // After dimension change, avg_count should be 1 (reset + one new frame)
         assert_eq!(proc.state.lock().avg_count, 1);
     }
@@ -1225,7 +1225,7 @@ mod tests {
         let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
             // Each sample should be magnitude 1.0 (8/8 = 1.0 after normalization)
@@ -1308,7 +1308,7 @@ mod tests {
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v.iter_mut().for_each(|x| *x = 2.0);
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 2);
@@ -1329,7 +1329,7 @@ mod tests {
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v.iter_mut().for_each(|x| *x = 1.0);
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 1);
         assert_eq!(out.dims[0].size, 4); // 8/2
@@ -1349,7 +1349,7 @@ mod tests {
             ],
             NDDataType::Float64,
         );
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 0);
         assert!(
             result.param_updates.is_empty(),
@@ -1395,7 +1395,7 @@ mod tests {
                 v[i] = (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).cos();
             }
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let u = &result.param_updates;
 
         // All six FFT waveforms must be present, addressed by their param
@@ -1440,7 +1440,7 @@ mod tests {
                 v[i] = (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).cos();
             }
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let u = &result.param_updates;
 
         let real = find_array_update(u, real_reason).unwrap();
@@ -1492,7 +1492,7 @@ mod tests {
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v[0] = 1.0;
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let u = &result.param_updates;
 
         let time_axis = find_array_update(u, time_axis_reason).unwrap();
@@ -1528,7 +1528,7 @@ mod tests {
                 *x = (i + 1) as f64; // 1,2,3,4,5
             }
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let u = &result.param_updates;
 
         let ts = find_array_update(u, ts_reason).unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v[0] = 8.0;
         }
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let array_updates = result
             .param_updates
             .iter()
@@ -1593,7 +1593,7 @@ mod tests {
         };
         let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
             let has_negative = v.iter().any(|&x| x < -1e-6);
             assert!(

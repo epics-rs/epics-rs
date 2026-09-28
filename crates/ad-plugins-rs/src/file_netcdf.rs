@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue};
 use ad_core_rs::error::{ADError, ADResult};
@@ -22,13 +23,6 @@ const DIM_UNLIMITED: &str = "numArrays";
 const ND_NETCDF_FILE_VERSION: f64 = 3.1;
 
 /// Dimension metadata captured from NDArray dimensions.
-struct DimMeta {
-    size: usize,
-    offset: usize,
-    binning: usize,
-    reverse: bool,
-}
-
 /// A single captured NDAttribute, preserving its typed value and metadata.
 struct AttrData {
     name: String,
@@ -42,17 +36,12 @@ struct AttrData {
     value: NDAttrValue,
 }
 
-/// A single buffered frame captured from an NDArray.
+/// A single buffered frame: the NDArray itself (held, not copied, the way
+/// C keeps a reserved `NDArray*`) plus the attribute list as it stood when
+/// the frame arrived.
 struct FrameData {
-    dims: Vec<usize>,
-    dim_meta: Vec<DimMeta>,
-    data: NDDataBuffer,
-    data_type: NDDataType,
+    frame: Arc<NDArray>,
     attrs: Vec<AttrData>,
-    unique_id: i32,
-    time_stamp: f64,
-    epics_ts_sec: i32,
-    epics_ts_nsec: i32,
 }
 
 /// Map an `NDAttrSource` to the C++ `sourceTypeString_` label
@@ -368,13 +357,14 @@ fn define_data_set(
     };
 
     let mut ds = DataSet::new();
-    let ndims = first.dims.len();
+    let dims = &first.frame.dims;
+    let ndims = dims.len();
 
     // --- Global attributes, part 1 (C :92-101, :108-110, :140-151) ---------
     // C emits dataType and NDNetCDFFileVersion before it defines any
     // dimension, and the dim* metadata attributes right after; the gatt list
     // therefore starts with these seven, in this order.
-    ds.add_global_attr_i32("dataType", vec![first.data_type as i32])
+    ds.add_global_attr_i32("dataType", vec![first.frame.data.data_type() as i32])
         .map_err(map_def)?;
     ds.add_global_attr_f64("NDNetCDFFileVersion", vec![ND_NETCDF_FILE_VERSION])
         .map_err(map_def)?;
@@ -382,20 +372,16 @@ fn define_data_set(
         .map_err(map_def)?;
     // C reads dims[i] here — natural order, *not* the reversed order used for
     // the dimension definitions below (:125-131).
-    let dim_size: Vec<i32> = first.dim_meta.iter().map(|d| d.size as i32).collect();
+    let dim_size: Vec<i32> = dims.iter().map(|d| d.size as i32).collect();
     ds.add_global_attr_i32("dimSize", dim_size)
         .map_err(map_def)?;
-    let dim_offset: Vec<i32> = first.dim_meta.iter().map(|d| d.offset as i32).collect();
+    let dim_offset: Vec<i32> = dims.iter().map(|d| d.offset as i32).collect();
     ds.add_global_attr_i32("dimOffset", dim_offset)
         .map_err(map_def)?;
-    let dim_binning: Vec<i32> = first.dim_meta.iter().map(|d| d.binning as i32).collect();
+    let dim_binning: Vec<i32> = dims.iter().map(|d| d.binning as i32).collect();
     ds.add_global_attr_i32("dimBinning", dim_binning)
         .map_err(map_def)?;
-    let dim_reverse: Vec<i32> = first
-        .dim_meta
-        .iter()
-        .map(|d| if d.reverse { 1 } else { 0 })
-        .collect();
+    let dim_reverse: Vec<i32> = dims.iter().map(|d| if d.reverse { 1 } else { 0 }).collect();
     ds.add_global_attr_i32("dimReverse", dim_reverse)
         .map_err(map_def)?;
 
@@ -413,7 +399,7 @@ fn define_data_set(
     let mut dim_names: Vec<String> = Vec::new();
     for i in 0..ndims {
         let name = format!("dim{}", i);
-        ds.add_fixed_dim(&name, first.dims[ndims - 1 - i])
+        ds.add_fixed_dim(&name, dims[ndims - 1 - i].size)
             .map_err(map_def)?;
         dim_names.push(name);
     }
@@ -437,8 +423,12 @@ fn define_data_set(
     // single-array file is still rank ndims+1 (:202-204).
     let mut var_dims: Vec<&str> = vec![DIM_UNLIMITED];
     var_dims.extend(dim_names.iter().map(|s| s.as_str()));
-    ds.add_var(VAR_NAME, &var_dims, nc_data_type(first.data_type)?)
-        .map_err(map_def)?;
+    ds.add_var(
+        VAR_NAME,
+        &var_dims,
+        nc_data_type(first.frame.data.data_type())?,
+    )
+    .map_err(map_def)?;
 
     // --- Per-attribute variables and their text attributes (C :208-330) ----
     // One pass over the attribute list, exactly as C does: the four
@@ -497,21 +487,10 @@ impl NDFileWriter for NetcdfWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         // Validate data type early
         nc_data_type(array.data.data_type())?;
 
-        let dims: Vec<usize> = array.dims.iter().map(|d| d.size).collect();
-        let dim_meta: Vec<DimMeta> = array
-            .dims
-            .iter()
-            .map(|d| DimMeta {
-                size: d.size,
-                offset: d.offset,
-                binning: d.binning,
-                reverse: d.reverse,
-            })
-            .collect();
         // C `writeFile` merges this frame into `pFileAttributes` and then
         // writes every attribute variable out of that list
         // (NDFileNetCDF.cpp:359-362, :419-483), so an attribute that drops out
@@ -534,15 +513,8 @@ impl NDFileWriter for NetcdfWriter {
             .collect();
 
         self.frames.push(FrameData {
-            dims,
-            dim_meta,
-            data: array.data.clone(),
-            data_type: array.data.data_type(),
+            frame: Arc::clone(array),
             attrs,
-            unique_id: array.unique_id,
-            time_stamp: array.time_stamp,
-            epics_ts_sec: array.timestamp.sec as i32,
-            epics_ts_nsec: array.timestamp.nsec as i32,
         });
         Ok(())
     }
@@ -584,18 +556,19 @@ impl NDFileWriter for NetcdfWriter {
 
             if multi {
                 for (i, frame) in w.frames.iter().enumerate() {
-                    write_record_data(&mut writer, i, &frame.data)?;
+                    let array = &frame.frame;
+                    write_record_data(&mut writer, i, &array.data)?;
                     writer
-                        .write_record_i32("uniqueId", i, &[frame.unique_id])
+                        .write_record_i32("uniqueId", i, &[array.unique_id])
                         .map_err(map_write)?;
                     writer
-                        .write_record_f64("timeStamp", i, &[frame.time_stamp])
+                        .write_record_f64("timeStamp", i, &[array.time_stamp])
                         .map_err(map_write)?;
                     writer
-                        .write_record_i32("epicsTSSec", i, &[frame.epics_ts_sec])
+                        .write_record_i32("epicsTSSec", i, &[array.timestamp.sec as i32])
                         .map_err(map_write)?;
                     writer
-                        .write_record_i32("epicsTSNsec", i, &[frame.epics_ts_nsec])
+                        .write_record_i32("epicsTSNsec", i, &[array.timestamp.nsec as i32])
                         .map_err(map_write)?;
                     // Per-attribute values. Every frame's `attrs` is a
                     // snapshot of the same sticky list, which only ever grows
@@ -607,18 +580,19 @@ impl NDFileWriter for NetcdfWriter {
                     }
                 }
             } else {
-                write_var_data(&mut writer, &w.frames[0].data)?;
+                let array = &first.frame;
+                write_var_data(&mut writer, &array.data)?;
                 writer
-                    .write_var_i32("uniqueId", &[first.unique_id])
+                    .write_var_i32("uniqueId", &[array.unique_id])
                     .map_err(map_write)?;
                 writer
-                    .write_var_f64("timeStamp", &[first.time_stamp])
+                    .write_var_f64("timeStamp", &[array.time_stamp])
                     .map_err(map_write)?;
                 writer
-                    .write_var_i32("epicsTSSec", &[first.epics_ts_sec])
+                    .write_var_i32("epicsTSSec", &[array.timestamp.sec as i32])
                     .map_err(map_write)?;
                 writer
-                    .write_var_i32("epicsTSNsec", &[first.epics_ts_nsec])
+                    .write_var_i32("epicsTSNsec", &[array.timestamp.nsec as i32])
                     .map_err(map_write)?;
                 for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
                     write_attr_value(&mut writer, var_name, 0, false, &attr.value)?;
@@ -750,7 +724,7 @@ impl Default for NetcdfFileProcessor {
 }
 
 impl NDPluginProcess for NetcdfFileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
 
@@ -814,7 +788,7 @@ mod tests {
             NDDataType::UInt8,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         assert_eq!(writer.frames.len(), 1);
 
         assert!(
@@ -825,6 +799,25 @@ mod tests {
             writer.frames.is_empty(),
             "a failed close must still drop the frames of the file that was never written"
         );
+    }
+
+    /// The file is written at close, so the frames wait in `frames`; they
+    /// wait as the driver's own `Arc` (C `pArray->reserve()`), not as a copy.
+    #[test]
+    fn the_buffered_frame_is_the_input_arc_itself() {
+        let path = temp_path("nc_arc");
+        let mut writer = NetcdfWriter::new();
+        let arr = Arc::new(NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        ));
+        writer.open_file(&path, NDFileMode::Capture, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        assert!(Arc::ptr_eq(&writer.frames[0].frame, &arr));
+        assert_eq!(Arc::strong_count(&arr), 2);
+        writer.close_file().unwrap();
+        assert_eq!(Arc::strong_count(&arr), 1, "close releases the frame");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -843,7 +836,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         // Verify file exists and has NetCDF magic bytes: "CDF\x01" or "CDF\x02"
@@ -870,7 +863,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let data = std::fs::read(&path).unwrap();
@@ -896,7 +889,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
         writer.close_file().unwrap();
 
         writer.current_path = Some(path.clone());
@@ -926,7 +919,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
         writer.close_file().unwrap();
 
         writer.current_path = Some(path.clone());
@@ -956,7 +949,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
         writer.close_file().unwrap();
 
         writer.current_path = Some(path.clone());
@@ -1006,9 +999,9 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Stream, &arr1).unwrap();
-        writer.write_file(&arr1).unwrap();
-        writer.write_file(&arr2).unwrap();
-        writer.write_file(&arr3).unwrap();
+        writer.write_file(&Arc::new(arr1)).unwrap();
+        writer.write_file(&Arc::new(arr2)).unwrap();
+        writer.write_file(&Arc::new(arr3)).unwrap();
         writer.close_file().unwrap();
 
         // Read back first frame
@@ -1051,7 +1044,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Capture, &frame())
             .unwrap();
-        writer.write_file(&frame()).unwrap();
+        writer.write_file(&Arc::new(frame())).unwrap();
         writer.close_file().unwrap();
         assert!(
             num_arrays_is_unlimited(&path),
@@ -1065,7 +1058,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Stream, &frame())
             .unwrap();
-        writer.write_file(&frame()).unwrap();
+        writer.write_file(&Arc::new(frame())).unwrap();
         writer.close_file().unwrap();
         assert!(
             num_arrays_is_unlimited(&path),
@@ -1079,7 +1072,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Single, &frame())
             .unwrap();
-        writer.write_file(&frame()).unwrap();
+        writer.write_file(&Arc::new(frame())).unwrap();
         writer.close_file().unwrap();
         assert!(
             !num_arrays_is_unlimited(&path),
@@ -1108,7 +1101,7 @@ mod tests {
         ));
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut reader = FileReader::open(&path).unwrap();
@@ -1176,9 +1169,9 @@ mod tests {
 
         let a0 = mk(Some(0.5));
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(Some(0.75))).unwrap();
-        writer.write_file(&mk(None)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(Some(0.75)))).unwrap();
+        writer.write_file(&Arc::new(mk(None))).unwrap();
         writer.close_file().unwrap();
 
         let mut reader = FileReader::open(&path).unwrap();
@@ -1201,7 +1194,7 @@ mod tests {
             NDDataType::UInt8,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let reader = FileReader::open(&path).unwrap();
@@ -1231,7 +1224,7 @@ mod tests {
             NDDataType::UInt8,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let reader = FileReader::open(&path).unwrap();
@@ -1270,7 +1263,7 @@ mod tests {
         arr.timestamp.nsec = 777;
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut reader = FileReader::open(&path).unwrap();
@@ -1465,7 +1458,7 @@ mod tests {
     fn write_one(path: &PathBuf, arr: &NDArray) -> Vec<u8> {
         let mut writer = NetcdfWriter::new();
         writer.open_file(path, NDFileMode::Single, arr).unwrap();
-        writer.write_file(arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
         writer.close_file().unwrap();
         let bytes = std::fs::read(path).unwrap();
         std::fs::remove_file(path).ok();

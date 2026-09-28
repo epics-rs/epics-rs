@@ -359,7 +359,7 @@ fn roi_stats_of<T: StatsElem>(
 }
 
 impl NDPluginProcess for ROIStatProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // NDPluginROIStat operates on the raw array dimensions like the C
         // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
         // or 2-D arrays are supported; C errors and yields zero stats for
@@ -812,7 +812,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.min - 10.0).abs() < 1e-10);
@@ -835,7 +835,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // ROI pixels: (2,2)=18, (3,2)=19, (4,2)=20, (2,3)=26, (3,3)=27, (4,3)=28, (2,4)=34, (3,4)=35, (4,4)=36
@@ -867,7 +867,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r0 = &proc.results()[0];
         assert!((r0.min - 0.0).abs() < 1e-10);
@@ -898,7 +898,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // ROI is 4x4 at (1,1): border pixels = 12 (all with value 10), center = 4 (value 100)
@@ -923,7 +923,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // C clamps a zero-size ROI to a single pixel (size >= 1) at the
         // clamped offset (0,0), so stats reflect that one pixel, not zero.
@@ -944,7 +944,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!(
@@ -965,7 +965,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // C clamps offset to dim-1 (3,3) and size to 1, so the ROI is the
         // single corner pixel — stats reflect it, not zero.
@@ -989,7 +989,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // Should be clamped to 2x2 region
@@ -1012,7 +1012,7 @@ mod tests {
 
         for i in 0..5 {
             let arr = make_2d_array(4, 4, |_, _| (i + 1) as f64);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
 
         // Check mean time series (stat index 2)
@@ -1043,7 +1043,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.min - 1.0).abs() < 1e-10);
@@ -1085,7 +1085,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_2d_array(4, 4, |_, _| 7.0);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let data = rx.try_recv().unwrap();
         // 2 ROIs * 5 stats = 10 values
@@ -1154,7 +1154,7 @@ mod tests {
         let p = *proc.params_handle().lock();
 
         let pool = NDArrayPool::new(1_000_000);
-        let res = proc.process_array(&arr, &pool);
+        let res = proc.process_array(&Arc::new(arr), &pool);
 
         let find = |reason: usize, addr: i32| {
             res.param_updates.iter().find_map(|u| match u {
@@ -1191,7 +1191,7 @@ mod tests {
         }];
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.total - 20.0).abs() < 1e-10, "total={}", r.total);

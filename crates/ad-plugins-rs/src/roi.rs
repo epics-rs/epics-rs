@@ -442,7 +442,7 @@ impl ROIProcessor {
 }
 
 impl NDPluginProcess for ROIProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
         // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with
         // `userDims = {xDim, yDim, colorDim}` (`:80-82`) — the same logical
@@ -469,7 +469,6 @@ impl NDPluginProcess for ROIProcessor {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
                 scatter: false,
-                forward_input: false,
             },
             None => ProcessResult::sink(updates),
         }
@@ -1037,7 +1036,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_4x4_u8();
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims[0].size, 2);
         assert_eq!(result.output_arrays[0].dims[1].size, 2);
@@ -1081,7 +1080,7 @@ mod tests {
         ];
 
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let max_size = |reason: usize| {
             result
                 .param_updates
@@ -1119,7 +1118,7 @@ mod tests {
             vec![NDDimension::new(6), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        let result = proc.process_array(&arr2d, &pool);
+        let result = proc.process_array(&Arc::new(arr2d), &pool);
         let max_size = |reason: usize| {
             result
                 .param_updates

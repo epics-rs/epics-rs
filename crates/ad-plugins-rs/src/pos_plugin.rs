@@ -480,7 +480,7 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 }
 
 impl NDPluginProcess for PosPluginProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
         if !state.running {
             // C only reaches endProcessCallbacks inside `if (running ==
@@ -600,7 +600,6 @@ impl NDPluginProcess for PosPluginProcessor {
             output_arrays: vec![Arc::new(out)],
             param_updates: updates,
             scatter: false,
-            forward_input: false,
         }
     }
 
@@ -787,7 +786,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
 
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let x = result.output_arrays[0]
             .attributes
@@ -798,7 +797,7 @@ mod tests {
             .unwrap();
         assert!((x - 1.5).abs() < 1e-10);
 
-        let result = proc.process_array(&make_array(2), &pool);
+        let result = proc.process_array(&Arc::new(make_array(2)), &pool);
         let x = result.output_arrays[0]
             .attributes
             .get("X")
@@ -821,7 +820,7 @@ mod tests {
         proc.start();
 
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         let attr = result.output_arrays[0].attributes.get("X").unwrap();
         assert_eq!(attr.description, "Position of NDArray");
     }
@@ -839,7 +838,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
 
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         let x = result.output_arrays[0]
             .attributes
             .get("X")
@@ -849,7 +848,7 @@ mod tests {
             .unwrap();
         assert!((x - 10.0).abs() < 1e-10);
 
-        let result = proc.process_array(&make_array(2), &pool);
+        let result = proc.process_array(&Arc::new(make_array(2)), &pool);
         let x = result.output_arrays[0]
             .attributes
             .get("X")
@@ -861,7 +860,7 @@ mod tests {
 
         // Stops at end of list (no wrapping): the exhausted frame is dropped and
         // the plugin goes idle (ADP-38).
-        let result = proc.process_array(&make_array(3), &pool);
+        let result = proc.process_array(&Arc::new(make_array(3)), &pool);
         assert!(result.output_arrays.is_empty());
         assert!(!proc.state.lock().running);
     }
@@ -879,10 +878,10 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         // Frame 1 consumes the only position.
-        let r1 = proc.process_array(&make_array(1), &pool);
+        let r1 = proc.process_array(&Arc::new(make_array(1)), &pool);
         assert_eq!(r1.output_arrays.len(), 1);
         // Frame 2 finds no positions: dropped, Running posted IDLE, plugin idle.
-        let r2 = proc.process_array(&make_array(2), &pool);
+        let r2 = proc.process_array(&Arc::new(make_array(2)), &pool);
         assert!(r2.output_arrays.is_empty());
         assert!(!proc.state.lock().running);
         use ad_core_rs::plugin::runtime::ParamUpdate;
@@ -911,10 +910,10 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
 
-        proc.process_array(&make_array(1), &pool);
+        proc.process_array(&Arc::new(make_array(1)), &pool);
 
         // Frame 3 (skip frame 2)
-        let result = proc.process_array(&make_array(3), &pool);
+        let result = proc.process_array(&Arc::new(make_array(3)), &pool);
         assert_eq!(proc.missing_frames(), 1);
         let x = result.output_arrays[0]
             .attributes
@@ -939,9 +938,9 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
 
-        proc.process_array(&make_array(1), &pool);
+        proc.process_array(&Arc::new(make_array(1)), &pool);
 
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         assert_eq!(proc.duplicate_frames(), 1);
         assert!(result.output_arrays.is_empty());
     }
@@ -961,7 +960,7 @@ mod tests {
         // frame is dropped, not passed through.
         let proc = PosPluginProcessor::new(PosMode::Discard);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         assert!(result.output_arrays.is_empty());
     }
 
@@ -1004,12 +1003,12 @@ mod tests {
         proc.start();
         let pool = NDArrayPool::new(1_000_000);
 
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         let attrs = &result.output_arrays[0].attributes;
         assert!((attrs.get("x").unwrap().value.as_f64().unwrap() - 10.0).abs() < 1e-10);
         assert!((attrs.get("y").unwrap().value.as_f64().unwrap() - 100.0).abs() < 1e-10);
 
-        let result = proc.process_array(&make_array(2), &pool);
+        let result = proc.process_array(&Arc::new(make_array(2)), &pool);
         let attrs = &result.output_arrays[0].attributes;
         assert!((attrs.get("x").unwrap().value.as_f64().unwrap() - 20.0).abs() < 1e-10);
         assert!((attrs.get("y").unwrap().value.as_f64().unwrap() - 200.0).abs() < 1e-10);
@@ -1077,7 +1076,7 @@ mod tests {
         proc.start();
 
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         // CurrentQty drops to 1 remaining after consuming the first position.
         assert!(
             result
@@ -1178,7 +1177,7 @@ mod tests {
         proc.start();
 
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&make_array(1), &pool);
+        let result = proc.process_array(&Arc::new(make_array(1)), &pool);
         let s = result.param_updates.iter().find_map(|u| match u {
             ParamUpdate::Octet {
                 reason: 30, value, ..
@@ -1205,7 +1204,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         // First frame arrives as uniqueId 3 → frames 1 and 2 counted missing.
-        let result = proc.process_array(&make_array(3), &pool);
+        let result = proc.process_array(&Arc::new(make_array(3)), &pool);
         assert_eq!(proc.missing_frames(), 2);
         let x = result.output_arrays[0]
             .attributes
@@ -1233,9 +1232,9 @@ mod tests {
         proc.start();
 
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&make_array(1), &pool);
-        proc.process_array(&make_array(3), &pool);
-        let r = proc.process_array(&make_array(5), &pool);
+        proc.process_array(&Arc::new(make_array(1)), &pool);
+        proc.process_array(&Arc::new(make_array(3)), &pool);
+        let r = proc.process_array(&Arc::new(make_array(5)), &pool);
         assert_eq!(proc.missing_frames(), 0);
         let x = r.output_arrays[0]
             .attributes
@@ -1274,7 +1273,7 @@ mod tests {
         let pool = NDArrayPool::new(0);
 
         let first = proc
-            .process_array(&make_array(1), &pool)
+            .process_array(&Arc::new(make_array(1)), &pool)
             .output_arrays
             .remove(0);
         assert_eq!(first.pool_id(), pool.id());
@@ -1283,7 +1282,7 @@ mod tests {
         drop(first);
 
         let second = proc
-            .process_array(&make_array(2), &pool)
+            .process_array(&Arc::new(make_array(2)), &pool)
             .output_arrays
             .remove(0);
         assert_eq!(

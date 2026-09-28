@@ -201,11 +201,6 @@ pub struct ProcessResult {
     /// (C++ `NDPluginScatter::nextClient_`); the processor only marks the frame
     /// as a scatter frame.
     pub scatter: bool,
-    /// Publish the input frame itself, ahead of `output_arrays` — C's
-    /// `doCallbacksGenericPointer(pArray, ...)` on the very array the plugin
-    /// was handed. The runtime holds that `Arc` and prepends it; the
-    /// processor never copies a frame just to pass it on.
-    pub forward_input: bool,
 }
 
 impl ProcessResult {
@@ -215,7 +210,6 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates,
             scatter: false,
-            forward_input: false,
         }
     }
 
@@ -225,17 +219,17 @@ impl ProcessResult {
             output_arrays,
             param_updates: vec![],
             scatter: false,
-            forward_input: false,
         }
     }
 
-    /// Convenience: pass the input frame through unchanged, with `param_updates`.
-    pub fn forward(param_updates: Vec<ParamUpdate>) -> Self {
+    /// Convenience: pass the input frame itself through, with `param_updates`
+    /// — C's `doCallbacksGenericPointer(pArray, ...)` on the very array the
+    /// plugin was handed. No copy: the output is the input `Arc`.
+    pub fn forward(input: &Arc<NDArray>, param_updates: Vec<ParamUpdate>) -> Self {
         Self {
-            output_arrays: vec![],
+            output_arrays: vec![Arc::clone(input)],
             param_updates,
             scatter: false,
-            forward_input: true,
         }
     }
 
@@ -245,43 +239,30 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates: vec![],
             scatter: false,
-            forward_input: false,
         }
     }
 
     /// Convenience: scatter the input frame — deliver it to the next
     /// downstream consumer in round-robin order (the runtime owns the cursor
     /// and reroute logic).
-    pub fn scatter() -> Self {
+    pub fn scatter(input: &Arc<NDArray>) -> Self {
         Self {
-            output_arrays: vec![],
+            output_arrays: vec![Arc::clone(input)],
             param_updates: vec![],
             scatter: true,
-            forward_input: true,
         }
-    }
-
-    /// Turn `forward_input` into the input `Arc` itself, prepended to
-    /// `output_arrays`. The one place that meaning is applied; the runtime
-    /// calls it on every frame, a test calls it to see what would go out.
-    pub fn resolve(mut self, input: &Arc<NDArray>) -> Self {
-        if std::mem::take(&mut self.forward_input) {
-            self.output_arrays.insert(0, Arc::clone(input));
-        }
-        self
     }
 }
 
-/// Run `processor` on one frame: the single place `forward_input` is turned
-/// into the input `Arc` (prepended to `output_arrays`), and the single writer
-/// of the processor's served-array handle (what `readInt8Array` and friends
-/// hand out), which C's `NDPluginStdArrays` keeps as its cached `pArrays[0]`.
+/// Run `processor` on one frame: the single writer of the processor's
+/// served-array handle (what `readInt8Array` and friends hand out), which C's
+/// `NDPluginStdArrays` keeps as its cached `pArrays[0]`.
 fn run_processor<P: NDPluginProcess + ?Sized>(
     processor: &P,
     array: &Arc<NDArray>,
     pool: &NDArrayPool,
 ) -> ProcessResult {
-    let result = processor.process_array(array, pool).resolve(array);
+    let result = processor.process_array(array, pool);
     if let Some(served) = processor.array_data_handle() {
         *served.lock() = result.output_arrays.first().cloned();
     }
@@ -336,7 +317,7 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// Process one array. Return output arrays and param updates.
     ///
     /// May run concurrently with itself on `NumThreads` worker threads.
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult;
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult;
 
     /// Plugin type name for PLUGIN_TYPE param.
     fn plugin_type(&self) -> &str;
@@ -3091,8 +3072,8 @@ mod tests {
     struct PassthroughProcessor;
 
     impl NDPluginProcess for PassthroughProcessor {
-        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-            ProcessResult::forward(vec![])
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
         }
         fn plugin_type(&self) -> &str {
             "Passthrough"
@@ -3105,8 +3086,8 @@ mod tests {
     }
 
     impl NDPluginProcess for ServingProcessor {
-        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-            ProcessResult::forward(vec![])
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
         }
         fn plugin_type(&self) -> &str {
             "Serving"
@@ -3126,7 +3107,6 @@ mod tests {
             served: Arc::new(parking_lot::Mutex::new(None)),
         };
         let result = run_processor(&proc, &input, &pool);
-        assert!(!result.forward_input);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(Arc::ptr_eq(&result.output_arrays[0], &input));
         assert!(Arc::ptr_eq(proc.served.lock().as_ref().unwrap(), &input));
@@ -3138,7 +3118,7 @@ mod tests {
     }
 
     impl NDPluginProcess for SinkProcessor {
-        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             ProcessResult::empty()
@@ -3714,8 +3694,8 @@ mod tests {
 
         struct ParamTracker;
         impl NDPluginProcess for ParamTracker {
-            fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-                ProcessResult::arrays(vec![Arc::new(array.clone())])
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::arrays(vec![Arc::clone(array)])
             }
             fn plugin_type(&self) -> &str {
                 "ParamTracker"
@@ -3894,7 +3874,7 @@ mod tests {
     }
 
     impl NDPluginProcess for OverlapProcessor {
-        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut inside = self.probe.inside.lock();
             *inside += 1;
             let peak = self
@@ -4507,8 +4487,8 @@ mod tests {
         // compressed size. CompressedSize_RBV (Int32) exercises both arms.
         struct CompressProcessor;
         impl NDPluginProcess for CompressProcessor {
-            fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-                let mut out = array.clone();
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let mut out = NDArray::clone(array);
                 out.codec = Some(crate::codec::Codec {
                     name: crate::codec::CodecName::JPEG,
                     compressed_size: 7,
@@ -4694,7 +4674,7 @@ mod tests {
         // DroppedArrays counter rather than back-pressuring the producer.
         struct SlowProcessor;
         impl NDPluginProcess for SlowProcessor {
-            fn process_array(&self, _a: &NDArray, _p: &NDArrayPool) -> ProcessResult {
+            fn process_array(&self, _a: &Arc<NDArray>, _p: &NDArrayPool) -> ProcessResult {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 ProcessResult::empty()
             }
@@ -4939,7 +4919,7 @@ mod tests {
     }
 
     impl NDPluginProcess for GatedProcessor {
-        fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.entered.fetch_add(1, Ordering::AcqRel);
             let mut open = self.open.lock();
             while !*open {

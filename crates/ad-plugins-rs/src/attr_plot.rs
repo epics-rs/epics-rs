@@ -27,6 +27,7 @@
 //! at the detector frame rate.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// C++ `ND_ATTRPLOT_DATA_EXPOSURE_PERIOD` (`NDPluginAttrPlot.h:39`) — the
 /// period of `ExposeDataTask::run`'s `AP_Data` post.
@@ -418,7 +419,7 @@ impl AttrPlotState {
 }
 
 impl NDPluginProcess for AttrPlotProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 
         // Re-acquisition: a UID at or below the last cached one resets.
@@ -544,7 +545,7 @@ mod tests {
         let mut exposures = 0;
         for uid in 1..=3 {
             let arr = make_array_with_attrs(uid, &[("Temp", 25.0 + uid as f64)]);
-            let result = proc.process_array(&arr, &pool);
+            let result = proc.process_array(&Arc::new(arr), &pool);
             if has_data_update(&result, data_reason) {
                 exposures += 1;
             }
@@ -580,7 +581,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_array_with_attrs(1, &[("Temp", 25.0)]);
-        proc.process_array(&arr, &pool); // consumes this period's exposure
+        proc.process_array(&Arc::new(arr), &pool); // consumes this period's exposure
 
         let snapshot = PluginParamSnapshot {
             enable_callbacks: true,
@@ -609,7 +610,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::String("test".to_string()),
         ));
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert_eq!(proc.num_attributes(), 2);
         assert_eq!(proc.attributes()[0], "Gain");
@@ -622,7 +623,7 @@ mod tests {
         let proc = AttrPlotProcessor::new(2, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("D", 4.0), ("A", 1.0), ("C", 3.0), ("B", 2.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(proc.num_attributes(), 2);
         assert_eq!(proc.attributes(), vec!["A", "B"]);
     }
@@ -633,7 +634,7 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 2);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 10.0), ("B", 20.0), ("C", 30.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         proc.set_data_select(0, 1).unwrap(); // "B"
         proc.set_data_select(1, ATTRPLOT_UID_INDEX).unwrap();
@@ -652,7 +653,7 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 2);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 1.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // Only 1 attribute -> selection 1 is out of range.
         assert!(proc.set_data_select(0, 1).is_err());
@@ -678,7 +679,7 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 3);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 1.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         // Block 2 was never selected.
         assert_eq!(proc.data_label(2), ATTRPLOT_NONE_LABEL);
         assert_eq!(proc.data_select(2), Some(ATTRPLOT_NONE_INDEX));
@@ -690,7 +691,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=4 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         assert_eq!(proc.uid_buffer().len(), 4);
     }
@@ -703,7 +704,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=3 {
             let arr = make_array_with_attrs(i, &[("X", i as f64 * 10.0)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         proc.set_data_select(0, 0).unwrap();
         let wf = proc.state.lock().block_waveform(0);
@@ -722,13 +723,13 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(5, &[("Gain", 1.0), ("Temp", 25.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         let temp_idx = proc.find_attribute("Temp").unwrap() as i32;
         proc.set_data_select(0, temp_idx).unwrap();
 
         // Re-acquisition (UID drops); same attributes.
         let arr2 = make_array_with_attrs(1, &[("Gain", 2.0), ("Temp", 99.0)]);
-        proc.process_array(&arr2, &pool);
+        proc.process_array(&Arc::new(arr2), &pool);
         assert_eq!(proc.data_label(0), "Temp");
         let wf = proc.state.lock().block_waveform(0);
         assert!((wf[0] - 99.0).abs() < 1e-10);
@@ -740,7 +741,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Value", i as f64 * 10.0)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         let idx = proc.find_attribute("Value").unwrap();
         let buf = proc.buffer(idx).unwrap();
@@ -755,7 +756,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Val", i as f64)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         let idx = proc.find_attribute("Val").unwrap();
         let buf = proc.buffer(idx).unwrap();
@@ -770,13 +771,13 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         let idx = proc.find_attribute("X").unwrap();
         assert_eq!(proc.buffer(idx).unwrap().len(), 5);
 
         let arr = make_array_with_attrs(1, &[("X", 100.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         let buf = proc.buffer(idx).unwrap();
         assert_eq!(buf.len(), 1);
         assert!((buf[0] - 100.0).abs() < 1e-10);
@@ -787,11 +788,11 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr1 = make_array_with_attrs(1, &[("Temp", 25.0)]);
-        proc.process_array(&arr1, &pool);
+        proc.process_array(&Arc::new(arr1), &pool);
 
         let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr2.unique_id = 2;
-        proc.process_array(&arr2, &pool);
+        proc.process_array(&Arc::new(arr2), &pool);
 
         let idx = proc.find_attribute("Temp").unwrap();
         let buf = proc.buffer(idx).unwrap();
@@ -805,13 +806,13 @@ mod tests {
         let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(5, &[("A", 1.0), ("B", 2.0)]);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(proc.num_attributes(), 2);
 
         proc.reset();
         // Re-initializes from the next frame.
         let arr2 = make_array_with_attrs(1, &[("C", 3.0)]);
-        proc.process_array(&arr2, &pool);
+        proc.process_array(&Arc::new(arr2), &pool);
         assert_eq!(proc.num_attributes(), 1);
         assert_eq!(proc.attributes()[0], "C");
     }
@@ -822,7 +823,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=100 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
         let idx = proc.find_attribute("X").unwrap();
         assert_eq!(proc.buffer(idx).unwrap().len(), 100);

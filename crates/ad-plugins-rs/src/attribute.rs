@@ -14,6 +14,7 @@ use asyn_rs::error::AsynError;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 
@@ -126,7 +127,7 @@ impl AttributeProcessor {
 }
 
 impl NDPluginProcess for AttributeProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
 
@@ -285,7 +286,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_array_with_attr("Temperature", 25.5, 1);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         assert!(
             result.output_arrays.is_empty(),
@@ -301,11 +302,11 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Intensity", 10.0, 1);
-        proc.process_array(&arr1, &pool);
+        proc.process_array(&Arc::new(arr1), &pool);
         assert!((proc.value_sum() - 10.0).abs() < 1e-10);
 
         let arr2 = make_array_with_attr("Intensity", 20.0, 2);
-        proc.process_array(&arr2, &pool);
+        proc.process_array(&Arc::new(arr2), &pool);
         assert!((proc.value() - 20.0).abs() < 1e-10);
         assert!((proc.value_sum() - 30.0).abs() < 1e-10);
     }
@@ -316,7 +317,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Count", 100.0, 1);
-        proc.process_array(&arr1, &pool);
+        proc.process_array(&Arc::new(arr1), &pool);
         assert!((proc.value_sum() - 100.0).abs() < 1e-10);
 
         proc.reset();
@@ -332,7 +333,7 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = 42;
 
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert!((proc.value() - 42.0).abs() < 1e-10);
     }
 
@@ -350,7 +351,7 @@ mod tests {
             nsec: 500_000_000,
         });
 
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert!((proc.value() - 100.5).abs() < 1e-9);
     }
 
@@ -371,6 +372,7 @@ mod tests {
         arr.time_stamp = 7.25;
 
         let ts = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        let arr = Arc::new(arr);
         ts.process_array(&arr, &pool);
         assert!(
             (ts.value() - 7.25).abs() < 1e-9,
@@ -393,7 +395,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert!((proc.value() - 0.0).abs() < 1e-10);
         assert!((proc.value_sum() - 0.0).abs() < 1e-10);
@@ -412,7 +414,7 @@ mod tests {
             NDAttrValue::String("hello".to_string()),
         ));
 
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert!((proc.value() - 0.0).abs() < 1e-10);
     }
 
@@ -429,7 +431,7 @@ mod tests {
             NDAttrValue::Int32(7),
         ));
 
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert!((proc.value() - 7.0).abs() < 1e-10);
     }
 
@@ -460,7 +462,7 @@ mod tests {
             NDAttrValue::Float64(9.0),
         ));
 
-        let r = proc.process_array(&arr, &NDArrayPool::new(1_000_000));
+        let r = proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
         // Channel 15 — beyond the old fixed 8 — must post its value.
         assert!(
             r.param_updates.iter().any(|u| matches!(
@@ -480,7 +482,7 @@ mod tests {
         proc.params.value_sum = 3;
         let pool = NDArrayPool::new(1_000_000);
 
-        let r1 = proc.process_array(&make_array_with_attr("Temp", 5.0, 1), &pool);
+        let r1 = proc.process_array(&Arc::new(make_array_with_attr("Temp", 5.0, 1)), &pool);
         assert!(
             r1.param_updates
                 .iter()
@@ -489,7 +491,7 @@ mod tests {
         );
 
         let bare = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        let r2 = proc.process_array(&bare, &pool);
+        let r2 = proc.process_array(&Arc::new(bare), &pool);
         assert!(
             !r2.param_updates
                 .iter()
@@ -510,7 +512,7 @@ mod tests {
         proc.params.reset = 7;
 
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&make_array_with_attr("Count", 100.0, 1), &pool);
+        proc.process_array(&Arc::new(make_array_with_attr("Count", 100.0, 1)), &pool);
         assert!((proc.value_sum() - 100.0).abs() < 1e-10);
 
         let snapshot = PluginParamSnapshot {
@@ -546,7 +548,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attr("B", 99.0, 1);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
         assert!((proc.value() - 99.0).abs() < 1e-10);
     }
 }

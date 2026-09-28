@@ -1692,7 +1692,7 @@ impl Default for StatsProcessor {
 }
 
 impl NDPluginProcess for StatsProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let p = &self.params;
         let info = array.info();
         let cfg = *self.config.lock();
@@ -1882,7 +1882,7 @@ impl NDPluginProcess for StatsProcessor {
 
         *self.latest_stats.lock() = result;
         // C++ Stats forwards the input array to downstream plugins
-        ProcessResult::forward(updates)
+        ProcessResult::forward(array, updates)
     }
 
     fn plugin_type(&self) -> &str {
@@ -2086,7 +2086,7 @@ mod tests {
         };
         arr.time_stamp = 7.25; // hardware clock, unrelated to epicsTS
 
-        processor.process_array(&arr, &NDArrayPool::new(1_000_000));
+        processor.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
 
         let ts = rx.try_recv().expect("stats pushes a TS sample per frame");
         assert_eq!(ts.values.len(), NUM_STATS_TS_CHANNELS);
@@ -2712,10 +2712,14 @@ mod tests {
             v[4] = 50;
         }
 
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
         // C++ Stats forwards the input array to downstream plugins
-        assert!(result.forward_input, "stats forwards the array");
-        assert!(result.output_arrays.is_empty());
+        assert!(
+            Arc::ptr_eq(&result.output_arrays[0], &arr),
+            "stats forwards the array"
+        );
+        assert_eq!(result.output_arrays.len(), 1);
 
         let stats = proc.stats_handle().lock().clone();
         assert_eq!(stats.min, 10.0);
@@ -2754,7 +2758,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let p = proc.params;
         // HIST_ARRAY, HIST_X_ARRAY and the 8 PROFILE_* waveforms must be
         // pushed as float64 array updates.
@@ -2824,7 +2828,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let p = proc.params;
 
         // Centroid left at 0 (not computed on a slice).
@@ -2890,7 +2894,7 @@ mod tests {
             v.copy_from_slice(&[0, 1, 3, 3, 9, 9, 9, 4]);
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let p = proc.params;
 
         let below = result.param_updates.iter().find_map(|u| match u {
@@ -2955,7 +2959,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let hist_x = result
             .param_updates
             .iter()

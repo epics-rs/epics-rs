@@ -692,7 +692,7 @@ impl OverlayProcessor {
 }
 
 impl NDPluginProcess for OverlayProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let active = self.build_active_overlays();
         match draw_overlays(pool, array, &active) {
             Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),

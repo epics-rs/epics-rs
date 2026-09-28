@@ -59,7 +59,7 @@ impl NDFileWriter for RecordingWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         self.writes_seen += 1;
         if self.fail_write_number == Some(self.writes_seen) {
             return Err(ADError::UnsupportedConversion("disk full".into()));

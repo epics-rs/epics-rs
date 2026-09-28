@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::codec::{Codec, CodecName};
@@ -3094,7 +3095,7 @@ impl NDFileWriter for Hdf5Writer {
         self.num_capture = n;
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         let start = std::time::Instant::now();
 
         // C `writeFile` merges this frame into `pFileAttributes` before it
@@ -3474,7 +3475,7 @@ const EXTRA_DIM_NAME_PARAMS: [&str; MAX_EXTRA_DIMS] = [
 ];
 
 impl NDPluginProcess for Hdf5FileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut ctrl = self.ctrl.lock();
         let was_swmr = ctrl.writer.is_swmr_active();
         let mut result = ctrl.process_array(array);
@@ -3768,7 +3769,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         // Single-frame standard mode: dataset is [1, 4, 4].
@@ -3829,7 +3830,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -3862,7 +3863,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -3920,7 +3921,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -3973,7 +3974,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -4012,8 +4013,8 @@ mod tests {
             }
         }
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4053,7 +4054,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -4097,7 +4098,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -4146,9 +4147,9 @@ mod tests {
 
         let a0 = mk(0.5, 10);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(0.75, 20)).unwrap();
-        writer.write_file(&mk(1.25, 30)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(0.75, 20))).unwrap();
+        writer.write_file(&Arc::new(mk(1.25, 30))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4202,11 +4203,11 @@ mod tests {
 
         let a0 = mk(Some(0.5));
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
         // Present and changed: the new value wins.
-        writer.write_file(&mk(Some(0.75))).unwrap();
+        writer.write_file(&Arc::new(mk(Some(0.75)))).unwrap();
         // Absent: the previous value stands, it does not become 0.
-        writer.write_file(&mk(None)).unwrap();
+        writer.write_file(&Arc::new(mk(None))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4245,8 +4246,8 @@ mod tests {
         ));
 
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&a1).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(a1)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4292,11 +4293,15 @@ mod tests {
         // The frame that opens the file carries no value for the attribute.
         let a0 = mk(NDAttrValue::Undefined);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
         // A concrete value arriving later must not retype the dataset, and must
         // not land in it: C never re-runs `typeAsHdf` and never lifts the gate.
-        writer.write_file(&mk(NDAttrValue::Int32(7))).unwrap();
-        writer.write_file(&mk(NDAttrValue::Int32(9))).unwrap();
+        writer
+            .write_file(&Arc::new(mk(NDAttrValue::Int32(7))))
+            .unwrap();
+        writer
+            .write_file(&Arc::new(mk(NDAttrValue::Int32(9))))
+            .unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4342,9 +4347,9 @@ mod tests {
 
         let a0 = mk(1);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(2)).unwrap();
-        writer.write_file(&mk(3)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(2))).unwrap();
+        writer.write_file(&Arc::new(mk(3))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4373,7 +4378,7 @@ mod tests {
             NDAttrValue::Int32(7),
         ));
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4404,8 +4409,8 @@ mod tests {
 
         let a0 = mk("Mono");
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk("RGB1")).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk("RGB1"))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4456,7 +4461,7 @@ mod tests {
         ));
 
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4535,9 +4540,9 @@ mod tests {
 
         let a0 = mk("Mono", 10);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk("RGB1", 20)).unwrap();
-        writer.write_file(&mk("Bayer", 30)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk("RGB1", 20))).unwrap();
+        writer.write_file(&Arc::new(mk("Bayer", 30))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4634,9 +4639,9 @@ mod tests {
 
         let a0 = mk("Mono", 10);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk("RGB1", 20)).unwrap();
-        writer.write_file(&mk("Bayer", 30)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk("RGB1", 20))).unwrap();
+        writer.write_file(&Arc::new(mk("Bayer", 30))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4709,8 +4714,8 @@ mod tests {
 
         let a0 = mk("Mono");
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk("RGB1")).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk("RGB1"))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4743,8 +4748,8 @@ mod tests {
         d.reverse = true;
         let arr = NDArray::new(vec![d], NDDataType::UInt16);
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("entry/instrument/detector/data").unwrap();
@@ -4770,8 +4775,8 @@ mod tests {
         d1.reverse = false;
         let arr = NDArray::new(vec![d0, d1], NDDataType::UInt16);
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("entry/instrument/detector/data").unwrap();
@@ -4811,8 +4816,8 @@ mod tests {
 
         let a0 = mk(0.1);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(0.2)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(0.2))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4844,7 +4849,7 @@ mod tests {
         d.reverse = true;
         let arr = NDArray::new(vec![d], NDDataType::UInt16);
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("entry/instrument/detector/data").unwrap();
@@ -4870,7 +4875,7 @@ mod tests {
         d1.reverse = false;
         let arr = NDArray::new(vec![d0, d1], NDDataType::UInt16);
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("entry/instrument/detector/data").unwrap();
@@ -4907,7 +4912,7 @@ mod tests {
             NDDataType::UInt16,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4945,8 +4950,8 @@ mod tests {
             NDDataType::UInt16,
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -4977,8 +4982,8 @@ mod tests {
             NDDataType::UInt16,
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -5005,7 +5010,7 @@ mod tests {
                     v.copy_from_slice(&src);
                 }
                 writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-                writer.write_file(&arr).unwrap();
+                writer.write_file(&Arc::new(arr)).unwrap();
                 writer.close_file().unwrap();
 
                 let mut reader = Hdf5Writer::new();
@@ -5100,7 +5105,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
         writer.close_file().unwrap();
 
         // Assert compression by COMPARING against an uncompressed baseline of
@@ -5119,7 +5124,7 @@ mod tests {
             raw_writer
                 .open_file(&raw_path, NDFileMode::Single, &arr)
                 .unwrap();
-            raw_writer.write_file(&arr).unwrap();
+            raw_writer.write_file(&Arc::new(arr)).unwrap();
             raw_writer.close_file().unwrap();
         }
         let compressed_size = std::fs::metadata(&path).unwrap().len();
@@ -5157,7 +5162,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -5187,7 +5192,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -5220,7 +5225,7 @@ mod tests {
             }
         }
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -5273,7 +5278,7 @@ mod tests {
             v[0] = 0xFFFF; // above 10 bits: must pack to the low 10 bits (0x3FF)
         }
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -5333,8 +5338,8 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -5406,7 +5411,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -5471,7 +5476,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -5518,7 +5523,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -5571,7 +5576,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -5625,7 +5630,7 @@ mod tests {
             if f == 0 {
                 writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
             }
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -5662,9 +5667,9 @@ mod tests {
         );
 
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap(); // should trigger flush
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap(); // should trigger flush
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         assert_eq!(writer.frame_count(), 3);
@@ -5705,8 +5710,8 @@ mod tests {
             !writer.swmr_compression_dropped(),
             "SWMR+ZLIB must apply compression, not drop it"
         );
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         // The compressed SWMR dataset round-trips.
@@ -5802,8 +5807,8 @@ mod tests {
 
         let a0 = mk(0.5);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(0.75)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(0.75))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -5913,11 +5918,19 @@ mod tests {
         // f4: /entry/data1   -> explicit default data1
         let f0 = mk(10, None);
         writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
-        writer.write_file(&f0).unwrap();
-        writer.write_file(&mk(11, Some("/entry/data2"))).unwrap();
-        writer.write_file(&mk(12, Some("/entry/data2"))).unwrap();
-        writer.write_file(&mk(13, Some("/nonexistent"))).unwrap();
-        writer.write_file(&mk(14, Some("/entry/data1"))).unwrap();
+        writer.write_file(&Arc::new(f0)).unwrap();
+        writer
+            .write_file(&Arc::new(mk(11, Some("/entry/data2"))))
+            .unwrap();
+        writer
+            .write_file(&Arc::new(mk(12, Some("/entry/data2"))))
+            .unwrap();
+        writer
+            .write_file(&Arc::new(mk(13, Some("/nonexistent"))))
+            .unwrap();
+        writer
+            .write_file(&Arc::new(mk(14, Some("/entry/data1"))))
+            .unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -5993,7 +6006,7 @@ mod tests {
 
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
         assert!(
-            writer.write_file(&arr).is_err(),
+            writer.write_file(&Arc::new(arr)).is_err(),
             "a non-string destination attribute must abort the write"
         );
         writer.close_file().ok();
@@ -6037,7 +6050,7 @@ mod tests {
             NDDataType::UInt16,
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6101,7 +6114,7 @@ mod tests {
             NDDataType::UInt16,
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
 
         assert!(
             writer.close_file().is_err(),
@@ -6174,8 +6187,8 @@ mod tests {
             writer.is_swmr_active(),
             "writer must be in SWMR mode for this test"
         );
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6257,8 +6270,8 @@ mod tests {
             writer.is_swmr_active(),
             "writer must be in SWMR mode for this test"
         );
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         // Read back via the SWMR reader — these are the exact paths a live
@@ -6362,7 +6375,7 @@ mod tests {
             NDDataType::UInt8,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6392,7 +6405,7 @@ mod tests {
             NDDataType::UInt8,
         );
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6424,7 +6437,7 @@ mod tests {
             NDDataType::Float32,
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6586,7 +6599,7 @@ mod tests {
         let comp = crate::codec::compress_lz4(&orig).unwrap();
         assert!(comp.codec.is_some());
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
-        writer.write_file(&comp).unwrap();
+        writer.write_file(&Arc::new(comp)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6614,7 +6627,7 @@ mod tests {
             crate::codec::compress_blosc(&orig, &crate::codec::BloscConfig::default()).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Blosc);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
-        writer.write_file(&comp).unwrap();
+        writer.write_file(&Arc::new(comp)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6642,7 +6655,7 @@ mod tests {
         let comp = crate::codec::compress_bslz4(&orig).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::BSLZ4);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
-        writer.write_file(&comp).unwrap();
+        writer.write_file(&Arc::new(comp)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6699,7 +6712,7 @@ mod tests {
             .open_file(&path, NDFileMode::Stream, &comp[0])
             .unwrap();
         for c in &comp {
-            writer.write_file(c).unwrap();
+            writer.write_file(&Arc::new(c.clone())).unwrap();
         }
         writer.close_file().unwrap();
 
@@ -6733,7 +6746,7 @@ mod tests {
         let comp = crate::codec::compress_jpeg(&src, 90).expect("jpeg encode");
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::JPEG);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
-        writer.write_file(&comp).unwrap();
+        writer.write_file(&Arc::new(comp)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -6753,9 +6766,9 @@ mod tests {
         let f0 = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
         let f1_plain = ramp_u16(4, 5); // no codec
         writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
-        writer.write_file(&f0).unwrap();
+        writer.write_file(&Arc::new(f0)).unwrap();
         assert!(
-            writer.write_file(&f1_plain).is_err(),
+            writer.write_file(&Arc::new(f1_plain)).is_err(),
             "an uncompressed frame must be rejected for a compressed dataset"
         );
         writer.close_file().ok();
@@ -6772,7 +6785,7 @@ mod tests {
         let comp = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
         writer.open_file(&path, NDFileMode::Stream, &comp).unwrap();
         assert!(
-            writer.write_file(&comp).is_err(),
+            writer.write_file(&Arc::new(comp)).is_err(),
             "SWMR mode cannot direct-chunk-write a pre-compressed array"
         );
         writer.close_file().ok();
@@ -6789,7 +6802,7 @@ mod tests {
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Zlib);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         assert!(
-            writer.write_file(&comp).is_err(),
+            writer.write_file(&Arc::new(comp)).is_err(),
             "an unsupported (zlib) codec must be rejected, not silently mis-written"
         );
         writer.close_file().ok();

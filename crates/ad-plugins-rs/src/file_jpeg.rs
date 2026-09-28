@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
@@ -44,7 +45,7 @@ impl NDFileWriter for JpegWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         let path = self
             .current_path
             .as_ref()
@@ -190,7 +191,7 @@ impl Default for JpegFileProcessor {
 }
 
 impl NDPluginProcess for JpegFileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
 
@@ -273,7 +274,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
-        let err = writer.write_file(&arr).unwrap_err();
+        let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
@@ -296,7 +297,7 @@ mod tests {
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
         assert!(matches!(
-            writer.write_file(&arr).unwrap_err(),
+            writer.write_file(&Arc::new(arr)).unwrap_err(),
             ADError::InvalidDimensions(_)
         ));
         std::fs::remove_file(&path).ok();
@@ -315,7 +316,7 @@ mod tests {
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
         writer
-            .write_file(&arr)
+            .write_file(&Arc::new(arr))
             .expect("3-D WITH ColorMode=RGB1 must still write");
         assert!(path.exists());
         std::fs::remove_file(&path).ok();
@@ -337,7 +338,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let data = std::fs::read(&path).unwrap();
@@ -382,14 +383,14 @@ mod tests {
         writer_high
             .open_file(&path_high, NDFileMode::Single, &arr)
             .unwrap();
-        writer_high.write_file(&arr).unwrap();
+        writer_high.write_file(&Arc::new(arr.clone())).unwrap();
         writer_high.close_file().unwrap();
 
         let mut writer_low = JpegWriter::new(10);
         writer_low
             .open_file(&path_low, NDFileMode::Single, &arr)
             .unwrap();
-        writer_low.write_file(&arr).unwrap();
+        writer_low.write_file(&Arc::new(arr)).unwrap();
         writer_low.close_file().unwrap();
 
         let size_high = std::fs::metadata(&path_high).unwrap().len();
@@ -440,7 +441,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
 
         let read_back = writer.read_file().unwrap();
         assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
@@ -482,7 +483,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         let read_back = writer.read_file().unwrap();
         writer.close_file().unwrap();
         std::fs::remove_file(&path).ok();

@@ -38,10 +38,9 @@ impl Default for StdArraysProcessor {
 }
 
 impl NDPluginProcess for StdArraysProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        // The runtime forwards the frame and files it in `latest_data`.
-        let _ = array;
-        ProcessResult::forward(vec![])
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        // The frame goes on as it is; the runtime files it in `latest_data`.
+        ProcessResult::forward(array, vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -122,9 +121,10 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
-        assert!(result.forward_input);
-        assert!(result.output_arrays.is_empty());
+        assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
+        assert_eq!(result.output_arrays.len(), 1);
     }
 
     #[test]

@@ -78,7 +78,7 @@ struct Unlocked {
 }
 
 impl NDPluginProcess for Unlocked {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
         ProcessResult::empty()
@@ -98,7 +98,7 @@ struct Locked {
 }
 
 impl NDPluginProcess for Locked {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);
         ProcessResult::empty()

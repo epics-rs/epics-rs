@@ -75,7 +75,10 @@ impl NDFileMode {
 /// Trait for file format writers.
 pub trait NDFileWriter: Send + Sync {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()>;
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()>;
+    /// Write one frame. The frame arrives as its `Arc` (C `NDArray*` with
+    /// `reserve()` available) so a writer that materialises the file later
+    /// can hold it without copying.
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()>;
     fn read_file(&mut self) -> ADResult<NDArray>;
     fn close_file(&mut self) -> ADResult<()>;
     fn supports_multiple_arrays(&self) -> bool {
@@ -665,7 +668,7 @@ mod tests {
             self.opens.push(path.to_path_buf());
             Ok(())
         }
-        fn write_file(&mut self, _array: &NDArray) -> ADResult<()> {
+        fn write_file(&mut self, _array: &Arc<NDArray>) -> ADResult<()> {
             if self.fail_write {
                 return Err(crate::error::ADError::UnsupportedConversion(
                     "disk full".into(),

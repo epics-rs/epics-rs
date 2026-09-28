@@ -56,12 +56,9 @@ fn stack_3x4x4() -> NDArray {
     arr
 }
 
-/// Process `arr` and resolve the result as the runtime does, so a forwarded
-/// input shows up in `output_arrays`.
 fn run(proc: &mut ColorConvertProcessor, arr: &NDArray) -> ProcessResult {
     let input = Arc::new(arr.clone());
     proc.process_array(&input, &NDArrayPool::new(1 << 20))
-        .resolve(&input)
 }
 
 /// The cited case: a 3-D array whose leading dimension happens to be 3. The port

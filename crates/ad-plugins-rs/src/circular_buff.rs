@@ -398,6 +398,12 @@ impl CircularBuffer {
     /// post-trigger frame (`:162-166`) and the soft-trigger write when
     /// FlushOnSoftTrig > 0 (`:276-277`) — and whichever runs second finds the
     /// ring already empty, exactly as C does.
+    /// The oldest ringed frame (tests: the ring holds the input itself).
+    #[cfg(test)]
+    fn pre_buffer_front(&self) -> Option<Arc<NDArray>> {
+        self.buffer.front().cloned()
+    }
+
     fn flush_pre_buffer(&mut self) -> Vec<Arc<NDArray>> {
         self.pre_flushed = true;
         self.buffer.drain(..).collect()
@@ -591,11 +597,14 @@ impl CircularBuffState {
 }
 
 impl NDPluginProcess for CircularBuffProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
+        // C copies the frame into its own pool so the driver's array can be
+        // released (NDPluginCircularBuff.cpp:137); a shared immutable Arc
+        // needs no copy, the ring just holds a reference.
         let mut state = self.state.lock();
-        let push_result = state.buffer.push(Arc::new(array.clone()));
+        let push_result = state.buffer.push(Arc::clone(array));
 
         // The buffer reports exactly the parameters C assigns for this frame
         // (see `FrameParams`); the processor only maps them onto indices. A
@@ -1652,6 +1661,22 @@ mod tests {
         assert_eq!(r2.params.control, Some(1), "still acquiring");
     }
 
+    /// The ring holds the frame it was handed; C copies through its pool
+    /// (NDPluginCircularBuff.cpp:137) only so the driver's array can be
+    /// released, which a shared `Arc` does not need.
+    #[test]
+    fn the_ringed_frame_is_the_input_arc_itself() {
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+
+        let p = CircularBuffProcessor::new(1, 1, TriggerCondition::External, 100);
+        p.buffer().start();
+        let pool = NDArrayPool::new(0);
+        let input = Arc::new(NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8));
+        p.process_array(&input, &pool);
+        assert!(Arc::ptr_eq(&p.buffer().pre_buffer_front().unwrap(), &input));
+        assert_eq!(pool.num_alloc_buffers(), 0);
+    }
+
     #[test]
     fn test_processor_emits_the_frame_params() {
         // The processor maps `FrameParams` onto the registered indices: a
@@ -1677,14 +1702,14 @@ mod tests {
         };
 
         // Pre-trigger frame: CURRENT_IMAGE=1, no POST_COUNT.
-        let r = p.process_array(&frame(), &pool);
+        let r = p.process_array(&Arc::new(frame()), &pool);
         assert!(int32s(&r).contains(&(11, 1)));
         assert!(!int32s(&r).iter().any(|(reason, _)| *reason == 13));
 
         // Flushing frame: POST_COUNT=1 and NO CURRENT_IMAGE update (the pre-fix
         // processor posted CURRENT_IMAGE=0 here and never posted POST_COUNT).
         p.trigger();
-        let r = p.process_array(&frame(), &pool);
+        let r = p.process_array(&Arc::new(frame()), &pool);
         assert!(int32s(&r).contains(&(13, 1)), "POST_COUNT posted per frame");
         assert!(
             !int32s(&r).iter().any(|(reason, _)| *reason == 11),
@@ -1696,7 +1721,7 @@ mod tests {
         );
 
         // Completing frame: ACTUAL_TRIGGER_COUNT=1, POST_COUNT reset to 0.
-        let r = p.process_array(&frame(), &pool);
+        let r = p.process_array(&Arc::new(frame()), &pool);
         assert!(int32s(&r).contains(&(16, 1)));
         assert!(int32s(&r).contains(&(13, 0)));
     }
@@ -1740,7 +1765,7 @@ mod tests {
             for id in 1..=2 {
                 let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
                 a.unique_id = id;
-                p.process_array(&a, &pool);
+                p.process_array(&Arc::new(a), &pool);
             }
             assert_eq!(p.buffer().pre_buffer_len(), 2);
             p
@@ -1795,7 +1820,7 @@ mod tests {
         let pool = NDArrayPool::new(0);
         let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         a.unique_id = 3;
-        let r = p.process_array(&a, &pool);
+        let r = p.process_array(&Arc::new(a), &pool);
         let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
         assert_eq!(ids, vec![3], "pre-buffer already flushed, not re-emitted");
     }
@@ -1843,7 +1868,7 @@ mod tests {
             for id in 1..=2 {
                 let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
                 a.unique_id = id;
-                p.process_array(&a, &pool);
+                p.process_array(&Arc::new(a), &pool);
             }
             assert_eq!(p.buffer().pre_buffer_len(), 2);
 

@@ -32,6 +32,7 @@
 //! delivery is not expressible in the broadcast `ProcessResult` model); the
 //! observable waveform/scalar records are fully implemented.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
@@ -437,7 +438,7 @@ impl TimeSeriesState {
 }
 
 impl NDPluginProcess for TimeSeriesProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C processCallbacks: this plugin only handles 1-D or 2-D arrays.
         let ndims = array.dims.len();
         if !(1..=2).contains(&ndims) {
@@ -661,7 +662,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(3)],
             NDDataBuffer::U8(vec![200; 6]),
         );
-        let res = proc.process_array(&arr, &pool);
+        let res = proc.process_array(&Arc::new(arr), &pool);
 
         // One averaged output point per signal: 600 / 3 = 200 (C: 29).
         assert_eq!(proc.state.lock().current_time_point, 1);
@@ -688,7 +689,7 @@ mod tests {
             vec![NDDimension::new(1), NDDimension::new(3)],
             NDDataBuffer::F64(vec![10.0, 20.0, 30.0]),
         );
-        let res = proc.process_array(&arr, &pool);
+        let res = proc.process_array(&Arc::new(arr), &pool);
 
         // Buffer of 2 fills at the 2nd point: acquisition stops, 3rd point dropped.
         assert!(!proc.state.lock().acquiring);
@@ -711,7 +712,7 @@ mod tests {
             vec![NDDimension::new(1), NDDimension::new(5)],
             NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
         );
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // Ring holds [4,5,3] with write position at 2; Circular never stops.
         assert!(proc.state.lock().acquiring);
@@ -745,7 +746,7 @@ mod tests {
             vec![NDDimension::new(3)],
             NDDataBuffer::F64(vec![11.0, 22.0, 33.0]),
         );
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert_eq!(proc.state.lock().num_signals, 3);
         assert_eq!(proc.state.lock().current_time_point, 1);
@@ -766,7 +767,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(1)],
             NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0]),
         );
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert_eq!(proc.state.lock().num_signals, 2);
         assert_eq!(proc.state.lock().circular[0], 1.0);
@@ -788,7 +789,7 @@ mod tests {
             ],
             NDDataBuffer::F64(vec![0.0; 8]),
         );
-        let res = proc.process_array(&arr, &pool);
+        let res = proc.process_array(&Arc::new(arr), &pool);
         assert!(res.param_updates.is_empty());
         assert_eq!(proc.state.lock().current_time_point, 0);
     }

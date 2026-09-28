@@ -790,7 +790,7 @@ impl ProcessProcessor {
 }
 
 impl NDPluginProcess for ProcessProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         // C holds the port lock only for the parameter reads and the validity
@@ -1377,7 +1377,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let input = make_array(&[10, 20, 30]);
-        let result = proc.process_array(&input, &pool);
+        let result = proc.process_array(&Arc::new(input), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         if let NDDataBuffer::U8(ref v) = result.output_arrays[0].data {
             assert_eq!(v[0], 22); // (10+1)*2 = 22 (C++: offset first, then scale)
@@ -1657,7 +1657,7 @@ mod tests {
         let mut base = PortDriverBase::new("R9_68", 1, PortFlags::default());
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
-        let _ = proc.process_array(&make_array(&[4, 5, 6]), &pool);
+        let _ = proc.process_array(&Arc::new(make_array(&[4, 5, 6])), &pool);
 
         let reason = proc.params.save_background.unwrap();
         let valid = proc.params.valid_background.unwrap();

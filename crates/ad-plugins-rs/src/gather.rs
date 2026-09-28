@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ad_core_rs::ndarray::NDArray;
@@ -104,10 +105,9 @@ impl Default for GatherProcessor {
 }
 
 impl NDPluginProcess for GatherProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
-        let _ = array;
-        ProcessResult::forward(vec![])
+        ProcessResult::forward(array, vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -177,11 +177,13 @@ mod tests {
         let arr1 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         let arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
 
+        let arr1 = Arc::new(arr1);
         let result1 = proc.process_array(&arr1, &pool);
+        let arr2 = Arc::new(arr2);
         let result2 = proc.process_array(&arr2, &pool);
 
-        assert!(result1.forward_input && result1.output_arrays.is_empty());
-        assert!(result2.forward_input && result2.output_arrays.is_empty());
+        assert!(Arc::ptr_eq(&result1.output_arrays[0], &arr1) && result1.output_arrays.len() == 1);
+        assert!(Arc::ptr_eq(&result2.output_arrays[0], &arr2) && result2.output_arrays.len() == 1);
         assert_eq!(proc.total_received(), 2);
     }
 
@@ -203,7 +205,7 @@ mod tests {
         // Simulate arrays arriving from different sources (all arrive on same channel)
         for _ in 0..5 {
             let arr = NDArray::new(vec![NDDimension::new(10)], NDDataType::UInt16);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
 
         assert_eq!(proc.total_received(), 5);

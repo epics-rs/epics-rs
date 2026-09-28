@@ -232,7 +232,7 @@ impl TransformProcessor {
 }
 
 impl NDPluginProcess for TransformProcessor {
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
         // straight into the call would live to the end of the statement and
@@ -526,7 +526,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_3x2();
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims[0].size, 2); // swapped
         assert_eq!(result.output_arrays[0].dims[1].size, 3);

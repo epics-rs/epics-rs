@@ -875,7 +875,7 @@ impl NDPluginProcess for ColorConvertProcessor {
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
     }
 
-    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C `convertColor` (NDPluginColorConvert.cpp:44,54-55) starts from
         // `int colorMode = NDColorModeMono` and overwrites it only from the
         // `ColorMode` attribute; it never infers a layout from the dimensions.
@@ -891,7 +891,7 @@ impl NDPluginProcess for ColorConvertProcessor {
         // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
         // the untouched input is forwarded — with its own ColorMode, since
         // `changedColorMode` stayed 0 (:589). A frame is never dropped.
-        let passthrough = || ProcessResult::forward(vec![]);
+        let passthrough = || ProcessResult::forward(array, vec![]);
 
         if src_mode == target {
             return passthrough();
@@ -908,7 +908,7 @@ impl NDPluginProcess for ColorConvertProcessor {
 
         // Step 1: Convert source to RGB1 intermediate
         let rgb1 = match src_mode {
-            NDColorMode::RGB1 => Ok(Some(Cow::Borrowed(array))),
+            NDColorMode::RGB1 => Ok(Some(Cow::Borrowed(array.as_ref()))),
             NDColorMode::Mono => {
                 let false_colored = if false_color != 0 {
                     false_color_mono_to_rgb1(pool, array, false_color)
@@ -1267,7 +1267,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims[0].size, 3); // RGB color dim
     }
@@ -1293,7 +1293,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 3);
@@ -1334,7 +1334,7 @@ mod tests {
             v[1] = 192;
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
         if let NDDataBuffer::U8(ref v) = out.data {
             // false_color=2 selects Iron (NDPluginColorConvert.cpp:68-72).
@@ -1372,7 +1372,7 @@ mod tests {
             v[1] = -64; // (unsigned char)(-64) == 192
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
         let NDDataBuffer::I8(ref v) = out.data else {
             panic!("Int8 input must stay Int8 (C allocates with pArray->dataType)");
@@ -1413,7 +1413,7 @@ mod tests {
             v[1] = 2000;
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
         let NDDataBuffer::U16(ref v) = out.data else {
             panic!("expected UInt16 output");
@@ -1449,7 +1449,7 @@ mod tests {
         // (NDPluginColorConvert.cpp:54-55).
         set_color_mode_attr(&mut arr, NDColorMode::RGB1);
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 3);
@@ -1485,7 +1485,7 @@ mod tests {
         // (NDPluginColorConvert.cpp:54-55).
         set_color_mode_attr(&mut arr, NDColorMode::RGB2);
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         // Mono output should be 2D
@@ -1548,9 +1548,13 @@ mod tests {
             }
         }
 
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
-        assert!(result.forward_input, "same mode forwards the input itself");
-        assert!(result.output_arrays.is_empty());
+        assert!(
+            Arc::ptr_eq(&result.output_arrays[0], &arr),
+            "same mode forwards the input itself"
+        );
+        assert_eq!(result.output_arrays.len(), 1);
     }
 
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {
@@ -1584,7 +1588,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims.len(), 2);
     }
@@ -1614,8 +1618,12 @@ mod tests {
             }
         }
 
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
-        assert!(!result.forward_input, "RGB1 -> YUV444 converts");
+        assert!(
+            !Arc::ptr_eq(&result.output_arrays[0], &arr),
+            "RGB1 -> YUV444 converts"
+        );
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 3);
@@ -1650,7 +1658,7 @@ mod tests {
             v[..16].copy_from_slice(&uyvy);
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims[0].size, 3);
@@ -1678,7 +1686,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 2);
@@ -1710,7 +1718,7 @@ mod tests {
             }
         }
 
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 2);
@@ -1791,7 +1799,10 @@ mod tests {
         });
         set_color_mode_attr(&mut arr, NDColorMode::Bayer);
         drop(second);
-        let out = proc.process_array(&arr, &pool).output_arrays.remove(0);
+        let out = proc
+            .process_array(&Arc::new(arr), &pool)
+            .output_arrays
+            .remove(0);
         assert_eq!(out.pool_id(), pool.id());
         assert_eq!(pool.num_alloc_buffers(), 1);
     }

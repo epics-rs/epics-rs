@@ -1341,7 +1341,7 @@ impl CodecOutcome {
 }
 
 impl NDPluginProcess for CodecProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C reads the codec selection under the port lock and releases it
         // around every codec call (`NDPluginCodec.cpp:556`, `:596`), so the
         // compression itself never holds it. `mode`, `jpeg_quality` and
@@ -1464,7 +1464,7 @@ impl NDPluginProcess for CodecProcessor {
                 r.param_updates = updates;
                 r
             }
-            None => ProcessResult::forward(updates),
+            None => ProcessResult::forward(array, updates),
         }
     }
 
@@ -2074,7 +2074,7 @@ mod tests {
 
         let mut decomp = CodecProcessor::new(CodecMode::Decompress);
         decomp.params.codec_error = Some(13);
-        let result = decomp.process_array(&compressed, &pool);
+        let result = decomp.process_array(&Arc::new(compressed), &pool);
         let text = result
             .param_updates
             .iter()
@@ -2107,7 +2107,7 @@ mod tests {
             codec: CodecName::BSLZ4,
             quality: 0,
         });
-        let compressed = comp.process_array(&arr, &pool);
+        let compressed = comp.process_array(&Arc::new(arr), &pool);
         let compressed_arr = &compressed.output_arrays[0];
         assert_eq!(
             compressed_arr.codec.as_ref().unwrap().name,
@@ -2422,7 +2422,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        let result = proc.process_array(&arr, &NDArrayPool::new(0));
+        let result = proc.process_array(&Arc::new(arr), &NDArrayPool::new(0));
         let text = result
             .param_updates
             .iter()
@@ -2541,7 +2541,7 @@ mod tests {
             codec: CodecName::Zlib,
             quality: 0,
         });
-        let compressed = comp.process_array(&arr, &pool);
+        let compressed = comp.process_array(&Arc::new(arr), &pool);
         let compressed_arr = &compressed.output_arrays[0];
         assert_eq!(compressed_arr.codec.as_ref().unwrap().name, CodecName::Zlib);
 
@@ -2670,7 +2670,7 @@ mod tests {
             codec: CodecName::LZ4HDF5,
             quality: 0,
         });
-        let compressed = comp.process_array(&arr, &pool);
+        let compressed = comp.process_array(&Arc::new(arr), &pool);
         let compressed_arr = &compressed.output_arrays[0];
         assert_eq!(
             compressed_arr.codec.as_ref().unwrap().name,
@@ -2750,7 +2750,7 @@ mod tests {
             quality: 0,
         });
         let arr = make_u8_array(32, 32);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(
             result.output_arrays[0].codec.as_ref().unwrap().name,
@@ -2767,7 +2767,7 @@ mod tests {
             quality: 80,
         });
         let arr = make_u8_array(16, 16);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(
             result.output_arrays[0].codec.as_ref().unwrap().name,
@@ -2782,7 +2782,7 @@ mod tests {
         let compressed = compress_lz4(&arr).unwrap();
 
         let proc = CodecProcessor::new(CodecMode::Decompress);
-        let result = proc.process_array(&compressed, &pool);
+        let result = proc.process_array(&Arc::new(compressed), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(result.output_arrays[0].codec.is_none());
         assert_eq!(
@@ -2799,7 +2799,7 @@ mod tests {
         let compressed = compress_jpeg(&arr, 90).unwrap();
 
         let proc = CodecProcessor::new(CodecMode::Decompress);
-        let result = proc.process_array(&compressed, &pool);
+        let result = proc.process_array(&Arc::new(compressed), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(result.output_arrays[0].codec.is_none());
     }
@@ -2809,10 +2809,11 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(8, 8);
         let proc = CodecProcessor::new(CodecMode::Decompress);
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
         // C++: on failure, pass through original array unchanged
-        assert!(result.forward_input);
-        assert!(result.output_arrays.is_empty());
+        assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
+        assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(proc.compression_ratio(), 1.0);
     }
 
@@ -2856,6 +2857,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(8, 8);
         let proc = processor_with_params(CodecMode::Decompress);
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
 
         assert_eq!(
@@ -2874,7 +2876,7 @@ mod tests {
             "COMPRESSOR must be set to NDCODEC_NONE"
         );
         assert!(
-            result.forward_input && result.output_arrays.is_empty(),
+            Arc::ptr_eq(&result.output_arrays[0], &arr) && result.output_arrays.len() == 1,
             "the input array is passed through unchanged"
         );
         assert_eq!(proc.compression_ratio(), 1.0);
@@ -2893,7 +2895,7 @@ mod tests {
             (compress_jpeg(&src, 90).expect("jpeg"), 1),
         ] {
             let proc = processor_with_params(CodecMode::Decompress);
-            let result = proc.process_array(&codec, &pool);
+            let result = proc.process_array(&Arc::new(codec), &pool);
             assert_eq!(
                 int32_update(&result.param_updates, 11),
                 Some(ordinal),
@@ -2919,6 +2921,7 @@ mod tests {
             codec: CodecName::None,
             quality: 85,
         });
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
 
         assert_eq!(int32_update(&result.param_updates, 12), Some(0));
@@ -2929,7 +2932,7 @@ mod tests {
             "compress mode must not overwrite the operator's COMPRESSOR selection"
         );
         assert!(
-            result.forward_input && result.output_arrays.is_empty(),
+            Arc::ptr_eq(&result.output_arrays[0], &arr) && result.output_arrays.len() == 1,
             "the uncompressed input itself is passed through"
         );
     }
@@ -2946,6 +2949,7 @@ mod tests {
             v.truncate(3);
         }
         let proc = processor_with_params(CodecMode::Decompress);
+        let corrupted = Arc::new(corrupted);
         let result = proc.process_array(&corrupted, &pool);
 
         assert_ne!(
@@ -2959,7 +2963,7 @@ mod tests {
         );
         assert_eq!(int32_update(&result.param_updates, 11), Some(3));
         assert!(
-            result.forward_input && result.output_arrays.is_empty(),
+            Arc::ptr_eq(&result.output_arrays[0], &corrupted) && result.output_arrays.len() == 1,
             "the input array is republished on failure"
         );
     }
@@ -2986,6 +2990,7 @@ mod tests {
             codec: CodecName::Zlib,
             quality: 85,
         });
+        let compressed = Arc::new(compressed);
         let result = proc.process_array(&compressed, &pool);
 
         assert_eq!(
@@ -2998,7 +3003,9 @@ mod tests {
             Some("Array already compressed".to_string())
         );
         // The frame still flows on, still LZ4-compressed: the input itself.
-        assert!(result.forward_input && result.output_arrays.is_empty());
+        assert!(
+            Arc::ptr_eq(&result.output_arrays[0], &compressed) && result.output_arrays.len() == 1
+        );
     }
 
     #[test]
@@ -3018,7 +3025,7 @@ mod tests {
             codec: CodecName::JPEG,
             quality: 85,
         });
-        let result = proc.process_array(&wide, &pool);
+        let result = proc.process_array(&Arc::new(wide), &pool);
         assert_eq!(
             int32_update(&result.param_updates, 12),
             Some(CodecStatus::Error.as_i32()),
@@ -3031,7 +3038,7 @@ mod tests {
             v.truncate(3);
         }
         let proc = processor_with_params(CodecMode::Decompress);
-        let result = proc.process_array(&corrupted, &pool);
+        let result = proc.process_array(&Arc::new(corrupted), &pool);
         assert_eq!(
             int32_update(&result.param_updates, 12),
             Some(CodecStatus::Error.as_i32()),
@@ -3050,6 +3057,7 @@ mod tests {
             codec: CodecName::LZ4,
             quality: 85,
         });
+        let arr = Arc::new(arr);
         let compressed = proc.process_array(&arr, &pool);
         assert_eq!(
             int32_update(&compressed.param_updates, 12),
@@ -3082,7 +3090,7 @@ mod tests {
             codec: CodecName::LZ4,
             quality: 0,
         });
-        let _ = proc.process_array(&arr, &pool);
+        let _ = proc.process_array(&Arc::new(arr), &pool);
         let ratio = proc.compression_ratio();
         assert!(
             ratio > 2.0,

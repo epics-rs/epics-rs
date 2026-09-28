@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::color::NDColorMode;
@@ -422,7 +423,7 @@ impl NDFileWriter for TiffWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         let path = self
             .current_path
             .as_ref()
@@ -614,7 +615,7 @@ impl Default for TiffFileProcessor {
 }
 
 impl NDPluginProcess for TiffFileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
 
@@ -692,7 +693,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
-        let err = writer.write_file(&arr).unwrap_err();
+        let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
@@ -722,7 +723,7 @@ mod tests {
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
         writer
-            .write_file(&arr)
+            .write_file(&Arc::new(arr))
             .expect("3-D WITH ColorMode=RGB1 must still write");
         writer.close_file().ok();
         assert!(path.exists());
@@ -745,7 +746,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let data = std::fs::read(&path).unwrap();
@@ -769,7 +770,7 @@ mod tests {
         );
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let data = std::fs::read(&path).unwrap();
@@ -794,7 +795,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
         if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
@@ -823,7 +824,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
         if let (NDDataBuffer::U16(orig), NDDataBuffer::U16(read)) = (&arr.data, &read_back.data) {
@@ -853,7 +854,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut base = PortDriverBase::new("TIFFTEST", 1, PortFlags::default());
@@ -937,7 +938,7 @@ mod tests {
         arr.timestamp.nsec = 500;
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
@@ -990,7 +991,7 @@ mod tests {
         ));
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
@@ -1031,7 +1032,7 @@ mod tests {
         let path = temp_path("tiff_attr_fmt");
         let mut writer = TiffWriter::new();
         writer.open_file(&path, NDFileMode::Single, &a).unwrap();
-        writer.write_file(&a).unwrap();
+        writer.write_file(&Arc::new(a)).unwrap();
         writer.close_file().unwrap();
 
         let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
@@ -1068,7 +1069,7 @@ mod tests {
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
         // Previously a hard error; must now succeed.
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
@@ -1149,7 +1150,7 @@ mod tests {
         let path = temp_path(prefix);
         let mut writer = TiffWriter::new();
         writer.open_file(&path, NDFileMode::Single, array).unwrap();
-        writer.write_file(array).unwrap();
+        writer.write_file(&Arc::new(array.clone())).unwrap();
         writer.close_file().unwrap();
         path
     }
@@ -1340,6 +1341,7 @@ mod tests {
         }
 
         proc.ctrl.lock().auto_save = false;
+        let arr = Arc::new(arr);
         let _ = proc.process_array(&arr, &NDArrayPool::new(1024));
         assert!(!std::path::Path::new(&full_name).exists());
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
@@ -7,7 +8,8 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use ad_core_rs::color::{self, NDBayerPattern, NDColorMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::error::{ADError, ADResult};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
@@ -19,9 +21,13 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 /// overflows. Only the pixels not touching a border are interpolated
 /// (`:267`); a border pixel keeps its native channel and zero in the other
 /// two.
-pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> {
+pub fn bayer_to_rgb1(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    pattern: NDBayerPattern,
+) -> ADResult<Option<NDArray>> {
     if src.dims.len() != 2 {
-        return None;
+        return Ok(None);
     }
     let w = src.dims[0].size;
     let h = src.dims[1].size;
@@ -49,23 +55,26 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         r_col_even,
     };
 
-    let out_data = match &src.data {
-        NDDataBuffer::U8(v) => NDDataBuffer::U8(demosaic(v, w, h, phase)),
-        NDDataBuffer::U16(v) => NDDataBuffer::U16(demosaic(v, w, h, phase)),
-        _ => return None,
-    };
-
+    if !matches!(src.data, NDDataBuffer::U8(_) | NDDataBuffer::U16(_)) {
+        return Ok(None);
+    }
+    // C allocates the RGB1 output through the pool
+    // (NDPluginColorConvert.cpp:93,119,155).
     let dims = vec![
         NDDimension::new(3),
         NDDimension::new(w),
         NDDimension::new(h),
     ];
-    let mut arr = NDArray::new(dims, src.data.data_type());
-    arr.data = out_data;
+    let mut arr = pool.alloc(dims, src.data.data_type())?;
+    match (&src.data, &mut arr.data) {
+        (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => demosaic(v, w, h, phase, out),
+        (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => demosaic(v, w, h, phase, out),
+        _ => unreachable!("the output was allocated in the source type"),
+    }
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.attributes = src.attributes.clone();
-    Some(arr)
+    Ok(Some(arr))
 }
 
 /// Where the red pixels of a frame lie, after the pattern and the offsets.
@@ -98,9 +107,9 @@ macro_rules! bayer_pixel {
 }
 bayer_pixel!(u8, u16);
 
-/// The RGB1 frame of `src` (`w * h` pixels, zero-padded if shorter), row by
-/// row across the pool when the frame is large enough.
-fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase) -> Vec<T> {
+/// The RGB1 frame of `src` (`w * h` pixels, zero-padded if shorter) into
+/// `out`, row by row across the thread pool when the frame is large enough.
+fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out: &mut [T]) {
     let n = w * h;
     let padded: Vec<T>;
     let src = if src.len() >= n {
@@ -114,7 +123,6 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase) -> 
             .collect();
         &padded
     };
-    let mut out = vec![T::default(); n * 3];
     let row = |y: usize, out_row: &mut [T]| demosaic_row(src, w, h, phase, y, out_row);
 
     #[cfg(feature = "parallel")]
@@ -124,14 +132,13 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase) -> 
                 .enumerate()
                 .for_each(|(y, out_row)| row(y, out_row));
         });
-        return out;
+        return;
     }
     if w > 0 {
         for (y, out_row) in out.chunks_mut(w * 3).enumerate() {
             row(y, out_row);
         }
     }
-    out
 }
 
 /// Row `y` of the RGB1 output — C's per-pixel arithmetic
@@ -764,52 +771,56 @@ fn false_color_lut(false_color: i32) -> Option<&'static [[u8; 3]; 256]> {
 ///
 /// Returns `None` for a non-8-bit or non-2-D input, or a `false_color` value
 /// with no table.
-fn false_color_mono_to_rgb1(src: &NDArray, false_color: i32) -> Option<NDArray> {
+fn false_color_mono_to_rgb1(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    false_color: i32,
+) -> ADResult<Option<NDArray>> {
     if src.dims.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    let lut = false_color_lut(false_color)?;
+    let Some(lut) = false_color_lut(false_color) else {
+        return Ok(None);
+    };
 
     let w = src.dims[0].size;
     let h = src.dims[1].size;
     let n = w * h;
 
+    if !matches!(src.data, NDDataBuffer::U8(_) | NDDataBuffer::I8(_)) {
+        return Ok(None);
+    }
+    // C allocates the RGB1 output through the pool (NDPluginColorConvert.cpp:93).
+    let dims = vec![
+        NDDimension::new(3),
+        NDDimension::new(w),
+        NDDimension::new(h),
+    ];
+    let mut arr = pool.alloc(dims, src.data.data_type())?;
     // Map each sample through the LUT by its low byte, keeping the input type.
-    let (data, data_type) = match &src.data {
-        NDDataBuffer::U8(src_slice) => {
-            let mut out = vec![0u8; n * 3];
+    match (&src.data, &mut arr.data) {
+        (NDDataBuffer::U8(src_slice), NDDataBuffer::U8(out)) => {
             for i in 0..n {
                 let [r, g, b] = lut[src_slice[i] as usize];
                 out[i * 3] = r;
                 out[i * 3 + 1] = g;
                 out[i * 3 + 2] = b;
             }
-            (NDDataBuffer::U8(out), NDDataType::UInt8)
         }
-        NDDataBuffer::I8(src_slice) => {
-            let mut out = vec![0i8; n * 3];
+        (NDDataBuffer::I8(src_slice), NDDataBuffer::I8(out)) => {
             for i in 0..n {
                 let [r, g, b] = lut[src_slice[i] as u8 as usize];
                 out[i * 3] = r as i8;
                 out[i * 3 + 1] = g as i8;
                 out[i * 3 + 2] = b as i8;
             }
-            (NDDataBuffer::I8(out), NDDataType::Int8)
         }
-        _ => return None,
-    };
-
-    let dims = vec![
-        NDDimension::new(3),
-        NDDimension::new(w),
-        NDDimension::new(h),
-    ];
-    let mut arr = NDArray::new(dims, data_type);
-    arr.data = data;
+        _ => unreachable!("the output was allocated in the source type"),
+    }
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.attributes = src.attributes.clone();
-    Some(arr)
+    Ok(Some(arr))
 }
 
 /// Color convert plugin configuration.
@@ -864,7 +875,7 @@ impl NDPluginProcess for ColorConvertProcessor {
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
     }
 
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
         // C `convertColor` (NDPluginColorConvert.cpp:44,54-55) starts from
         // `int colorMode = NDColorModeMono` and overwrites it only from the
         // `ColorMode` attribute; it never infers a layout from the dimensions.
@@ -880,52 +891,89 @@ impl NDPluginProcess for ColorConvertProcessor {
         // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
         // the untouched input is forwarded — with its own ColorMode, since
         // `changedColorMode` stayed 0 (:589). A frame is never dropped.
-        let passthrough = || ProcessResult::arrays(vec![Arc::new(array.clone())]);
+        let passthrough = || ProcessResult::forward(vec![]);
 
         if src_mode == target {
             return passthrough();
         }
 
+        // A conversion the pair or shape does not support leaves no output
+        // (C's NULL pArrayOut); a pool that cannot supply the output is the
+        // one failure that drops the frame instead.
+        let converted = |r: ADResult<NDArray>| match r {
+            Ok(out) => Ok(Some(out)),
+            Err(e @ ADError::PoolExhausted(..)) => Err(e),
+            Err(_) => Ok(None),
+        };
+
         // Step 1: Convert source to RGB1 intermediate
         let rgb1 = match src_mode {
-            NDColorMode::RGB1 => Some(array.clone()),
+            NDColorMode::RGB1 => Ok(Some(Cow::Borrowed(array))),
             NDColorMode::Mono => {
-                if false_color != 0 {
-                    false_color_mono_to_rgb1(array, false_color)
-                        .or_else(|| color::mono_to_rgb1(array).ok())
+                let false_colored = if false_color != 0 {
+                    false_color_mono_to_rgb1(pool, array, false_color)
                 } else {
-                    color::mono_to_rgb1(array).ok()
+                    Ok(None)
+                };
+                match false_colored {
+                    Ok(None) => converted(color::mono_to_rgb1(pool, array)),
+                    other => other,
                 }
             }
-            NDColorMode::Bayer => bayer_to_rgb1(array, bayer_pattern),
-            NDColorMode::RGB2 | NDColorMode::RGB3 => {
-                color::convert_rgb_layout(array, src_mode, NDColorMode::RGB1).ok()
+            .map(|r| r.map(Cow::Owned)),
+            NDColorMode::Bayer => {
+                bayer_to_rgb1(pool, array, bayer_pattern).map(|r| r.map(Cow::Owned))
             }
-            NDColorMode::YUV444 => color::yuv444_to_rgb1(array).ok(),
-            NDColorMode::YUV422 => color::yuv422_to_rgb1(array).ok(),
-            NDColorMode::YUV411 => color::yuv411_to_rgb1(array).ok(),
+            NDColorMode::RGB2 | NDColorMode::RGB3 => converted(color::convert_rgb_layout(
+                pool,
+                array,
+                src_mode,
+                NDColorMode::RGB1,
+            ))
+            .map(|r| r.map(Cow::Owned)),
+            NDColorMode::YUV444 => {
+                converted(color::yuv444_to_rgb1(pool, array)).map(|r| r.map(Cow::Owned))
+            }
+            NDColorMode::YUV422 => {
+                converted(color::yuv422_to_rgb1(pool, array)).map(|r| r.map(Cow::Owned))
+            }
+            NDColorMode::YUV411 => {
+                converted(color::yuv411_to_rgb1(pool, array)).map(|r| r.map(Cow::Owned))
+            }
         };
 
         let rgb1 = match rgb1 {
-            Some(r) => r,
-            None => return passthrough(),
+            Ok(Some(r)) => r,
+            Ok(None) => return passthrough(),
+            Err(e) => {
+                tracing::warn!(error = %e, "color convert output allocation failed; dropping frame");
+                return ProcessResult::empty();
+            }
         };
 
-        // Step 2: Convert RGB1 intermediate to target
+        // Step 2: Convert RGB1 intermediate to target. `src_mode != target`
+        // here, so an RGB1 target always takes the owned intermediate.
         let result = match target {
-            NDColorMode::RGB1 => Some(rgb1),
-            NDColorMode::Mono => color::rgb1_to_mono(&rgb1).ok(),
-            NDColorMode::Bayer => None,
-            NDColorMode::RGB2 | NDColorMode::RGB3 => {
-                color::convert_rgb_layout(&rgb1, NDColorMode::RGB1, target).ok()
-            }
-            NDColorMode::YUV444 => color::rgb1_to_yuv444(&rgb1).ok(),
-            NDColorMode::YUV422 => color::rgb1_to_yuv422(&rgb1).ok(),
-            NDColorMode::YUV411 => color::rgb1_to_yuv411(&rgb1).ok(),
+            NDColorMode::RGB1 => Ok(Some(rgb1.into_owned())),
+            NDColorMode::Mono => converted(color::rgb1_to_mono(pool, &rgb1)),
+            NDColorMode::Bayer => Ok(None),
+            NDColorMode::RGB2 | NDColorMode::RGB3 => converted(color::convert_rgb_layout(
+                pool,
+                &rgb1,
+                NDColorMode::RGB1,
+                target,
+            )),
+            NDColorMode::YUV444 => converted(color::rgb1_to_yuv444(pool, &rgb1)),
+            NDColorMode::YUV422 => converted(color::rgb1_to_yuv422(pool, &rgb1)),
+            NDColorMode::YUV411 => converted(color::rgb1_to_yuv411(pool, &rgb1)),
         };
 
         match result {
-            Some(mut out) => {
+            Err(e) => {
+                tracing::warn!(error = %e, "color convert output allocation failed; dropping frame");
+                ProcessResult::empty()
+            }
+            Ok(Some(mut out)) => {
                 // C++: set ColorMode attribute on output array
                 let color_mode_val = match target {
                     NDColorMode::Mono => 0i32,
@@ -946,7 +994,7 @@ impl NDPluginProcess for ColorConvertProcessor {
                 ));
                 ProcessResult::arrays(vec![Arc::new(out)])
             }
-            None => passthrough(),
+            Ok(None) => passthrough(),
         }
     }
 
@@ -958,6 +1006,11 @@ impl NDPluginProcess for ColorConvertProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDataType;
+
+    fn pool() -> Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
 
     #[test]
     fn test_bayer_to_rgb1_basic() {
@@ -973,7 +1026,9 @@ mod tests {
             }
         }
 
-        let rgb = bayer_to_rgb1(&arr, NDBayerPattern::RGGB).unwrap();
+        let rgb = bayer_to_rgb1(&pool(), &arr, NDBayerPattern::RGGB)
+            .unwrap()
+            .unwrap();
         assert_eq!(rgb.dims.len(), 3);
         assert_eq!(rgb.dims[0].size, 3); // color
         assert_eq!(rgb.dims[1].size, 4); // x
@@ -1012,7 +1067,7 @@ mod tests {
             (NDBayerPattern::GRBG, (1, 0), (0, 3)),
             (NDBayerPattern::BGGR, (3, 3), (0, 0)),
         ] {
-            let rgb = bayer_to_rgb1(&arr, pattern).unwrap();
+            let rgb = bayer_to_rgb1(&pool(), &arr, pattern).unwrap().unwrap();
             let at = |(x, y): (usize, usize)| 10 + (y * 4 + x) as u8;
             assert_eq!(
                 rgb1_pixel(&rgb, 4, red.0, red.1),
@@ -1040,7 +1095,9 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             v.iter_mut().for_each(|p| *p = 100);
         }
-        let rgb = bayer_to_rgb1(&arr, NDBayerPattern::RGGB).unwrap();
+        let rgb = bayer_to_rgb1(&pool(), &arr, NDBayerPattern::RGGB)
+            .unwrap()
+            .unwrap();
 
         // Border pixels: native channel only.
         assert_eq!(rgb1_pixel(&rgb, 4, 0, 0), [100, 0, 0]); // corner, red
@@ -1069,7 +1126,9 @@ mod tests {
             // row0: 200 40 200 / row1: 80 128 80 / row2: 200 40 200
             v.copy_from_slice(&[200, 40, 200, 80, 128, 80, 200, 40, 200]);
         }
-        let rgb = bayer_to_rgb1(&arr, NDBayerPattern::RGGB).unwrap();
+        let rgb = bayer_to_rgb1(&pool(), &arr, NDBayerPattern::RGGB)
+            .unwrap()
+            .unwrap();
 
         // Interior blue centre: red = (200*4)/4 = 200, green = (40+40+80+80)/4 = 60.
         assert_eq!(rgb1_pixel(&rgb, 3, 1, 1), [200, 60, 128]);
@@ -1155,7 +1214,7 @@ mod tests {
                         dims.clone(),
                         NDDataBuffer::U16(vals.iter().map(|&v| v as u16).collect()),
                     );
-                    let got = bayer_to_rgb1(&u16s, pattern).unwrap();
+                    let got = bayer_to_rgb1(&pool(), &u16s, pattern).unwrap().unwrap();
                     let NDDataBuffer::U16(got) = &got.data else {
                         panic!("u16 in, u16 out");
                     };
@@ -1175,7 +1234,7 @@ mod tests {
                         dims,
                         NDDataBuffer::U8(vals.iter().map(|&v| v as u8).collect()),
                     );
-                    let got = bayer_to_rgb1(&u8s, pattern).unwrap();
+                    let got = bayer_to_rgb1(&pool(), &u8s, pattern).unwrap().unwrap();
                     let NDDataBuffer::U8(got) = &got.data else {
                         panic!("u8 in, u8 out");
                     };
@@ -1490,9 +1549,8 @@ mod tests {
         }
 
         let result = proc.process_array(&arr, &pool);
-        assert_eq!(result.output_arrays.len(), 1);
-        assert_eq!(result.output_arrays[0].unique_id, 42);
-        assert_eq!(result.output_arrays[0].dims.len(), 2);
+        assert!(result.forward_input, "same mode forwards the input itself");
+        assert!(result.output_arrays.is_empty());
     }
 
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {
@@ -1549,6 +1607,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
+        set_color_mode_attr(&mut arr, NDColorMode::RGB1);
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
@@ -1556,10 +1615,15 @@ mod tests {
         }
 
         let result = proc.process_array(&arr, &pool);
+        assert!(!result.forward_input, "RGB1 -> YUV444 converts");
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
         assert_eq!(out.dims.len(), 3);
         assert_eq!(out.dims[0].size, 3);
+        assert_eq!(
+            out.attributes.get("ColorMode").unwrap().value,
+            ad_core_rs::attributes::NDAttrValue::Int32(NDColorMode::YUV444 as i32)
+        );
     }
 
     #[test]
@@ -1686,5 +1750,49 @@ mod tests {
         assert_eq!(false_color_lut(2), Some(&IRON_COLOR_MAP));
         assert_eq!(false_color_lut(0), None);
         assert_eq!(false_color_lut(3), None);
+    }
+
+    #[test]
+    fn color_convert_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            v.fill(128);
+        }
+
+        let first = bayer_to_rgb1(&pool, &arr, NDBayerPattern::RGGB)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        let NDDataBuffer::U8(v) = &first.data else {
+            panic!("expected U8 output");
+        };
+        assert_eq!(v.len(), 48);
+        let ptr = v.as_ptr();
+        drop(first);
+
+        let second = bayer_to_rgb1(&pool, &arr, NDBayerPattern::RGGB)
+            .unwrap()
+            .unwrap();
+        let NDDataBuffer::U8(v) = &second.data else {
+            panic!("expected U8 output");
+        };
+        assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");
+        assert_eq!(pool.num_alloc_buffers(), 1);
+
+        // The plugin itself hands the pooled frame downstream.
+        let proc = ColorConvertProcessor::new(ColorConvertConfig {
+            target_mode: NDColorMode::RGB1,
+            bayer_pattern: NDBayerPattern::RGGB,
+            false_color: 0,
+        });
+        set_color_mode_attr(&mut arr, NDColorMode::Bayer);
+        drop(second);
+        let out = proc.process_array(&arr, &pool).output_arrays.remove(0);
+        assert_eq!(out.pool_id(), pool.id());
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 }

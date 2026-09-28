@@ -9,8 +9,6 @@
 //! - NDAttribute list management
 //! - NDArray copy/clone behavior
 
-use std::sync::Arc;
-
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -642,7 +640,7 @@ fn validate_fails_for_mismatched_buffer() {
 fn pool_concurrent_alloc_release() {
     use std::thread;
 
-    let pool = Arc::new(NDArrayPool::new(10_000_000));
+    let pool = NDArrayPool::new(10_000_000);
     let mut handles = Vec::new();
 
     for _ in 0..4 {

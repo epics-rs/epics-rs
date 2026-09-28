@@ -157,12 +157,76 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
     })
 }
 
+/// The `errorMessage` a codec reports when it produces no array
+/// (C `result = NULL` + `NDCODEC_ERROR`).
+pub type CodecFailure = Cow<'static, str>;
+
+/// C's `allocArray` (NDPluginCodec.cpp:64-84): an output from the input's
+/// pool (`input->pNDArrayPool`, or a throwaway pool for a frame that has
+/// none), carrying `dims` and the input's identity, whose payload is `bytes`
+/// read as `data_type`. `alloc_failure` is the text C reports when the pool
+/// cannot supply it.
+fn codec_output(
+    src: &NDArray,
+    dims: Vec<NDDimension>,
+    data_type: NDDataType,
+    bytes: &[u8],
+    alloc_failure: &'static str,
+) -> Result<NDArray, CodecFailure> {
+    let pool = src.pool().unwrap_or_else(|| NDArrayPool::new(0));
+    let mut arr = pool
+        .alloc_sized(dims, data_type, bytes.len())
+        .map_err(|_| CodecFailure::from(alloc_failure))?;
+    arr.data.as_u8_slice_mut().copy_from_slice(bytes);
+    // `pool->copy(input, output, false, true, false)`: the metadata, not the data.
+    arr.unique_id = src.unique_id;
+    arr.timestamp = src.timestamp;
+    arr.time_stamp = src.time_stamp;
+    arr.attributes = src.attributes.clone();
+    Ok(arr)
+}
+
+/// [`codec_output`] for a compressed payload: `UInt8` bytes under the
+/// input's dims, coded as `codec`.
+fn compressed_output(
+    src: &NDArray,
+    bytes: &[u8],
+    codec: Codec,
+    alloc_failure: &'static str,
+) -> Result<NDArray, CodecFailure> {
+    let mut arr = codec_output(
+        src,
+        src.dims.clone(),
+        NDDataType::UInt8,
+        bytes,
+        alloc_failure,
+    )?;
+    arr.codec = Some(codec);
+    Ok(arr)
+}
+
+/// [`codec_output`] for a decoded payload: the original element type under
+/// `dims`, or `decode_failure` when the byte count is not whole elements.
+fn decompressed_output(
+    src: &NDArray,
+    dims: Vec<NDDimension>,
+    data_type: NDDataType,
+    bytes: &[u8],
+    decode_failure: &'static str,
+    alloc_failure: &'static str,
+) -> Result<NDArray, CodecFailure> {
+    if bytes.len() % data_type.element_size() != 0 {
+        return Err(decode_failure.into());
+    }
+    codec_output(src, dims, data_type, bytes, alloc_failure)
+}
+
 /// Compress an NDArray using LZ4.
 ///
 /// The raw bytes of the data buffer are compressed with LZ4 (block mode, size-prepended).
 /// The original data type ordinal is stored as an attribute so decompression can
 /// reconstruct the correct typed buffer.
-pub fn compress_lz4(src: &NDArray) -> NDArray {
+pub fn compress_lz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let original_data_type = src.data.data_type();
     let original_size = raw.len();
@@ -170,9 +234,7 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
     let compressed = compress(raw);
     let compressed_size = compressed.len();
 
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(compressed);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::LZ4,
         compressed_size,
         level: 0,
@@ -181,7 +243,7 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
         // The original element type travels in the codec (C `NDArray::dataType`,
         // NDPluginCodec.cpp:35-36), so decompression can rebuild the buffer.
         original_data_type,
-    });
+    };
 
     tracing::debug!(
         original_size,
@@ -190,14 +252,33 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
         "LZ4 compress"
     );
 
-    arr
+    // C's own text, typo included (NDPluginCodec.cpp:567).
+    compressed_output(
+        src,
+        &compressed,
+        codec,
+        "Failed to allocate BZLZ4 output array",
+    )
 }
 
 /// Decompress an LZ4-compressed NDArray.
 ///
 /// Returns `None` if the codec is not LZ4 or decompression fails.
 /// The original typed buffer is reconstructed using the stored data type attribute.
-pub fn decompress_lz4(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_lz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    let (data_type, bytes) = decode_lz4(src).ok_or("Failed to LZ4 decompress")?;
+    decompressed_output(
+        src,
+        src.dims.clone(),
+        data_type,
+        &bytes,
+        "Failed to LZ4 decompress",
+        "Failed to allocate LZ4 output array",
+    )
+}
+
+/// The decoded bytes of an LZ4 frame and their element type.
+fn decode_lz4(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::LZ4) {
         return None;
     }
@@ -208,14 +289,7 @@ pub fn decompress_lz4(src: &NDArray) -> Option<NDArray> {
     let num_elements: usize = src.dims.iter().map(|d| d.size).product();
     let uncompressed_size = num_elements * original_type.element_size();
     let decompressed = decompress(compressed, uncompressed_size).ok()?;
-
-    let buffer = buffer_from_bytes(&decompressed, original_type)?;
-
-    let mut arr = src.clone();
-    arr.data = buffer;
-    arr.codec = None;
-
-    Some(arr)
+    Some((original_type, decompressed))
 }
 
 // ---------------------------------------------------------------------------
@@ -235,32 +309,31 @@ const ZLIB_DEFAULT_LEVEL: u32 = 6;
 /// Mirrors C++ `compressZlib`. The raw bytes of the data buffer are compressed
 /// with a zlib stream. The original data type ordinal is stored as an attribute
 /// so decompression can reconstruct the correct typed buffer.
-pub fn compress_zlib(src: &NDArray) -> NDArray {
+pub fn compress_zlib(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let original_data_type = src.data.data_type();
     let original_size = raw.len();
 
     let mut encoder = ZlibEncoder::new(Vec::<u8>::new(), Compression::new(ZLIB_DEFAULT_LEVEL));
     // Writing to a `Vec` and finishing the stream are infallible here.
+    // C reports `compress2`'s failure as an error (NDPluginCodec.cpp:377), it
+    // does not hand the frame on uncompressed.
     if encoder.write_all(raw).is_err() {
-        return src.clone();
+        return Err("zlib compress2 failed".into());
     }
-    let compressed = match encoder.finish() {
-        Ok(buf) => buf,
-        Err(_) => return src.clone(),
-    };
+    let compressed = encoder
+        .finish()
+        .map_err(|_| CodecFailure::from("zlib compress2 failed"))?;
     let compressed_size = compressed.len();
 
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(compressed);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::Zlib,
         compressed_size,
         level: ZLIB_DEFAULT_LEVEL as i32,
         shuffle: 0,
         compressor: 0,
         original_data_type,
-    });
+    };
 
     tracing::debug!(
         original_size,
@@ -268,14 +341,32 @@ pub fn compress_zlib(src: &NDArray) -> NDArray {
         ratio = original_size as f64 / compressed_size.max(1) as f64,
         "Zlib compress"
     );
-    arr
+    compressed_output(
+        src,
+        &compressed,
+        codec,
+        "Failed to allocate zlib output array",
+    )
 }
 
 /// Decompress a zlib-compressed NDArray.
 ///
 /// Returns `None` if the codec is not Zlib or decompression fails.
 /// The original typed buffer is reconstructed using the stored data type attribute.
-pub fn decompress_zlib(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_zlib(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    let (data_type, bytes) = decode_zlib(src).ok_or("Failed to Zlib decompress")?;
+    decompressed_output(
+        src,
+        src.dims.clone(),
+        data_type,
+        &bytes,
+        "Failed to Zlib decompress",
+        "Failed to allocate zlib output array",
+    )
+}
+
+/// The decoded bytes of a zlib stream and their element type.
+fn decode_zlib(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::Zlib) {
         return None;
     }
@@ -288,13 +379,7 @@ pub fn decompress_zlib(src: &NDArray) -> Option<NDArray> {
     let mut decoder = ZlibDecoder::new(compressed);
     let mut decompressed = Vec::with_capacity(uncompressed_size);
     decoder.read_to_end(&mut decompressed).ok()?;
-
-    let buffer = buffer_from_bytes(&decompressed, original_type)?;
-
-    let mut arr = src.clone();
-    arr.data = buffer;
-    arr.codec = None;
-    Some(arr)
+    Some((original_type, decompressed))
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +409,7 @@ const LZ4HDF5_DEFAULT_BLOCK_SIZE: usize = 1 << 20;
 /// is split into fixed-size blocks, each LZ4-block-compressed, and the HDF5 LZ4
 /// container header is prepended. The original data type is stored as an
 /// attribute so decompression can rebuild the typed buffer.
-pub fn compress_lz4hdf5(src: &NDArray) -> NDArray {
+pub fn compress_lz4hdf5(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let data_type = src.data.data_type();
     let original_size = raw.len();
@@ -353,16 +438,14 @@ pub fn compress_lz4hdf5(src: &NDArray) -> NDArray {
     }
 
     let compressed_size = out.len();
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(out);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::LZ4HDF5,
         compressed_size,
         level: 0,
         shuffle: 0,
         compressor: 0,
         original_data_type: data_type,
-    });
+    };
 
     tracing::debug!(
         original_size,
@@ -370,13 +453,26 @@ pub fn compress_lz4hdf5(src: &NDArray) -> NDArray {
         ratio = original_size as f64 / compressed_size.max(1) as f64,
         "LZ4HDF5 compress"
     );
-    arr
+    compressed_output(src, &out, codec, "Failed to allocate LZ4HDF5 output array")
 }
 
 /// Decompress an LZ4HDF5-compressed NDArray.
 ///
 /// Returns `None` if the codec is not LZ4HDF5 or the container is malformed.
-pub fn decompress_lz4hdf5(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_lz4hdf5(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    let (data_type, bytes) = decode_lz4hdf5(src).ok_or("Failed to LZ4 decompress")?;
+    decompressed_output(
+        src,
+        src.dims.clone(),
+        data_type,
+        &bytes,
+        "Failed to LZ4 decompress",
+        "Failed to allocate LZ4HDF5 output array",
+    )
+}
+
+/// The decoded bytes of an HDF5 LZ4 container and their element type.
+fn decode_lz4hdf5(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::LZ4HDF5) {
         return None;
     }
@@ -420,12 +516,7 @@ pub fn decompress_lz4hdf5(src: &NDArray) -> Option<NDArray> {
     if out.len() != total_bytes {
         return None;
     }
-
-    let buffer = buffer_from_bytes(&out, original_type)?;
-    let mut arr = src.clone();
-    arr.data = buffer;
-    arr.codec = None;
-    Some(arr)
+    Some((original_type, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +742,7 @@ fn bshuf_decompress_lz4_block(
 /// writer (NDFileHDF5Dataset::writeFile), so this payload matches C
 /// `pArray->pData`. The original element type is recorded in the codec so
 /// decompression can rebuild the typed buffer and derive the element count.
-pub fn compress_bslz4(src: &NDArray) -> NDArray {
+pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let data_type = src.data.data_type();
     let elem_size = data_type.element_size();
@@ -683,16 +774,14 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
     }
 
     let compressed_size = out.len();
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(out);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::BSLZ4,
         compressed_size,
         level: 0,
         shuffle: 0,
         compressor: 0,
         original_data_type: data_type,
-    });
+    };
 
     tracing::debug!(
         original_size = raw.len(),
@@ -700,7 +789,8 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
         ratio = raw.len() as f64 / compressed_size.max(1) as f64,
         "BSLZ4 compress"
     );
-    arr
+    // C's own text, typo included (NDPluginCodec.cpp:711).
+    compressed_output(src, &out, codec, "Failed to allocate BZLZ4 output array")
 }
 
 /// Decompress a Bitshuffle + LZ4 (`bslz4`) NDArray.
@@ -710,7 +800,20 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
 /// array dims (matching C, which passes `nElements` from the NDArray, not from
 /// the payload), so the codec buffer carries no global header. Returns `None`
 /// if the codec is not BSLZ4 or the stream is malformed.
-pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    let (data_type, bytes) = decode_bslz4(src).ok_or("Failed to Blosc decompress")?;
+    decompressed_output(
+        src,
+        src.dims.clone(),
+        data_type,
+        &bytes,
+        "Failed to Blosc decompress",
+        "Failed to allocate BSLZ4 output array",
+    )
+}
+
+/// The decoded bytes of a bslz4 container and their element type.
+fn decode_bslz4(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     let codec = src.codec.as_ref()?;
     if codec.name != CodecName::BSLZ4 {
         return None;
@@ -753,12 +856,7 @@ pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
     if out.len() != total_bytes {
         return None;
     }
-
-    let buffer = buffer_from_bytes(&out, original_type)?;
-    let mut arr = src.clone();
-    arr.data = buffer;
-    arr.codec = None;
-    Some(arr)
+    Some((original_type, out))
 }
 
 /// Compress an NDArray to JPEG.
@@ -811,15 +909,22 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Result<NDArray, JpegCompress
     }
 
     // RGB2/RGB3 are re-interleaved to RGB1 first; every other accepted layout
-    // encodes straight out of the input buffer.
+    // encodes straight out of the input buffer. The scratch comes from the
+    // frame's own pool (C `input->pNDArrayPool`, NDPluginCodec.cpp:67), or a
+    // throwaway one for a frame that has none.
     let (color_type, interleaved) = match (src.dims.len(), info.color_mode) {
         (2, NDColorMode::Mono | NDColorMode::RGB1) => (jpeg_encoder::ColorType::Luma, None),
         (3, NDColorMode::RGB1) if info.color_size == 3 => (jpeg_encoder::ColorType::Rgb, None),
         (3, mode @ (NDColorMode::RGB2 | NDColorMode::RGB3)) if info.color_size == 3 => (
             jpeg_encoder::ColorType::Rgb,
             Some(
-                convert_rgb_layout(src, mode, NDColorMode::RGB1)
-                    .map_err(|_| JpegCompressError::EncodeFailed)?,
+                convert_rgb_layout(
+                    &src.pool().unwrap_or_else(|| NDArrayPool::new(0)),
+                    src,
+                    mode,
+                    NDColorMode::RGB1,
+                )
+                .map_err(|_| JpegCompressError::EncodeFailed)?,
             ),
         ),
         // Layouts C leaves `image_width`/`image_height` unset for, or reads out
@@ -842,9 +947,7 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Result<NDArray, JpegCompress
     let compressed_size = jpeg_buf.len();
     let original_size = src.data.as_u8_slice().len();
 
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(jpeg_buf);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::JPEG,
         compressed_size,
         level: 0,
@@ -853,7 +956,7 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Result<NDArray, JpegCompress
         // Record the source type so the codec carries the original element type
         // uniformly (C `NDArray::dataType`, NDPluginCodec.cpp:35-36).
         original_data_type: src.data.data_type(),
-    });
+    };
 
     tracing::debug!(
         original_size,
@@ -863,7 +966,7 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Result<NDArray, JpegCompress
         quality,
     );
 
-    Ok(arr)
+    compressed_output(src, &jpeg_buf, codec, "").map_err(|_| JpegCompressError::AllocFailed)
 }
 
 /// Why `compress_jpeg` refused an array, carrying the exact `errorMessage` C
@@ -893,6 +996,8 @@ pub enum JpegCompressError {
     /// The port reports the failure instead of aborting the IOC, under C's own
     /// text for "the encoder would not take this array".
     EncodeFailed,
+    /// C `:250-254` — the pool could not supply the output array.
+    AllocFailed,
 }
 
 impl JpegCompressError {
@@ -905,6 +1010,7 @@ impl JpegCompressError {
             // NDColorMode's discriminants are C's NDColorMode_t values.
             Self::UnknownColorMode(mode) => format!("Unknown color mode {}", mode).into(),
             Self::EncodeFailed => "Error writing JPEG data".into(),
+            Self::AllocFailed => "Failed to allocate JPEG array".into(),
         }
     }
 }
@@ -922,8 +1028,30 @@ impl JpegCompressError {
 /// in the wrong order.
 ///
 /// Returns `None` if the codec is not JPEG or decoding fails.
-pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_jpeg(src: &NDArray) -> Result<NDArray, CodecFailure> {
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+    let (dims, color_mode, pixels) = decode_jpeg(src).ok_or("Error decoding JPEG")?;
+    let mut arr = codec_output(
+        src,
+        dims,
+        NDDataType::UInt8,
+        &pixels,
+        "Failed to allocate JPEG output array",
+    )?;
+    arr.attributes.add(NDAttribute::new_static(
+        "ColorMode",
+        "Color Mode",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(color_mode as i32),
+    ));
+    Ok(arr)
+}
+
+/// The decoded pixels of a JPEG frame, with their dims and layout.
+fn decode_jpeg(
+    src: &NDArray,
+) -> Option<(Vec<NDDimension>, ad_core_rs::color::NDColorMode, Vec<u8>)> {
     use ad_core_rs::color::NDColorMode;
 
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::JPEG) {
@@ -954,18 +1082,7 @@ pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
         _ => return None,
     };
 
-    let mut arr = src.clone();
-    arr.dims = dims;
-    arr.data = NDDataBuffer::U8(pixels);
-    arr.codec = None;
-    arr.attributes.add(NDAttribute::new_static(
-        "ColorMode",
-        "Color Mode",
-        NDAttrSource::Driver,
-        NDAttrValue::Int32(color_mode as i32),
-    ));
-
-    Some(arr)
+    Some((dims, color_mode, pixels))
 }
 
 /// Blosc compression settings.
@@ -994,7 +1111,7 @@ impl Default for BloscConfig {
 }
 
 /// Compress an NDArray using Blosc via rust-hdf5's filter pipeline.
-pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
+pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let element_size = src.data.data_type().element_size();
 
@@ -1020,16 +1137,14 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
         }],
     };
 
-    let compressed = match apply_filters(&pipeline, raw) {
-        Ok(data) => data,
-        Err(_) => return src.clone(),
-    };
+    // C reports a failed blosc_compress_ctx as an error (NDPluginCodec.cpp:
+    // 480-484), it does not hand the frame on uncompressed.
+    let compressed =
+        apply_filters(&pipeline, raw).map_err(|_| CodecFailure::from("Internal Blosc error"))?;
 
     let compressed_size = compressed.len();
     let original_data_type = src.data.data_type();
-    let mut arr = src.clone();
-    arr.data = NDDataBuffer::U8(compressed);
-    arr.codec = Some(Codec {
+    let codec = Codec {
         name: CodecName::Blosc,
         compressed_size,
         // C records the real Blosc params in the codec (NDPluginCodec.cpp:
@@ -1038,12 +1153,30 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
         shuffle: config.shuffle as i32,
         compressor: config.compressor as i32,
         original_data_type,
-    });
-    arr
+    };
+    compressed_output(
+        src,
+        &compressed,
+        codec,
+        "Failed to allocate Blosc output array",
+    )
 }
 
 /// Decompress a Blosc-compressed NDArray via rust-hdf5's filter pipeline.
-pub fn decompress_blosc(src: &NDArray) -> Option<NDArray> {
+pub fn decompress_blosc(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    let (data_type, bytes) = decode_blosc(src).ok_or("Failed to Blosc decompress")?;
+    decompressed_output(
+        src,
+        src.dims.clone(),
+        data_type,
+        &bytes,
+        "Failed to Blosc decompress",
+        "Failed to allocate Blosc output array",
+    )
+}
+
+/// The decoded bytes of a Blosc stream and their element type.
+fn decode_blosc(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     let codec = src.codec.as_ref()?;
     if codec.name != CodecName::Blosc {
         return None;
@@ -1074,13 +1207,7 @@ pub fn decompress_blosc(src: &NDArray) -> Option<NDArray> {
     };
 
     let decompressed = reverse_filters(&pipeline, compressed).ok()?;
-
-    let buffer = buffer_from_bytes(&decompressed, original_type)?;
-
-    let mut arr = src.clone();
-    arr.data = buffer;
-    arr.codec = None;
-    Some(arr)
+    Some((original_type, decompressed))
 }
 
 /// Codec operation mode.
@@ -1183,6 +1310,15 @@ enum CodecOutcome {
     Failed(Cow<'static, str>),
 }
 
+impl From<Result<NDArray, CodecFailure>> for CodecOutcome {
+    fn from(result: Result<NDArray, CodecFailure>) -> Self {
+        match result {
+            Ok(out) => Self::Converted(out),
+            Err(message) => Self::Failed(message),
+        }
+    }
+}
+
 impl CodecOutcome {
     /// Severity reported in `CodecStatus` (C `NDCodecStatus_t`).
     fn status(&self) -> CodecStatus {
@@ -1237,19 +1373,19 @@ impl NDPluginProcess for CodecProcessor {
                 // as a benign WARNING with an error string (:671-676).
                 CodecOutcome::Skipped("Array already compressed")
             }
+            // The codec names its own failure (C writes a different
+            // errorMessage at each rejection, NDPluginCodec.cpp:140, :166,
+            // :201, :235); the caller must not invent one.
             CodecMode::Compress { codec, .. } => match codec {
-                CodecName::LZ4 => CodecOutcome::Converted(compress_lz4(array)),
-                // The encoder names its own failure (C writes a different
-                // errorMessage at each rejection, NDPluginCodec.cpp:140, :166,
-                // :201, :235); the caller must not invent one.
+                CodecName::LZ4 => CodecOutcome::from(compress_lz4(array)),
                 CodecName::JPEG => match compress_jpeg(array, jpeg_quality) {
                     Ok(out) => CodecOutcome::Converted(out),
                     Err(e) => CodecOutcome::Failed(e.message()),
                 },
-                CodecName::Zlib => CodecOutcome::Converted(compress_zlib(array)),
-                CodecName::Blosc => CodecOutcome::Converted(compress_blosc(array, &blosc_config)),
-                CodecName::LZ4HDF5 => CodecOutcome::Converted(compress_lz4hdf5(array)),
-                CodecName::BSLZ4 => CodecOutcome::Converted(compress_bslz4(array)),
+                CodecName::Zlib => CodecOutcome::from(compress_zlib(array)),
+                CodecName::Blosc => CodecOutcome::from(compress_blosc(array, &blosc_config)),
+                CodecName::LZ4HDF5 => CodecOutcome::from(compress_lz4hdf5(array)),
+                CodecName::BSLZ4 => CodecOutcome::from(compress_bslz4(array)),
                 // Matched by the first arm above.
                 CodecName::None => CodecOutcome::PassThrough,
             },
@@ -1268,34 +1404,16 @@ impl NDPluginProcess for CodecProcessor {
                     // C `NDPluginCodec.cpp:732-735` — uncompressed input: result = pArray,
                     // COMPRESSOR = NDCODEC_NONE, codecStatus stays SUCCESS.
                     CodecName::None => CodecOutcome::PassThrough,
-                    CodecName::LZ4 => match decompress_lz4(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to LZ4 decompress".into()),
-                    },
-                    CodecName::JPEG => match decompress_jpeg(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Error decoding JPEG".into()),
-                    },
-                    CodecName::Zlib => match decompress_zlib(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to Zlib decompress".into()),
-                    },
-                    CodecName::Blosc => match decompress_blosc(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to Blosc decompress".into()),
-                    },
-                    CodecName::LZ4HDF5 => match decompress_lz4hdf5(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to LZ4 decompress".into()),
-                    },
+                    CodecName::LZ4 => CodecOutcome::from(decompress_lz4(array)),
+                    CodecName::JPEG => CodecOutcome::from(decompress_jpeg(array)),
+                    CodecName::Zlib => CodecOutcome::from(decompress_zlib(array)),
+                    CodecName::Blosc => CodecOutcome::from(decompress_blosc(array)),
+                    CodecName::LZ4HDF5 => CodecOutcome::from(decompress_lz4hdf5(array)),
                     // C's decompressBSLZ4 reports "Failed to Blosc decompress"
                     // (NDPluginCodec.cpp:601) — a copy-paste from decompressBlosc
                     // (:431), but it is the text the CodecError PV shows for a
                     // corrupt BSLZ4 frame, so it is the contract.
-                    CodecName::BSLZ4 => match decompress_bslz4(array) {
-                        Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to Blosc decompress".into()),
-                    },
+                    CodecName::BSLZ4 => CodecOutcome::from(decompress_bslz4(array)),
                 }
             }
         };
@@ -1316,11 +1434,9 @@ impl NDPluginProcess for CodecProcessor {
                     }
                     CodecMode::Decompress => output_bytes as f64 / original_bytes.max(1) as f64,
                 };
-                out
+                Some(out)
             }
-            CodecOutcome::PassThrough | CodecOutcome::Skipped(_) | CodecOutcome::Failed(_) => {
-                array.clone()
-            }
+            CodecOutcome::PassThrough | CodecOutcome::Skipped(_) | CodecOutcome::Failed(_) => None,
         };
         self.state.lock().compression_ratio = compression_ratio;
 
@@ -1342,9 +1458,14 @@ impl NDPluginProcess for CodecProcessor {
             });
         }
 
-        let mut r = ProcessResult::arrays(vec![Arc::new(output)]);
-        r.param_updates = updates;
-        r
+        match output {
+            Some(out) => {
+                let mut r = ProcessResult::arrays(vec![Arc::new(out)]);
+                r.param_updates = updates;
+                r
+            }
+            None => ProcessResult::forward(updates),
+        }
     }
 
     fn plugin_type(&self) -> &str {
@@ -1500,11 +1621,11 @@ mod tests {
             }
         }
         for compressed in [
-            compress_lz4(&arr),
-            compress_zlib(&arr),
-            compress_lz4hdf5(&arr),
-            compress_bslz4(&arr),
-            compress_blosc(&arr, &BloscConfig::default()),
+            compress_lz4(&arr).unwrap(),
+            compress_zlib(&arr).unwrap(),
+            compress_lz4hdf5(&arr).unwrap(),
+            compress_bslz4(&arr).unwrap(),
+            compress_blosc(&arr, &BloscConfig::default()).unwrap(),
         ] {
             assert_eq!(
                 compressed.codec.as_ref().unwrap().original_data_type,
@@ -1539,7 +1660,7 @@ mod tests {
                 *x = (i * 7) as u16;
             }
         }
-        let out = compress_blosc(&arr, &BloscConfig::default());
+        let out = compress_blosc(&arr, &BloscConfig::default()).unwrap();
         let codec = out.codec.as_ref().expect("blosc codec metadata");
         // codec.level = 5 (not the old hardcoded 0) proves the real clevel is
         // recorded; shuffle/compressor likewise mirror the config.
@@ -1566,7 +1687,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_blosc(&arr, &BloscConfig::default());
+        let compressed = compress_blosc(&arr, &BloscConfig::default()).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::Blosc);
         assert_ne!(
             compressed.data.as_u8_slice(),
@@ -1597,7 +1718,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_blosc(&arr, &cfg);
+        let compressed = compress_blosc(&arr, &cfg).unwrap();
         let codec = compressed.codec.as_ref().unwrap();
         assert_eq!(codec.compressor, 1, "records the LZ4 sub-compressor");
         assert_eq!(codec.shuffle, 1, "records byte shuffle");
@@ -1613,7 +1734,7 @@ mod tests {
         let arr = make_u8_array(4, 4);
         let original_data = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4);
         // Data buffer should now be the compressed bytes
         assert_ne!(compressed.data.as_u8_slice(), original_data.as_slice());
@@ -1641,7 +1762,7 @@ mod tests {
         let mut raw = make_u8_array(4, 4);
         raw.unique_id = 1;
         let original_data = raw.data.as_u8_slice().to_vec();
-        let compressed = compress_lz4(&raw);
+        let compressed = compress_lz4(&raw).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4);
         assert_eq!(compressed.unique_id, 1);
 
@@ -1651,7 +1772,7 @@ mod tests {
         let mut sentinel = make_u8_array(4, 4);
         sentinel.unique_id = 2;
 
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (ds_sender, mut ds_rx) = ndarray_channel("DS", 10);
         let mut output = NDArrayOutput::new();
         output.add(ds_sender);
@@ -1713,7 +1834,7 @@ mod tests {
         }
         let original_bytes = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4);
         // The original data type is recorded structurally in the codec.
         assert_eq!(
@@ -1744,7 +1865,7 @@ mod tests {
         }
         let original_bytes = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
         let decompressed = decompress_lz4(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::Float64);
         assert_eq!(decompressed.data.as_u8_slice(), original_bytes.as_slice());
@@ -1765,7 +1886,7 @@ mod tests {
         }
         let original_size = arr.data.as_u8_slice().len();
 
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
         let compressed_size = compressed.codec.as_ref().unwrap().compressed_size;
         assert!(
             compressed_size < original_size,
@@ -1780,7 +1901,7 @@ mod tests {
         let mut arr = make_u8_array(4, 4);
         arr.unique_id = 42;
 
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
         assert_eq!(compressed.unique_id, 42);
         assert_eq!(compressed.dims.len(), 2);
         assert_eq!(compressed.dims[0].size, 4);
@@ -1834,7 +1955,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_bslz4(&arr);
+        let compressed = compress_bslz4(&arr).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::BSLZ4);
         assert_ne!(compressed.data.as_u8_slice(), original.as_slice());
 
@@ -1857,7 +1978,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_bslz4(&arr);
+        let compressed = compress_bslz4(&arr).unwrap();
         assert_eq!(
             compressed.codec.as_ref().unwrap().original_data_type,
             NDDataType::UInt16
@@ -1877,7 +1998,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_bslz4(&arr);
+        let compressed = compress_bslz4(&arr).unwrap();
         let decompressed = decompress_bslz4(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::Float64);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
@@ -1899,7 +2020,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_bslz4(&arr);
+        let compressed = compress_bslz4(&arr).unwrap();
         let decompressed = decompress_bslz4(&compressed).unwrap();
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
     }
@@ -1912,7 +2033,7 @@ mod tests {
             NDDataType::UInt16,
         );
         let original_size = arr.data.as_u8_slice().len();
-        let compressed = compress_bslz4(&arr);
+        let compressed = compress_bslz4(&arr).unwrap();
         let compressed_size = compressed.codec.as_ref().unwrap().compressed_size;
         assert!(
             compressed_size < original_size,
@@ -1940,14 +2061,14 @@ mod tests {
         let pool = NDArrayPool::new(10_000_000);
 
         // A genuine BSLZ4 frame, then corrupt the compressed payload.
-        let mut compressed = compress_bslz4(&arr);
+        let mut compressed = compress_bslz4(&arr).unwrap();
         if let NDDataBuffer::U8(ref mut v) = compressed.data {
             for b in v.iter_mut() {
                 *b = 0xFF;
             }
         }
         assert!(
-            decompress_bslz4(&compressed).is_none(),
+            decompress_bslz4(&compressed).is_err(),
             "the corrupted frame must fail to decompress"
         );
 
@@ -2337,7 +2458,7 @@ mod tests {
         let arr = make_u8_array(8, 8);
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_zlib(&arr);
+        let compressed = compress_zlib(&arr).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::Zlib);
         assert_ne!(compressed.data.as_u8_slice(), original.as_slice());
 
@@ -2360,7 +2481,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_zlib(&arr);
+        let compressed = compress_zlib(&arr).unwrap();
         assert_eq!(
             compressed.codec.as_ref().unwrap().original_data_type,
             NDDataType::UInt16
@@ -2381,7 +2502,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_zlib(&arr);
+        let compressed = compress_zlib(&arr).unwrap();
         let decompressed = decompress_zlib(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::Float64);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
@@ -2394,7 +2515,7 @@ mod tests {
             NDDataType::UInt8,
         );
         let original_size = arr.data.as_u8_slice().len();
-        let compressed = compress_zlib(&arr);
+        let compressed = compress_zlib(&arr).unwrap();
         let compressed_size = compressed.codec.as_ref().unwrap().compressed_size;
         assert!(
             compressed_size < original_size,
@@ -2447,7 +2568,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4hdf5(&arr);
+        let compressed = compress_lz4hdf5(&arr).unwrap();
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4HDF5);
         assert_ne!(compressed.data.as_u8_slice(), original.as_slice());
 
@@ -2470,7 +2591,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4hdf5(&arr);
+        let compressed = compress_lz4hdf5(&arr).unwrap();
         assert_eq!(
             compressed.codec.as_ref().unwrap().original_data_type,
             NDDataType::UInt16
@@ -2491,7 +2612,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4hdf5(&arr);
+        let compressed = compress_lz4hdf5(&arr).unwrap();
         let decompressed = decompress_lz4hdf5(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::Float64);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
@@ -2511,7 +2632,7 @@ mod tests {
         }
         let original = arr.data.as_u8_slice().to_vec();
 
-        let compressed = compress_lz4hdf5(&arr);
+        let compressed = compress_lz4hdf5(&arr).unwrap();
         let decompressed = decompress_lz4hdf5(&compressed).unwrap();
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
     }
@@ -2523,7 +2644,7 @@ mod tests {
             NDDataType::UInt16,
         );
         let original_size = arr.data.as_u8_slice().len();
-        let compressed = compress_lz4hdf5(&arr);
+        let compressed = compress_lz4hdf5(&arr).unwrap();
         let compressed_size = compressed.codec.as_ref().unwrap().compressed_size;
         assert!(
             compressed_size < original_size,
@@ -2613,10 +2734,10 @@ mod tests {
     #[test]
     fn test_decompress_wrong_codec() {
         let arr = make_u8_array(4, 4);
-        assert!(decompress_lz4(&arr).is_none());
-        assert!(decompress_jpeg(&arr).is_none());
-        assert!(decompress_zlib(&arr).is_none());
-        assert!(decompress_lz4hdf5(&arr).is_none());
+        assert!(decompress_lz4(&arr).is_err());
+        assert!(decompress_jpeg(&arr).is_err());
+        assert!(decompress_zlib(&arr).is_err());
+        assert!(decompress_lz4hdf5(&arr).is_err());
     }
 
     // ---- CodecProcessor tests ----
@@ -2658,7 +2779,7 @@ mod tests {
     fn test_processor_decompress_auto_lz4() {
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(16, 16);
-        let compressed = compress_lz4(&arr);
+        let compressed = compress_lz4(&arr).unwrap();
 
         let proc = CodecProcessor::new(CodecMode::Decompress);
         let result = proc.process_array(&compressed, &pool);
@@ -2690,7 +2811,8 @@ mod tests {
         let proc = CodecProcessor::new(CodecMode::Decompress);
         let result = proc.process_array(&arr, &pool);
         // C++: on failure, pass through original array unchanged
-        assert_eq!(result.output_arrays.len(), 1);
+        assert!(result.forward_input);
+        assert!(result.output_arrays.is_empty());
         assert_eq!(proc.compression_ratio(), 1.0);
     }
 
@@ -2751,9 +2873,8 @@ mod tests {
             Some(0),
             "COMPRESSOR must be set to NDCODEC_NONE"
         );
-        assert_eq!(
-            result.output_arrays[0].data.as_u8_slice(),
-            arr.data.as_u8_slice(),
+        assert!(
+            result.forward_input && result.output_arrays.is_empty(),
             "the input array is passed through unchanged"
         );
         assert_eq!(proc.compression_ratio(), 1.0);
@@ -2766,9 +2887,9 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let src = make_u8_array(16, 16);
         for (codec, ordinal) in [
-            (compress_lz4(&src), 3),
-            (compress_blosc(&src, &BloscConfig::default()), 2),
-            (compress_bslz4(&src), 4),
+            (compress_lz4(&src).unwrap(), 3),
+            (compress_blosc(&src, &BloscConfig::default()).unwrap(), 2),
+            (compress_bslz4(&src).unwrap(), 4),
             (compress_jpeg(&src, 90).expect("jpeg"), 1),
         ] {
             let proc = processor_with_params(CodecMode::Decompress);
@@ -2807,10 +2928,9 @@ mod tests {
             None,
             "compress mode must not overwrite the operator's COMPRESSOR selection"
         );
-        assert!(result.output_arrays[0].codec.is_none());
-        assert_eq!(
-            result.output_arrays[0].data.as_u8_slice(),
-            arr.data.as_u8_slice()
+        assert!(
+            result.forward_input && result.output_arrays.is_empty(),
+            "the uncompressed input itself is passed through"
         );
     }
 
@@ -2821,7 +2941,7 @@ mod tests {
         // still republishes the input (C `finish:` block, :770-776).
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(16, 16);
-        let mut corrupted = compress_lz4(&arr);
+        let mut corrupted = compress_lz4(&arr).unwrap();
         if let NDDataBuffer::U8(ref mut v) = corrupted.data {
             v.truncate(3);
         }
@@ -2838,9 +2958,8 @@ mod tests {
             Some("Failed to LZ4 decompress".to_string())
         );
         assert_eq!(int32_update(&result.param_updates, 11), Some(3));
-        assert_eq!(
-            result.output_arrays[0].data.as_u8_slice(),
-            corrupted.data.as_u8_slice(),
+        assert!(
+            result.forward_input && result.output_arrays.is_empty(),
             "the input array is republished on failure"
         );
     }
@@ -2862,7 +2981,7 @@ mod tests {
         // but not silent: errorMessage "Array already compressed", codecStatus WARNING, and
         // the input passes through. The port reported SUCCESS with no error.
         let pool = NDArrayPool::new(1_000_000);
-        let compressed = compress_lz4(&make_u8_array(16, 16));
+        let compressed = compress_lz4(&make_u8_array(16, 16)).unwrap();
         let proc = processor_with_params(CodecMode::Compress {
             codec: CodecName::Zlib,
             quality: 85,
@@ -2878,11 +2997,8 @@ mod tests {
             octet_update(&result.param_updates, 13),
             Some("Array already compressed".to_string())
         );
-        // The frame still flows on, still LZ4-compressed.
-        assert_eq!(
-            result.output_arrays[0].codec.as_ref().unwrap().name,
-            CodecName::LZ4
-        );
+        // The frame still flows on, still LZ4-compressed: the input itself.
+        assert!(result.forward_input && result.output_arrays.is_empty());
     }
 
     #[test]
@@ -2910,7 +3026,7 @@ mod tests {
         );
 
         // Decompress: a truncated payload is a decoder failure.
-        let mut corrupted = compress_lz4(&make_u8_array(16, 16));
+        let mut corrupted = compress_lz4(&make_u8_array(16, 16)).unwrap();
         if let NDDataBuffer::U8(ref mut v) = corrupted.data {
             v.truncate(3);
         }
@@ -3023,5 +3139,51 @@ mod tests {
         } else {
             panic!("wrong buffer type");
         }
+    }
+
+    #[test]
+    fn codec_output_comes_from_the_input_pool_and_is_reused() {
+        // C's allocArray takes `input->pNDArrayPool` (NDPluginCodec.cpp:67).
+        let pool = NDArrayPool::new(0);
+        let mut src = pool
+            .alloc(
+                vec![NDDimension::new(16), NDDimension::new(16)],
+                NDDataType::UInt8,
+            )
+            .unwrap();
+        if let NDDataBuffer::U8(ref mut v) = src.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i % 7) as u8;
+            }
+        }
+
+        let compressed = compress_lz4(&src).unwrap();
+        assert_eq!(compressed.pool_id(), pool.id());
+        assert_eq!(pool.num_alloc_buffers(), 2);
+        let ptr = compressed.data.as_u8_slice().as_ptr();
+        let len = compressed.data.as_u8_slice().len();
+        drop(compressed);
+
+        let again = compress_lz4(&src).unwrap();
+        assert_eq!(again.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(again.data.as_u8_slice().len(), len);
+        assert_eq!(pool.num_alloc_buffers(), 2);
+
+        let restored = decompress_lz4(&again).unwrap();
+        assert_eq!(restored.pool_id(), pool.id());
+        assert_eq!(restored.data.as_u8_slice(), src.data.as_u8_slice());
+        assert!(restored.codec.is_none());
+    }
+
+    #[test]
+    fn a_heap_input_gets_a_throwaway_pool() {
+        let src = make_u8_array(8, 8);
+        let compressed = compress_lz4(&src).unwrap();
+        // The pool lived only for the call; the buffer is plainly freed on drop.
+        assert_eq!(compressed.pool_id(), 0);
+        assert_eq!(
+            decompress_lz4(&compressed).unwrap().data.as_u8_slice(),
+            src.data.as_u8_slice()
+        );
     }
 }

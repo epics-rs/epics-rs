@@ -153,9 +153,12 @@ impl MagickWriter {
             NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3
         );
 
-        // Convert to RGB1 layout if needed (image crate expects interleaved RGB)
+        // Convert to RGB1 layout if needed (image crate expects interleaved RGB).
+        // The scratch comes from the frame's own pool (C `pArray->pNDArrayPool`),
+        // or a throwaway one for a frame that has none.
         let src = if is_rgb && color != NDColorMode::RGB1 {
-            &convert_rgb_layout(array, color, NDColorMode::RGB1)?
+            let pool = array.pool().unwrap_or_else(|| NDArrayPool::new(0));
+            &convert_rgb_layout(&pool, array, color, NDColorMode::RGB1)?
         } else {
             array
         };

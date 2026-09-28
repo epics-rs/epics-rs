@@ -83,44 +83,38 @@ pub fn convert_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray>
         return Ok(src.clone());
     }
 
-    macro_rules! cast_all {
-        ($v:expr) => {
-            match target_type {
-                NDDataType::Int8 => NDDataBuffer::I8($v.iter().map(|&x| x as i8).collect()),
-                NDDataType::UInt8 => NDDataBuffer::U8($v.iter().map(|&x| x as u8).collect()),
-                NDDataType::Int16 => NDDataBuffer::I16($v.iter().map(|&x| x as i16).collect()),
-                NDDataType::UInt16 => NDDataBuffer::U16($v.iter().map(|&x| x as u16).collect()),
-                NDDataType::Int32 => NDDataBuffer::I32($v.iter().map(|&x| x as i32).collect()),
-                NDDataType::UInt32 => NDDataBuffer::U32($v.iter().map(|&x| x as u32).collect()),
-                NDDataType::Int64 => NDDataBuffer::I64($v.iter().map(|&x| x as i64).collect()),
-                NDDataType::UInt64 => NDDataBuffer::U64($v.iter().map(|&x| x as u64).collect()),
-                NDDataType::Float32 => NDDataBuffer::F32($v.iter().map(|&x| x as f32).collect()),
-                NDDataType::Float64 => NDDataBuffer::F64($v.iter().map(|&x| x as f64).collect()),
-            }
-        };
-    }
-
-    let out_data = match &src.data {
-        NDDataBuffer::I8(v) => cast_all!(v),
-        NDDataBuffer::U8(v) => cast_all!(v),
-        NDDataBuffer::I16(v) => cast_all!(v),
-        NDDataBuffer::U16(v) => cast_all!(v),
-        NDDataBuffer::I32(v) => cast_all!(v),
-        NDDataBuffer::U32(v) => cast_all!(v),
-        NDDataBuffer::I64(v) => cast_all!(v),
-        NDDataBuffer::U64(v) => cast_all!(v),
-        NDDataBuffer::F32(v) => cast_all!(v),
-        NDDataBuffer::F64(v) => cast_all!(v),
-    };
-
-    let mut arr = NDArray::new(src.dims.clone(), target_type);
-    arr.data = out_data;
+    let mut data = NDDataBuffer::zeros(target_type, 0);
+    convert_type_into(src, &mut data)?;
+    let mut arr = NDArray::with_data(src.dims.clone(), data);
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
     arr.codec = src.codec.clone();
     Ok(arr)
+}
+
+/// [`convert_type`] into a buffer the caller owns: `out` keeps its element
+/// type (that is the target) and its allocation when it is large enough, so
+/// a pooled output buffer is filled in place as C's `convertType` fills the
+/// buffer `NDArrayPool::alloc` handed it.
+pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
+    if src.data.data_type() == out.data_type() {
+        out.copy_from(&src.data);
+        return Ok(());
+    }
+
+    macro_rules! cast_into {
+        ($v:expr, $out:expr) => {
+            crate::with_buffer_mut_typed!($out, |o: T| {
+                o.clear();
+                o.extend($v.iter().map(|&x| x as T));
+            })
+        };
+    }
+
+    crate::with_buffer!(&src.data, |v| cast_into!(v, out));
+    Ok(())
 }
 
 /// Sub-region + binning + reverse + element-type conversion — C++
@@ -143,6 +137,21 @@ pub fn convert_dims(
     dims_out: &[NDDimension],
     target_type: NDDataType,
 ) -> ADResult<NDArray> {
+    let out_dims = output_dims(src, dims_out)?;
+    let mut data = NDDataBuffer::zeros(target_type, 0);
+    convert_dims_into(src, dims_out, &mut data)?;
+    let mut arr = NDArray::with_data(out_dims, data);
+    arr.timestamp = src.timestamp;
+    arr.time_stamp = src.time_stamp;
+    arr.attributes.copy_from(&src.attributes);
+    Ok(arr)
+}
+
+/// The dimensions [`convert_dims`] produces for `dims_out`, after the checks
+/// it applies (C++ NDArrayPool.cpp:626-724): each output size is
+/// `size / binning`, offsets add, binning multiplies, and `reverse` toggles
+/// against the source dimension's own flag. Fails as `convert_dims` fails.
+pub fn output_dims(src: &NDArray, dims_out: &[NDDimension]) -> ADResult<Vec<NDDimension>> {
     // C parity (NDArrayPool.cpp:620-625): cannot convert compressed data.
     if src.codec.is_some() {
         return Err(ADError::UnsupportedConversion(
@@ -200,7 +209,21 @@ pub fn convert_dims(
             reverse: dims_out[i].reverse ^ src.dims[i].reverse,
         });
     }
+    Ok(out_dims)
+}
 
+/// [`convert_dims`] into a buffer the caller owns: `out`'s element type is
+/// the target type, and its allocation is kept when it is large enough, so a
+/// pooled output buffer is filled in place as C's `convert` fills the buffer
+/// `NDArrayPool::alloc` handed it. `out` ends up holding exactly the
+/// elements of [`output_dims`].
+pub fn convert_dims_into(
+    src: &NDArray,
+    dims_out: &[NDDimension],
+    out: &mut NDDataBuffer,
+) -> ADResult<()> {
+    let ndims = src.dims.len();
+    let out_sizes: Vec<usize> = output_dims(src, dims_out)?.iter().map(|d| d.size).collect();
     let total_out: usize = out_sizes.iter().product();
 
     // Precompute source strides (row-major: dim[0] varies fastest)
@@ -223,8 +246,10 @@ pub fn convert_dims(
     // `$DstT` / `$variant` are the target element type and its
     // `NDDataBuffer` variant.
     macro_rules! bin_loop {
-        ($src_vec:expr, $DstT:ty, $AccT:ty, $variant:ident) => {{
-            let mut out = vec![0 as $DstT; total_out];
+        ($src_vec:expr, $out:expr, $DstT:ty, $AccT:ty) => {{
+            let out = $out;
+            out.clear();
+            out.resize(total_out, 0 as $DstT);
 
             // Iterate over all output pixels
             for out_idx in 0..total_out {
@@ -278,8 +303,6 @@ pub fn convert_dims(
 
                 out[out_idx] = acc as $DstT;
             }
-
-            NDDataBuffer::$variant(out)
         }};
     }
 
@@ -288,38 +311,21 @@ pub fn convert_dims(
     // float type, matching C `convertDim`'s output-typed accumulator.
     macro_rules! bin_to_target {
         ($src_vec:expr) => {
-            match target_type {
-                NDDataType::Int8 => bin_loop!($src_vec, i8, i128, I8),
-                NDDataType::UInt8 => bin_loop!($src_vec, u8, i128, U8),
-                NDDataType::Int16 => bin_loop!($src_vec, i16, i128, I16),
-                NDDataType::UInt16 => bin_loop!($src_vec, u16, i128, U16),
-                NDDataType::Int32 => bin_loop!($src_vec, i32, i128, I32),
-                NDDataType::UInt32 => bin_loop!($src_vec, u32, i128, U32),
-                NDDataType::Int64 => bin_loop!($src_vec, i64, i128, I64),
-                NDDataType::UInt64 => bin_loop!($src_vec, u64, i128, U64),
-                NDDataType::Float32 => bin_loop!($src_vec, f32, f32, F32),
-                NDDataType::Float64 => bin_loop!($src_vec, f64, f64, F64),
+            match out {
+                NDDataBuffer::I8(o) => bin_loop!($src_vec, o, i8, i128),
+                NDDataBuffer::U8(o) => bin_loop!($src_vec, o, u8, i128),
+                NDDataBuffer::I16(o) => bin_loop!($src_vec, o, i16, i128),
+                NDDataBuffer::U16(o) => bin_loop!($src_vec, o, u16, i128),
+                NDDataBuffer::I32(o) => bin_loop!($src_vec, o, i32, i128),
+                NDDataBuffer::U32(o) => bin_loop!($src_vec, o, u32, i128),
+                NDDataBuffer::I64(o) => bin_loop!($src_vec, o, i64, i128),
+                NDDataBuffer::U64(o) => bin_loop!($src_vec, o, u64, i128),
+                NDDataBuffer::F32(o) => bin_loop!($src_vec, o, f32, f32),
+                NDDataBuffer::F64(o) => bin_loop!($src_vec, o, f64, f64),
             }
         };
     }
 
-    let out_data = match &src.data {
-        NDDataBuffer::I8(v) => bin_to_target!(v),
-        NDDataBuffer::U8(v) => bin_to_target!(v),
-        NDDataBuffer::I16(v) => bin_to_target!(v),
-        NDDataBuffer::U16(v) => bin_to_target!(v),
-        NDDataBuffer::I32(v) => bin_to_target!(v),
-        NDDataBuffer::U32(v) => bin_to_target!(v),
-        NDDataBuffer::I64(v) => bin_to_target!(v),
-        NDDataBuffer::U64(v) => bin_to_target!(v),
-        NDDataBuffer::F32(v) => bin_to_target!(v),
-        NDDataBuffer::F64(v) => bin_to_target!(v),
-    };
-
-    let mut arr = NDArray::new(out_dims, target_type);
-    arr.data = out_data;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
-    arr.attributes.copy_from(&src.attributes);
-    Ok(arr)
+    crate::with_buffer!(&src.data, |v| bin_to_target!(v));
+    Ok(())
 }

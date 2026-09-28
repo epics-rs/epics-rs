@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -51,7 +49,8 @@ impl Default for ScatterProcessor {
 
 impl NDPluginProcess for ScatterProcessor {
     fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        ProcessResult::scatter(vec![Arc::new(array.clone())])
+        let _ = array;
+        ProcessResult::scatter()
     }
 
     fn plugin_type(&self) -> &str {
@@ -103,8 +102,8 @@ mod tests {
                 r.scatter,
                 "scatter processor must mark the frame as scatter"
             );
-            assert_eq!(r.output_arrays.len(), 1);
-            assert_eq!(r.output_arrays[0].unique_id, 42);
+            assert!(r.forward_input, "the input frame itself is scattered");
+            assert!(r.output_arrays.is_empty());
         }
     }
 }

@@ -205,7 +205,7 @@ fn report(what: &str, one: std::time::Duration, four: std::time::Duration) -> f6
 #[ignore = "wall-clock measurement"]
 fn measure_pool_throughput() {
     let wiring = Arc::new(WiringRegistry::new());
-    let pool = Arc::new(NDArrayPool::new(64_000_000));
+    let pool = NDArrayPool::new(64_000_000);
     let frames = frames();
 
     let (unlocked, _jh1) = create_plugin_runtime(
@@ -257,7 +257,7 @@ fn measure_pool_throughput() {
 #[ignore = "wall-clock measurement"]
 fn measure_shipped_plugin_throughput() {
     let wiring = Arc::new(WiringRegistry::new());
-    let pool = Arc::new(NDArrayPool::new(512_000_000));
+    let pool = NDArrayPool::new(512_000_000);
     let ts_registry = TsReceiverRegistry::new();
     let mut rows: Vec<(&str, std::time::Duration, std::time::Duration)> = Vec::new();
     let frames = frames();

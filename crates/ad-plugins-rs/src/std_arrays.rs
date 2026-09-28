@@ -39,9 +39,9 @@ impl Default for StdArraysProcessor {
 
 impl NDPluginProcess for StdArraysProcessor {
     fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let out = Arc::new(array.clone());
-        *self.latest_data.lock() = Some(out.clone());
-        ProcessResult::arrays(vec![out])
+        // The runtime forwards the frame and files it in `latest_data`.
+        let _ = array;
+        ProcessResult::forward(vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -117,21 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn test_processor_stores_and_passes_through() {
+    fn test_processor_passes_the_input_through() {
         let proc = StdArraysProcessor::new();
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         let result = proc.process_array(&arr, &pool);
-        assert_eq!(result.output_arrays.len(), 1);
-
-        let latest = proc.data_handle().lock().clone();
-        assert!(latest.is_some());
+        assert!(result.forward_input);
+        assert!(result.output_arrays.is_empty());
     }
 
     #[test]
     fn test_std_arrays_runtime() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
 
@@ -157,7 +155,7 @@ mod tests {
     fn test_std_arrays_initial_array_callbacks_off() {
         // C NDPluginStdArrays.cpp:343 sets NDArrayCallbacks=0 in the
         // constructor; the initial param a client reads must be 0, not 1.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
 
@@ -206,7 +204,7 @@ mod tests {
         // STD_ARRAY_DATA interrupt being gated by the downstream-delivery flag.
         use asyn_rs::param::ParamValue;
 
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
 
@@ -262,7 +260,7 @@ mod tests {
         // leaves ArrayCounter unchanged (ImageJ etc. see no new data) while
         // DroppedArrays advances.
 
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
         let port = handle.port_runtime().port_handle();

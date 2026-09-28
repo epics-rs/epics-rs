@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ad_core_rs::ndarray::NDArray;
@@ -107,7 +106,8 @@ impl Default for GatherProcessor {
 impl NDPluginProcess for GatherProcessor {
     fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
-        ProcessResult::arrays(vec![Arc::new(array.clone())])
+        let _ = array;
+        ProcessResult::forward(vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -180,8 +180,8 @@ mod tests {
         let result1 = proc.process_array(&arr1, &pool);
         let result2 = proc.process_array(&arr2, &pool);
 
-        assert_eq!(result1.output_arrays.len(), 1);
-        assert_eq!(result2.output_arrays.len(), 1);
+        assert!(result1.forward_input && result1.output_arrays.is_empty());
+        assert!(result2.forward_input && result2.output_arrays.is_empty());
         assert_eq!(proc.total_received(), 2);
     }
 

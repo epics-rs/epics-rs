@@ -1,6 +1,9 @@
+use std::sync::Weak;
+
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
+use crate::ndarray_pool::NDArrayPool;
 use crate::timestamp::EpicsTimestamp;
 
 /// Maximum number of NDArray dimensions (C++ `ND_ARRAY_MAX_DIMS`,
@@ -65,6 +68,14 @@ pub enum NDDataBuffer {
     U64(Vec<u64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+}
+
+/// An empty `UInt8` buffer: what [`NDArray`]'s destructor leaves behind once
+/// the real buffer has gone back to its pool. Allocates nothing.
+impl Default for NDDataBuffer {
+    fn default() -> Self {
+        Self::U8(Vec::new())
+    }
 }
 
 impl NDDataBuffer {
@@ -151,6 +162,81 @@ impl NDDataBuffer {
             Self::U64(v) => v.resize(new_len, 0),
             Self::F32(v) => v.resize(new_len, 0.0),
             Self::F64(v) => v.resize(new_len, 0.0),
+        }
+    }
+
+    /// View the underlying data as a mutable byte slice, for payloads that
+    /// arrive as bytes (a decoded frame, a compressed stream).
+    pub fn as_u8_slice_mut(&mut self) -> &mut [u8] {
+        macro_rules! bytes_of {
+            ($v:expr) => {
+                // SAFETY: the Vec's elements are plain numbers with no padding,
+                // so its `len * size_of::<T>()` bytes are initialized and
+                // exclusively borrowed for the lifetime of `&mut self`.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        $v.as_mut_ptr() as *mut u8,
+                        $v.len() * std::mem::size_of_val(&$v[0]),
+                    )
+                }
+            };
+        }
+        match self {
+            Self::U8(v) => v.as_mut_slice(),
+            Self::I8(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I16(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U16(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::F32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::F64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
         }
     }
 
@@ -295,6 +381,35 @@ impl NDDataBuffer {
             NDDataType::Float64 => Self::F64(values.to_vec()),
         }
     }
+
+    /// Refill this buffer with `values`, keeping its element type and, when
+    /// the capacity suffices, its allocation: the in-place form of
+    /// [`from_f64`](Self::from_f64) for a pooled output buffer.
+    pub fn fill_from_f64(&mut self, values: &[f64]) {
+        crate::with_buffer_mut_typed!(self, |v: T| {
+            v.clear();
+            v.extend(values.iter().map(|&x| x as T));
+        });
+    }
+
+    /// Make this buffer a copy of `src`. A same-typed buffer is refilled in
+    /// place so a pooled allocation survives the copy (C's pool `copy`
+    /// memcpy's into the buffer it already holds); a differently typed one is
+    /// replaced by a clone of `src`.
+    pub fn copy_from(&mut self, src: &NDDataBuffer) {
+        macro_rules! same {
+            ($($variant:ident),*) => {
+                match (self, src) {
+                    $((Self::$variant(dst), Self::$variant(s)) => {
+                        dst.clear();
+                        dst.extend_from_slice(s);
+                    })*
+                    (dst, s) => *dst = s.clone(),
+                }
+            };
+        }
+        same!(I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
+    }
 }
 
 /// A single dimension of an NDArray.
@@ -359,7 +474,13 @@ impl NDArrayInfo {
 }
 
 /// N-dimensional array with typed data buffer.
-#[derive(Debug, Clone)]
+///
+/// An array allocated by an [`NDArrayPool`] hands its buffer back to that
+/// pool's free list when it is dropped (C++ `NDArray::release` at refcount
+/// zero), so a frame published as `Arc<NDArray>` recycles itself once the last
+/// consumer lets go. A [`Clone`] is an ordinary heap array: it owes nothing to
+/// the pool and never enters its free list or its accounting.
+#[derive(Debug)]
 pub struct NDArray {
     pub unique_id: i32,
     pub timestamp: EpicsTimestamp,
@@ -369,14 +490,38 @@ pub struct NDArray {
     pub data: NDDataBuffer,
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
-    /// Identity of the pool that allocated this array (C++ `pNDArrayPool`).
-    /// `0` means the array was not allocated through any pool. `NDArrayPool::release`
-    /// verifies this matches its own id before returning the buffer to the free list.
-    pub pool_id: u64,
+    /// The pool that allocated this array (C++ `pNDArrayPool`), `None` for an
+    /// array built outside any pool. Set only by `NDArrayPool::alloc`; the
+    /// destructor returns the buffer through it.
+    pub(crate) pool: Option<Weak<NDArrayPool>>,
     /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
     /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
     /// Pool memory accounting adds/subtracts this exact value.
     pub data_size: usize,
+}
+
+impl Drop for NDArray {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take().and_then(|pool| pool.upgrade()) {
+            pool.recycle(std::mem::take(&mut self.data), self.data_size);
+        }
+    }
+}
+
+impl Clone for NDArray {
+    fn clone(&self) -> Self {
+        Self {
+            unique_id: self.unique_id,
+            timestamp: self.timestamp,
+            time_stamp: self.time_stamp,
+            dims: self.dims.clone(),
+            data: self.data.clone(),
+            attributes: self.attributes.clone(),
+            codec: self.codec.clone(),
+            pool: None,
+            data_size: self.data_size,
+        }
+    }
 }
 
 impl NDArray {
@@ -395,14 +540,14 @@ impl NDArray {
             data: NDDataBuffer::zeros(data_type, num_elements),
             attributes: NDAttributeList::new(),
             codec: None,
-            pool_id: 0,
+            pool: None,
             data_size: num_elements * data_type.element_size(),
         }
     }
 
     /// Create an NDArray wrapping an already-built data buffer.
     ///
-    /// The array is not pool-allocated (`pool_id == 0`); `data_size` is taken
+    /// The array is not pool-allocated (`pool_id() == 0`); `data_size` is taken
     /// from the buffer's element count. Use this when a producer fills its own
     /// buffer instead of allocating through an [`crate::ndarray_pool::NDArrayPool`].
     pub fn with_data(dims: Vec<NDDimension>, data: NDDataBuffer) -> Self {
@@ -415,9 +560,24 @@ impl NDArray {
             data,
             attributes: NDAttributeList::new(),
             codec: None,
-            pool_id: 0,
+            pool: None,
             data_size,
         }
+    }
+
+    /// The pool that allocated this array (C++ `pNDArrayPool`), `None` when it
+    /// came from no pool or that pool is gone.
+    pub fn pool(&self) -> Option<std::sync::Arc<NDArrayPool>> {
+        self.pool.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Identity of the pool that allocated this array, `0` when it came from
+    /// no pool or that pool is gone (C++ `pNDArrayPool`).
+    pub fn pool_id(&self) -> u64 {
+        self.pool
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or(0, |pool| pool.id())
     }
 
     /// Stamp both timestamps from one time source.
@@ -572,7 +732,7 @@ impl NDArray {
             "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
             self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
         ));
-        out.push_str(&format!("  poolId={}\n", self.pool_id));
+        out.push_str(&format!("  poolId={}\n", self.pool_id()));
         match &self.codec {
             Some(c) => out.push_str(&format!(
                 "  codec={:?}, compressedSize={}\n",
@@ -857,5 +1017,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn as_u8_slice_mut_writes_the_elements_in_place() {
+        let mut buf = NDDataBuffer::U16(vec![0, 0]);
+        buf.as_u8_slice_mut().copy_from_slice(
+            &1u16
+                .to_ne_bytes()
+                .into_iter()
+                .chain(2u16.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let NDDataBuffer::U16(v) = &buf else {
+            panic!("the variant does not change");
+        };
+        assert_eq!(v, &[1, 2]);
+        let mut empty = NDDataBuffer::F64(vec![]);
+        assert!(empty.as_u8_slice_mut().is_empty());
     }
 }

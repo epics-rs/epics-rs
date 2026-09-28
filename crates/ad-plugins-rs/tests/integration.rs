@@ -42,7 +42,7 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 
 #[test]
 fn test_driver_to_stats_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let ts_registry = ad_plugins_rs::time_series::TsReceiverRegistry::new();
     let (stats_handle, stats_data, _params, _jh) =
@@ -91,7 +91,7 @@ fn test_driver_to_stats_pipeline() {
 
 #[test]
 fn test_driver_to_std_arrays_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) =
         create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
@@ -136,7 +136,7 @@ fn test_driver_to_std_arrays_pipeline() {
 
 #[test]
 fn test_pool_reuse_in_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
 
     // Allocate, use, release, reallocate
     // Use sizes within THRESHOLD_SIZE_RATIO (1.5) to ensure reuse
@@ -170,7 +170,7 @@ fn test_rewire_ndarray_port_at_runtime() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // Create two "upstream" outputs: SIM1 and ROI1
@@ -273,7 +273,7 @@ fn test_rewire_through_real_roi_plugin() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // SIM1 driver output
@@ -406,7 +406,7 @@ fn test_roi_param_change_enables_output() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // SIM1 driver output
@@ -558,7 +558,7 @@ fn test_roi_then_stats_chain() {
     assert_eq!(stats.num_elements, 16); // 4*4
     assert!(stats.min >= 0.0);
     assert!(stats.max <= 255.0);
-    assert_eq!(stats_result.output_arrays.len(), 1); // stats forwards the array
+    assert!(stats_result.forward_input); // stats forwards the array
 }
 
 #[test]
@@ -663,7 +663,7 @@ fn test_codec_compress_decompress_roundtrip() {
     );
     // Data is already zeros from NDArray::new
 
-    let compressed = compress_lz4(&arr);
+    let compressed = compress_lz4(&arr).unwrap();
     assert!(compressed.codec.is_some());
 
     let decompressed = decompress_lz4(&compressed).unwrap();
@@ -734,7 +734,7 @@ fn test_pos_plugin_position_attachment() {
 #[test]
 fn test_process_and_publish_writes_array_size_params() {
     // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) =
         create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);

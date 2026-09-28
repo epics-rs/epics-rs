@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
+use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -120,15 +121,21 @@ fn dims_for(
     }
 }
 
-/// Apply a transform to an NDArray.
+/// Apply a transform to an NDArray, allocating the output from `pool` as
+/// C's `NDPluginTransform` does with `pNDArrayPool->copy(pArray, NULL, 0)`
+/// (NDPluginTransform.cpp:497).
 ///
 /// Handles 2-D mono images and 3-D RGB1/RGB2/RGB3 color images. The per-color
 /// reindexing mirrors C++ `transformNDArray`: source `(x, y)` is geometrically
 /// mapped to destination `(x, y)` and every color component is copied with the
 /// destination strides recomputed for the (possibly swapped) X/Y sizes.
-pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
+pub fn apply_transform(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    transform: TransformType,
+) -> ADResult<NDArray> {
     if transform == TransformType::None || src.dims.len() < 2 {
-        return src.clone();
+        return pool.alloc_copy(src);
     }
 
     let info = src.info();
@@ -136,7 +143,7 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
     let src_h = info.y_size;
     let color = info.color_size.max(1);
     if src_w == 0 || src_h == 0 {
-        return src.clone();
+        return pool.alloc_copy(src);
     }
 
     let (dst_w, dst_h) = if transform.swaps_dims() {
@@ -145,52 +152,66 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
         (src_w, src_h)
     };
 
-    let (sxs, sys, scs) = (
-        info.x_stride,
-        info.y_stride.max(1),
-        info.color_stride.max(1),
-    );
-    let (dxs, dys, dcs) = strides_for(info.color_mode, dst_w, dst_h, color);
-    let total = dst_w * dst_h * color;
-
-    macro_rules! transform_buf {
-        ($vec:expr, $zero:expr) => {{
-            let mut out = vec![$zero; total];
-            for sy in 0..src_h {
-                for sx in 0..src_w {
-                    let (dx, dy) = map_coords(sx, sy, src_w, src_h, transform);
-                    let s_base = sy * sys + sx * sxs;
-                    let d_base = dy * dys + dx * dxs;
-                    for c in 0..color {
-                        out[d_base + c * dcs] = $vec[s_base + c * scs];
-                    }
-                }
-            }
-            out
-        }};
-    }
-
-    let out_data = match &src.data {
-        NDDataBuffer::U8(v) => NDDataBuffer::U8(transform_buf!(v, 0)),
-        NDDataBuffer::U16(v) => NDDataBuffer::U16(transform_buf!(v, 0)),
-        NDDataBuffer::I8(v) => NDDataBuffer::I8(transform_buf!(v, 0)),
-        NDDataBuffer::I16(v) => NDDataBuffer::I16(transform_buf!(v, 0)),
-        NDDataBuffer::I32(v) => NDDataBuffer::I32(transform_buf!(v, 0)),
-        NDDataBuffer::U32(v) => NDDataBuffer::U32(transform_buf!(v, 0)),
-        NDDataBuffer::I64(v) => NDDataBuffer::I64(transform_buf!(v, 0)),
-        NDDataBuffer::U64(v) => NDDataBuffer::U64(transform_buf!(v, 0)),
-        NDDataBuffer::F32(v) => NDDataBuffer::F32(transform_buf!(v, 0.0)),
-        NDDataBuffer::F64(v) => NDDataBuffer::F64(transform_buf!(v, 0.0)),
+    let geometry = Geometry {
+        src_w,
+        src_h,
+        color,
+        src_strides: (
+            info.x_stride,
+            info.y_stride.max(1),
+            info.color_stride.max(1),
+        ),
+        dst_strides: strides_for(info.color_mode, dst_w, dst_h, color),
+        transform,
     };
 
     let dims = dims_for(info.color_mode, dst_w, dst_h, color, src.dims.len());
-    let mut arr = NDArray::new(dims, src.data.data_type());
-    arr.data = out_data;
+    let mut arr = pool.alloc(dims, src.data.data_type())?;
+    macro_rules! same_type {
+        ($($variant:ident),*) => {
+            match (&src.data, &mut arr.data) {
+                $((NDDataBuffer::$variant(v), NDDataBuffer::$variant(o)) => {
+                    geometry.transform_into(v, o)
+                })*
+                _ => unreachable!("the output was allocated in the source type"),
+            }
+        };
+    }
+    same_type!(U8, U16, I8, I16, I32, U32, I64, U64, F32, F64);
+
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
-    arr
+    Ok(arr)
+}
+
+/// The index mapping of one transform: `(x_stride, y_stride, color_stride)`
+/// on each side, applied per source pixel.
+struct Geometry {
+    src_w: usize,
+    src_h: usize,
+    color: usize,
+    src_strides: (usize, usize, usize),
+    dst_strides: (usize, usize, usize),
+    transform: TransformType,
+}
+
+impl Geometry {
+    fn transform_into<T: Copy>(&self, src: &[T], out: &mut [T]) {
+        let (sxs, sys, scs) = self.src_strides;
+        let (dxs, dys, dcs) = self.dst_strides;
+        for sy in 0..self.src_h {
+            for sx in 0..self.src_w {
+                let (dx, dy) = map_coords(sx, sy, self.src_w, self.src_h, self.transform);
+                let s_base = sy * sys + sx * sxs;
+                let d_base = dy * dys + dx * dxs;
+                for c in 0..self.color {
+                    out[d_base + c * dcs] = src[s_base + c * scs];
+                }
+            }
+        }
+    }
 }
 
 // --- New TransformProcessor (NDPluginProcess-based) ---
@@ -211,14 +232,20 @@ impl TransformProcessor {
 }
 
 impl NDPluginProcess for TransformProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
         // straight into the call would live to the end of the statement and
         // hold across the whole rotation.
         let transform = *self.transform.lock();
-        let out = apply_transform(array, transform);
-        ProcessResult::arrays(vec![Arc::new(out)])
+        match apply_transform(pool, array, transform) {
+            Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),
+            Err(e) => {
+                // C's copy() returning NULL ends the frame without output.
+                tracing::warn!(error = %e, "transform output allocation failed; dropping frame");
+                ProcessResult::empty()
+            }
+        }
     }
 
     fn plugin_type(&self) -> &str {
@@ -252,6 +279,25 @@ mod tests {
     use super::*;
     use ad_core_rs::ndarray::NDDataType;
 
+    fn pool() -> std::sync::Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
+
+    /// The rotated frame is a pool array; the next frame reuses its buffer.
+    #[test]
+    fn transform_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let arr = make_3x2();
+        let first = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        let ptr = first.data.as_u8_slice().as_ptr();
+        drop(first);
+        let second = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
+        assert_eq!(second.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(get_u8(&second), &[4, 1, 5, 2, 6, 3]);
+    }
+
     /// Create a 3x2 array:
     /// [1, 2, 3]
     /// [4, 5, 6]
@@ -276,14 +322,14 @@ mod tests {
     #[test]
     fn test_none() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::None);
+        let out = apply_transform(&pool(), &arr, TransformType::None).unwrap();
         assert_eq!(get_u8(&out), &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn test_rot90cw() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot90CW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Expected:
@@ -296,7 +342,7 @@ mod tests {
     #[test]
     fn test_rot180() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot180);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot180).unwrap();
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(get_u8(&out), &[6, 5, 4, 3, 2, 1]);
@@ -305,7 +351,7 @@ mod tests {
     #[test]
     fn test_rot90ccw() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot90CCW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CCW).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Expected:
@@ -318,21 +364,21 @@ mod tests {
     #[test]
     fn test_flip_horiz() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipHoriz);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipHoriz).unwrap();
         assert_eq!(get_u8(&out), &[3, 2, 1, 6, 5, 4]);
     }
 
     #[test]
     fn test_flip_vert() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipVert);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipVert).unwrap();
         assert_eq!(get_u8(&out), &[4, 5, 6, 1, 2, 3]);
     }
 
     #[test]
     fn test_flip_diag() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipDiag);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipDiag).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Transpose:
@@ -345,7 +391,7 @@ mod tests {
     #[test]
     fn test_flip_anti_diag() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipAntiDiag);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipAntiDiag).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Anti-transpose:
@@ -358,10 +404,10 @@ mod tests {
     #[test]
     fn test_rot90_roundtrip() {
         let arr = make_3x2();
-        let r1 = apply_transform(&arr, TransformType::Rot90CW);
-        let r2 = apply_transform(&r1, TransformType::Rot90CW);
-        let r3 = apply_transform(&r2, TransformType::Rot90CW);
-        let r4 = apply_transform(&r3, TransformType::Rot90CW);
+        let r1 = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
+        let r2 = apply_transform(&pool(), &r1, TransformType::Rot90CW).unwrap();
+        let r3 = apply_transform(&pool(), &r2, TransformType::Rot90CW).unwrap();
+        let r4 = apply_transform(&pool(), &r3, TransformType::Rot90CW).unwrap();
         assert_eq!(get_u8(&r4), get_u8(&arr));
         assert_eq!(r4.dims[0].size, arr.dims[0].size);
         assert_eq!(r4.dims[1].size, arr.dims[1].size);
@@ -385,7 +431,7 @@ mod tests {
     fn test_transform_5_is_transpose() {
         // Selecting transform 5 from EPICS must produce a transpose.
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::from_u8(5));
+        let out = apply_transform(&pool(), &arr, TransformType::from_u8(5)).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         assert_eq!(get_u8(&out), &[1, 4, 2, 5, 3, 6]); // transpose
@@ -395,7 +441,7 @@ mod tests {
     fn test_transform_6_is_vertical_flip() {
         // Selecting transform 6 from EPICS must produce a vertical flip.
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::from_u8(6));
+        let out = apply_transform(&pool(), &arr, TransformType::from_u8(6)).unwrap();
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(get_u8(&out), &[4, 5, 6, 1, 2, 3]); // vertical flip
@@ -437,7 +483,7 @@ mod tests {
         // Horizontal flip of an RGB1 image: each pixel's 3 channels stay
         // together; only the x coordinate is mirrored.
         let arr = make_rgb1_2x2();
-        let out = apply_transform(&arr, TransformType::FlipHoriz);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipHoriz).unwrap();
         // dims unchanged for a non-swapping transform
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
@@ -457,7 +503,7 @@ mod tests {
     #[test]
     fn test_rgb1_rot90cw_swaps_dims_and_keeps_color() {
         let arr = make_rgb1_2x2();
-        let out = apply_transform(&arr, TransformType::Rot90CW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
         // x/y swapped (both 2 here), color dim preserved
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);

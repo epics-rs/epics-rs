@@ -283,11 +283,7 @@ impl PosPluginState {
         self.running = false;
         let mut updates = Vec::new();
         push_int(&mut updates, self.params.running, 0);
-        ProcessResult {
-            output_arrays: vec![],
-            param_updates: updates,
-            scatter: false,
-        }
+        ProcessResult::sink(updates)
     }
 }
 
@@ -484,7 +480,7 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 }
 
 impl NDPluginProcess for PosPluginProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
         if !state.running {
             // C only reaches endProcessCallbacks inside `if (running ==
@@ -529,17 +525,21 @@ impl NDPluginProcess for PosPluginProcessor {
                 state.params.duplicate_frames,
                 state.duplicate_frames as i32,
             );
-            return ProcessResult {
-                output_arrays: vec![],
-                param_updates: updates,
-                scatter: false,
-            };
+            return ProcessResult::sink(updates);
         }
 
         // Guaranteed `Some` here: has_position() was rechecked above.
         let position = state.current_position().unwrap().clone();
 
-        let mut out = array.clone();
+        // C copies the input through the pool and attaches the position
+        // attributes to the copy (NDPosPlugin.cpp:142,163).
+        let mut out = match pool.alloc_copy(array) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(error = %e, "position output allocation failed; dropping frame");
+                return ProcessResult::empty();
+            }
+        };
         // C iterates the position std::map (sorted ascending by key), building
         // the CurrentPos string "[k=v,...]" and attaching each attribute in the
         // same loop (NDPosPlugin.cpp:149-166). The attribute description is the
@@ -600,6 +600,7 @@ impl NDPluginProcess for PosPluginProcessor {
             output_arrays: vec![Arc::new(out)],
             param_updates: updates,
             scatter: false,
+            forward_input: false,
         }
     }
 
@@ -1261,5 +1262,35 @@ mod tests {
         assert_eq!(format_cpp_g6(123456.0), "123456");
         assert_eq!(format_cpp_g6(-1.5), "-1.5");
         assert_eq!(format_cpp_g6(0.0), "0");
+    }
+
+    #[test]
+    fn pos_output_comes_from_the_pool_and_is_reused() {
+        let proc = PosPluginProcessor::new(PosMode::Discard);
+        let mut pos = HashMap::new();
+        pos.insert("X".into(), 1.5);
+        proc.load_positions(vec![pos.clone(), pos]);
+        proc.start();
+        let pool = NDArrayPool::new(0);
+
+        let first = proc
+            .process_array(&make_array(1), &pool)
+            .output_arrays
+            .remove(0);
+        assert_eq!(first.pool_id(), pool.id());
+        assert!(first.attributes.get("X").is_some());
+        let ptr = first.data.as_u8_slice().as_ptr();
+        drop(first);
+
+        let second = proc
+            .process_array(&make_array(2), &pool)
+            .output_arrays
+            .remove(0);
+        assert_eq!(
+            second.data.as_u8_slice().as_ptr(),
+            ptr,
+            "the second frame reuses the freed buffer"
+        );
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 }

@@ -6,7 +6,8 @@ use crate::par_util;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::error::ADResult;
+use ad_core_rs::ndarray::{NDArray, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
@@ -581,20 +582,21 @@ impl ProcessState {
     /// Returns `Some(output)` for a normal frame, or `None` when the frame is
     /// suppressed by the recursive-filter `filter_callbacks` setting (C++ sets
     /// `doCallbacks = 0` and the frame is dropped -- nothing goes downstream).
+    /// Fails only when `pool` cannot supply the output buffer.
     ///
     /// This is the single-threaded composition. `process_array` drives the
     /// same steps itself so it can hold the state lock for `begin_frame`,
     /// `run_filter` and `end_frame` only.
-    pub fn process(&mut self, src: &NDArray) -> Option<Arc<NDArray>> {
+    pub fn process(&mut self, pool: &NDArrayPool, src: &NDArray) -> ADResult<Option<Arc<NDArray>>> {
         let mut values = elements_as_f64(src);
         let frame = self.begin_frame(values.len());
         frame.apply_element_ops(&mut values);
         if !self.run_filter(&frame, &mut values) {
-            return None;
+            return Ok(None);
         }
-        let arr = Arc::new(frame.build_output(src, &values));
+        let arr = Arc::new(frame.build_output(pool, src, &values)?);
         self.end_frame(&frame, src, &arr);
-        Some(arr)
+        Ok(Some(arr))
     }
 }
 
@@ -706,15 +708,19 @@ impl ProcessFrame {
     /// Build the output array. Pure given the snapshot, so it also runs
     /// released; C likewise converts to the output data type with the lock
     /// down and only re-takes it at NDPluginProcess.cpp:254.
-    fn build_output(&self, src: &NDArray, values: &[f64]) -> NDArray {
+    ///
+    /// The output buffer comes from `pool`, as C's
+    /// `pNDArrayPool->convert(pScratch, &pArrayOut, dataType)`
+    /// (NDPluginProcess.cpp:235).
+    fn build_output(&self, pool: &NDArrayPool, src: &NDArray, values: &[f64]) -> ADResult<NDArray> {
         let out_type = self.config.output_type.unwrap_or(src.data.data_type());
-        let mut arr = NDArray::new(src.dims.clone(), out_type);
-        arr.data = NDDataBuffer::from_f64(out_type, values);
+        let mut arr = pool.alloc(src.dims.clone(), out_type)?;
+        arr.data.fill_from_f64(values);
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
 
-        arr
+        Ok(arr)
     }
 }
 
@@ -784,7 +790,7 @@ impl ProcessProcessor {
 }
 
 impl NDPluginProcess for ProcessProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         // C holds the port lock only for the parameter reads and the validity
@@ -804,9 +810,17 @@ impl NDPluginProcess for ProcessProcessor {
         };
 
         let out = if emitted {
-            let arr = Arc::new(frame.build_output(array, &values));
-            self.state.lock().end_frame(&frame, array, &arr);
-            Some(arr)
+            match frame.build_output(pool, array, &values) {
+                Ok(arr) => {
+                    let arr = Arc::new(arr);
+                    self.state.lock().end_frame(&frame, array, &arr);
+                    Some(arr)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "process output allocation failed; dropping frame");
+                    return ProcessResult::empty();
+                }
+            }
         } else {
             None
         };
@@ -1105,6 +1119,10 @@ mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
 
+    fn pool() -> Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
+
     fn make_array(vals: &[u8]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::UInt8);
         if let NDDataBuffer::U8(ref mut v) = arr.data {
@@ -1145,7 +1163,7 @@ mod tests {
         });
         seed_background(&mut state, &bg_arr);
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 5);
@@ -1168,7 +1186,7 @@ mod tests {
         seed_background(&mut state, &bg_arr);
         assert!(state.config.valid_background); // set at save time (C writeInt32)
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         // Size mismatch → background ignored → output unchanged; valid recomputed
         // false at process time.
         assert!(!state.config.valid_background);
@@ -1193,7 +1211,7 @@ mod tests {
         });
         seed_flat_field(&mut state, &ff_arr);
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 100); // 100*100/100
             assert_eq!(v[1], 50); //  100*100/200
@@ -1216,7 +1234,7 @@ mod tests {
             ..Default::default()
         });
         seed_flat_field(&mut state, &ff_arr);
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v, &[0, 0, 0]);
         } else {
@@ -1234,7 +1252,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             // C++: value = (value + offset) * scale
             assert_eq!(v[0], 30); // (10+5)*2
@@ -1256,7 +1274,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
@@ -1280,7 +1298,7 @@ mod tests {
             low_clip_value: 999.0,
             ..Default::default()
         });
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         if let NDDataBuffer::F64(ref v) = result.data {
             assert_eq!(v[0], 999.0);
         } else {
@@ -1320,13 +1338,13 @@ mod tests {
         // N=1: F1=0.5, F2=0.5, O1=1, O2=0
         // data   = 0 + 1*100 + 0*100 = 100
         // filter = 0 + 0.5*100 + 0.5*100(orig data) = 100
-        let _ = state.process(&input1);
+        let _ = state.process(&pool(), &input1).unwrap();
 
         // Frame 1: data=0, filter=100
         // N=2: F1=0.5, F2=0.5, O1=1, O2=0
         // data   = 0 + 1*100 + 0*0 = 100
         // filter = 0 + 0.5*100 + 0.5*0(orig data) = 50
-        let result = state.process(&input2).unwrap();
+        let result = state.process(&pool(), &input2).unwrap().unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             // Output is data = O1*filter = 1*100 = 100
             assert_eq!(v[0], 100);
@@ -1342,7 +1360,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         assert_eq!(result.data.data_type(), NDDataType::Float64);
     }
 
@@ -1396,7 +1414,10 @@ mod tests {
         // O1=oScale*(oc1+oc2/N)=1*(1+0/1)=1, O2=oScale*(oc3+oc4/N)=1*(0+0/1)=0
         // data   = oOffset + O1*filter + O2*data = 0 + 1*100 + 0*100 = 100
         // filter = fOffset + F1*filter + F2*data(orig=100) = 0 + 1*100 + 1*100 = 200
-        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
+        let r0 = state
+            .process(&pool(), &make_f64_array(&[100.0]))
+            .unwrap()
+            .unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
@@ -1406,7 +1427,10 @@ mod tests {
         // O1=1*(1+0/2)=1, O2=0
         // data   = 0 + 1*200 + 0*100 = 200
         // filter = 0 + 1*200 + 1*data(orig=100) = 300
-        let r1 = state.process(&make_f64_array(&[100.0])).unwrap();
+        let r1 = state
+            .process(&pool(), &make_f64_array(&[100.0]))
+            .unwrap()
+            .unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 200.0).abs() < 1e-9, "frame 1: got {v1}");
     }
@@ -1436,7 +1460,10 @@ mod tests {
         // Frame 0 (reset): filter=100. N=1: O1=oScale*(0+1/1)=1, O2=0
         // data   = 0 + 1*100 + 0 = 100
         // filter = 0 + 1*100 + 1*100(orig data) = 200
-        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
+        let r0 = state
+            .process(&pool(), &make_f64_array(&[100.0]))
+            .unwrap()
+            .unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
@@ -1444,7 +1471,10 @@ mod tests {
         // N=2: O1=oScale*(0+1/2)=0.5, O2=0
         // data   = 0 + 0.5*200 + 0 = 100
         // filter = 0 + 1*200 + 1*200(orig data) = 400
-        let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
+        let r1 = state
+            .process(&pool(), &make_f64_array(&[200.0]))
+            .unwrap()
+            .unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
@@ -1452,7 +1482,10 @@ mod tests {
         // N=3: O1=1/3, O2=0
         // data   = 0 + (1/3)*400 + 0 = 400/3
         // filter = 0 + 1*400 + 1*300(orig data) = 700
-        let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
+        let r2 = state
+            .process(&pool(), &make_f64_array(&[300.0]))
+            .unwrap()
+            .unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
         let expected = 400.0 / 3.0;
         assert!((v2 - expected).abs() < 1e-9, "frame 2: got {v2}");
@@ -1488,7 +1521,10 @@ mod tests {
         // F1=1*(1-1/1)=0, F2=1*(0+1/1)=1, O1=1*(1+0/1)=1
         // data   = 0 + 1*100 + 0*100 = 100
         // filter = 0 + 0*100 + 1*100(orig data) = 100
-        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
+        let r0 = state
+            .process(&pool(), &make_f64_array(&[100.0]))
+            .unwrap()
+            .unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
@@ -1496,7 +1532,10 @@ mod tests {
         // F1=(2-1)/2=0.5, F2=1/2=0.5
         // data   = 0 + 1*100 + 0*200 = 100
         // filter = 0 + 0.5*100 + 0.5*200(orig data) = 150
-        let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
+        let r1 = state
+            .process(&pool(), &make_f64_array(&[200.0]))
+            .unwrap()
+            .unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
@@ -1504,7 +1543,10 @@ mod tests {
         // F1=2/3, F2=1/3, O1=1
         // data   = 0 + 1*150 + 0*300 = 150
         // filter = (2/3)*150 + (1/3)*300(orig data) = 100 + 100 = 200
-        let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
+        let r2 = state
+            .process(&pool(), &make_f64_array(&[300.0]))
+            .unwrap()
+            .unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
         assert!((v2 - 150.0).abs() < 1e-9, "frame 2: got {v2}");
     }
@@ -1535,7 +1577,10 @@ mod tests {
         assert!(!state.config.valid_background);
 
         // One frame through: input 10,20,30 → output (x + 0) * 2 = 20,40,60.
-        let out = state.process(&make_array(&[10, 20, 30])).unwrap();
+        let out = state
+            .process(&pool(), &make_array(&[10, 20, 30]))
+            .unwrap()
+            .unwrap();
         assert_eq!(out.data.get_as_f64(0), Some(20.0));
 
         // SaveBackground now copies THAT OUTPUT (20,40,60), not the input and not
@@ -1553,7 +1598,7 @@ mod tests {
         );
 
         // The next frame must not overwrite the background — the old one-shot did.
-        let _ = state.process(&make_array(&[1, 2, 3]));
+        let _ = state.process(&pool(), &make_array(&[1, 2, 3])).unwrap();
         assert_eq!(
             state.background.as_ref().unwrap().as_slice(),
             &[20.0, 40.0, 60.0]
@@ -1576,7 +1621,10 @@ mod tests {
         assert!(!state.config.valid_flat_field);
 
         // Output = (input + 1) * 1 → 51, 101, 151.
-        let _ = state.process(&make_array(&[50, 100, 150])).unwrap();
+        let _ = state
+            .process(&pool(), &make_array(&[50, 100, 150]))
+            .unwrap()
+            .unwrap();
         state.save_flat_field();
 
         assert!(state.config.valid_flat_field);
@@ -1586,7 +1634,7 @@ mod tests {
             "flat field is the OUTPUT array, not the input"
         );
 
-        let _ = state.process(&make_array(&[7, 7, 7]));
+        let _ = state.process(&pool(), &make_array(&[7, 7, 7])).unwrap();
         assert_eq!(
             state.flat_field.as_ref().unwrap().as_slice(),
             &[51.0, 101.0, 151.0]
@@ -1661,19 +1709,19 @@ mod tests {
         });
 
         // Frame 0 (reset): num_filtered becomes 1
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert_eq!(state.num_filtered, 1);
 
         // Frame 1: num_filtered becomes 2
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert_eq!(state.num_filtered, 2);
 
         // Frame 2: num_filtered becomes 3 = num_filter, triggers auto_reset on next
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert_eq!(state.num_filtered, 3);
 
         // Frame 3: auto_reset fires (num_filtered >= num_filter), filter is reset
-        let _ = state.process(&make_f64_array(&[200.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[200.0])).unwrap();
         // After reset + processing, num_filtered should be 1
         assert_eq!(state.num_filtered, 1, "fresh start after auto reset");
     }
@@ -1709,7 +1757,10 @@ mod tests {
         // N=1: F1=2*(0+0/1)=0, F2=2*(1+0/1)=2, O1=3*(1+0/1)=3, O2=0
         // data   = 5 + 3*50 + 0 = 155
         // filter = 10 + 0*50 + 2*50(orig data) = 110
-        let r0 = state.process(&make_f64_array(&[50.0])).unwrap();
+        let r0 = state
+            .process(&pool(), &make_f64_array(&[50.0]))
+            .unwrap()
+            .unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 155.0).abs() < 1e-9, "frame 0: got {v0}");
 
@@ -1717,7 +1768,10 @@ mod tests {
         // N=2: F1=0, F2=2, O1=3, O2=0
         // data   = 5 + 3*110 + 0 = 335
         // filter = 10 + 0 + 2*20(orig data) = 50
-        let r1 = state.process(&make_f64_array(&[20.0])).unwrap();
+        let r1 = state
+            .process(&pool(), &make_f64_array(&[20.0]))
+            .unwrap()
+            .unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 335.0).abs() < 1e-9, "frame 1: got {v1}");
     }
@@ -1738,8 +1792,8 @@ mod tests {
         });
 
         // Build up filter state
-        let _ = state.process(&make_f64_array(&[100.0]));
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert!(state.filter_state.is_some());
         assert_eq!(state.num_filtered, 2);
 
@@ -1754,7 +1808,7 @@ mod tests {
         assert_eq!(state.num_filtered, 2);
 
         // Next frame runs the reset formula, so num_filtered restarts at 1.
-        let _ = state.process(&make_f64_array(&[200.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[200.0])).unwrap();
         assert_eq!(state.num_filtered, 1);
     }
 
@@ -1786,12 +1840,15 @@ mod tests {
         let mut state = ProcessState::new(cfg());
         // Frame 0 seeds the buffer from the frame itself (no prior filter):
         //   filter = 1.0 + 0.5*100 + 2.0*100 = 251, then CopyToFilter -> 100.
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert_eq!(state.filter_state.as_ref().unwrap()[0], 100.0);
 
         // Arm the manual reset, then send a frame of 10.
         state.reset_filter();
-        let out = state.process(&make_f64_array(&[10.0])).unwrap();
+        let out = state
+            .process(&pool(), &make_f64_array(&[10.0]))
+            .unwrap()
+            .unwrap();
 
         // Reset uses the PREVIOUS filter (100), not the current data (10):
         //   newFilter = 1.0 + 0.5*100 + 2.0*10 = 71
@@ -1820,13 +1877,16 @@ mod tests {
             ..Default::default()
         });
 
-        let _ = state.process(&make_f64_array(&[100.0]));
+        let _ = state.process(&pool(), &make_f64_array(&[100.0])).unwrap();
         assert_eq!(state.filter_state.as_ref().unwrap().len(), 1);
 
         // Two elements now: the old buffer is dropped and re-seeded from this
         // frame, so the reset reads filter[i] == data[i] == 10.
         //   newFilter = 1.0 + 0.5*10 + 2.0*10 = 26
-        let out = state.process(&make_f64_array(&[10.0, 10.0])).unwrap();
+        let out = state
+            .process(&pool(), &make_f64_array(&[10.0, 10.0]))
+            .unwrap()
+            .unwrap();
         assert_eq!(state.filter_state.as_ref().unwrap().len(), 2);
         assert_eq!(out.data.get_as_f64(0).unwrap(), 26.0);
         assert_eq!(state.num_filtered, 1);
@@ -1846,7 +1906,10 @@ mod tests {
 
         // Trigger frame: input range [10, 30]. Offset/scale were OFF going in, so
         // the frame is emitted UNSCALED — output == input converted to u8.
-        let out1 = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
+        let out1 = state
+            .process(&pool(), &make_f64_array(&[10.0, 20.0, 30.0]))
+            .unwrap()
+            .unwrap();
         assert!(!state.config.auto_offset_scale_pending); // one-shot consumed
         if let NDDataBuffer::U8(v) = &out1.data {
             assert_eq!(v, &[10, 20, 30]); // trigger frame NOT transformed
@@ -1860,7 +1923,10 @@ mod tests {
         assert!((state.config.scale - 255.0 / 20.0).abs() < 1e-9);
 
         // NEXT frame IS transformed with the armed params: (v-10)*12.75, clipped.
-        let out2 = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
+        let out2 = state
+            .process(&pool(), &make_f64_array(&[10.0, 20.0, 30.0]))
+            .unwrap()
+            .unwrap();
         if let NDDataBuffer::U8(v) = &out2.data {
             assert_eq!(v[0], 0); // (10-10)*12.75 = 0
             assert_eq!(v[2], 255); // (30-10)*12.75 = 255
@@ -1889,10 +1955,25 @@ mod tests {
         });
 
         // Frames 1 and 2 are below num_filter => suppressed (None).
-        assert!(state.process(&make_f64_array(&[100.0])).is_none());
-        assert!(state.process(&make_f64_array(&[100.0])).is_none());
+        assert!(
+            state
+                .process(&pool(), &make_f64_array(&[100.0]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .process(&pool(), &make_f64_array(&[100.0]))
+                .unwrap()
+                .is_none()
+        );
         // Frame 3 reaches num_filter => output produced.
-        assert!(state.process(&make_f64_array(&[100.0])).is_some());
+        assert!(
+            state
+                .process(&pool(), &make_f64_array(&[100.0]))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1942,7 +2023,10 @@ mod tests {
         let expected_filter = [200.0, 400.0, 700.0, 1100.0];
 
         for k in 0..inputs.len() {
-            let r = state.process(&make_f64_array(&[inputs[k]])).unwrap();
+            let r = state
+                .process(&pool(), &make_f64_array(&[inputs[k]]))
+                .unwrap()
+                .unwrap();
             let v = r.data.get_as_f64(0).unwrap();
             assert!(
                 (v - expected_data[k]).abs() < 1e-9,
@@ -1985,7 +2069,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input).unwrap();
+        let result = state.process(&pool(), &input).unwrap().unwrap();
         let NDDataBuffer::F64(ref v) = result.data else {
             panic!("expected an F64 output buffer, got {:?}", result.data);
         };
@@ -1999,7 +2083,7 @@ mod tests {
         // And the poison must not be latent in the filter state either: a second,
         // fully finite frame still comes out clean.
         let clean = make_f64_array(&[7.0, 8.0, 9.0]);
-        let result = state.process(&clean).unwrap();
+        let result = state.process(&pool(), &clean).unwrap().unwrap();
         let NDDataBuffer::F64(ref v) = result.data else {
             panic!("expected an F64 output buffer");
         };
@@ -2007,5 +2091,39 @@ mod tests {
             v.iter().all(|x| x.is_finite()),
             "the NaN must not survive in filter[] across frames: {v:?}"
         );
+    }
+
+    #[test]
+    fn process_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let mut state = ProcessState::new(ProcessConfig {
+            output_type: Some(NDDataType::Float32),
+            ..Default::default()
+        });
+
+        let first = state
+            .process(&pool, &make_array(&[1, 2, 3]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        let NDDataBuffer::F32(v) = &first.data else {
+            panic!("expected F32 output");
+        };
+        assert_eq!(v, &[1.0, 2.0, 3.0]);
+        let ptr = v.as_ptr();
+        // `last_output` holds C's pArrays[0]; release both references.
+        drop(first);
+        state.last_output = None;
+
+        let second = state
+            .process(&pool, &make_array(&[4, 5, 6]))
+            .unwrap()
+            .unwrap();
+        let NDDataBuffer::F32(v) = &second.data else {
+            panic!("expected F32 output");
+        };
+        assert_eq!(v, &[4.0, 5.0, 6.0]);
+        assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 }

@@ -6583,7 +6583,7 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         let orig = ramp_u16(4, 5);
         let expect = u16_pixels(&orig);
-        let comp = crate::codec::compress_lz4(&orig);
+        let comp = crate::codec::compress_lz4(&orig).unwrap();
         assert!(comp.codec.is_some());
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         writer.write_file(&comp).unwrap();
@@ -6610,7 +6610,8 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         let orig = ramp_u16(4, 5);
         let expect = u16_pixels(&orig);
-        let comp = crate::codec::compress_blosc(&orig, &crate::codec::BloscConfig::default());
+        let comp =
+            crate::codec::compress_blosc(&orig, &crate::codec::BloscConfig::default()).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Blosc);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         writer.write_file(&comp).unwrap();
@@ -6638,7 +6639,7 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         let orig = ramp_u16(128, 128);
         let expect = u16_pixels(&orig);
-        let comp = crate::codec::compress_bslz4(&orig);
+        let comp = crate::codec::compress_bslz4(&orig).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::BSLZ4);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         writer.write_file(&comp).unwrap();
@@ -6690,7 +6691,10 @@ mod tests {
                 )
             })
             .collect();
-        let comp: Vec<NDArray> = frames.iter().map(crate::codec::compress_lz4).collect();
+        let comp: Vec<NDArray> = frames
+            .iter()
+            .map(|f| crate::codec::compress_lz4(f).unwrap())
+            .collect();
         writer
             .open_file(&path, NDFileMode::Stream, &comp[0])
             .unwrap();
@@ -6746,7 +6750,7 @@ mod tests {
         // a later uncompressed frame must be refused.
         let path = temp_path("hdf5_codec_change");
         let mut writer = Hdf5Writer::new();
-        let f0 = crate::codec::compress_lz4(&ramp_u16(4, 5));
+        let f0 = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
         let f1_plain = ramp_u16(4, 5); // no codec
         writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
         writer.write_file(&f0).unwrap();
@@ -6765,7 +6769,7 @@ mod tests {
         let path = temp_path("hdf5_swmr_compressed");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
-        let comp = crate::codec::compress_lz4(&ramp_u16(4, 5));
+        let comp = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
         writer.open_file(&path, NDFileMode::Stream, &comp).unwrap();
         assert!(
             writer.write_file(&comp).is_err(),
@@ -6781,7 +6785,7 @@ mod tests {
         // creation rejects it rather than writing an unreadable file.
         let path = temp_path("hdf5_dcw_zlib");
         let mut writer = Hdf5Writer::new();
-        let comp = crate::codec::compress_zlib(&ramp_u16(4, 5));
+        let comp = crate::codec::compress_zlib(&ramp_u16(4, 5)).unwrap();
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Zlib);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
         assert!(

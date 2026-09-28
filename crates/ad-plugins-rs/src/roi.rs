@@ -126,7 +126,7 @@ fn find_peak_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, us
 /// `NDPluginROI` via `userDims = {xDim, yDim, colorDim}` — keeps ROI Dim0/Dim1
 /// bound to the image X/Y axes and Dim2 to the color axis regardless of the
 /// physical dimension order.
-pub fn extract_roi(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
+pub fn extract_roi(pool: &NDArrayPool, src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     use ad_core_rs::color::NDColorMode;
     if src.dims.len() >= 3 {
         let info = src.info();
@@ -134,10 +134,10 @@ pub fn extract_roi(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
             info.color_mode,
             NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3
         ) {
-            return extract_roi_3d(src, config);
+            return extract_roi_3d(pool, src, config);
         }
     }
-    extract_roi_2d(src, config)
+    extract_roi_2d(pool, src, config)
 }
 
 /// Resolve one ROI axis to C's clamped `(offset, size, binning)` — C++
@@ -185,23 +185,30 @@ fn resolve_axis(cfg: &ROIDimConfig, dim_size: usize) -> (usize, usize, usize) {
 /// * otherwise (`:174`): convert straight to the output type — the bin sum
 ///   accumulates in that type and wraps (UInt8 3x3 bin of 100s -> 900 % 256
 ///   == 132).
-fn convert_roi(src: &NDArray, dims_out: &[NDDimension], config: &ROIConfig) -> Option<NDArray> {
-    use ad_core_rs::convert::{convert_dims, convert_type};
-
+fn convert_roi(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    dims_out: &[NDDimension],
+    config: &ROIConfig,
+) -> Option<NDArray> {
     let target_type = config.data_type.unwrap_or(src.data.data_type());
     let scaled = config.enable_scale && config.scale != 0.0 && config.scale != 1.0;
 
+    // Both the scratch and the output come from the pool, as C's
+    // `pNDArrayPool->convert(pArray, &pScratch, ...)` / `(pScratch, &pOutput,
+    // ...)` do, so a frame later hands both buffers back for the next one.
     let result = if scaled {
-        convert_dims(src, dims_out, NDDataType::Float64).and_then(|mut scratch| {
-            if let NDDataBuffer::F64(v) = &mut scratch.data {
-                for x in v.iter_mut() {
-                    *x /= config.scale;
+        pool.convert(src, dims_out, NDDataType::Float64)
+            .and_then(|mut scratch| {
+                if let NDDataBuffer::F64(v) = &mut scratch.data {
+                    for x in v.iter_mut() {
+                        *x /= config.scale;
+                    }
                 }
-            }
-            convert_type(&scratch, target_type)
-        })
+                pool.convert_type(&scratch, target_type)
+            })
     } else {
-        convert_dims(src, dims_out, target_type)
+        pool.convert(src, dims_out, target_type)
     };
 
     match result {
@@ -228,7 +235,7 @@ fn convert_roi(src: &NDArray, dims_out: &[NDDimension], config: &ROIConfig) -> O
 /// so the ROI geometry is independent of the RGB1/RGB2/RGB3 memory layout.
 /// Per-axis binning and reverse are applied; the output keeps the source
 /// color mode and dimension order.
-pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
+pub fn extract_roi_3d(pool: &NDArrayPool, src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     let info = src.info();
     let (src_x, src_y, src_c) = (info.x_size, info.y_size, info.color_size.max(1));
     if src_x == 0 || src_y == 0 || src_c == 0 {
@@ -269,7 +276,7 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         d.reverse = config.dims[roi_dim].reverse;
     }
 
-    let mut arr = convert_roi(src, &dims_out, config)?;
+    let mut arr = convert_roi(pool, src, &dims_out, config)?;
 
     // Single-color selection: when the color axis collapses to 1 and the
     // source is an RGB mode, C forces collapseDims and tags the output Mono
@@ -309,7 +316,7 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
 }
 
 /// Extract ROI sub-region from a 2-D (mono) array.
-pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
+pub fn extract_roi_2d(pool: &NDArrayPool, src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     if src.dims.len() < 2 {
         return None;
     }
@@ -376,7 +383,7 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         reverse: config.dims[1].reverse,
     };
 
-    let mut arr = convert_roi(src, &dims_out, config)?;
+    let mut arr = convert_roi(pool, src, &dims_out, config)?;
 
     if config.collapse_dims {
         let collapsed: Vec<NDDimension> = arr.dims.iter().filter(|d| d.size > 1).cloned().collect();
@@ -435,7 +442,7 @@ impl ROIProcessor {
 }
 
 impl NDPluginProcess for ROIProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, pool: &NDArrayPool) -> ProcessResult {
         // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
         // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with
         // `userDims = {xDim, yDim, colorDim}` (`:80-82`) — the same logical
@@ -457,11 +464,12 @@ impl NDPluginProcess for ROIProcessor {
         // extracting (NDPluginROI.cpp:140). A guard in the match scrutinee
         // would live to the end of the match, i.e. across the whole copy.
         let config = self.config.lock().clone();
-        match extract_roi(array, &config) {
+        match extract_roi(pool, array, &config) {
             Some(roi_arr) => ProcessResult {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
                 scatter: false,
+                forward_input: false,
             },
             None => ProcessResult::sink(updates),
         }
@@ -663,6 +671,44 @@ pub fn create_roi_runtime(
 mod tests {
     use super::*;
 
+    fn pool() -> std::sync::Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
+
+    /// The ROI output is a pool array, and the next frame reuses its buffer
+    /// once the first one is dropped.
+    #[test]
+    fn roi_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(v) = &mut arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = i as u8;
+            }
+        }
+        let mut config = ROIConfig::default();
+        config.dims[0].enable = true;
+        config.dims[0].min = 2;
+        config.dims[0].size = 4;
+        config.dims[1].enable = true;
+        config.dims[1].min = 2;
+        config.dims[1].size = 4;
+
+        let first = extract_roi(&pool, &arr, &config).unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        let ptr = first.data.as_u8_slice().as_ptr();
+        drop(first);
+
+        let second = extract_roi(&pool, &arr, &config).unwrap();
+        assert_eq!(second.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(second.data.as_u8_slice()[0], 2 + 2 * 8);
+    }
+
     fn make_4x4_u8() -> NDArray {
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -705,7 +751,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // Disabled → the whole 4-wide axis at full resolution, NOT 4/2 == 2 bins,
         // and the stale min = 2 is ignored.
         assert_eq!(roi.dims[0].size, 4, "disabled axis keeps its full size");
@@ -722,7 +768,7 @@ mod tests {
         config.dims[0].enable = true;
         config.dims[0].min = 0;
         config.dims[0].auto_size = true; // size = full axis, bin = 2
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(
             roi.dims[0].size, 2,
             "enabled axis with bin=2 halves the axis"
@@ -777,7 +823,7 @@ mod tests {
             };
         }
 
-        let roi = extract_roi_3d(&arr, &config).unwrap();
+        let roi = extract_roi_3d(&pool(), &arr, &config).unwrap();
         // Disabled colour axis: all 3 planes survive, unbinned. With the stale
         // bin = 3 applied it would have collapsed to a single summed plane.
         assert_eq!(
@@ -809,7 +855,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims[0].size, 2);
         assert_eq!(roi.dims[1].size, 2);
         if let NDDataBuffer::U8(ref v) = roi.data {
@@ -842,7 +888,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims[0].size, 2);
         assert_eq!(roi.dims[1].size, 2);
         if let NDDataBuffer::U8(ref v) = roi.data {
@@ -872,7 +918,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[0], 3);
             assert_eq!(v[1], 2);
@@ -903,7 +949,7 @@ mod tests {
         };
         config.collapse_dims = true;
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims.len(), 1);
         assert_eq!(roi.dims[0].size, 4);
     }
@@ -931,7 +977,7 @@ mod tests {
         config.enable_scale = true;
         config.scale = 2.0;
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         if let NDDataBuffer::U8(ref v) = roi.data {
             // C++: scale is a divisor
             assert_eq!(v[0], 0); // 0 / 2 = 0
@@ -961,7 +1007,7 @@ mod tests {
         };
         config.data_type = Some(NDDataType::UInt16);
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.data.data_type(), NDDataType::UInt16);
     }
 
@@ -1115,7 +1161,7 @@ mod tests {
             auto_size: true,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // C++: autoSize sets size = dimSize, then size = MIN(size, dimSize -
         // offset). With offset_x = 1 the X size clamps to 4 - 1 = 3; the Y
         // dimension with offset 0 stays at the full 4.
@@ -1145,7 +1191,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // X dim disabled, so full range: size=4
         assert_eq!(roi.dims[0].size, 4);
         assert_eq!(roi.dims[1].size, 4);
@@ -1185,7 +1231,7 @@ mod tests {
         };
         config.autocenter = AutoCenter::PeakPosition;
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims[0].size, 4);
         assert_eq!(roi.dims[1].size, 4);
 
@@ -1223,7 +1269,7 @@ mod tests {
             enable: true,
             auto_size: false,
         };
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // offset clamps to 3, size clamps to 4-3 = 1.
         assert_eq!(roi.dims[0].size, 1);
         if let NDDataBuffer::U8(ref v) = roi.data {
@@ -1254,7 +1300,7 @@ mod tests {
             enable: true,
             auto_size: false,
         };
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // bin clamps to size 2 => out_x = 2/2 = 1.
         assert_eq!(roi.dims[0].size, 1);
         if let NDDataBuffer::U8(ref v) = roi.data {
@@ -1322,7 +1368,7 @@ mod tests {
             enable: true,
             auto_size: false,
         };
-        let roi = extract_roi(&arr, &config).unwrap();
+        let roi = extract_roi(&pool(), &arr, &config).unwrap();
         // RGB1 layout: dims = [color=3, x=1, y=2].
         assert_eq!(roi.dims[0].size, 3);
         assert_eq!(roi.dims[1].size, 1);
@@ -1370,7 +1416,7 @@ mod tests {
         };
         config.data_type = Some(NDDataType::UInt16);
 
-        let roi = extract_roi(&arr, &config).unwrap();
+        let roi = extract_roi(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.data.data_type(), NDDataType::UInt16);
         // RGB1 dims preserved: [color=3, x=2, y=2].
         assert_eq!(roi.dims[0].size, 3);
@@ -1418,7 +1464,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi(&arr, &config).unwrap();
+        let roi = extract_roi(&pool(), &arr, &config).unwrap();
         // Collapsed to 2-D [x=2, y=2].
         assert_eq!(roi.dims.len(), 2);
         assert_eq!(roi.dims[0].size, 2);
@@ -1470,7 +1516,7 @@ mod tests {
             };
         }
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[0], 132, "900 % 256 == 132 (C wraps), not 255");
         } else {
@@ -1507,7 +1553,7 @@ mod tests {
             };
         }
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[0], 100, "900/9 via the Float64 path");
         } else {
@@ -1549,7 +1595,7 @@ mod tests {
             auto_size: false,
         };
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.data.data_type(), NDDataType::UInt8);
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[0], 44, "(epicsUInt8)300 == 44");
@@ -1587,7 +1633,7 @@ mod tests {
             };
         }
 
-        let roi = extract_roi_2d(&arr, &config).unwrap();
+        let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         if let NDDataBuffer::U16(ref v) = roi.data {
             assert_eq!(v[0], 900, "the bin sum accumulates in UInt16");
         } else {

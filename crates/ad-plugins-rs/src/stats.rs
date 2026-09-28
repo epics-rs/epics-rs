@@ -1882,11 +1882,7 @@ impl NDPluginProcess for StatsProcessor {
 
         *self.latest_stats.lock() = result;
         // C++ Stats forwards the input array to downstream plugins
-        ProcessResult {
-            output_arrays: vec![Arc::new(array.clone())],
-            param_updates: updates,
-            scatter: false,
-        }
+        ProcessResult::forward(updates)
     }
 
     fn plugin_type(&self) -> &str {
@@ -2718,7 +2714,8 @@ mod tests {
 
         let result = proc.process_array(&arr, &pool);
         // C++ Stats forwards the input array to downstream plugins
-        assert_eq!(result.output_arrays.len(), 1, "stats forwards the array");
+        assert!(result.forward_input, "stats forwards the array");
+        assert!(result.output_arrays.is_empty());
 
         let stats = proc.stats_handle().lock().clone();
         assert_eq!(stats.min, 10.0);
@@ -2998,7 +2995,7 @@ mod tests {
 
     #[test]
     fn test_stats_runtime_end_to_end() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let ts_registry = crate::time_series::TsReceiverRegistry::new();
         let (handle, stats, _params, _jh) =

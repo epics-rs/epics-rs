@@ -201,6 +201,11 @@ pub struct ProcessResult {
     /// (C++ `NDPluginScatter::nextClient_`); the processor only marks the frame
     /// as a scatter frame.
     pub scatter: bool,
+    /// Publish the input frame itself, ahead of `output_arrays` — C's
+    /// `doCallbacksGenericPointer(pArray, ...)` on the very array the plugin
+    /// was handed. The runtime holds that `Arc` and prepends it; the
+    /// processor never copies a frame just to pass it on.
+    pub forward_input: bool,
 }
 
 impl ProcessResult {
@@ -210,15 +215,27 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates,
             scatter: false,
+            forward_input: false,
         }
     }
 
-    /// Convenience: passthrough/transform plugin with output arrays but no param updates.
+    /// Convenience: transform plugin with output arrays but no param updates.
     pub fn arrays(output_arrays: Vec<Arc<NDArray>>) -> Self {
         Self {
             output_arrays,
             param_updates: vec![],
             scatter: false,
+            forward_input: false,
+        }
+    }
+
+    /// Convenience: pass the input frame through unchanged, with `param_updates`.
+    pub fn forward(param_updates: Vec<ParamUpdate>) -> Self {
+        Self {
+            output_arrays: vec![],
+            param_updates,
+            scatter: false,
+            forward_input: true,
         }
     }
 
@@ -228,18 +245,47 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates: vec![],
             scatter: false,
+            forward_input: false,
         }
     }
 
-    /// Convenience: scatter output — deliver to the next downstream consumer in
-    /// round-robin order (the runtime owns the cursor and reroute logic).
-    pub fn scatter(output_arrays: Vec<Arc<NDArray>>) -> Self {
+    /// Convenience: scatter the input frame — deliver it to the next
+    /// downstream consumer in round-robin order (the runtime owns the cursor
+    /// and reroute logic).
+    pub fn scatter() -> Self {
         Self {
-            output_arrays,
+            output_arrays: vec![],
             param_updates: vec![],
             scatter: true,
+            forward_input: true,
         }
     }
+
+    /// Turn `forward_input` into the input `Arc` itself, prepended to
+    /// `output_arrays`. The one place that meaning is applied; the runtime
+    /// calls it on every frame, a test calls it to see what would go out.
+    pub fn resolve(mut self, input: &Arc<NDArray>) -> Self {
+        if std::mem::take(&mut self.forward_input) {
+            self.output_arrays.insert(0, Arc::clone(input));
+        }
+        self
+    }
+}
+
+/// Run `processor` on one frame: the single place `forward_input` is turned
+/// into the input `Arc` (prepended to `output_arrays`), and the single writer
+/// of the processor's served-array handle (what `readInt8Array` and friends
+/// hand out), which C's `NDPluginStdArrays` keeps as its cached `pArrays[0]`.
+fn run_processor<P: NDPluginProcess + ?Sized>(
+    processor: &P,
+    array: &Arc<NDArray>,
+    pool: &NDArrayPool,
+) -> ProcessResult {
+    let result = processor.process_array(array, pool).resolve(array);
+    if let Some(served) = processor.array_data_handle() {
+        *served.lock() = result.output_arrays.first().cloned();
+    }
+    result
 }
 
 /// Result of handling a control-plane param change.
@@ -610,7 +656,7 @@ impl SharedProcessorInner {
     ) -> ProcessOutput {
         self.cache_input_array(array);
         let t0 = std::time::Instant::now();
-        let result = processor.process_array(array, &self.pool);
+        let result = run_processor(processor, array, &self.pool);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.post_process(array, result, elapsed_ms)
     }
@@ -2183,7 +2229,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
                 // queued behind it.
                 shared.lock().cache_input_array(&item.msg.array);
                 let t0 = std::time::Instant::now();
-                let result = processor.process_array(&item.msg.array, &array_pool);
+                let result = run_processor(&*processor, &item.msg.array, &array_pool);
                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if done_tx
                     .send(DoneItem {
@@ -3045,12 +3091,45 @@ mod tests {
     struct PassthroughProcessor;
 
     impl NDPluginProcess for PassthroughProcessor {
-        fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-            ProcessResult::arrays(vec![Arc::new(array.clone())])
+        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(vec![])
         }
         fn plugin_type(&self) -> &str {
             "Passthrough"
         }
+    }
+
+    /// A processor that serves its latest frame, as NDPluginStdArrays does.
+    struct ServingProcessor {
+        served: Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>,
+    }
+
+    impl NDPluginProcess for ServingProcessor {
+        fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "Serving"
+        }
+        fn array_data_handle(&self) -> Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>> {
+            Some(Arc::clone(&self.served))
+        }
+    }
+
+    /// A forwarded frame goes out as the input `Arc` itself — no copy — and
+    /// lands in the processor's served-array handle.
+    #[test]
+    fn a_forwarded_frame_is_the_input_arc_and_is_served() {
+        let pool = NDArrayPool::new(1_000_000);
+        let input = make_test_array(7);
+        let proc = ServingProcessor {
+            served: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        let result = run_processor(&proc, &input, &pool);
+        assert!(!result.forward_input);
+        assert_eq!(result.output_arrays.len(), 1);
+        assert!(Arc::ptr_eq(&result.output_arrays[0], &input));
+        assert!(Arc::ptr_eq(proc.served.lock().as_ref().unwrap(), &input));
     }
 
     /// Sink processor: consumes arrays, returns nothing.
@@ -3164,7 +3243,7 @@ mod tests {
 
     #[test]
     fn test_passthrough_runtime() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         // Create downstream receiver
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
@@ -3192,7 +3271,7 @@ mod tests {
 
     #[test]
     fn test_sink_runtime() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         let (handle, _data_jh) = create_plugin_runtime(
             "SINK1",
@@ -3221,7 +3300,7 @@ mod tests {
 
     #[test]
     fn test_plugin_type_param() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         let (handle, _data_jh) = create_plugin_runtime(
             "TYPE_TEST",
@@ -3245,7 +3324,7 @@ mod tests {
         // while NDEpicsTSSec/nSec carry epicsTS (`:218-219`). The plugin runtime
         // published `timestamp.as_f64()` for all three, so NDTimeStamp_RBV
         // reported the epicsTS-derived value.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (ds, _rx) = ndarray_channel("DS_TS", 10);
         let mut output = NDArrayOutput::new();
         output.add(ds);
@@ -3290,7 +3369,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_on_handle_drop() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         let (handle, data_jh) = create_plugin_runtime(
             "SHUTDOWN_TEST",
@@ -3319,7 +3398,7 @@ mod tests {
         // registered under the bare port name only, so the "PORT:1" key was
         // missing and rewire failed with "not found".
         use crate::plugin::wiring::upstream_key;
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let wiring = test_wiring();
 
         // Upstream plugin advertises 2 addresses.
@@ -3360,7 +3439,7 @@ mod tests {
 
     #[test]
     fn test_nonblocking_passthrough() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -3384,7 +3463,7 @@ mod tests {
 
     #[test]
     fn test_blocking_to_nonblocking_switch() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -3428,7 +3507,7 @@ mod tests {
 
     #[test]
     fn test_enable_callbacks_disables_processing() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -3482,7 +3561,7 @@ mod tests {
     #[test]
     fn disabling_callbacks_does_not_discard_the_queued_backlog() {
         const LAST: i32 = 5;
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("DISABLE_MID", processor, pool, 8, "", test_wiring());
@@ -3543,7 +3622,7 @@ mod tests {
     /// One case per branch of that C `if`, not one per story.
     #[test]
     fn a_plugin_port_answers_the_pool_control_writes() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (handle, _jh) = create_plugin_runtime(
             "POOLCTL",
             PassthroughProcessor,
@@ -3601,7 +3680,7 @@ mod tests {
 
     #[test]
     fn test_downstream_receives_multiple() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         let (ds1, mut rx1) = ndarray_channel("DS1", 10);
         let (ds2, mut rx2) = ndarray_channel("DS2", 10);
@@ -3631,7 +3710,7 @@ mod tests {
 
     #[test]
     fn test_param_updates_after_send() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         struct ParamTracker;
         impl NDPluginProcess for ParamTracker {
@@ -3759,7 +3838,7 @@ mod tests {
         // array: this is the idle plugin an operator sees right after
         // iocInit, which is when QueueFree_RBV read 0 (full) and
         // MaxThreads_RBV read UDF/INVALID.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (handle, _data_jh) = create_plugin_runtime_with_output(
             "CTOR_TEST",
             PassthroughProcessor,
@@ -3852,7 +3931,7 @@ mod tests {
         // when NumThreads is written (`:730-733`). Four frames that each hold
         // until four are inside can only all return if four threads really
         // are running — which is what the NumThreads PV exists to buy.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let probe = OverlapProbe::default();
         let (handle, _data_jh) = create_plugin_runtime_with_output(
             "NTHREADS_TEST",
@@ -3901,7 +3980,7 @@ mod tests {
     fn test_default_num_threads_processes_one_frame_at_a_time() {
         // C's constructor starts NumThreads at 1 (NDPluginDriver.cpp:159), so
         // an untouched plugin must still serialise its frames.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let probe = OverlapProbe::default();
         let (handle, _data_jh) = create_plugin_runtime_with_output(
             "NTHREADS1_TEST",
@@ -3935,7 +4014,7 @@ mod tests {
         // constructor's block (asynNDArrayDriver.cpp:954-1005) runs for a
         // plugin as well. Read through the port handle, which is the same
         // path a record takes: an unwritten param comes back as an error.
-        let pool = Arc::new(NDArrayPool::new(2_097_152));
+        let pool = NDArrayPool::new(2_097_152);
         let (handle, _data_jh) = create_plugin_runtime_with_output(
             "NDCTOR_TEST",
             PassthroughProcessor,
@@ -4010,7 +4089,7 @@ mod tests {
     fn a_full_sort_buffer_drops_output_arrays_from_the_first_frame() {
         const SORT_SIZE: i32 = 3;
         const SENT: i32 = 8;
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 32);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4064,7 +4143,7 @@ mod tests {
 
     #[test]
     fn test_sort_mode_runtime_integration() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4144,7 +4223,7 @@ mod tests {
         // One case per counter, not one per scenario: the boundary is
         // "written value survives the next publish", and it is the same
         // boundary for all four regardless of how they came to be non-zero.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (handle, _data_jh) = create_plugin_runtime(
             "COUNTER_RESET_TEST",
             PassthroughProcessor,
@@ -4198,7 +4277,7 @@ mod tests {
     fn test_throttle_drops_output_arrays() {
         // G7: with a tiny MaxByteRate, output arrays exceeding the byte budget
         // are dropped and counted into DroppedOutputArrays.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4262,7 +4341,7 @@ mod tests {
     #[test]
     fn test_process_plugin_reprocesses_last_input() {
         // G5: writing ProcessPlugin re-injects the cached last input array.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4303,7 +4382,7 @@ mod tests {
         // a compression-unaware array (:388) or a full message queue (:440).
         // Verify (a) the throttled array is not emitted and (b) DroppedArrays
         // stays zero.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4361,7 +4440,7 @@ mod tests {
         // endProcessCallbacks (NDPluginDriver.cpp:257-265) caches the array and
         // returns before doCallbacksGenericPointer. Distinct from
         // EnableCallbacks, which gates whether the plugin processes at all.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4447,7 +4526,7 @@ mod tests {
 
         // Uncompressed passthrough: a 4-byte UInt8 array → compressedSize == 4.
         {
-            let pool = Arc::new(NDArrayPool::new(1_000_000));
+            let pool = NDArrayPool::new(1_000_000);
             let (ds, _rx) = ndarray_channel("DS_RAW", 10);
             let mut output = NDArrayOutput::new();
             output.add(ds);
@@ -4476,7 +4555,7 @@ mod tests {
 
         // Compressed output: compressedSize == codec.compressed_size (7).
         {
-            let pool = Arc::new(NDArrayPool::new(1_000_000));
+            let pool = NDArrayPool::new(1_000_000);
             let (ds, _rx) = ndarray_channel("DS_CMP", 10);
             let mut output = NDArrayOutput::new();
             output.add(ds);
@@ -4508,7 +4587,7 @@ mod tests {
         // ProcessPlugin input. After array 1 is processed and array 2 is
         // dropped by the throttle, ProcessPlugin must re-inject array 1
         // (the last *processed* array), not the dropped array 2.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4569,7 +4648,7 @@ mod tests {
     #[test]
     fn test_g3_compressed_array_dropped_on_non_aware_plugin() {
         // G3: a non-compression-aware plugin drops a compressed array.
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
@@ -4623,7 +4702,7 @@ mod tests {
                 "Slow"
             }
         }
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
 
         // Downstream plugin with queue size 1 and a slow processor.
         let (downstream_handle, _ds_jh) =
@@ -4890,7 +4969,7 @@ mod tests {
     #[test]
     fn test_queue_size_write_resizes_the_input_queue() {
         const OFFERED: usize = 20;
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, _entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("QSIZE_TEST", processor, pool, 2, "", test_wiring());
@@ -4951,7 +5030,7 @@ mod tests {
     fn min_callback_time_gate_takes_no_queue_slot() {
         const OFFERED: usize = 20;
         const DEPTH: usize = 2;
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("MINCB_PRESSURE", processor, pool, DEPTH, "", test_wiring());
@@ -5020,7 +5099,7 @@ mod tests {
             });
             Arc::new(a)
         }
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("COMPR_PRESSURE", processor, pool, 2, "", test_wiring());
@@ -5060,7 +5139,7 @@ mod tests {
     /// duplicate arrive *before* frames the detector had already delivered.
     #[test]
     fn test_process_plugin_queues_behind_the_backlog() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("PPORDER_TEST", processor, pool, 8, "", test_wiring());
@@ -5105,7 +5184,7 @@ mod tests {
     /// gives them a dropped-array count.
     #[test]
     fn test_process_plugin_is_refused_when_the_queue_is_full() {
-        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) =
             create_plugin_runtime("PPFULL_TEST", processor, pool, 1, "", test_wiring());

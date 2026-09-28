@@ -76,7 +76,7 @@ impl NDPluginProcess for PvaProcessor {
         }
 
         // Pass through to downstream plugins.
-        ProcessResult::arrays(vec![Arc::new(array.clone())])
+        ProcessResult::forward(vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -394,7 +394,7 @@ mod tests {
         }
         let uncompressed_bytes = (arr.data.len() * 2) as i64; // 8 elems * 2 bytes
 
-        let compressed = crate::codec::compress_lz4(&arr);
+        let compressed = crate::codec::compress_lz4(&arr).unwrap();
         let comp_size = compressed.codec.as_ref().unwrap().compressed_size as i64;
         assert!(
             matches!(compressed.data, NDDataBuffer::U8(_)),
@@ -525,7 +525,7 @@ mod tests {
 
         // The compressor records the original type structurally in the codec
         // and attaches no carrier attribute.
-        let compressed = crate::codec::compress_lz4(&arr);
+        let compressed = crate::codec::compress_lz4(&arr).unwrap();
         assert_eq!(
             compressed.codec.as_ref().unwrap().original_data_type,
             NDDataType::UInt16,

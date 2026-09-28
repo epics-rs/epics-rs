@@ -856,18 +856,16 @@ fn stats_of<T: StatsElem + Send + Sync>(
 /// 1-D vectors, and its `doComputeProfilesT` only extracts rows and columns.
 ///
 /// Every sum is per column (`col_*`, `x_size` long) or per row (`row_*`,
-/// `y_size` long). `*_thr` and `*_cnt` cover the pixels at or above the
-/// threshold — C's `value >= centroidThreshold` (NDPluginStats.cpp:212), so a
-/// NaN is never one of them. `row_m10` is Σ value·ix over a row's threshold
+/// `y_size` long). `*_thr` covers the pixels at or above the threshold —
+/// C's `value >= centroidThreshold` (NDPluginStats.cpp:212), so a NaN is
+/// never one of them. `row_m10` is Σ value·ix over a row's threshold
 /// pixels: the one moment (`mu11`) that needs both coordinates at once, kept
 /// per row so it can be centred once the centroid is known.
 struct Projection {
     col_sum: Vec<f64>,
     col_thr: Vec<f64>,
-    col_cnt: Vec<u32>,
     row_sum: Vec<f64>,
     row_thr: Vec<f64>,
-    row_cnt: Vec<u32>,
     row_m10: Vec<f64>,
 }
 
@@ -876,10 +874,8 @@ impl Projection {
         Self {
             col_sum: vec![0.0; x_size],
             col_thr: vec![0.0; x_size],
-            col_cnt: vec![0; x_size],
             row_sum: vec![0.0; y_size],
             row_thr: vec![0.0; y_size],
-            row_cnt: vec![0; y_size],
             row_m10: vec![0.0; y_size],
         }
     }
@@ -893,12 +889,8 @@ impl Projection {
         for (a, b) in self.col_thr.iter_mut().zip(&next.col_thr) {
             *a += b;
         }
-        for (a, b) in self.col_cnt.iter_mut().zip(&next.col_cnt) {
-            *a += b;
-        }
         self.row_sum.extend(next.row_sum);
         self.row_thr.extend(next.row_thr);
-        self.row_cnt.extend(next.row_cnt);
         self.row_m10.extend(next.row_m10);
         self
     }
@@ -916,7 +908,6 @@ fn project_band<T: StatsElem>(v: &[T], x_size: usize, threshold: f64) -> Project
         let mut sum = [0.0f64; LANES];
         let mut thr = [0.0f64; LANES];
         let mut m10 = [0.0f64; LANES];
-        let mut cnt = [0u32; LANES];
         let mut cols = row.chunks_exact(LANES);
         let mut base = 0;
         // The column index as a vector of f64, stepped by LANES per chunk:
@@ -934,20 +925,14 @@ fn project_band<T: StatsElem>(v: &[T], x_size: usize, threshold: f64) -> Project
             let ct: &mut [f64; LANES] = (&mut p.col_thr[base..base + LANES])
                 .try_into()
                 .expect("LANES columns");
-            let cc: &mut [u32; LANES] = (&mut p.col_cnt[base..base + LANES])
-                .try_into()
-                .expect("LANES columns");
             for l in 0..LANES {
                 let val = c[l].to_f64();
-                let above = val >= threshold;
-                let masked = if above { val } else { 0.0 };
+                let masked = if val >= threshold { val } else { 0.0 };
                 cs[l] += val;
                 ct[l] += masked;
-                cc[l] += above as u32;
                 sum[l] += val;
                 thr[l] += masked;
                 m10[l] += masked * idx[l];
-                cnt[l] += above as u32;
             }
             for x in idx.iter_mut() {
                 *x += LANES as f64;
@@ -957,24 +942,19 @@ fn project_band<T: StatsElem>(v: &[T], x_size: usize, threshold: f64) -> Project
         let mut row_sum: f64 = sum.iter().sum();
         let mut row_thr: f64 = thr.iter().sum();
         let mut row_m10: f64 = m10.iter().sum();
-        let mut row_cnt: u32 = cnt.iter().sum();
         for (l, &e) in cols.remainder().iter().enumerate() {
             let ix = base + l;
             let val = e.to_f64();
-            let above = val >= threshold;
-            let masked = if above { val } else { 0.0 };
+            let masked = if val >= threshold { val } else { 0.0 };
             p.col_sum[ix] += val;
             p.col_thr[ix] += masked;
-            p.col_cnt[ix] += above as u32;
             row_sum += val;
             row_thr += masked;
             row_m10 += masked * ix as f64;
-            row_cnt += above as u32;
         }
         p.row_sum[iy] = row_sum;
         p.row_thr[iy] = row_thr;
         p.row_m10[iy] = row_m10;
-        p.row_cnt[iy] = row_cnt;
     }
     p
 }
@@ -1254,7 +1234,8 @@ fn histogram_of<T: StatsElem + Sync>(
 /// Compute profile projections for a 2D image.
 ///
 /// - Average X/Y: column/row averages over the full image
-/// - Threshold X/Y: column/row averages using only pixels >= threshold
+/// - Threshold X/Y: column/row averages with the pixels under the
+///   threshold taken as zero
 /// - Centroid X/Y: single row/column at the centroid position (rounded)
 /// - Cursor X/Y: single row/column at cursor position
 pub fn compute_profiles(
@@ -1286,12 +1267,16 @@ fn profiles_from(
     let x_size = p.col_sum.len();
     let y_size = p.row_sum.len();
 
-    let avg_x: Vec<f64> = p.col_sum.iter().map(|&s| s / y_size as f64).collect();
-    let avg_y: Vec<f64> = p.row_sum.iter().map(|&s| s / x_size as f64).collect();
-    // Threshold profiles: divide by count of pixels above threshold
-    let mean_of = |(&s, &c): (&f64, &u32)| if c > 0 { s / c as f64 } else { 0.0 };
-    let threshold_x: Vec<f64> = p.col_thr.iter().zip(&p.col_cnt).map(mean_of).collect();
-    let threshold_y: Vec<f64> = p.row_thr.iter().zip(&p.row_cnt).map(mean_of).collect();
+    // Both the average and the threshold profile of an axis are divided by
+    // the other axis's length (NDPluginStats.cpp:230,240): the threshold
+    // profile is the per-pixel mean over the whole column or row, with the
+    // pixels under the threshold counted as zero.
+    let per_row = |s: &f64| s / y_size as f64;
+    let per_col = |s: &f64| s / x_size as f64;
+    let avg_x: Vec<f64> = p.col_sum.iter().map(per_row).collect();
+    let avg_y: Vec<f64> = p.row_sum.iter().map(per_col).collect();
+    let threshold_x: Vec<f64> = p.col_thr.iter().map(per_row).collect();
+    let threshold_y: Vec<f64> = p.row_thr.iter().map(per_col).collect();
 
     // Centroid/cursor profiles: extract a single row/column at the requested
     // position. C clamps the index to the valid range (NDPluginStats.cpp:341-360,
@@ -2405,9 +2390,10 @@ mod tests {
             2.0, 1.0, 0, 0,
         );
 
-        // Threshold X profile: only column 2 has a pixel >= 5.0 (at row 1)
+        // Threshold X profile: only column 2 has a pixel >= 5.0 (at row 1);
+        // its sum is divided by the 4 rows (NDPluginStats.cpp:230).
         assert_eq!(profiles.threshold_x.len(), 4);
-        assert!((profiles.threshold_x[2] - 10.0).abs() < 1e-10);
+        assert!((profiles.threshold_x[2] - 2.5).abs() < 1e-10);
         // Other columns: no pixels above threshold
         assert!((profiles.threshold_x[0] - 0.0).abs() < 1e-10);
         assert!((profiles.threshold_x[1] - 0.0).abs() < 1e-10);
@@ -2415,7 +2401,7 @@ mod tests {
 
         // Threshold Y profile: only row 1 has a pixel >= 5.0
         assert_eq!(profiles.threshold_y.len(), 4);
-        assert!((profiles.threshold_y[1] - 10.0).abs() < 1e-10);
+        assert!((profiles.threshold_y[1] - 2.5).abs() < 1e-10);
         assert!((profiles.threshold_y[0] - 0.0).abs() < 1e-10);
     }
 
@@ -2851,7 +2837,6 @@ mod tests {
     fn reference_profiles(vals: &[f64], w: usize, h: usize, thr: f64) -> [Vec<f64>; 4] {
         let (mut ax, mut ay) = (vec![0.0; w], vec![0.0; h]);
         let (mut tx, mut ty) = (vec![0.0; w], vec![0.0; h]);
-        let (mut cx, mut cy) = (vec![0usize; w], vec![0usize; h]);
         for iy in 0..h {
             for ix in 0..w {
                 let val = vals[iy * w + ix];
@@ -2859,25 +2844,16 @@ mod tests {
                 ay[iy] += val;
                 if val >= thr {
                     tx[ix] += val;
-                    cx[ix] += 1;
                     ty[iy] += val;
-                    cy[iy] += 1;
                 }
             }
         }
-        let mean = |s: &[f64], c: &[usize]| -> Vec<f64> {
-            s.iter()
-                .zip(c)
-                .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
-                .collect()
-        };
-        for a in ax.iter_mut() {
+        for a in ax.iter_mut().chain(tx.iter_mut()) {
             *a /= h as f64;
         }
-        for a in ay.iter_mut() {
+        for a in ay.iter_mut().chain(ty.iter_mut()) {
             *a /= w as f64;
         }
-        let (tx, ty) = (mean(&tx, &cx), mean(&ty, &cy));
         [ax, ay, tx, ty]
     }
 
@@ -3034,8 +3010,8 @@ mod tests {
     }
 
     /// C's `value >= centroidThreshold` (NDPluginStats.cpp:212) is false for
-    /// a NaN: it is left out of the threshold sums and counts, and out of the
-    /// centroid, while the plain average it does take part in becomes NaN.
+    /// a NaN: it is left out of the threshold sums and out of the centroid,
+    /// while the plain average it does take part in becomes NaN.
     #[test]
     fn projection_leaves_nan_out_of_the_threshold_sums() {
         let mut pixels = vec![2.0f32; 4 * 3];
@@ -3045,8 +3021,8 @@ mod tests {
         assert_eq!(c.centroid_total, 22.0);
         assert!((c.centroid_x - 16.0 / 11.0).abs() < 1e-12);
         let p = compute_profiles(&data, 4, 3, 0.0, 0.0, 0.0, 0, 0);
-        assert_eq!(p.threshold_x[2], 2.0);
-        assert_eq!(p.threshold_y[1], 2.0);
+        assert_eq!(p.threshold_x[2], 4.0 / 3.0);
+        assert_eq!(p.threshold_y[1], 1.5);
         assert!(p.avg_x[2].is_nan());
         assert!(p.avg_y[1].is_nan());
         assert_eq!(p.avg_x[0], 2.0);

@@ -265,7 +265,8 @@ impl NDArrayPool {
         ))
     }
 
-    /// Allocate a copy of an existing NDArray (new unique_id, data cloned).
+    /// Allocate a copy of an existing NDArray: data, both stamps, attributes,
+    /// codec and `unique_id` all carry across (C++ NDArrayPool.cpp:283-302).
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
         let dims = source.dims.clone();
@@ -275,6 +276,7 @@ impl NDArrayPool {
         // C++ NDArrayPool::copy carries BOTH stamps across (NDArrayPool.cpp:284-285).
         // Copying only `time_stamp` left `timestamp` (epicsTS) at whatever the
         // recycled buffer happened to hold.
+        copy.unique_id = source.unique_id;
         copy.time_stamp = source.time_stamp;
         copy.timestamp = source.timestamp;
         copy.attributes = source.attributes.clone();
@@ -616,7 +618,7 @@ mod tests {
         }
 
         let copy = pool.alloc_copy(&source).unwrap();
-        assert_ne!(copy.unique_id, source.unique_id);
+        assert_eq!(copy.unique_id, source.unique_id);
         assert_eq!(copy.dims.len(), source.dims.len());
         if let NDDataBuffer::U8(ref v) = copy.data {
             assert_eq!(v, &[1, 2, 3, 4]);

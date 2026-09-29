@@ -207,64 +207,66 @@ pub(crate) fn from_f64_f32<S: Simd>(simd: S, values: &[f64], out: &mut [f32]) {
 }
 
 #[cfg(test)]
+/// Every level this machine can run, so a kernel is checked on each
+/// lowering and not only on the one `level()` picks.
+pub(crate) fn levels() -> Vec<Level> {
+    let top = level();
+    let mut out = vec![top];
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        out.extend(top.as_avx2().map(Level::Avx2));
+        out.extend(top.as_sse4_2().map(Level::Sse4_2));
+        out.extend(top.as_sse2().map(Level::Sse2));
+    }
+    out
+}
+
+#[cfg(test)]
+/// The `f64` values whose casts differ between a truncating, a
+/// saturating and a NaN-clearing conversion, plus enough ordinary ones
+/// to fill several vectors of the widest lowering and leave a tail.
+pub(crate) fn edge_values() -> Vec<f64> {
+    let mut v = vec![
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.5,
+        -1.5,
+        127.9,
+        -128.9,
+        255.9,
+        256.0,
+        -1.0,
+        32767.9,
+        -32768.9,
+        65535.9,
+        65536.0,
+        2147483647.9,
+        -2147483648.9,
+        4294967295.9,
+        4294967296.0,
+        9.3e18,
+        -9.3e18,
+        1.9e19,
+        -1.9e19,
+        1e300,
+        -1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::MAX,
+        f64::MIN,
+        f64::EPSILON,
+        9007199254740993.0,
+    ];
+    v.extend((0..77).map(|i| (i as f64 - 30.0) * 1234.5678));
+    v
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every level this machine can run, so a kernel is checked on each
-    /// lowering and not only on the one `level()` picks.
-    fn levels() -> Vec<Level> {
-        let top = level();
-        let mut out = vec![top];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            out.extend(top.as_avx2().map(Level::Avx2));
-            out.extend(top.as_sse4_2().map(Level::Sse4_2));
-            out.extend(top.as_sse2().map(Level::Sse2));
-        }
-        out
-    }
-
-    /// The `f64` values whose casts differ between a truncating, a
-    /// saturating and a NaN-clearing conversion, plus enough ordinary ones
-    /// to fill several vectors of the widest lowering and leave a tail.
-    fn edge_values() -> Vec<f64> {
-        let mut v = vec![
-            0.0,
-            -0.0,
-            0.5,
-            -0.5,
-            1.5,
-            -1.5,
-            127.9,
-            -128.9,
-            255.9,
-            256.0,
-            -1.0,
-            32767.9,
-            -32768.9,
-            65535.9,
-            65536.0,
-            2147483647.9,
-            -2147483648.9,
-            4294967295.9,
-            4294967296.0,
-            9.3e18,
-            -9.3e18,
-            1.9e19,
-            -1.9e19,
-            1e300,
-            -1e300,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NAN,
-            f64::MAX,
-            f64::MIN,
-            f64::EPSILON,
-            9007199254740993.0,
-        ];
-        v.extend((0..77).map(|i| (i as f64 - 30.0) * 1234.5678));
-        v
-    }
 
     macro_rules! check_from_f64 {
         ($t:ty, $kernel:ident) => {

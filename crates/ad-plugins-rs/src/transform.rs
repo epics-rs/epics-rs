@@ -197,17 +197,76 @@ struct Geometry {
     transform: TransformType,
 }
 
+/// Rows and columns per tile of a transposing transform, so the
+/// destination lines a tile writes stay cached across its source rows.
+const TILE: usize = 64;
+
 impl Geometry {
+    /// The destination element index of source pixel `(sx, sy)`, color 0.
+    fn dst_index(&self, sx: usize, sy: usize) -> usize {
+        let (dx, dy) = map_coords(sx, sy, self.src_w, self.src_h, self.transform);
+        dy * self.dst_strides.1 + dx * self.dst_strides.0
+    }
+
     fn transform_into<T: Copy>(&self, src: &[T], out: &mut [T]) {
         let (sxs, sys, scs) = self.src_strides;
-        let (dxs, dys, dcs) = self.dst_strides;
-        for sy in 0..self.src_h {
-            for sx in 0..self.src_w {
-                let (dx, dy) = map_coords(sx, sy, self.src_w, self.src_h, self.transform);
-                let s_base = sy * sys + sx * sxs;
-                let d_base = dy * dys + dx * dxs;
-                for c in 0..self.color {
-                    out[d_base + c * dcs] = src[s_base + c * scs];
+        let (_, _, dcs) = self.dst_strides;
+        let (w, h, color) = (self.src_w, self.src_h, self.color);
+        // Every transform maps a source row to a destination line the index
+        // walks with one constant signed step, so the mapping is evaluated
+        // once per row and the row itself is one of three copies.
+        let step = if w > 1 {
+            self.dst_index(1, 0) as isize - self.dst_index(0, 0) as isize
+        } else {
+            sxs as isize
+        };
+        // A row whose elements are one contiguous run on both sides.
+        let row_is_contiguous = step == sxs as isize
+            && dcs == scs
+            && ((color == 1 && sxs == 1) || (sxs == color && scs == 1) || (sxs == 1 && scs == w));
+        let row = |sy: usize, sx0: usize, len: usize, out: &mut [T]| {
+            let s_base = sy * sys + sx0 * sxs;
+            let d_base = (self.dst_index(0, sy) as isize + sx0 as isize * step) as usize;
+            if row_is_contiguous {
+                out[d_base..d_base + len * color]
+                    .copy_from_slice(&src[s_base..s_base + len * color]);
+                return;
+            }
+            if sxs == 1 && step == 1 {
+                for c in 0..color {
+                    let (s, d) = (s_base + c * scs, d_base + c * dcs);
+                    out[d..d + len].copy_from_slice(&src[s..s + len]);
+                }
+            } else if sxs == 1 && step == -1 {
+                for c in 0..color {
+                    let (s, d) = (s_base + c * scs, d_base + c * dcs);
+                    for (o, &i) in out[d + 1 - len..=d].iter_mut().rev().zip(&src[s..s + len]) {
+                        *o = i;
+                    }
+                }
+            } else {
+                // Strided on at least one side: the elements of one pixel
+                // stay together, which keeps interleaved stores adjacent.
+                for sx in 0..len {
+                    let s = s_base + sx * sxs;
+                    let d = (d_base as isize + sx as isize * step) as usize;
+                    for c in 0..color {
+                        out[d + c * dcs] = src[s + c * scs];
+                    }
+                }
+            }
+        };
+        if !self.transform.swaps_dims() {
+            for sy in 0..h {
+                row(sy, 0, w, out);
+            }
+            return;
+        }
+        for ty in (0..h).step_by(TILE) {
+            for tx in (0..w).step_by(TILE) {
+                let len = TILE.min(w - tx);
+                for sy in ty..(ty + TILE).min(h) {
+                    row(sy, tx, len, out);
                 }
             }
         }
@@ -296,6 +355,73 @@ mod tests {
         assert_eq!(second.data.as_u8_slice().as_ptr(), ptr);
         assert_eq!(pool.num_alloc_buffers(), 1);
         assert_eq!(get_u8(&second), &[4, 1, 5, 2, 6, 3]);
+    }
+
+    /// Every transform on every color layout, on frames wider and taller
+    /// than a tile with a partial tile at both edges, against the element
+    /// by element mapping of `map_coords`.
+    #[test]
+    fn transform_into_matches_the_per_pixel_mapping() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let (w, h) = (TILE * 2 + 5, TILE + 3);
+        let modes = [
+            (NDColorMode::Mono, 1),
+            (NDColorMode::RGB1, 3),
+            (NDColorMode::RGB2, 3),
+            (NDColorMode::RGB3, 3),
+        ];
+        let transforms = [
+            TransformType::Rot90CW,
+            TransformType::Rot180,
+            TransformType::Rot90CCW,
+            TransformType::FlipHoriz,
+            TransformType::FlipVert,
+            TransformType::FlipDiag,
+            TransformType::FlipAntiDiag,
+        ];
+        for (mode, color) in modes {
+            let data: Vec<u16> = (0..w * h * color)
+                .map(|i| (i * 7919 % 65521) as u16)
+                .collect();
+            let dims = dims_for(mode, w, h, color, if color == 1 { 2 } else { 3 });
+            let mut arr = NDArray::with_data(dims, NDDataBuffer::U16(data.clone()));
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(mode as i32),
+            ));
+            let info = arr.info();
+            let (sxs, sys, scs) = (
+                info.x_stride,
+                info.y_stride.max(1),
+                info.color_stride.max(1),
+            );
+            for transform in transforms {
+                let out = apply_transform(&pool(), &arr, transform).unwrap();
+                let (dw, dh) = if transform.swaps_dims() {
+                    (h, w)
+                } else {
+                    (w, h)
+                };
+                let (dxs, dys, dcs) = strides_for(mode, dw, dh, color);
+                let mut want = vec![0u16; w * h * color];
+                for sy in 0..h {
+                    for sx in 0..w {
+                        let (dx, dy) = map_coords(sx, sy, w, h, transform);
+                        for c in 0..color {
+                            want[dy * dys + dx * dxs + c * dcs] =
+                                data[sy * sys + sx * sxs + c * scs];
+                        }
+                    }
+                }
+                let got = match &out.data {
+                    NDDataBuffer::U16(v) => v.as_slice(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(got, want.as_slice(), "{mode:?} {transform:?}");
+            }
+        }
     }
 
     /// Create a 3x2 array:

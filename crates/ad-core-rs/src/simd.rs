@@ -1,6 +1,6 @@
-//! The run-time SIMD level every kernel in the AD crates dispatches on, and
-//! the element-type casts of [`NDDataBuffer`](crate::ndarray::NDDataBuffer)
-//! on explicit vectors.
+//! The run-time SIMD level every kernel in the AD crates dispatches on, the
+//! element-type casts of [`NDDataBuffer`](crate::ndarray::NDDataBuffer) on
+//! explicit vectors, and the three-way (de)interleave of RGB pixels.
 //!
 //! `fearless_simd` picks AVX2/AVX-512/NEON at run time; the lane loops the
 //! compiler vectorizes on its own only reach the baseline the binary was
@@ -233,6 +233,90 @@ pub(crate) fn from_f64_f32<S: Simd>(simd: S, values: &[f64], out: &mut [f32]) {
     }
     for (&x, o) in chunks.remainder().iter().zip(outs.into_remainder()) {
         *o = x as f32;
+    }
+}
+
+/// An element type with a native-width vector: the ten element types of
+/// [`NDDataBuffer`](crate::ndarray::NDDataBuffer).
+pub trait LaneVec: Copy + Default {
+    /// The native-width vector of this element.
+    type Vec<S: Simd>: SimdBase<S, Element = Self, ByteVector = S::u8s>;
+}
+
+macro_rules! lane_vec {
+    ($($t:ty => $vec:ident),*) => {$(
+        impl LaneVec for $t {
+            type Vec<S: Simd> = S::$vec;
+        }
+    )*};
+}
+
+lane_vec!(i8 => i8s, u8 => u8s, i16 => i16s, u16 => u16s, i32 => i32s, u32 => u32s, i64 => i64s, u64 => u64s, f32 => f32s, f64 => f64s);
+
+/// The byte-swizzle tables of a three-way split or join of `e`-byte
+/// elements across three consecutive vectors: `t[i][k]` maps output vector
+/// `i` from input vector `k`, with `0xFF` (past every vector) in the lanes
+/// that come from another input, which `swizzle_dyn_precise` zeroes so the
+/// three pulls or together.
+pub type Tables<S> = [[<S as Simd>::u8s; 3]; 3];
+
+/// The tables that split pixels `[r0 g0 b0 r1 ...]` into the planes
+/// `[r0 r1 ...]`, `[g0 g1 ...]`, `[b0 b1 ...]`.
+#[inline(always)]
+pub fn split_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+    let n = S::u8s::LEN;
+    std::array::from_fn(|c| {
+        std::array::from_fn(|k| {
+            S::u8s::from_fn(simd, |j| {
+                let g = (3 * (j / e) + c) * e + j % e;
+                if g / n == k { (g % n) as u8 } else { 0xFF }
+            })
+        })
+    })
+}
+
+/// The tables that join the planes back into pixels; the inverse of
+/// [`split_tables`].
+#[inline(always)]
+pub fn join_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+    let n = S::u8s::LEN;
+    std::array::from_fn(|k| {
+        std::array::from_fn(|c| {
+            S::u8s::from_fn(simd, |j| {
+                let q = (k * n + j) / e;
+                if q % 3 == c {
+                    ((q / 3) * e + j % e) as u8
+                } else {
+                    0xFF
+                }
+            })
+        })
+    })
+}
+
+/// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | v[2][t[i][2]]`, per byte.
+#[inline(always)]
+pub fn shuffle3<S: Simd>(t: &Tables<S>, v: [S::u8s; 3]) -> [S::u8s; 3] {
+    std::array::from_fn(|i| {
+        v[0].swizzle_dyn_precise(t[i][0])
+            | v[1].swizzle_dyn_precise(t[i][1])
+            | v[2].swizzle_dyn_precise(t[i][2])
+    })
+}
+
+/// Three consecutive vectors of `v`, as bytes.
+#[inline(always)]
+pub fn load3<S: Simd, T: LaneVec>(simd: S, v: &[T]) -> [S::u8s; 3] {
+    let per = T::Vec::<S>::LEN;
+    std::array::from_fn(|k| T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes())
+}
+
+/// `v` into three consecutive vectors of `out`.
+#[inline(always)]
+pub fn store3<S: Simd, T: LaneVec>(v: [S::u8s; 3], out: &mut [T]) {
+    let per = T::Vec::<S>::LEN;
+    for (k, b) in v.into_iter().enumerate() {
+        T::Vec::<S>::from_bytes(b).store_slice(&mut out[k * per..(k + 1) * per]);
     }
 }
 

@@ -208,7 +208,53 @@ impl Geometry {
         dy * self.dst_strides.1 + dx * self.dst_strides.0
     }
 
-    fn transform_into<T: Copy>(&self, src: &[T], out: &mut [T]) {
+    fn transform_into<T: LaneVec>(&self, src: &[T], out: &mut [T]) {
+        #[cfg(feature = "simd")]
+        let lanes = self.transpose_lanes(ad_core_rs::simd::level(), src, out);
+        #[cfg(not(feature = "simd"))]
+        let lanes = (0, 0);
+        self.transform_rows(src, out, lanes);
+    }
+
+    /// The whole vectors of a transposing transform on lanes: every
+    /// channel as a planar matrix, or the three of RGB1 split off each
+    /// row and joined back. Returns the source columns and rows covered.
+    #[cfg(feature = "simd")]
+    fn transpose_lanes<T: LaneVec>(
+        &self,
+        level: fearless_simd::Level,
+        src: &[T],
+        out: &mut [T],
+    ) -> (usize, usize) {
+        use fearless_simd::dispatch;
+        let (flip_x, flip_y) = match self.transform {
+            TransformType::FlipDiag => (false, false),
+            TransformType::Rot90CW => (true, false),
+            TransformType::Rot90CCW => (false, true),
+            TransformType::FlipAntiDiag => (true, true),
+            _ => return (0, 0),
+        };
+        let (sxs, sys, scs) = self.src_strides;
+        let (dxs, dys, dcs) = self.dst_strides;
+        let (w, h) = (self.src_w, self.src_h);
+        let flips = (flip_x, flip_y);
+        if sxs == 1 && dxs == 1 {
+            let mut done = (0, 0);
+            for c in 0..self.color {
+                let (s, o) = (&src[c * scs..], &mut out[c * dcs..]);
+                done = dispatch!(level, s_ => simd_kernels::transpose_planar(s_, s, o, w, h, sys, dys, flips));
+            }
+            done
+        } else if sxs == 3 && scs == 1 && dxs == 3 && dcs == 1 {
+            dispatch!(level, s_ => simd_kernels::transpose_rgb1(s_, src, out, w, h, sys, dys, flips))
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// The scalar rows: from column `w0` on the rows below `h0`, and every
+    /// row from `h0` on.
+    fn transform_rows<T: Copy>(&self, src: &[T], out: &mut [T], (w0, h0): (usize, usize)) {
         let (sxs, sys, scs) = self.src_strides;
         let (_, _, dcs) = self.dst_strides;
         let (w, h, color) = (self.src_w, self.src_h, self.color);
@@ -262,7 +308,12 @@ impl Geometry {
             }
             return;
         }
-        for ty in (0..h).step_by(TILE) {
+        if w0 < w {
+            for sy in 0..h0 {
+                row(sy, w0, w - w0, out);
+            }
+        }
+        for ty in (h0..h).step_by(TILE) {
             for tx in (0..w).step_by(TILE) {
                 let len = TILE.min(w - tx);
                 for sy in ty..(ty + TILE).min(h) {
@@ -270,6 +321,152 @@ impl Geometry {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "simd")]
+use ad_core_rs::simd::LaneVec;
+/// Without lanes every element type qualifies; the bound is only there so
+/// the kernels can name the native vector.
+#[cfg(not(feature = "simd"))]
+trait LaneVec: Copy {}
+#[cfg(not(feature = "simd"))]
+impl<T: Copy> LaneVec for T {}
+
+/// The transposing transforms on explicit vectors. A `K` by `K` block, `K`
+/// the lane count of the element, is `K` row vectors; `log2 K` rounds of
+/// the perfect shuffle — every vector interleaved with the one `K / 2`
+/// after it, the two halves consecutive in the next round's order — leave
+/// the `K` column vectors. A rotation is that transpose with the rows
+/// loaded in reverse order (the columns of the result run backwards) or
+/// the columns stored in reverse order, so the flips cost no lane
+/// operation at all.
+#[cfg(feature = "simd")]
+mod simd_kernels {
+    use ad_core_rs::simd::{LaneVec, join_tables, load3, shuffle3, split_tables, store3};
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    /// Vectors of the widest block: the lane count of the narrowest
+    /// element on every level.
+    const MAX_K: usize = 64;
+
+    /// The `k` row vectors in `a` to the `k` column vectors, in `a` or `b`.
+    #[inline(always)]
+    fn transpose_block<'a, S: Simd, T: LaneVec>(
+        a: &'a mut [T::Vec<S>; MAX_K],
+        b: &'a mut [T::Vec<S>; MAX_K],
+        k: usize,
+    ) -> &'a [T::Vec<S>; MAX_K] {
+        let (mut from, mut to) = (a, b);
+        for _ in 0..k.trailing_zeros() {
+            for i in 0..k / 2 {
+                let (lo, hi) = from[i].interleave(from[i + k / 2]);
+                to[2 * i] = lo;
+                to[2 * i + 1] = hi;
+            }
+            std::mem::swap(&mut from, &mut to);
+        }
+        from
+    }
+
+    /// The source row of block row `i`, and the destination row of block
+    /// column `j` with the column the block's rows start at.
+    #[inline(always)]
+    fn block_rows(
+        (ry, cx, k): (usize, usize, usize),
+        (w, h): (usize, usize),
+        (flip_x, flip_y): (bool, bool),
+    ) -> (impl Fn(usize) -> usize, impl Fn(usize) -> usize, usize) {
+        let src_row = move |i: usize| if flip_x { ry + k - 1 - i } else { ry + i };
+        let dst_row = move |j: usize| if flip_y { w - 1 - (cx + j) } else { cx + j };
+        let col = if flip_x { h - k - ry } else { ry };
+        (src_row, dst_row, col)
+    }
+
+    /// Transpose `src`, `h` rows of `w` elements at the row stride `sys`,
+    /// into `out` at the row stride `dys`: source column `x` becomes row
+    /// `x` (`w - 1 - x` with `flip_y`) and source row `y` column `y`
+    /// (`h - 1 - y` with `flip_x`). Every whole block; returns the source
+    /// columns and rows covered.
+    #[simd]
+    pub(super) fn transpose_planar<S: Simd, T: LaneVec>(
+        simd: S,
+        src: &[T],
+        out: &mut [T],
+        w: usize,
+        h: usize,
+        sys: usize,
+        dys: usize,
+        flips: (bool, bool),
+    ) -> (usize, usize) {
+        let k = T::Vec::<S>::LEN;
+        let (w0, h0) = (w / k * k, h / k * k);
+        let zero = T::Vec::<S>::splat(simd, T::default());
+        let (mut a, mut b) = ([zero; MAX_K], [zero; MAX_K]);
+        for ry in (0..h0).step_by(k) {
+            for cx in (0..w0).step_by(k) {
+                let (src_row, dst_row, col) = block_rows((ry, cx, k), (w, h), flips);
+                for (i, v) in a[..k].iter_mut().enumerate() {
+                    *v = T::Vec::<S>::from_slice(simd, &src[src_row(i) * sys + cx..][..k]);
+                }
+                let t = transpose_block::<S, T>(&mut a, &mut b, k);
+                for (j, v) in t[..k].iter().enumerate() {
+                    v.store_slice(&mut out[dst_row(j) * dys + col..][..k]);
+                }
+            }
+        }
+        (w0, h0)
+    }
+
+    /// [`transpose_planar`] of an RGB1 frame: each block row splits into
+    /// its three planes, the planes transpose, and each column joins back.
+    #[simd]
+    pub(super) fn transpose_rgb1<S: Simd, T: LaneVec>(
+        simd: S,
+        src: &[T],
+        out: &mut [T],
+        w: usize,
+        h: usize,
+        sys: usize,
+        dys: usize,
+        flips: (bool, bool),
+    ) -> (usize, usize) {
+        let k = T::Vec::<S>::LEN;
+        let (w0, h0) = (w / k * k, h / k * k);
+        let e = std::mem::size_of::<T>();
+        let (split, join) = (split_tables::<S>(simd, e), join_tables::<S>(simd, e));
+        let zero = T::Vec::<S>::splat(simd, T::default());
+        let (mut a, mut b) = ([[zero; MAX_K]; 3], [[zero; MAX_K]; 3]);
+        for ry in (0..h0).step_by(k) {
+            for cx in (0..w0).step_by(k) {
+                let (src_row, dst_row, col) = block_rows((ry, cx, k), (w, h), flips);
+                for i in 0..k {
+                    let planes = shuffle3::<S>(
+                        &split,
+                        load3::<S, T>(simd, &src[src_row(i) * sys + 3 * cx..]),
+                    );
+                    for (c, p) in planes.into_iter().enumerate() {
+                        a[c][i] = T::Vec::<S>::from_bytes(p);
+                    }
+                }
+                let [a0, a1, a2] = &mut a;
+                let [b0, b1, b2] = &mut b;
+                let t = [
+                    transpose_block::<S, T>(a0, b0, k),
+                    transpose_block::<S, T>(a1, b1, k),
+                    transpose_block::<S, T>(a2, b2, k),
+                ];
+                for j in 0..k {
+                    let planes = std::array::from_fn(|c| t[c][j].to_bytes());
+                    store3::<S, T>(
+                        shuffle3::<S>(&join, planes),
+                        &mut out[dst_row(j) * dys + 3 * col..],
+                    );
+                }
+            }
+        }
+        (w0, h0)
     }
 }
 
@@ -422,6 +619,67 @@ mod tests {
                 assert_eq!(got, want.as_slice(), "{mode:?} {transform:?}");
             }
         }
+    }
+
+    /// The transposing transforms on every level and element type, on
+    /// every color layout, at sizes below, at and past one block of every
+    /// lane count, against the element by element mapping of `map_coords`.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn transpose_lanes_match_the_per_pixel_mapping_on_every_level() {
+        use fearless_simd::Level;
+        let top = ad_core_rs::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        let modes = [
+            (NDColorMode::Mono, 1),
+            (NDColorMode::RGB1, 3),
+            (NDColorMode::RGB2, 3),
+            (NDColorMode::RGB3, 3),
+        ];
+        let transforms = [
+            TransformType::Rot90CW,
+            TransformType::Rot90CCW,
+            TransformType::FlipDiag,
+            TransformType::FlipAntiDiag,
+        ];
+        macro_rules! check {
+            ($($t:ty),*) => {$(
+                for (w, h) in [(1, 1), (5, 3), (64, 64), (65, 66), (131, 70)] {
+                    for (mode, color) in modes {
+                        let data: Vec<$t> = (0..w * h * color).map(|i| (i * 7919 % 65521) as $t).collect();
+                        let (sxs, sys, scs) = strides_for(mode, w, h, color);
+                        for transform in transforms {
+                            let (dw, dh) = (h, w);
+                            let dst = strides_for(mode, dw, dh, color);
+                            let geometry = Geometry {
+                                src_w: w,
+                                src_h: h,
+                                color,
+                                src_strides: (sxs, sys, scs),
+                                dst_strides: dst,
+                                transform,
+                            };
+                            let mut want = vec![<$t>::default(); w * h * color];
+                            geometry.transform_rows(&data, &mut want, (0, 0));
+                            for &level in &levels {
+                                let mut got = vec![<$t>::default(); w * h * color];
+                                let (w0, h0) = geometry.transpose_lanes(level, &data, &mut got);
+                                assert!(w0 <= w && h0 <= h && (w < 64 || w0 > 0) && (h < 64 || h0 > 0), "{level:?} {} {mode:?} {transform:?} {w}x{h}: {w0}x{h0}", stringify!($t));
+                                geometry.transform_rows(&data, &mut got, (w0, h0));
+                                assert_eq!(got, want, "{level:?} {} {mode:?} {transform:?} {w}x{h}", stringify!($t));
+                            }
+                        }
+                    }
+                }
+            )*};
+        }
+        check!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
     }
 
     /// Create a 3x2 array:

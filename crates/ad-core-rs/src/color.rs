@@ -421,13 +421,18 @@ fn round_clamp(v: f64, max: f64) -> f64 {
     v.round().clamp(0.0, max)
 }
 
-/// An element type the lane conversions run in: its native vector, and
-/// the widening to `f64` and back that the arithmetic kernels use, on a
-/// slice or on one vector.
-trait LaneElem: Copy {
-    /// The native-width vector of this element.
-    #[cfg(feature = "simd")]
-    type Vec<S: fearless_simd::Simd>: fearless_simd::SimdBase<S, Element = Self, ByteVector = S::u8s>;
+#[cfg(feature = "simd")]
+use crate::simd::LaneVec;
+/// Without lanes every element type qualifies; the bound is only there so
+/// the kernels can name the native vector.
+#[cfg(not(feature = "simd"))]
+trait LaneVec: Copy {}
+#[cfg(not(feature = "simd"))]
+impl<T: Copy> LaneVec for T {}
+
+/// An element type the lane conversions run in: the widening to `f64` and
+/// back that the arithmetic kernels use, on a slice or on one vector.
+trait LaneElem: LaneVec {
     fn to_f64(self) -> f64;
     fn from_f64(v: f64) -> Self;
     /// [`to_f64`](Self::to_f64) over a slice, on lanes.
@@ -447,10 +452,8 @@ trait LaneElem: Copy {
 }
 
 macro_rules! lane_elem {
-    ($t:ty, $vec:ident, $widen:ident, $narrow:ident, $widen_vec:ident, $narrow_vec:ident) => {
+    ($t:ty, $widen:ident, $narrow:ident, $widen_vec:ident, $narrow_vec:ident) => {
         impl LaneElem for $t {
-            #[cfg(feature = "simd")]
-            type Vec<S: fearless_simd::Simd> = S::$vec;
             #[inline(always)]
             fn to_f64(self) -> f64 {
                 self as f64
@@ -484,68 +487,17 @@ macro_rules! lane_elem {
     };
 }
 
-lane_elem!(i8, i8s, to_f64_i8, from_f64_i8, to_f64s_i8, from_f64s_i8);
-lane_elem!(u8, u8s, to_f64_u8, from_f64_u8, to_f64s_u8, from_f64s_u8);
-lane_elem!(
-    i16,
-    i16s,
-    to_f64_i16,
-    from_f64_i16,
-    to_f64s_i16,
-    from_f64s_i16
-);
-lane_elem!(
-    u16,
-    u16s,
-    to_f64_u16,
-    from_f64_u16,
-    to_f64s_u16,
-    from_f64s_u16
-);
-lane_elem!(
-    i32,
-    i32s,
-    to_f64_i32,
-    from_f64_i32,
-    to_f64s_i32,
-    from_f64s_i32
-);
-lane_elem!(
-    u32,
-    u32s,
-    to_f64_u32,
-    from_f64_u32,
-    to_f64s_u32,
-    from_f64s_u32
-);
-lane_elem!(
-    i64,
-    i64s,
-    to_f64_i64,
-    from_f64_i64,
-    to_f64s_i64,
-    from_f64s_i64
-);
-lane_elem!(
-    u64,
-    u64s,
-    to_f64_u64,
-    from_f64_u64,
-    to_f64s_u64,
-    from_f64s_u64
-);
-lane_elem!(
-    f32,
-    f32s,
-    to_f64_f32,
-    from_f64_f32,
-    to_f64s_f32,
-    from_f64s_f32
-);
+lane_elem!(i8, to_f64_i8, from_f64_i8, to_f64s_i8, from_f64s_i8);
+lane_elem!(u8, to_f64_u8, from_f64_u8, to_f64s_u8, from_f64s_u8);
+lane_elem!(i16, to_f64_i16, from_f64_i16, to_f64s_i16, from_f64s_i16);
+lane_elem!(u16, to_f64_u16, from_f64_u16, to_f64s_u16, from_f64s_u16);
+lane_elem!(i32, to_f64_i32, from_f64_i32, to_f64s_i32, from_f64s_i32);
+lane_elem!(u32, to_f64_u32, from_f64_u32, to_f64s_u32, from_f64s_u32);
+lane_elem!(i64, to_f64_i64, from_f64_i64, to_f64s_i64, from_f64s_i64);
+lane_elem!(u64, to_f64_u64, from_f64_u64, to_f64s_u64, from_f64s_u64);
+lane_elem!(f32, to_f64_f32, from_f64_f32, to_f64s_f32, from_f64s_f32);
 
 impl LaneElem for f64 {
-    #[cfg(feature = "simd")]
-    type Vec<S: fearless_simd::Simd> = S::f64s;
     #[inline(always)]
     fn to_f64(self) -> f64 {
         self
@@ -932,6 +884,7 @@ pub fn yuv411_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
 #[cfg(feature = "simd")]
 mod simd_kernels {
     use super::LaneElem;
+    use crate::simd::{join_tables, load3, shuffle3, split_tables, store3};
     use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
 
@@ -1088,75 +1041,6 @@ mod simd_kernels {
 
     fn padded() -> Vec<f64> {
         vec![0.0; PAD + 3 * BLOCK + PAD]
-    }
-
-    /// The byte-swizzle tables of a three-way split or join of `e`-byte
-    /// elements across three consecutive vectors: `t[i][k]` maps output
-    /// vector `i` from input vector `k`, with `0xFF` (past every vector)
-    /// in the lanes that come from another input, which
-    /// `swizzle_dyn_precise` zeroes so the three pulls or together.
-    type Tables<S> = [[<S as Simd>::u8s; 3]; 3];
-
-    /// The tables that split pixels `[r0 g0 b0 r1 ...]` into the planes
-    /// `[r0 r1 ...]`, `[g0 g1 ...]`, `[b0 b1 ...]`.
-    #[inline(always)]
-    fn split_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
-        let n = S::u8s::LEN;
-        std::array::from_fn(|c| {
-            std::array::from_fn(|k| {
-                S::u8s::from_fn(simd, |j| {
-                    let g = (3 * (j / e) + c) * e + j % e;
-                    if g / n == k { (g % n) as u8 } else { 0xFF }
-                })
-            })
-        })
-    }
-
-    /// The tables that join the planes back into pixels; the inverse of
-    /// [`split_tables`].
-    #[inline(always)]
-    fn join_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
-        let n = S::u8s::LEN;
-        std::array::from_fn(|k| {
-            std::array::from_fn(|c| {
-                S::u8s::from_fn(simd, |j| {
-                    let q = (k * n + j) / e;
-                    if q % 3 == c {
-                        ((q / 3) * e + j % e) as u8
-                    } else {
-                        0xFF
-                    }
-                })
-            })
-        })
-    }
-
-    /// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | v[2][t[i][2]]`, per byte.
-    #[inline(always)]
-    fn shuffle3<S: Simd>(t: &Tables<S>, v: [S::u8s; 3]) -> [S::u8s; 3] {
-        std::array::from_fn(|i| {
-            v[0].swizzle_dyn_precise(t[i][0])
-                | v[1].swizzle_dyn_precise(t[i][1])
-                | v[2].swizzle_dyn_precise(t[i][2])
-        })
-    }
-
-    /// Three consecutive vectors of `v`, as bytes.
-    #[inline(always)]
-    fn load3<S: Simd, T: LaneElem>(simd: S, v: &[T]) -> [S::u8s; 3] {
-        let per = T::Vec::<S>::LEN;
-        std::array::from_fn(|k| {
-            T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes()
-        })
-    }
-
-    /// `v` into three consecutive vectors of `out`.
-    #[inline(always)]
-    fn store3<S: Simd, T: LaneElem>(v: [S::u8s; 3], out: &mut [T]) {
-        let per = T::Vec::<S>::LEN;
-        for (k, b) in v.into_iter().enumerate() {
-            T::Vec::<S>::from_bytes(b).store_slice(&mut out[k * per..(k + 1) * per]);
-        }
     }
 
     /// `f64` vectors per vector of the narrowest element, on every level.

@@ -580,8 +580,30 @@ fn read_u64_le(b: &[u8], off: usize) -> u64 {
 
 /// Transpose bytes within elements (library `bshuf_trans_byte_elem_scal`,
 /// bitshuffle_core.c:174). `size` is a multiple of 8 for every shuffled block.
+/// With the `simd` feature the 2-, 4- and 8-byte elements go through
+/// [`bshuf_simd::trans_byte_elem`] first; the loops pick up where it stopped.
 fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
-    let mut ii = 0;
+    if elem_size == 1 {
+        out[..size].copy_from_slice(&input[..size]);
+        return;
+    }
+    #[cfg(feature = "simd")]
+    let done = fearless_simd::dispatch!(ad_core_rs::simd::level(), s => bshuf_simd::trans_byte_elem(s, input, out, size, elem_size));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    bshuf_trans_byte_elem_from(done, input, out, size, elem_size);
+}
+
+/// The element loops of [`bshuf_trans_byte_elem`] from element `from`, a
+/// multiple of 8.
+fn bshuf_trans_byte_elem_from(
+    from: usize,
+    input: &[u8],
+    out: &mut [u8],
+    size: usize,
+    elem_size: usize,
+) {
+    let mut ii = from;
     while ii + 7 < size {
         for jj in 0..elem_size {
             for kk in 0..8 {
@@ -601,11 +623,23 @@ fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: u
 }
 
 /// Transpose bits within bytes (library `bshuf_trans_bit_byte_scal`,
-/// bitshuffle_core.c:219, little-endian path).
+/// bitshuffle_core.c:219, little-endian path). With the `simd` feature
+/// [`bshuf_simd::trans_bit_byte`] runs first; the loop picks up where it
+/// stopped.
 fn bshuf_trans_bit_byte(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
+    #[cfg(feature = "simd")]
+    let done = fearless_simd::dispatch!(ad_core_rs::simd::level(), s => bshuf_simd::trans_bit_byte(s, input, out, nbyte));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    bshuf_trans_bit_byte_from(done, input, out, nbyte);
+}
+
+/// The quadword loop of [`bshuf_trans_bit_byte`] from byte `from`, a
+/// multiple of 8.
+fn bshuf_trans_bit_byte_from(from: usize, input: &[u8], out: &mut [u8], nbyte: usize) {
     let nbyte_bitrow = nbyte / 8;
-    for ii in 0..nbyte_bitrow {
+    for ii in from / 8..nbyte_bitrow {
         let mut x = trans_bit_8x8(read_u64_le(input, ii * 8));
         for kk in 0..8 {
             out[kk * nbyte_bitrow + ii] = x as u8;
@@ -643,11 +677,28 @@ fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> 
 }
 
 /// Transpose bytes for data organized as one row per bit (library
-/// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:281).
+/// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:281). With the `simd`
+/// feature [`bshuf_simd::trans_byte_bitrow`] runs first; the loops pick up
+/// at the column where it stopped.
 fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    #[cfg(feature = "simd")]
+    let done = fearless_simd::dispatch!(ad_core_rs::simd::level(), s => bshuf_simd::trans_byte_bitrow(s, input, out, size, elem_size));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    bshuf_trans_byte_bitrow_from(done, input, out, size, elem_size);
+}
+
+/// The column loops of [`bshuf_trans_byte_bitrow`] from column `from`.
+fn bshuf_trans_byte_bitrow_from(
+    from: usize,
+    input: &[u8],
+    out: &mut [u8],
+    size: usize,
+    elem_size: usize,
+) {
     let nbyte_row = size / 8;
     for jj in 0..elem_size {
-        for ii in 0..nbyte_row {
+        for ii in from..nbyte_row {
             for kk in 0..8 {
                 out[ii * 8 * elem_size + jj * 8 + kk] = input[(jj * 8 + kk) * nbyte_row + ii];
             }
@@ -656,21 +707,300 @@ fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size:
 }
 
 /// Shuffle bits within the bytes of eight-element groups (library
-/// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:308, LE path).
+/// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:308, LE path). With
+/// the `simd` feature [`bshuf_simd::shuffle_bit_eightelem`] runs first; the
+/// loop picks up at the quadword where it stopped.
 fn bshuf_shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
-    let mut jj = 0;
-    while jj < 8 * elem_size {
-        let mut ii = 0;
-        while ii + 8 * elem_size - 1 < nbyte {
-            let mut x = trans_bit_8x8(read_u64_le(input, ii + jj));
-            for kk in 0..8 {
-                out[ii + jj / 8 + kk * elem_size] = x as u8;
-                x >>= 8;
-            }
-            ii += 8 * elem_size;
+    #[cfg(feature = "simd")]
+    let done = fearless_simd::dispatch!(ad_core_rs::simd::level(), s => bshuf_simd::shuffle_bit_eightelem(s, input, out, nbyte, elem_size));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    bshuf_shuffle_bit_eightelem_from(done, input, out, nbyte, elem_size);
+}
+
+/// The quadword loop of [`bshuf_shuffle_bit_eightelem`] from byte `from`, a
+/// multiple of 8: the library walks the quadwords group-column first, this
+/// walks them in address order, and every quadword lands in the same place.
+fn bshuf_shuffle_bit_eightelem_from(
+    from: usize,
+    input: &[u8],
+    out: &mut [u8],
+    nbyte: usize,
+    elem_size: usize,
+) {
+    let group = 8 * elem_size;
+    let mut p = from;
+    while p + 7 < nbyte {
+        let mut x = trans_bit_8x8(read_u64_le(input, p));
+        let base = p / group * group + p % group / 8;
+        for kk in 0..8 {
+            out[base + kk * elem_size] = x as u8;
+            x >>= 8;
         }
-        jj += 8;
+        p += 8;
+    }
+}
+
+/// The bitshuffle transposes on `fearless_simd` lanes. Each kernel covers
+/// the vector-sized prefix of its input and returns where it stopped, so
+/// the scalar loop after it finishes the rest.
+#[cfg(feature = "simd")]
+mod bshuf_simd {
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    // The kernels reinterpret byte vectors as quadword lanes and back, which
+    // is `read_u64_le` only on a little-endian host.
+    const _: () = assert!(cfg!(target_endian = "little"));
+
+    /// [`super::trans_bit_8x8`] on every quadword lane of `x`, back as
+    /// bytes: byte `8 * k + r` holds bit `r` of each byte of quadword `k`.
+    #[inline(always)]
+    fn bit_transposed<S: Simd>(simd: S, x: S::u8s) -> S::u8s {
+        let mut x = S::u64s::from_bytes(x);
+        let m = S::u64s::splat(simd, 0x00AA_00AA_00AA_00AA);
+        let t = (x ^ (x >> 7)) & m;
+        x = x ^ t ^ (t << 7);
+        let m = S::u64s::splat(simd, 0x0000_CCCC_0000_CCCC);
+        let t = (x ^ (x >> 14)) & m;
+        x = x ^ t ^ (t << 14);
+        let m = S::u64s::splat(simd, 0x0000_0000_F0F0_F0F0);
+        let t = (x ^ (x >> 28)) & m;
+        x = x ^ t ^ (t << 28);
+        x.to_bytes()
+    }
+
+    /// The byte shuffle that turns [`bit_transposed`] output into its eight
+    /// bit rows, `LEN / 8` bytes each: byte `r * q + k` takes byte
+    /// `8 * k + r`.
+    #[inline(always)]
+    fn row_order<S: Simd>(simd: S) -> S::u8s {
+        let q = S::u8s::LEN / 8;
+        S::u8s::from_fn(simd, |i| (8 * (i % q) + i / q) as u8)
+    }
+
+    /// [`super::bshuf_trans_byte_elem`] for 2-, 4- and 8-byte elements: the
+    /// vector's worth of elements is `elem_size` byte vectors, and each
+    /// deinterleave level halves the byte stride, so after `log2(elem_size)`
+    /// levels vector `k` holds byte `k` of every element. Returns the
+    /// elements done, 0 for any other element size.
+    #[simd]
+    pub(super) fn trans_byte_elem<S: Simd>(
+        simd: S,
+        input: &[u8],
+        out: &mut [u8],
+        size: usize,
+        elem_size: usize,
+    ) -> usize {
+        if !matches!(elem_size, 2 | 4 | 8) {
+            return 0;
+        }
+        let n = S::u8s::LEN;
+        let mut v = [S::u8s::splat(simd, 0); 8];
+        let mut ii = 0;
+        while ii + n <= size {
+            let chunk = &input[ii * elem_size..(ii + n) * elem_size];
+            for (k, x) in v[..elem_size].iter_mut().enumerate() {
+                *x = S::u8s::from_slice(simd, &chunk[k * n..(k + 1) * n]);
+            }
+            let mut stride = elem_size;
+            while stride > 1 {
+                let mut next = v;
+                for k in 0..elem_size / 2 {
+                    let (lo, hi) = v[2 * k].deinterleave(v[2 * k + 1]);
+                    next[k] = lo;
+                    next[elem_size / 2 + k] = hi;
+                }
+                v = next;
+                stride /= 2;
+            }
+            for (k, x) in v[..elem_size].iter().enumerate() {
+                x.store_slice(&mut out[k * size + ii..k * size + ii + n]);
+            }
+            ii += n;
+        }
+        ii
+    }
+
+    /// [`super::bshuf_trans_bit_byte`]: a vector of bytes at a time, its bit
+    /// rows stored as `LEN / 8` bytes into the eight output rows. Returns
+    /// the bytes done.
+    #[simd]
+    pub(super) fn trans_bit_byte<S: Simd>(
+        simd: S,
+        input: &[u8],
+        out: &mut [u8],
+        nbyte: usize,
+    ) -> usize {
+        let n = S::u8s::LEN;
+        let q = n / 8;
+        let nbyte_bitrow = nbyte / 8;
+        let order = row_order(simd);
+        let mut ii = 0;
+        while ii + n <= nbyte {
+            let rows = bit_transposed(simd, S::u8s::from_slice(simd, &input[ii..ii + n]))
+                .swizzle_dyn(order);
+            for (r, bytes) in rows.as_slice().chunks_exact(q).enumerate() {
+                let o = r * nbyte_bitrow + ii / 8;
+                out[o..o + q].copy_from_slice(bytes);
+            }
+            ii += n;
+        }
+        ii
+    }
+
+    /// One zip level of the row transpose: units `w` bytes wide, row groups
+    /// `2m` and `2m + 1` of the same column range interleaved into the two
+    /// column halves of group `m`. Units of 16 bytes and up are the quadword
+    /// zip followed by `perm`, the lane permutation that regroups its
+    /// alternating quadwords into alternating units.
+    #[inline(always)]
+    fn zip<S: Simd>(a: S::u8s, b: S::u8s, w: usize, perm: S::u8s) -> (S::u8s, S::u8s) {
+        match w {
+            1 => a.interleave(b),
+            2 => {
+                let (lo, hi) = S::u16s::from_bytes(a).interleave(S::u16s::from_bytes(b));
+                (lo.to_bytes(), hi.to_bytes())
+            }
+            4 => {
+                let (lo, hi) = S::u32s::from_bytes(a).interleave(S::u32s::from_bytes(b));
+                (lo.to_bytes(), hi.to_bytes())
+            }
+            8 => {
+                let (lo, hi) = S::u64s::from_bytes(a).interleave(S::u64s::from_bytes(b));
+                (lo.to_bytes(), hi.to_bytes())
+            }
+            _ => {
+                let (lo, hi) = S::u64s::from_bytes(a).interleave(S::u64s::from_bytes(b));
+                (
+                    lo.to_bytes().swizzle_dyn(perm),
+                    hi.to_bytes().swizzle_dyn(perm),
+                )
+            }
+        }
+    }
+
+    /// The permutation [`zip`] applies after the quadword zip for a unit of
+    /// `w` bytes: unit `t`'s `u = w / 8` quadwords of the first operand sit
+    /// at even lanes `2 * (t * u + s)`, the second operand's at the odd
+    /// lanes after them.
+    #[inline(always)]
+    fn zip_perm<S: Simd>(simd: S, w: usize) -> S::u8s {
+        let u = (w / 8).max(1);
+        S::u8s::from_fn(simd, |i| {
+            let lane = i / 8;
+            let (t, s) = (lane / (2 * u), lane % (2 * u));
+            let src = if s < u {
+                2 * (t * u + s)
+            } else {
+                2 * (t * u + s - u) + 1
+            };
+            (src * 8 + i % 8) as u8
+        })
+    }
+
+    /// [`super::bshuf_trans_byte_bitrow`], a plain `8 * elem_size` rows by
+    /// `size / 8` columns byte transpose: a vector of columns at a time, the
+    /// rows zipped level by level (bytes, then 16-, 32-, 64-bit units, and
+    /// on up) until each vector holds whole columns of a group of `g` row
+    /// groups, or one column piece when the column is taller than the
+    /// vector; the vectors then go out column by column, row group by row
+    /// group. Returns the columns done.
+    #[simd]
+    pub(super) fn trans_byte_bitrow<S: Simd>(
+        simd: S,
+        input: &[u8],
+        out: &mut [u8],
+        size: usize,
+        elem_size: usize,
+    ) -> usize {
+        if !matches!(elem_size, 1 | 2 | 4 | 8) {
+            return 0;
+        }
+        let n = S::u8s::LEN;
+        let nbyte_row = size / 8;
+        let nrows = 8 * elem_size;
+        let perms = [zip_perm(simd, 16), zip_perm(simd, 32)];
+        let mut a = [S::u8s::splat(simd, 0); 64];
+        let mut b = [S::u8s::splat(simd, 0); 64];
+        let mut ii = 0;
+        while ii + n <= nbyte_row {
+            for (k, x) in a[..nrows].iter_mut().enumerate() {
+                let s = k * nbyte_row + ii;
+                *x = S::u8s::from_slice(simd, &input[s..s + n]);
+            }
+            let (mut src, mut dst) = (&mut a, &mut b);
+            let (mut g, mut c, mut w) = (nrows, 1, 1);
+            while g > 1 && w < n {
+                let perm = perms[usize::from(w == 32)];
+                for m in 0..g / 2 {
+                    for j in 0..c {
+                        let (lo, hi) =
+                            zip::<S>(src[2 * m * c + j], src[(2 * m + 1) * c + j], w, perm);
+                        dst[2 * m * c + 2 * j] = lo;
+                        dst[2 * m * c + 2 * j + 1] = hi;
+                    }
+                }
+                std::mem::swap(&mut src, &mut dst);
+                g /= 2;
+                c *= 2;
+                w *= 2;
+            }
+            for j in 0..c {
+                for rg in 0..g {
+                    let o = ii * nrows + (j * g + rg) * n;
+                    src[rg * c + j].store_slice(&mut out[o..o + n]);
+                }
+            }
+            ii += n;
+        }
+        ii
+    }
+
+    /// [`super::bshuf_shuffle_bit_eightelem`]: a vector of bytes at a time.
+    /// When a vector sits inside one eight-element group its bit rows are
+    /// runs of consecutive quadwords, one copy per row; when it covers
+    /// whole groups the output bytes are a permutation of the transposed
+    /// bytes, one byte shuffle and one store. Returns the bytes done.
+    #[simd]
+    pub(super) fn shuffle_bit_eightelem<S: Simd>(
+        simd: S,
+        input: &[u8],
+        out: &mut [u8],
+        nbyte: usize,
+        elem_size: usize,
+    ) -> usize {
+        let n = S::u8s::LEN;
+        let q = n / 8;
+        let group = 8 * elem_size;
+        let mut ii = 0;
+        if group >= n {
+            let order = row_order(simd);
+            while ii + n <= nbyte {
+                let rows = bit_transposed(simd, S::u8s::from_slice(simd, &input[ii..ii + n]))
+                    .swizzle_dyn(order);
+                let base = ii / group * group + ii % group / 8;
+                for (r, bytes) in rows.as_slice().chunks_exact(q).enumerate() {
+                    let o = base + r * elem_size;
+                    out[o..o + q].copy_from_slice(bytes);
+                }
+                ii += n;
+            }
+        } else {
+            let order = S::u8s::from_fn(simd, |i| {
+                let (t, rem) = (i / group, i % group);
+                let (r, e) = (rem / elem_size, rem % elem_size);
+                (8 * (t * elem_size + e) + r) as u8
+            });
+            while ii + n <= nbyte {
+                bit_transposed(simd, S::u8s::from_slice(simd, &input[ii..ii + n]))
+                    .swizzle_dyn(order)
+                    .store_slice(&mut out[ii..ii + n]);
+                ii += n;
+            }
+        }
+        ii
     }
 }
 
@@ -1909,6 +2239,63 @@ mod tests {
     }
 
     // ---- Bitshuffle / LZ4 (bslz4) tests ----
+
+    /// Every bitshuffle kernel, finished by its scalar tail, against the
+    /// scalar loops alone, on every level the box offers, for every element
+    /// size the codec sees and block sizes that leave every kind of tail.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn bitshuffle_kernels_match_the_scalar_loops_on_every_level() {
+        use fearless_simd::{Level, dispatch};
+        let top = ad_core_rs::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        for elem_size in [1usize, 2, 4, 8] {
+            for size in [8usize, 16, 24, 64, 128, 136, 520, 1024, 1032] {
+                let nbyte = size * elem_size;
+                let input: Vec<u8> = (0..nbyte)
+                    .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+                    .collect();
+                let mut want = vec![0u8; nbyte];
+                let mut got = vec![0u8; nbyte];
+                for &level in &levels {
+                    let what = format!("{level:?} elem_size={elem_size} size={size}");
+
+                    bshuf_trans_byte_elem_from(0, &input, &mut want, size, elem_size);
+                    got.fill(0);
+                    let done = dispatch!(level, s => bshuf_simd::trans_byte_elem(s, &input, &mut got, size, elem_size));
+                    assert_eq!(done % 8, 0, "{what} trans_byte_elem done");
+                    bshuf_trans_byte_elem_from(done, &input, &mut got, size, elem_size);
+                    assert_eq!(got, want, "{what} trans_byte_elem");
+
+                    bshuf_trans_bit_byte_from(0, &input, &mut want, nbyte);
+                    got.fill(0);
+                    let done = dispatch!(level, s => bshuf_simd::trans_bit_byte(s, &input, &mut got, nbyte));
+                    assert_eq!(done % 8, 0, "{what} trans_bit_byte done");
+                    bshuf_trans_bit_byte_from(done, &input, &mut got, nbyte);
+                    assert_eq!(got, want, "{what} trans_bit_byte");
+
+                    bshuf_trans_byte_bitrow_from(0, &input, &mut want, size, elem_size);
+                    got.fill(0);
+                    let done = dispatch!(level, s => bshuf_simd::trans_byte_bitrow(s, &input, &mut got, size, elem_size));
+                    bshuf_trans_byte_bitrow_from(done, &input, &mut got, size, elem_size);
+                    assert_eq!(got, want, "{what} trans_byte_bitrow");
+
+                    bshuf_shuffle_bit_eightelem_from(0, &input, &mut want, nbyte, elem_size);
+                    got.fill(0);
+                    let done = dispatch!(level, s => bshuf_simd::shuffle_bit_eightelem(s, &input, &mut got, nbyte, elem_size));
+                    assert_eq!(done % 8, 0, "{what} shuffle_bit_eightelem done");
+                    bshuf_shuffle_bit_eightelem_from(done, &input, &mut got, nbyte, elem_size);
+                    assert_eq!(got, want, "{what} shuffle_bit_eightelem");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_bitshuffle_block_transpose_roundtrip() {

@@ -712,12 +712,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 
                 let channel_name_refs: Vec<&str> =
                     channel_names.iter().map(|s| s.as_str()).collect();
+                let drv = m.driver()?;
                 let (ts_runtime, _ts_params, _ts_actor_jh, _ts_data_jh) =
                     crate::time_series::create_ts_port_runtime(
                         &port_name,
                         &channel_name_refs,
                         2048,
                         ts_rx,
+                        drv.pool(),
                     );
                 if let Err(e) = m.add_port(&dtyp, ts_runtime) {
                     eprintln!("NDTimeSeriesConfigure: {e}");

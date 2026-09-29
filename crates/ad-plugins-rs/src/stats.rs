@@ -193,8 +193,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     fn lower(cur: Self, e: Self) -> Self;
     fn upper(cur: Self, e: Self) -> Self;
     /// The two reductions, as this type runs them: the lane loops below, or,
-    /// with the `simd` feature, [`simd_kernels`] — `range` for every type,
-    /// `variance` for the types up to 32 bits.
+    /// with the `simd` feature, [`simd_kernels`].
     fn range(v: &[Self]) -> Range<Self> {
         range_pass(v)
     }
@@ -296,13 +295,17 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (wide: $($t:ty => $lane:ty => $acc:ty [$range:ident, $project:ident]),* $(,)?) => {$(
+    (wide: $($t:ty => $lane:ty => $acc:ty [$range:ident, $variance:ident, $project:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = $acc;
             type Lane = $lane;
             #[cfg(feature = "simd")]
             fn range(v: &[Self]) -> Range<Self> {
                 fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
+            }
+            #[cfg(feature = "simd")]
+            fn variance(v: &[Self], mean: f64) -> f64 {
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$variance(s, v, mean))
             }
             #[cfg(feature = "simd")]
             fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
@@ -338,13 +341,17 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (float: $($t:ty [$range:ident, $project:ident, $hist:ident]),* $(,)?) => {$(
+    (float: $($t:ty [$range:ident, $variance:ident, $project:ident, $hist:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = f64;
             type Lane = f64;
             #[cfg(feature = "simd")]
             fn range(v: &[Self]) -> Range<Self> {
                 fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
+            }
+            #[cfg(feature = "simd")]
+            fn variance(v: &[Self], mean: f64) -> f64 {
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$variance(s, v, mean))
             }
             #[cfg(feature = "simd")]
             fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
@@ -393,8 +400,8 @@ stats_elem! {
     u16 => u32 => u64 [range_u16, variance_u16, project_u16] Some(1 << 16),
     u32 => u64 => u64 [range_u32, variance_u32, project_u32, hist hist_u32] None,
 }
-stats_elem!(wide: i64 => f64 => f64 [range_i64, project_i64], u64 => f64 => f64 [range_u64, project_u64]);
-stats_elem!(float: f32 [range_f32, project_f32, hist_f32], f64 [range_f64, project_f64, hist_f64]);
+stats_elem!(wide: i64 => f64 => f64 [range_i64, variance_i64, project_i64], u64 => f64 => f64 [range_u64, variance_u64, project_u64]);
+stats_elem!(float: f32 [range_f32, variance_f32, project_f32, hist_f32], f64 [range_f64, variance_f64, project_f64, hist_f64]);
 
 /// Independent accumulators per reduction. Fixing the association this way is
 /// what lets the compiler vectorize a floating-point sum at all — an IEEE sum
@@ -955,6 +962,40 @@ mod simd_kernels {
         [a, b]
     });
     float_range_kernel!(f64, f64s, range_f64, |y| [y]);
+
+    /// [`super::variance_pass`] on vectors for the types whose chunk is
+    /// `$to_f64` `f64` vectors: the 64-bit integers and the floats.
+    macro_rules! variance_kernel {
+        ($t:ty, $vec:ident, $name:ident, |$y:ident| $to_f64:expr) => {
+            #[simd]
+            pub(super) fn $name<S: Simd>(simd: S, v: &[$t], mean: f64) -> f64 {
+                let mut chunks = v.chunks_exact(S::$vec::LEN);
+                let m = S::f64s::splat(simd, mean);
+                let mut acc = S::f64s::splat(simd, 0.0);
+                for c in &mut chunks {
+                    let $y = S::$vec::from_slice(simd, c);
+                    for f in $to_f64 {
+                        let d = f - m;
+                        acc = d.mul_add(d, acc);
+                    }
+                }
+                let mut sum = acc.reduce_sum();
+                for &e in chunks.remainder() {
+                    let d = e as f64 - mean;
+                    sum += d * d;
+                }
+                sum
+            }
+        };
+    }
+
+    variance_kernel!(i64, i64s, variance_i64, |y| [S::f64s::float_from(y)]);
+    variance_kernel!(u64, u64s, variance_u64, |y| [S::f64s::float_from(y)]);
+    variance_kernel!(f32, f32s, variance_f32, |y| {
+        let (a, b) = y.widen();
+        [a, b]
+    });
+    variance_kernel!(f64, f64s, variance_f64, |y| [y]);
 }
 
 /// Merge two partial ranges; ties keep `a`, the earlier slice.
@@ -2319,7 +2360,7 @@ mod tests {
     /// in the first slot, mid-vector, and in the tail.
     #[cfg(feature = "simd")]
     #[test]
-    fn wide_and_float_range_kernels_match_range_pass_on_every_level() {
+    fn wide_and_float_kernels_match_the_lane_passes_on_every_level() {
         use fearless_simd::{Level, dispatch};
         let top = ad_core_rs::simd::level();
         let mut levels = vec![top, Level::baseline()];
@@ -2360,7 +2401,36 @@ mod tests {
                     dispatch!(level, s => simd_kernels::range_u64(s, &uints)),
                     range_pass(&uints),
                 );
+                // A sum of squares near 1e16 over 1e5 elements: the lane
+                // association differs, so the two round apart by up to
+                // n * eps, well inside 1e-10.
+                let var = |got: f64, want: f64, what: &str| {
+                    if !(got.is_nan() && want.is_nan()) {
+                        assert_close(what, got, want, 1e-10);
+                    }
+                };
+                var(
+                    dispatch!(level, s => simd_kernels::variance_i64(s, &ints, 3.5)),
+                    variance_pass(&ints, 3.5),
+                    &format!("{what} i64 variance"),
+                );
+                var(
+                    dispatch!(level, s => simd_kernels::variance_u64(s, &uints, 3.5)),
+                    variance_pass(&uints, 3.5),
+                    &format!("{what} u64 variance"),
+                );
                 for (k, v) in floats.iter().enumerate() {
+                    var(
+                        dispatch!(level, s => simd_kernels::variance_f64(s, v, 3.5)),
+                        variance_pass(v, 3.5),
+                        &format!("{what} f64 variance case {k}"),
+                    );
+                    let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+                    var(
+                        dispatch!(level, s => simd_kernels::variance_f32(s, &v32, 3.5)),
+                        variance_pass(&v32, 3.5),
+                        &format!("{what} f32 variance case {k}"),
+                    );
                     same(
                         &format!("{what} f64 case {k}"),
                         dispatch!(level, s => simd_kernels::range_f64(s, v)),

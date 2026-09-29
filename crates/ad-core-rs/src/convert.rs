@@ -16,11 +16,10 @@
 //! A C cast is NOT Rust's saturating `as` on the float→int edge, and it is
 //! NOT a clamp: narrowing truncates to the low bits (`(epicsUInt8)300 ==
 //! 44`), same-width sign changes reinterpret (`(epicsInt8)(epicsUInt8)255
-//! == -1`). Rust's `as` between integer types is exactly the C cast, so the
-//! kernels below cast with `as` and never clamp. Any plugin that
-//! re-implements extraction with an f64 accumulator plus a clamp/saturate
-//! re-opens this divergence — call [`convert_dims`] / [`convert_type`]
-//! instead.
+//! == -1`). Both kernels cast through one definition, `CCast`, and never
+//! clamp. Any plugin that re-implements extraction with an f64 accumulator
+//! plus a clamp/saturate re-opens this divergence — call [`convert_dims`] /
+//! [`convert_type`] instead.
 
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -266,10 +265,10 @@ mod simd_kernels {
 
 /// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`).
 ///
-/// Every element goes through a C cast (`(dataTypeOut)value`): narrowing
-/// truncates to the low bits and wraps, it does not clamp. Float sources
-/// truncate toward zero (out-of-range float→int is undefined in C; the port
-/// keeps Rust's saturation there rather than inventing a trap value).
+/// Every element goes through the C cast (`(dataTypeOut)value`) of
+/// `CCast`: narrowing truncates to the low bits and wraps, it does not
+/// clamp, and a float source truncates toward zero before that, exactly as
+/// [`convert_dims`] casts it.
 ///
 /// Dimensions, timestamps and attributes are carried over unchanged.
 pub fn convert_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
@@ -302,7 +301,8 @@ pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> 
         ($v:expr, $out:expr) => {
             crate::with_buffer_mut_typed!($out, |o: T| {
                 o.clear();
-                o.extend($v.iter().map(|&x| x as T));
+                o.reserve($v.len());
+                CCast::<T>::cast_extend($v, o);
             })
         };
     }
@@ -552,6 +552,36 @@ mod tests {
         assert_eq!(<f64 as CCast<u64>>::c_cast(-1.0), u64::MAX);
         assert_eq!(<f64 as CCast<u16>>::c_cast(f64::NAN), 0);
         assert_eq!(<f32 as CCast<i32>>::c_cast(f32::INFINITY), -1);
+    }
+
+    #[test]
+    fn convert_type_casts_float_sources_as_convert_dims_does() {
+        use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+        let values = vec![
+            300.0f32,
+            -1.5,
+            255.9,
+            f32::NAN,
+            f32::INFINITY,
+            65536.0 + 44.0,
+        ];
+        let src = NDArray::with_data(
+            vec![NDDimension::new(values.len())],
+            NDDataBuffer::F32(values),
+        );
+        let typed = super::convert_type(&src, NDDataType::UInt8).unwrap();
+        let dims = super::convert_dims(
+            &src,
+            &[NDDimension::new(src.dims[0].size)],
+            NDDataType::UInt8,
+        )
+        .unwrap();
+        let (NDDataBuffer::U8(typed), NDDataBuffer::U8(dims)) = (&typed.data, &dims.data) else {
+            panic!("target type not honoured");
+        };
+        // Infinity saturates the i128 and its low byte is 0xff.
+        assert_eq!(*typed, vec![44, 255, 255, 0, 255, 44]);
+        assert_eq!(typed, dims);
     }
 
     #[cfg(feature = "simd")]

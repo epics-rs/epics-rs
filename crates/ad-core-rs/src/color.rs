@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_data_type_f32_to_u8_clamp() {
+    fn test_convert_data_type_f32_to_u8_wraps_like_a_c_cast() {
         let mut arr = NDArray::new(vec![NDDimension::new(3)], NDDataType::Float32);
         if let NDDataBuffer::F32(ref mut v) = arr.data {
             v[0] = -10.0;
@@ -1398,9 +1398,9 @@ mod tests {
         }
         let result = convert_data_type(&arr, NDDataType::UInt8).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
-            assert_eq!(v[0], 0); // clamped
+            assert_eq!(v[0], 246); // (epicsUInt8)-10
             assert_eq!(v[1], 128); // truncated
-            assert_eq!(v[2], 255); // clamped
+            assert_eq!(v[2], 44); // (epicsUInt8)300
         } else {
             panic!("wrong type");
         }

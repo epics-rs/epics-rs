@@ -10,6 +10,8 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
+ "fearless_simd",
+ "fearless_simd_macros",
  "futures-util",
  "parking_lot",
  "source-guard",

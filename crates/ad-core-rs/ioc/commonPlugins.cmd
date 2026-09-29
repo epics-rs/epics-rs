@@ -56,7 +56,7 @@ dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI4:,PORT=ROI4,NDARRAY_PORT=$(PO
 
 # ===== ROI statistics (with 32 ROIs via substitute+include) =====
 
-NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0)
+NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0, 32, 0, 0, 0, 0)
 dbLoadRecords("NDROIStat.template", "P=$(PREFIX),R=ROIStat1:,PORT=ROISTAT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:1:,PORT=ROISTAT1,ADDR=0,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:2:,PORT=ROISTAT1,ADDR=1,TIMEOUT=1,NCHANS=$(NCHANS)")
@@ -151,7 +151,7 @@ dbLoadRecords("NDTransform.template", "P=$(PREFIX),R=Trans1:,PORT=TRANS1,NDARRAY
 
 # ===== Overlay plugin (with 8 overlays) =====
 
-NDOverlayConfigure("OVER1", $(QSIZE), 0, "$(PORT)", 0)
+NDOverlayConfigure("OVER1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0)
 dbLoadRecords("NDOverlay.template", "P=$(PREFIX),R=Over1:,PORT=OVER1,NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDOverlayN.template", "P=$(PREFIX),R=Over1:1:,NAME=ROI1,SHAPE=1,O=Over1:,XPOS=$(PREFIX)ROI1:MinX_RBV,YPOS=$(PREFIX)ROI1:MinY_RBV,XSIZE=$(PREFIX)ROI1:SizeX_RBV,YSIZE=$(PREFIX)ROI1:SizeY_RBV,PORT=OVER1,ADDR=0,TIMEOUT=1")
 dbLoadRecords("NDOverlayN.template", "P=$(PREFIX),R=Over1:2:,NAME=ROI2,SHAPE=1,O=Over1:,XPOS=$(PREFIX)ROI2:MinX_RBV,YPOS=$(PREFIX)ROI2:MinY_RBV,XSIZE=$(PREFIX)ROI2:SizeX_RBV,YSIZE=$(PREFIX)ROI2:SizeY_RBV,PORT=OVER1,ADDR=1,TIMEOUT=1")

@@ -459,10 +459,7 @@ pub fn draw_overlays(
     Ok(arr)
 }
 
-/// Maximum number of overlays.
-const MAX_OVERLAYS: usize = 8;
-
-/// Runtime overlay state — one per addr (0..7).
+/// Runtime overlay state — one per address in `0..maxOverlays`.
 #[derive(Debug, Clone)]
 struct OverlaySlot {
     use_overlay: bool,
@@ -603,14 +600,17 @@ struct OverlayParamIndices {
 pub struct OverlayProcessor {
     /// The overlay slots, rewritten by an addressed param write while the
     /// frame path may be drawing from them.
-    slots: Mutex<[OverlaySlot; MAX_OVERLAYS]>,
+    slots: Mutex<Vec<OverlaySlot>>,
     params: OverlayParamIndices,
 }
 
 impl OverlayProcessor {
-    pub fn new(overlays: Vec<OverlayDef>) -> Self {
-        let mut slots: [OverlaySlot; MAX_OVERLAYS] = Default::default();
-        for (i, o) in overlays.into_iter().enumerate().take(MAX_OVERLAYS) {
+    /// `max_overlays` is the C constructor's `maxOverlays`: one slot per
+    /// address (NDPluginOverlay.cpp:412), and the port that serves them has
+    /// the same number of addresses (`:403`). Address 0 always exists.
+    pub fn new(max_overlays: usize, overlays: Vec<OverlayDef>) -> Self {
+        let mut slots = vec![OverlaySlot::default(); max_overlays.max(1)];
+        for (i, o) in overlays.into_iter().enumerate().take(slots.len()) {
             let slot = &mut slots[i];
             slot.use_overlay = true;
             slot.draw_mode = if o.draw_mode == DrawMode::XOR { 1 } else { 0 };
@@ -761,11 +761,10 @@ impl NDPluginProcess for OverlayProcessor {
         use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue, ParamUpdate};
 
         let idx = params.addr as usize;
-        if idx >= MAX_OVERLAYS {
-            return ParamChangeResult::updates(vec![]);
-        }
         let mut slots = self.slots.lock();
-        let slot = &mut slots[idx];
+        let Some(slot) = slots.get_mut(idx) else {
+            return ParamChangeResult::updates(vec![]);
+        };
         let mut updates = Vec::new();
 
         // C++ NDPluginOverlay::writeInt32 freeze semantics. Position/Center/
@@ -962,8 +961,8 @@ mod tests {
         use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
-        let mut proc = OverlayProcessor::new(vec![]);
-        let mut base = PortDriverBase::new("R6_72", MAX_OVERLAYS + 1, PortFlags::default());
+        let mut proc = OverlayProcessor::new(8, vec![]);
+        let mut base = PortDriverBase::new("R6_72", 9, PortFlags::default());
         proc.register_params(&mut base).unwrap();
 
         let red = proc.params.red.expect("OVERLAY_RED registered");
@@ -1647,7 +1646,7 @@ mod tests {
     }
 
     fn setup_processor() -> (OverlayProcessor, OverlayParamIndices) {
-        let mut p = OverlayProcessor::new(vec![]);
+        let mut p = OverlayProcessor::new(8, vec![]);
         let mut base =
             asyn_rs::port::PortDriverBase::new("OV_TEST", 8, asyn_rs::port::PortFlags::default());
         p.register_params(&mut base).unwrap();
@@ -1661,6 +1660,35 @@ mod tests {
             ..Default::default()
         };
         (p, params)
+    }
+
+    #[test]
+    fn a_slot_exists_for_every_address_below_max_overlays_and_none_above() {
+        // NDOverlayConfigure's maxOverlays sizes the slots; the port has the
+        // same number of addresses, so the last overlay is at maxOverlays-1
+        // and an address past that reaches no slot.
+        let mut p = OverlayProcessor::new(3, vec![]);
+        let mut base =
+            asyn_rs::port::PortDriverBase::new("OV_MAX", 3, asyn_rs::port::PortFlags::default());
+        p.register_params(&mut base).unwrap();
+        let use_overlay = p.params.use_overlay.unwrap();
+        for (addr, want_slots) in [(2, 3), (3, 3)] {
+            let snap = PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: use_overlay,
+                addr,
+                value: ParamChangeValue::Int32(1),
+            };
+            p.on_param_change(use_overlay, &snap);
+            assert_eq!(p.slots.lock().len(), want_slots);
+        }
+        assert!(p.slots.lock()[2].use_overlay, "address 2 is the third slot");
+        assert_eq!(p.build_active_overlays().len(), 1);
+        assert_eq!(
+            OverlayProcessor::new(0, vec![]).slots.lock().len(),
+            1,
+            "address 0 always exists"
+        );
     }
 
     #[test]

@@ -142,6 +142,22 @@ pub fn max_threads_arg(args: &[ArgValue], index: usize) -> i32 {
     }
 }
 
+/// The count a plugin `*Configure` command inserts at argument 5 —
+/// `maxOverlays` (NDPluginOverlay.cpp:523-526), `maxROIs`
+/// (NDPluginROIStat.cpp:590-593) — as the number of addresses to build the
+/// port with.
+///
+/// C hands the count to `NDPluginDriver` as `maxAddr` and sizes its
+/// per-address state by it (NDPluginOverlay.cpp:403,412;
+/// NDPluginROIStat.cpp:495,502). An absent iocsh int argument is 0, and
+/// address 0 always exists, so the floor is 1 on both sides.
+pub fn count_arg(args: &[ArgValue], index: usize) -> usize {
+    match args.get(index) {
+        Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
+        _ => 1,
+    }
+}
+
 /// Auto-derive DTYP name from port name: `"ROI1"` → `"asynROI1"`.
 pub fn dtyp_from_port(port_name: &str) -> String {
     format!("asyn{port_name}")

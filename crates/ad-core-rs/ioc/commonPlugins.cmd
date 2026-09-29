@@ -177,7 +177,7 @@ dbLoadRecords("NDCircularBuff.template", "P=$(PREFIX),R=CB1:,PORT=CB1,NDARRAY_PO
 
 # ===== Attributes (with 8 attribute channels + TimeSeries) =====
 
-NDAttrConfigure("ATTR1", $(QSIZE), 0, "$(PORT)", 0)
+NDAttrConfigure("ATTR1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0)
 dbLoadRecords("NDAttribute.template", "P=$(PREFIX),R=Attr1:,PORT=ATTR1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDAttributeN.template", "P=$(PREFIX),R=Attr1:1:,PORT=ATTR1,ADDR=0,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDAttributeN.template", "P=$(PREFIX),R=Attr1:2:,PORT=ATTR1,ADDR=1,TIMEOUT=1,NCHANS=$(NCHANS)")

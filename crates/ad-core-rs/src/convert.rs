@@ -238,70 +238,101 @@ pub fn convert_dims_into(
         out_strides[i] = out_strides[i - 1] * out_sizes[i - 1];
     }
 
+    // The output row by row: a row is the run along dim 0, and every output
+    // row is the bin sum of `bin_hi` source rows (the binning window in the
+    // outer dims), each binned along dim 0 by `bin0`. The decomposition of
+    // an index into coordinates happens per row, not per element, and the
+    // per-element loops are plain strided runs the compiler vectorizes. The
+    // source coordinates never leave the source: `output_dims` checked
+    // `offset + size <= src size` per dim and the window covers
+    // `out_size * bin <= size` of it.
+    let bin0 = dims_out[0].binning.max(1);
+    let out0 = out_sizes[0];
+    let used0 = out0 * bin0;
+    let off0 = dims_out[0].offset;
+    let rows = total_out / out0;
+    let bin_hi: usize = dims_out[1..].iter().map(|d| d.binning.max(1)).product();
+    let mut out_coords = vec![0usize; ndims];
+    let mut bases = vec![0usize; bin_hi];
+    // The flat source index of each source row in output row `row`'s
+    // binning window, into `bases`.
+    let mut row_bases = |row: usize, bases: &mut [usize]| {
+        // The output row's coordinates in dims 1.., reversed where asked.
+        let mut remaining = row;
+        for i in (1..ndims).rev() {
+            let stride = out_strides[i] / out0;
+            let c = remaining / stride;
+            remaining %= stride;
+            out_coords[i] = if dims_out[i].reverse {
+                out_sizes[i] - 1 - c
+            } else {
+                c
+            };
+        }
+        for (b, base) in bases.iter_mut().enumerate() {
+            let mut br = b;
+            let mut flat = off0;
+            for i in (1..ndims).rev() {
+                let bin = dims_out[i].binning.max(1);
+                let win = br % bin;
+                br /= bin;
+                flat += (dims_out[i].offset + out_coords[i] * bin + win) * src_strides[i];
+            }
+            *base = flat;
+        }
+    };
+
     // Macro: bin/offset/reverse a single (source -> target) type pair,
     // accumulating directly in the TARGET type to match C `convertDim`
     // (NDArrayPool.cpp:434-471), which sums `(dataTypeOut)*pDIn` in the
     // output type. `$AccT` is the accumulator (`i128` for integer
     // targets, the target float type otherwise — see [`BinAcc`]);
-    // `$DstT` / `$variant` are the target element type and its
-    // `NDDataBuffer` variant.
+    // `$DstT` is the target element type. Every element goes through
+    // `as $AccT as $DstT` on both paths below, so an unbinned frame casts
+    // exactly as a binned one does.
     macro_rules! bin_loop {
         ($src_vec:expr, $out:expr, $DstT:ty, $AccT:ty) => {{
+            let src_vec = $src_vec;
             let out = $out;
             out.clear();
-            out.resize(total_out, 0 as $DstT);
-
-            // Iterate over all output pixels
-            for out_idx in 0..total_out {
-                // Decompose flat output index into per-dim coordinates
-                let mut remaining = out_idx;
-                let mut out_coords = [0usize; 10]; // up to 10 dims
-                for i in (0..ndims).rev() {
-                    out_coords[i] = remaining / out_strides[i];
-                    remaining %= out_strides[i];
-                }
-
-                // Apply reverse: flip coordinate in output space
-                let mut eff_coords = [0usize; 10];
-                for i in 0..ndims {
-                    eff_coords[i] = if dims_out[i].reverse {
-                        out_sizes[i] - 1 - out_coords[i]
+            out.reserve(total_out);
+            if bin0 == 1 && bin_hi == 1 {
+                // No binning: each output element is one source element.
+                for row in 0..rows {
+                    row_bases(row, &mut bases);
+                    let base = bases[0];
+                    let src_row = src_vec[base..base + used0].iter();
+                    if dims_out[0].reverse {
+                        out.extend(src_row.rev().map(|&s| s as $AccT as $DstT));
                     } else {
-                        out_coords[i]
-                    };
+                        out.extend(src_row.map(|&s| s as $AccT as $DstT));
+                    }
                 }
-
-                // Sum over the binning window in the TARGET type.
-                let mut acc = <$AccT as BinAcc>::ZERO;
-                let bin_total: usize = dims_out.iter().map(|d| d.binning.max(1)).product();
-
-                // Iterate over all bin offsets
-                for bin_flat in 0..bin_total {
-                    let mut br = bin_flat;
-                    let mut src_flat = 0usize;
-                    let mut valid = true;
-
-                    for i in (0..ndims).rev() {
-                        let bin = dims_out[i].binning.max(1);
-                        let bin_off = br % bin;
-                        br /= bin;
-
-                        let src_coord = dims_out[i].offset + eff_coords[i] * bin + bin_off;
-                        if src_coord >= src.dims[i].size {
-                            valid = false;
-                            break;
+            } else {
+                let mut acc = vec![<$AccT as BinAcc>::ZERO; out0];
+                for row in 0..rows {
+                    acc.fill(<$AccT as BinAcc>::ZERO);
+                    row_bases(row, &mut bases);
+                    for &base in &bases {
+                        let src_row = &src_vec[base..base + used0];
+                        if bin0 == 1 {
+                            for (a, &s) in acc.iter_mut().zip(src_row) {
+                                *a = a.bin_add(s as $AccT);
+                            }
+                        } else {
+                            for (a, w) in acc.iter_mut().zip(src_row.chunks_exact(bin0)) {
+                                for &s in w {
+                                    *a = a.bin_add(s as $AccT);
+                                }
+                            }
                         }
-                        src_flat += src_coord * src_strides[i];
                     }
-
-                    if valid {
-                        // C `(dataTypeOut)*pDIn`: cast the source element
-                        // into the accumulator (target) type, then add.
-                        acc = acc.bin_add($src_vec[src_flat] as $AccT);
+                    if dims_out[0].reverse {
+                        out.extend(acc.iter().rev().map(|&a| a as $DstT));
+                    } else {
+                        out.extend(acc.iter().map(|&a| a as $DstT));
                     }
                 }
-
-                out[out_idx] = acc as $DstT;
             }
         }};
     }

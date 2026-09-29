@@ -193,7 +193,8 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     fn lower(cur: Self, e: Self) -> Self;
     fn upper(cur: Self, e: Self) -> Self;
     /// The two reductions, as this type runs them: the lane loops below, or,
-    /// with the `simd` feature, [`simd_kernels`] for the types up to 32 bits.
+    /// with the `simd` feature, [`simd_kernels`] — `range` for every type,
+    /// `variance` for the types up to 32 bits.
     fn range(v: &[Self]) -> Range<Self> {
         range_pass(v)
     }
@@ -296,10 +297,14 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (wide: $($t:ty => $lane:ty => $acc:ty),* $(,)?) => {$(
+    (wide: $($t:ty => $lane:ty => $acc:ty [$range:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = $acc;
             type Lane = $lane;
+            #[cfg(feature = "simd")]
+            fn range(v: &[Self]) -> Range<Self> {
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
+            }
             #[inline(always)]
             fn to_lane(self) -> $lane {
                 self as $lane
@@ -330,10 +335,14 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (float: $($t:ty [$project:ident, $hist:ident]),* $(,)?) => {$(
+    (float: $($t:ty [$range:ident, $project:ident, $hist:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = f64;
             type Lane = f64;
+            #[cfg(feature = "simd")]
+            fn range(v: &[Self]) -> Range<Self> {
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
+            }
             #[cfg(feature = "simd")]
             fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
                 fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
@@ -381,8 +390,8 @@ stats_elem! {
     u16 => u32 => u64 [range_u16, variance_u16, project_u16] Some(1 << 16),
     u32 => u64 => u64 [range_u32, variance_u32, project_u32, hist hist_u32] None,
 }
-stats_elem!(wide: i64 => f64 => f64, u64 => f64 => f64);
-stats_elem!(float: f32 [project_f32, hist_f32], f64 [project_f64, hist_f64]);
+stats_elem!(wide: i64 => f64 => f64 [range_i64], u64 => f64 => f64 [range_u64]);
+stats_elem!(float: f32 [range_f32, project_f32, hist_f32], f64 [range_f64, project_f64, hist_f64]);
 
 /// Independent accumulators per reduction. Fixing the association this way is
 /// what lets the compiler vectorize a floating-point sum at all — an IEEE sum
@@ -512,7 +521,7 @@ fn first_index<T: PartialEq + Copy>(v: &[T], x: T) -> usize {
 /// element, so every type that widens to `f64` vectors gets a kernel.
 #[cfg(feature = "simd")]
 mod simd_kernels {
-    use super::{FLUSH, Formula, Range};
+    use super::{FLUSH, Formula, Range, StatsElem};
     use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
 
@@ -864,6 +873,83 @@ mod simd_kernels {
             [S::f64s::float_from(p0), S::f64s::float_from(p1)]
         }
     );
+
+    /// [`super::range_pass`] for a 64-bit integer type: the extremes on the
+    /// native lanes, the total as `f64` lane sums, the association the
+    /// scalar pass uses too.
+    macro_rules! wide_range_kernel {
+        ($t:ty, $vec:ident, $name:ident) => {
+            #[simd]
+            pub(super) fn $name<S: Simd>(simd: S, v: &[$t]) -> Range<$t> {
+                let mut chunks = v.chunks_exact(S::$vec::LEN);
+                let mut mins = S::$vec::splat(simd, v[0]);
+                let mut maxs = S::$vec::splat(simd, v[0]);
+                let mut sums = S::f64s::splat(simd, 0.0);
+                for c in &mut chunks {
+                    let x = S::$vec::from_slice(simd, c);
+                    mins = mins.min(x);
+                    maxs = maxs.max(x);
+                    sums += S::f64s::float_from(x);
+                }
+                let mut min = mins.reduce_min();
+                let mut max = maxs.reduce_max();
+                let mut total = sums.reduce_sum();
+                for &e in chunks.remainder() {
+                    min = min.min(e);
+                    max = max.max(e);
+                    total += e as f64;
+                }
+                Range { min, max, total }
+            }
+        };
+    }
+
+    wide_range_kernel!(i64, i64s, range_i64);
+    wide_range_kernel!(u64, u64s, range_u64);
+
+    /// [`super::range_pass`] for a float type: strict `<`/`>` compares with a
+    /// select, so a NaN never wins a lane and the NaN a lane holds from
+    /// `v[0]` is never displaced; the lane fold and the tail keep the same
+    /// rule through [`StatsElem::lower`]/[`upper`]. `$to_f64` splits a chunk
+    /// into its `f64` vectors for the sum.
+    macro_rules! float_range_kernel {
+        ($t:ty, $vec:ident, $name:ident, |$y:ident| $to_f64:expr) => {
+            #[simd]
+            pub(super) fn $name<S: Simd>(simd: S, v: &[$t]) -> Range<$t> {
+                let mut chunks = v.chunks_exact(S::$vec::LEN);
+                let mut mins = S::$vec::splat(simd, v[0]);
+                let mut maxs = S::$vec::splat(simd, v[0]);
+                let mut sums = S::f64s::splat(simd, 0.0);
+                for c in &mut chunks {
+                    let $y = S::$vec::from_slice(simd, c);
+                    mins = $y.simd_lt(mins).select($y, mins);
+                    maxs = $y.simd_gt(maxs).select($y, maxs);
+                    for f in $to_f64 {
+                        sums += f;
+                    }
+                }
+                let mut min = v[0];
+                let mut max = v[0];
+                for (&lo, &hi) in mins.as_slice().iter().zip(maxs.as_slice()) {
+                    min = <$t as StatsElem>::lower(min, lo);
+                    max = <$t as StatsElem>::upper(max, hi);
+                }
+                let mut total = sums.reduce_sum();
+                for &e in chunks.remainder() {
+                    min = <$t as StatsElem>::lower(min, e);
+                    max = <$t as StatsElem>::upper(max, e);
+                    total += e as f64;
+                }
+                Range { min, max, total }
+            }
+        };
+    }
+
+    float_range_kernel!(f32, f32s, range_f32, |y| {
+        let (a, b) = y.widen();
+        [a, b]
+    });
+    float_range_kernel!(f64, f64s, range_f64, |y| [y]);
 }
 
 /// Merge two partial ranges; ties keep `a`, the earlier slice.
@@ -2222,6 +2308,69 @@ mod tests {
         70_001,
         2 * FLUSH * LANES + 3,
     ];
+
+    /// The wide and float range kernels against the lane pass on every
+    /// level the box offers, with NaNs where the strict-compare rule shows:
+    /// in the first slot, mid-vector, and in the tail.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn wide_and_float_range_kernels_match_range_pass_on_every_level() {
+        use fearless_simd::{Level, dispatch};
+        let top = ad_core_rs::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        fn same<T: StatsElem + std::fmt::Debug>(what: &str, got: Range<T>, want: Range<T>) {
+            let bits = |x: T| format!("{x:?}");
+            assert_eq!(bits(got.min), bits(want.min), "{what} min");
+            assert_eq!(bits(got.max), bits(want.max), "{what} max");
+            if got.total.is_nan() && want.total.is_nan() {
+                return;
+            }
+            assert_close(&format!("{what} total"), got.total, want.total, 1e-12);
+        }
+        for &n in KERNEL_LENGTHS {
+            let ints: Vec<i64> = (0..n).map(|i| seq(i) as i64 - 500_000).collect();
+            let uints: Vec<u64> = (0..n).map(|i| seq(i) as u64 * 3).collect();
+            let mut floats: Vec<Vec<f64>> =
+                vec![(0..n).map(|i| seq(i) as f64 * 0.37 - 100.0).collect()];
+            for at in [0, n / 2, n - 1] {
+                let mut v = floats[0].clone();
+                v[at] = f64::NAN;
+                floats.push(v);
+            }
+            for &level in &levels {
+                let what = format!("{level:?} n={n}");
+                same(
+                    &format!("{what} i64"),
+                    dispatch!(level, s => simd_kernels::range_i64(s, &ints)),
+                    range_pass(&ints),
+                );
+                same(
+                    &format!("{what} u64"),
+                    dispatch!(level, s => simd_kernels::range_u64(s, &uints)),
+                    range_pass(&uints),
+                );
+                for (k, v) in floats.iter().enumerate() {
+                    same(
+                        &format!("{what} f64 case {k}"),
+                        dispatch!(level, s => simd_kernels::range_f64(s, v)),
+                        range_pass(v),
+                    );
+                    let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+                    same(
+                        &format!("{what} f32 case {k}"),
+                        dispatch!(level, s => simd_kernels::range_f32(s, &v32)),
+                        range_pass(&v32),
+                    );
+                }
+            }
+        }
+    }
 
     fn check_kernel_against_reference<T>(
         name: &str,

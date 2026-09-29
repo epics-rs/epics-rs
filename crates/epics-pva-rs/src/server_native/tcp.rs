@@ -9623,24 +9623,16 @@ mod tests {
 
         // --- Forward fail-closed: unsupported scalar leaf -> None. ---
 
-        /// PVA scalar types with no DBR `EpicsValue` counterpart must
+        /// A PVA scalar type with no DBR `EpicsValue` counterpart must
         /// fail closed at the forward bridge (None), not be substituted
-        /// with `Double(0.0)`.
+        /// with `Double(0.0)`. Only `boolean` qualifies: every other
+        /// scalar type is one the serve mapping emits.
         #[test]
         fn forward_unsupported_scalars_return_none() {
-            // `Byte` is NOT here: it is DBF_CHAR (signed), a faithful leaf
-            // carried as `EpicsValue::Char` — see
-            // `forward_char_and_uchar_bytes_carry_faithfully`.
-            for sv in [
-                ScalarValue::Boolean(true),
-                ScalarValue::UShort(7),
-                ScalarValue::UInt(9),
-            ] {
-                assert!(
-                    pv_field_to_filter_event(&PvField::Scalar(sv.clone())).is_none(),
-                    "unsupported scalar {sv:?} must fail closed (None), not fabricate a value",
-                );
-            }
+            assert!(
+                pv_field_to_filter_event(&PvField::Scalar(ScalarValue::Boolean(true))).is_none(),
+                "boolean must fail closed (None), not fabricate a value",
+            );
         }
 
         /// Supported scalar types still convert (the fix must not
@@ -9656,6 +9648,8 @@ mod tests {
                 ScalarValue::Short(6),
                 ScalarValue::Byte(-56),
                 ScalarValue::UByte(7),
+                ScalarValue::UShort(8),
+                ScalarValue::UInt(9),
                 ScalarValue::String("x".into()),
             ] {
                 assert!(
@@ -9665,23 +9659,42 @@ mod tests {
             }
         }
 
-        /// Unsupported scalar arrays (uint[]/ushort[]/bool[]/byte[])
-        /// fail closed at the forward bridge.
+        /// A `boolean[]` leaf, the one array type with no DBR
+        /// counterpart, fails closed at the forward bridge.
         #[test]
         fn forward_unsupported_arrays_return_none() {
-            // `byte[]` is NOT here: it is DBF_CHAR[] (signed), carried as
-            // `EpicsValue::CharArray` — see
-            // `forward_char_and_uchar_bytes_carry_faithfully`.
-            let cases = [
-                vec![ScalarValue::UInt(1), ScalarValue::UInt(2)],
-                vec![ScalarValue::UShort(1)],
-                vec![ScalarValue::Boolean(true)],
-            ];
-            for items in cases {
-                assert!(
-                    pv_field_to_filter_event(&PvField::ScalarArray(items.clone())).is_none(),
-                    "unsupported array {items:?} must fail closed (None)",
-                );
+            assert!(
+                pv_field_to_filter_event(&PvField::ScalarArray(vec![ScalarValue::Boolean(true)]))
+                    .is_none(),
+                "boolean[] must fail closed (None)",
+            );
+        }
+
+        /// A filtered `NTScalar<uint>` (DBF_ULONG) under `ts` is served,
+        /// not a `DescriptorMismatch`: the forward bridge carries `uint`
+        /// as `EpicsValue::ULong` and the backward bridge re-emits `uint`.
+        #[test]
+        fn owner_uint_under_filter_is_served() {
+            let chain = parse_filter_chain(r#"{"ts":{}}"#);
+            let value = nt_scalar_value(ScalarValue::UInt(0xdead_beef));
+            let desc = nt_scalar_desc(ScalarType::UInt);
+            match apply_monitor_filter_chain(&chain, &value, &desc) {
+                MonitorFilterOutcome::DescriptorMismatch => {
+                    panic!("filtered NTScalar<uint> must not be a DescriptorMismatch");
+                }
+                MonitorFilterOutcome::Drop => panic!("ts must not drop the frame"),
+                MonitorFilterOutcome::Transformed(PvField::Structure(out)) => {
+                    let leaf = out
+                        .fields
+                        .iter()
+                        .find_map(|(k, v)| (k == "value").then_some(v))
+                        .expect("transformed frame keeps a value leaf");
+                    assert_eq!(leaf, &PvField::Scalar(ScalarValue::UInt(0xdead_beef)));
+                }
+                MonitorFilterOutcome::Transformed(other) => {
+                    panic!("transformed frame must stay an NT structure, got {other:?}");
+                }
+                MonitorFilterOutcome::Pass => {}
             }
         }
 
@@ -9701,12 +9714,13 @@ mod tests {
             );
         }
 
-        /// `NTScalarArray<uint[]>` under a non-empty chain: the inbound
-        /// uint[] leaf has no `EpicsValue`, so the owner emits a monitor
-        /// error instead of an empty array.
+        /// `NTScalarArray<uint[]>` (DBF_ULONG[]) under `arr`: the inbound
+        /// uint[] leaf carries as `EpicsValue::ULongArray`, is sliced, and
+        /// comes back as a `uint[]` leaf, not a `DescriptorMismatch` and
+        /// not an empty array.
         #[test]
-        fn owner_uint_array_under_filter_is_descriptor_mismatch() {
-            let chain = parse_filter_chain(r#"{"arr":{}}"#);
+        fn owner_uint_array_under_filter_is_sliced() {
+            let chain = parse_filter_chain(r#"{"arr":{"s":1}}"#);
             let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
             s.fields.push((
                 "value".into(),
@@ -9717,9 +9731,19 @@ mod tests {
                 struct_id: "epics:nt/NTScalarArray:1.0".into(),
                 fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::UInt))],
             };
-            assert!(
-                is_mismatch(apply_monitor_filter_chain(&chain, &value, &desc)),
-                "filtered uint[] monitor must be a DescriptorMismatch, not an empty array",
+            let MonitorFilterOutcome::Transformed(PvField::Structure(out)) =
+                apply_monitor_filter_chain(&chain, &value, &desc)
+            else {
+                panic!("filtered uint[] monitor must be a transformed NT frame");
+            };
+            let leaf = out
+                .fields
+                .iter()
+                .find_map(|(k, v)| (k == "value").then_some(v))
+                .expect("transformed frame keeps a value leaf");
+            assert_eq!(
+                leaf,
+                &PvField::ScalarArrayTyped(TypedScalarArray::UInt(vec![2u32].into())),
             );
         }
 

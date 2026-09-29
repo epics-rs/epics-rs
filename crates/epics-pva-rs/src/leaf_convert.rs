@@ -150,12 +150,11 @@ pub(crate) fn epics_value_to_field_desc_leaf(v: &EpicsValue) -> FieldDesc {
 /// transformed leaf on the same wire type. `Byte ↔ Char` and `UByte ↔ UChar`
 /// travel as distinct carriers precisely so this round-trip is unambiguous.
 ///
-/// Partial by design: types the filter engine does not carry (and shapes with
-/// no representable value leaf) return `None`, which the caller fails closed as
-/// a filter incompatible with the negotiated descriptor — never a fabricated
-/// stand-in. Scalar `UShort`/`UInt` are not carried here; that is a
-/// pre-existing forward-bridge gap, not part of the `DBF_CHAR` family. The
-/// typed `ushort[]`/`uint[]` arrays are carried, type for type.
+/// Partial by design: a leaf with no `EpicsValue` counterpart (`boolean`,
+/// and shapes with no representable value leaf) returns `None`, which the
+/// caller fails closed as a filter incompatible with the negotiated
+/// descriptor — never a fabricated stand-in. Every type the serve mapping
+/// emits comes back, so a served record can always be filtered.
 ///
 /// Both directions are target-neutral. This backward direction is only ever
 /// driven by an inbound PUT in `server_native::tcp`, which used to be
@@ -179,8 +178,12 @@ pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
             // signed leaf is reinterpreted with `as u8` (wire byte unchanged).
             ScalarValue::Byte(b) => EpicsValue::Char(*b as u8),
             ScalarValue::UByte(b) => EpicsValue::UChar(*b),
+            // `ushort` / `uint` are DBF_USHORT / DBF_ULONG, the inverse of
+            // the serve mapping above.
+            ScalarValue::UShort(u) => EpicsValue::UShort(*u),
+            ScalarValue::UInt(u) => EpicsValue::ULong(*u),
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
-            _ => return None,
+            ScalarValue::Boolean(_) => return None,
         })
     }
     fn array(items: &[ScalarValue]) -> Option<EpicsValue> {
@@ -276,7 +279,25 @@ pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
                     })
                     .collect(),
             ),
-            _ => return None,
+            Some(ScalarValue::UShort(_)) => EpicsValue::UShortArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::UShort(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::UInt(_)) => EpicsValue::ULongArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::UInt(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Boolean(_)) => return None,
         })
     }
     match f {
@@ -417,6 +438,8 @@ mod tests {
             PvField::ScalarArrayTyped(TypedScalarArray::UShort(vec![3u16].into())),
             PvField::ScalarArrayTyped(TypedScalarArray::UInt(vec![5u32].into())),
             PvField::ScalarArrayTyped(TypedScalarArray::String(vec![PvString::from("s")].into())),
+            PvField::Scalar(ScalarValue::UShort(65_535)),
+            PvField::Scalar(ScalarValue::UInt(3_000_000_000)),
         ];
         for leaf in carried {
             let ev = pv_leaf_to_epics_value(&leaf).expect("carried type decodes");
@@ -448,15 +471,17 @@ mod tests {
     // serve/backward mapping can produce them, but the filter engine drops
     // them). Pinned so a later fill-in is a deliberate, tested change — not
     // silent drift, and not part of the DBF_CHAR family.
+    /// A boxed `ushort[]` / `uint[]` leaf (the pre-typed monitor shape)
+    /// carries as the same DBF types the typed form does.
     #[test]
-    fn forward_does_not_carry_ushort_or_uint() {
+    fn boxed_ushort_and_uint_arrays_carry_forward() {
         assert_eq!(
-            pv_leaf_to_epics_value(&PvField::Scalar(ScalarValue::UShort(1))),
-            None,
+            pv_leaf_to_epics_value(&PvField::ScalarArray(vec![ScalarValue::UShort(7)])),
+            Some(EpicsValue::UShortArray(vec![7].into())),
         );
         assert_eq!(
-            pv_leaf_to_epics_value(&PvField::Scalar(ScalarValue::UInt(1))),
-            None,
+            pv_leaf_to_epics_value(&PvField::ScalarArray(vec![ScalarValue::UInt(9)])),
+            Some(EpicsValue::ULongArray(vec![9].into())),
         );
     }
 }

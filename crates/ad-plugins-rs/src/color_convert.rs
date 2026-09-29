@@ -89,10 +89,22 @@ struct BayerPhase {
 trait BayerPixel: Copy + Default + Send + Sync {
     fn to_u32(self) -> u32;
     fn from_u32(v: u32) -> Self;
+    /// The interior pixels of an interior row on lanes, as many as fill
+    /// whole vectors: see [`simd_kernels`]. Returns the pixels covered.
+    #[cfg(feature = "simd")]
+    fn interior_lanes<S: fearless_simd::Simd>(
+        simd: S,
+        above: &[Self],
+        row: &[Self],
+        below: &[Self],
+        even_row: bool,
+        first_even: bool,
+        out: &mut [Self],
+    ) -> usize;
 }
 
 macro_rules! bayer_pixel {
-    ($($t:ty),*) => {$(
+    ($t:ty, $kernel:ident) => {
         impl BayerPixel for $t {
             #[inline(always)]
             fn to_u32(self) -> u32 {
@@ -102,10 +114,135 @@ macro_rules! bayer_pixel {
             fn from_u32(v: u32) -> Self {
                 v as $t
             }
+            #[cfg(feature = "simd")]
+            #[inline(always)]
+            fn interior_lanes<S: fearless_simd::Simd>(
+                simd: S,
+                above: &[Self],
+                row: &[Self],
+                below: &[Self],
+                even_row: bool,
+                first_even: bool,
+                out: &mut [Self],
+            ) -> usize {
+                simd_kernels::$kernel(simd, above, row, below, even_row, first_even, out)
+            }
         }
-    )*};
+    };
 }
-bayer_pixel!(u8, u16);
+bayer_pixel!(u8, demosaic_u8);
+bayer_pixel!(u16, demosaic_u16);
+
+/// [`demosaic_row`]'s interior loop on explicit vectors. One vector holds
+/// one pixel per lane; its nine inputs are the loads of the three rows at
+/// the lane offset and one to either side, summed on lanes twice as wide
+/// (four 8-bit values fit 16 bits, four 16-bit values fit 32) with the
+/// division as a shift, and the channels picked by a column-parity mask.
+/// The three channel vectors then interleave into RGB1 with a byte swizzle
+/// per channel and two selects per output vector.
+#[cfg(feature = "simd")]
+mod simd_kernels {
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    macro_rules! demosaic_kernel {
+        ($t:ty, $vec:ident, $wide:ty, $wides:ident, $name:ident) => {
+            #[simd]
+            pub(super) fn $name<S: Simd>(
+                simd: S,
+                above: &[$t],
+                row: &[$t],
+                below: &[$t],
+                even_row: bool,
+                first_even: bool,
+                out: &mut [$t],
+            ) -> usize {
+                let e = std::mem::size_of::<$t>();
+                let n = S::$vec::LEN;
+                let half = n / 2;
+                let len = row.len() - 2;
+                // Column parity of each lane, on the low and high wide halves.
+                let parity = |off: usize| {
+                    S::$wides::from_fn(simd, |k| (((k + off) % 2 == 0) == first_even) as $wide)
+                        .simd_eq(S::$wides::splat(simd, 1))
+                };
+                let (even_lo, even_hi) = (parity(0), parity(half));
+                // Output vector `j` of the three per pixel vector: byte `k` is
+                // byte `q % e` of element `q / e` of the RGB1 run, so pixel
+                // `p = q / e / 3` and channel `c = q / e % 3`.
+                let index = |j: usize| {
+                    S::u8s::from_fn(simd, |k| {
+                        let q = j * n * e + k;
+                        ((q / e / 3) * e + q % e) as u8
+                    })
+                };
+                let channel = |j: usize, c: usize| {
+                    S::$vec::from_fn(simd, |k| ((j * n + k) % 3 == c) as $t)
+                        .simd_eq(S::$vec::splat(simd, 1))
+                };
+                let indices = [index(0), index(1), index(2)];
+                let is_r = [channel(0, 0), channel(1, 0), channel(2, 0)];
+                let is_g = [channel(0, 1), channel(1, 1), channel(2, 1)];
+
+                let mut base = 0;
+                while base + n <= len {
+                    let load = |v: &[$t], off: usize| {
+                        S::$vec::from_slice(simd, &v[base + off..base + off + n]).widen()
+                    };
+                    let (l, c, r) = (load(row, 0), load(row, 1), load(row, 2));
+                    let (al, a, ar) = (load(above, 0), load(above, 1), load(above, 2));
+                    let (bl, b, br) = (load(below, 0), load(below, 1), load(below, 2));
+                    let mut rgb: [[S::$wides; 2]; 3] = [[S::$wides::splat(simd, 0); 2]; 3];
+                    for (k, even) in [(0, even_lo), (1, even_hi)].into_iter() {
+                        let v = |x: (S::$wides, S::$wides)| if k == 0 { x.0 } else { x.1 };
+                        let (l, c, r) = (v(l), v(c), v(r));
+                        let (al, a, ar) = (v(al), v(a), v(ar));
+                        let (bl, b, br) = (v(bl), v(b), v(br));
+                        // The four orthogonal and four diagonal neighbours,
+                        // each over 4 (`:269-270`, `:274-275`); the two
+                        // horizontal and the two vertical ones, each over 2
+                        // (`:279-280`, `:284-285`).
+                        let orthogonal = (l + r + a + b) >> 2;
+                        let diagonal = (al + ar + bl + br) >> 2;
+                        let horizontal = (l + r) >> 1;
+                        let vertical = (a + b) >> 1;
+                        let (rr, gg, bb) = if even_row {
+                            (
+                                even.select(c, horizontal),
+                                even.select(orthogonal, c),
+                                even.select(diagonal, vertical),
+                            )
+                        } else {
+                            (
+                                even.select(vertical, diagonal),
+                                even.select(c, orthogonal),
+                                even.select(horizontal, c),
+                            )
+                        };
+                        rgb[0][k] = rr;
+                        rgb[1][k] = gg;
+                        rgb[2][k] = bb;
+                    }
+                    let narrow = |x: [S::$wides; 2]| x[0].narrow(x[1]);
+                    let (r, g, b) = (narrow(rgb[0]), narrow(rgb[1]), narrow(rgb[2]));
+                    let o = &mut out[base * 3..(base + n) * 3];
+                    for j in 0..3 {
+                        let v = is_r[j].select(
+                            r.swizzle_dyn(indices[j]),
+                            is_g[j].select(g.swizzle_dyn(indices[j]), b.swizzle_dyn(indices[j])),
+                        );
+                        v.store_slice(&mut o[j * n..(j + 1) * n]);
+                    }
+                    base += n;
+                }
+                base
+            }
+        };
+    }
+
+    demosaic_kernel!(u8, u8s, u16, u16s, demosaic_u8);
+    demosaic_kernel!(u16, u16s, u32, u32s, demosaic_u16);
+}
 
 /// The RGB1 frame of `src` (`w * h` pixels, zero-padded if shorter) into
 /// `out`, row by row across the thread pool when the frame is large enough.
@@ -143,6 +280,13 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out
 
 /// Row `y` of the RGB1 output — C's per-pixel arithmetic
 /// (NDPluginColorConvert.cpp:262-289) with the row above and below in hand.
+///
+/// The interior of an interior row runs as one straight loop: every pixel
+/// takes the four means from the shifted views of the three rows and picks
+/// its channels by column parity, so the loop carries no branch and the
+/// compiler keeps it on vectors. The border pixels, which copy their own
+/// channel and zero the other two, and every pixel of a border row go
+/// through [`demosaic_pixel`].
 fn demosaic_row<T: BayerPixel>(
     src: &[T],
     w: usize,
@@ -152,67 +296,79 @@ fn demosaic_row<T: BayerPixel>(
     out_row: &mut [T],
 ) {
     let row = &src[y * w..(y + 1) * w];
-    let interior_y = y > 0 && y + 1 < h;
-    // Only read when `interior_y`; any row does for the type.
-    let above = if interior_y {
-        &src[(y - 1) * w..y * w]
-    } else {
-        row
-    };
-    let below = if interior_y {
-        &src[(y + 1) * w..(y + 2) * w]
-    } else {
-        row
-    };
-    let at = |r: &[T], x: usize| r[x].to_u32();
     let even_row = (y % 2 == 0) == phase.r_row_even;
-    for (x, px) in out_row.chunks_exact_mut(3).enumerate() {
-        let val = at(row, x);
+    let interior_y = y > 0 && y + 1 < h;
+    if !interior_y || w < 3 {
+        for (x, px) in out_row.chunks_exact_mut(3).enumerate() {
+            let even_col = (x % 2 == 0) == phase.r_col_even;
+            demosaic_pixel(row[x], even_row, even_col, px);
+        }
+        return;
+    }
+    let above = &src[(y - 1) * w..y * w];
+    let below = &src[(y + 1) * w..(y + 2) * w];
+    for x in [0, w - 1] {
         let even_col = (x % 2 == 0) == phase.r_col_even;
-        let interior = interior_y && x > 0 && x + 1 < w;
-        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+        demosaic_pixel(row[x], even_row, even_col, &mut out_row[x * 3..x * 3 + 3]);
+    }
+    // Interior x in 1..w-1: index i = x - 1 into the three shifted views.
+    let n = w - 2;
+    let (l, c, r) = (&row[..n], &row[1..n + 1], &row[2..n + 2]);
+    let (al, a, ar) = (&above[..n], &above[1..n + 1], &above[2..n + 2]);
+    let (bl, b, br) = (&below[..n], &below[1..n + 1], &below[2..n + 2]);
+    // Whether x = 1, the first interior column, is an even column.
+    let first_even = !phase.r_col_even;
+    let out = &mut out_row[3..3 * (w - 1)];
+    #[cfg(feature = "simd")]
+    let done = fearless_simd::dispatch!(ad_core_rs::simd::level(), s => T::interior_lanes(s, above, row, below, even_row, first_even, out));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    let out = &mut out[done * 3..];
+    for (i, px) in out.chunks_exact_mut(3).enumerate() {
+        let i = i + done;
+        let even_col = (i % 2 == 0) == first_even;
+        let val = c[i].to_u32();
+        let (l, r, a, b) = (l[i].to_u32(), r[i].to_u32(), a[i].to_u32(), b[i].to_u32());
         // The four orthogonal and four diagonal neighbours, each over 4
         // (`:269-270`, `:274-275`); the two horizontal and the two vertical
         // ones, each over 2 (`:279-280`, `:284-285`).
-        let orthogonal = || (at(row, x - 1) + at(row, x + 1) + at(above, x) + at(below, x)) / 4;
-        let diagonal =
-            || (at(above, x - 1) + at(above, x + 1) + at(below, x - 1) + at(below, x + 1)) / 4;
-        let horizontal = || (at(row, x - 1) + at(row, x + 1)) / 2;
-        let vertical = || (at(above, x) + at(below, x)) / 2;
-        match (even_row, even_col) {
-            (true, true) => {
-                r = val;
-                if interior {
-                    g = orthogonal();
-                    b = diagonal();
-                }
+        let orthogonal = (l + r + a + b) / 4;
+        let diagonal = (al[i].to_u32() + ar[i].to_u32() + bl[i].to_u32() + br[i].to_u32()) / 4;
+        let horizontal = (l + r) / 2;
+        let vertical = (a + b) / 2;
+        let (r, g, b) = if even_row {
+            if even_col {
+                (val, orthogonal, diagonal)
+            } else {
+                // Green next to red.
+                (horizontal, val, vertical)
             }
-            (true, false) | (false, true) => {
-                g = val;
-                if interior {
-                    if even_row {
-                        // Green next to red.
-                        r = horizontal();
-                        b = vertical();
-                    } else {
-                        // Green next to blue.
-                        b = horizontal();
-                        r = vertical();
-                    }
-                }
-            }
-            (false, false) => {
-                b = val;
-                if interior {
-                    g = orthogonal();
-                    r = diagonal();
-                }
-            }
-        }
+        } else if even_col {
+            // Green next to blue.
+            (vertical, val, horizontal)
+        } else {
+            (diagonal, orthogonal, val)
+        };
         px[0] = T::from_u32(r);
         px[1] = T::from_u32(g);
         px[2] = T::from_u32(b);
     }
+}
+
+/// A pixel that is not interpolated: its own channel, zero in the others
+/// (NDPluginColorConvert.cpp:267 falls through with the zeroed output).
+#[inline(always)]
+fn demosaic_pixel<T: BayerPixel>(val: T, even_row: bool, even_col: bool, px: &mut [T]) {
+    let zero = T::from_u32(0);
+    let channel = match (even_row, even_col) {
+        (true, true) => 0,
+        (true, false) | (false, true) => 1,
+        (false, false) => 2,
+    };
+    px[0] = zero;
+    px[1] = zero;
+    px[2] = zero;
+    px[channel] = val;
 }
 
 /// Rainbow false-color lookup table (`falseColor == 1`), 256 RGB entries.
@@ -1194,6 +1350,85 @@ mod tests {
 
     /// Every pattern and offset parity on frames from a single pixel up to
     /// one past the parallel threshold, for both element types.
+    /// The interior kernel of every SIMD level against the C arithmetic,
+    /// on rows wide enough for several vectors and a tail.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn demosaic_kernels_match_the_c_pixel_arithmetic_on_every_level() {
+        use fearless_simd::{Level, dispatch};
+        let top = ad_core_rs::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        let (w, h) = (301, 4);
+        let vals: Vec<u32> = (0..w * h).map(|i| (i * 7919 + 13) as u32 % 65536).collect();
+        for pattern in [
+            NDBayerPattern::RGGB,
+            NDBayerPattern::GBRG,
+            NDBayerPattern::GRBG,
+            NDBayerPattern::BGGR,
+        ] {
+            let (r_row_even, r_col_even) = match pattern {
+                NDBayerPattern::RGGB => (true, true),
+                NDBayerPattern::GBRG => (false, true),
+                NDBayerPattern::GRBG => (true, false),
+                NDBayerPattern::BGGR => (false, false),
+            };
+            let want = reference_bayer(&vals, w, h, (0, 0), pattern as u32);
+            let want8 = reference_bayer(
+                &vals.iter().map(|&v| v & 0xff).collect::<Vec<_>>(),
+                w,
+                h,
+                (0, 0),
+                pattern as u32,
+            );
+            let u16s: Vec<u16> = vals.iter().map(|&v| v as u16).collect();
+            let u8s: Vec<u8> = vals.iter().map(|&v| v as u8).collect();
+            for level in &levels {
+                for y in 1..h - 1 {
+                    let even_row = (y % 2 == 0) == r_row_even;
+                    let first_even = !r_col_even;
+                    let rows = |v: &[u16]| {
+                        (
+                            v[(y - 1) * w..y * w].to_vec(),
+                            v[y * w..(y + 1) * w].to_vec(),
+                            v[(y + 1) * w..(y + 2) * w].to_vec(),
+                        )
+                    };
+                    let (above, row, below) = rows(&u16s);
+                    let mut out = vec![0u16; (w - 2) * 3];
+                    let done = dispatch!(*level, s => simd_kernels::demosaic_u16(s, &above, &row, &below, even_row, first_even, &mut out));
+                    assert!(done > 0, "{level:?}");
+                    let got: Vec<u32> = out[..done * 3].iter().map(|&v| v as u32).collect();
+                    assert_eq!(
+                        got,
+                        want[(y * w + 1) * 3..(y * w + 1 + done) * 3],
+                        "{level:?} {pattern:?} u16"
+                    );
+
+                    let (above, row, below) = (
+                        u8s[(y - 1) * w..y * w].to_vec(),
+                        u8s[y * w..(y + 1) * w].to_vec(),
+                        u8s[(y + 1) * w..(y + 2) * w].to_vec(),
+                    );
+                    let mut out = vec![0u8; (w - 2) * 3];
+                    let done = dispatch!(*level, s => simd_kernels::demosaic_u8(s, &above, &row, &below, even_row, first_even, &mut out));
+                    assert!(done > 0, "{level:?}");
+                    let got: Vec<u32> = out[..done * 3].iter().map(|&v| v as u32).collect();
+                    assert_eq!(
+                        got,
+                        want8[(y * w + 1) * 3..(y * w + 1 + done) * 3],
+                        "{level:?} {pattern:?} u8"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn bayer_to_rgb1_matches_the_c_pixel_arithmetic() {
         let patterns = [

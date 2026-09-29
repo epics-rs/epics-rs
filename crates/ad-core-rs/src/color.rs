@@ -242,26 +242,27 @@ pub fn convert_rgb_layout(
         }
     };
 
-    // Convert via generic index mapping
+    // Each layout is a stride triple over (ix, c, iy); a run along x in
+    // either layout is then a strided copy, contiguous in RGB2 and RGB3.
+    let strides = |mode: NDColorMode| match mode {
+        NDColorMode::RGB1 => (3, 1, x * 3),
+        NDColorMode::RGB2 => (1, x, x * 3),
+        NDColorMode::RGB3 => (1, x * y, x),
+        _ => unreachable!("checked above"),
+    };
+    let (sx, sc, sy) = strides(src_mode);
+    let (dx, dc, dy) = strides(dst_mode);
     let mut arr = output(pool, src, out_dims, src.data.data_type())?;
     same_type!(&src.data, &mut arr.data, |v, out| {
-        {
-            for iy in 0..y {
-                for ix in 0..x {
-                    for c in 0..3usize {
-                        let src_idx = match src_mode {
-                            NDColorMode::RGB1 => c + ix * 3 + iy * x * 3,
-                            NDColorMode::RGB2 => ix + c * x + iy * x * 3,
-                            NDColorMode::RGB3 => ix + iy * x + c * x * y,
-                            _ => unreachable!(),
-                        };
-                        let dst_idx = match dst_mode {
-                            NDColorMode::RGB1 => c + ix * 3 + iy * x * 3,
-                            NDColorMode::RGB2 => ix + c * x + iy * x * 3,
-                            NDColorMode::RGB3 => ix + iy * x + c * x * y,
-                            _ => unreachable!(),
-                        };
-                        out[dst_idx] = v[src_idx];
+        for iy in 0..y {
+            for c in 0..3usize {
+                let s = &v[c * sc + iy * sy..];
+                let d = &mut out[c * dc + iy * dy..];
+                if sx == 1 && dx == 1 {
+                    d[..x].copy_from_slice(&s[..x]);
+                } else {
+                    for (o, i) in d.iter_mut().step_by(dx).zip(s.iter().step_by(sx)).take(x) {
+                        *o = *i;
                     }
                 }
             }
@@ -321,30 +322,10 @@ pub fn rgb1_to_yuv444(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, src.data.data_type())?;
     match (&src.data, &mut arr.data) {
         (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => {
-            for i in 0..n {
-                let r = v[i * 3] as f64;
-                let g = v[i * 3 + 1] as f64;
-                let b = v[i * 3 + 2] as f64;
-                let y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-                let cb = -0.169 * r - 0.331 * g + 0.5 * b + 128.0;
-                let cr = 0.5 * r - 0.419 * g - 0.081 * b + 128.0;
-                out[i * 3] = y_val.round().clamp(0.0, 255.0) as u8;
-                out[i * 3 + 1] = cb.round().clamp(0.0, 255.0) as u8;
-                out[i * 3 + 2] = cr.round().clamp(0.0, 255.0) as u8;
-            }
+            yuv444_forward(&v[..n * 3], &mut out[..n * 3], U8_HALF, U8_MAX);
         }
         (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => {
-            for i in 0..n {
-                let r = v[i * 3] as f64;
-                let g = v[i * 3 + 1] as f64;
-                let b = v[i * 3 + 2] as f64;
-                let y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-                let cb = -0.169 * r - 0.331 * g + 0.5 * b + 32768.0;
-                let cr = 0.5 * r - 0.419 * g - 0.081 * b + 32768.0;
-                out[i * 3] = y_val.round().clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 1] = cb.round().clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 2] = cr.round().clamp(0.0, 65535.0) as u16;
-            }
+            yuv444_forward(&v[..n * 3], &mut out[..n * 3], U16_HALF, U16_MAX);
         }
         _ => {
             return Err(ADError::UnsupportedConversion(
@@ -353,6 +334,223 @@ pub fn rgb1_to_yuv444(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         }
     }
     Ok(arr)
+}
+
+/// The chroma zero point and the clamp ceiling of the two YUV element
+/// types.
+const U8_HALF: f64 = 128.0;
+const U8_MAX: f64 = 255.0;
+const U16_HALF: f64 = 32768.0;
+const U16_MAX: f64 = 65535.0;
+
+/// BT.601 forward on one pixel before rounding, and its inverse on chroma
+/// already offset to zero: the expressions every YUV conversion here
+/// shares, in the association the vector kernels reproduce operation for
+/// operation.
+#[inline(always)]
+fn rgb_to_yuv(r: f64, g: f64, b: f64, half: f64) -> (f64, f64, f64) {
+    (
+        0.299 * r + 0.587 * g + 0.114 * b,
+        -0.169 * r - 0.331 * g + 0.5 * b + half,
+        0.5 * r - 0.419 * g - 0.081 * b + half,
+    )
+}
+
+#[inline(always)]
+fn yuv_to_rgb(y: f64, cb: f64, cr: f64) -> (f64, f64, f64) {
+    (y + 1.402 * cr, y - 0.344 * cb - 0.714 * cr, y + 1.772 * cb)
+}
+
+/// Round half away from zero and clamp to `0..=max`, the value the element
+/// then truncates to.
+#[inline(always)]
+fn round_clamp(v: f64, max: f64) -> f64 {
+    v.round().clamp(0.0, max)
+}
+
+/// An element type the YUV conversions run in.
+trait YuvElem: Copy {
+    fn to_f64(self) -> f64;
+    fn from_f64(v: f64) -> Self;
+    /// [`to_f64`](Self::to_f64) over a slice, on lanes.
+    #[cfg(feature = "simd")]
+    fn widen<S: fearless_simd::Simd>(simd: S, v: &[Self], out: &mut [f64]);
+    /// [`from_f64`](Self::from_f64) over a slice, on lanes.
+    #[cfg(feature = "simd")]
+    fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]);
+}
+
+macro_rules! yuv_elem {
+    ($t:ty, $widen:ident, $narrow:ident) => {
+        impl YuvElem for $t {
+            #[inline(always)]
+            fn to_f64(self) -> f64 {
+                self as f64
+            }
+            #[inline(always)]
+            fn from_f64(v: f64) -> Self {
+                v as $t
+            }
+            #[cfg(feature = "simd")]
+            #[inline(always)]
+            fn widen<S: fearless_simd::Simd>(simd: S, v: &[Self], out: &mut [f64]) {
+                crate::simd::$widen(simd, v, out)
+            }
+            #[cfg(feature = "simd")]
+            #[inline(always)]
+            fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]) {
+                crate::simd::$narrow(simd, v, out)
+            }
+        }
+    };
+}
+
+yuv_elem!(u8, to_f64_u8, from_f64_u8);
+yuv_elem!(u16, to_f64_u16, from_f64_u16);
+
+/// RGB1 pixels to YUV444 pixels, both `[3, n]`.
+fn yuv444_forward<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv444_forward(s, v, out, half, max));
+        yuv444_forward_scalar(&v[done..], &mut out[done..], half, max);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv444_forward_scalar(v, out, half, max);
+}
+
+fn yuv444_forward_scalar<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+    for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
+        let (y, cb, cr) = rgb_to_yuv(px[0].to_f64(), px[1].to_f64(), px[2].to_f64(), half);
+        o[0] = T::from_f64(round_clamp(y, max));
+        o[1] = T::from_f64(round_clamp(cb, max));
+        o[2] = T::from_f64(round_clamp(cr, max));
+    }
+}
+
+/// YUV444 pixels to RGB1 pixels, both `[3, n]`.
+fn yuv444_inverse<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv444_inverse(s, v, out, half, max));
+        yuv444_inverse_scalar(&v[done..], &mut out[done..], half, max);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv444_inverse_scalar(v, out, half, max);
+}
+
+fn yuv444_inverse_scalar<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+    for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
+        let (r, g, b) = yuv_to_rgb(px[0].to_f64(), px[1].to_f64() - half, px[2].to_f64() - half);
+        o[0] = T::from_f64(round_clamp(r, max));
+        o[1] = T::from_f64(round_clamp(g, max));
+        o[2] = T::from_f64(round_clamp(b, max));
+    }
+}
+
+/// RGB1 pixel pairs to packed UYVY: `v` is `[3, 2 * pairs]`, `out`
+/// `[4 * pairs]`, the two chroma values averaged over the pair.
+fn yuv422_forward(v: &[u8], out: &mut [u8]) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv422_forward(s, v, out));
+        yuv422_forward_scalar(&v[done * 6..], &mut out[done * 4..]);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv422_forward_scalar(v, out);
+}
+
+fn yuv422_forward_scalar(v: &[u8], out: &mut [u8]) {
+    for (px, o) in v.chunks_exact(6).zip(out.chunks_exact_mut(4)) {
+        let (y0, cb0, cr0) = rgb_to_yuv(px[0] as f64, px[1] as f64, px[2] as f64, U8_HALF);
+        let (y1, cb1, cr1) = rgb_to_yuv(px[3] as f64, px[4] as f64, px[5] as f64, U8_HALF);
+        o[0] = round_clamp((cb0 + cb1) / 2.0, U8_MAX) as u8;
+        o[1] = round_clamp(y0, U8_MAX) as u8;
+        o[2] = round_clamp((cr0 + cr1) / 2.0, U8_MAX) as u8;
+        o[3] = round_clamp(y1, U8_MAX) as u8;
+    }
+}
+
+/// Packed UYVY to RGB1 pixel pairs: `v` is `[4 * pairs]`, `out`
+/// `[3, 2 * pairs]`.
+fn yuv422_inverse(v: &[u8], out: &mut [u8]) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv422_inverse(s, v, out));
+        yuv422_inverse_scalar(&v[done * 4..], &mut out[done * 6..]);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv422_inverse_scalar(v, out);
+}
+
+fn yuv422_inverse_scalar(v: &[u8], out: &mut [u8]) {
+    for (px, o) in v.chunks_exact(4).zip(out.chunks_exact_mut(6)) {
+        let u = px[0] as f64 - U8_HALF;
+        let vc = px[2] as f64 - U8_HALF;
+        for (k, &y) in [px[1], px[3]].iter().enumerate() {
+            let (r, g, b) = yuv_to_rgb(y as f64, u, vc);
+            o[k * 3] = round_clamp(r, U8_MAX) as u8;
+            o[k * 3 + 1] = round_clamp(g, U8_MAX) as u8;
+            o[k * 3 + 2] = round_clamp(b, U8_MAX) as u8;
+        }
+    }
+}
+
+/// RGB1 pixel quads to packed UYYVYY: `v` is `[3, 4 * groups]`, `out`
+/// `[6 * groups]`, the two chroma values averaged over the quad.
+fn yuv411_forward(v: &[u8], out: &mut [u8]) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv411_forward(s, v, out));
+        yuv411_forward_scalar(&v[done * 12..], &mut out[done * 6..]);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv411_forward_scalar(v, out);
+}
+
+fn yuv411_forward_scalar(v: &[u8], out: &mut [u8]) {
+    for (px, o) in v.chunks_exact(12).zip(out.chunks_exact_mut(6)) {
+        let mut ys = [0u8; 4];
+        let mut cbs = [0.0f64; 4];
+        let mut crs = [0.0f64; 4];
+        for (p, q) in px.chunks_exact(3).enumerate() {
+            let (y, cb, cr) = rgb_to_yuv(q[0] as f64, q[1] as f64, q[2] as f64, U8_HALF);
+            ys[p] = round_clamp(y, U8_MAX) as u8;
+            cbs[p] = cb;
+            crs[p] = cr;
+        }
+        o[0] = round_clamp((cbs[0] + cbs[1] + cbs[2] + cbs[3]) / 4.0, U8_MAX) as u8;
+        o[1] = ys[0];
+        o[2] = ys[1];
+        o[3] = round_clamp((crs[0] + crs[1] + crs[2] + crs[3]) / 4.0, U8_MAX) as u8;
+        o[4] = ys[2];
+        o[5] = ys[3];
+    }
+}
+
+/// Packed UYYVYY to RGB1 pixel quads: `v` is `[6 * groups]`, `out`
+/// `[3, 4 * groups]`.
+fn yuv411_inverse(v: &[u8], out: &mut [u8]) {
+    #[cfg(feature = "simd")]
+    {
+        let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv411_inverse(s, v, out));
+        yuv411_inverse_scalar(&v[done * 6..], &mut out[done * 12..]);
+    }
+    #[cfg(not(feature = "simd"))]
+    yuv411_inverse_scalar(v, out);
+}
+
+fn yuv411_inverse_scalar(v: &[u8], out: &mut [u8]) {
+    for (px, o) in v.chunks_exact(6).zip(out.chunks_exact_mut(12)) {
+        let u = px[0] as f64 - U8_HALF;
+        let vc = px[3] as f64 - U8_HALF;
+        for (k, &y) in [px[1], px[2], px[4], px[5]].iter().enumerate() {
+            let (r, g, b) = yuv_to_rgb(y as f64, u, vc);
+            o[k * 3] = round_clamp(r, U8_MAX) as u8;
+            o[k * 3 + 1] = round_clamp(g, U8_MAX) as u8;
+            o[k * 3 + 2] = round_clamp(b, U8_MAX) as u8;
+        }
+    }
 }
 
 /// Convert YUV444 to RGB1 using inverse BT.601.
@@ -375,30 +573,10 @@ pub fn yuv444_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, src.data.data_type())?;
     match (&src.data, &mut arr.data) {
         (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => {
-            for i in 0..n {
-                let y_val = v[i * 3] as f64;
-                let cb = v[i * 3 + 1] as f64 - 128.0;
-                let cr = v[i * 3 + 2] as f64 - 128.0;
-                let r = y_val + 1.402 * cr;
-                let g = y_val - 0.344 * cb - 0.714 * cr;
-                let b = y_val + 1.772 * cb;
-                out[i * 3] = r.round().clamp(0.0, 255.0) as u8;
-                out[i * 3 + 1] = g.round().clamp(0.0, 255.0) as u8;
-                out[i * 3 + 2] = b.round().clamp(0.0, 255.0) as u8;
-            }
+            yuv444_inverse(&v[..n * 3], &mut out[..n * 3], U8_HALF, U8_MAX);
         }
         (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => {
-            for i in 0..n {
-                let y_val = v[i * 3] as f64;
-                let cb = v[i * 3 + 1] as f64 - 32768.0;
-                let cr = v[i * 3 + 2] as f64 - 32768.0;
-                let r = y_val + 1.402 * cr;
-                let g = y_val - 0.344 * cb - 0.714 * cr;
-                let b = y_val + 1.772 * cb;
-                out[i * 3] = r.round().clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 1] = g.round().clamp(0.0, 65535.0) as u16;
-                out[i * 3 + 2] = b.round().clamp(0.0, 65535.0) as u16;
-            }
+            yuv444_inverse(&v[..n * 3], &mut out[..n * 3], U16_HALF, U16_MAX);
         }
         _ => {
             return Err(ADError::UnsupportedConversion(
@@ -440,37 +618,9 @@ pub fn rgb1_to_yuv422(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, NDDataType::UInt8)?;
     let out = u8_slice(&mut arr);
 
-    for iy in 0..y {
-        for pair in 0..(x / 2) {
-            let i0 = (iy * x + pair * 2) * 3;
-            let i1 = i0 + 3;
-            let r0 = v[i0] as f64;
-            let g0 = v[i0 + 1] as f64;
-            let b0 = v[i0 + 2] as f64;
-            let r1 = v[i1] as f64;
-            let g1 = v[i1 + 1] as f64;
-            let b1 = v[i1 + 2] as f64;
-
-            let y0 = (0.299 * r0 + 0.587 * g0 + 0.114 * b0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let y1 = (0.299 * r1 + 0.587 * g1 + 0.114 * b1)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let cb0 = -0.169 * r0 - 0.331 * g0 + 0.5 * b0 + 128.0;
-            let cb1 = -0.169 * r1 - 0.331 * g1 + 0.5 * b1 + 128.0;
-            let cr0 = 0.5 * r0 - 0.419 * g0 - 0.081 * b0 + 128.0;
-            let cr1 = 0.5 * r1 - 0.419 * g1 - 0.081 * b1 + 128.0;
-            let u = ((cb0 + cb1) / 2.0).round().clamp(0.0, 255.0) as u8;
-            let v_ch = ((cr0 + cr1) / 2.0).round().clamp(0.0, 255.0) as u8;
-
-            let oi = iy * packed_x + pair * 4;
-            out[oi] = u;
-            out[oi + 1] = y0;
-            out[oi + 2] = v_ch;
-            out[oi + 3] = y1;
-        }
-    }
+    // Every row is a whole number of pairs, so the pairs of the frame are
+    // one contiguous run in both layouts.
+    yuv422_forward(&v[..x * y * 3], &mut out[..packed_x * y]);
 
     Ok(arr)
 }
@@ -510,26 +660,7 @@ pub fn yuv422_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, NDDataType::UInt8)?;
     let out = u8_slice(&mut arr);
 
-    for iy in 0..y {
-        for pair in 0..(width / 2) {
-            let si = iy * packed_x + pair * 4;
-            let u = v[si] as f64 - 128.0;
-            let y0 = v[si + 1] as f64;
-            let v_ch = v[si + 2] as f64 - 128.0;
-            let y1 = v[si + 3] as f64;
-
-            let oi0 = (iy * width + pair * 2) * 3;
-            let oi1 = oi0 + 3;
-
-            out[oi0] = (y0 + 1.402 * v_ch).round().clamp(0.0, 255.0) as u8;
-            out[oi0 + 1] = (y0 - 0.344 * u - 0.714 * v_ch).round().clamp(0.0, 255.0) as u8;
-            out[oi0 + 2] = (y0 + 1.772 * u).round().clamp(0.0, 255.0) as u8;
-
-            out[oi1] = (y1 + 1.402 * v_ch).round().clamp(0.0, 255.0) as u8;
-            out[oi1 + 1] = (y1 - 0.344 * u - 0.714 * v_ch).round().clamp(0.0, 255.0) as u8;
-            out[oi1 + 2] = (y1 + 1.772 * u).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    yuv422_inverse(&v[..packed_x * y], &mut out[..width * y * 3]);
 
     Ok(arr)
 }
@@ -565,41 +696,7 @@ pub fn rgb1_to_yuv411(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, NDDataType::UInt8)?;
     let out = u8_slice(&mut arr);
 
-    for iy in 0..y {
-        for group in 0..(x / 4) {
-            let base = (iy * x + group * 4) * 3;
-            let mut cbs = [0.0f64; 4];
-            let mut crs = [0.0f64; 4];
-            let mut ys = [0u8; 4];
-
-            for p in 0..4 {
-                let pi = base + p * 3;
-                let r = v[pi] as f64;
-                let g = v[pi + 1] as f64;
-                let b = v[pi + 2] as f64;
-                ys[p] = (0.299 * r + 0.587 * g + 0.114 * b)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                cbs[p] = -0.169 * r - 0.331 * g + 0.5 * b + 128.0;
-                crs[p] = 0.5 * r - 0.419 * g - 0.081 * b + 128.0;
-            }
-
-            let u = ((cbs[0] + cbs[1] + cbs[2] + cbs[3]) / 4.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let v_ch = ((crs[0] + crs[1] + crs[2] + crs[3]) / 4.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-
-            let oi = iy * packed_x + group * 6;
-            out[oi] = u;
-            out[oi + 1] = ys[0];
-            out[oi + 2] = ys[1];
-            out[oi + 3] = v_ch;
-            out[oi + 4] = ys[2];
-            out[oi + 5] = ys[3];
-        }
-    }
+    yuv411_forward(&v[..x * y * 3], &mut out[..packed_x * y]);
 
     Ok(arr)
 }
@@ -639,26 +736,525 @@ pub fn yuv411_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let mut arr = output(pool, src, dims, NDDataType::UInt8)?;
     let out = u8_slice(&mut arr);
 
-    for iy in 0..y {
-        for group in 0..(width / 4) {
-            let si = iy * packed_x + group * 6;
-            let u = v[si] as f64 - 128.0;
-            let y0 = v[si + 1] as f64;
-            let y1 = v[si + 2] as f64;
-            let v_ch = v[si + 3] as f64 - 128.0;
-            let y2 = v[si + 4] as f64;
-            let y3 = v[si + 5] as f64;
+    yuv411_inverse(&v[..packed_x * y], &mut out[..width * y * 3]);
 
-            for (p, y_val) in [(0, y0), (1, y1), (2, y2), (3, y3)] {
-                let oi = (iy * width + group * 4 + p) * 3;
-                out[oi] = (y_val + 1.402 * v_ch).round().clamp(0.0, 255.0) as u8;
-                out[oi + 1] = (y_val - 0.344 * u - 0.714 * v_ch).round().clamp(0.0, 255.0) as u8;
-                out[oi + 2] = (y_val + 1.772 * u).round().clamp(0.0, 255.0) as u8;
+    Ok(arr)
+}
+
+/// The YUV conversions on explicit vectors, one block of [`BLOCK`] pixels
+/// at a time: the block is widened to `f64` with the cast kernels, the
+/// BT.601 arithmetic runs on the interleaved stream in place, and the
+/// result narrows back with the cast kernels. Each kernel converts the
+/// whole prefix of its input that fills blocks and returns how many
+/// elements, pairs or quads it covered; the scalar loop finishes the rest.
+///
+/// The interleaved stream needs no gather: element `i` of a three-channel
+/// stream belongs to the pixel starting at `i - c` with `c = i % 3`, so
+/// its three inputs are the unaligned loads at offsets `-2..=2` from `i`,
+/// picked per lane by masks that depend only on `c` — and so do the
+/// coefficients, which become per-lane vectors too. With the vector start
+/// advancing by the lane count, `c` of lane 0 cycles through three
+/// phases, each with its own mask and coefficient set built once per
+/// call. The arithmetic between is the scalar expression, operation for
+/// operation, and the round-half-away-from-zero of `f64::round` is
+/// spelled out on lanes (the vector `round_ties_even` is not it), so a
+/// frame is bit for bit the same on either path. The channels whose
+/// scalar expression lacks a term get the coefficient `0.0`; that adds a
+/// signed zero to a value that is never `-0.0`, which leaves it unchanged.
+#[cfg(feature = "simd")]
+mod simd_kernels {
+    use super::YuvElem;
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    /// Pixels per block. Three, two and one-and-a-half elements per pixel
+    /// all give a whole number of vectors of every lane count.
+    const BLOCK: usize = 1024;
+    /// Elements either side of the widened block that the shifted loads
+    /// may reach.
+    const PAD: usize = 8;
+
+    /// `f64::round` on lanes: the truncation, plus one away from zero
+    /// where the fraction reaches a half. `v - trunc(v)` is exact, and
+    /// the added term takes the sign of `v` even when it is zero so that
+    /// `-0.25` rounds to `-0.0` as the scalar does.
+    #[inline(always)]
+    fn round<S: Simd>(simd: S, v: S::f64s) -> S::f64s {
+        let t = v.trunc();
+        let away = (v - t).abs().simd_ge(S::f64s::splat(simd, 0.5));
+        t + away
+            .select(S::f64s::splat(simd, 1.0), S::f64s::splat(simd, 0.0))
+            .copysign(v)
+    }
+
+    /// [`round`] on the first vector of `v`, for the tests.
+    #[cfg(test)]
+    pub(super) fn round_slice<S: Simd>(simd: S, v: &[f64]) -> Vec<f64> {
+        let n = S::f64s::LEN;
+        round(simd, S::f64s::from_slice(simd, &v[..n]))
+            .as_slice()
+            .to_vec()
+    }
+
+    /// [`super::round_clamp`] on lanes.
+    #[inline(always)]
+    fn round_clamp<S: Simd>(simd: S, v: S::f64s, max: f64) -> S::f64s {
+        round(simd, v)
+            .max(S::f64s::splat(simd, 0.0))
+            .min(S::f64s::splat(simd, max))
+    }
+
+    /// [`round_clamp`] over a slice, in place.
+    #[inline(always)]
+    fn round_clamp_slice<S: Simd>(simd: S, v: &mut [f64], max: f64) {
+        for c in v.chunks_exact_mut(S::f64s::LEN) {
+            round_clamp(simd, S::f64s::from_slice(simd, c), max).store_slice(c);
+        }
+    }
+
+    /// The lane masks and coefficients for the vectors whose lane 0 is
+    /// channel `phase` of its pixel.
+    struct Phase<S: Simd> {
+        /// Lanes that are channel 1 and channel 2 of their pixel.
+        m1: S::mask64s,
+        m2: S::mask64s,
+        /// The coefficient of each of the three inputs, and the constant.
+        k: [S::f64s; 3],
+        h: S::f64s,
+    }
+
+    /// The three phases of a coefficient table with one row per channel.
+    fn phases<S: Simd>(simd: S, table: [[f64; 4]; 3]) -> [Phase<S>; 3] {
+        std::array::from_fn(|phase| {
+            let chan = |lane: usize| (phase + lane) % 3;
+            let row = |j: usize| S::f64s::from_fn(simd, |lane| table[chan(lane)][j]);
+            let is = |c: usize| {
+                S::f64s::from_fn(simd, |lane| (chan(lane) == c) as u8 as f64)
+                    .simd_eq(S::f64s::splat(simd, 1.0))
+            };
+            Phase {
+                m1: is(1),
+                m2: is(2),
+                k: [row(0), row(1), row(2)],
+                h: row(3),
+            }
+        })
+    }
+
+    /// The three inputs of the pixel each lane belongs to, for the vector
+    /// starting at element `at` of the padded stream `x`.
+    #[inline(always)]
+    fn pixel_lanes<S: Simd>(
+        simd: S,
+        ph: &Phase<S>,
+        x: &[f64],
+        at: usize,
+    ) -> (S::f64s, S::f64s, S::f64s) {
+        let n = S::f64s::LEN;
+        let load = |o: usize| S::f64s::from_slice(simd, &x[at + o - 2..at + o - 2 + n]);
+        let (lm2, lm1, l0, l1, l2) = (load(0), load(1), load(2), load(3), load(4));
+        (
+            ph.m1.select(lm1, ph.m2.select(lm2, l0)),
+            ph.m1.select(l0, ph.m2.select(lm1, l1)),
+            ph.m1.select(l1, ph.m2.select(l0, l2)),
+        )
+    }
+
+    /// [`super::rgb_to_yuv`] over the padded RGB stream `x` into `out`,
+    /// rounded and clamped when `max` is given.
+    #[inline(always)]
+    fn forward_block<S: Simd>(
+        simd: S,
+        ph: &[Phase<S>; 3],
+        x: &[f64],
+        out: &mut [f64],
+        max: Option<f64>,
+    ) {
+        let n = S::f64s::LEN;
+        for (k, o) in out.chunks_exact_mut(n).enumerate() {
+            let ph = &ph[(k * n) % 3];
+            let (r, g, b) = pixel_lanes(simd, ph, x, PAD + k * n);
+            let v = ((ph.k[0] * r + ph.k[1] * g) + ph.k[2] * b) + ph.h;
+            match max {
+                Some(max) => round_clamp(simd, v, max).store_slice(o),
+                None => v.store_slice(o),
             }
         }
     }
 
-    Ok(arr)
+    /// [`super::yuv_to_rgb`] over the padded YUV stream `x` into `out`,
+    /// rounded and clamped.
+    #[inline(always)]
+    fn inverse_block<S: Simd>(
+        simd: S,
+        ph: &[Phase<S>; 3],
+        x: &[f64],
+        out: &mut [f64],
+        half: f64,
+        max: f64,
+    ) {
+        let n = S::f64s::LEN;
+        let half = S::f64s::splat(simd, half);
+        for (k, o) in out.chunks_exact_mut(n).enumerate() {
+            let ph = &ph[(k * n) % 3];
+            let (y, cb, cr) = pixel_lanes(simd, ph, x, PAD + k * n);
+            let v = (y + ph.k[1] * (cb - half)) + ph.k[2] * (cr - half);
+            round_clamp(simd, v, max).store_slice(o);
+        }
+    }
+
+    fn forward_table(half: f64) -> [[f64; 4]; 3] {
+        [
+            [0.299, 0.587, 0.114, 0.0],
+            [-0.169, -0.331, 0.5, half],
+            [0.5, -0.419, -0.081, half],
+        ]
+    }
+
+    /// Column 0 is unused: the inverse takes `y` itself.
+    const INVERSE_TABLE: [[f64; 4]; 3] = [
+        [0.0, 0.0, 1.402, 0.0],
+        [0.0, -0.344, -0.714, 0.0],
+        [0.0, 1.772, 0.0, 0.0],
+    ];
+
+    fn padded() -> Vec<f64> {
+        vec![0.0; PAD + 3 * BLOCK + PAD]
+    }
+
+    #[simd]
+    pub(super) fn yuv444_forward<S: Simd, T: YuvElem>(
+        simd: S,
+        v: &[T],
+        out: &mut [T],
+        half: f64,
+        max: f64,
+    ) -> usize {
+        let ph = phases(simd, forward_table(half));
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let blocks = v.len() / (3 * BLOCK);
+        for (src, dst) in v
+            .chunks_exact(3 * BLOCK)
+            .zip(out.chunks_exact_mut(3 * BLOCK))
+        {
+            T::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
+            forward_block(simd, &ph, &x, &mut y, Some(max));
+            T::narrow(simd, &y, dst);
+        }
+        blocks * 3 * BLOCK
+    }
+
+    #[simd]
+    pub(super) fn yuv444_inverse<S: Simd, T: YuvElem>(
+        simd: S,
+        v: &[T],
+        out: &mut [T],
+        half: f64,
+        max: f64,
+    ) -> usize {
+        let ph = phases(simd, INVERSE_TABLE);
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let blocks = v.len() / (3 * BLOCK);
+        for (src, dst) in v
+            .chunks_exact(3 * BLOCK)
+            .zip(out.chunks_exact_mut(3 * BLOCK))
+        {
+            T::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
+            inverse_block(simd, &ph, &x, &mut y, half, max);
+            T::narrow(simd, &y, dst);
+        }
+        blocks * 3 * BLOCK
+    }
+
+    #[simd]
+    pub(super) fn yuv422_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let ph = phases(simd, forward_table(super::U8_HALF));
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let mut packed = vec![0.0; 2 * BLOCK];
+        let blocks = v.len() / (3 * BLOCK);
+        for (src, dst) in v
+            .chunks_exact(3 * BLOCK)
+            .zip(out.chunks_exact_mut(2 * BLOCK))
+        {
+            u8::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
+            forward_block(simd, &ph, &x, &mut y, None);
+            for (p, o) in y.chunks_exact(6).zip(packed.chunks_exact_mut(4)) {
+                o[0] = (p[1] + p[4]) / 2.0;
+                o[1] = p[0];
+                o[2] = (p[2] + p[5]) / 2.0;
+                o[3] = p[3];
+            }
+            round_clamp_slice(simd, &mut packed, super::U8_MAX);
+            u8::narrow(simd, &packed, dst);
+        }
+        blocks * BLOCK / 2
+    }
+
+    #[simd]
+    pub(super) fn yuv422_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let ph = phases(simd, INVERSE_TABLE);
+        let mut packed = vec![0.0; 2 * BLOCK];
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let blocks = v.len() / (2 * BLOCK);
+        for (src, dst) in v
+            .chunks_exact(2 * BLOCK)
+            .zip(out.chunks_exact_mut(3 * BLOCK))
+        {
+            u8::widen(simd, src, &mut packed);
+            for (p, o) in packed.chunks_exact(4).zip(x[PAD..].chunks_exact_mut(6)) {
+                o[0] = p[1];
+                o[1] = p[0];
+                o[2] = p[2];
+                o[3] = p[3];
+                o[4] = p[0];
+                o[5] = p[2];
+            }
+            inverse_block(simd, &ph, &x, &mut y, super::U8_HALF, super::U8_MAX);
+            u8::narrow(simd, &y, dst);
+        }
+        blocks * BLOCK / 2
+    }
+
+    #[simd]
+    pub(super) fn yuv411_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let ph = phases(simd, forward_table(super::U8_HALF));
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let mut packed = vec![0.0; 6 * BLOCK / 4];
+        let blocks = v.len() / (3 * BLOCK);
+        for (src, dst) in v
+            .chunks_exact(3 * BLOCK)
+            .zip(out.chunks_exact_mut(6 * BLOCK / 4))
+        {
+            u8::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
+            forward_block(simd, &ph, &x, &mut y, None);
+            for (p, o) in y.chunks_exact(12).zip(packed.chunks_exact_mut(6)) {
+                o[0] = (((p[1] + p[4]) + p[7]) + p[10]) / 4.0;
+                o[1] = p[0];
+                o[2] = p[3];
+                o[3] = (((p[2] + p[5]) + p[8]) + p[11]) / 4.0;
+                o[4] = p[6];
+                o[5] = p[9];
+            }
+            round_clamp_slice(simd, &mut packed, super::U8_MAX);
+            u8::narrow(simd, &packed, dst);
+        }
+        blocks * BLOCK / 4
+    }
+
+    #[simd]
+    pub(super) fn yuv411_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let ph = phases(simd, INVERSE_TABLE);
+        let mut packed = vec![0.0; 6 * BLOCK / 4];
+        let mut x = padded();
+        let mut y = vec![0.0; 3 * BLOCK];
+        let blocks = v.len() / (6 * BLOCK / 4);
+        for (src, dst) in v
+            .chunks_exact(6 * BLOCK / 4)
+            .zip(out.chunks_exact_mut(3 * BLOCK))
+        {
+            u8::widen(simd, src, &mut packed);
+            for (p, o) in packed.chunks_exact(6).zip(x[PAD..].chunks_exact_mut(12)) {
+                for (k, &yv) in [p[1], p[2], p[4], p[5]].iter().enumerate() {
+                    o[k * 3] = yv;
+                    o[k * 3 + 1] = p[0];
+                    o[k * 3 + 2] = p[3];
+                }
+            }
+            inverse_block(simd, &ph, &x, &mut y, super::U8_HALF, super::U8_MAX);
+            u8::narrow(simd, &y, dst);
+        }
+        blocks * BLOCK / 4
+    }
+}
+
+#[cfg(all(test, feature = "simd"))]
+mod simd_tests {
+    use super::*;
+    use fearless_simd::{Level, dispatch};
+
+    fn levels() -> Vec<Level> {
+        let top = crate::simd::level();
+        let mut out = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            out.extend(top.as_avx2().map(Level::Avx2));
+            out.extend(top.as_sse4_2().map(Level::Sse4_2));
+            out.extend(top.as_sse2().map(Level::Sse2));
+        }
+        out
+    }
+
+    /// A pseudo-random frame, with the values whose BT.601 outputs land on
+    /// an exact half, on the clamp edges or beyond them mixed in.
+    fn frame_u8(n: usize) -> Vec<u8> {
+        let mut x = 0x2545_f491u32;
+        (0..n)
+            .map(|i| match i % 7 {
+                0 => 0,
+                1 => 255,
+                2 => 128,
+                3 => 1,
+                _ => {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                }
+            })
+            .collect()
+    }
+
+    fn frame_u16(n: usize) -> Vec<u16> {
+        let mut x = 0x9e37_79b9u32;
+        (0..n)
+            .map(|i| match i % 5 {
+                0 => 0,
+                1 => 65535,
+                2 => 32768,
+                _ => {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u16
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_matches_f64_round_on_every_level() {
+        let cases: Vec<f64> = (-40..40)
+            .map(|i| i as f64 * 0.25)
+            .chain([
+                0.49999999999999994,
+                -0.49999999999999994,
+                2.5,
+                -2.5,
+                1e15 + 0.5,
+            ])
+            .collect();
+        for level in levels() {
+            for chunk in cases.chunks(2) {
+                let mut inp = [0.0; 8];
+                inp[..chunk.len()].copy_from_slice(chunk);
+                let got: Vec<f64> = dispatch!(level, s => simd_kernels::round_slice(s, &inp));
+                for (k, &g) in got.iter().enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        inp[k].round().to_bits(),
+                        "{level:?} {}",
+                        inp[k]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yuv444_kernels_match_scalar_on_every_level() {
+        let pixels = 2 * 1024 + 97;
+        let u8s = frame_u8(pixels * 3);
+        let u16s = frame_u16(pixels * 3);
+        for level in levels() {
+            let mut want = vec![0u8; pixels * 3];
+            yuv444_forward_scalar(&u8s, &mut want, U8_HALF, U8_MAX);
+            let mut got = vec![0u8; pixels * 3];
+            let done = dispatch!(level, s => simd_kernels::yuv444_forward(s, &u8s, &mut got, U8_HALF, U8_MAX));
+            assert_eq!(got[..done], want[..done], "{level:?} forward u8");
+            let mut want_inv = vec![0u8; pixels * 3];
+            yuv444_inverse_scalar(&want, &mut want_inv, U8_HALF, U8_MAX);
+            let done = dispatch!(level, s => simd_kernels::yuv444_inverse(s, &want, &mut got, U8_HALF, U8_MAX));
+            assert_eq!(got[..done], want_inv[..done], "{level:?} inverse u8");
+
+            let mut want = vec![0u16; pixels * 3];
+            yuv444_forward_scalar(&u16s, &mut want, U16_HALF, U16_MAX);
+            let mut got = vec![0u16; pixels * 3];
+            let done = dispatch!(level, s => simd_kernels::yuv444_forward(s, &u16s, &mut got, U16_HALF, U16_MAX));
+            assert_eq!(got[..done], want[..done], "{level:?} forward u16");
+            let mut want_inv = vec![0u16; pixels * 3];
+            yuv444_inverse_scalar(&want, &mut want_inv, U16_HALF, U16_MAX);
+            let done = dispatch!(level, s => simd_kernels::yuv444_inverse(s, &want, &mut got, U16_HALF, U16_MAX));
+            assert_eq!(got[..done], want_inv[..done], "{level:?} inverse u16");
+        }
+    }
+
+    #[test]
+    fn yuv422_kernels_match_scalar_on_every_level() {
+        let pairs = 1024 + 61;
+        let rgb = frame_u8(pairs * 6);
+        for level in levels() {
+            let mut want = vec![0u8; pairs * 4];
+            yuv422_forward_scalar(&rgb, &mut want);
+            let mut got = vec![0u8; pairs * 4];
+            let done = dispatch!(level, s => simd_kernels::yuv422_forward(s, &rgb, &mut got));
+            assert!(done > 0);
+            assert_eq!(got[..done * 4], want[..done * 4], "{level:?} forward");
+            let mut want_inv = vec![0u8; pairs * 6];
+            yuv422_inverse_scalar(&want, &mut want_inv);
+            let mut got = vec![0u8; pairs * 6];
+            let done = dispatch!(level, s => simd_kernels::yuv422_inverse(s, &want, &mut got));
+            assert_eq!(got[..done * 6], want_inv[..done * 6], "{level:?} inverse");
+        }
+    }
+
+    #[test]
+    fn yuv411_kernels_match_scalar_on_every_level() {
+        let groups = 512 + 43;
+        let rgb = frame_u8(groups * 12);
+        for level in levels() {
+            let mut want = vec![0u8; groups * 6];
+            yuv411_forward_scalar(&rgb, &mut want);
+            let mut got = vec![0u8; groups * 6];
+            let done = dispatch!(level, s => simd_kernels::yuv411_forward(s, &rgb, &mut got));
+            assert!(done > 0);
+            assert_eq!(got[..done * 6], want[..done * 6], "{level:?} forward");
+            let mut want_inv = vec![0u8; groups * 12];
+            yuv411_inverse_scalar(&want, &mut want_inv);
+            let mut got = vec![0u8; groups * 12];
+            let done = dispatch!(level, s => simd_kernels::yuv411_inverse(s, &want, &mut got));
+            assert_eq!(got[..done * 12], want_inv[..done * 12], "{level:?} inverse");
+        }
+    }
+
+    /// The public entry points on a frame that is not a whole number of
+    /// blocks, so the scalar tail is exercised too.
+    #[test]
+    fn frame_conversions_match_scalar_end_to_end() {
+        let (x, y) = (1028, 3);
+        let rgb = frame_u8(x * y * 3);
+        let mut want = vec![0u8; x * y * 3];
+        yuv444_forward_scalar(&rgb, &mut want, U8_HALF, U8_MAX);
+        let mut got = vec![0u8; x * y * 3];
+        yuv444_forward(&rgb, &mut got, U8_HALF, U8_MAX);
+        assert_eq!(got, want);
+
+        let mut want = vec![0u8; x * y * 2];
+        yuv422_forward_scalar(&rgb, &mut want);
+        let mut got = vec![0u8; x * y * 2];
+        yuv422_forward(&rgb, &mut got);
+        assert_eq!(got, want);
+        let mut back_want = vec![0u8; x * y * 3];
+        yuv422_inverse_scalar(&want, &mut back_want);
+        let mut back = vec![0u8; x * y * 3];
+        yuv422_inverse(&want, &mut back);
+        assert_eq!(back, back_want);
+
+        let mut want = vec![0u8; x * y * 6 / 4];
+        yuv411_forward_scalar(&rgb, &mut want);
+        let mut got = vec![0u8; x * y * 6 / 4];
+        yuv411_forward(&rgb, &mut got);
+        assert_eq!(got, want);
+        let mut back_want = vec![0u8; x * y * 3];
+        yuv411_inverse_scalar(&want, &mut back_want);
+        let mut back = vec![0u8; x * y * 3];
+        yuv411_inverse(&want, &mut back);
+        assert_eq!(back, back_want);
+    }
 }
 
 #[cfg(test)]

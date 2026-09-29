@@ -604,7 +604,7 @@ const PAR_CHUNK: usize = 1 << 16;
 /// Stages 1-4 of one frame with every switch resolved: each stage is present
 /// or absent, and the two correction buffers are the slices the stage reads
 /// at the same index as the value it corrects. One such set describes the
-/// frame; [`slice`](Self::slice) cuts it down to a chunk of it.
+/// frame; `slice` cuts it down to a chunk of it.
 struct ElementOps<'a> {
     /// Stage 1: background subtraction, `value -= bg[i]`.
     bg: Option<&'a [f64]>,

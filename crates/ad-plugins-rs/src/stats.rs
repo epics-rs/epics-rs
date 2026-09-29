@@ -193,7 +193,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     fn lower(cur: Self, e: Self) -> Self;
     fn upper(cur: Self, e: Self) -> Self;
     /// The two reductions, as this type runs them: the lane loops below, or,
-    /// with the `simd` feature, [`simd_kernels`].
+    /// with the `simd` feature, `simd_kernels`.
     fn range(v: &[Self]) -> Range<Self> {
         range_pass(v)
     }
@@ -203,7 +203,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     /// One row of a [`Projection`]: `col_sum` and `col_thr` gain the row's
     /// values and threshold values column by column, and the row's own
     /// Σvalue, Σthreshold value and Σthreshold value·ix come back. The lane
-    /// loop below, or, with the `simd` feature, [`simd_kernels`].
+    /// loop below, or, with the `simd` feature, `simd_kernels`.
     fn project_row(
         row: &[Self],
         threshold: f64,
@@ -226,7 +226,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     }
     /// The formula path of a histogram: every value of `v` counted into
     /// `slots` (the bins, then the below and above slots). The element loop
-    /// below, or, with the `simd` feature, [`simd_kernels`] for the 32-bit
+    /// below, or, with the `simd` feature, `simd_kernels` for the 32-bit
     /// integers and the floats.
     fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
         formula_count_pass(v, f, slots)
@@ -922,7 +922,7 @@ mod simd_kernels {
     /// [`super::range_pass`] for a float type: strict `<`/`>` compares with a
     /// select, so a NaN never wins a lane and the NaN a lane holds from
     /// `v[0]` is never displaced; the lane fold and the tail keep the same
-    /// rule through [`StatsElem::lower`]/[`upper`]. `$to_f64` splits a chunk
+    /// rule through [`StatsElem::lower`]/[`StatsElem::upper`]. `$to_f64` splits a chunk
     /// into its `f64` vectors for the sum.
     macro_rules! float_range_kernel {
         ($t:ty, $vec:ident, $name:ident, |$y:ident| $to_f64:expr) => {

@@ -144,7 +144,7 @@ fn magnitudes_into(out: &mut [f64], bins: &[Complex<f64>], n: f64) {
 }
 
 /// The column transforms of the row-major `w`-wide complex array `data`,
-/// [`COLS`] columns at a time so every row is read and written in runs of
+/// `COLS` columns at a time so every row is read and written in runs of
 /// adjacent elements instead of one element per row per column.
 fn fft_columns(plan: &mut Plan, data: &mut [Complex<f64>], w: usize) {
     const COLS: usize = 8;

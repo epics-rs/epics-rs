@@ -600,7 +600,7 @@ fn read_u64_le(b: &[u8], off: usize) -> u64 {
 /// Transpose bytes within elements (library `bshuf_trans_byte_elem_scal`,
 /// bitshuffle_core.c:174). `size` is a multiple of 8 for every shuffled block.
 /// With the `simd` feature the 2-, 4- and 8-byte elements go through
-/// [`bshuf_simd::trans_byte_elem`] first; the loops pick up where it stopped.
+/// `bshuf_simd::trans_byte_elem` first; the loops pick up where it stopped.
 fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     if elem_size == 1 {
         out[..size].copy_from_slice(&input[..size]);
@@ -643,7 +643,7 @@ fn bshuf_trans_byte_elem_from(
 
 /// Transpose bits within bytes (library `bshuf_trans_bit_byte_scal`,
 /// bitshuffle_core.c:219, little-endian path). With the `simd` feature
-/// [`bshuf_simd::trans_bit_byte`] runs first; the loop picks up where it
+/// `bshuf_simd::trans_bit_byte` runs first; the loop picks up where it
 /// stopped.
 fn bshuf_trans_bit_byte(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
@@ -733,7 +733,7 @@ fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> 
 
 /// Transpose bytes for data organized as one row per bit (library
 /// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:281). With the `simd`
-/// feature [`bshuf_simd::trans_byte_bitrow`] runs first; the loops pick up
+/// feature `bshuf_simd::trans_byte_bitrow` runs first; the loops pick up
 /// at the column where it stopped.
 fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     #[cfg(feature = "simd")]
@@ -763,7 +763,7 @@ fn bshuf_trans_byte_bitrow_from(
 
 /// Shuffle bits within the bytes of eight-element groups (library
 /// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:308, LE path). With
-/// the `simd` feature [`bshuf_simd::shuffle_bit_eightelem`] runs first; the
+/// the `simd` feature `bshuf_simd::shuffle_bit_eightelem` runs first; the
 /// loop picks up at the quadword where it stopped.
 fn bshuf_shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;

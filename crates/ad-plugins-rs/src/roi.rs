@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::pixel_cast::PixelCast;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
+
+use crate::stats::StatsElem;
 
 /// Per-dimension ROI configuration.
 #[derive(Debug, Clone)]
@@ -72,23 +73,26 @@ impl Default for ROIConfig {
 }
 
 /// Compute the centroid (center of mass) of a 2D image.
+///
+/// Each row goes through [`StatsElem::project_row`], the kernel the stats
+/// plugin's projections run: below a threshold of `-inf` every value passes,
+/// so the row's threshold moment is its Σvalue·ix, and the row's plain sum
+/// still carries a NaN through to the total, which then falls back to the
+/// frame center as the element loop did.
 fn find_centroid_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, usize) {
     let mut cx = 0.0f64;
     let mut cy = 0.0f64;
     let mut total = 0.0f64;
     ad_core_rs::with_buffer!(data, |v| {
         let v = &v[..(x_size * y_size).min(v.len())];
+        let mut col_sum = vec![0.0f64; x_size];
+        let mut col_thr = vec![0.0f64; x_size];
         for (iy, row) in v.chunks(x_size).enumerate() {
-            let mut row_total = 0.0f64;
-            let mut row_cx = 0.0f64;
-            for (ix, &e) in row.iter().enumerate() {
-                let val = PixelCast::to_f64(e);
-                row_total += val;
-                row_cx += val * ix as f64;
-            }
-            total += row_total;
-            cx += row_cx;
-            cy += row_total * iy as f64;
+            let [sum, _, m10] =
+                StatsElem::project_row(row, f64::NEG_INFINITY, &mut col_sum, &mut col_thr);
+            total += sum;
+            cx += m10;
+            cy += sum * iy as f64;
         }
     });
     if total > 0.0 {
@@ -98,7 +102,14 @@ fn find_centroid_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize
     }
 }
 
-/// Find the position of the maximum value in a 2D image.
+/// Find the position of the maximum value in a 2D image: the first
+/// occurrence, in row-major order, of the largest value, with a NaN never
+/// counted as larger than anything.
+///
+/// A row's maximum comes from [`StatsElem::range`], and only a row whose
+/// maximum beats the running one is searched for the position. That kernel
+/// seeds from the row's first element, so a row that starts with a NaN
+/// reports NaN and is scanned element by element instead.
 fn find_peak_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, usize) {
     let mut max_val = f64::NEG_INFINITY;
     let mut max_x = 0;
@@ -106,13 +117,23 @@ fn find_peak_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, us
     ad_core_rs::with_buffer!(data, |v| {
         let v = &v[..(x_size * y_size).min(v.len())];
         for (iy, row) in v.chunks(x_size).enumerate() {
-            for (ix, &e) in row.iter().enumerate() {
-                let val = PixelCast::to_f64(e);
-                if val > max_val {
-                    max_val = val;
-                    max_x = ix;
-                    max_y = iy;
+            let row_max = StatsElem::to_f64(StatsElem::range(row).max);
+            if row_max.is_nan() {
+                for (ix, &e) in row.iter().enumerate() {
+                    let val = StatsElem::to_f64(e);
+                    if val > max_val {
+                        max_val = val;
+                        max_x = ix;
+                        max_y = iy;
+                    }
                 }
+            } else if row_max > max_val {
+                max_val = row_max;
+                max_x = row
+                    .iter()
+                    .position(|&e| StatsElem::to_f64(e) == row_max)
+                    .expect("the row's maximum is in the row");
+                max_y = iy;
             }
         }
     });
@@ -1241,6 +1262,87 @@ mod tests {
         // In the ROI, the peak is at local (6-4, 5-3) = (2, 2)
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[2 * 4 + 2], 255); // peak at local (2,2)
+        }
+    }
+
+    /// Both searches against the element loops they replaced, on every
+    /// element type, with the rows that show the seeding rule: a NaN in a
+    /// row's first slot, a NaN mid-row, a tie across rows, and a frame that
+    /// sums to nothing.
+    #[test]
+    fn centroid_and_peak_match_the_element_loops() {
+        fn reference(v: &[f64], x: usize, y: usize) -> ((usize, usize), (usize, usize)) {
+            let (mut cx, mut cy, mut total) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut max_val, mut max_x, mut max_y) = (f64::NEG_INFINITY, 0, 0);
+            for (iy, row) in v[..(x * y).min(v.len())].chunks(x).enumerate() {
+                let mut row_total = 0.0;
+                for (ix, &val) in row.iter().enumerate() {
+                    row_total += val;
+                    cx += val * ix as f64;
+                    if val > max_val {
+                        max_val = val;
+                        max_x = ix;
+                        max_y = iy;
+                    }
+                }
+                total += row_total;
+                cy += row_total * iy as f64;
+            }
+            let centroid = if total > 0.0 {
+                ((cx / total) as usize, (cy / total) as usize)
+            } else {
+                (x / 2, y / 2)
+            };
+            (centroid, (max_x, max_y))
+        }
+        let (x, y) = (37usize, 5usize);
+        let base: Vec<f64> = (0..x * y)
+            .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 25) as f64)
+            .collect();
+        let mut frames = vec![("plain", base.clone())];
+        let mut tie = base.clone();
+        tie[1 * x + 3] = 200.0;
+        tie[3 * x + 9] = 200.0;
+        tie[3 * x + 30] = 200.0;
+        frames.push(("tie", tie));
+        let mut nan_first = base.clone();
+        nan_first[2 * x] = f64::NAN;
+        nan_first[2 * x + 5] = 300.0;
+        frames.push(("nan first", nan_first));
+        let mut nan_mid = base.clone();
+        nan_mid[2 * x + 17] = f64::NAN;
+        frames.push(("nan mid", nan_mid));
+        frames.push(("zero", vec![0.0; x * y]));
+        frames.push(("short", base[..x * 3 + 11].to_vec()));
+        for (name, f) in &frames {
+            let want = reference(f, x, y);
+            let cast = |b: NDDataBuffer| {
+                let got = (find_centroid_2d(&b, x, y), find_peak_2d(&b, x, y));
+                (b.data_type(), got)
+            };
+            let ints = !f.iter().any(|v| v.is_nan());
+            let mut cases = vec![
+                cast(NDDataBuffer::F64(f.clone())),
+                cast(NDDataBuffer::F32(f.iter().map(|&v| v as f32).collect())),
+            ];
+            if ints {
+                cases.push(cast(NDDataBuffer::U8(f.iter().map(|&v| v as u8).collect())));
+                cases.push(cast(NDDataBuffer::I16(
+                    f.iter().map(|&v| v as i16).collect(),
+                )));
+                cases.push(cast(NDDataBuffer::U32(
+                    f.iter().map(|&v| v as u32).collect(),
+                )));
+                cases.push(cast(NDDataBuffer::I64(
+                    f.iter().map(|&v| v as i64).collect(),
+                )));
+                cases.push(cast(NDDataBuffer::U64(
+                    f.iter().map(|&v| v as u64).collect(),
+                )));
+            }
+            for (t, got) in cases {
+                assert_eq!(got, want, "{name} as {t:?}");
+            }
         }
     }
 

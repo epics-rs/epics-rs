@@ -151,35 +151,30 @@ pub fn rgb1_to_mono(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     let y = src.dims[2].size;
     let n = x * y;
 
-    macro_rules! rgb1_to_mono_typed {
-        ($v:expr, $out:expr, $T:ty) => {{
-            let out: &mut [$T] = $out;
-            for (i, o) in out.iter_mut().enumerate().take(n) {
-                let r = $v[i * 3] as f64;
-                let g = $v[i * 3 + 1] as f64;
-                let b = $v[i * 3 + 2] as f64;
-                // C: value = (R+G+B)/3. then (epicsType)value — truncate.
-                *o = ((r + g + b) / 3.0) as $T;
-            }
-        }};
-    }
-
     let dims = vec![NDDimension::new(x), NDDimension::new(y)];
     let mut arr = output(pool, src, dims, src.data.data_type())?;
-    match (&src.data, &mut arr.data) {
-        (NDDataBuffer::I8(v), NDDataBuffer::I8(out)) => rgb1_to_mono_typed!(v, out, i8),
-        (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => rgb1_to_mono_typed!(v, out, u8),
-        (NDDataBuffer::I16(v), NDDataBuffer::I16(out)) => rgb1_to_mono_typed!(v, out, i16),
-        (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => rgb1_to_mono_typed!(v, out, u16),
-        (NDDataBuffer::I32(v), NDDataBuffer::I32(out)) => rgb1_to_mono_typed!(v, out, i32),
-        (NDDataBuffer::U32(v), NDDataBuffer::U32(out)) => rgb1_to_mono_typed!(v, out, u32),
-        (NDDataBuffer::I64(v), NDDataBuffer::I64(out)) => rgb1_to_mono_typed!(v, out, i64),
-        (NDDataBuffer::U64(v), NDDataBuffer::U64(out)) => rgb1_to_mono_typed!(v, out, u64),
-        (NDDataBuffer::F32(v), NDDataBuffer::F32(out)) => rgb1_to_mono_typed!(v, out, f32),
-        (NDDataBuffer::F64(v), NDDataBuffer::F64(out)) => rgb1_to_mono_typed!(v, out, f64),
-        _ => unreachable!("the output was allocated in the source type"),
-    }
+    same_type!(&src.data, &mut arr.data, |v, out| {
+        rgb1_mean(&v[..3 * n], &mut out[..n])
+    });
     Ok(arr)
+}
+
+/// The mean of [`rgb1_to_mono`] over the RGB1 pixels `v` into `out`: on
+/// lanes as far as whole vectors of pixels reach, then scalar.
+fn rgb1_mean<T: LaneElem>(v: &[T], out: &mut [T]) {
+    #[cfg(feature = "simd")]
+    let done =
+        fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::rgb1_mean(s, v, out));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    rgb1_mean_scalar(&v[3 * done..], &mut out[done..]);
+}
+
+fn rgb1_mean_scalar<T: LaneElem>(v: &[T], out: &mut [T]) {
+    for (px, o) in v.chunks_exact(3).zip(out) {
+        // C: value = (R+G+B)/3. then (epicsType)value — truncate.
+        *o = T::from_f64(((px[0].to_f64() + px[1].to_f64()) + px[2].to_f64()) / 3.0);
+    }
 }
 
 /// Convert between RGB layout orders (RGB1 ↔ RGB2 ↔ RGB3).
@@ -368,8 +363,13 @@ fn round_clamp(v: f64, max: f64) -> f64 {
     v.round().clamp(0.0, max)
 }
 
-/// An element type the YUV conversions run in.
-trait YuvElem: Copy {
+/// An element type the lane conversions run in: its native vector, and
+/// the widening to `f64` and back that the arithmetic kernels use, on a
+/// slice or on one vector.
+trait LaneElem: Copy {
+    /// The native-width vector of this element.
+    #[cfg(feature = "simd")]
+    type Vec<S: fearless_simd::Simd>: fearless_simd::SimdBase<S, Element = Self, ByteVector = S::u8s>;
     fn to_f64(self) -> f64;
     fn from_f64(v: f64) -> Self;
     /// [`to_f64`](Self::to_f64) over a slice, on lanes.
@@ -378,11 +378,21 @@ trait YuvElem: Copy {
     /// [`from_f64`](Self::from_f64) over a slice, on lanes.
     #[cfg(feature = "simd")]
     fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]);
+    /// One vector as its `f64` vectors in element order, into the head
+    /// of `out`.
+    #[cfg(feature = "simd")]
+    fn widen_vec<S: fearless_simd::Simd>(simd: S, v: Self::Vec<S>, out: &mut [S::f64s]);
+    /// The head of `w` as one vector; the inverse of
+    /// [`widen_vec`](Self::widen_vec).
+    #[cfg(feature = "simd")]
+    fn narrow_vec<S: fearless_simd::Simd>(simd: S, w: &[S::f64s]) -> Self::Vec<S>;
 }
 
-macro_rules! yuv_elem {
-    ($t:ty, $widen:ident, $narrow:ident) => {
-        impl YuvElem for $t {
+macro_rules! lane_elem {
+    ($t:ty, $vec:ident, $widen:ident, $narrow:ident, $widen_vec:ident, $narrow_vec:ident) => {
+        impl LaneElem for $t {
+            #[cfg(feature = "simd")]
+            type Vec<S: fearless_simd::Simd> = S::$vec;
             #[inline(always)]
             fn to_f64(self) -> f64 {
                 self as f64
@@ -401,15 +411,115 @@ macro_rules! yuv_elem {
             fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]) {
                 crate::simd::$narrow(simd, v, out)
             }
+            #[cfg(feature = "simd")]
+            #[inline(always)]
+            fn widen_vec<S: fearless_simd::Simd>(_simd: S, v: Self::Vec<S>, out: &mut [S::f64s]) {
+                let wide = crate::simd::$widen_vec::<S>(v);
+                out[..wide.len()].copy_from_slice(&wide);
+            }
+            #[cfg(feature = "simd")]
+            #[inline(always)]
+            fn narrow_vec<S: fearless_simd::Simd>(simd: S, w: &[S::f64s]) -> Self::Vec<S> {
+                crate::simd::$narrow_vec::<S>(simd, std::array::from_fn(|k| w[k]))
+            }
         }
     };
 }
 
-yuv_elem!(u8, to_f64_u8, from_f64_u8);
-yuv_elem!(u16, to_f64_u16, from_f64_u16);
+lane_elem!(i8, i8s, to_f64_i8, from_f64_i8, to_f64s_i8, from_f64s_i8);
+lane_elem!(u8, u8s, to_f64_u8, from_f64_u8, to_f64s_u8, from_f64s_u8);
+lane_elem!(
+    i16,
+    i16s,
+    to_f64_i16,
+    from_f64_i16,
+    to_f64s_i16,
+    from_f64s_i16
+);
+lane_elem!(
+    u16,
+    u16s,
+    to_f64_u16,
+    from_f64_u16,
+    to_f64s_u16,
+    from_f64s_u16
+);
+lane_elem!(
+    i32,
+    i32s,
+    to_f64_i32,
+    from_f64_i32,
+    to_f64s_i32,
+    from_f64s_i32
+);
+lane_elem!(
+    u32,
+    u32s,
+    to_f64_u32,
+    from_f64_u32,
+    to_f64s_u32,
+    from_f64s_u32
+);
+lane_elem!(
+    i64,
+    i64s,
+    to_f64_i64,
+    from_f64_i64,
+    to_f64s_i64,
+    from_f64s_i64
+);
+lane_elem!(
+    u64,
+    u64s,
+    to_f64_u64,
+    from_f64_u64,
+    to_f64s_u64,
+    from_f64s_u64
+);
+lane_elem!(
+    f32,
+    f32s,
+    to_f64_f32,
+    from_f64_f32,
+    to_f64s_f32,
+    from_f64s_f32
+);
+
+impl LaneElem for f64 {
+    #[cfg(feature = "simd")]
+    type Vec<S: fearless_simd::Simd> = S::f64s;
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self
+    }
+    #[inline(always)]
+    fn from_f64(v: f64) -> Self {
+        v
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn widen<S: fearless_simd::Simd>(_simd: S, v: &[Self], out: &mut [f64]) {
+        out.copy_from_slice(v)
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn narrow<S: fearless_simd::Simd>(_simd: S, v: &[f64], out: &mut [Self]) {
+        out.copy_from_slice(v)
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn widen_vec<S: fearless_simd::Simd>(_simd: S, v: Self::Vec<S>, out: &mut [S::f64s]) {
+        out[0] = v;
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn narrow_vec<S: fearless_simd::Simd>(_simd: S, w: &[S::f64s]) -> Self::Vec<S> {
+        w[0]
+    }
+}
 
 /// RGB1 pixels to YUV444 pixels, both `[3, n]`.
-fn yuv444_forward<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+fn yuv444_forward<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     #[cfg(feature = "simd")]
     {
         let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv444_forward(s, v, out, half, max));
@@ -419,7 +529,7 @@ fn yuv444_forward<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     yuv444_forward_scalar(v, out, half, max);
 }
 
-fn yuv444_forward_scalar<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+fn yuv444_forward_scalar<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
         let (y, cb, cr) = rgb_to_yuv(px[0].to_f64(), px[1].to_f64(), px[2].to_f64(), half);
         o[0] = T::from_f64(round_clamp(y, max));
@@ -429,7 +539,7 @@ fn yuv444_forward_scalar<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64
 }
 
 /// YUV444 pixels to RGB1 pixels, both `[3, n]`.
-fn yuv444_inverse<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+fn yuv444_inverse<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     #[cfg(feature = "simd")]
     {
         let done = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::yuv444_inverse(s, v, out, half, max));
@@ -439,7 +549,7 @@ fn yuv444_inverse<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     yuv444_inverse_scalar(v, out, half, max);
 }
 
-fn yuv444_inverse_scalar<T: YuvElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
+fn yuv444_inverse_scalar<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
     for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
         let (r, g, b) = yuv_to_rgb(px[0].to_f64(), px[1].to_f64() - half, px[2].to_f64() - half);
         o[0] = T::from_f64(round_clamp(r, max));
@@ -763,7 +873,7 @@ pub fn yuv411_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
 /// signed zero to a value that is never `-0.0`, which leaves it unchanged.
 #[cfg(feature = "simd")]
 mod simd_kernels {
-    use super::YuvElem;
+    use super::LaneElem;
     use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
 
@@ -922,8 +1032,80 @@ mod simd_kernels {
         vec![0.0; PAD + 3 * BLOCK + PAD]
     }
 
+    /// The byte-swizzle tables of a three-way split or join of `e`-byte
+    /// elements across three consecutive vectors: `t[i][k]` maps output
+    /// vector `i` from input vector `k`, with `0xFF` (past every vector)
+    /// in the lanes that come from another input, which
+    /// `swizzle_dyn_precise` zeroes so the three pulls or together.
+    type Tables<S> = [[<S as Simd>::u8s; 3]; 3];
+
+    /// The tables that split pixels `[r0 g0 b0 r1 ...]` into the planes
+    /// `[r0 r1 ...]`, `[g0 g1 ...]`, `[b0 b1 ...]`.
+    #[inline(always)]
+    fn split_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+        let n = S::u8s::LEN;
+        std::array::from_fn(|c| {
+            std::array::from_fn(|k| {
+                S::u8s::from_fn(simd, |j| {
+                    let g = (3 * (j / e) + c) * e + j % e;
+                    if g / n == k { (g % n) as u8 } else { 0xFF }
+                })
+            })
+        })
+    }
+
+    /// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | v[2][t[i][2]]`, per byte.
+    #[inline(always)]
+    fn shuffle3<S: Simd>(t: &Tables<S>, v: [S::u8s; 3]) -> [S::u8s; 3] {
+        std::array::from_fn(|i| {
+            v[0].swizzle_dyn_precise(t[i][0])
+                | v[1].swizzle_dyn_precise(t[i][1])
+                | v[2].swizzle_dyn_precise(t[i][2])
+        })
+    }
+
+    /// Three consecutive vectors of `v`, as bytes.
+    #[inline(always)]
+    fn load3<S: Simd, T: LaneElem>(simd: S, v: &[T]) -> [S::u8s; 3] {
+        let per = T::Vec::<S>::LEN;
+        std::array::from_fn(|k| {
+            T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes()
+        })
+    }
+
+    /// `f64` vectors per vector of the narrowest element, on every level.
+    const WIDE: usize = 8;
+
+    /// [`super::rgb1_mean_scalar`] on lanes, a vector of pixels per step
+    /// and all of it in registers: the pixels split into their planes,
+    /// each plane widens, and the mean narrows back. Returns the pixels
+    /// done, every whole vector of them.
     #[simd]
-    pub(super) fn yuv444_forward<S: Simd, T: YuvElem>(
+    pub(super) fn rgb1_mean<S: Simd, T: LaneElem>(simd: S, v: &[T], out: &mut [T]) -> usize {
+        let per = T::Vec::<S>::LEN;
+        let k = per / S::f64s::LEN;
+        let t = split_tables::<S>(simd, std::mem::size_of::<T>());
+        let zero = S::f64s::splat(simd, 0.0);
+        let three = S::f64s::splat(simd, 3.0);
+        let steps = (v.len() / 3).min(out.len()) / per;
+        for (src, dst) in v.chunks_exact(3 * per).zip(out.chunks_exact_mut(per)) {
+            let split = shuffle3::<S>(&t, load3::<S, T>(simd, src));
+            let mut wide = [[zero; WIDE]; 3];
+            for (c, p) in split.into_iter().enumerate() {
+                T::widen_vec(simd, T::Vec::<S>::from_bytes(p), &mut wide[c]);
+            }
+            let [r, g, b] = wide;
+            let mut mean = [zero; WIDE];
+            for j in 0..k {
+                mean[j] = ((r[j] + g[j]) + b[j]) / three;
+            }
+            T::narrow_vec(simd, &mean[..k]).store_slice(dst);
+        }
+        steps * per
+    }
+
+    #[simd]
+    pub(super) fn yuv444_forward<S: Simd, T: LaneElem>(
         simd: S,
         v: &[T],
         out: &mut [T],
@@ -946,7 +1128,7 @@ mod simd_kernels {
     }
 
     #[simd]
-    pub(super) fn yuv444_inverse<S: Simd, T: YuvElem>(
+    pub(super) fn yuv444_inverse<S: Simd, T: LaneElem>(
         simd: S,
         v: &[T],
         out: &mut [T],
@@ -1153,6 +1335,69 @@ mod simd_tests {
                 }
             }
         }
+    }
+
+    /// Every element type, the integers over their whole range and the
+    /// floats with NaN, the infinities and values the `f32` narrowing
+    /// rounds mixed in, on a pixel count that leaves a tail.
+    #[test]
+    fn rgb1_mean_matches_scalar_on_every_level() {
+        let pixels = 3 * 64 + 5;
+        let mut x = 0x2545_f491_u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        macro_rules! check {
+            ($t:ty, $f:expr, $eq:expr) => {{
+                let f: fn(u64, usize) -> $t = $f;
+                let eq: fn($t, $t) -> bool = $eq;
+                let v: Vec<$t> = (0..pixels * 3).map(|i| f(next(), i)).collect();
+                let mut want = vec![<$t>::default(); pixels];
+                rgb1_mean_scalar(&v, &mut want);
+                for level in levels() {
+                    let mut got = vec![<$t>::default(); pixels];
+                    let done = dispatch!(level, s => simd_kernels::rgb1_mean(s, &v, &mut got));
+                    assert!(done > 0 && done <= pixels, "{level:?} {}", stringify!($t));
+                    rgb1_mean_scalar(&v[3 * done..], &mut got[done..]);
+                    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                        assert!(eq(g, w), "{level:?} {} pixel {i}: {g:?} vs {w:?}", stringify!($t));
+                    }
+                }
+            }};
+        }
+        macro_rules! ints {
+            ($($t:ty),*) => {$(
+                check!($t, |x, i| match i % 5 { 0 => <$t>::MIN, 1 => <$t>::MAX, _ => x as $t }, |g, w| g == w);
+            )*};
+        }
+        ints!(i8, u8, i16, u16, i32, u32, i64, u64);
+        check!(
+            f32,
+            |x, i| match i % 7 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                3 => f32::MAX,
+                4 => -0.0,
+                _ => f32::from_bits(x as u32),
+            },
+            |g, w| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan())
+        );
+        check!(
+            f64,
+            |x, i| match i % 7 {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                2 => f64::NEG_INFINITY,
+                3 => f64::MAX,
+                4 => -0.0,
+                _ => f64::from_bits(x),
+            },
+            |g, w| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan())
+        );
     }
 
     #[test]

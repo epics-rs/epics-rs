@@ -16,10 +16,17 @@ pub fn level() -> Level {
     *LEVEL.get_or_init(Level::new)
 }
 
-/// `v.iter().map(|&x| x as f64)` on vectors: `$to_f64` splits a chunk of
-/// `$vec` into its `f64` vectors in element order.
+/// `v.iter().map(|&x| x as f64)` on vectors: `$to_f64` splits a vector
+/// of `$vec` into its `$k` `f64` vectors in element order. `$wide` is
+/// that on one vector, for the kernels that keep their lanes in
+/// registers; `$name` runs it over a slice.
 macro_rules! to_f64_kernel {
-    ($t:ty, $vec:ident, $name:ident, |$y:ident| $to_f64:expr) => {
+    ($t:ty, $vec:ident, $name:ident, $wide:ident, $k:literal, |$y:ident| $to_f64:expr) => {
+        #[inline(always)]
+        pub(crate) fn $wide<S: Simd>($y: S::$vec) -> [S::f64s; $k] {
+            $to_f64
+        }
+
         #[simd]
         pub(crate) fn $name<S: Simd>(simd: S, v: &[$t], out: &mut [f64]) {
             assert_eq!(v.len(), out.len());
@@ -27,8 +34,8 @@ macro_rules! to_f64_kernel {
             let mut chunks = v.chunks_exact(S::$vec::LEN);
             let mut outs = out.chunks_exact_mut(S::$vec::LEN);
             for (c, o) in (&mut chunks).zip(&mut outs) {
-                let $y = S::$vec::from_slice(simd, c);
-                for (k, f) in $to_f64.into_iter().enumerate() {
+                let wide = $wide::<S>(S::$vec::from_slice(simd, c));
+                for (k, f) in wide.into_iter().enumerate() {
                     f.store_slice(&mut o[k * n..(k + 1) * n]);
                 }
             }
@@ -39,21 +46,25 @@ macro_rules! to_f64_kernel {
     };
 }
 
-to_f64_kernel!(f32, f32s, to_f64_f32, |y| {
+to_f64_kernel!(f32, f32s, to_f64_f32, to_f64s_f32, 2, |y| {
     let (a, b) = y.widen();
     [a, b]
 });
-to_f64_kernel!(i64, i64s, to_f64_i64, |y| [S::f64s::float_from(y)]);
-to_f64_kernel!(u64, u64s, to_f64_u64, |y| [S::f64s::float_from(y)]);
-to_f64_kernel!(i32, i32s, to_f64_i32, |y| {
+to_f64_kernel!(i64, i64s, to_f64_i64, to_f64s_i64, 1, |y| [
+    S::f64s::float_from(y)
+]);
+to_f64_kernel!(u64, u64s, to_f64_u64, to_f64s_u64, 1, |y| [
+    S::f64s::float_from(y)
+]);
+to_f64_kernel!(i32, i32s, to_f64_i32, to_f64s_i32, 2, |y| {
     let (p0, p1) = y.widen();
     [S::f64s::float_from(p0), S::f64s::float_from(p1)]
 });
-to_f64_kernel!(u32, u32s, to_f64_u32, |y| {
+to_f64_kernel!(u32, u32s, to_f64_u32, to_f64s_u32, 2, |y| {
     let (p0, p1) = y.widen();
     [S::f64s::float_from(p0), S::f64s::float_from(p1)]
 });
-to_f64_kernel!(i16, i16s, to_f64_i16, |y| {
+to_f64_kernel!(i16, i16s, to_f64_i16, to_f64s_i16, 4, |y| {
     let (a, b) = y.widen();
     let (p0, p1) = a.widen();
     let (p2, p3) = b.widen();
@@ -64,7 +75,7 @@ to_f64_kernel!(i16, i16s, to_f64_i16, |y| {
         S::f64s::float_from(p3),
     ]
 });
-to_f64_kernel!(u16, u16s, to_f64_u16, |y| {
+to_f64_kernel!(u16, u16s, to_f64_u16, to_f64s_u16, 4, |y| {
     let (a, b) = y.widen();
     let (p0, p1) = a.widen();
     let (p2, p3) = b.widen();
@@ -75,7 +86,7 @@ to_f64_kernel!(u16, u16s, to_f64_u16, |y| {
         S::f64s::float_from(p3),
     ]
 });
-to_f64_kernel!(i8, i8s, to_f64_i8, |y| {
+to_f64_kernel!(i8, i8s, to_f64_i8, to_f64s_i8, 8, |y| {
     let (a, b) = y.widen();
     let (a0, a1) = a.widen();
     let (b0, b1) = b.widen();
@@ -94,7 +105,7 @@ to_f64_kernel!(i8, i8s, to_f64_i8, |y| {
         S::f64s::float_from(p7),
     ]
 });
-to_f64_kernel!(u8, u8s, to_f64_u8, |y| {
+to_f64_kernel!(u8, u8s, to_f64_u8, to_f64s_u8, 8, |y| {
     let (a, b) = y.widen();
     let (a0, a1) = a.widen();
     let (b0, b1) = b.widen();
@@ -118,28 +129,36 @@ to_f64_kernel!(u8, u8s, to_f64_u8, |y| {
 /// 32 bits: a NaN lane becomes 0, every lane is clamped to the type's range
 /// (whose bounds are exact in `f64`), and the truncating conversion to 64-bit
 /// lanes is then in range, so it is exact on every level. `$w(k)` is the
-/// `k`-th `f64` vector of a chunk converted that way, and `$narrow` packs
-/// `$per` of them into one vector of `$t`, low lanes first.
+/// `k`-th `f64` vector converted that way, and `$narrow` packs `$per` of
+/// them into one vector of `$t`, low lanes first: `$vname` on `$per`
+/// vectors, `$name` over a slice.
 macro_rules! from_f64_kernel {
-    ($t:ty, $wide:ident, $name:ident, $per:expr, |$w:ident| $narrow:expr) => {
+    ($t:ty, $tvec:ident, $wide:ident, $name:ident, $vname:ident, $per:expr, |$w:ident| $narrow:expr) => {
+        #[inline(always)]
+        pub(crate) fn $vname<S: Simd>(simd: S, values: [S::f64s; $per]) -> S::$tvec {
+            let zero = S::f64s::splat(simd, 0.0);
+            let lo = S::f64s::splat(simd, <$t>::MIN as f64);
+            let hi = S::f64s::splat(simd, <$t>::MAX as f64);
+            macro_rules! $w {
+                ($k:expr) => {{
+                    let v = values[$k];
+                    let v = v.simd_eq(v).select(v, zero);
+                    S::$wide::truncate_from(v.max(lo).min(hi))
+                }};
+            }
+            $narrow
+        }
+
         #[simd]
         pub(crate) fn $name<S: Simd>(simd: S, values: &[f64], out: &mut [$t]) {
             assert_eq!(values.len(), out.len());
             let n = S::f64s::LEN;
-            let zero = S::f64s::splat(simd, 0.0);
-            let lo = S::f64s::splat(simd, <$t>::MIN as f64);
-            let hi = S::f64s::splat(simd, <$t>::MAX as f64);
             let mut chunks = values.chunks_exact(n * $per);
             let mut outs = out.chunks_exact_mut(n * $per);
             for (c, o) in (&mut chunks).zip(&mut outs) {
-                macro_rules! $w {
-                    ($k:expr) => {{
-                        let v = S::f64s::from_slice(simd, &c[$k * n..($k + 1) * n]);
-                        let v = v.simd_eq(v).select(v, zero);
-                        S::$wide::truncate_from(v.max(lo).min(hi))
-                    }};
-                }
-                $narrow.store_slice(o);
+                let wide =
+                    std::array::from_fn(|k| S::f64s::from_slice(simd, &c[k * n..(k + 1) * n]));
+                $vname::<S>(simd, wide).store_slice(o);
             }
             for (&x, o) in chunks.remainder().iter().zip(outs.into_remainder()) {
                 *o = x as $t;
@@ -148,19 +167,21 @@ macro_rules! from_f64_kernel {
     };
 }
 
-from_f64_kernel!(i32, i64s, from_f64_i32, 2, |w| w!(0).narrow(w!(1)));
-from_f64_kernel!(u32, u64s, from_f64_u32, 2, |w| w!(0).narrow(w!(1)));
-from_f64_kernel!(i16, i64s, from_f64_i16, 4, |w| w!(0)
+from_f64_kernel!(i32, i32s, i64s, from_f64_i32, from_f64s_i32, 2, |w| w!(0)
+    .narrow(w!(1)));
+from_f64_kernel!(u32, u32s, u64s, from_f64_u32, from_f64s_u32, 2, |w| w!(0)
+    .narrow(w!(1)));
+from_f64_kernel!(i16, i16s, i64s, from_f64_i16, from_f64s_i16, 4, |w| w!(0)
     .narrow(w!(1))
     .narrow(w!(2).narrow(w!(3))));
-from_f64_kernel!(u16, u64s, from_f64_u16, 4, |w| w!(0)
+from_f64_kernel!(u16, u16s, u64s, from_f64_u16, from_f64s_u16, 4, |w| w!(0)
     .narrow(w!(1))
     .narrow(w!(2).narrow(w!(3))));
-from_f64_kernel!(i8, i64s, from_f64_i8, 8, |w| w!(0)
+from_f64_kernel!(i8, i8s, i64s, from_f64_i8, from_f64s_i8, 8, |w| w!(0)
     .narrow(w!(1))
     .narrow(w!(2).narrow(w!(3)))
     .narrow(w!(4).narrow(w!(5)).narrow(w!(6).narrow(w!(7)))));
-from_f64_kernel!(u8, u64s, from_f64_u8, 8, |w| w!(0)
+from_f64_kernel!(u8, u8s, u64s, from_f64_u8, from_f64s_u8, 8, |w| w!(0)
     .narrow(w!(1))
     .narrow(w!(2).narrow(w!(3)))
     .narrow(w!(4).narrow(w!(5)).narrow(w!(6).narrow(w!(7)))));
@@ -169,15 +190,19 @@ from_f64_kernel!(u8, u64s, from_f64_u8, 8, |w| w!(0)
 /// above cannot be used; `truncate_from_precise` is the `as` conversion
 /// itself (saturating, NaN to 0) on every level.
 macro_rules! from_f64_wide_kernel {
-    ($t:ty, $wide:ident, $name:ident) => {
+    ($t:ty, $wide:ident, $name:ident, $vname:ident) => {
+        #[inline(always)]
+        pub(crate) fn $vname<S: Simd>(_simd: S, values: [S::f64s; 1]) -> S::$wide {
+            S::$wide::truncate_from_precise(values[0])
+        }
+
         #[simd]
         pub(crate) fn $name<S: Simd>(simd: S, values: &[f64], out: &mut [$t]) {
             assert_eq!(values.len(), out.len());
             let mut chunks = values.chunks_exact(S::f64s::LEN);
             let mut outs = out.chunks_exact_mut(S::f64s::LEN);
             for (c, o) in (&mut chunks).zip(&mut outs) {
-                let v = S::f64s::from_slice(simd, c);
-                S::$wide::truncate_from_precise(v).store_slice(o);
+                $vname::<S>(simd, [S::f64s::from_slice(simd, c)]).store_slice(o);
             }
             for (&x, o) in chunks.remainder().iter().zip(outs.into_remainder()) {
                 *o = x as $t;
@@ -186,10 +211,15 @@ macro_rules! from_f64_wide_kernel {
     };
 }
 
-from_f64_wide_kernel!(i64, i64s, from_f64_i64);
-from_f64_wide_kernel!(u64, u64s, from_f64_u64);
+from_f64_wide_kernel!(i64, i64s, from_f64_i64, from_f64s_i64);
+from_f64_wide_kernel!(u64, u64s, from_f64_u64, from_f64s_u64);
 
 /// `f64` to `f32`: the narrowing conversion rounds to nearest as `as` does.
+#[inline(always)]
+pub(crate) fn from_f64s_f32<S: Simd>(_simd: S, values: [S::f64s; 2]) -> S::f32s {
+    values[0].narrow(values[1])
+}
+
 #[simd]
 pub(crate) fn from_f64_f32<S: Simd>(simd: S, values: &[f64], out: &mut [f32]) {
     assert_eq!(values.len(), out.len());
@@ -199,7 +229,7 @@ pub(crate) fn from_f64_f32<S: Simd>(simd: S, values: &[f64], out: &mut [f32]) {
     for (c, o) in (&mut chunks).zip(&mut outs) {
         let lo = S::f64s::from_slice(simd, &c[..n]);
         let hi = S::f64s::from_slice(simd, &c[n..]);
-        lo.narrow(hi).store_slice(o);
+        from_f64s_f32::<S>(simd, [lo, hi]).store_slice(o);
     }
     for (&x, o) in chunks.remainder().iter().zip(outs.into_remainder()) {
         *o = x as f32;

@@ -106,7 +106,7 @@ dbLoadRecords("NDFileTIFF.template", "P=$(PREFIX),R=Proc1:TIFF:,PORT=PROC1TIFF,N
 NDScatterConfigure("SCATTER1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDScatter.template", "P=$(PREFIX),R=Scatter1:,PORT=SCATTER1,NDARRAY_PORT=$(PORT)")
 
-NDGatherConfigure("GATHER1", $(QSIZE), 0, "$(PORT)", 0)
+NDGatherConfigure("GATHER1", $(QSIZE), 0, 8, 0, 0)
 dbLoadRecords("NDGather.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDGatherN.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),N=1")
 dbLoadRecords("NDGatherN.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,ADDR=1,TIMEOUT=1,NDARRAY_PORT=$(PORT),N=2")

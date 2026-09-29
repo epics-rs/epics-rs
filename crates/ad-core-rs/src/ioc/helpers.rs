@@ -68,6 +68,31 @@ pub fn plugin_arg_defs_with_count(count_name: &'static str) -> Vec<ArgDesc> {
     defs
 }
 
+/// Arg descriptors for `NDGatherConfigure` (NDPluginGather.cpp:200-217):
+/// `(portName, queueSize, blockingCallbacks, maxPorts, maxBuffers, maxMemory,
+/// priority, stackSize)`. No `NDArrayPort`/`NDArrayAddr`: the plugin's
+/// sources are the pairs its NDGatherN.template records write, one per
+/// address.
+pub fn gather_arg_defs() -> Vec<ArgDesc> {
+    let int = |name| ArgDesc {
+        name,
+        arg_type: ArgType::Int,
+    };
+    vec![
+        ArgDesc {
+            name: "portName",
+            arg_type: ArgType::String,
+        },
+        int("queueSize"),
+        int("blockingCallbacks"),
+        int("maxPorts"),
+        int("maxBuffers"),
+        int("maxMemory"),
+        int("priority"),
+        int("stackSize"),
+    ]
+}
+
 /// Arg descriptors for `NDAttrConfigure`, whose C signature inserts
 /// `maxAttributes` at index 5 (NDPluginAttribute.cpp:222-242):
 /// `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr,
@@ -142,15 +167,16 @@ pub fn max_threads_arg(args: &[ArgValue], index: usize) -> i32 {
     }
 }
 
-/// The count a plugin `*Configure` command inserts at argument 5 —
-/// `maxOverlays` (NDPluginOverlay.cpp:523-526), `maxROIs`
-/// (NDPluginROIStat.cpp:590-593) — as the number of addresses to build the
-/// port with.
+/// The count a plugin `*Configure` command carries — `maxOverlays` at 5
+/// (NDPluginOverlay.cpp:523-526), `maxROIs` at 5 (NDPluginROIStat.cpp:590-593),
+/// `maxPorts` at 3 (NDPluginGather.cpp:190-193) — as the number of addresses
+/// to build the port with.
 ///
 /// C hands the count to `NDPluginDriver` as `maxAddr` and sizes its
 /// per-address state by it (NDPluginOverlay.cpp:403,412;
-/// NDPluginROIStat.cpp:495,502). An absent iocsh int argument is 0, and
-/// address 0 always exists, so the floor is 1 on both sides.
+/// NDPluginROIStat.cpp:495,502; NDPluginGather.cpp:45,58). An absent iocsh
+/// int argument is 0, and address 0 always exists, so the floor is 1 on both
+/// sides.
 pub fn count_arg(args: &[ArgValue], index: usize) -> usize {
     match args.get(index) {
         Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,

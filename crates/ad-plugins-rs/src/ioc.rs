@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, max_threads_arg,
-    plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
+    PluginManager, attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, gather_arg_defs,
+    max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
 };
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
@@ -312,63 +312,43 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             )
         },
     );
-    // NDGatherConfigure: portName [queueSize] [blockingCallbacks] port1 [port2 ... portN]
-    // Connects multiple upstream ports to a single Gather plugin.
+    // NDGatherConfigure: portName queueSize blockingCallbacks maxPorts
+    // maxBuffers maxMemory priority stackSize (NDPluginGather.cpp:190-193).
+    // The port has maxPorts addresses and is connected to nothing here: its
+    // sources are the NDArrayPort/NDArrayAddr pairs NDGatherN.template
+    // writes at addresses 0..maxPorts, and the runtime wires one input per
+    // pair (`GatherProcessor::num_array_sources`).
     {
         let m = mgr.clone();
         let taken = std::mem::replace(&mut app, IocApplication::new());
         app = taken.register_startup_command(CommandDef::new(
             "NDGatherConfigure",
-            plugin_arg_defs(),
-            "NDGatherConfigure portName [queueSize] [blockingCallbacks] NDArrayPort [port2 ...]"
-                .to_string(),
+            gather_arg_defs(),
+            "NDGatherConfigure portName [queueSize] [blockingCallbacks] [maxPorts]".to_string(),
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let (port_name, queue_size, first_port) = extract_plugin_args(args)?;
+                let (port_name, queue_size, _) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
                     println!("NDGatherConfigure: port={port_name} already configured, skipping");
                     return Ok(CommandOutcome::Continue);
                 }
+                let max_ports = count_arg(args, 3);
                 let drv = m.driver()?;
                 let pool = drv.pool();
-                let wiring = m.wiring().clone();
-
-                let (handle, _jh) = create_plugin_runtime(
+                let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &port_name,
-                    crate::gather::GatherProcessor::new(),
+                    crate::gather::GatherProcessor::new(max_ports),
                     pool,
                     queue_size,
-                    &first_port,
-                    wiring.clone(),
+                    "",
+                    m.wiring().clone(),
+                    max_ports,
                 );
-
-                // Wire first upstream port
-                if !first_port.is_empty() {
-                    if let Err(e) = wiring.rewire(handle.array_sender(), "", &first_port) {
-                        eprintln!("NDGatherConfigure: wiring to {first_port} failed: {e}");
-                    }
-                }
-
-                // Wire additional upstream ports (args index 4+)
-                for i in 4..args.len() {
-                    if let ArgValue::String(upstream) = &args[i] {
-                        if !upstream.is_empty() {
-                            if let Some(upstream_output) = wiring.lookup_output(upstream) {
-                                upstream_output.lock().add(handle.array_sender().clone());
-                            } else {
-                                eprintln!(
-                                    "NDGatherConfigure: upstream port '{upstream}' not found"
-                                );
-                            }
-                        }
-                    }
-                }
-
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDGatherConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
-                println!("NDGatherConfigure: port={port_name}");
+                println!("NDGatherConfigure: port={port_name} (maxPorts={max_ports})");
                 Ok(CommandOutcome::Continue)
             },
         ));

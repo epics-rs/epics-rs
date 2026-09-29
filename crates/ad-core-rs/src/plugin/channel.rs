@@ -580,6 +580,56 @@ impl NDArrayReceiver {
     }
 }
 
+/// An [`NDArraySender`] that does not keep its queue open.
+///
+/// The plugin data loop wires its own input to an upstream output when an
+/// `NDArrayPort` write names one, and what it hands the output has to be a
+/// clone of the port's sender. A strong clone held by the loop would keep
+/// the queue open past the last real producer, so the loop holds this and
+/// upgrades it at the moment of wiring.
+pub(crate) struct WeakNDArraySender {
+    tx: std::sync::Weak<parking_lot::RwLock<tokio::sync::mpsc::Sender<ArrayMessage>>>,
+    port_name: String,
+    enabled: Arc<AtomicBool>,
+    blocking_mode: Arc<AtomicBool>,
+    queued_counter: Option<Arc<QueuedArrayCounter>>,
+    dropped_arrays: Arc<AtomicI32>,
+    overflow: Arc<OverflowEpisode>,
+    admission: Arc<ArrayAdmission>,
+}
+
+impl WeakNDArraySender {
+    /// A sender sharing every cell of the original, or `None` once every
+    /// strong sender is gone and the queue with it.
+    pub(crate) fn upgrade(&self) -> Option<NDArraySender> {
+        Some(NDArraySender {
+            tx: self.tx.upgrade()?,
+            port_name: self.port_name.clone(),
+            enabled: self.enabled.clone(),
+            blocking_mode: self.blocking_mode.clone(),
+            queued_counter: self.queued_counter.clone(),
+            dropped_arrays: self.dropped_arrays.clone(),
+            overflow: self.overflow.clone(),
+            admission: self.admission.clone(),
+        })
+    }
+}
+
+impl NDArraySender {
+    pub(crate) fn downgrade(&self) -> WeakNDArraySender {
+        WeakNDArraySender {
+            tx: Arc::downgrade(&self.tx),
+            port_name: self.port_name.clone(),
+            enabled: self.enabled.clone(),
+            blocking_mode: self.blocking_mode.clone(),
+            queued_counter: self.queued_counter.clone(),
+            dropped_arrays: self.dropped_arrays.clone(),
+            overflow: self.overflow.clone(),
+            admission: self.admission.clone(),
+        }
+    }
+}
+
 /// Lets the plugin's data loop swap its own input queue for a deeper or
 /// shallower one without owning a sender.
 ///

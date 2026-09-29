@@ -6,6 +6,9 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
+
+use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
 // Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
 // the runtime layer, and this crate already depends on it unconditionally.
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
@@ -287,6 +290,12 @@ impl SharedTsState {
 pub struct TimeSeriesPortDriver {
     base: PortDriverBase,
     params: TSParams,
+    /// The NDPluginBase params this port serves; the pool branch of
+    /// `write_int32` and the construction-time statistics go through them.
+    nd_params: NDArrayDriverParams,
+    /// The pool whose statistics this port reports: the one the plugins
+    /// share, as every runtime plugin port reports it.
+    pool: Arc<NDArrayPool>,
     shared: Arc<Mutex<SharedTsState>>,
     num_channels: usize,
     time_per_point: f64,
@@ -298,6 +307,7 @@ impl TimeSeriesPortDriver {
         channel_names: &[&str],
         num_points: usize,
         shared: Arc<Mutex<SharedTsState>>,
+        pool: Arc<NDArrayPool>,
     ) -> Self {
         let num_channels = channel_names.len();
         let mut base = PortDriverBase::new(
@@ -317,12 +327,15 @@ impl TimeSeriesPortDriver {
         // C++ `NDPluginTimeSeries` derives from `NDPluginDriver` and so runs
         // the `asynNDArrayDriver` constructor's read-only block; without it
         // every NDPluginBase read-back this port serves reads back
-        // uninitialized. The four pool statistics stay unwritten: this port
-        // owns no `NDArrayPool`, and publishing zeros for a pool that does not
-        // exist would be inventing state rather than reporting it.
+        // uninitialized. The block ends with the four pool statistics
+        // (asynNDArrayDriver.cpp:1000-1003): every asynNDArrayDriver owns a
+        // pool there, and an unset NDPoolMaxMemory leaves `TS:PoolMaxMem`
+        // UDF/INVALID for the life of the IOC.
         let _ = ad_core_rs::driver::ndarray_driver::init_read_only_params(
             &mut base, &nd_params, port_name,
         );
+        let _ =
+            ad_core_rs::driver::ndarray_driver::refresh_pool_stats(&mut base, &nd_params, &pool);
 
         // Register control params
         let ts_acquire = base.create_param("TS_ACQUIRE", ParamType::Int32).unwrap();
@@ -400,6 +413,8 @@ impl TimeSeriesPortDriver {
 
         Self {
             base,
+            nd_params,
+            pool,
             params,
             shared,
             num_channels,
@@ -490,6 +505,20 @@ impl PortDriver for TimeSeriesPortDriver {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> asyn_rs::error::AsynResult<()> {
         let reason = user.reason;
+
+        // The base-class pool branch a plugin port inherits
+        // (asynNDArrayDriver.cpp:684-694); this port holds no array to
+        // pre-allocate from.
+        if ad_core_rs::driver::ndarray_driver::handle_pool_write_int32(
+            &mut self.base,
+            &self.nd_params,
+            &self.pool,
+            reason,
+            None,
+        )? {
+            self.base.call_param_callbacks(0)?;
+            return Ok(());
+        }
 
         if reason == self.params.ts_acquire {
             let mut state = self.shared.lock();
@@ -652,6 +681,7 @@ pub fn create_ts_port_runtime(
     channel_names: &[&str],
     num_points: usize,
     data_rx: TimeSeriesReceiver,
+    pool: Arc<NDArrayPool>,
 ) -> (
     PortRuntimeHandle,
     TSParams,
@@ -661,7 +691,8 @@ pub fn create_ts_port_runtime(
     let num_channels = channel_names.len();
     let shared = Arc::new(Mutex::new(SharedTsState::new(num_channels, num_points)));
 
-    let driver = TimeSeriesPortDriver::new(port_name, channel_names, num_points, shared.clone());
+    let driver =
+        TimeSeriesPortDriver::new(port_name, channel_names, num_points, shared.clone(), pool);
 
     // Capture params before the driver is moved into the actor
     let ts_params = TSParams {
@@ -815,6 +846,10 @@ mod tests {
 
     const TEST_CHANNELS: [&str; 3] = ["ChA", "ChB", "ChC"];
 
+    fn test_pool() -> Arc<NDArrayPool> {
+        NDArrayPool::new(2 * 1024 * 1024)
+    }
+
     #[test]
     fn test_shared_ts_state_init() {
         let state = SharedTsState::new(3, 100);
@@ -827,7 +862,7 @@ mod tests {
     #[test]
     fn test_ts_port_driver_create() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
-        let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared);
+        let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, test_pool());
         assert_eq!(driver.base().port_name, "TEST_TS");
         assert_eq!(driver.num_channels, 3);
         assert!(!driver.base().flags.multi_device);
@@ -842,7 +877,7 @@ mod tests {
         // so an unseeded read-back leaves them UDF/INVALID for the life of
         // the IOC. Read through the strict getters, as a record does.
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
-        let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared);
+        let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, test_pool());
         let base = driver.base();
         for (name, want) in [
             ("ARRAY_SIZE_X", 0),
@@ -877,9 +912,54 @@ mod tests {
     }
 
     #[test]
+    fn test_ts_port_driver_publishes_the_pool_statistics() {
+        // asynNDArrayDriver.cpp:1000-1003 sets the four pool statistics in
+        // the constructor, so `TS:PoolMaxMem` and its siblings read a value
+        // at PINI; the pool branch of writeInt32 (`:684-694`) refreshes
+        // them on NDPoolPollStats.
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
+        let pool = test_pool();
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, pool.clone());
+        let nd = driver.nd_params;
+        let read = |driver: &TimeSeriesPortDriver| {
+            (
+                driver
+                    .base()
+                    .get_float64_param_strict(nd.pool_max_memory, 0)
+                    .expect("POOL_MAX_MEMORY unset after construction"),
+                driver
+                    .base()
+                    .get_float64_param_strict(nd.pool_used_memory, 0)
+                    .expect("POOL_USED_MEMORY unset after construction"),
+                driver
+                    .base()
+                    .get_int32_param_strict(nd.pool_alloc_buffers, 0)
+                    .expect("POOL_ALLOC_BUFFERS unset after construction"),
+                driver
+                    .base()
+                    .get_int32_param_strict(nd.pool_free_buffers, 0)
+                    .expect("POOL_FREE_BUFFERS unset after construction"),
+            )
+        };
+        assert_eq!(read(&driver), (2.0, 0.0, 0, 0));
+
+        let _held = pool
+            .alloc(vec![NDDimension::new(1024)], NDDataType::UInt8)
+            .unwrap();
+        let mut user = AsynUser::new(nd.pool_poll_stats);
+        driver.write_int32(&mut user, 1).unwrap();
+        let (_, used, alloc, _) = read(&driver);
+        assert_eq!(alloc, 1, "NDPoolPollStats re-reads the pool");
+        assert!(used > 0.0);
+    }
+
+    #[test]
     fn test_ts_port_driver_write_acquire() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone(), test_pool());
 
         // Start acquiring
         let mut user = AsynUser::new(driver.params.ts_acquire);
@@ -894,7 +974,8 @@ mod tests {
     #[test]
     fn test_ts_port_driver_write_num_points() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone(), test_pool());
 
         let mut user = AsynUser::new(driver.params.ts_num_points);
         driver.write_int32(&mut user, 50).unwrap();
@@ -909,7 +990,8 @@ mod tests {
     #[test]
     fn test_ts_port_driver_write_mode() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared.clone(), test_pool());
 
         let mut user = AsynUser::new(driver.params.ts_acquire_mode);
         driver.write_int32(&mut user, 1).unwrap();
@@ -924,7 +1006,8 @@ mod tests {
     #[test]
     fn test_ts_port_driver_update_waveforms() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 10)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 10, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 10, shared.clone(), test_pool());
 
         // Add some data
         {
@@ -960,7 +1043,8 @@ mod tests {
     #[test]
     fn test_ts_port_driver_read_array() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 5)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 5, shared);
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 5, shared, test_pool());
 
         let user = AsynUser::new(driver.params.ts_time_axis);
         let mut buf = vec![0.0; 5];
@@ -1150,7 +1234,8 @@ mod tests {
         // Writing TS_ACQUIRE_MODE must switch the buffer mode AND flip the
         // time axis from ascending (Fixed) to signed-ending-at-0 (Circular).
         let shared = Arc::new(Mutex::new(SharedTsState::new(1, 4)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS_MODE", &["Ch0"], 4, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS_MODE", &["Ch0"], 4, shared.clone(), test_pool());
 
         // Fixed mode axis: 0, 1, 2, 3.
         let axis = driver
@@ -1178,7 +1263,8 @@ mod tests {
     fn test_num_average_param_drives_state() {
         // Writing TS_NUM_AVERAGE must update SharedTsState::num_average.
         let shared = Arc::new(Mutex::new(SharedTsState::new(1, 10)));
-        let mut driver = TimeSeriesPortDriver::new("TEST_TS_NAVG", &["Ch0"], 10, shared.clone());
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS_NAVG", &["Ch0"], 10, shared.clone(), test_pool());
         let mut user = AsynUser::new(driver.params.ts_num_average);
         driver.write_int32(&mut user, 5).unwrap();
         assert_eq!(shared.lock().num_average, 5);
@@ -1191,7 +1277,7 @@ mod tests {
     fn test_create_ts_port_runtime() {
         let (_tx, rx) = tokio::sync::mpsc::channel(16);
         let (handle, params, _actor_jh, _data_jh) =
-            create_ts_port_runtime("TEST_TS_RT", &TEST_CHANNELS, 100, rx);
+            create_ts_port_runtime("TEST_TS_RT", &TEST_CHANNELS, 100, rx, test_pool());
         assert_eq!(handle.port_name(), "TEST_TS_RT");
         assert_eq!(params.ts_channels.len(), 3);
         handle.shutdown();

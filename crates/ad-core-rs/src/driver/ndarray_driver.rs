@@ -491,7 +491,7 @@ pub(crate) fn pool_stats_values(
 /// Refresh the pool-statistics parameters from a pool.
 ///
 /// Shared by the `NDPoolPollStats` dispatch and `preAllocateBuffers`.
-pub(crate) fn refresh_pool_stats(
+pub fn refresh_pool_stats(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
     pool: &NDArrayPool,
@@ -522,7 +522,7 @@ pub(crate) fn refresh_pool_stats(
 /// parameter and was handled. `template_array` is used by the
 /// `POOL_PRE_ALLOC_BUFFERS` path (C++ uses `pArrays[0]` — the most recent
 /// array); pass the driver's last array, or `None` if none exists yet.
-pub(crate) fn handle_pool_write_int32(
+pub fn handle_pool_write_int32(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
     pool: &NDArrayPool,

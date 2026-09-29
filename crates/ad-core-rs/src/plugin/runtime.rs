@@ -42,7 +42,7 @@ use asyn_rs::param::ParamValue;
 
 use super::channel::{
     Admission, ArrayMessage, NDArrayOutput, NDArrayReceiver, NDArraySender, PublishOutcome,
-    ndarray_channel,
+    WeakNDArraySender, ndarray_channel,
 };
 use super::params::PluginBaseParams;
 use super::wiring::{WiringRegistry, upstream_key};
@@ -339,6 +339,16 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// (e.g. `NDPluginFile.cpp:948` `setIntegerParam(NDArrayCallbacks, 0)`).
     fn does_array_callbacks(&self) -> bool {
         true
+    }
+
+    /// How many `(NDArrayPort, NDArrayAddr)` pairs this plugin reads as its
+    /// array sources: the pair at address `a` for every `a` below this.
+    /// `NDPluginDriver::connectToArrayPort` reads the pair at address 0
+    /// (NDPluginDriver.cpp:590-591); `NDPluginGather` overrides it to read
+    /// one pair per address in `0..maxPorts_` and connects to every one
+    /// (NDPluginGather.cpp:146-148).
+    fn num_array_sources(&self) -> usize {
+        1
     }
 
     /// Register plugin-specific params on the base. Called once during construction.
@@ -1972,6 +1982,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // The data loop owns queue replacement; the handle is weak so it does not
     // keep the channel open past the last real sender.
     let data_queue_handle = array_sender.self_queue_handle();
+    let data_sender = array_sender.downgrade();
 
     // Capture wiring info for data loop
     let sender_port_name = port_name.to_string();
@@ -1994,6 +2005,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
             processor,
             array_rx,
             data_queue_handle,
+            data_sender,
             param_rx,
             plugin_params,
             data_enabled,
@@ -2266,6 +2278,44 @@ async fn complete_frame(
     // msg dropped here → completion signaled (if tracked)
 }
 
+/// Move one array-source slot from its `(port, addr)` to another: what
+/// `NDPluginDriver::connectToArrayPort` does for its one source
+/// (NDPluginDriver.cpp:581-640) and `NDPluginGather::connectToArrayPort` for
+/// each of its `maxPorts_` (NDPluginGather.cpp:134-186). On success the slot
+/// holds the new pair; on failure it is unchanged and wired as before. A
+/// slot leaving an empty port has no sender in any output to move, so it is
+/// given a fresh clone of the port's.
+fn rewire_source(
+    wiring: &WiringRegistry,
+    sender_port: &str,
+    sender: &WeakNDArraySender,
+    slot: &mut (String, i32),
+    new_port: &str,
+    new_addr: i32,
+) -> Result<(), String> {
+    let old_key = upstream_key(&slot.0, slot.1);
+    let new_key = upstream_key(new_port, new_addr);
+    if old_key != new_key {
+        if old_key.is_empty() {
+            let sender = sender.upgrade().ok_or("input queue closed")?;
+            wiring.rewire(&sender, "", &new_key)?;
+        } else {
+            wiring.rewire_by_name(sender_port, &old_key, &new_key)?;
+        }
+    }
+    *slot = (new_port.to_string(), new_addr);
+    Ok(())
+}
+
+/// The source slot an `NDArrayPort`/`NDArrayAddr` write at `addr` moves, with
+/// its index. -1 is asyn's "no address" and reads as 0
+/// (asynPortDriver.cpp:1907); an address past the slots moves nothing, as
+/// `NDPluginDriver::connectToArrayPort` reads address 0 only.
+fn source_slot(sources: &mut [(String, i32)], addr: i32) -> Option<(usize, &mut (String, i32))> {
+    let index = usize::try_from(if addr == -1 { 0 } else { addr }).ok()?;
+    sources.get_mut(index).map(|slot| (index, slot))
+}
+
 fn plugin_data_loop<P: NDPluginProcess>(
     shared: Arc<parking_lot::Mutex<SharedProcessorInner>>,
     processor: Arc<P>,
@@ -2274,6 +2324,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
     // sender. Weak, so holding it cannot stop this loop seeing its own
     // shutdown.
     queue_handle: crate::plugin::channel::SelfQueueHandle,
+    // What an `NDArrayPort` write hands the named upstream. Weak for the
+    // same reason as `queue_handle`.
+    sender: WeakNDArraySender,
     mut param_rx: tokio::sync::mpsc::UnboundedReceiver<PluginParamMsg>,
     plugin_params: PluginBaseParams,
     enabled: Arc<AtomicBool>,
@@ -2296,11 +2349,12 @@ fn plugin_data_loop<P: NDPluginProcess>(
     let max_threads_reason = plugin_params.max_threads;
     let queue_size_reason = plugin_params.queue_size;
     let array_callbacks_reason = shared.lock().ndarray_params.array_callbacks;
-    // G6: the upstream connection is keyed by (port, addr). `current_upstream`
-    // is the base port name; `current_addr` is the selected NDArrayAddr; the
-    // effective WiringRegistry key is computed by `upstream_key`.
-    let mut current_upstream = initial_upstream;
-    let mut current_addr: i32 = 0;
+    // The array sources: one `(NDArrayPort, NDArrayAddr)` pair per address
+    // the processor reads (`num_array_sources`), each wired under its
+    // `upstream_key`. Slot 0 starts on the constructor's port, as
+    // NDPluginDriver.cpp:152-153 seeds it.
+    let mut sources = vec![(String::new(), 0i32); processor.num_array_sources().max(1)];
+    sources[0].0 = initial_upstream;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2607,21 +2661,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // multi-address driver — reconnect on change
                             // (C++ writeInt32 NDPluginDriver.cpp:724-728).
                             if reason == nd_array_addr_reason {
-                                let new_addr = value.as_i32();
-                                if new_addr != current_addr {
-                                    let old_key = upstream_key(&current_upstream, current_addr);
-                                    let new_key = upstream_key(&current_upstream, new_addr);
-                                    shared.lock().nd_array_addr = new_addr;
-                                    match wiring.rewire_by_name(
+                                if let Some((index, slot)) = source_slot(&mut sources, addr) {
+                                    let port = slot.0.clone();
+                                    match rewire_source(
+                                        &wiring,
                                         &sender_port_name,
-                                        &old_key,
-                                        &new_key,
+                                        &sender,
+                                        slot,
+                                        &port,
+                                        value.as_i32(),
                                     ) {
-                                        Ok(()) => current_addr = new_addr,
-                                        Err(e) => {
-                                            eprintln!("NDArrayAddr reconnect failed: {e}");
-                                            shared.lock().nd_array_addr = current_addr;
+                                        Ok(()) => {
+                                            if index == 0 {
+                                                shared.lock().nd_array_addr = slot.1;
+                                            }
                                         }
+                                        Err(e) => eprintln!("NDArrayAddr reconnect failed: {e}"),
                                     }
                                 }
                             }
@@ -2787,23 +2842,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             if reason == sort_size_reason {
                                 shared.lock().sort_size = value.as_i32();
                             }
-                            // Handle NDArrayPort rewiring — keyed by (port, addr).
+                            // NDArrayPort at address `a` moves source slot `a`
+                            // (NDPluginDriver.cpp:834-836).
                             if reason == nd_array_port_reason {
-                                if let Some(new_port) = value.as_string() {
-                                    if new_port != current_upstream {
-                                        let old_key =
-                                            upstream_key(&current_upstream, current_addr);
-                                        let new_key = upstream_key(new_port, current_addr);
-                                        match wiring.rewire_by_name(
-                                            &sender_port_name,
-                                            &old_key,
-                                            &new_key,
-                                        ) {
-                                            Ok(()) => current_upstream = new_port.to_string(),
-                                            Err(e) => {
-                                                eprintln!("NDArrayPort rewire failed: {e}")
-                                            }
-                                        }
+                                if let (Some((_, slot)), Some(new_port)) =
+                                    (source_slot(&mut sources, addr), value.as_string())
+                                {
+                                    let source_addr = slot.1;
+                                    if let Err(e) = rewire_source(
+                                        &wiring,
+                                        &sender_port_name,
+                                        &sender,
+                                        slot,
+                                        new_port,
+                                        source_addr,
+                                    ) {
+                                        eprintln!("NDArrayPort rewire failed: {e}");
                                     }
                                 }
                             }
@@ -2964,6 +3018,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // The data loop owns queue replacement; the handle is weak so it does not
     // keep the channel open past the last real sender.
     let data_queue_handle = array_sender.self_queue_handle();
+    let data_sender = array_sender.downgrade();
 
     // Capture wiring info for data loop
     let sender_port_name = port_name.to_string();
@@ -2985,6 +3040,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
             processor,
             array_rx,
             data_queue_handle,
+            data_sender,
             param_rx,
             plugin_params,
             data_enabled,
@@ -3414,6 +3470,88 @@ mod tests {
         assert_eq!(
             received.unique_id, 99,
             "consumer wired to NDArrayAddr=1 must receive upstream arrays"
+        );
+    }
+
+    #[test]
+    fn a_gathering_plugin_wires_one_source_per_address() {
+        // NDGatherN.template writes NDArrayPort at address N. A plugin
+        // reading `num_array_sources` pairs holds one wiring per slot: slot 1
+        // joins a second upstream without moving slot 0, and an empty port
+        // at address 1 leaves only slot 0.
+        struct Gathering;
+        impl NDPluginProcess for Gathering {
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::forward(array, vec![])
+            }
+            fn plugin_type(&self) -> &str {
+                "Gathering"
+            }
+            fn num_array_sources(&self) -> usize {
+                2
+            }
+        }
+        let pool = NDArrayPool::new(1_000_000);
+        let wiring = test_wiring();
+        let mut ups = Vec::new();
+        for name in ["UP_A", "UP_B"] {
+            let (up, jh) = create_plugin_runtime_multi_addr(
+                name,
+                PassthroughProcessor,
+                pool.clone(),
+                10,
+                "",
+                wiring.clone(),
+                1,
+            );
+            enable_callbacks(&up);
+            ups.push((up, jh));
+        }
+        let (handle, _jh) = create_plugin_runtime_multi_addr(
+            "GATHERING",
+            Gathering,
+            pool,
+            10,
+            "UP_A",
+            wiring.clone(),
+            2,
+        );
+        wiring.rewire(handle.array_sender(), "", "UP_A").unwrap();
+        let (down, mut down_rx) = ndarray_channel("DOWN", 10);
+        wiring.rewire(&down, "", "GATHERING").unwrap();
+        enable_callbacks(&handle);
+
+        let port_reason = handle.plugin_params.nd_array_port;
+        let write_port = |addr: i32, port: &str| {
+            handle
+                .param_tx
+                .send(PluginParamMsg::Change(
+                    port_reason,
+                    addr,
+                    ParamChangeValue::Octet(port.to_string()),
+                ))
+                .unwrap();
+            params_applied(&handle);
+        };
+        write_port(1, "UP_B");
+        send_array(ups[1].0.array_sender(), make_test_array(2));
+        send_array(ups[0].0.array_sender(), make_test_array(1));
+        // UP_A and UP_B forward on their own threads, so the two arrivals
+        // carry no order.
+        let mut ids = [
+            down_rx.blocking_recv().unwrap().unique_id,
+            down_rx.blocking_recv().unwrap().unique_id,
+        ];
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2], "both slots deliver");
+
+        write_port(1, "");
+        send_array(ups[1].0.array_sender(), make_test_array(3));
+        send_array(ups[0].0.array_sender(), make_test_array(4));
+        assert_eq!(
+            down_rx.blocking_recv().unwrap().unique_id,
+            4,
+            "an emptied slot 1 delivers nothing; slot 0 still does"
         );
     }
 

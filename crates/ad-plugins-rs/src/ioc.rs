@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, dtyp_from_port, extract_plugin_args, max_threads_arg,
-    plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
+    PluginManager, attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, gather_arg_defs,
+    max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
 };
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
@@ -192,24 +192,48 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             )
         },
     );
-    app = register_generic_plugin(
-        &mut app,
-        mgr,
-        "NDOverlayConfigure",
-        plugin_arg_defs_with_count("maxOverlays"),
-        Some(10),
-        |port_name, queue_size, ndarray_port, pool, wiring| {
-            use crate::overlay::OverlayProcessor;
-            create_plugin_runtime(
-                port_name,
-                OverlayProcessor::new(vec![]),
-                pool,
-                queue_size,
-                ndarray_port,
-                wiring,
-            )
-        },
-    );
+    // NDOverlayConfigure: maxOverlays is the port's address count
+    // (NDPluginOverlay.cpp:403), one overlay per address as
+    // NDOverlayN.template addresses them.
+    {
+        let m = mgr.clone();
+        let taken = std::mem::replace(&mut app, IocApplication::new());
+        app = taken.register_startup_command(CommandDef::new(
+            "NDOverlayConfigure",
+            plugin_arg_defs_with_count("maxOverlays"),
+            "NDOverlayConfigure portName [queueSize] ...".to_string(),
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
+                let dtyp = dtyp_from_port(&port_name);
+                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
+                    println!("NDOverlayConfigure: port={port_name} already configured, skipping");
+                    return Ok(CommandOutcome::Continue);
+                }
+                let max_overlays = count_arg(args, 5);
+                let drv = m.driver()?;
+                let pool = drv.pool();
+                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                    &port_name,
+                    crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
+                    pool,
+                    queue_size,
+                    &ndarray_port,
+                    m.wiring().clone(),
+                    max_overlays,
+                );
+                handle.set_max_threads(max_threads_arg(args, 10));
+                if let Err(e) = m.add_plugin(&dtyp, &handle) {
+                    eprintln!("NDOverlayConfigure: {e}");
+                    return Ok(CommandOutcome::Continue);
+                }
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("NDOverlayConfigure: wiring failed: {e}");
+                }
+                println!("NDOverlayConfigure: port={port_name}");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
     app = register_generic_plugin(
         &mut app,
         mgr,
@@ -288,63 +312,43 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             )
         },
     );
-    // NDGatherConfigure: portName [queueSize] [blockingCallbacks] port1 [port2 ... portN]
-    // Connects multiple upstream ports to a single Gather plugin.
+    // NDGatherConfigure: portName queueSize blockingCallbacks maxPorts
+    // maxBuffers maxMemory priority stackSize (NDPluginGather.cpp:190-193).
+    // The port has maxPorts addresses and is connected to nothing here: its
+    // sources are the NDArrayPort/NDArrayAddr pairs NDGatherN.template
+    // writes at addresses 0..maxPorts, and the runtime wires one input per
+    // pair (`GatherProcessor::num_array_sources`).
     {
         let m = mgr.clone();
         let taken = std::mem::replace(&mut app, IocApplication::new());
         app = taken.register_startup_command(CommandDef::new(
             "NDGatherConfigure",
-            plugin_arg_defs(),
-            "NDGatherConfigure portName [queueSize] [blockingCallbacks] NDArrayPort [port2 ...]"
-                .to_string(),
+            gather_arg_defs(),
+            "NDGatherConfigure portName [queueSize] [blockingCallbacks] [maxPorts]".to_string(),
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let (port_name, queue_size, first_port) = extract_plugin_args(args)?;
+                let (port_name, queue_size, _) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
                     println!("NDGatherConfigure: port={port_name} already configured, skipping");
                     return Ok(CommandOutcome::Continue);
                 }
+                let max_ports = count_arg(args, 3);
                 let drv = m.driver()?;
                 let pool = drv.pool();
-                let wiring = m.wiring().clone();
-
-                let (handle, _jh) = create_plugin_runtime(
+                let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &port_name,
-                    crate::gather::GatherProcessor::new(),
+                    crate::gather::GatherProcessor::new(max_ports),
                     pool,
                     queue_size,
-                    &first_port,
-                    wiring.clone(),
+                    "",
+                    m.wiring().clone(),
+                    max_ports,
                 );
-
-                // Wire first upstream port
-                if !first_port.is_empty() {
-                    if let Err(e) = wiring.rewire(handle.array_sender(), "", &first_port) {
-                        eprintln!("NDGatherConfigure: wiring to {first_port} failed: {e}");
-                    }
-                }
-
-                // Wire additional upstream ports (args index 4+)
-                for i in 4..args.len() {
-                    if let ArgValue::String(upstream) = &args[i] {
-                        if !upstream.is_empty() {
-                            if let Some(upstream_output) = wiring.lookup_output(upstream) {
-                                upstream_output.lock().add(handle.array_sender().clone());
-                            } else {
-                                eprintln!(
-                                    "NDGatherConfigure: upstream port '{upstream}' not found"
-                                );
-                            }
-                        }
-                    }
-                }
-
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDGatherConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
-                println!("NDGatherConfigure: port={port_name}");
+                println!("NDGatherConfigure: port={port_name} (maxPorts={max_ports})");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -587,7 +591,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     queue_size,
                     &ndarray_port,
                     m.wiring().clone(),
-                    32,
+                    count_arg(args, 5),
                     &tsr,
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
@@ -708,12 +712,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 
                 let channel_name_refs: Vec<&str> =
                     channel_names.iter().map(|s| s.as_str()).collect();
+                let drv = m.driver()?;
                 let (ts_runtime, _ts_params, _ts_actor_jh, _ts_data_jh) =
                     crate::time_series::create_ts_port_runtime(
                         &port_name,
                         &channel_name_refs,
                         2048,
                         ts_rx,
+                        drv.pool(),
                     );
                 if let Err(e) = m.add_port(&dtyp, ts_runtime) {
                     eprintln!("NDTimeSeriesConfigure: {e}");

@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(47): checked, not waived — all 47 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(49): checked, not waived — all 49 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1106/1106). asyn-rs became a census subject when its
+// --all-features`, 1117/1117). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -3353,12 +3353,18 @@ pub fn universal_asyn_factory(
             // (C callbackWfWriteBinary, devAsynOctet.c:1086-1091), unlike
             // asynOctetWrite which trims at the first NUL (my_strnlen, :1071-1076).
             adapter.octet_binary = ctx.dtyp == "asynOctetWriteBinary";
-        } else {
+        } else if dtyp != "asynOctet" {
             // Output records: read back current driver value on init.
             // Mirrors C `initAo` / `initBo` / `initLongout` / `initMbbo`
             // which call `pasynManager->queueRequest(... ASYN_INIT ...)`
             // to pull the driver's current value into the record before
-            // record processing starts.
+            // record processing starts. NOT asynOctet: C devAsynOctet reads
+            // an output's initial value only under info(asyn:INITIAL_READBACK,
+            // "1") (devAsynOctet.c:357-380; `initSoWrite` queues no ASYN_INIT
+            // read), so a stringout's .db VAL — NDPluginBase.template's
+            // NDArrayPort macro among them — survives a driver param that a
+            // plugin constructor seeded with "". The tag path stays in
+            // `apply_record_info`.
             adapter = adapter.with_initial_readback();
         }
     }
@@ -7890,6 +7896,17 @@ mod tests {
         ) -> AsynResult<crate::port::DrvUserInfo> {
             Ok(crate::port::DrvUserInfo::from_reason(0))
         }
+        // A defined driver value, so an initial readback that DOES run
+        // succeeds and is visible in the record (the gate tests below).
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let v = b"DRIVER";
+            let n = v.len().min(buf.len());
+            buf[..n].copy_from_slice(&v[..n]);
+            Ok(n)
+        }
+        fn io_read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+            Ok(7)
+        }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             if self.fail {
                 // A generic asynError (not a specific Timeout/Overflow/…): this
@@ -7974,6 +7991,63 @@ mod tests {
             writes.lock().unwrap().clone(),
             vec![vec![0x01, 0x00, 0x02]],
             "binary write must send the full NORD bytes, interior NUL included"
+        );
+    }
+
+    /// An octet OUTPUT record keeps its .db VAL through init: C devAsynOctet
+    /// reads an output's initial value only under info(asyn:INITIAL_READBACK,
+    /// "1") (devAsynOctet.c:357-380); `initSoWrite` queues no ASYN_INIT read.
+    /// Before the gate, the auto-readback pulled the driver's value ("DRIVER"
+    /// here, "" for a Gather port's seeded NDARRAY_PORT) over the .db VAL, so
+    /// NDPluginBase.template's NDArrayPort macro never reached PINI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stringout_keeps_its_db_val_without_the_readback_tag() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringout::StringoutRecord;
+
+        let (handle, _writes) = spawn_binary_write_port("octet_no_initrb");
+        crate::asyn_record::register_port("octet_no_initrb", handle).unwrap();
+
+        let ctx = DeviceSupportContext {
+            record_type: "stringout",
+            dtyp: "asynOctetWrite",
+            inp: "",
+            out: "@asyn(octet_no_initrb,0)NDARRAY_PORT",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+        let mut rec = StringoutRecord::new("FROMDB");
+        dev.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("VAL").unwrap(),
+            EpicsValue::String("FROMDB".into()),
+            "an octet output's .db VAL must survive init without asyn:INITIAL_READBACK"
+        );
+    }
+
+    /// Contrast: the Int32 families DO read back at init (C initAo/initBo/
+    /// initLongout/initMbbo queue an ASYN_INIT read), so the octet gate must
+    /// not widen to them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_longout_still_reads_back_its_initial_value() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::longout::LongoutRecord;
+
+        let (handle, _writes) = spawn_binary_write_port("int32_initrb");
+        crate::asyn_record::register_port("int32_initrb", handle).unwrap();
+
+        let ctx = DeviceSupportContext {
+            record_type: "longout",
+            dtyp: "asynInt32",
+            inp: "",
+            out: "@asyn(int32_initrb,0)REG",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+        let mut rec = LongoutRecord::new(0);
+        dev.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("VAL").unwrap(),
+            EpicsValue::Long(7),
+            "an asynInt32 output must still seed VAL from the driver at init"
         );
     }
 

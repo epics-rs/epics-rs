@@ -1293,7 +1293,7 @@ impl AsynDeviceSupport {
         }
         let val = match iface_type {
             "asynInt32" => EpicsValue::Long(self.apply_int32_mask(pv.as_int32()?)),
-            "asynInt64" => EpicsValue::Double(pv.as_int64()? as f64),
+            "asynInt64" => EpicsValue::Int64(pv.as_int64()?),
             "asynFloat64" => EpicsValue::Double(pv.as_float64()?),
             "asynOctet" => EpicsValue::String(pv.as_octet()?.into()),
             "asynUInt32Digital" => EpicsValue::Long(pv.as_uint32()? as i32),
@@ -1319,7 +1319,7 @@ impl AsynDeviceSupport {
             "asynInt32" => result
                 .int_val
                 .map(|v| EpicsValue::Long(self.apply_int32_mask(v))),
-            "asynInt64" => result.int64_val.map(|v| EpicsValue::Double(v as f64)),
+            "asynInt64" => result.int64_val.map(EpicsValue::Int64),
             "asynFloat64" => result.float_val.map(EpicsValue::Double),
             "asynOctet" => result.data.as_ref().map(|d| {
                 let n = result.nbytes.min(d.len());
@@ -1415,6 +1415,7 @@ impl AsynDeviceSupport {
                 Some(RequestOp::Int32Write { value: *v as i32 })
             }
             ("asynInt32", EpicsValue::Float(v)) => Some(RequestOp::Int32Write { value: *v as i32 }),
+            ("asynInt64", EpicsValue::Int64(v)) => Some(RequestOp::Int64Write { value: *v }),
             ("asynInt64", EpicsValue::Long(v)) => Some(RequestOp::Int64Write { value: *v as i64 }),
             ("asynInt64", EpicsValue::Double(v)) => {
                 Some(RequestOp::Int64Write { value: *v as i64 })
@@ -3948,6 +3949,62 @@ mod tests {
             AsynDeviceSupport::from_handle(handle, link, "asynInt32").with_mask((-8i32) as u32);
         let result = RequestResult::int32_read(0xFF);
         assert_eq!(ads.result_to_value(&result), Some(EpicsValue::Long(-1)));
+    }
+
+    /// `asynInt64` carries the record's i64 whole on both sides. An
+    /// int64out VAL is `EpicsValue::Int64`, which `write_op` had no arm for,
+    /// so the put completed without a driver write; the reads went through
+    /// `f64` and lost every bit past 2^53. C hands the `epicsInt64` through
+    /// (`processLLo` `result.value = pr->val`, `processLLi` `pr->val =
+    /// result.value`, devAsynInt64.c:710,668) and casts at the record: ai
+    /// `(epicsFloat64)`, longin `(epicsInt32)` (:779,970).
+    #[test]
+    fn asynint64_carries_the_i64_whole() {
+        use crate::param::ParamValue;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::int64in::Int64inRecord;
+        use epics_base_rs::server::records::longin::LonginRecord;
+
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let handle = PortHandle::new(
+            tx,
+            "p".into(),
+            interrupts,
+            ActorId::new(),
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
+        let link = AsynLink {
+            port_name: "p".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "GC_GevSCPD".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt64");
+
+        let v = (1i64 << 53) + 1;
+        match ads.write_op(&EpicsValue::Int64(v)) {
+            Some(RequestOp::Int64Write { value }) => assert_eq!(value, v),
+            other => panic!("an int64out VAL must reach the driver as Int64Write, got {other:?}"),
+        }
+        assert_eq!(
+            ads.result_to_value(&RequestResult::int64_read(v)),
+            Some(EpicsValue::Int64(v))
+        );
+        assert_eq!(
+            ads.param_value_for_iface(&ParamValue::Int64(v)).unwrap(),
+            Some(EpicsValue::Int64(v))
+        );
+
+        let mut int64in = Int64inRecord::new(0);
+        assert!(ads.store_read_value(&mut int64in, EpicsValue::Int64(v)));
+        assert_eq!(int64in.val(), Some(EpicsValue::Int64(v)));
+        let mut ai = AiRecord::new(0.0);
+        ads.store_read_value(&mut ai, EpicsValue::Int64(v));
+        assert_eq!(ai.val(), Some(EpicsValue::Double(v as f64)));
+        let mut longin = LonginRecord::new(0);
+        ads.store_read_value(&mut longin, EpicsValue::Int64(2000));
+        assert_eq!(longin.val(), Some(EpicsValue::Long(2000)));
     }
 
     /// The I/O-Intr twin of `result_to_value_masks_and_sign_extends_int32`.

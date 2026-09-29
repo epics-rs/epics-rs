@@ -498,14 +498,12 @@ impl ProcessState {
                 //   newFilter = rOffset;
                 //   if (rc1) newFilter += rc1*filter[i];
                 //   if (rc2) newFilter += rc2*data[i];
-                let r_offset = fc.r_offset;
-                let rc1 = fc.rc[0];
-                let rc2 = fc.rc[1];
-                for i in 0..n {
-                    let mut new_filter = accumulate(r_offset, rc1, filter[i]);
-                    new_filter = accumulate(new_filter, rc2, values[i]);
-                    filter[i] = new_filter;
-                }
+                let reset = FilterTerm {
+                    offset: fc.r_offset,
+                    c1: fc.rc[0],
+                    c2: fc.rc[1],
+                };
+                reset.reset(filter, values);
                 self.num_filtered = 0;
             }
 
@@ -516,12 +514,16 @@ impl ProcessState {
 
             // Compute effective coefficients (depend on numFiltered)
             let nf = self.num_filtered as f64;
-            let o1 = fc.o_scale * (fc.oc[0] + fc.oc[1] / nf);
-            let o2 = fc.o_scale * (fc.oc[2] + fc.oc[3] / nf);
-            let f1 = fc.f_scale * (fc.fc[0] + fc.fc[1] / nf);
-            let f2 = fc.f_scale * (fc.fc[2] + fc.fc[3] / nf);
-            let o_offset = fc.o_offset;
-            let f_offset = fc.f_offset;
+            let out = FilterTerm {
+                offset: fc.o_offset,
+                c1: fc.o_scale * (fc.oc[0] + fc.oc[1] / nf),
+                c2: fc.o_scale * (fc.oc[2] + fc.oc[3] / nf),
+            };
+            let next = FilterTerm {
+                offset: fc.f_offset,
+                c1: fc.f_scale * (fc.fc[0] + fc.fc[1] / nf),
+                c2: fc.f_scale * (fc.fc[2] + fc.fc[3] / nf),
+            };
 
             // C++ NDPluginProcess.cpp:219-227 doProcess:
             //   newData   = oOffset;
@@ -535,14 +537,7 @@ impl ProcessState {
             // Both newData AND newFilter are computed from the ORIGINAL
             // data[i]; data[i] = newData is assigned only afterward. So the
             // filter-state update must use the original input, not new_data.
-            for i in 0..n {
-                let mut new_data = accumulate(o_offset, o1, filter[i]);
-                new_data = accumulate(new_data, o2, values[i]);
-                let mut new_filter = accumulate(f_offset, f1, filter[i]);
-                new_filter = accumulate(new_filter, f2, values[i]);
-                values[i] = new_data;
-                filter[i] = new_filter;
-            }
+            FilterTerm::step(&out, &next, values, filter);
 
             // Suppress output if filterCallbacks is set and we haven't reached
             // numFilter. C++ sets doCallbacks = 0 and does NOT call
@@ -600,6 +595,250 @@ impl ProcessState {
     }
 }
 
+/// Elements per parallel chunk of the element-wise pass: large enough that
+/// the per-chunk dispatch is noise, small enough to split a frame across the
+/// pool.
+#[cfg(feature = "parallel")]
+const PAR_CHUNK: usize = 1 << 16;
+
+/// Stages 1-4 of one frame with every switch resolved: each stage is present
+/// or absent, and the two correction buffers are the slices the stage reads
+/// at the same index as the value it corrects. One such set describes the
+/// frame; [`slice`](Self::slice) cuts it down to a chunk of it.
+struct ElementOps<'a> {
+    /// Stage 1: background subtraction, `value -= bg[i]`.
+    bg: Option<&'a [f64]>,
+    /// Stage 2: flat-field normalization, `value = value * scale / ff[i]`
+    /// wherever `ff[i] != 0`.
+    ff: Option<(&'a [f64], f64)>,
+    /// Stage 3: `value = (value + offset) * scale`.
+    offset_scale: Option<(f64, f64)>,
+    /// Stage 4, first half: `value > threshold` becomes the clip value.
+    high_clip: Option<(f64, f64)>,
+    /// Stage 4, second half: `value < threshold` becomes the clip value.
+    /// C applies high-clip THEN low-clip (NDPluginProcess.cpp:175-176); when
+    /// the two thresholds cross (high < low) the order changes the result.
+    low_clip: Option<(f64, f64)>,
+}
+
+impl ElementOps<'_> {
+    /// The same stages over `len` elements from `start`.
+    #[cfg(any(feature = "simd", feature = "parallel"))]
+    fn slice(&self, start: usize, len: usize) -> ElementOps<'_> {
+        ElementOps {
+            bg: self.bg.map(|bg| &bg[start..start + len]),
+            ff: self.ff.map(|(ff, scale)| (&ff[start..start + len], scale)),
+            ..*self
+        }
+    }
+
+    /// The stages over `values`, on vectors where the `simd` feature
+    /// provides them.
+    fn apply(&self, values: &mut [f64]) {
+        #[cfg(feature = "simd")]
+        fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::element_ops(s, self, values));
+        #[cfg(not(feature = "simd"))]
+        self.apply_scalar(values);
+    }
+
+    /// The stages element by element: the scalar form, and the tail the
+    /// vector kernel leaves.
+    fn apply_scalar(&self, values: &mut [f64]) {
+        for (i, v) in values.iter_mut().enumerate() {
+            if let Some(bg) = self.bg {
+                *v -= bg[i];
+            }
+            if let Some((ff, scale)) = self.ff {
+                if ff[i] != 0.0 {
+                    *v = *v * scale / ff[i];
+                }
+            }
+            if let Some((offset, scale)) = self.offset_scale {
+                *v = (*v + offset) * scale;
+            }
+            if let Some((thresh, clip)) = self.high_clip {
+                if *v > thresh {
+                    *v = clip;
+                }
+            }
+            if let Some((thresh, clip)) = self.low_clip {
+                if *v < thresh {
+                    *v = clip;
+                }
+            }
+        }
+    }
+}
+
+/// One output of the recursive filter, `offset + c1 * filter[i] + c2 *
+/// data[i]`, with C's guards: a zero coefficient contributes nothing at all
+/// (NDPluginProcess.cpp:204-209, 219-227 test each coefficient before the
+/// multiply), so a NaN or infinity in the buffer it would have multiplied
+/// does not leak through as `0 * NaN`. The coefficients are the same for
+/// every element of a frame, so the guards resolve once per frame here
+/// rather than once per element.
+#[derive(Clone, Copy)]
+struct FilterTerm {
+    offset: f64,
+    c1: f64,
+    c2: f64,
+}
+
+impl FilterTerm {
+    /// The term for one element.
+    #[inline(always)]
+    fn at(&self, filter: f64, data: f64) -> f64 {
+        accumulate(accumulate(self.offset, self.c1, filter), self.c2, data)
+    }
+
+    /// The reset, `filter[i] = term(filter[i], data[i])` for every element.
+    fn reset(&self, filter: &mut [f64], values: &[f64]) {
+        #[cfg(feature = "simd")]
+        fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::filter_reset(s, self, filter, values));
+        #[cfg(not(feature = "simd"))]
+        self.reset_scalar(filter, values);
+    }
+
+    fn reset_scalar(&self, filter: &mut [f64], values: &[f64]) {
+        for (f, &d) in filter.iter_mut().zip(values) {
+            *f = self.at(*f, d);
+        }
+    }
+
+    /// The filter step: `data[i]` becomes `out`'s term and `filter[i]`
+    /// `next`'s, both from the ORIGINAL `data[i]` and `filter[i]`.
+    fn step(out: &Self, next: &Self, values: &mut [f64], filter: &mut [f64]) {
+        #[cfg(feature = "simd")]
+        fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::filter_step(s, out, next, values, filter));
+        #[cfg(not(feature = "simd"))]
+        Self::step_scalar(out, next, values, filter);
+    }
+
+    fn step_scalar(out: &Self, next: &Self, values: &mut [f64], filter: &mut [f64]) {
+        for (d, f) in values.iter_mut().zip(filter) {
+            let new_data = out.at(*f, *d);
+            let new_filter = next.at(*f, *d);
+            *d = new_data;
+            *f = new_filter;
+        }
+    }
+}
+
+/// [`ElementOps::apply_scalar`] and the two [`FilterTerm`] loops on explicit
+/// vectors, one level per CPU the binary may run on. Every stage keeps the
+/// scalar expression, operation for operation, so a frame comes out bit for
+/// bit the same on either path: the flat-field guard is a lane select on
+/// `ff == 0`, the clips are lane selects on the strict compares (a NaN
+/// compares false and passes through, as in the scalar `if`), and the
+/// filter's multiply and add stay separate rather than fused.
+#[cfg(feature = "simd")]
+mod simd_kernels {
+    use super::{ElementOps, FilterTerm};
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    #[simd]
+    pub(super) fn element_ops<S: Simd>(simd: S, ops: &ElementOps<'_>, values: &mut [f64]) {
+        let n = S::f64s::LEN;
+        let zero = S::f64s::splat(simd, 0.0);
+        let ff_scale = S::f64s::splat(simd, ops.ff.map_or(0.0, |(_, s)| s));
+        let (offset, scale) = ops.offset_scale.unwrap_or((0.0, 0.0));
+        let (offset, scale) = (S::f64s::splat(simd, offset), S::f64s::splat(simd, scale));
+        let (hi_thresh, hi_clip) = ops.high_clip.unwrap_or((0.0, 0.0));
+        let (hi_thresh, hi_clip) = (
+            S::f64s::splat(simd, hi_thresh),
+            S::f64s::splat(simd, hi_clip),
+        );
+        let (lo_thresh, lo_clip) = ops.low_clip.unwrap_or((0.0, 0.0));
+        let (lo_thresh, lo_clip) = (
+            S::f64s::splat(simd, lo_thresh),
+            S::f64s::splat(simd, lo_clip),
+        );
+        let len = values.len();
+        let mut chunks = values.chunks_exact_mut(n);
+        let mut base = 0;
+        for c in &mut chunks {
+            let mut v = S::f64s::from_slice(simd, c);
+            if let Some(bg) = ops.bg {
+                v -= S::f64s::from_slice(simd, &bg[base..base + n]);
+            }
+            if let Some((ff, _)) = ops.ff {
+                let f = S::f64s::from_slice(simd, &ff[base..base + n]);
+                v = f.simd_eq(zero).select(v, v * ff_scale / f);
+            }
+            if ops.offset_scale.is_some() {
+                v = (v + offset) * scale;
+            }
+            if ops.high_clip.is_some() {
+                v = v.simd_gt(hi_thresh).select(hi_clip, v);
+            }
+            if ops.low_clip.is_some() {
+                v = v.simd_lt(lo_thresh).select(lo_clip, v);
+            }
+            v.store_slice(c);
+            base += n;
+        }
+        ops.slice(base, len - base)
+            .apply_scalar(chunks.into_remainder());
+    }
+
+    /// `offset + c1 * filter + c2 * data` on vectors, a zero coefficient
+    /// skipped as [`super::accumulate`] skips it.
+    #[inline(always)]
+    fn term<S: Simd>(simd: S, t: &FilterTerm, filter: S::f64s, data: S::f64s) -> S::f64s {
+        let mut acc = S::f64s::splat(simd, t.offset);
+        if t.c1 != 0.0 {
+            acc += S::f64s::splat(simd, t.c1) * filter;
+        }
+        if t.c2 != 0.0 {
+            acc += S::f64s::splat(simd, t.c2) * data;
+        }
+        acc
+    }
+
+    #[simd]
+    pub(super) fn filter_reset<S: Simd>(
+        simd: S,
+        t: &FilterTerm,
+        filter: &mut [f64],
+        values: &[f64],
+    ) {
+        let n = S::f64s::LEN;
+        let mut fs = filter.chunks_exact_mut(n);
+        let mut ds = values.chunks_exact(n);
+        for (f, d) in (&mut fs).zip(&mut ds) {
+            let out = term(
+                simd,
+                t,
+                S::f64s::from_slice(simd, f),
+                S::f64s::from_slice(simd, d),
+            );
+            out.store_slice(f);
+        }
+        t.reset_scalar(fs.into_remainder(), ds.remainder());
+    }
+
+    #[simd]
+    pub(super) fn filter_step<S: Simd>(
+        simd: S,
+        out: &FilterTerm,
+        next: &FilterTerm,
+        values: &mut [f64],
+        filter: &mut [f64],
+    ) {
+        let n = S::f64s::LEN;
+        let mut ds = values.chunks_exact_mut(n);
+        let mut fs = filter.chunks_exact_mut(n);
+        for (d, f) in (&mut ds).zip(&mut fs) {
+            let data = S::f64s::from_slice(simd, d);
+            let filt = S::f64s::from_slice(simd, f);
+            term(simd, out, filt, data).store_slice(d);
+            term(simd, next, filt, data).store_slice(f);
+        }
+        FilterTerm::step_scalar(out, next, ds.into_remainder(), fs.into_remainder());
+    }
+}
+
 /// Everything one frame reads and nothing it writes: the tuning config, the
 /// two correction buffers and the two one-shot requests it consumed.
 ///
@@ -633,74 +872,53 @@ impl ProcessFrame {
         if needs_element_ops {
             // C only takes the background/flat-field pointer when the buffer is
             // BOTH enabled AND valid for this frame (NDPluginProcess.cpp:127-130).
+            // bg.len() == n is guaranteed by the validity gate, and the stages
+            // below index it directly (C subtracts background[i]
+            // unconditionally for every element).
             let bg = if self.config.enable_background && self.config.valid_background {
-                self.background.as_ref()
+                self.background.as_deref().map(Vec::as_slice)
             } else {
                 None
             };
-            let (ff, ff_scale) = if self.config.enable_flat_field && self.config.valid_flat_field {
-                if let Some(ref ff) = self.flat_field {
-                    // C++: value *= scaleFlatField / flatField[i]
-                    // (NDPluginProcess.cpp:172). scaleFlatField is used directly
-                    // — there is no mean substitution when it is <= 0.
-                    (Some(ff.as_slice()), self.config.scale_flat_field)
-                } else {
-                    (None, 0.0)
-                }
+            let ff = if self.config.enable_flat_field && self.config.valid_flat_field {
+                // C++: value *= scaleFlatField / flatField[i]
+                // (NDPluginProcess.cpp:172). scaleFlatField is used directly
+                // — there is no mean substitution when it is <= 0.
+                self.flat_field
+                    .as_deref()
+                    .map(|ff| (ff.as_slice(), self.config.scale_flat_field))
             } else {
-                (None, 0.0)
+                None
             };
-            let do_offset_scale = self.config.enable_offset_scale;
-            let scale = self.config.scale;
-            let offset = self.config.offset;
-            let do_low_clip = self.config.enable_low_clip;
-            let low_clip_thresh = self.config.low_clip_thresh;
-            let low_clip_value = self.config.low_clip_value;
-            let do_high_clip = self.config.enable_high_clip;
-            let high_clip_thresh = self.config.high_clip_thresh;
-            let high_clip_value = self.config.high_clip_value;
-
-            let apply_stages = |i: usize, v: &mut f64| {
-                // Stage 1: Background subtraction. bg.len() == n is guaranteed by
-                // the validity gate above, so index directly (C subtracts
-                // background[i] unconditionally for every element).
-                if let Some(bg) = bg {
-                    *v -= bg[i];
-                }
-                // Stage 2: Flat field normalization
-                if let Some(ff) = ff {
-                    if ff[i] != 0.0 {
-                        *v = *v * ff_scale / ff[i];
-                    }
-                }
-                // Stage 3: Offset + scale (C++: value = (value + offset) * scale)
-                if do_offset_scale {
-                    *v = (*v + offset) * scale;
-                }
-                // Stage 4: Clipping — C applies high-clip THEN low-clip
-                // (NDPluginProcess.cpp:175-176). When the two thresholds cross
-                // (high < low) the order changes the result, so it must match.
-                if do_high_clip && *v > high_clip_thresh {
-                    *v = high_clip_value;
-                }
-                if do_low_clip && *v < low_clip_thresh {
-                    *v = low_clip_value;
-                }
+            let ops = ElementOps {
+                bg,
+                ff,
+                offset_scale: self
+                    .config
+                    .enable_offset_scale
+                    .then_some((self.config.offset, self.config.scale)),
+                high_clip: self
+                    .config
+                    .enable_high_clip
+                    .then_some((self.config.high_clip_thresh, self.config.high_clip_value)),
+                low_clip: self
+                    .config
+                    .enable_low_clip
+                    .then_some((self.config.low_clip_thresh, self.config.low_clip_value)),
             };
 
-            let use_parallel = par_util::should_parallelize(n);
-
-            if use_parallel {
+            if par_util::should_parallelize(n) {
                 #[cfg(feature = "parallel")]
                 par_util::thread_pool().install(|| {
-                    values.par_iter_mut().enumerate().for_each(|(i, v)| {
-                        apply_stages(i, v);
-                    });
+                    values
+                        .par_chunks_mut(PAR_CHUNK)
+                        .enumerate()
+                        .for_each(|(k, chunk)| {
+                            ops.slice(k * PAR_CHUNK, chunk.len()).apply(chunk);
+                        });
                 });
             } else {
-                for (i, v) in values.iter_mut().enumerate() {
-                    apply_stages(i, v);
-                }
+                ops.apply(values);
             }
         }
     }

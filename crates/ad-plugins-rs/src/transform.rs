@@ -343,7 +343,7 @@ impl<T: Copy> LaneVec for T {}
 /// operation at all.
 #[cfg(feature = "simd")]
 mod simd_kernels {
-    use ad_core_rs::simd::{LaneVec, join_tables, load3, shuffle3, split_tables, store3};
+    use ad_core_rs::simd::{LaneVec, join_tables, load_vecs, shuffle, split_tables, store_vecs};
     use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
 
@@ -435,16 +435,16 @@ mod simd_kernels {
         let k = T::Vec::<S>::LEN;
         let (w0, h0) = (w / k * k, h / k * k);
         let e = std::mem::size_of::<T>();
-        let (split, join) = (split_tables::<S>(simd, e), join_tables::<S>(simd, e));
+        let (split, join) = (split_tables::<S, 3>(simd, e), join_tables::<S, 3>(simd, e));
         let zero = T::Vec::<S>::splat(simd, T::default());
         let (mut a, mut b) = ([[zero; MAX_K]; 3], [[zero; MAX_K]; 3]);
         for ry in (0..h0).step_by(k) {
             for cx in (0..w0).step_by(k) {
                 let (src_row, dst_row, col) = block_rows((ry, cx, k), (w, h), flips);
                 for i in 0..k {
-                    let planes = shuffle3::<S>(
+                    let planes = shuffle::<S, 3>(
                         &split,
-                        load3::<S, T>(simd, &src[src_row(i) * sys + 3 * cx..]),
+                        load_vecs::<S, T, 3>(simd, &src[src_row(i) * sys + 3 * cx..]),
                     );
                     for (c, p) in planes.into_iter().enumerate() {
                         a[c][i] = T::Vec::<S>::from_bytes(p);
@@ -459,8 +459,8 @@ mod simd_kernels {
                 ];
                 for j in 0..k {
                     let planes = std::array::from_fn(|c| t[c][j].to_bytes());
-                    store3::<S, T>(
-                        shuffle3::<S>(&join, planes),
+                    store_vecs::<S, T, 3>(
+                        shuffle::<S, 3>(&join, planes),
                         &mut out[dst_row(j) * dys + 3 * col..],
                     );
                 }

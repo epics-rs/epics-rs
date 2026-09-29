@@ -253,39 +253,39 @@ macro_rules! lane_vec {
 
 lane_vec!(i8 => i8s, u8 => u8s, i16 => i16s, u16 => u16s, i32 => i32s, u32 => u32s, i64 => i64s, u64 => u64s, f32 => f32s, f64 => f64s);
 
-/// The byte-swizzle tables of a three-way split or join of `e`-byte
-/// elements across three consecutive vectors: `t[i][k]` maps output vector
+/// The byte-swizzle tables of an `N`-way split or join of `e`-byte
+/// elements across `N` consecutive vectors: `t[i][k]` maps output vector
 /// `i` from input vector `k`, with `0xFF` (past every vector) in the lanes
 /// that come from another input, which `swizzle_dyn_precise` zeroes so the
-/// three pulls or together.
-pub type Tables<S> = [[<S as Simd>::u8s; 3]; 3];
+/// `N` pulls or together.
+pub type Tables<S, const N: usize> = [[<S as Simd>::u8s; N]; N];
 
-/// The tables that split pixels `[r0 g0 b0 r1 ...]` into the planes
-/// `[r0 r1 ...]`, `[g0 g1 ...]`, `[b0 b1 ...]`.
+/// The tables that split groups `[a0 b0 c0 a1 ...]` of `N` elements into
+/// the planes `[a0 a1 ...]`, `[b0 b1 ...]`, `[c0 c1 ...]`.
 #[inline(always)]
-pub fn split_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+pub fn split_tables<S: Simd, const N: usize>(simd: S, e: usize) -> Tables<S, N> {
     let n = S::u8s::LEN;
     std::array::from_fn(|c| {
         std::array::from_fn(|k| {
             S::u8s::from_fn(simd, |j| {
-                let g = (3 * (j / e) + c) * e + j % e;
+                let g = (N * (j / e) + c) * e + j % e;
                 if g / n == k { (g % n) as u8 } else { 0xFF }
             })
         })
     })
 }
 
-/// The tables that join the planes back into pixels; the inverse of
+/// The tables that join the planes back into groups; the inverse of
 /// [`split_tables`].
 #[inline(always)]
-pub fn join_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+pub fn join_tables<S: Simd, const N: usize>(simd: S, e: usize) -> Tables<S, N> {
     let n = S::u8s::LEN;
     std::array::from_fn(|k| {
         std::array::from_fn(|c| {
             S::u8s::from_fn(simd, |j| {
                 let q = (k * n + j) / e;
-                if q % 3 == c {
-                    ((q / 3) * e + j % e) as u8
+                if q % N == c {
+                    ((q / N) * e + j % e) as u8
                 } else {
                     0xFF
                 }
@@ -294,26 +294,37 @@ pub fn join_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
     })
 }
 
-/// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | v[2][t[i][2]]`, per byte.
+/// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | ...`, per byte. Plain loops
+/// throughout, as in the loaders below: a closure body that the inliner
+/// leaves behind cannot take the lane operations with it, since they
+/// carry the target features of the caller and it does not.
 #[inline(always)]
-pub fn shuffle3<S: Simd>(t: &Tables<S>, v: [S::u8s; 3]) -> [S::u8s; 3] {
-    std::array::from_fn(|i| {
-        v[0].swizzle_dyn_precise(t[i][0])
-            | v[1].swizzle_dyn_precise(t[i][1])
-            | v[2].swizzle_dyn_precise(t[i][2])
-    })
+pub fn shuffle<S: Simd, const N: usize>(t: &Tables<S, N>, v: [S::u8s; N]) -> [S::u8s; N] {
+    let mut out = v;
+    for i in 0..N {
+        let mut o = v[0].swizzle_dyn_precise(t[i][0]);
+        for k in 1..N {
+            o |= v[k].swizzle_dyn_precise(t[i][k]);
+        }
+        out[i] = o;
+    }
+    out
 }
 
-/// Three consecutive vectors of `v`, as bytes.
+/// `N` consecutive vectors of `v`, as bytes.
 #[inline(always)]
-pub fn load3<S: Simd, T: LaneVec>(simd: S, v: &[T]) -> [S::u8s; 3] {
+pub fn load_vecs<S: Simd, T: LaneVec, const N: usize>(simd: S, v: &[T]) -> [S::u8s; N] {
     let per = T::Vec::<S>::LEN;
-    std::array::from_fn(|k| T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes())
+    let mut out = [S::u8s::splat(simd, 0); N];
+    for (k, o) in out.iter_mut().enumerate() {
+        *o = T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes();
+    }
+    out
 }
 
-/// `v` into three consecutive vectors of `out`.
+/// `v` into `N` consecutive vectors of `out`.
 #[inline(always)]
-pub fn store3<S: Simd, T: LaneVec>(v: [S::u8s; 3], out: &mut [T]) {
+pub fn store_vecs<S: Simd, T: LaneVec, const N: usize>(v: [S::u8s; N], out: &mut [T]) {
     let per = T::Vec::<S>::LEN;
     for (k, b) in v.into_iter().enumerate() {
         T::Vec::<S>::from_bytes(b).store_slice(&mut out[k * per..(k + 1) * per]);

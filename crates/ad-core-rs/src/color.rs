@@ -435,12 +435,6 @@ impl<T: Copy> LaneVec for T {}
 trait LaneElem: LaneVec {
     fn to_f64(self) -> f64;
     fn from_f64(v: f64) -> Self;
-    /// [`to_f64`](Self::to_f64) over a slice, on lanes.
-    #[cfg(feature = "simd")]
-    fn widen<S: fearless_simd::Simd>(simd: S, v: &[Self], out: &mut [f64]);
-    /// [`from_f64`](Self::from_f64) over a slice, on lanes.
-    #[cfg(feature = "simd")]
-    fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]);
     /// One vector as its `f64` vectors in element order, into the head
     /// of `out`.
     #[cfg(feature = "simd")]
@@ -452,7 +446,7 @@ trait LaneElem: LaneVec {
 }
 
 macro_rules! lane_elem {
-    ($t:ty, $widen:ident, $narrow:ident, $widen_vec:ident, $narrow_vec:ident) => {
+    ($t:ty, $widen_vec:ident, $narrow_vec:ident) => {
         impl LaneElem for $t {
             #[inline(always)]
             fn to_f64(self) -> f64 {
@@ -464,16 +458,6 @@ macro_rules! lane_elem {
             }
             #[cfg(feature = "simd")]
             #[inline(always)]
-            fn widen<S: fearless_simd::Simd>(simd: S, v: &[Self], out: &mut [f64]) {
-                crate::simd::$widen(simd, v, out)
-            }
-            #[cfg(feature = "simd")]
-            #[inline(always)]
-            fn narrow<S: fearless_simd::Simd>(simd: S, v: &[f64], out: &mut [Self]) {
-                crate::simd::$narrow(simd, v, out)
-            }
-            #[cfg(feature = "simd")]
-            #[inline(always)]
             fn widen_vec<S: fearless_simd::Simd>(_simd: S, v: Self::Vec<S>, out: &mut [S::f64s]) {
                 let wide = crate::simd::$widen_vec::<S>(v);
                 out[..wide.len()].copy_from_slice(&wide);
@@ -481,21 +465,21 @@ macro_rules! lane_elem {
             #[cfg(feature = "simd")]
             #[inline(always)]
             fn narrow_vec<S: fearless_simd::Simd>(simd: S, w: &[S::f64s]) -> Self::Vec<S> {
-                crate::simd::$narrow_vec::<S>(simd, std::array::from_fn(|k| w[k]))
+                crate::simd::$narrow_vec::<S>(simd, w.try_into().expect("a whole vector"))
             }
         }
     };
 }
 
-lane_elem!(i8, to_f64_i8, from_f64_i8, to_f64s_i8, from_f64s_i8);
-lane_elem!(u8, to_f64_u8, from_f64_u8, to_f64s_u8, from_f64s_u8);
-lane_elem!(i16, to_f64_i16, from_f64_i16, to_f64s_i16, from_f64s_i16);
-lane_elem!(u16, to_f64_u16, from_f64_u16, to_f64s_u16, from_f64s_u16);
-lane_elem!(i32, to_f64_i32, from_f64_i32, to_f64s_i32, from_f64s_i32);
-lane_elem!(u32, to_f64_u32, from_f64_u32, to_f64s_u32, from_f64s_u32);
-lane_elem!(i64, to_f64_i64, from_f64_i64, to_f64s_i64, from_f64s_i64);
-lane_elem!(u64, to_f64_u64, from_f64_u64, to_f64s_u64, from_f64s_u64);
-lane_elem!(f32, to_f64_f32, from_f64_f32, to_f64s_f32, from_f64s_f32);
+lane_elem!(i8, to_f64s_i8, from_f64s_i8);
+lane_elem!(u8, to_f64s_u8, from_f64s_u8);
+lane_elem!(i16, to_f64s_i16, from_f64s_i16);
+lane_elem!(u16, to_f64s_u16, from_f64s_u16);
+lane_elem!(i32, to_f64s_i32, from_f64s_i32);
+lane_elem!(u32, to_f64s_u32, from_f64s_u32);
+lane_elem!(i64, to_f64s_i64, from_f64s_i64);
+lane_elem!(u64, to_f64s_u64, from_f64s_u64);
+lane_elem!(f32, to_f64s_f32, from_f64s_f32);
 
 impl LaneElem for f64 {
     #[inline(always)]
@@ -505,16 +489,6 @@ impl LaneElem for f64 {
     #[inline(always)]
     fn from_f64(v: f64) -> Self {
         v
-    }
-    #[cfg(feature = "simd")]
-    #[inline(always)]
-    fn widen<S: fearless_simd::Simd>(_simd: S, v: &[Self], out: &mut [f64]) {
-        out.copy_from_slice(v)
-    }
-    #[cfg(feature = "simd")]
-    #[inline(always)]
-    fn narrow<S: fearless_simd::Simd>(_simd: S, v: &[f64], out: &mut [Self]) {
-        out.copy_from_slice(v)
     }
     #[cfg(feature = "simd")]
     #[inline(always)]
@@ -861,51 +835,37 @@ pub fn yuv411_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     Ok(arr)
 }
 
-/// The YUV conversions on explicit vectors, one block of [`BLOCK`] pixels
-/// at a time: the block is widened to `f64` with the cast kernels, the
-/// BT.601 arithmetic runs on the interleaved stream in place, and the
-/// result narrows back with the cast kernels. Each kernel converts the
-/// whole prefix of its input that fills blocks and returns how many
-/// elements, pairs or quads it covered; the scalar loop finishes the rest.
+/// The YUV conversions on explicit vectors, a vector of pixels, of pixel
+/// pairs or of pixel quads per step and all of it in registers: the
+/// pixels split into their planes with the byte shuffles of
+/// [`crate::simd`], each plane widens to `f64`, the BT.601 arithmetic
+/// runs plane against plane, and the results narrow and join back into
+/// the packed layout. The subsampled layouts split the pixels of a pair
+/// or quad into one plane per position first, so the chroma of a pair or
+/// quad averages lane against lane. Each kernel converts the whole prefix
+/// of its input that fills steps and returns how many elements, pairs or
+/// quads it covered; the scalar loop finishes the rest.
 ///
-/// The interleaved stream needs no gather: element `i` of a three-channel
-/// stream belongs to the pixel starting at `i - c` with `c = i % 3`, so
-/// its three inputs are the unaligned loads at offsets `-2..=2` from `i`,
-/// picked per lane by masks that depend only on `c` — and so do the
-/// coefficients, which become per-lane vectors too. With the vector start
-/// advancing by the lane count, `c` of lane 0 cycles through three
-/// phases, each with its own mask and coefficient set built once per
-/// call. The arithmetic between is the scalar expression, operation for
-/// operation, and the round-half-away-from-zero of `f64::round` is
-/// spelled out on lanes (the vector `round_ties_even` is not it), so a
-/// frame is bit for bit the same on either path. The channels whose
-/// scalar expression lacks a term get the coefficient `0.0`; that adds a
-/// signed zero to a value that is never `-0.0`, which leaves it unchanged.
+/// The arithmetic is the scalar expression, operation for operation, and
+/// the round-half-away-from-zero of `f64::round` is spelled out on lanes
+/// (the vector `round_ties_even` is not it), so a frame is bit for bit
+/// the same on either path.
 #[cfg(feature = "simd")]
 mod simd_kernels {
     use super::LaneElem;
-    use crate::simd::{join_tables, load3, shuffle3, split_tables, store3};
+    use crate::simd::{join_tables, load_vecs, shuffle, split_tables, store_vecs};
     use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
 
-    /// Pixels per block. Three, two and one-and-a-half elements per pixel
-    /// all give a whole number of vectors of every lane count.
-    const BLOCK: usize = 1024;
-    /// Elements either side of the widened block that the shifted loads
-    /// may reach.
-    const PAD: usize = 8;
-
     /// `f64::round` on lanes: the truncation, plus one away from zero
-    /// where the fraction reaches a half. `v - trunc(v)` is exact, and
-    /// the added term takes the sign of `v` even when it is zero so that
-    /// `-0.25` rounds to `-0.0` as the scalar does.
+    /// where the fraction reaches a half. `v - trunc(v)` is exact and so
+    /// is its double, whose truncation is that one with the sign of `v`.
+    /// Only `-0.0` itself comes back as `+0.0`, which no element cast
+    /// tells apart.
     #[inline(always)]
     fn round<S: Simd>(simd: S, v: S::f64s) -> S::f64s {
         let t = v.trunc();
-        let away = (v - t).abs().simd_ge(S::f64s::splat(simd, 0.5));
-        t + away
-            .select(S::f64s::splat(simd, 1.0), S::f64s::splat(simd, 0.0))
-            .copysign(v)
+        t + ((v - t) * S::f64s::splat(simd, 2.0)).trunc()
     }
 
     /// [`round`] on the first vector of `v`, for the tests.
@@ -925,126 +885,88 @@ mod simd_kernels {
             .min(S::f64s::splat(simd, max))
     }
 
-    /// [`round_clamp`] over a slice, in place.
-    #[inline(always)]
-    fn round_clamp_slice<S: Simd>(simd: S, v: &mut [f64], max: f64) {
-        for c in v.chunks_exact_mut(S::f64s::LEN) {
-            round_clamp(simd, S::f64s::from_slice(simd, c), max).store_slice(c);
-        }
+    /// [`super::rgb_to_yuv`] on lanes: `k[c]` the coefficients of the
+    /// three inputs for output channel `c`.
+    struct Forward<S: Simd> {
+        k: [[S::f64s; 3]; 3],
+        half: S::f64s,
     }
 
-    /// The lane masks and coefficients for the vectors whose lane 0 is
-    /// channel `phase` of its pixel.
-    struct Phase<S: Simd> {
-        /// Lanes that are channel 1 and channel 2 of their pixel.
-        m1: S::mask64s,
-        m2: S::mask64s,
-        /// The coefficient of each of the three inputs, and the constant.
-        k: [S::f64s; 3],
-        h: S::f64s,
-    }
-
-    /// The three phases of a coefficient table with one row per channel.
-    fn phases<S: Simd>(simd: S, table: [[f64; 4]; 3]) -> [Phase<S>; 3] {
-        std::array::from_fn(|phase| {
-            let chan = |lane: usize| (phase + lane) % 3;
-            let row = |j: usize| S::f64s::from_fn(simd, |lane| table[chan(lane)][j]);
-            let is = |c: usize| {
-                S::f64s::from_fn(simd, |lane| (chan(lane) == c) as u8 as f64)
-                    .simd_eq(S::f64s::splat(simd, 1.0))
-            };
-            Phase {
-                m1: is(1),
-                m2: is(2),
-                k: [row(0), row(1), row(2)],
-                h: row(3),
+    impl<S: Simd> Forward<S> {
+        fn new(simd: S, half: f64) -> Self {
+            let k = [
+                [0.299, 0.587, 0.114],
+                [-0.169, -0.331, 0.5],
+                [0.5, -0.419, -0.081],
+            ];
+            let mut lanes = [[S::f64s::splat(simd, 0.0); 3]; 3];
+            for (row, ks) in lanes.iter_mut().zip(k) {
+                for (lane, &c) in row.iter_mut().zip(&ks) {
+                    *lane = S::f64s::splat(simd, c);
+                }
             }
-        })
-    }
-
-    /// The three inputs of the pixel each lane belongs to, for the vector
-    /// starting at element `at` of the padded stream `x`.
-    #[inline(always)]
-    fn pixel_lanes<S: Simd>(
-        simd: S,
-        ph: &Phase<S>,
-        x: &[f64],
-        at: usize,
-    ) -> (S::f64s, S::f64s, S::f64s) {
-        let n = S::f64s::LEN;
-        let load = |o: usize| S::f64s::from_slice(simd, &x[at + o - 2..at + o - 2 + n]);
-        let (lm2, lm1, l0, l1, l2) = (load(0), load(1), load(2), load(3), load(4));
-        (
-            ph.m1.select(lm1, ph.m2.select(lm2, l0)),
-            ph.m1.select(l0, ph.m2.select(lm1, l1)),
-            ph.m1.select(l1, ph.m2.select(l0, l2)),
-        )
-    }
-
-    /// [`super::rgb_to_yuv`] over the padded RGB stream `x` into `out`,
-    /// rounded and clamped when `max` is given.
-    #[inline(always)]
-    fn forward_block<S: Simd>(
-        simd: S,
-        ph: &[Phase<S>; 3],
-        x: &[f64],
-        out: &mut [f64],
-        max: Option<f64>,
-    ) {
-        let n = S::f64s::LEN;
-        for (k, o) in out.chunks_exact_mut(n).enumerate() {
-            let ph = &ph[(k * n) % 3];
-            let (r, g, b) = pixel_lanes(simd, ph, x, PAD + k * n);
-            let v = ((ph.k[0] * r + ph.k[1] * g) + ph.k[2] * b) + ph.h;
-            match max {
-                Some(max) => round_clamp(simd, v, max).store_slice(o),
-                None => v.store_slice(o),
+            Forward {
+                k: lanes,
+                half: S::f64s::splat(simd, half),
             }
         }
-    }
 
-    /// [`super::yuv_to_rgb`] over the padded YUV stream `x` into `out`,
-    /// rounded and clamped.
-    #[inline(always)]
-    fn inverse_block<S: Simd>(
-        simd: S,
-        ph: &[Phase<S>; 3],
-        x: &[f64],
-        out: &mut [f64],
-        half: f64,
-        max: f64,
-    ) {
-        let n = S::f64s::LEN;
-        let half = S::f64s::splat(simd, half);
-        for (k, o) in out.chunks_exact_mut(n).enumerate() {
-            let ph = &ph[(k * n) % 3];
-            let (y, cb, cr) = pixel_lanes(simd, ph, x, PAD + k * n);
-            let v = (y + ph.k[1] * (cb - half)) + ph.k[2] * (cr - half);
-            round_clamp(simd, v, max).store_slice(o);
+        /// `[y, cb, cr]` of the pixels `(r, g, b)`, unrounded.
+        #[inline(always)]
+        fn apply(&self, r: S::f64s, g: S::f64s, b: S::f64s) -> [S::f64s; 3] {
+            let row = |k: &[S::f64s; 3]| (k[0] * r + k[1] * g) + k[2] * b;
+            [
+                row(&self.k[0]),
+                row(&self.k[1]) + self.half,
+                row(&self.k[2]) + self.half,
+            ]
         }
     }
 
-    fn forward_table(half: f64) -> [[f64; 4]; 3] {
-        [
-            [0.299, 0.587, 0.114, 0.0],
-            [-0.169, -0.331, 0.5, half],
-            [0.5, -0.419, -0.081, half],
-        ]
+    /// [`super::yuv_to_rgb`] on lanes.
+    struct Inverse<S: Simd> {
+        r_cr: S::f64s,
+        g_cb: S::f64s,
+        g_cr: S::f64s,
+        b_cb: S::f64s,
     }
 
-    /// Column 0 is unused: the inverse takes `y` itself.
-    const INVERSE_TABLE: [[f64; 4]; 3] = [
-        [0.0, 0.0, 1.402, 0.0],
-        [0.0, -0.344, -0.714, 0.0],
-        [0.0, 1.772, 0.0, 0.0],
-    ];
+    impl<S: Simd> Inverse<S> {
+        fn new(simd: S) -> Self {
+            Inverse {
+                r_cr: S::f64s::splat(simd, 1.402),
+                g_cb: S::f64s::splat(simd, 0.344),
+                g_cr: S::f64s::splat(simd, 0.714),
+                b_cb: S::f64s::splat(simd, 1.772),
+            }
+        }
 
-    fn padded() -> Vec<f64> {
-        vec![0.0; PAD + 3 * BLOCK + PAD]
+        /// `[r, g, b]` of the pixels `(y, cb, cr)`, the chroma already
+        /// offset to zero, unrounded.
+        #[inline(always)]
+        fn apply(&self, y: S::f64s, cb: S::f64s, cr: S::f64s) -> [S::f64s; 3] {
+            [
+                y + self.r_cr * cr,
+                (y - self.g_cb * cb) - self.g_cr * cr,
+                y + self.b_cb * cb,
+            ]
+        }
     }
 
     /// `f64` vectors per vector of the narrowest element, on every level.
     const WIDE: usize = 8;
+
+    /// A vector of `T` as its `f64` vectors, into the head of `w`.
+    #[inline(always)]
+    fn widen<S: Simd, T: LaneElem>(simd: S, p: S::u8s, w: &mut [S::f64s; WIDE]) {
+        T::widen_vec(simd, T::Vec::<S>::from_bytes(p), w);
+    }
+
+    /// The inverse of [`widen`].
+    #[inline(always)]
+    fn narrow<S: Simd, T: LaneElem>(simd: S, w: &[S::f64s]) -> S::u8s {
+        T::narrow_vec(simd, w).to_bytes()
+    }
 
     /// [`super::rgb1_mean_scalar`] on lanes, a vector of pixels per step
     /// and all of it in registers: the pixels split into their planes,
@@ -1054,12 +976,12 @@ mod simd_kernels {
     pub(super) fn rgb1_mean<S: Simd, T: LaneElem>(simd: S, v: &[T], out: &mut [T]) -> usize {
         let per = T::Vec::<S>::LEN;
         let k = per / S::f64s::LEN;
-        let t = split_tables::<S>(simd, std::mem::size_of::<T>());
+        let t = split_tables::<S, 3>(simd, std::mem::size_of::<T>());
         let zero = S::f64s::splat(simd, 0.0);
         let three = S::f64s::splat(simd, 3.0);
         let steps = (v.len() / 3).min(out.len()) / per;
         for (src, dst) in v.chunks_exact(3 * per).zip(out.chunks_exact_mut(per)) {
-            let split = shuffle3::<S>(&t, load3::<S, T>(simd, src));
+            let split = shuffle::<S, 3>(&t, load_vecs::<S, T, 3>(simd, src));
             let mut wide = [[zero; WIDE]; 3];
             for (c, p) in split.into_iter().enumerate() {
                 T::widen_vec(simd, T::Vec::<S>::from_bytes(p), &mut wide[c]);
@@ -1079,11 +1001,11 @@ mod simd_kernels {
     #[simd]
     pub(super) fn broadcast3<S: Simd, T: LaneElem>(simd: S, v: &[T], out: &mut [T]) -> usize {
         let per = T::Vec::<S>::LEN;
-        let t = join_tables::<S>(simd, std::mem::size_of::<T>());
+        let t = join_tables::<S, 3>(simd, std::mem::size_of::<T>());
         let steps = v.len().min(out.len() / 3) / per;
         for (src, dst) in v.chunks_exact(per).zip(out.chunks_exact_mut(3 * per)) {
             let p = T::Vec::<S>::from_slice(simd, src).to_bytes();
-            store3::<S, T>(shuffle3::<S>(&t, [p; 3]), dst);
+            store_vecs::<S, T, 3>(shuffle::<S, 3>(&t, [p; 3]), dst);
         }
         steps * per
     }
@@ -1107,10 +1029,11 @@ mod simd_kernels {
         let e = std::mem::size_of::<T>();
         let x0 = x / per * per;
         if sx == 3 && dx == 1 {
-            let t = split_tables::<S>(simd, e);
+            let t = split_tables::<S, 3>(simd, e);
             for iy in 0..y {
                 for ix in (0..x0).step_by(per) {
-                    let split = shuffle3::<S>(&t, load3::<S, T>(simd, &v[iy * sy + ix * 3..]));
+                    let split =
+                        shuffle::<S, 3>(&t, load_vecs::<S, T, 3>(simd, &v[iy * sy + ix * 3..]));
                     for (c, p) in split.into_iter().enumerate() {
                         T::Vec::<S>::from_bytes(p)
                             .store_slice(&mut out[c * dc + iy * dy + ix..][..per]);
@@ -1119,13 +1042,16 @@ mod simd_kernels {
             }
             x0
         } else if sx == 1 && dx == 3 {
-            let t = join_tables::<S>(simd, e);
+            let t = join_tables::<S, 3>(simd, e);
             for iy in 0..y {
                 for ix in (0..x0).step_by(per) {
                     let planes = std::array::from_fn(|c| {
                         T::Vec::<S>::from_slice(simd, &v[c * sc + iy * sy + ix..][..per]).to_bytes()
                     });
-                    store3::<S, T>(shuffle3::<S>(&t, planes), &mut out[iy * dy + ix * 3..]);
+                    store_vecs::<S, T, 3>(
+                        shuffle::<S, 3>(&t, planes),
+                        &mut out[iy * dy + ix * 3..],
+                    );
                 }
             }
             x0
@@ -1134,6 +1060,8 @@ mod simd_kernels {
         }
     }
 
+    /// [`super::yuv444_forward_scalar`] on lanes. Returns the elements
+    /// done.
     #[simd]
     pub(super) fn yuv444_forward<S: Simd, T: LaneElem>(
         simd: S,
@@ -1142,21 +1070,37 @@ mod simd_kernels {
         half: f64,
         max: f64,
     ) -> usize {
-        let ph = phases(simd, forward_table(half));
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let blocks = v.len() / (3 * BLOCK);
-        for (src, dst) in v
-            .chunks_exact(3 * BLOCK)
-            .zip(out.chunks_exact_mut(3 * BLOCK))
-        {
-            T::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
-            forward_block(simd, &ph, &x, &mut y, Some(max));
-            T::narrow(simd, &y, dst);
+        let per = T::Vec::<S>::LEN;
+        let count = per / S::f64s::LEN;
+        let e = std::mem::size_of::<T>();
+        let (split, join) = (split_tables::<S, 3>(simd, e), join_tables::<S, 3>(simd, e));
+        let f = Forward::new(simd, half);
+        let zero = S::f64s::splat(simd, 0.0);
+        let steps = v.len().min(out.len()) / (3 * per);
+        for (src, dst) in v.chunks_exact(3 * per).zip(out.chunks_exact_mut(3 * per)) {
+            let planes = shuffle::<S, 3>(&split, load_vecs::<S, T, 3>(simd, src));
+            let mut rgb = [[zero; WIDE]; 3];
+            for c in 0..3 {
+                widen::<S, T>(simd, planes[c], &mut rgb[c]);
+            }
+            let mut yuv = [[zero; WIDE]; 3];
+            for j in 0..count {
+                let p = f.apply(rgb[0][j], rgb[1][j], rgb[2][j]);
+                for c in 0..3 {
+                    yuv[c][j] = round_clamp(simd, p[c], max);
+                }
+            }
+            let mut planes = [S::u8s::splat(simd, 0); 3];
+            for c in 0..3 {
+                planes[c] = narrow::<S, T>(simd, &yuv[c][..count]);
+            }
+            store_vecs::<S, T, 3>(shuffle::<S, 3>(&join, planes), dst);
         }
-        blocks * 3 * BLOCK
+        steps * 3 * per
     }
 
+    /// [`super::yuv444_inverse_scalar`] on lanes. Returns the elements
+    /// done.
     #[simd]
     pub(super) fn yuv444_inverse<S: Simd, T: LaneElem>(
         simd: S,
@@ -1165,122 +1109,225 @@ mod simd_kernels {
         half: f64,
         max: f64,
     ) -> usize {
-        let ph = phases(simd, INVERSE_TABLE);
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let blocks = v.len() / (3 * BLOCK);
-        for (src, dst) in v
-            .chunks_exact(3 * BLOCK)
-            .zip(out.chunks_exact_mut(3 * BLOCK))
-        {
-            T::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
-            inverse_block(simd, &ph, &x, &mut y, half, max);
-            T::narrow(simd, &y, dst);
-        }
-        blocks * 3 * BLOCK
-    }
-
-    #[simd]
-    pub(super) fn yuv422_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
-        let ph = phases(simd, forward_table(super::U8_HALF));
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let mut packed = vec![0.0; 2 * BLOCK];
-        let blocks = v.len() / (3 * BLOCK);
-        for (src, dst) in v
-            .chunks_exact(3 * BLOCK)
-            .zip(out.chunks_exact_mut(2 * BLOCK))
-        {
-            u8::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
-            forward_block(simd, &ph, &x, &mut y, None);
-            for (p, o) in y.chunks_exact(6).zip(packed.chunks_exact_mut(4)) {
-                o[0] = (p[1] + p[4]) / 2.0;
-                o[1] = p[0];
-                o[2] = (p[2] + p[5]) / 2.0;
-                o[3] = p[3];
+        let per = T::Vec::<S>::LEN;
+        let count = per / S::f64s::LEN;
+        let e = std::mem::size_of::<T>();
+        let (split, join) = (split_tables::<S, 3>(simd, e), join_tables::<S, 3>(simd, e));
+        let inv = Inverse::new(simd);
+        let half = S::f64s::splat(simd, half);
+        let zero = S::f64s::splat(simd, 0.0);
+        let steps = v.len().min(out.len()) / (3 * per);
+        for (src, dst) in v.chunks_exact(3 * per).zip(out.chunks_exact_mut(3 * per)) {
+            let planes = shuffle::<S, 3>(&split, load_vecs::<S, T, 3>(simd, src));
+            let mut yuv = [[zero; WIDE]; 3];
+            for c in 0..3 {
+                widen::<S, T>(simd, planes[c], &mut yuv[c]);
             }
-            round_clamp_slice(simd, &mut packed, super::U8_MAX);
-            u8::narrow(simd, &packed, dst);
-        }
-        blocks * BLOCK / 2
-    }
-
-    #[simd]
-    pub(super) fn yuv422_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
-        let ph = phases(simd, INVERSE_TABLE);
-        let mut packed = vec![0.0; 2 * BLOCK];
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let blocks = v.len() / (2 * BLOCK);
-        for (src, dst) in v
-            .chunks_exact(2 * BLOCK)
-            .zip(out.chunks_exact_mut(3 * BLOCK))
-        {
-            u8::widen(simd, src, &mut packed);
-            for (p, o) in packed.chunks_exact(4).zip(x[PAD..].chunks_exact_mut(6)) {
-                o[0] = p[1];
-                o[1] = p[0];
-                o[2] = p[2];
-                o[3] = p[3];
-                o[4] = p[0];
-                o[5] = p[2];
-            }
-            inverse_block(simd, &ph, &x, &mut y, super::U8_HALF, super::U8_MAX);
-            u8::narrow(simd, &y, dst);
-        }
-        blocks * BLOCK / 2
-    }
-
-    #[simd]
-    pub(super) fn yuv411_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
-        let ph = phases(simd, forward_table(super::U8_HALF));
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let mut packed = vec![0.0; 6 * BLOCK / 4];
-        let blocks = v.len() / (3 * BLOCK);
-        for (src, dst) in v
-            .chunks_exact(3 * BLOCK)
-            .zip(out.chunks_exact_mut(6 * BLOCK / 4))
-        {
-            u8::widen(simd, src, &mut x[PAD..PAD + 3 * BLOCK]);
-            forward_block(simd, &ph, &x, &mut y, None);
-            for (p, o) in y.chunks_exact(12).zip(packed.chunks_exact_mut(6)) {
-                o[0] = (((p[1] + p[4]) + p[7]) + p[10]) / 4.0;
-                o[1] = p[0];
-                o[2] = p[3];
-                o[3] = (((p[2] + p[5]) + p[8]) + p[11]) / 4.0;
-                o[4] = p[6];
-                o[5] = p[9];
-            }
-            round_clamp_slice(simd, &mut packed, super::U8_MAX);
-            u8::narrow(simd, &packed, dst);
-        }
-        blocks * BLOCK / 4
-    }
-
-    #[simd]
-    pub(super) fn yuv411_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
-        let ph = phases(simd, INVERSE_TABLE);
-        let mut packed = vec![0.0; 6 * BLOCK / 4];
-        let mut x = padded();
-        let mut y = vec![0.0; 3 * BLOCK];
-        let blocks = v.len() / (6 * BLOCK / 4);
-        for (src, dst) in v
-            .chunks_exact(6 * BLOCK / 4)
-            .zip(out.chunks_exact_mut(3 * BLOCK))
-        {
-            u8::widen(simd, src, &mut packed);
-            for (p, o) in packed.chunks_exact(6).zip(x[PAD..].chunks_exact_mut(12)) {
-                for (k, &yv) in [p[1], p[2], p[4], p[5]].iter().enumerate() {
-                    o[k * 3] = yv;
-                    o[k * 3 + 1] = p[0];
-                    o[k * 3 + 2] = p[3];
+            let mut rgb = [[zero; WIDE]; 3];
+            for j in 0..count {
+                let p = inv.apply(yuv[0][j], yuv[1][j] - half, yuv[2][j] - half);
+                for c in 0..3 {
+                    rgb[c][j] = round_clamp(simd, p[c], max);
                 }
             }
-            inverse_block(simd, &ph, &x, &mut y, super::U8_HALF, super::U8_MAX);
-            u8::narrow(simd, &y, dst);
+            let mut planes = [S::u8s::splat(simd, 0); 3];
+            for c in 0..3 {
+                planes[c] = narrow::<S, T>(simd, &rgb[c][..count]);
+            }
+            store_vecs::<S, T, 3>(shuffle::<S, 3>(&join, planes), dst);
         }
-        blocks * BLOCK / 4
+        steps * 3 * per
+    }
+
+    /// [`super::yuv422_forward_scalar`] on lanes, a vector of pairs per
+    /// step. Returns the pairs done.
+    #[simd]
+    pub(super) fn yuv422_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let n = S::u8s::LEN;
+        let count = n / S::f64s::LEN;
+        let split = split_tables::<S, 3>(simd, 1);
+        let pair = split_tables::<S, 2>(simd, 1);
+        let join = join_tables::<S, 4>(simd, 1);
+        let f = Forward::new(simd, super::U8_HALF);
+        let zero = S::f64s::splat(simd, 0.0);
+        let two = S::f64s::splat(simd, 2.0);
+        let steps = (v.len() / 6).min(out.len() / 4) / n;
+        for (src, dst) in v.chunks_exact(6 * n).zip(out.chunks_exact_mut(4 * n)) {
+            let a = shuffle::<S, 3>(&split, load_vecs::<S, u8, 3>(simd, src));
+            let b = shuffle::<S, 3>(&split, load_vecs::<S, u8, 3>(simd, &src[3 * n..]));
+            // The planes of the first and of the second pixel of each pair.
+            let mut rgb = [[[zero; WIDE]; 2]; 3];
+            for c in 0..3 {
+                let pos = shuffle::<S, 2>(&pair, [a[c], b[c]]);
+                for k in 0..2 {
+                    widen::<S, u8>(simd, pos[k], &mut rgb[c][k]);
+                }
+            }
+            let mut o = [[zero; WIDE]; 4];
+            for j in 0..count {
+                let [y0, cb0, cr0] = f.apply(rgb[0][0][j], rgb[1][0][j], rgb[2][0][j]);
+                let [y1, cb1, cr1] = f.apply(rgb[0][1][j], rgb[1][1][j], rgb[2][1][j]);
+                o[0][j] = round_clamp(simd, (cb0 + cb1) / two, super::U8_MAX);
+                o[1][j] = round_clamp(simd, y0, super::U8_MAX);
+                o[2][j] = round_clamp(simd, (cr0 + cr1) / two, super::U8_MAX);
+                o[3][j] = round_clamp(simd, y1, super::U8_MAX);
+            }
+            let mut planes = [S::u8s::splat(simd, 0); 4];
+            for c in 0..4 {
+                planes[c] = narrow::<S, u8>(simd, &o[c][..count]);
+            }
+            store_vecs::<S, u8, 4>(shuffle::<S, 4>(&join, planes), dst);
+        }
+        steps * n
+    }
+
+    /// [`super::yuv422_inverse_scalar`] on lanes, a vector of pairs per
+    /// step. Returns the pairs done.
+    #[simd]
+    pub(super) fn yuv422_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let n = S::u8s::LEN;
+        let count = n / S::f64s::LEN;
+        let split = split_tables::<S, 4>(simd, 1);
+        let pair = join_tables::<S, 2>(simd, 1);
+        let join = join_tables::<S, 3>(simd, 1);
+        let inv = Inverse::new(simd);
+        let half = S::f64s::splat(simd, super::U8_HALF);
+        let zero = S::f64s::splat(simd, 0.0);
+        let steps = (v.len() / 4).min(out.len() / 6) / n;
+        for (src, dst) in v.chunks_exact(4 * n).zip(out.chunks_exact_mut(6 * n)) {
+            let planes = shuffle::<S, 4>(&split, load_vecs::<S, u8, 4>(simd, src));
+            let mut uyvy = [[zero; WIDE]; 4];
+            for c in 0..4 {
+                widen::<S, u8>(simd, planes[c], &mut uyvy[c]);
+            }
+            let [u, y0, vc, y1] = uyvy;
+            // The planes of the first and of the second pixel of each pair.
+            let mut rgb = [[[zero; WIDE]; 2]; 3];
+            for j in 0..count {
+                let (cb, cr) = (u[j] - half, vc[j] - half);
+                let p = [inv.apply(y0[j], cb, cr), inv.apply(y1[j], cb, cr)];
+                for c in 0..3 {
+                    for k in 0..2 {
+                        rgb[c][k][j] = round_clamp(simd, p[k][c], super::U8_MAX);
+                    }
+                }
+            }
+            let mut planes = [[S::u8s::splat(simd, 0); 2]; 3];
+            for c in 0..3 {
+                let mut pos = [S::u8s::splat(simd, 0); 2];
+                for k in 0..2 {
+                    pos[k] = narrow::<S, u8>(simd, &rgb[c][k][..count]);
+                }
+                planes[c] = shuffle::<S, 2>(&pair, pos);
+            }
+            for k in 0..2 {
+                let px = [planes[0][k], planes[1][k], planes[2][k]];
+                store_vecs::<S, u8, 3>(shuffle::<S, 3>(&join, px), &mut dst[3 * n * k..]);
+            }
+        }
+        steps * n
+    }
+
+    /// [`super::yuv411_forward_scalar`] on lanes, a vector of quads per
+    /// step. Returns the quads done.
+    #[simd]
+    pub(super) fn yuv411_forward<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let n = S::u8s::LEN;
+        let count = n / S::f64s::LEN;
+        let split = split_tables::<S, 3>(simd, 1);
+        let quad = split_tables::<S, 4>(simd, 1);
+        let join = join_tables::<S, 6>(simd, 1);
+        let f = Forward::new(simd, super::U8_HALF);
+        let zero = S::f64s::splat(simd, 0.0);
+        let four = S::f64s::splat(simd, 4.0);
+        let steps = (v.len() / 12).min(out.len() / 6) / n;
+        for (src, dst) in v.chunks_exact(12 * n).zip(out.chunks_exact_mut(6 * n)) {
+            let mut q = [[S::u8s::splat(simd, 0); 3]; 4];
+            for k in 0..4 {
+                q[k] = shuffle::<S, 3>(&split, load_vecs::<S, u8, 3>(simd, &src[3 * n * k..]));
+            }
+            // The planes of each of the four pixels of a quad.
+            let mut pos = [[S::u8s::splat(simd, 0); 4]; 3];
+            for c in 0..3 {
+                pos[c] = shuffle::<S, 4>(&quad, [q[0][c], q[1][c], q[2][c], q[3][c]]);
+            }
+            let mut ys = [[zero; WIDE]; 4];
+            let mut cb = [zero; WIDE];
+            let mut cr = [zero; WIDE];
+            for k in 0..4 {
+                let mut rgb = [[zero; WIDE]; 3];
+                for c in 0..3 {
+                    widen::<S, u8>(simd, pos[c][k], &mut rgb[c]);
+                }
+                for j in 0..count {
+                    let [y, cb1, cr1] = f.apply(rgb[0][j], rgb[1][j], rgb[2][j]);
+                    ys[k][j] = round_clamp(simd, y, super::U8_MAX);
+                    (cb[j], cr[j]) = if k == 0 {
+                        (cb1, cr1)
+                    } else {
+                        (cb[j] + cb1, cr[j] + cr1)
+                    };
+                }
+            }
+            let mut planes = [S::u8s::splat(simd, 0); 6];
+            for j in 0..count {
+                cb[j] = round_clamp(simd, cb[j] / four, super::U8_MAX);
+                cr[j] = round_clamp(simd, cr[j] / four, super::U8_MAX);
+            }
+            planes[0] = narrow::<S, u8>(simd, &cb[..count]);
+            planes[3] = narrow::<S, u8>(simd, &cr[..count]);
+            for (k, slot) in [1, 2, 4, 5].into_iter().enumerate() {
+                planes[slot] = narrow::<S, u8>(simd, &ys[k][..count]);
+            }
+            store_vecs::<S, u8, 6>(shuffle::<S, 6>(&join, planes), dst);
+        }
+        steps * n
+    }
+
+    /// [`super::yuv411_inverse_scalar`] on lanes, a vector of quads per
+    /// step. Returns the quads done.
+    #[simd]
+    pub(super) fn yuv411_inverse<S: Simd>(simd: S, v: &[u8], out: &mut [u8]) -> usize {
+        let n = S::u8s::LEN;
+        let count = n / S::f64s::LEN;
+        let split = split_tables::<S, 6>(simd, 1);
+        let quad = join_tables::<S, 4>(simd, 1);
+        let join = join_tables::<S, 3>(simd, 1);
+        let inv = Inverse::new(simd);
+        let half = S::f64s::splat(simd, super::U8_HALF);
+        let zero = S::f64s::splat(simd, 0.0);
+        let steps = (v.len() / 6).min(out.len() / 12) / n;
+        for (src, dst) in v.chunks_exact(6 * n).zip(out.chunks_exact_mut(12 * n)) {
+            let planes = shuffle::<S, 6>(&split, load_vecs::<S, u8, 6>(simd, src));
+            let mut uyyvyy = [[zero; WIDE]; 6];
+            for c in 0..6 {
+                widen::<S, u8>(simd, planes[c], &mut uyyvyy[c]);
+            }
+            let [u, y0, y1, vc, y2, y3] = uyyvyy;
+            // The planes of each of the four pixels of a quad.
+            let mut pos = [[S::u8s::splat(simd, 0); 4]; 3];
+            for (k, y) in [y0, y1, y2, y3].iter().enumerate() {
+                let mut rgb = [[zero; WIDE]; 3];
+                for j in 0..count {
+                    let p = inv.apply(y[j], u[j] - half, vc[j] - half);
+                    for c in 0..3 {
+                        rgb[c][j] = round_clamp(simd, p[c], super::U8_MAX);
+                    }
+                }
+                for c in 0..3 {
+                    pos[c][k] = narrow::<S, u8>(simd, &rgb[c][..count]);
+                }
+            }
+            let mut ordered = [[S::u8s::splat(simd, 0); 4]; 3];
+            for c in 0..3 {
+                ordered[c] = shuffle::<S, 4>(&quad, pos[c]);
+            }
+            for k in 0..4 {
+                let px = [ordered[0][k], ordered[1][k], ordered[2][k]];
+                store_vecs::<S, u8, 3>(shuffle::<S, 3>(&join, px), &mut dst[3 * n * k..]);
+            }
+        }
+        steps * n
     }
 }
 

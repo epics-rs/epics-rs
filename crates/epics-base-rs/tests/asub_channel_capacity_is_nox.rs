@@ -41,7 +41,7 @@ fn served_len(r: &ASubRecord, field: &str) -> usize {
 fn an_input_channel_advertises_noa_not_nea() {
     let mut r = ASubRecord::default();
     r.put_field("NOA", EpicsValue::Long(8)).unwrap();
-    r.put_field("A", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+    r.put_field("A", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .unwrap();
 
     assert_eq!(r.get_field("NEA").unwrap(), EpicsValue::Long(3));
@@ -54,7 +54,7 @@ fn an_input_channel_advertises_noa_not_nea() {
 fn an_output_channel_advertises_nova_not_neva() {
     let mut r = ASubRecord::default();
     r.put_field("NOVA", EpicsValue::Long(6)).unwrap();
-    r.put_field("VALA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    r.put_field("VALA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
 
     assert_eq!(r.get_field("NEVA").unwrap(), EpicsValue::Long(2));

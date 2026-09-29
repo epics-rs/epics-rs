@@ -105,7 +105,7 @@ async fn udf_of(db: &PvDatabase, name: &str) -> u8 {
 async fn a_simulated_mca_does_not_write_its_spectrum_onto_siol() {
     let db = PvDatabase::new();
     load(&db, DB).await;
-    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec()))
+    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec().into()))
         .await
         .unwrap();
     db.put_pv("MCA1.SIMM", EpicsValue::Short(1)).await.unwrap();
@@ -114,7 +114,7 @@ async fn a_simulated_mca_does_not_write_its_spectrum_onto_siol() {
 
     assert_eq!(
         db.get_pv("SIM:SPEC").unwrap(),
-        EpicsValue::LongArray(COUNTS.to_vec()),
+        EpicsValue::LongArray(COUNTS.to_vec().into()),
         "the simulation source was overwritten"
     );
 }
@@ -124,7 +124,7 @@ async fn a_simulated_mca_does_not_write_its_spectrum_onto_siol() {
 async fn a_simulated_mca_reads_the_spectrum_in_from_siol() {
     let db = PvDatabase::new();
     load(&db, DB).await;
-    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec()))
+    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec().into()))
         .await
         .unwrap();
     db.put_pv("MCA1.SIMM", EpicsValue::Short(1)).await.unwrap();
@@ -133,7 +133,7 @@ async fn a_simulated_mca_reads_the_spectrum_in_from_siol() {
 
     assert_eq!(
         db.get_pv("MCA1").unwrap(),
-        EpicsValue::LongArray(COUNTS.to_vec())
+        EpicsValue::LongArray(COUNTS.to_vec().into())
     );
     // `if (pmca->siol.type == DB_LINK) pmca->nord = nRequest;` — SIOL names a
     // local record here, so the guard is taken.
@@ -147,7 +147,7 @@ async fn a_simulated_mca_reads_the_spectrum_in_from_siol() {
 async fn a_simulated_mca_reads_at_most_nmax_elements() {
     let db = PvDatabase::new();
     load(&db, DB_NARROW).await;
-    db.put_pv("SIM:WIDE", EpicsValue::LongArray(COUNTS.to_vec()))
+    db.put_pv("SIM:WIDE", EpicsValue::LongArray(COUNTS.to_vec().into()))
         .await
         .unwrap();
     db.put_pv("MCA2.SIMM", EpicsValue::Short(1)).await.unwrap();
@@ -156,7 +156,7 @@ async fn a_simulated_mca_reads_at_most_nmax_elements() {
 
     assert_eq!(
         db.get_pv("MCA2").unwrap(),
-        EpicsValue::LongArray(COUNTS[..4].to_vec())
+        EpicsValue::LongArray(COUNTS[..4].to_vec().into())
     );
     assert_eq!(db.get_pv("MCA2.NORD").unwrap(), EpicsValue::Long(4));
 }
@@ -167,7 +167,7 @@ async fn a_simulated_mca_reads_at_most_nmax_elements() {
 async fn an_unsimulated_mca_ignores_siol_entirely() {
     let db = PvDatabase::new();
     load(&db, DB).await;
-    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec()))
+    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec().into()))
         .await
         .unwrap();
 
@@ -175,7 +175,7 @@ async fn an_unsimulated_mca_ignores_siol_entirely() {
 
     assert_eq!(
         db.get_pv("SIM:SPEC").unwrap(),
-        EpicsValue::LongArray(COUNTS.to_vec())
+        EpicsValue::LongArray(COUNTS.to_vec().into())
     );
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(0));
 }
@@ -188,7 +188,7 @@ async fn an_unsimulated_mca_ignores_siol_entirely() {
 async fn an_illegal_simm_alarms_soft_invalid_and_lands_nothing() {
     let db = PvDatabase::new();
     load(&db, DB).await;
-    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec()))
+    db.put_pv("SIM:SPEC", EpicsValue::LongArray(COUNTS.to_vec().into()))
         .await
         .unwrap();
     db.put_pv("MCA1.SIMM", EpicsValue::Short(2)).await.unwrap();
@@ -202,6 +202,6 @@ async fn an_illegal_simm_alarms_soft_invalid_and_lands_nothing() {
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(0));
     assert_eq!(
         db.get_pv("SIM:SPEC").unwrap(),
-        EpicsValue::LongArray(COUNTS.to_vec())
+        EpicsValue::LongArray(COUNTS.to_vec().into())
     );
 }

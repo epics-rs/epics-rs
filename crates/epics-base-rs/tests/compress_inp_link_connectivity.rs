@@ -113,7 +113,7 @@ async fn constant_inp_is_not_connected_and_is_never_ingested() {
     );
     assert_eq!(
         db.get_pv("C:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![]),
+        EpicsValue::DoubleArray(vec![].into()),
         "C: VAL is DBF_DOUBLE[0] (empty)"
     );
 }
@@ -135,7 +135,7 @@ async fn a_connected_db_link_ingests_and_stays_no_alarm() {
     assert_eq!(nuse(&db, "C:LINK").await, 2.0);
     assert_eq!(
         db.get_pv("C:LINK").unwrap(),
-        EpicsValue::DoubleArray(vec![7.0, 7.0])
+        EpicsValue::DoubleArray(vec![7.0, 7.0].into())
     );
 }
 

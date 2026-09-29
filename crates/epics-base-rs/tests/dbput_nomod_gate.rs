@@ -42,7 +42,7 @@ async fn build() -> PvDatabase {
         .await
         .unwrap();
 
-    db.put_pv_and_post("WF", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+    db.put_pv_and_post("WF", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .await
         .unwrap();
     db

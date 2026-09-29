@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::DbFieldType;
 use super::PvString;
+use super::SharedArray;
 use super::c_cast;
 use super::c_parse;
 
@@ -69,34 +70,34 @@ pub enum EpicsValue {
     /// signed `byte`). See [`DbFieldType::UChar`].
     UChar(u8),
     // Array variants
-    ShortArray(Vec<i16>),
-    FloatArray(Vec<f32>),
-    EnumArray(Vec<u16>),
-    DoubleArray(Vec<f64>),
-    LongArray(Vec<i32>),
-    CharArray(Vec<u8>),
-    Int64Array(Vec<i64>),
+    ShortArray(SharedArray<i16>),
+    FloatArray(SharedArray<f32>),
+    EnumArray(SharedArray<u16>),
+    DoubleArray(SharedArray<f64>),
+    LongArray(SharedArray<i32>),
+    CharArray(SharedArray<u8>),
+    Int64Array(SharedArray<i64>),
     /// Unsigned int64 array storage for `waveform` records with
     /// `FTVL = UINT64`. Over CA served as DBR_DOUBLE; over PVA `ulong[]`.
-    UInt64Array(Vec<u64>),
+    UInt64Array(SharedArray<u64>),
     /// Unsigned 16-bit array storage (`DBF_USHORT` waveform / filter
     /// result). Over CA promoted to `DBR_LONG[]`; over PVA `ushort[]`.
-    UShortArray(Vec<u16>),
+    UShortArray(SharedArray<u16>),
     /// Unsigned 32-bit array storage (`DBF_ULONG` waveform / `ts`
     /// `num=ts` two-element result). Over CA promoted to `DBR_DOUBLE[]`;
     /// over PVA `uint[]`.
-    ULongArray(Vec<u32>),
+    ULongArray(SharedArray<u32>),
     /// Unsigned 8-bit array storage (`DBF_UCHAR` waveform / `aai` / `aao`,
     /// the common image/byte-buffer shape). Distinct from the signed
     /// `CharArray` (epicsInt8): over CA promoted to `DBR_CHAR[]` (identical
     /// raw bytes); over PVA `ubyte[]` (UInt8), so element 200 stays 200 not
     /// −56. See [`DbFieldType::UChar`].
-    UCharArray(Vec<u8>),
+    UCharArray(SharedArray<u8>),
     /// DBR_STRING with `count > 1`. Each element is at most 40 bytes
     /// per the DBR_STRING spec; the wire layout is `count * 40` bytes
     /// of NUL-padded strings. Used by `mbbo`/`mbbi` choice arrays
     /// (ZNAM..FFNAM as a single read), NTNDArray dim labels, etc.
-    StringArray(Vec<PvString>),
+    StringArray(SharedArray<PvString>),
 }
 
 impl fmt::Display for EpicsValue {
@@ -183,6 +184,30 @@ impl fmt::Display for EpicsValue {
             }
         }
     }
+}
+
+/// Append `arr` as big-endian DBR elements, `wire` giving each element's
+/// bytes. One `resize` and a fixed-stride copy the compiler vectorises,
+/// instead of a `Vec` growth check per element.
+fn write_be<T: Copy, const N: usize>(dst: &mut Vec<u8>, arr: &[T], wire: impl Fn(T) -> [u8; N]) {
+    let start = dst.len();
+    dst.resize(start + arr.len() * N, 0);
+    for (out, &v) in dst[start..].chunks_exact_mut(N).zip(arr) {
+        out.copy_from_slice(&wire(v));
+    }
+}
+
+/// The first `count` complete `N`-byte big-endian elements of `data`; a
+/// trailing partial element is dropped, never read.
+fn read_be<T, const N: usize>(
+    data: &[u8],
+    count: usize,
+    elem: impl Fn([u8; N]) -> T,
+) -> SharedArray<T> {
+    data.chunks_exact(N)
+        .take(count)
+        .map(|c| elem(c.try_into().expect("chunks_exact yields N bytes")))
+        .collect()
 }
 
 impl EpicsValue {
@@ -418,62 +443,17 @@ impl EpicsValue {
             // `dbDBRnewToDBRold[DBR_UCHAR] = DBR_CHAR`); the raw byte is
             // identical to `Char`, only the interpretation is unsigned.
             Self::UChar(v) => dst.push(*v),
-            Self::ShortArray(arr) => {
-                dst.reserve(arr.len() * 2);
-                for v in arr {
-                    dst.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            Self::FloatArray(arr) => {
-                dst.reserve(arr.len() * 4);
-                for v in arr {
-                    dst.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            Self::EnumArray(arr) => {
-                dst.reserve(arr.len() * 2);
-                for v in arr {
-                    dst.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            Self::DoubleArray(arr) => {
-                dst.reserve(arr.len() * 8);
-                for v in arr {
-                    dst.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            Self::LongArray(arr) => {
-                dst.reserve(arr.len() * 4);
-                for v in arr {
-                    dst.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            Self::Int64Array(arr) => {
-                dst.reserve(arr.len() * 8);
-                for v in arr {
-                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
-                }
-            }
-            Self::UInt64Array(arr) => {
-                dst.reserve(arr.len() * 8);
-                for v in arr {
-                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
-                }
-            }
+            Self::ShortArray(arr) => write_be(dst, arr, i16::to_be_bytes),
+            Self::FloatArray(arr) => write_be(dst, arr, f32::to_be_bytes),
+            Self::EnumArray(arr) => write_be(dst, arr, u16::to_be_bytes),
+            Self::DoubleArray(arr) => write_be(dst, arr, f64::to_be_bytes),
+            Self::LongArray(arr) => write_be(dst, arr, i32::to_be_bytes),
+            Self::Int64Array(arr) => write_be(dst, arr, |v| (v as f64).to_be_bytes()),
+            Self::UInt64Array(arr) => write_be(dst, arr, |v| (v as f64).to_be_bytes()),
             // DBF_USHORT[] promotes element-wise to DBR_LONG[] (4 bytes each).
-            Self::UShortArray(arr) => {
-                dst.reserve(arr.len() * 4);
-                for v in arr {
-                    dst.extend_from_slice(&(*v as i32).to_be_bytes());
-                }
-            }
+            Self::UShortArray(arr) => write_be(dst, arr, |v| (v as i32).to_be_bytes()),
             // DBF_ULONG[] promotes element-wise to DBR_DOUBLE[] (8 bytes each).
-            Self::ULongArray(arr) => {
-                dst.reserve(arr.len() * 8);
-                for v in arr {
-                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
-                }
-            }
+            Self::ULongArray(arr) => write_be(dst, arr, |v| (v as f64).to_be_bytes()),
             Self::CharArray(arr) => dst.extend_from_slice(arr),
             // DBF_UCHAR[] promotes to DBR_CHAR[] over CA (identical raw bytes,
             // same as CharArray); the unsigned interpretation is carried by
@@ -514,185 +494,52 @@ impl EpicsValue {
         // one" case in CA).
         if count == 0 {
             return Ok(match dbr_type {
-                DbFieldType::String => Self::StringArray(Vec::new()),
-                DbFieldType::Short => Self::ShortArray(Vec::new()),
-                DbFieldType::Float => Self::FloatArray(Vec::new()),
-                DbFieldType::Enum => Self::EnumArray(Vec::new()),
-                DbFieldType::Char => Self::CharArray(Vec::new()),
-                DbFieldType::Long => Self::LongArray(Vec::new()),
-                DbFieldType::Double => Self::DoubleArray(Vec::new()),
-                DbFieldType::Int64 => Self::Int64Array(Vec::new()),
-                DbFieldType::UInt64 => Self::UInt64Array(Vec::new()),
-                DbFieldType::UShort => Self::UShortArray(Vec::new()),
-                DbFieldType::ULong => Self::ULongArray(Vec::new()),
-                DbFieldType::UChar => Self::UCharArray(Vec::new()),
+                DbFieldType::String => Self::StringArray(Vec::new().into()),
+                DbFieldType::Short => Self::ShortArray(Vec::new().into()),
+                DbFieldType::Float => Self::FloatArray(Vec::new().into()),
+                DbFieldType::Enum => Self::EnumArray(Vec::new().into()),
+                DbFieldType::Char => Self::CharArray(Vec::new().into()),
+                DbFieldType::Long => Self::LongArray(Vec::new().into()),
+                DbFieldType::Double => Self::DoubleArray(Vec::new().into()),
+                DbFieldType::Int64 => Self::Int64Array(Vec::new().into()),
+                DbFieldType::UInt64 => Self::UInt64Array(Vec::new().into()),
+                DbFieldType::UShort => Self::UShortArray(Vec::new().into()),
+                DbFieldType::ULong => Self::ULongArray(Vec::new().into()),
+                DbFieldType::UChar => Self::UCharArray(Vec::new().into()),
             });
         }
         if count == 1 {
             return Self::from_bytes(dbr_type, data);
         }
-        let cap_for = |elem_size: usize| count.min(data.len() / elem_size.max(1));
         match dbr_type {
-            DbFieldType::Short => {
-                let mut arr = Vec::with_capacity(cap_for(2));
-                for i in 0..count {
-                    let offset = i * 2;
-                    if offset + 2 > data.len() {
-                        break;
-                    }
-                    arr.push(i16::from_be_bytes([data[offset], data[offset + 1]]));
-                }
-                Ok(Self::ShortArray(arr))
-            }
-            DbFieldType::Float => {
-                let mut arr = Vec::with_capacity(cap_for(4));
-                for i in 0..count {
-                    let offset = i * 4;
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    arr.push(f32::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]));
-                }
-                Ok(Self::FloatArray(arr))
-            }
-            DbFieldType::Enum => {
-                let mut arr = Vec::with_capacity(cap_for(2));
-                for i in 0..count {
-                    let offset = i * 2;
-                    if offset + 2 > data.len() {
-                        break;
-                    }
-                    arr.push(u16::from_be_bytes([data[offset], data[offset + 1]]));
-                }
-                Ok(Self::EnumArray(arr))
-            }
-            DbFieldType::Double => {
-                let mut arr = Vec::with_capacity(cap_for(8));
-                for i in 0..count {
-                    let offset = i * 8;
-                    if offset + 8 > data.len() {
-                        break;
-                    }
-                    arr.push(f64::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]));
-                }
-                Ok(Self::DoubleArray(arr))
-            }
-            DbFieldType::Long => {
-                let mut arr = Vec::with_capacity(cap_for(4));
-                for i in 0..count {
-                    let offset = i * 4;
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    arr.push(i32::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]));
-                }
-                Ok(Self::LongArray(arr))
-            }
-            DbFieldType::Int64 => {
-                let mut arr = Vec::with_capacity(cap_for(8));
-                for i in 0..count {
-                    let offset = i * 8;
-                    if offset + 8 > data.len() {
-                        break;
-                    }
-                    arr.push(i64::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]));
-                }
-                Ok(Self::Int64Array(arr))
-            }
-            DbFieldType::UInt64 => {
-                let mut arr = Vec::with_capacity(cap_for(8));
-                for i in 0..count {
-                    let offset = i * 8;
-                    if offset + 8 > data.len() {
-                        break;
-                    }
-                    arr.push(u64::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]));
-                }
-                Ok(Self::UInt64Array(arr))
-            }
+            DbFieldType::Short => Ok(Self::ShortArray(read_be(data, count, i16::from_be_bytes))),
+            DbFieldType::Float => Ok(Self::FloatArray(read_be(data, count, f32::from_be_bytes))),
+            DbFieldType::Enum => Ok(Self::EnumArray(read_be(data, count, u16::from_be_bytes))),
+            DbFieldType::Double => Ok(Self::DoubleArray(read_be(data, count, f64::from_be_bytes))),
+            DbFieldType::Long => Ok(Self::LongArray(read_be(data, count, i32::from_be_bytes))),
+            DbFieldType::Int64 => Ok(Self::Int64Array(read_be(data, count, i64::from_be_bytes))),
+            DbFieldType::UInt64 => Ok(Self::UInt64Array(read_be(data, count, u64::from_be_bytes))),
             // Native-width decoders (see the scalar `from_bytes` note): over
             // CA these arrive promoted as DBR_LONG[]/DBR_DOUBLE[]; these arms
             // keep the match total over `DbFieldType`.
-            DbFieldType::UShort => {
-                let mut arr = Vec::with_capacity(cap_for(2));
-                for i in 0..count {
-                    let offset = i * 2;
-                    if offset + 2 > data.len() {
-                        break;
-                    }
-                    arr.push(u16::from_be_bytes([data[offset], data[offset + 1]]));
-                }
-                Ok(Self::UShortArray(arr))
-            }
-            DbFieldType::ULong => {
-                let mut arr = Vec::with_capacity(cap_for(4));
-                for i in 0..count {
-                    let offset = i * 4;
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    arr.push(u32::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]));
-                }
-                Ok(Self::ULongArray(arr))
-            }
+            DbFieldType::UShort => Ok(Self::UShortArray(read_be(data, count, u16::from_be_bytes))),
+            DbFieldType::ULong => Ok(Self::ULongArray(read_be(data, count, u32::from_be_bytes))),
             DbFieldType::Char => {
                 let len = count.min(data.len());
-                Ok(Self::CharArray(data[..len].to_vec()))
+                Ok(Self::CharArray(data[..len].to_vec().into()))
             }
             // DBF_UCHAR[] decodes 1 byte per element like Char (it promotes to
             // DBR_CHAR[] over CA); the bytes are copied verbatim, unsigned.
             DbFieldType::UChar => {
                 let len = count.min(data.len());
-                Ok(Self::UCharArray(data[..len].to_vec()))
+                Ok(Self::UCharArray(data[..len].to_vec().into()))
             }
             DbFieldType::String => {
                 // DBR_STRING is fixed-width 40 bytes per element. The
                 // wire delivers `count * 40` bytes; each slot is
                 // NUL-padded. Walk in 40-byte slots and strip at the
                 // first NUL (if any).
-                let mut arr = Vec::with_capacity(cap_for(40));
+                let mut arr = Vec::with_capacity(count.min(data.len() / 40));
                 for i in 0..count {
                     let start = i * 40;
                     let end = start + 40;
@@ -705,7 +552,7 @@ impl EpicsValue {
                     // branch in `from_bytes`.
                     arr.push(PvString::from_bytes(&slot[..nul]));
                 }
-                Ok(Self::StringArray(arr))
+                Ok(Self::StringArray(arr.into()))
             }
         }
     }
@@ -901,18 +748,18 @@ impl EpicsValue {
     /// is the elements kept, not the elements held.
     pub fn head(&self, max: usize) -> Self {
         match self {
-            Self::ShortArray(arr) => Self::ShortArray(arr[..arr.len().min(max)].to_vec()),
-            Self::FloatArray(arr) => Self::FloatArray(arr[..arr.len().min(max)].to_vec()),
-            Self::EnumArray(arr) => Self::EnumArray(arr[..arr.len().min(max)].to_vec()),
-            Self::DoubleArray(arr) => Self::DoubleArray(arr[..arr.len().min(max)].to_vec()),
-            Self::LongArray(arr) => Self::LongArray(arr[..arr.len().min(max)].to_vec()),
-            Self::Int64Array(arr) => Self::Int64Array(arr[..arr.len().min(max)].to_vec()),
-            Self::UInt64Array(arr) => Self::UInt64Array(arr[..arr.len().min(max)].to_vec()),
-            Self::UShortArray(arr) => Self::UShortArray(arr[..arr.len().min(max)].to_vec()),
-            Self::ULongArray(arr) => Self::ULongArray(arr[..arr.len().min(max)].to_vec()),
-            Self::UCharArray(arr) => Self::UCharArray(arr[..arr.len().min(max)].to_vec()),
-            Self::CharArray(arr) => Self::CharArray(arr[..arr.len().min(max)].to_vec()),
-            Self::StringArray(arr) => Self::StringArray(arr[..arr.len().min(max)].to_vec()),
+            Self::ShortArray(arr) => Self::ShortArray(arr.head(max)),
+            Self::FloatArray(arr) => Self::FloatArray(arr.head(max)),
+            Self::EnumArray(arr) => Self::EnumArray(arr.head(max)),
+            Self::DoubleArray(arr) => Self::DoubleArray(arr.head(max)),
+            Self::LongArray(arr) => Self::LongArray(arr.head(max)),
+            Self::Int64Array(arr) => Self::Int64Array(arr.head(max)),
+            Self::UInt64Array(arr) => Self::UInt64Array(arr.head(max)),
+            Self::UShortArray(arr) => Self::UShortArray(arr.head(max)),
+            Self::ULongArray(arr) => Self::ULongArray(arr.head(max)),
+            Self::UCharArray(arr) => Self::UCharArray(arr.head(max)),
+            Self::CharArray(arr) => Self::CharArray(arr.head(max)),
+            Self::StringArray(arr) => Self::StringArray(arr.head(max)),
             other => other.clone(),
         }
     }
@@ -946,7 +793,7 @@ impl EpicsValue {
             Self::FloatArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::EnumArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::LongArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
-            Self::DoubleArray(a) => Some(a.clone()),
+            Self::DoubleArray(a) => Some(a.clone().to_vec()),
             Self::Int64Array(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::UInt64Array(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::UShortArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
@@ -1011,7 +858,7 @@ impl EpicsValue {
             Self::ShortArray(a) => a.iter().map(|&v| v as i64).collect(),
             Self::EnumArray(a) => a.iter().map(|&v| v as i64).collect(),
             Self::LongArray(a) => a.iter().map(|&v| v as i64).collect(),
-            Self::Int64Array(a) => a.clone(),
+            Self::Int64Array(a) => a.clone().to_vec(),
             Self::UInt64Array(a) => a.iter().map(|&v| v as i64).collect(),
             Self::UShortArray(a) => a.iter().map(|&v| v as i64).collect(),
             Self::ULongArray(a) => a.iter().map(|&v| v as i64).collect(),
@@ -1090,9 +937,9 @@ impl EpicsValue {
                     Some(v) => v.iter().map(|&x| x as i32).collect(),
                     None => nums.iter().map(|&v| c_cast::f64_to_i32(v)).collect(),
                 }),
-                DbFieldType::Double => EpicsValue::DoubleArray(nums),
+                DbFieldType::Double => EpicsValue::DoubleArray(nums.into()),
                 DbFieldType::Int64 => EpicsValue::Int64Array(match &ints {
-                    Some(v) => v.clone(),
+                    Some(v) => v.clone().into(),
                     None => nums.iter().map(|&v| c_cast::f64_to_i64(v)).collect(),
                 }),
                 DbFieldType::UInt64 => EpicsValue::UInt64Array(match &ints {
@@ -1163,7 +1010,7 @@ impl EpicsValue {
                 }
                 // CharArray as text: preserve the byte buffer verbatim
                 // (no UTF-8 validation), matching pvxs raw-byte storage.
-                DbFieldType::String => EpicsValue::String(PvString::from_bytes(bytes.clone())),
+                DbFieldType::String => EpicsValue::String(PvString::from_bytes(bytes.to_vec())),
                 DbFieldType::Char => EpicsValue::CharArray(bytes.clone()),
                 // epicsInt8 -> epicsUInt8 is byte-identity (C `charToUchar`
                 // casts the signed source: -1/0xFF -> 255/0xFF), so the raw
@@ -1209,7 +1056,7 @@ impl EpicsValue {
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)
                 if let EpicsValue::String(s) = self {
-                    EpicsValue::CharArray(s.as_bytes().to_vec())
+                    EpicsValue::CharArray(s.as_bytes().to_vec().into())
                 } else {
                     EpicsValue::Char(match self.as_int_i64() {
                         Some(i) => i as u8,
@@ -1259,7 +1106,7 @@ impl EpicsValue {
                 // String → UCharArray (for waveform FTVL=UCHAR), the unsigned
                 // twin of the Char target's String → CharArray path.
                 if let EpicsValue::String(s) = self {
-                    EpicsValue::UCharArray(s.as_bytes().to_vec())
+                    EpicsValue::UCharArray(s.as_bytes().to_vec().into())
                 } else {
                     EpicsValue::UChar(match self.as_int_i64() {
                         Some(i) => i as u8,
@@ -1845,47 +1692,47 @@ mod array_convert_tests {
     /// must convert element-by-element, not collapse to one scalar.
     #[test]
     fn double_array_to_short_array() {
-        let v = EpicsValue::DoubleArray(vec![1.5, 2.9, -3.1]);
+        let v = EpicsValue::DoubleArray(vec![1.5, 2.9, -3.1].into());
         assert_eq!(
             v.convert_to(DbFieldType::Short),
-            EpicsValue::ShortArray(vec![1, 2, -3])
+            EpicsValue::ShortArray(vec![1, 2, -3].into())
         );
     }
 
     #[test]
     fn short_array_to_double_array() {
-        let v = EpicsValue::ShortArray(vec![10, 20, 30]);
+        let v = EpicsValue::ShortArray(vec![10, 20, 30].into());
         assert_eq!(
             v.convert_to(DbFieldType::Double),
-            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0])
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into())
         );
     }
 
     #[test]
     fn long_array_to_float_array() {
-        let v = EpicsValue::LongArray(vec![-1, 0, 7]);
+        let v = EpicsValue::LongArray(vec![-1, 0, 7].into());
         assert_eq!(
             v.convert_to(DbFieldType::Float),
-            EpicsValue::FloatArray(vec![-1.0, 0.0, 7.0])
+            EpicsValue::FloatArray(vec![-1.0, 0.0, 7.0].into())
         );
     }
 
     #[test]
     fn double_array_to_int64_array() {
-        let v = EpicsValue::DoubleArray(vec![100.0, 200.0]);
+        let v = EpicsValue::DoubleArray(vec![100.0, 200.0].into());
         assert_eq!(
             v.convert_to(DbFieldType::Int64),
-            EpicsValue::Int64Array(vec![100, 200])
+            EpicsValue::Int64Array(vec![100, 200].into())
         );
     }
 
     /// CharArray converts element-wise as signed `epicsInt8`.
     #[test]
     fn char_array_to_short_array_signed() {
-        let v = EpicsValue::CharArray(vec![0x01, 0xFF]); // 1, -1
+        let v = EpicsValue::CharArray(vec![0x01, 0xFF].into()); // 1, -1
         assert_eq!(
             v.convert_to(DbFieldType::Short),
-            EpicsValue::ShortArray(vec![1, -1])
+            EpicsValue::ShortArray(vec![1, -1].into())
         );
     }
 
@@ -1893,17 +1740,17 @@ mod array_convert_tests {
     /// preserved), not a scalar zero.
     #[test]
     fn empty_array_conversion_preserves_emptiness() {
-        let v = EpicsValue::DoubleArray(Vec::new());
+        let v = EpicsValue::DoubleArray(Vec::new().into());
         assert_eq!(
             v.convert_to(DbFieldType::Short),
-            EpicsValue::ShortArray(Vec::new())
+            EpicsValue::ShortArray(Vec::new().into())
         );
     }
 
     /// Same-type conversion is an identity clone.
     #[test]
     fn same_type_array_identity() {
-        let v = EpicsValue::LongArray(vec![1, 2, 3]);
+        let v = EpicsValue::LongArray(vec![1, 2, 3].into());
         assert_eq!(v.convert_to(DbFieldType::Long), v);
     }
 
@@ -1914,20 +1761,20 @@ mod array_convert_tests {
     /// `waveform(FTVL=LONG)` lands as `{1,2,-1}`, not `{1,2,i32::MAX}`.
     #[test]
     fn int64_array_narrows_to_signed_long_by_truncation() {
-        let v = EpicsValue::Int64Array(vec![1, 2, 0xffff_ffff]);
+        let v = EpicsValue::Int64Array(vec![1, 2, 0xffff_ffff].into());
         assert_eq!(
             v.convert_to(DbFieldType::Long),
-            EpicsValue::LongArray(vec![1, 2, -1])
+            EpicsValue::LongArray(vec![1, 2, -1].into())
         );
         // i16 target truncates the same way (pvxs uint32->int16 == -1).
         assert_eq!(
             v.convert_to(DbFieldType::Short),
-            EpicsValue::ShortArray(vec![1, 2, -1])
+            EpicsValue::ShortArray(vec![1, 2, -1].into())
         );
         // Float/Double targets keep the value-preserving (unsigned) view.
         assert_eq!(
-            EpicsValue::UInt64Array(vec![u64::MAX]).convert_to(DbFieldType::Double),
-            EpicsValue::DoubleArray(vec![u64::MAX as f64])
+            EpicsValue::UInt64Array(vec![u64::MAX].into()).convert_to(DbFieldType::Double),
+            EpicsValue::DoubleArray(vec![u64::MAX as f64].into())
         );
     }
 }
@@ -2110,8 +1957,114 @@ mod enum_with_choices_tests {
             }
             .queues_by_value()
         );
-        assert!(!EpicsValue::DoubleArray(vec![1.0]).queues_by_value());
-        assert!(!EpicsValue::DoubleArray(vec![]).queues_by_value());
-        assert!(!EpicsValue::CharArray(vec![0u8; 1]).queues_by_value());
+        assert!(!EpicsValue::DoubleArray(vec![1.0].into()).queues_by_value());
+        assert!(!EpicsValue::DoubleArray(vec![].into()).queues_by_value());
+        assert!(!EpicsValue::CharArray(vec![0u8; 1].into()).queues_by_value());
+    }
+}
+
+#[cfg(test)]
+mod wire_array_tests {
+    use super::*;
+
+    /// Every numeric array variant's wire bytes are the per-element
+    /// big-endian bytes of its DBR element (`Int64`/`UInt64`/`ULong`
+    /// promote to DBR_DOUBLE, `UShort` to DBR_LONG), and the matching
+    /// `from_bytes_array` reads them back.
+    #[test]
+    fn write_into_emits_big_endian_elements_and_reads_them_back() {
+        fn bytes(v: &EpicsValue) -> Vec<u8> {
+            let mut out = vec![0xAA; 3];
+            v.write_into(&mut out);
+            out.split_off(3)
+        }
+        let cases: Vec<(EpicsValue, Vec<u8>)> = vec![
+            (
+                EpicsValue::ShortArray(vec![-2, i16::MAX].into()),
+                [(-2i16).to_be_bytes(), i16::MAX.to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::FloatArray(vec![1.5, -0.0].into()),
+                [1.5f32.to_be_bytes(), (-0.0f32).to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::EnumArray(vec![7, u16::MAX].into()),
+                [7u16.to_be_bytes(), u16::MAX.to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::DoubleArray(vec![f64::MIN, 2.5].into()),
+                [f64::MIN.to_be_bytes(), 2.5f64.to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::LongArray(vec![i32::MIN, 1].into()),
+                [i32::MIN.to_be_bytes(), 1i32.to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::Int64Array(vec![-3, 1 << 40].into()),
+                [(-3f64).to_be_bytes(), ((1i64 << 40) as f64).to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::UInt64Array(vec![u64::MAX].into()),
+                (u64::MAX as f64).to_be_bytes().to_vec(),
+            ),
+            (
+                EpicsValue::UShortArray(vec![u16::MAX, 0].into()),
+                [(u16::MAX as i32).to_be_bytes(), 0i32.to_be_bytes()].concat(),
+            ),
+            (
+                EpicsValue::ULongArray(vec![u32::MAX].into()),
+                (u32::MAX as f64).to_be_bytes().to_vec(),
+            ),
+        ];
+        for (value, expected) in cases {
+            let wire = bytes(&value);
+            assert_eq!(wire, expected, "{value:?}");
+            let native = [
+                EpicsValue::ShortArray(vec![-2, i16::MAX].into()),
+                EpicsValue::FloatArray(vec![1.5, -0.0].into()),
+                EpicsValue::EnumArray(vec![7, u16::MAX].into()),
+                EpicsValue::DoubleArray(vec![f64::MIN, 2.5].into()),
+                EpicsValue::LongArray(vec![i32::MIN, 1].into()),
+            ];
+            if native.contains(&value) {
+                let back =
+                    EpicsValue::from_bytes_array(value.dbr_type(), &wire, value.count() as usize)
+                        .unwrap();
+                assert_eq!(back, value);
+            }
+        }
+        let mut empty = Vec::new();
+        EpicsValue::DoubleArray(vec![].into()).write_into(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    /// `count` bounds the elements read, a shorter payload bounds them
+    /// again, and a trailing partial element is never read.
+    #[test]
+    fn from_bytes_array_reads_complete_elements_up_to_count() {
+        let wire: Vec<u8> = [1.0f64, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let read = |data: &[u8], count| match EpicsValue::from_bytes_array(
+            DbFieldType::Double,
+            data,
+            count,
+        )
+        .unwrap()
+        {
+            EpicsValue::DoubleArray(a) => a,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(read(&wire, 3), [1.0, 2.0, 3.0]);
+        assert_eq!(read(&wire, 2), [1.0, 2.0]);
+        assert_eq!(read(&wire, 5), [1.0, 2.0, 3.0]);
+        assert_eq!(read(&wire[..20], 3), [1.0, 2.0]);
+        assert_eq!(read(&wire[..7], 2), Vec::<f64>::new());
+        let shorts: Vec<u8> = [5i16, 6, 7].iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(
+            EpicsValue::from_bytes_array(DbFieldType::UShort, &shorts[..5], 3).unwrap(),
+            EpicsValue::UShortArray(vec![5, 6].into())
+        );
     }
 }

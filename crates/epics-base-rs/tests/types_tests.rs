@@ -995,7 +995,7 @@ fn test_dbr_class_name_empty_when_unpopulated() {
 #[test]
 fn p1_empty_array_double_decodes_as_empty_doublearray() {
     let v = EpicsValue::from_bytes_array(DbFieldType::Double, &[], 0).unwrap();
-    assert_eq!(v, EpicsValue::DoubleArray(vec![]));
+    assert_eq!(v, EpicsValue::DoubleArray(vec![].into()));
     assert_eq!(v.count(), 0);
 }
 
@@ -1014,7 +1014,7 @@ fn p1_empty_array_string_decodes_as_empty_stringarray() {
     // bytes consumed; the decoder must produce StringArray(vec![])
     // not error on zero-length input.
     let v = EpicsValue::from_bytes_array(DbFieldType::String, &[], 0).unwrap();
-    assert_eq!(v, EpicsValue::StringArray(vec![]));
+    assert_eq!(v, EpicsValue::StringArray(vec![].into()));
     assert_eq!(v.count(), 0);
 }
 
@@ -1024,13 +1024,13 @@ fn p1_empty_array_all_dbr_types_round_trip() {
     // variant. Catches future variants added without an arm in
     // from_bytes_array's count=0 dispatch.
     let cases: &[(DbFieldType, EpicsValue)] = &[
-        (DbFieldType::Short, EpicsValue::ShortArray(vec![])),
-        (DbFieldType::Float, EpicsValue::FloatArray(vec![])),
-        (DbFieldType::Enum, EpicsValue::EnumArray(vec![])),
-        (DbFieldType::Char, EpicsValue::CharArray(vec![])),
-        (DbFieldType::Long, EpicsValue::LongArray(vec![])),
-        (DbFieldType::Double, EpicsValue::DoubleArray(vec![])),
-        (DbFieldType::String, EpicsValue::StringArray(vec![])),
+        (DbFieldType::Short, EpicsValue::ShortArray(vec![].into())),
+        (DbFieldType::Float, EpicsValue::FloatArray(vec![].into())),
+        (DbFieldType::Enum, EpicsValue::EnumArray(vec![].into())),
+        (DbFieldType::Char, EpicsValue::CharArray(vec![].into())),
+        (DbFieldType::Long, EpicsValue::LongArray(vec![].into())),
+        (DbFieldType::Double, EpicsValue::DoubleArray(vec![].into())),
+        (DbFieldType::String, EpicsValue::StringArray(vec![].into())),
     ];
     for (t, expected) in cases {
         let v = EpicsValue::from_bytes_array(*t, &[], 0).unwrap();

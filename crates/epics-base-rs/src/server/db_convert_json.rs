@@ -1148,7 +1148,7 @@ pub fn db_put_convert_json(
     capacity: usize,
 ) -> Result<EpicsValue, ConvertJsonError> {
     if json.is_empty() {
-        return Ok(EpicsValue::DoubleArray(Vec::new()).convert_to(target));
+        return Ok(EpicsValue::DoubleArray(Vec::new().into()).convert_to(target));
     }
 
     let txt = json.as_bytes();
@@ -1181,7 +1181,7 @@ pub fn db_put_convert_json(
     }
     Ok(
         match tokens.iter().map(Token::int).collect::<Option<Vec<_>>>() {
-            Some(ints) => EpicsValue::Int64Array(ints),
+            Some(ints) => EpicsValue::Int64Array(ints.into()),
             None => EpicsValue::DoubleArray(tokens.iter().map(Token::real).collect()),
         }
         .convert_to(target),
@@ -1200,23 +1200,23 @@ mod tests {
         let conv = |json| db_put_convert_json(json, DbFieldType::Long, 4);
 
         // A bare scalar: `dbcj_start_array` never fires, one element lands.
-        assert_eq!(conv("7").unwrap(), EpicsValue::LongArray(vec![7]));
+        assert_eq!(conv("7").unwrap(), EpicsValue::LongArray(vec![7].into()));
         assert_eq!(
             conv("[1,2,3]").unwrap(),
-            EpicsValue::LongArray(vec![1, 2, 3])
+            EpicsValue::LongArray(vec![1, 2, 3].into())
         );
         // `if (parser->elems > 0)` drops the tail in silence (`:45`, `:57`).
         assert_eq!(
             conv("[1,2,3,4,5]").unwrap(),
-            EpicsValue::LongArray(vec![1, 2, 3, 4])
+            EpicsValue::LongArray(vec![1, 2, 3, 4].into())
         );
         // `!jlen` (`:144-147`) — zero elements, status 0.
-        assert_eq!(conv("").unwrap(), EpicsValue::LongArray(vec![]));
+        assert_eq!(conv("").unwrap(), EpicsValue::LongArray(vec![].into()));
         // `dbcj_double` → `dbFastPutConvertRoutine[DBF_DOUBLE][DBF_LONG]`
         // truncates toward zero, it does not round.
         assert_eq!(
             conv("[1.9,2.1]").unwrap(),
-            EpicsValue::LongArray(vec![1, 2])
+            EpicsValue::LongArray(vec![1, 2].into())
         );
     }
 
@@ -1226,7 +1226,7 @@ mod tests {
     fn string_target_takes_text_and_truncates_at_39() {
         assert_eq!(
             db_put_convert_json("[\"a\",\"bb\"]", DbFieldType::String, 3).unwrap(),
-            EpicsValue::StringArray(vec!["a".into(), "bb".into()])
+            EpicsValue::StringArray(vec!["a".into(), "bb".into()].into())
         );
         let long = "x".repeat(50);
         let EpicsValue::StringArray(v) =
@@ -1239,7 +1239,7 @@ mod tests {
         // `dbFastPutConvertRoutine[DBF_INT64][DBF_STRING]`.
         assert_eq!(
             db_put_convert_json("[1,\"b\"]", DbFieldType::String, 2).unwrap(),
-            EpicsValue::StringArray(vec!["1".into(), "b".into()])
+            EpicsValue::StringArray(vec!["1".into(), "b".into()].into())
         );
     }
 
@@ -1260,11 +1260,9 @@ mod tests {
     fn a_real_token_into_a_string_target_renders_at_precision_six() {
         assert_eq!(
             db_put_convert_json("[1.0, 2.5, 1.23456789]", DbFieldType::String, 4).unwrap(),
-            EpicsValue::StringArray(vec![
-                "1.000000".into(),
-                "2.500000".into(),
-                "1.234568".into()
-            ])
+            EpicsValue::StringArray(
+                vec!["1.000000".into(), "2.500000".into(), "1.234568".into()].into()
+            )
         );
     }
 
@@ -1274,7 +1272,7 @@ mod tests {
     fn integers_past_two_to_the_53_stay_exact() {
         assert_eq!(
             db_put_convert_json("[9007199254740993]", DbFieldType::Int64, 1).unwrap(),
-            EpicsValue::Int64Array(vec![9007199254740993])
+            EpicsValue::Int64Array(vec![9007199254740993].into())
         );
     }
 
@@ -1289,33 +1287,36 @@ mod tests {
         let text = |j| db_put_convert_json(j, DbFieldType::String, 4).unwrap();
 
         // Trailing comma before `]` (`yajl_parser.c:357-360`).
-        assert_eq!(long("[1,2,]"), EpicsValue::LongArray(vec![1, 2]));
-        assert_eq!(real("[1,]"), EpicsValue::DoubleArray(vec![1.0]));
+        assert_eq!(long("[1,2,]"), EpicsValue::LongArray(vec![1, 2].into()));
+        assert_eq!(real("[1,]"), EpicsValue::DoubleArray(vec![1.0].into()));
         // Hex integers, either case of the `x` (`yajl_lex.c:465-470`).
-        assert_eq!(long("[0x10]"), EpicsValue::LongArray(vec![16]));
-        assert_eq!(long("[0X1f]"), EpicsValue::LongArray(vec![31]));
+        assert_eq!(long("[0x10]"), EpicsValue::LongArray(vec![16].into()));
+        assert_eq!(long("[0X1f]"), EpicsValue::LongArray(vec![31].into()));
         // Leading `+` (`:438`), leading `.` (`:478`), trailing `.` (`:491`).
-        assert_eq!(long("[+5]"), EpicsValue::LongArray(vec![5]));
-        assert_eq!(real("[.5]"), EpicsValue::DoubleArray(vec![0.5]));
-        assert_eq!(real("[5.]"), EpicsValue::DoubleArray(vec![5.0]));
+        assert_eq!(long("[+5]"), EpicsValue::LongArray(vec![5].into()));
+        assert_eq!(real("[.5]"), EpicsValue::DoubleArray(vec![0.5].into()));
+        assert_eq!(real("[5.]"), EpicsValue::DoubleArray(vec![5.0].into()));
         // Comments are whitespace, so they SEPARATE tokens (`:728-737`).
-        assert_eq!(long("[/*c*/1]"), EpicsValue::LongArray(vec![1]));
-        assert_eq!(long("[1 // tail\n]"), EpicsValue::LongArray(vec![1]));
+        assert_eq!(long("[/*c*/1]"), EpicsValue::LongArray(vec![1].into()));
+        assert_eq!(long("[1 // tail\n]"), EpicsValue::LongArray(vec![1].into()));
         // Single-quoted strings (`:695-699`), bare or bracketed.
         assert_eq!(
             text("['a','b']"),
-            EpicsValue::StringArray(vec!["a".into(), "b".into()])
+            EpicsValue::StringArray(vec!["a".into(), "b".into()].into())
         );
-        assert_eq!(text("'abc'"), EpicsValue::StringArray(vec!["abc".into()]));
+        assert_eq!(
+            text("'abc'"),
+            EpicsValue::StringArray(vec!["abc".into()].into())
+        );
         // The non-finites the GENERATOR writes for a non-finite double
         // (`yajl_gen.c:228-232`), read back by `:673-693`.
         assert_eq!(
             real("[Infinity]"),
-            EpicsValue::DoubleArray(vec![f64::INFINITY])
+            EpicsValue::DoubleArray(vec![f64::INFINITY].into())
         );
         assert_eq!(
             real("[-Infinity]"),
-            EpicsValue::DoubleArray(vec![f64::NEG_INFINITY])
+            EpicsValue::DoubleArray(vec![f64::NEG_INFINITY].into())
         );
         let EpicsValue::DoubleArray(nan) = real("[NaN]") else {
             panic!("a DBF_DOUBLE target yields a DoubleArray");
@@ -1331,7 +1332,7 @@ mod tests {
     fn a_leading_zero_ends_the_number_token() {
         assert_eq!(
             db_put_convert_json("[0]", DbFieldType::Long, 4).unwrap(),
-            EpicsValue::LongArray(vec![0])
+            EpicsValue::LongArray(vec![0].into())
         );
         let e = db_put_convert_json("[01]", DbFieldType::Long, 4).unwrap_err();
         assert!(
@@ -1594,19 +1595,19 @@ mod tests {
         assert!(real("[1e999]").is_err());
         assert_eq!(
             real("[Infinity]").unwrap(),
-            EpicsValue::DoubleArray(vec![f64::INFINITY])
+            EpicsValue::DoubleArray(vec![f64::INFINITY].into())
         );
         // Underflow sets ERANGE too, but C tests the VALUE against ±HUGE_VAL,
         // so a denormal-to-zero literal is accepted on both sides.
         assert_eq!(
             real("[1e-999]").unwrap(),
-            EpicsValue::DoubleArray(vec![0.0])
+            EpicsValue::DoubleArray(vec![0.0].into())
         );
         // The integer row overflows at `LLONG_MAX`, not at the double's range.
         assert!(db_put_convert_json("[9223372036854775808]", DbFieldType::Int64, 1).is_err());
         assert_eq!(
             db_put_convert_json("[9223372036854775807]", DbFieldType::Int64, 1).unwrap(),
-            EpicsValue::Int64Array(vec![i64::MAX])
+            EpicsValue::Int64Array(vec![i64::MAX].into())
         );
     }
 

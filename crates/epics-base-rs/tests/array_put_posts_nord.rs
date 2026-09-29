@@ -88,9 +88,13 @@ async fn a_ca_array_put_posts_nord() {
     for rec in ["WS", "AS", "AOS"] {
         let mut rx = nord_sub(&db, rec).await;
 
-        db.put_record_field_from_ca(rec, "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-            .await
-            .unwrap_or_else(|e| panic!("caput -a {rec} 3 1 2 3: {e:?}"));
+        db.put_record_field_from_ca(
+            rec,
+            "VAL",
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("caput -a {rec} 3 1 2 3: {e:?}"));
 
         assert_eq!(
             drain(&mut rx),
@@ -107,7 +111,7 @@ async fn a_ca_array_put_posts_nord_on_subarray() {
     let db = build().await;
     let mut rx = nord_sub(&db, "SS").await;
 
-    db.put_record_field_from_ca("SS", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+    db.put_record_field_from_ca("SS", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
         .await
         .unwrap();
 
@@ -122,9 +126,12 @@ async fn a_db_link_write_posts_nord() {
     let db = build().await;
     let mut rx = nord_sub(&db, "WL").await;
 
-    db.put_pv("WL.VAL", EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "WL.VAL",
+        EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0].into()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         drain(&mut rx),
@@ -140,15 +147,23 @@ async fn a_db_link_write_posts_nord() {
 async fn a_put_that_does_not_move_nord_posts_nothing() {
     let db = build().await;
 
-    db.put_record_field_from_ca("WS", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca(
+        "WS",
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+    )
+    .await
+    .unwrap();
 
     // Subscribe AFTER NORD is already 3, then put three different elements.
     let mut rx = nord_sub(&db, "WS").await;
-    db.put_record_field_from_ca("WS", "VAL", EpicsValue::DoubleArray(vec![4.0, 5.0, 6.0]))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca(
+        "WS",
+        "VAL",
+        EpicsValue::DoubleArray(vec![4.0, 5.0, 6.0].into()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         drain(&mut rx),

@@ -1,6 +1,9 @@
+use std::sync::Weak;
+
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
+use crate::ndarray_pool::NDArrayPool;
 use crate::timestamp::EpicsTimestamp;
 
 /// Maximum number of NDArray dimensions (C++ `ND_ARRAY_MAX_DIMS`,
@@ -65,6 +68,14 @@ pub enum NDDataBuffer {
     U64(Vec<u64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+}
+
+/// An empty `UInt8` buffer: what [`NDArray`]'s destructor leaves behind once
+/// the real buffer has gone back to its pool. Allocates nothing.
+impl Default for NDDataBuffer {
+    fn default() -> Self {
+        Self::U8(Vec::new())
+    }
 }
 
 impl NDDataBuffer {
@@ -151,6 +162,81 @@ impl NDDataBuffer {
             Self::U64(v) => v.resize(new_len, 0),
             Self::F32(v) => v.resize(new_len, 0.0),
             Self::F64(v) => v.resize(new_len, 0.0),
+        }
+    }
+
+    /// View the underlying data as a mutable byte slice, for payloads that
+    /// arrive as bytes (a decoded frame, a compressed stream).
+    pub fn as_u8_slice_mut(&mut self) -> &mut [u8] {
+        macro_rules! bytes_of {
+            ($v:expr) => {
+                // SAFETY: the Vec's elements are plain numbers with no padding,
+                // so its `len * size_of::<T>()` bytes are initialized and
+                // exclusively borrowed for the lifetime of `&mut self`.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        $v.as_mut_ptr() as *mut u8,
+                        $v.len() * std::mem::size_of_val(&$v[0]),
+                    )
+                }
+            };
+        }
+        match self {
+            Self::U8(v) => v.as_mut_slice(),
+            Self::I8(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I16(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U16(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::I64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::U64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::F32(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
+            Self::F64(v) => {
+                if v.is_empty() {
+                    return &mut [];
+                }
+                bytes_of!(v)
+            }
         }
     }
 
@@ -257,6 +343,115 @@ impl NDDataBuffer {
             }
         }
     }
+
+    /// Every element as f64, converted on the typed slice: the per-frame form
+    /// of [`get_as_f64`](Self::get_as_f64), for a plugin that works in
+    /// `double` as C's `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` does.
+    pub fn to_f64_vec(&self) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.copy_to_f64(&mut out);
+        out
+    }
+
+    /// [`to_f64_vec`](Self::to_f64_vec) into a buffer the caller keeps: `out`
+    /// is emptied and refilled, so a plugin that converts every frame reuses
+    /// the mapping instead of faulting in a fresh frame-sized allocation
+    /// each time (at 2048x2048 the fault-in costs several times the
+    /// conversion).
+    pub fn copy_to_f64(&self, out: &mut Vec<f64>) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd;
+            out.resize(self.len(), 0.0);
+            macro_rules! kernel {
+                ($v:expr, $k:ident) => {
+                    fearless_simd::dispatch!(simd::level(), s => simd::$k(s, $v, out))
+                };
+            }
+            match self {
+                Self::I8(v) => kernel!(v, to_f64_i8),
+                Self::U8(v) => kernel!(v, to_f64_u8),
+                Self::I16(v) => kernel!(v, to_f64_i16),
+                Self::U16(v) => kernel!(v, to_f64_u16),
+                Self::I32(v) => kernel!(v, to_f64_i32),
+                Self::U32(v) => kernel!(v, to_f64_u32),
+                Self::I64(v) => kernel!(v, to_f64_i64),
+                Self::U64(v) => kernel!(v, to_f64_u64),
+                Self::F32(v) => kernel!(v, to_f64_f32),
+                Self::F64(v) => out.copy_from_slice(v),
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        {
+            out.clear();
+            crate::with_buffer!(self, |v| out
+                .extend(v.iter().map(|&x| crate::pixel_cast::PixelCast::to_f64(x))));
+        }
+    }
+
+    /// A buffer of `data_type` holding `values`, each cast as
+    /// [`set_from_f64`](Self::set_from_f64) casts it: `as`, which truncates,
+    /// saturates the integer types and takes a NaN to 0.
+    pub fn from_f64(data_type: NDDataType, values: &[f64]) -> Self {
+        let mut out = Self::zeros(data_type, 0);
+        out.fill_from_f64(values);
+        out
+    }
+
+    /// Refill this buffer with `values`, keeping its element type and, when
+    /// the capacity suffices, its allocation: the in-place form of
+    /// [`from_f64`](Self::from_f64) for a pooled output buffer.
+    pub fn fill_from_f64(&mut self, values: &[f64]) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd;
+            macro_rules! kernel {
+                ($v:expr, $k:ident) => {{
+                    $v.resize(values.len(), 0 as _);
+                    fearless_simd::dispatch!(simd::level(), s => simd::$k(s, values, $v))
+                }};
+            }
+            match self {
+                Self::I8(v) => kernel!(v, from_f64_i8),
+                Self::U8(v) => kernel!(v, from_f64_u8),
+                Self::I16(v) => kernel!(v, from_f64_i16),
+                Self::U16(v) => kernel!(v, from_f64_u16),
+                Self::I32(v) => kernel!(v, from_f64_i32),
+                Self::U32(v) => kernel!(v, from_f64_u32),
+                Self::I64(v) => kernel!(v, from_f64_i64),
+                Self::U64(v) => kernel!(v, from_f64_u64),
+                Self::F32(v) => kernel!(v, from_f64_f32),
+                Self::F64(v) => {
+                    v.resize(values.len(), 0.0);
+                    v.copy_from_slice(values);
+                }
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        crate::with_buffer_mut_typed!(self, |v: T| {
+            v.clear();
+            v.extend(values.iter().map(|&x| x as T));
+        });
+    }
+
+    /// Make this buffer a copy of `src`. A same-typed buffer is refilled in
+    /// place so a pooled allocation survives the copy (C's pool `copy`
+    /// memcpy's into the buffer it already holds); a differently typed one is
+    /// replaced by a clone of `src`.
+    pub fn copy_from(&mut self, src: &NDDataBuffer) {
+        macro_rules! same {
+            ($($variant:ident),*) => {
+                match (self, src) {
+                    $((Self::$variant(dst), Self::$variant(s)) => {
+                        dst.clear();
+                        dst.extend_from_slice(s);
+                    })*
+                    (dst, s) => *dst = s.clone(),
+                }
+            };
+        }
+        same!(I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
+    }
 }
 
 /// A single dimension of an NDArray.
@@ -321,7 +516,13 @@ impl NDArrayInfo {
 }
 
 /// N-dimensional array with typed data buffer.
-#[derive(Debug, Clone)]
+///
+/// An array allocated by an [`NDArrayPool`] hands its buffer back to that
+/// pool's free list when it is dropped (C++ `NDArray::release` at refcount
+/// zero), so a frame published as `Arc<NDArray>` recycles itself once the last
+/// consumer lets go. A [`Clone`] is an ordinary heap array: it owes nothing to
+/// the pool and never enters its free list or its accounting.
+#[derive(Debug)]
 pub struct NDArray {
     pub unique_id: i32,
     pub timestamp: EpicsTimestamp,
@@ -331,14 +532,38 @@ pub struct NDArray {
     pub data: NDDataBuffer,
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
-    /// Identity of the pool that allocated this array (C++ `pNDArrayPool`).
-    /// `0` means the array was not allocated through any pool. `NDArrayPool::release`
-    /// verifies this matches its own id before returning the buffer to the free list.
-    pub pool_id: u64,
+    /// The pool that allocated this array (C++ `pNDArrayPool`), `None` for an
+    /// array built outside any pool. Set only by `NDArrayPool::alloc`; the
+    /// destructor returns the buffer through it.
+    pub(crate) pool: Option<Weak<NDArrayPool>>,
     /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
     /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
     /// Pool memory accounting adds/subtracts this exact value.
     pub data_size: usize,
+}
+
+impl Drop for NDArray {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take().and_then(|pool| pool.upgrade()) {
+            pool.recycle(std::mem::take(&mut self.data), self.data_size);
+        }
+    }
+}
+
+impl Clone for NDArray {
+    fn clone(&self) -> Self {
+        Self {
+            unique_id: self.unique_id,
+            timestamp: self.timestamp,
+            time_stamp: self.time_stamp,
+            dims: self.dims.clone(),
+            data: self.data.clone(),
+            attributes: self.attributes.clone(),
+            codec: self.codec.clone(),
+            pool: None,
+            data_size: self.data_size,
+        }
+    }
 }
 
 impl NDArray {
@@ -357,14 +582,14 @@ impl NDArray {
             data: NDDataBuffer::zeros(data_type, num_elements),
             attributes: NDAttributeList::new(),
             codec: None,
-            pool_id: 0,
+            pool: None,
             data_size: num_elements * data_type.element_size(),
         }
     }
 
     /// Create an NDArray wrapping an already-built data buffer.
     ///
-    /// The array is not pool-allocated (`pool_id == 0`); `data_size` is taken
+    /// The array is not pool-allocated (`pool_id() == 0`); `data_size` is taken
     /// from the buffer's element count. Use this when a producer fills its own
     /// buffer instead of allocating through an [`crate::ndarray_pool::NDArrayPool`].
     pub fn with_data(dims: Vec<NDDimension>, data: NDDataBuffer) -> Self {
@@ -377,9 +602,24 @@ impl NDArray {
             data,
             attributes: NDAttributeList::new(),
             codec: None,
-            pool_id: 0,
+            pool: None,
             data_size,
         }
+    }
+
+    /// The pool that allocated this array (C++ `pNDArrayPool`), `None` when it
+    /// came from no pool or that pool is gone.
+    pub fn pool(&self) -> Option<std::sync::Arc<NDArrayPool>> {
+        self.pool.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Identity of the pool that allocated this array, `0` when it came from
+    /// no pool or that pool is gone (C++ `pNDArrayPool`).
+    pub fn pool_id(&self) -> u64 {
+        self.pool
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or(0, |pool| pool.id())
     }
 
     /// Stamp both timestamps from one time source.
@@ -534,7 +774,7 @@ impl NDArray {
             "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
             self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
         ));
-        out.push_str(&format!("  poolId={}\n", self.pool_id));
+        out.push_str(&format!("  poolId={}\n", self.pool_id()));
         match &self.codec {
             Some(c) => out.push_str(&format!(
                 "  codec={:?}, compressedSize={}\n",
@@ -765,5 +1005,77 @@ mod tests {
         });
         let cloned = arr.clone();
         assert_eq!(cloned.codec.as_ref().unwrap().compressed_size, 42);
+    }
+
+    /// `to_f64_vec` is `get_as_f64` over every index, and `from_f64` is
+    /// `set_from_f64` at every index, for every element type — including
+    /// the values the `as` cast saturates or zeroes.
+    #[test]
+    fn frame_wide_f64_conversions_match_the_per_element_ones() {
+        let values = [
+            -3.7,
+            -0.2,
+            0.0,
+            0.6,
+            1.4,
+            200.5,
+            70_000.9,
+            5e9,
+            -5e9,
+            1e300,
+            f64::NAN,
+        ];
+        for data_type in (0..10).map(|o| NDDataType::from_ordinal(o).unwrap()) {
+            let from = NDDataBuffer::from_f64(data_type, &values);
+            let mut set = NDDataBuffer::zeros(data_type, values.len());
+            for (i, &v) in values.iter().enumerate() {
+                set.set_from_f64(i, v);
+            }
+            assert_eq!(
+                from.as_u8_slice(),
+                set.as_u8_slice(),
+                "{data_type:?} from_f64"
+            );
+            let to = from.to_f64_vec();
+            let mut reused = vec![7.0; 3];
+            let capacity_before = {
+                reused.reserve(values.len());
+                reused.capacity()
+            };
+            from.copy_to_f64(&mut reused);
+            assert_eq!(reused.capacity(), capacity_before, "{data_type:?} reused");
+            assert_eq!(reused.len(), to.len());
+            assert!(
+                reused
+                    .iter()
+                    .zip(&to)
+                    .all(|(a, b)| a == b || (a.is_nan() && b.is_nan()))
+            );
+            for (i, &got) in to.iter().enumerate() {
+                let want = from.get_as_f64(i).unwrap();
+                assert!(
+                    got == want || (got.is_nan() && want.is_nan()),
+                    "{data_type:?}[{i}]: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn as_u8_slice_mut_writes_the_elements_in_place() {
+        let mut buf = NDDataBuffer::U16(vec![0, 0]);
+        buf.as_u8_slice_mut().copy_from_slice(
+            &1u16
+                .to_ne_bytes()
+                .into_iter()
+                .chain(2u16.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let NDDataBuffer::U16(v) = &buf else {
+            panic!("the variant does not change");
+        };
+        assert_eq!(v, &[1, 2]);
+        let mut empty = NDDataBuffer::F64(vec![]);
+        assert!(empty.as_u8_slice_mut().is_empty());
     }
 }

@@ -84,7 +84,7 @@ async fn nelm1_seeds_nord1_on_aai_and_serves_one_element() {
     assert_eq!(nord(&db, "N1:AAI").await, 1.0, "devAaiSoft keeps the seed");
     assert_eq!(
         db.get_pv("N1:AAI").unwrap(),
-        EpicsValue::DoubleArray(vec![0.0]),
+        EpicsValue::DoubleArray(vec![0.0].into()),
         "a NELM=1 aai serves its single element before first process"
     );
 }
@@ -103,7 +103,7 @@ async fn nelm1_keeps_nord_zero_on_waveform_and_aao() {
         );
         assert_eq!(
             db.get_pv(rec).unwrap(),
-            EpicsValue::DoubleArray(vec![]),
+            EpicsValue::DoubleArray(vec![].into()),
             "{rec}: NORD=0 serves a zero-length array"
         );
     }
@@ -116,7 +116,7 @@ async fn nelm_above_one_keeps_nord_zero() {
         assert_eq!(nord(&db, rec).await, 0.0, "{rec}: NELM>1 must keep NORD=0");
         assert_eq!(
             db.get_pv(rec).unwrap(),
-            EpicsValue::DoubleArray(vec![]),
+            EpicsValue::DoubleArray(vec![].into()),
             "{rec}: NORD=0 serves a zero-length array"
         );
     }

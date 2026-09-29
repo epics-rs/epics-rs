@@ -51,7 +51,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 
 async fn aval(db: &PvDatabase, rec: &str) -> Vec<f64> {
     match field(db, rec, "AVAL").await {
-        EpicsValue::DoubleArray(v) => v,
+        EpicsValue::DoubleArray(v) => v.to_vec(),
         other => panic!("AVAL: {other:?}"),
     }
 }
@@ -66,7 +66,7 @@ async fn primed(db: &PvDatabase, name: &str) {
     a.special("CALC", true).unwrap();
     a.put_field(
         "BB",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into()),
     )
     .unwrap();
     db.add_record(name, Box::new(a)).await.unwrap();
@@ -146,7 +146,7 @@ async fn a_store_before_the_failed_fit_lands_while_aval_holds() {
 
     assert_eq!(
         field(&db, "F3", "CC").await,
-        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]),
+        EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0].into()),
         "the store landed before the fit failed and is never rolled back"
     );
     assert_eq!(

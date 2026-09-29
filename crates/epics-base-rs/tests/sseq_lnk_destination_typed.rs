@@ -225,7 +225,7 @@ async fn char_array_destination_puts_the_string_bytes() {
         "TGT_CHAR",
         Box::new(probe(
             CHAR_VAL,
-            EpicsValue::CharArray(vec![0; 8]),
+            EpicsValue::CharArray(vec![0; 8].into()),
             last.clone(),
         )),
     )
@@ -246,7 +246,7 @@ async fn char_array_destination_puts_the_string_bytes() {
     want.resize(8, 0);
     assert_eq!(
         poll_put(&last, "numeric → CHAR array").await,
-        EpicsValue::CharArray(want),
+        EpicsValue::CharArray(want.into()),
         "a CHAR/UCHAR LNKn with n_elements > 1 takes the STRn bytes, NUL-padded to n"
     );
 }

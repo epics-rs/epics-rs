@@ -90,42 +90,42 @@ fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValu
     let scalar = element_count <= 1;
     match native_type {
         DbFieldType::String if scalar => EpicsValue::String(PvString::new()),
-        DbFieldType::String => EpicsValue::StringArray(vec![PvString::new(); n]),
+        DbFieldType::String => EpicsValue::StringArray(vec![PvString::new(); n].into()),
         DbFieldType::Short if scalar => EpicsValue::Short(0),
-        DbFieldType::Short => EpicsValue::ShortArray(vec![0; n]),
+        DbFieldType::Short => EpicsValue::ShortArray(vec![0; n].into()),
         DbFieldType::Float if scalar => EpicsValue::Float(0.0),
-        DbFieldType::Float => EpicsValue::FloatArray(vec![0.0; n]),
+        DbFieldType::Float => EpicsValue::FloatArray(vec![0.0; n].into()),
         DbFieldType::Enum if scalar => EpicsValue::Enum(0),
-        DbFieldType::Enum => EpicsValue::EnumArray(vec![0; n]),
+        DbFieldType::Enum => EpicsValue::EnumArray(vec![0; n].into()),
         DbFieldType::Char if scalar => EpicsValue::Char(0),
-        DbFieldType::Char => EpicsValue::CharArray(vec![0; n]),
+        DbFieldType::Char => EpicsValue::CharArray(vec![0; n].into()),
         DbFieldType::Long if scalar => EpicsValue::Long(0),
-        DbFieldType::Long => EpicsValue::LongArray(vec![0; n]),
+        DbFieldType::Long => EpicsValue::LongArray(vec![0; n].into()),
         DbFieldType::Double if scalar => EpicsValue::Double(0.0),
-        DbFieldType::Double => EpicsValue::DoubleArray(vec![0.0; n]),
+        DbFieldType::Double => EpicsValue::DoubleArray(vec![0.0; n].into()),
         // CA wire types 7/8 do not exist: a CA upstream channel never
         // reports Int64/UInt64 natively (they are internal record types
         // that travel over CA as DBR_DOUBLE). Mirror that DBR mapping —
         // their `dbr_type()` is `Double`, so the advertised create-channel
         // type stays DBF_DOUBLE even on this unreachable branch.
         DbFieldType::Int64 if scalar => EpicsValue::Int64(0),
-        DbFieldType::Int64 => EpicsValue::Int64Array(vec![0; n]),
+        DbFieldType::Int64 => EpicsValue::Int64Array(vec![0; n].into()),
         DbFieldType::UInt64 if scalar => EpicsValue::UInt64(0),
-        DbFieldType::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
+        DbFieldType::UInt64 => EpicsValue::UInt64Array(vec![0; n].into()),
         // Like Int64/UInt64, DBF_USHORT/DBF_ULONG never travel natively over
         // CA (they promote to DBR_LONG / DBR_DOUBLE), so these branches are
         // unreachable for a CA upstream; mapped for completeness.
         DbFieldType::UShort if scalar => EpicsValue::UShort(0),
-        DbFieldType::UShort => EpicsValue::UShortArray(vec![0; n]),
+        DbFieldType::UShort => EpicsValue::UShortArray(vec![0; n].into()),
         DbFieldType::ULong if scalar => EpicsValue::ULong(0),
-        DbFieldType::ULong => EpicsValue::ULongArray(vec![0; n]),
+        DbFieldType::ULong => EpicsValue::ULongArray(vec![0; n].into()),
         // DBF_UCHAR promotes to DBR_CHAR over CA (db_convert.h), so a CA
         // upstream reports it as DBF_CHAR, not DBF_UCHAR — this branch is
         // unreachable for a CA upstream but mapped for completeness. Its
         // `dbr_type()` is `Char`, keeping the advertised create-channel type
         // DBF_CHAR on this branch.
         DbFieldType::UChar if scalar => EpicsValue::UChar(0),
-        DbFieldType::UChar => EpicsValue::UCharArray(vec![0; n]),
+        DbFieldType::UChar => EpicsValue::UCharArray(vec![0; n].into()),
     }
 }
 
@@ -1916,31 +1916,31 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
     let truncated;
     let v_for_format: &EpicsValue = match v {
         EpicsValue::ShortArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::ShortArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::ShortArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         EpicsValue::FloatArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::FloatArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::FloatArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         EpicsValue::EnumArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::EnumArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::EnumArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         EpicsValue::DoubleArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::DoubleArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::DoubleArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         EpicsValue::LongArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::LongArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::LongArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         EpicsValue::CharArray(arr) if arr.len() > max_len => {
-            truncated = EpicsValue::CharArray(arr[..max_len].to_vec());
+            truncated = EpicsValue::CharArray(arr.head(max_len));
             &truncated
         }
         EpicsValue::StringArray(arr) if arr.len() > HEAD_PEEK_ELEMS => {
-            truncated = EpicsValue::StringArray(arr[..HEAD_PEEK_ELEMS].to_vec());
+            truncated = EpicsValue::StringArray(arr.head(HEAD_PEEK_ELEMS));
             &truncated
         }
         _ => v,

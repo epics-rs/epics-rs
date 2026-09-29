@@ -25,7 +25,7 @@ use epics_base_rs::types::EpicsValue;
 #[test]
 fn an_array_source_into_seln_lands_element_zero() {
     let mut rec = SseqRecord::new();
-    rec.put_field_internal("SELN", EpicsValue::DoubleArray(vec![3.0, 9.0]))
+    rec.put_field_internal("SELN", EpicsValue::DoubleArray(vec![3.0, 9.0].into()))
         .expect("an array source must reduce to element 0, not fail");
     assert_eq!(rec.get_field("SELN"), Some(EpicsValue::UShort(3)));
 }
@@ -35,7 +35,7 @@ fn an_array_source_into_seln_lands_element_zero() {
 #[test]
 fn an_array_source_into_a_scalar_field_lands_element_zero() {
     let mut rec = SseqRecord::new();
-    rec.put_field_internal("DLY1", EpicsValue::DoubleArray(vec![0.25, 7.0]))
+    rec.put_field_internal("DLY1", EpicsValue::DoubleArray(vec![0.25, 7.0].into()))
         .expect("an array source must reduce to element 0, not fail");
     assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(0.25)));
 }

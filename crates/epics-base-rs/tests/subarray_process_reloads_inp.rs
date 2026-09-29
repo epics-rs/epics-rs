@@ -90,7 +90,7 @@ async fn constant_inp_slice_is_loaded_at_init() {
 
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())
     );
     assert_eq!(nord(&db, "SA:CONST").await, 3.0);
     assert!(!udf(&db, "SA:CONST").await);
@@ -108,7 +108,7 @@ async fn constant_inp_is_re_loaded_and_re_sliced_at_process() {
 
     db.put_pv(
         "SA:CONST",
-        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0, 9.0]),
+        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0, 9.0].into()),
     )
     .await
     .unwrap();
@@ -116,7 +116,7 @@ async fn constant_inp_is_re_loaded_and_re_sliced_at_process() {
 
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
         "a constant INP subArray restores the INDX window of the constant every process"
     );
     assert_eq!(nord(&db, "SA:CONST").await, 3.0);
@@ -135,7 +135,7 @@ async fn constant_inp_indx_selects_the_window() {
     process(&db, "SA:CONST").await;
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0].into())
     );
     assert_eq!(nord(&db, "SA:CONST").await, 3.0);
 
@@ -169,7 +169,7 @@ async fn empty_inp_re_slices_the_client_written_val() {
 
     db.put_pv(
         "SA:EMPTY",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0].into()),
     )
     .await
     .unwrap();
@@ -180,7 +180,7 @@ async fn empty_inp_re_slices_the_client_written_val() {
     process(&db, "SA:EMPTY").await;
     assert_eq!(
         db.get_pv("SA:EMPTY").unwrap(),
-        EpicsValue::DoubleArray(vec![20.0, 30.0, 40.0]),
+        EpicsValue::DoubleArray(vec![20.0, 30.0, 40.0].into()),
         "empty INP: process slices VAL[INDX .. INDX+NELM]"
     );
     assert_eq!(nord(&db, "SA:EMPTY").await, 3.0);
@@ -188,14 +188,14 @@ async fn empty_inp_re_slices_the_client_written_val() {
     process(&db, "SA:EMPTY").await;
     assert_eq!(
         db.get_pv("SA:EMPTY").unwrap(),
-        EpicsValue::DoubleArray(vec![30.0, 40.0])
+        EpicsValue::DoubleArray(vec![30.0, 40.0].into())
     );
     assert_eq!(nord(&db, "SA:EMPTY").await, 2.0);
 
     process(&db, "SA:EMPTY").await;
     assert_eq!(
         db.get_pv("SA:EMPTY").unwrap(),
-        EpicsValue::DoubleArray(vec![40.0])
+        EpicsValue::DoubleArray(vec![40.0].into())
     );
     assert_eq!(nord(&db, "SA:EMPTY").await, 1.0);
 
@@ -216,14 +216,14 @@ async fn db_link_inp_re_reads_the_source_every_cycle() {
 
     db.put_pv(
         "SRC",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
     )
     .await
     .unwrap();
     process(&db, "SA:LINK").await;
     assert_eq!(
         db.get_pv("SA:LINK").unwrap(),
-        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0]),
+        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0].into()),
         "INDX=1 NELM=3 of the source"
     );
 
@@ -232,7 +232,7 @@ async fn db_link_inp_re_reads_the_source_every_cycle() {
     process(&db, "SA:LINK").await;
     assert_eq!(
         db.get_pv("SA:LINK").unwrap(),
-        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0].into())
     );
     assert_eq!(nord(&db, "SA:LINK").await, 3.0);
 }

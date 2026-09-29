@@ -8535,7 +8535,7 @@ mod pre_v49_peer_tests {
         // extended header (>= 0xffff).
         let values: Vec<i32> = vec![7; 20_000];
         let snapshot = Snapshot::new(
-            EpicsValue::LongArray(values),
+            EpicsValue::LongArray(values.into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -9805,7 +9805,7 @@ mod deprecated_read_autosize_tests {
         broadcast::Sender<()>,
     ) {
         let db = Arc::new(PvDatabase::new());
-        db.add_pv("rd:arr", EpicsValue::DoubleArray(elems))
+        db.add_pv("rd:arr", EpicsValue::DoubleArray(elems.into()))
             .await
             .expect("add array pv");
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
@@ -10414,7 +10414,7 @@ mod single_write_all_framing_tests {
 
         // Live PV holds 3 LONG elements; the client requested 8.
         let snapshot = Snapshot::new(
-            EpicsValue::LongArray(vec![10, 20, 30]),
+            EpicsValue::LongArray(vec![10, 20, 30].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -10478,7 +10478,7 @@ mod single_write_all_framing_tests {
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
         let snapshot = Snapshot::new(
-            EpicsValue::LongArray(vec![1, 2, 3, 4, 5]),
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -10511,7 +10511,7 @@ mod single_write_all_framing_tests {
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
         let snapshot = Snapshot::new(
-            EpicsValue::LongArray(vec![7, 8, 9, 10]),
+            EpicsValue::LongArray(vec![7, 8, 9, 10].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -11625,7 +11625,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn read_notify_char_waveform_as_string_is_forty_bytes_per_element() {
         let snap = Snapshot::new(
-            EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec()),
+            EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec().into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -11734,7 +11734,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn read_notify_array_pads_to_requested_count() {
         let snap = Snapshot::new(
-            EpicsValue::LongArray(vec![10, 20, 30]),
+            EpicsValue::LongArray(vec![10, 20, 30].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -11760,7 +11760,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn read_notify_array_truncates_under_requested_count() {
         let snap = Snapshot::new(
-            EpicsValue::LongArray(vec![1, 2, 3, 4, 5]),
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5].into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -11781,7 +11781,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn oversize_array_to_pre_v49_client_is_err_oversize() {
         let snap = Snapshot::new(
-            EpicsValue::LongArray(vec![7; 20_000]), // 80 000 bytes > 0xFFFF
+            EpicsValue::LongArray(vec![7; 20_000].into()), // 80 000 bytes > 0xFFFF
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,

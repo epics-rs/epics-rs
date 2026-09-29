@@ -589,7 +589,7 @@ async fn main() {
         WriteValue::EnumStringArray(v) => {
             // ENUM waveform by name — DBR_STRING array, server resolves
             // each element. Same single timeout owner as above.
-            let arr = epics_ca_rs::EpicsValue::StringArray(v.clone());
+            let arr = epics_ca_rs::EpicsValue::StringArray(v.clone().into());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
             if callback {
                 ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
@@ -901,7 +901,7 @@ fn build_write_value(
             tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
         return Ok(WriteValue::Wire {
             dbr_type: epics_ca_rs::DbFieldType::String as u16,
-            value: epics_ca_rs::EpicsValue::StringArray(escaped),
+            value: epics_ca_rs::EpicsValue::StringArray(escaped.into()),
         });
     }
 
@@ -937,7 +937,7 @@ fn build_write_value(
         bytes.push(0);
         return Ok(WriteValue::Wire {
             dbr_type: epics_ca_rs::DbFieldType::Char as u16,
-            value: epics_ca_rs::EpicsValue::CharArray(bytes),
+            value: epics_ca_rs::EpicsValue::CharArray(bytes.into()),
         });
     }
 
@@ -1076,7 +1076,7 @@ fn build_enum_array(
     if all_number {
         return Ok(WriteValue::Wire {
             dbr_type: epics_ca_rs::DbFieldType::Double as u16,
-            value: epics_ca_rs::EpicsValue::DoubleArray(numbers),
+            value: epics_ca_rs::EpicsValue::DoubleArray(numbers.into()),
         });
     }
     // At least one menu name → DBR_STRING array. A `Number` element keeps
@@ -1268,7 +1268,7 @@ mod tests {
         let (v, _) = zero_readback(DbFieldType::Long, false, 3, false);
         assert_eq!(
             v,
-            EpicsValue::LongArray(vec![0, 0, 0]),
+            EpicsValue::LongArray(vec![0, 0, 0].into()),
             "an array readback zeroes ca_element_count elements"
         );
     }
@@ -1763,7 +1763,7 @@ mod tests {
                 value: EpicsValue::StringArray(a),
             }) => {
                 assert_eq!(dbr_type, DbFieldType::String as u16);
-                assert_eq!(a, vec!["10", "20", "30"]);
+                assert_eq!(a.to_vec(), vec!["10", "20", "30"]);
             }
             other => panic!("numeric array must be a DBR_STRING[] Wire, got {other:?}"),
         }

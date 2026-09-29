@@ -75,7 +75,7 @@ async fn ca_string_array_put_writes_every_element() {
 
     assert_eq!(
         db.get_pv("WV").unwrap(),
-        EpicsValue::LongArray(vec![7, 8, 9]),
+        EpicsValue::LongArray(vec![7, 8, 9].into()),
         "a DBR_STRING array put must convert element by element, not collapse"
     );
     assert_eq!(nord(&db, "WV").await, 3.0, "NORD is the element count");
@@ -92,7 +92,7 @@ async fn ca_string_array_put_to_a_double_waveform() {
 
     assert_eq!(
         db.get_pv("WD").unwrap(),
-        EpicsValue::DoubleArray(vec![1.5, 2.5, 3.5])
+        EpicsValue::DoubleArray(vec![1.5, 2.5, 3.5].into())
     );
     assert_eq!(nord(&db, "WD").await, 3.0);
 }
@@ -109,7 +109,7 @@ async fn per_element_conversion_matches_the_scalar_string_rules() {
         .unwrap();
     assert_eq!(
         db.get_pv("WV").unwrap(),
-        EpicsValue::LongArray(vec![7, -3]),
+        EpicsValue::LongArray(vec![7, -3].into()),
         "epicsParseInt32 keeps the leading integer — it does not round"
     );
 
@@ -118,7 +118,7 @@ async fn per_element_conversion_matches_the_scalar_string_rules() {
         .unwrap();
     assert_eq!(
         db.get_pv("WV").unwrap(),
-        EpicsValue::LongArray(vec![16, 12]),
+        EpicsValue::LongArray(vec![16, 12].into()),
         "dbConvertBase is 0, so a 0x-prefixed element is hex"
     );
 }
@@ -131,28 +131,28 @@ async fn convert_to_is_element_wise_for_every_numeric_target() {
 
     assert_eq!(
         src.convert_to(DbFieldType::Short),
-        EpicsValue::ShortArray(vec![1, 2, 3])
+        EpicsValue::ShortArray(vec![1, 2, 3].into())
     );
     assert_eq!(
         src.convert_to(DbFieldType::Long),
-        EpicsValue::LongArray(vec![1, 2, 3])
+        EpicsValue::LongArray(vec![1, 2, 3].into())
     );
     assert_eq!(
         src.convert_to(DbFieldType::ULong),
-        EpicsValue::ULongArray(vec![1, 2, 3])
+        EpicsValue::ULongArray(vec![1, 2, 3].into())
     );
     assert_eq!(
         src.convert_to(DbFieldType::Double),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())
     );
     assert_eq!(
         src.convert_to(DbFieldType::Float),
-        EpicsValue::FloatArray(vec![1.0, 2.0, 3.0])
+        EpicsValue::FloatArray(vec![1.0, 2.0, 3.0].into())
     );
     // C `putStringChar` parses each element with epicsParseInt8 — a string
     // ARRAY into a CHAR field is numeric, unlike the scalar long-string put.
     assert_eq!(
         src.convert_to(DbFieldType::Char),
-        EpicsValue::CharArray(vec![1, 2, 3])
+        EpicsValue::CharArray(vec![1, 2, 3].into())
     );
 }

@@ -13,6 +13,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -670,7 +671,7 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         let h5file = self
             .file
             .as_ref()
@@ -1010,7 +1011,7 @@ impl Default for NexusFileProcessor {
 }
 
 impl NDPluginProcess for NexusFileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
 
@@ -1114,7 +1115,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         // Verify NeXus structure
@@ -1154,8 +1155,8 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Stream, &arr1).unwrap();
-        writer.write_file(&arr1).unwrap();
-        writer.write_file(&arr2).unwrap();
+        writer.write_file(&Arc::new(arr1)).unwrap();
+        writer.write_file(&Arc::new(arr2)).unwrap();
         writer.close_file().unwrap();
 
         assert_eq!(writer.frame_count(), 2);
@@ -1197,8 +1198,8 @@ mod tests {
         a2.time_stamp = 2.5;
 
         writer.open_file(&path, NDFileMode::Stream, &a1).unwrap();
-        writer.write_file(&a1).unwrap();
-        writer.write_file(&a2).unwrap();
+        writer.write_file(&Arc::new(a1)).unwrap();
+        writer.write_file(&Arc::new(a2)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -1271,7 +1272,7 @@ mod tests {
             }
         }
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
@@ -1359,8 +1360,8 @@ mod tests {
 
         let a0 = mk(0);
         writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&a0).unwrap();
-        writer.write_file(&mk(100)).unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer.write_file(&Arc::new(mk(100))).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -1398,7 +1399,7 @@ mod tests {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
@@ -1447,7 +1448,7 @@ mod tests {
             }
 
             writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-            writer.write_file(&arr).unwrap();
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
             writer.close_file().unwrap();
 
             let mut reader = NexusWriter::new();

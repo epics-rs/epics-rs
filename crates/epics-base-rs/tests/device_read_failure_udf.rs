@@ -453,7 +453,7 @@ async fn a_failing_read_still_defines_a_waveform() {
     let db = build(
         "waveform",
         r#"field(FTVL,"DOUBLE") field(NELM,"4")"#,
-        ("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0])),
+        ("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
         vec![CReturn::MinusTwo, CReturn::MinusOne],
     )
     .await;

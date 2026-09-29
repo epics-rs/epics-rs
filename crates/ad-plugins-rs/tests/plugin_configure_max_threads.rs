@@ -33,7 +33,7 @@ use epics_base_rs::server::iocsh::registry::CommandOutcome;
 /// which is `Err` until a detector has been configured.
 fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
     let ioc = AdIoc::new();
-    let pool = Arc::new(NDArrayPool::new(4_000_000));
+    let pool = NDArrayPool::new(4_000_000);
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     ioc.mgr().set_driver(Arc::new(GenericDriverContext::new(
         pool,

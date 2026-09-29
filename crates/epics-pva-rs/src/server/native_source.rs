@@ -1634,27 +1634,27 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
 /// length boundary where the rule changes.
 fn typed_array_to_epics(t: &TypedScalarArray) -> EpicsValue {
     match t {
-        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_vec()),
-        TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_vec()),
-        TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_vec()),
-        TypedScalarArray::Long(a) => EpicsValue::Int64Array(a.to_vec()),
+        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_shared()),
+        TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_shared()),
+        TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_shared()),
+        TypedScalarArray::Long(a) => EpicsValue::Int64Array(a.to_shared()),
         // PVA `uint`/`uint[]` carries the full `epicsUInt32` range; the
         // Rust value model has no unsigned-32 scalar, so `Int64Array`
         // is the lossless carrier (same rule as the scalar `UInt` arm).
         TypedScalarArray::UInt(a) => EpicsValue::Int64Array(a.iter().map(|x| *x as i64).collect()),
         // PVA `ulong[]` → `UInt64Array` keeps the full unsigned 64-bit width.
-        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_vec()),
-        TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_vec()),
+        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_shared()),
+        TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_shared()),
         // Byte/UByte → Char (bit-preserving), UShort/Boolean → Enum —
         // the same element rules `scalar_to_epics` applies to the
         // corresponding scalars.
         TypedScalarArray::Byte(a) => EpicsValue::CharArray(a.iter().map(|x| *x as u8).collect()),
-        TypedScalarArray::UByte(a) => EpicsValue::CharArray(a.to_vec()),
-        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(a.to_vec()),
+        TypedScalarArray::UByte(a) => EpicsValue::CharArray(a.to_shared()),
+        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(a.to_shared()),
         TypedScalarArray::Boolean(a) => {
             EpicsValue::EnumArray(a.iter().map(|b| u16::from(*b)).collect())
         }
-        TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_vec()),
+        TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_shared()),
     }
 }
 
@@ -2209,7 +2209,7 @@ mod tests {
     /// (pvxs `src/nt.cpp:44-112`). The port dropped both for every array.
     #[test]
     fn numeric_array_nt_keeps_control_and_value_alarm() {
-        let desc = desc_of(EpicsValue::LongArray(vec![1, 2]));
+        let desc = desc_of(EpicsValue::LongArray(vec![1, 2].into()));
         let FieldDesc::Structure { struct_id, .. } = &desc else {
             panic!("expected a structure");
         };
@@ -2243,8 +2243,8 @@ mod tests {
             EpicsValue::Short(1),
             EpicsValue::Char(1),
             EpicsValue::String("s".into()),
-            EpicsValue::DoubleArray(vec![1.0]),
-            EpicsValue::StringArray(vec!["s".into()]),
+            EpicsValue::DoubleArray(vec![1.0].into()),
+            EpicsValue::StringArray(vec!["s".into()].into()),
         ] {
             let snap = Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
             let desc = snapshot_to_field_desc(&snap);
@@ -2821,20 +2821,17 @@ mod tests {
         assert_eq!(*u, 200, "DBF_UCHAR must stay unsigned 200");
 
         // Array DBF_CHAR[] → signed byte[], element-wise (value + descriptor).
-        let asnap = Snapshot::new(EpicsValue::CharArray(vec![200, 0, 127]), 0, 0, ts);
+        let asnap = Snapshot::new(EpicsValue::CharArray(vec![200, 0, 127].into()), 0, 0, ts);
         let PvField::Structure(a) = snapshot_to_pv_field(&asnap) else {
             panic!("structure");
         };
-        let Some(PvField::ScalarArray(arr)) = a.get_field("value") else {
-            panic!("DBF_CHAR[] value must be a scalar array");
+        let Some(PvField::ScalarArrayTyped(TypedScalarArray::Byte(arr))) = a.get_field("value")
+        else {
+            panic!("DBF_CHAR[] value must be a signed byte array");
         };
         assert_eq!(
-            arr,
-            &vec![
-                ScalarValue::Byte(-56),
-                ScalarValue::Byte(0),
-                ScalarValue::Byte(127),
-            ],
+            arr.as_slice(),
+            &[-56i8, 0, 127],
             "DBF_CHAR[] must serve as signed byte[]"
         );
         let FieldDesc::Structure {
@@ -3668,7 +3665,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "UL:WF").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::UInt64Array(values),
+            EpicsValue::UInt64Array(values.into()),
             "ulong[] PUT must round-trip the full u64 elements, got {:?}",
             snap.value,
         );
@@ -3698,7 +3695,7 @@ ASG(LOCKED) {
         let values: Vec<u64> = vec![1, 0xDEAD_BEEF_0000_0001, u64::MAX, 0];
         // Wire-decoded shape: `decode_pv_field` produces the typed,
         // refcount-shared array — not `PvField::ScalarArray`.
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::ULong(Arc::from(values.as_slice())));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::ULong(values.as_slice().into()));
         source
             .put_value_ctx("UL:WFT", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3707,7 +3704,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "UL:WFT").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::UInt64Array(values),
+            EpicsValue::UInt64Array(values.into()),
             "wire-decoded ulong[] PUT must round-trip the full u64 elements, got {:?}",
             snap.value,
         );
@@ -3802,7 +3799,7 @@ ASG(LOCKED) {
         let source = PvDatabaseSource::new(db.clone());
 
         let values: Vec<u32> = vec![1, 0x8000_0001, u32::MAX, 0];
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::UInt(Arc::from(values.as_slice())));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::UInt(values.as_slice().into()));
         source
             .put_value_ctx("UI:WFT", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3880,7 +3877,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "UI:WFL").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::LongArray(vec![1, 2, -1]),
+            EpicsValue::LongArray(vec![1, 2, -1].into()),
             "uint[] {{1,2,0xffffffff}} into FTVL=LONG must truncate to {{1,2,-1}}, got {:?}",
             snap.value,
         );
@@ -3908,7 +3905,7 @@ ASG(LOCKED) {
         .unwrap();
         let source = PvDatabaseSource::new(db.clone());
 
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::Double(Arc::from([] as [f64; 0])));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Double(Vec::<f64>::new().into()));
         source
             .put_value_ctx("EMPTY:DBL", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3917,7 +3914,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "EMPTY:DBL").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::DoubleArray(vec![]),
+            EpicsValue::DoubleArray(vec![].into()),
             "empty double[] PUT must clear the waveform to zero elements, got {:?}",
             snap.value,
         );
@@ -3931,14 +3928,14 @@ ASG(LOCKED) {
         let db = Arc::new(PvDatabase::new());
         db.add_pv(
             "EMPTY:STR",
-            EpicsValue::StringArray(vec!["seed".into(), "other".into()]),
+            EpicsValue::StringArray(vec!["seed".into(), "other".into()].into()),
         )
         .await
         .unwrap();
         let source = PvDatabaseSource::new(db.clone());
 
         let put =
-            PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from([] as [PvString; 0])));
+            PvField::ScalarArrayTyped(TypedScalarArray::String(Vec::<PvString>::new().into()));
         source
             .put_value_ctx("EMPTY:STR", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3947,7 +3944,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "EMPTY:STR").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::StringArray(vec![]),
+            EpicsValue::StringArray(vec![].into()),
             "empty string[] PUT must store zero string elements, got {:?}",
             snap.value,
         );
@@ -3968,7 +3965,7 @@ ASG(LOCKED) {
         let source = PvDatabaseSource::new(db.clone());
 
         // PVA `int` (i32) → `EpicsValue::LongArray` (the i32 array family).
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::Int(Arc::from([] as [i32; 0])));
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Int(Vec::<i32>::new().into()));
         source
             .put_value_ctx("EMPTY:INT", put, make_ctx("h", "anyone", "anonymous"))
             .await
@@ -3977,7 +3974,7 @@ ASG(LOCKED) {
         let snap = snapshot_for(&db, "EMPTY:INT").await.unwrap();
         assert_eq!(
             snap.value,
-            EpicsValue::LongArray(vec![]),
+            EpicsValue::LongArray(vec![].into()),
             "empty int[] PUT must clear the waveform to zero elements, got {:?}",
             snap.value,
         );
@@ -5052,7 +5049,7 @@ ASG(PLAIN) {
         db.put_record_field_from_ca_no_notify(
             "WF:SPLIT",
             "VAL",
-            EpicsValue::LongArray(vec![1, 2, 3, 4]),
+            EpicsValue::LongArray(vec![1, 2, 3, 4].into()),
         )
         .await
         .expect("put VAL");
@@ -5308,7 +5305,7 @@ ASG(PLAIN) {
         db.put_record_field_from_ca_no_notify(
             name,
             "VAL",
-            EpicsValue::LongArray(vec![10, 20, 30, 40]),
+            EpicsValue::LongArray(vec![10, 20, 30, 40].into()),
         )
         .await
         .expect("seed VAL");
@@ -5449,7 +5446,7 @@ ASG(PLAIN) {
         db.put_record_field_from_ca_no_notify(
             "WF:MFILT",
             "VAL",
-            EpicsValue::LongArray(vec![1, 2, 3, 4]),
+            EpicsValue::LongArray(vec![1, 2, 3, 4].into()),
         )
         .await
         .expect("put VAL");

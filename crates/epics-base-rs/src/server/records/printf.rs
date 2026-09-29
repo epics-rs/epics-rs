@@ -859,7 +859,7 @@ impl Record for PrintfRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.val.as_bytes().to_vec()))
+        Some(EpicsValue::CharArray(self.val.as_bytes().to_vec().into()))
     }
 
     /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
@@ -875,7 +875,7 @@ impl Record for PrintfRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
+            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec().into())),
             "LEN" => Some(EpicsValue::ULong(self.len)),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone())),

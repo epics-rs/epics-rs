@@ -216,7 +216,7 @@ async fn a_working_siol_on_an_mca_still_raises_simm_alarm() {
     load(&db, DB_WORKING_SIOL).await;
     db.put_pv(
         "SIM:OK:SPEC",
-        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
     )
     .await
     .unwrap();
@@ -232,7 +232,7 @@ async fn a_working_siol_on_an_mca_still_raises_simm_alarm() {
     assert_eq!(sevr, AlarmSeverity::Invalid, "SIMS = INVALID");
     assert_eq!(
         db.get_pv("MCA:OK").unwrap(),
-        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
         "the spectrum must still land"
     );
 }

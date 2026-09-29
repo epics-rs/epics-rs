@@ -63,7 +63,10 @@ async fn a_never_acquired_spectrum_serves_one_zero_not_nothing() {
     let db = loaded().await;
 
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(0));
-    assert_eq!(db.get_pv("MCA1").unwrap(), EpicsValue::LongArray(vec![0]));
+    assert_eq!(
+        db.get_pv("MCA1").unwrap(),
+        EpicsValue::LongArray(vec![0].into())
+    );
 }
 
 /// `get_array_info` has no `fieldIndex` branch, so the floor governs `BG`
@@ -74,7 +77,7 @@ async fn the_background_is_floored_with_the_spectrum() {
 
     assert_eq!(
         db.get_pv("MCA1.BG").unwrap(),
-        EpicsValue::LongArray(vec![0])
+        EpicsValue::LongArray(vec![0].into())
     );
 }
 
@@ -83,26 +86,29 @@ async fn the_background_is_floored_with_the_spectrum() {
 #[tokio::test]
 async fn one_acquired_channel_serves_that_channel() {
     let db = loaded().await;
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![42]))
+    db.put_pv("MCA1", EpicsValue::LongArray(vec![42].into()))
         .await
         .unwrap();
 
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(1));
-    assert_eq!(db.get_pv("MCA1").unwrap(), EpicsValue::LongArray(vec![42]));
+    assert_eq!(
+        db.get_pv("MCA1").unwrap(),
+        EpicsValue::LongArray(vec![42].into())
+    );
 }
 
 /// `0 < NORD < NMAX`: the head of the buffer, not the whole buffer.
 #[tokio::test]
 async fn a_partial_spectrum_serves_nord_channels() {
     let db = loaded().await;
-    db.put_pv("MCA1", EpicsValue::LongArray(vec![1, 2, 3]))
+    db.put_pv("MCA1", EpicsValue::LongArray(vec![1, 2, 3].into()))
         .await
         .unwrap();
 
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(3));
     assert_eq!(
         db.get_pv("MCA1").unwrap(),
-        EpicsValue::LongArray(vec![1, 2, 3])
+        EpicsValue::LongArray(vec![1, 2, 3].into())
     );
     assert_eq!(db.get_pv("MCA1.NMAX").unwrap(), EpicsValue::Long(8));
 }
@@ -112,11 +118,14 @@ async fn a_partial_spectrum_serves_nord_channels() {
 async fn a_full_spectrum_serves_nmax_channels() {
     let db = loaded().await;
     let full: Vec<i32> = (1..=8).collect();
-    db.put_pv("MCA1", EpicsValue::LongArray(full.clone()))
+    db.put_pv("MCA1", EpicsValue::LongArray(full.clone().into()))
         .await
         .unwrap();
 
     assert_eq!(db.get_pv("MCA1.NORD").unwrap(), EpicsValue::Long(8));
     assert_eq!(count(&db.get_pv("MCA1").unwrap()), 8);
-    assert_eq!(db.get_pv("MCA1").unwrap(), EpicsValue::LongArray(full));
+    assert_eq!(
+        db.get_pv("MCA1").unwrap(),
+        EpicsValue::LongArray(full.into())
+    );
 }

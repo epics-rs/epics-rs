@@ -13,6 +13,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
+use epics_libcom_rs::SharedArray;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -1879,8 +1880,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Int32ArrayRead { max_elements } => {
-                let mut buf = vec![0i32; *max_elements];
-                let n = self.driver.read_int32_array(user, &mut buf)?;
+                let mut buf: SharedArray<i32> = std::iter::repeat_n(0i32, *max_elements).collect();
+                let n = self.driver.read_int32_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::int32_array_read(buf))
             }
@@ -1889,8 +1890,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Float64ArrayRead { max_elements } => {
-                let mut buf = vec![0f64; *max_elements];
-                let n = self.driver.read_float64_array(user, &mut buf)?;
+                let mut buf: SharedArray<f64> = std::iter::repeat_n(0f64, *max_elements).collect();
+                let n = self.driver.read_float64_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::float64_array_read(buf))
             }
@@ -1899,8 +1900,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Int8ArrayRead { max_elements } => {
-                let mut buf = vec![0i8; *max_elements];
-                let n = self.driver.read_int8_array(user, &mut buf)?;
+                let mut buf: SharedArray<i8> = std::iter::repeat_n(0i8, *max_elements).collect();
+                let n = self.driver.read_int8_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::int8_array_read(buf))
             }
@@ -1909,8 +1910,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Int16ArrayRead { max_elements } => {
-                let mut buf = vec![0i16; *max_elements];
-                let n = self.driver.read_int16_array(user, &mut buf)?;
+                let mut buf: SharedArray<i16> = std::iter::repeat_n(0i16, *max_elements).collect();
+                let n = self.driver.read_int16_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::int16_array_read(buf))
             }
@@ -1919,8 +1920,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Int64ArrayRead { max_elements } => {
-                let mut buf = vec![0i64; *max_elements];
-                let n = self.driver.read_int64_array(user, &mut buf)?;
+                let mut buf: SharedArray<i64> = std::iter::repeat_n(0i64, *max_elements).collect();
+                let n = self.driver.read_int64_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::int64_array_read(buf))
             }
@@ -1929,8 +1930,8 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Float32ArrayRead { max_elements } => {
-                let mut buf = vec![0f32; *max_elements];
-                let n = self.driver.read_float32_array(user, &mut buf)?;
+                let mut buf: SharedArray<f32> = std::iter::repeat_n(0f32, *max_elements).collect();
+                let n = self.driver.read_float32_array(user, buf.make_mut())?;
                 buf.truncate(n);
                 Ok(RequestResult::float32_array_read(buf))
             }

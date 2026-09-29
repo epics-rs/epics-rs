@@ -110,7 +110,10 @@ extern crate self as epics_libcom_rs;
 
 pub mod net;
 pub mod runtime;
+pub mod shared_array;
 pub mod walltime;
+
+pub use shared_array::SharedArray;
 
 /// Which [`runtime::task`] backend this build selected — `true` for the
 /// reactor-free std-thread [`runtime::background`] executor, `false` for tokio.

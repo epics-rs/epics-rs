@@ -114,7 +114,7 @@ async fn cmd_in_range_commands_execute_and_reset_to_zero() {
         .unwrap();
     assert_eq!(
         stored(&db, "VAL").await,
-        EpicsValue::ULongArray(vec![1, 0]),
+        EpicsValue::ULongArray(vec![1, 0].into()),
         "SGNL caput counts into bucket 0 while CSTA is TRUE"
     );
 
@@ -122,7 +122,7 @@ async fn cmd_in_range_commands_execute_and_reset_to_zero() {
     caput_cmd(&db, 1).await.unwrap();
     assert_eq!(
         stored(&db, "VAL").await,
-        EpicsValue::ULongArray(vec![0, 0]),
+        EpicsValue::ULongArray(vec![0, 0].into()),
         "Clear zeros the buckets"
     );
     assert_eq!(

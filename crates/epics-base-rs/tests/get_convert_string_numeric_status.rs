@@ -78,19 +78,25 @@ fn the_empty_string_reads_as_a_successful_zero_for_every_numeric_row() {
 
 #[test]
 fn a_string_waveform_parses_element_by_element_and_aborts_on_the_first_failure() {
-    let ok = EpicsValue::StringArray(vec![
-        PvString::from("1.5".to_string()),
-        PvString::from("".to_string()),
-        PvString::from("-2".to_string()),
-    ]);
+    let ok = EpicsValue::StringArray(
+        vec![
+            PvString::from("1.5".to_string()),
+            PvString::from("".to_string()),
+            PvString::from("-2".to_string()),
+        ]
+        .into(),
+    );
     assert_eq!(
         ok.get_convert(DbFieldType::Double).unwrap(),
-        EpicsValue::DoubleArray(vec![1.5, 0.0, -2.0])
+        EpicsValue::DoubleArray(vec![1.5, 0.0, -2.0].into())
     );
-    let bad = EpicsValue::StringArray(vec![
-        PvString::from("1.5".to_string()),
-        PvString::from("nope".to_string()),
-    ]);
+    let bad = EpicsValue::StringArray(
+        vec![
+            PvString::from("1.5".to_string()),
+            PvString::from("nope".to_string()),
+        ]
+        .into(),
+    );
     assert!(matches!(
         bad.get_convert(DbFieldType::Double),
         Err(CaError::GetConvertFailed(_))

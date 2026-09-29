@@ -42,7 +42,7 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 
 #[test]
 fn test_driver_to_stats_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let ts_registry = ad_plugins_rs::time_series::TsReceiverRegistry::new();
     let (stats_handle, stats_data, _params, _jh) =
@@ -91,7 +91,7 @@ fn test_driver_to_stats_pipeline() {
 
 #[test]
 fn test_driver_to_std_arrays_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) =
         create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
@@ -136,7 +136,7 @@ fn test_driver_to_std_arrays_pipeline() {
 
 #[test]
 fn test_pool_reuse_in_pipeline() {
-    let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
+    let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
 
     // Allocate, use, release, reallocate
     // Use sizes within THRESHOLD_SIZE_RATIO (1.5) to ensure reuse
@@ -170,7 +170,7 @@ fn test_rewire_ndarray_port_at_runtime() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // Create two "upstream" outputs: SIM1 and ROI1
@@ -189,7 +189,7 @@ fn test_rewire_ndarray_port_at_runtime() {
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
             &self,
-            array: &ad_core_rs::ndarray::NDArray,
+            array: &Arc<ad_core_rs::ndarray::NDArray>,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
@@ -273,7 +273,7 @@ fn test_rewire_through_real_roi_plugin() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // SIM1 driver output
@@ -327,7 +327,7 @@ fn test_rewire_through_real_roi_plugin() {
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
             &self,
-            array: &ad_core_rs::ndarray::NDArray,
+            array: &Arc<ad_core_rs::ndarray::NDArray>,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
@@ -406,7 +406,7 @@ fn test_roi_param_change_enables_output() {
         .build()
         .unwrap();
 
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
 
     // SIM1 driver output
@@ -437,7 +437,7 @@ fn test_roi_param_change_enables_output() {
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
             &self,
-            array: &ad_core_rs::ndarray::NDArray,
+            array: &Arc<ad_core_rs::ndarray::NDArray>,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
@@ -544,7 +544,7 @@ fn test_roi_then_stats_chain() {
     };
 
     let roi_proc = ROIProcessor::new(roi_config);
-    let roi_result = roi_proc.process_array(&arr, &pool);
+    let roi_result = roi_proc.process_array(&Arc::new(arr), &pool);
     assert_eq!(roi_result.output_arrays.len(), 1);
     assert_eq!(roi_result.output_arrays[0].dims[0].size, 4);
     assert_eq!(roi_result.output_arrays[0].dims[1].size, 4);
@@ -558,7 +558,10 @@ fn test_roi_then_stats_chain() {
     assert_eq!(stats.num_elements, 16); // 4*4
     assert!(stats.min >= 0.0);
     assert!(stats.max <= 255.0);
-    assert_eq!(stats_result.output_arrays.len(), 1); // stats forwards the array
+    assert!(Arc::ptr_eq(
+        &stats_result.output_arrays[0],
+        &roi_result.output_arrays[0]
+    )); // stats forwards the array
 }
 
 #[test]
@@ -577,7 +580,7 @@ fn test_process_then_file_tiff_pipeline() {
         offset: 0.0,
         ..Default::default()
     });
-    let proc_result = proc.process_array(&arr, &pool);
+    let proc_result = proc.process_array(&Arc::new(arr), &pool);
     assert_eq!(proc_result.output_arrays.len(), 1);
 
     // Write to TIFF
@@ -626,15 +629,15 @@ fn test_circular_buff_trigger_flow() {
     let arr1 = make_2d_u8(4, 4);
     let mut arr1c = arr1.clone();
     arr1c.unique_id = 1;
-    proc.process_array(&arr1c, &pool);
+    proc.process_array(&Arc::new(arr1c), &pool);
 
     let mut arr2 = arr1.clone();
     arr2.unique_id = 2;
-    proc.process_array(&arr2, &pool);
+    proc.process_array(&Arc::new(arr2), &pool);
 
     let mut arr3 = arr1.clone();
     arr3.unique_id = 3;
-    proc.process_array(&arr3, &pool);
+    proc.process_array(&Arc::new(arr3), &pool);
 
     // Trigger
     proc.trigger();
@@ -643,7 +646,7 @@ fn test_circular_buff_trigger_flow() {
     // Post-trigger frame
     let mut arr4 = arr1.clone();
     arr4.unique_id = 4;
-    let result = proc.process_array(&arr4, &pool);
+    let result = proc.process_array(&Arc::new(arr4), &pool);
 
     // Should have captured: 2 pre + 1 post = 3 frames
     assert_eq!(result.output_arrays.len(), 3);
@@ -663,7 +666,7 @@ fn test_codec_compress_decompress_roundtrip() {
     );
     // Data is already zeros from NDArray::new
 
-    let compressed = compress_lz4(&arr);
+    let compressed = compress_lz4(&arr).unwrap();
     assert!(compressed.codec.is_some());
 
     let decompressed = decompress_lz4(&compressed).unwrap();
@@ -686,7 +689,7 @@ fn test_attribute_plugin_value_extraction() {
         NDAttrValue::Float64(0.5),
     ));
 
-    let result = proc.process_array(&arr, &pool);
+    let result = proc.process_array(&Arc::new(arr.clone()), &pool);
     // AttributeProcessor is a sink (no output arrays)
     assert!(result.output_arrays.is_empty());
     // Check param updates contain the value
@@ -709,7 +712,7 @@ fn test_pos_plugin_position_attachment() {
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.unique_id = 1;
 
-    let result = proc.process_array(&arr, &pool);
+    let result = proc.process_array(&Arc::new(arr), &pool);
     assert_eq!(result.output_arrays.len(), 1);
 
     let out = &result.output_arrays[0];
@@ -734,7 +737,7 @@ fn test_pos_plugin_position_attachment() {
 #[test]
 fn test_process_and_publish_writes_array_size_params() {
     // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
-    let pool = Arc::new(NDArrayPool::new(1_000_000));
+    let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) =
         create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);

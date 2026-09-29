@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -410,8 +411,15 @@ macro_rules! draw_on_typed_buffer {
 /// overlay paints red, green and blue into the three color planes — exactly what
 /// `NDPluginOverlay::addPixel`/`setPixel` do. Arrays with fewer than two usable
 /// dimensions get `y_size == 0` from `info()` and are left untouched, as in C.
-pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
-    let mut arr = src.clone();
+///
+/// The output is a copy of `src` taken from `pool`, as C's
+/// `pNDArrayPool->copy(pArray, NULL, 1)` (NDPluginOverlay.cpp).
+pub fn draw_overlays(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    overlays: &[OverlayDef],
+) -> ADResult<NDArray> {
+    let mut arr = pool.alloc_copy(src)?;
     let info = arr.info();
     let ts = arr.timestamp;
 
@@ -448,7 +456,7 @@ pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
         }
     }
 
-    arr
+    Ok(arr)
 }
 
 /// Maximum number of overlays.
@@ -684,10 +692,15 @@ impl OverlayProcessor {
 }
 
 impl NDPluginProcess for OverlayProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let active = self.build_active_overlays();
-        let out = draw_overlays(array, &active);
-        ProcessResult::arrays(vec![Arc::new(out)])
+        match draw_overlays(pool, array, &active) {
+            Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),
+            Err(e) => {
+                tracing::warn!(error = %e, "overlay output allocation failed; dropping frame");
+                ProcessResult::empty()
+            }
+        }
     }
 
     fn plugin_type(&self) -> &str {
@@ -864,6 +877,10 @@ mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
+    fn pool() -> Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
+
     fn make_8x8() -> NDArray {
         NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
@@ -931,7 +948,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let NDDataBuffer::U16(ref v) = out.data else {
             panic!("expected U16 buffer");
         };
@@ -999,7 +1016,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             // Top edge of rectangle at y=1, x=1..4
             assert_eq!(v[1 * 8 + 1], 255);
@@ -1032,7 +1049,7 @@ mod tests {
             width_x: 1,
             width_y: 1,
         }];
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let px = |x: usize, y: usize| {
             if let NDDataBuffer::U8(ref v) = out.data {
                 v[y * 10 + x]
@@ -1077,7 +1094,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             // C++ Cross visits each pixel exactly once, so the center is
             // XOR'd a single time: 0xFF ^ 0xFF = 0x00 (not double-toggled).
@@ -1105,7 +1122,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             assert_eq!(v[4 * 8 + 4], 200); // center
             assert_eq!(v[4 * 8 + 6], 200); // right arm
@@ -1134,7 +1151,7 @@ mod tests {
             width_x: 1,
             width_y: 1,
         }];
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let px = |x: usize, y: usize| {
             if let NDDataBuffer::U8(ref v) = out.data {
                 v[y * 20 + x]
@@ -1182,7 +1199,7 @@ mod tests {
                 width_x: 1,
                 width_y: 1,
             }];
-            let out = draw_overlays(&arr, &overlays);
+            let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
             if let NDDataBuffer::U8(ref v) = out.data {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
@@ -1221,7 +1238,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             let w = 40;
             let bmp = font_for(0);
@@ -1264,7 +1281,7 @@ mod tests {
                 width_x: 1,
                 width_y: 1,
             }];
-            let out = draw_overlays(&arr, &ov);
+            let out = draw_overlays(&pool(), &arr, &ov).unwrap();
             if let NDDataBuffer::U8(v) = &out.data {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
@@ -1297,7 +1314,7 @@ mod tests {
             width_x: 1,
             width_y: 1,
         }];
-        let out = draw_overlays(&arr, &ov);
+        let out = draw_overlays(&pool(), &arr, &ov).unwrap();
         if let NDDataBuffer::U8(v) = &out.data {
             let w = 40;
             // The second glyph would start at column 6 == xmax, so nothing
@@ -1330,7 +1347,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U16(ref v) = out.data {
             // Top edge at y=1, x=1
             assert_eq!(v[1 * 8 + 1], 200);
@@ -1382,7 +1399,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let NDDataBuffer::U8(ref v) = out.data else {
             panic!("expected U8 buffer");
         };
@@ -1413,7 +1430,7 @@ mod tests {
             width_x: 1,
             width_y: 1,
         }];
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let NDDataBuffer::U8(ref v) = out.data else {
             panic!("expected U8 buffer");
         };
@@ -1451,7 +1468,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let NDDataBuffer::F32(ref v) = out.data else {
             panic!("expected F32 buffer");
         };
@@ -1485,7 +1502,7 @@ mod tests {
             width_y: 1,
         }];
 
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let NDDataBuffer::I64(ref v) = out.data else {
             panic!("expected I64 buffer");
         };
@@ -1513,7 +1530,7 @@ mod tests {
             width_x: 1,
             width_y: 4,
         }];
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             let w = 20;
             // The horizontal band spans rows [cy-2, cy+2] = [8, 12]. A column
@@ -1547,7 +1564,7 @@ mod tests {
             width_x: 3,
             width_y: 3,
         }];
-        let out = draw_overlays(&arr, &overlays);
+        let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             // Any non-zero pixel must be exactly 0xFF — a double-toggled pixel
             // would have wrapped back to 0x00, so the ellipse would have a
@@ -1592,7 +1609,7 @@ mod tests {
                 width_x: 1,
                 width_y: 1,
             }];
-            let out = draw_overlays(arr, &ov);
+            let out = draw_overlays(&pool(), arr, &ov).unwrap();
             if let NDDataBuffer::U8(v) = &out.data {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
@@ -1707,5 +1724,43 @@ mod tests {
             "1990-01-01 00:00:00.123456"
         );
         assert_eq!(format_epics_time(ts, "100%%"), "100%");
+    }
+
+    #[test]
+    fn overlay_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let mut arr = make_8x8();
+        if let NDDataBuffer::U8(v) = &mut arr.data {
+            v[0] = 7;
+        }
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 3,
+                height: 3,
+            },
+            draw_mode: DrawMode::Set,
+            color: [0, 255, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let first = draw_overlays(&pool, &arr, &overlays).unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        let NDDataBuffer::U8(v) = &first.data else {
+            panic!("expected U8 buffer");
+        };
+        assert_eq!(v[0], 7, "the copy carries the source pixels");
+        assert_eq!(v[8 + 1], 255, "the overlay is drawn on the copy");
+        let ptr = v.as_ptr();
+        drop(first);
+
+        let second = draw_overlays(&pool, &arr, &overlays).unwrap();
+        let NDDataBuffer::U8(v) = &second.data else {
+            panic!("expected U8 buffer");
+        };
+        assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 }

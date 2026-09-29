@@ -26,7 +26,7 @@
 use parking_lot::Mutex;
 
 use super::{FilteredMonitorEvent, SubscriptionFilter};
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, SharedArray};
 
 pub struct ArrayFilter {
     config: ArrayFilterConfig,
@@ -114,7 +114,7 @@ impl SubscriptionFilter for ArrayFilter {
         let mut event = event;
         // `make_mut` copies only when another subscriber still shares this
         // `Arc`; after it the snapshot is unique, so the value can be moved
-        // out (the arms below consume the `Vec`) and the slice moved back.
+        // out (the arms below consume the array) and the slice moved back.
         let snap = std::sync::Arc::make_mut(&mut event.event.snapshot);
         let taken = std::mem::replace(&mut snap.value, EpicsValue::Double(0.0));
         snap.value = match taken {
@@ -174,12 +174,13 @@ fn slice_len(len: i64, cfg: ArrayFilterConfig) -> usize {
 }
 
 /// Apply `start..=end` (negative indices wrap from `len`) with stride
-/// `incr`. Returns a fresh `Vec` whenever the slice is non-trivial.
+/// `incr`. A prefix (`start == 0`, `incr == 1`) is a view of the input
+/// buffer; any other non-trivial slice is one strided copy.
 /// Mirrors C `arr.c::wrapArrayIndices` — note the asymmetric clamps:
 /// `start` clamps to `[0, len]` (one past last) while `end` clamps to
 /// `[0, len-1]`, so a `start > len-1` request resolves to `start > end`
 /// and yields 0 elements (not 1).
-fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
+fn slice_with<T: Clone>(input: SharedArray<T>, cfg: ArrayFilterConfig) -> SharedArray<T> {
     let len = input.len() as i64;
     // C arr.c "array data only" (arr.c:148, no_elements > 1): a scalar or
     // single-element array is never sliced. `apply` already routes true
@@ -200,15 +201,16 @@ fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
     let start = resolve_start(cfg.start);
     let end = resolve_end(cfg.end);
     if start > end {
-        return Vec::new();
+        return SharedArray::default();
     }
-    let mut out = Vec::with_capacity(((end - start) / cfg.incr() + 1) as usize);
-    let mut idx = start;
-    while idx <= end {
-        out.push(input[idx as usize].clone());
-        idx += cfg.incr();
+    if start == 0 && cfg.incr() == 1 {
+        return input.head(end as usize + 1);
     }
-    out
+    input[start as usize..=end as usize]
+        .iter()
+        .step_by(cfg.incr() as usize)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -222,7 +224,7 @@ mod tests {
     fn ev_array(v: Vec<f64>) -> FilteredMonitorEvent {
         FilteredMonitorEvent::new(MonitorEvent {
             snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::DoubleArray(v),
+                EpicsValue::DoubleArray(v.into()),
                 0,
                 0,
                 SystemTime::UNIX_EPOCH,
@@ -234,12 +236,31 @@ mod tests {
 
     fn unpack(event: FilteredMonitorEvent) -> Vec<f64> {
         match std::sync::Arc::unwrap_or_clone(event.event.snapshot).value {
-            EpicsValue::DoubleArray(v) => v,
+            EpicsValue::DoubleArray(v) => v.to_vec(),
             other => panic!("expected DoubleArray, got {other:?}"),
         }
     }
 
     /// Default config (`s=0, i=1, e=-1`) yields the full array.
+    /// Boundary: `start == 0 && incr == 1` is a view of the record's
+    /// buffer; a non-zero start or a stride is a fresh copy.
+    #[test]
+    fn a_prefix_slice_shares_the_buffer_and_a_strided_slice_copies() {
+        let src: SharedArray<f64> = vec![1.0, 2.0, 3.0, 4.0].into();
+        let prefix = slice_with(src.clone(), ArrayFilterConfig::new(0, 1, 2));
+        assert!(std::ptr::eq(prefix.as_ptr(), src.as_ptr()));
+        assert_eq!(prefix, [1.0, 2.0, 3.0]);
+        let full = slice_with(src.clone(), ArrayFilterConfig::default());
+        assert!(std::ptr::eq(full.as_ptr(), src.as_ptr()));
+        assert_eq!(full.len(), 4);
+        let offset = slice_with(src.clone(), ArrayFilterConfig::new(1, 1, -1));
+        assert!(!std::ptr::eq(offset.as_ptr(), src.as_ptr()));
+        assert_eq!(offset, [2.0, 3.0, 4.0]);
+        let strided = slice_with(src.clone(), ArrayFilterConfig::new(0, 2, -1));
+        assert!(!std::ptr::eq(strided.as_ptr(), src.as_ptr()));
+        assert_eq!(strided, [1.0, 3.0]);
+    }
+
     #[test]
     fn default_config_is_identity() {
         let f = ArrayFilter::new(ArrayFilterConfig::default());
@@ -362,7 +383,7 @@ mod tests {
         let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 2));
         let ev = FilteredMonitorEvent::new(MonitorEvent {
             snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::UInt64Array(vec![0, big, big - 1, 7]),
+                EpicsValue::UInt64Array(vec![0, big, big - 1, 7].into()),
                 0,
                 0,
                 SystemTime::UNIX_EPOCH,

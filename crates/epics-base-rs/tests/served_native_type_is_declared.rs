@@ -238,7 +238,7 @@ fn a_selector_typed_field_keeps_its_runtime_type() {
         .put_field("FTVL", EpicsValue::Short(5))
         .expect("FTVL is writable");
     inst.record
-        .put_field("VAL", EpicsValue::LongArray(vec![7, 8, 9]))
+        .put_field("VAL", EpicsValue::LongArray(vec![7, 8, 9].into()))
         .expect("VAL takes a long array under FTVL=LONG");
 
     let served = inst
@@ -293,7 +293,7 @@ fn sub_array_is_declared_by_the_dbd_not_by_its_hand_table() {
         .put_field("FTVL", EpicsValue::Short(5))
         .expect("FTVL is writable");
     inst.record
-        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
         .expect("VAL takes a long array under FTVL=LONG");
     let val = inst
         .client_field_value("VAL")

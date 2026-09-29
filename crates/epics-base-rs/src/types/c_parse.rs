@@ -228,7 +228,7 @@ pub fn put_string_elements(
                     _ => return Ok(Converted::Unchanged),
                 }
             }
-            EpicsValue::$array(out)
+            EpicsValue::$array(out.into())
         }};
     }
     Ok(Converted::Stored(match target {
@@ -313,7 +313,7 @@ pub fn get_string_array(
                             ))),
                         }
                     }
-                    Ok(EpicsValue::$array(out))
+                    Ok(EpicsValue::$array(out.into()))
                 })+
             }
         };

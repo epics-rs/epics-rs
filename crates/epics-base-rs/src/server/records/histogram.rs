@@ -628,7 +628,7 @@ impl Record for HistogramRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
-            "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
+            "VAL" => Some(EpicsValue::ULongArray(self.val.clone().into())),
             // The DBF types are the `.dbd.pod`'s: NELM is DBF_USHORT (:163),
             // MDEL/MCNT are DBF_SHORT (:229,:234). The value variant is what CA
             // and PVA project the native type from, so it must agree with the
@@ -676,7 +676,7 @@ impl Record for HistogramRecord {
             "VAL" => {
                 let arr = match value {
                     EpicsValue::ULongArray(arr) => arr,
-                    EpicsValue::ULong(v) => vec![v],
+                    EpicsValue::ULong(v) => vec![v].into(),
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
                 let width = self.nelm.max(1) as usize;
@@ -885,13 +885,13 @@ mod tests {
         use crate::types::c_parse::Converted;
 
         let mut rec = HistogramRecord::new(4, 0.0, 10.0);
-        rec.put_field("VAL", EpicsValue::ULongArray(vec![9, 9, 9, 9]))
+        rec.put_field("VAL", EpicsValue::ULongArray(vec![9, 9, 9, 9].into()))
             .unwrap();
 
         rec.put_field("VAL", EpicsValue::ULong(7)).unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::ULongArray(vec![7, 9, 9, 9])),
+            Some(EpicsValue::ULongArray(vec![7, 9, 9, 9].into())),
             "a scalar request is one bin, not a type error"
         );
 
@@ -902,19 +902,19 @@ mod tests {
         else {
             panic!("the converter stores the rendered request");
         };
-        assert_eq!(rendered, EpicsValue::ULongArray(vec![5]));
+        assert_eq!(rendered, EpicsValue::ULongArray(vec![5].into()));
         rec.put_field("VAL", rendered).unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::ULongArray(vec![5, 9, 9, 9]))
+            Some(EpicsValue::ULongArray(vec![5, 9, 9, 9].into()))
         );
 
         // A request wider than NELM still writes the head and keeps the width.
-        rec.put_field("VAL", EpicsValue::ULongArray(vec![1, 2, 3, 4, 5, 6]))
+        rec.put_field("VAL", EpicsValue::ULongArray(vec![1, 2, 3, 4, 5, 6].into()))
             .unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::ULongArray(vec![1, 2, 3, 4]))
+            Some(EpicsValue::ULongArray(vec![1, 2, 3, 4].into()))
         );
     }
 

@@ -610,7 +610,7 @@ impl BareLeaf {
 pub(crate) fn long_string_put_image(s: &PvString) -> EpicsValue {
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
-    EpicsValue::CharArray(bytes)
+    EpicsValue::CharArray(bytes.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1577,7 @@ pub(crate) fn alarm_condition_string(condition: u16) -> &'static str {
 mod tests {
     use super::*;
     use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
+    use epics_pva_rs::pvdata::TypedScalarArray;
     use std::time::UNIX_EPOCH;
 
     /// the single-record QSRV PUT conversion chain. A native
@@ -1657,7 +1658,7 @@ mod tests {
     fn long_string_field_builds_string_ntscalar() {
         let text = "abc"; // 3 bytes; byte-collapse would yield 97 ('a')
         let snap = Snapshot::new(
-            EpicsValue::CharArray(text.as_bytes().to_vec()),
+            EpicsValue::CharArray(text.as_bytes().to_vec().into()),
             0,
             0,
             UNIX_EPOCH,
@@ -1693,7 +1694,7 @@ mod tests {
     #[test]
     fn long_string_value_stops_at_nul() {
         let snap = Snapshot::new(
-            EpicsValue::CharArray(b"hi\0junk".to_vec()),
+            EpicsValue::CharArray(b"hi\0junk".to_vec().into()),
             0,
             0,
             UNIX_EPOCH,
@@ -1716,7 +1717,7 @@ mod tests {
         // 0xFF / 0x80 are invalid standalone UTF-8; the byte path keeps
         // each as one byte. A NUL still truncates (C buffer semantics).
         let snap = Snapshot::new(
-            EpicsValue::CharArray(vec![0xff, 0x80, b'a', 0xc3, 0x28, 0x00, b'x']),
+            EpicsValue::CharArray(vec![0xff, 0x80, b'a', 0xc3, 0x28, 0x00, b'x'].into()),
             0,
             0,
             UNIX_EPOCH,
@@ -1740,7 +1741,7 @@ mod tests {
     #[test]
     fn q14_uchar_waveform_serves_as_ubyte_array() {
         let snap = Snapshot::new(
-            EpicsValue::UCharArray(vec![0u8, 1, 200, 0xFF]),
+            EpicsValue::UCharArray(vec![0u8, 1, 200, 0xFF].into()),
             0,
             0,
             UNIX_EPOCH,
@@ -1753,15 +1754,11 @@ mod tests {
         let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray);
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         match pv.get_field("value") {
-            Some(PvField::ScalarArray(arr)) => {
-                assert!(
-                    matches!(arr[2], ScalarValue::UByte(200)),
-                    "element 200 must stay unsigned 200, got {:?}",
-                    arr[2]
-                );
-                assert!(matches!(arr[3], ScalarValue::UByte(255)));
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::UByte(arr))) => {
+                assert_eq!(arr[2], 200, "element 200 must stay unsigned 200");
+                assert_eq!(arr[3], 255);
             }
-            other => panic!("expected ubyte ScalarArray value, got {other:?}"),
+            other => panic!("expected ubyte array value, got {other:?}"),
         }
 
         // The descriptor advertises `value` as ubyte[], matching the GET.
@@ -1902,7 +1899,7 @@ mod tests {
         // so clients don't read the placeholder zero as a valid sample.
         // alarm.status is the PVA status CLASS — UDF maps to DRIVER
         // (2) — and alarm.message is the condition string "UDF".
-        let snap = test_snapshot(EpicsValue::DoubleArray(vec![]));
+        let snap = test_snapshot(EpicsValue::DoubleArray(vec![].into()));
         let pv = snapshot_to_nt_scalar(&snap);
 
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
@@ -1973,11 +1970,11 @@ mod tests {
 
     #[test]
     fn nt_scalar_array_structure() {
-        let snap = test_snapshot(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]));
+        let snap = test_snapshot(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()));
         let pv = snapshot_to_nt_scalar_array(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
-        if let Some(PvField::ScalarArray(arr)) = pv.get_field("value") {
+        if let Some(PvField::ScalarArrayTyped(arr)) = pv.get_field("value") {
             assert_eq!(arr.len(), 3);
         } else {
             panic!("expected value array");
@@ -2025,7 +2022,7 @@ mod tests {
         let scalar = BareLeaf::Scalar(ScalarType::Double);
         assert_eq!(scalar.desc(), FieldDesc::Scalar(ScalarType::Double));
         assert_eq!(
-            scalar.value(&EpicsValue::DoubleArray(vec![2.5])),
+            scalar.value(&EpicsValue::DoubleArray(vec![2.5].into())),
             PvField::Scalar(ScalarValue::Double(2.5)),
             "a one-element array backing collapses to the element"
         );
@@ -2038,15 +2035,15 @@ mod tests {
         // `FTVL=STRING, NELM=1` — the shape pvxput refused to drive.
         let text = BareLeaf::Scalar(ScalarType::String);
         assert_eq!(
-            text.value(&EpicsValue::StringArray(vec!["hi".into()])),
+            text.value(&EpicsValue::StringArray(vec!["hi".into()].into())),
             PvField::Scalar(ScalarValue::String("hi".into()))
         );
 
         let array = BareLeaf::Array(ScalarType::Double);
         assert_eq!(array.desc(), FieldDesc::ScalarArray(ScalarType::Double));
         assert_eq!(
-            array.value(&EpicsValue::DoubleArray(vec![1.0, 2.0])),
-            PvField::ScalarArray(vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)])
+            array.value(&EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.0, 2.0].into()))
         );
     }
 
@@ -2149,7 +2146,7 @@ mod tests {
         // display/control/valueAlarm limits must be typed as the element
         // scalar type (Int, not Double), and `display.form` must be an
         // `enum_t` sub-structure, not a scalar int.
-        let snap = test_snapshot(EpicsValue::LongArray(vec![4, 5, 6, 7]));
+        let snap = test_snapshot(EpicsValue::LongArray(vec![4, 5, 6, 7].into()));
         let pv = snapshot_to_nt_scalar_array(&snap);
 
         // control + valueAlarm present on the array
@@ -2296,7 +2293,12 @@ mod tests {
         );
 
         // Numeric array (histogram-like), no metadata.
-        let snap_arr = Snapshot::new(EpicsValue::LongArray(vec![1, 2, 3]), 0, 0, UNIX_EPOCH);
+        let snap_arr = Snapshot::new(
+            EpicsValue::LongArray(vec![1, 2, 3].into()),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
         let pv_arr = snapshot_to_nt_scalar_array(&snap_arr);
         assert_eq!(
             names(&pv_arr),
@@ -2325,18 +2327,17 @@ mod tests {
         // matching pvxs test/testqsingle.cpp:530-546. On main there was no
         // `EpicsValue::UInt64Array`, so the value collapsed into
         // `DoubleArray` and the descriptor advertised `double[]`.
-        let snap = test_snapshot(EpicsValue::UInt64Array(vec![
-            11111111111111111,
-            222222222222222,
-        ]));
+        let snap = test_snapshot(EpicsValue::UInt64Array(
+            vec![11111111111111111, 222222222222222].into(),
+        ));
         let pv = snapshot_to_nt_scalar_array(&snap);
 
         // value is a ulong array
         match pv.get_field("value") {
-            Some(PvField::ScalarArray(vs)) => {
-                assert!(matches!(vs[0], ScalarValue::ULong(11111111111111111)));
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::ULong(vs))) => {
+                assert_eq!(vs[0], 11111111111111111);
             }
-            other => panic!("expected ulong ScalarArray, got {other:?}"),
+            other => panic!("expected ulong array, got {other:?}"),
         }
 
         // display.limitLow typed as ULong, not Double

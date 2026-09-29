@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
+use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -120,15 +121,21 @@ fn dims_for(
     }
 }
 
-/// Apply a transform to an NDArray.
+/// Apply a transform to an NDArray, allocating the output from `pool` as
+/// C's `NDPluginTransform` does with `pNDArrayPool->copy(pArray, NULL, 0)`
+/// (NDPluginTransform.cpp:497).
 ///
 /// Handles 2-D mono images and 3-D RGB1/RGB2/RGB3 color images. The per-color
 /// reindexing mirrors C++ `transformNDArray`: source `(x, y)` is geometrically
 /// mapped to destination `(x, y)` and every color component is copied with the
 /// destination strides recomputed for the (possibly swapped) X/Y sizes.
-pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
+pub fn apply_transform(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    transform: TransformType,
+) -> ADResult<NDArray> {
     if transform == TransformType::None || src.dims.len() < 2 {
-        return src.clone();
+        return pool.alloc_copy(src);
     }
 
     let info = src.info();
@@ -136,7 +143,7 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
     let src_h = info.y_size;
     let color = info.color_size.max(1);
     if src_w == 0 || src_h == 0 {
-        return src.clone();
+        return pool.alloc_copy(src);
     }
 
     let (dst_w, dst_h) = if transform.swaps_dims() {
@@ -145,52 +152,322 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
         (src_w, src_h)
     };
 
-    let (sxs, sys, scs) = (
-        info.x_stride,
-        info.y_stride.max(1),
-        info.color_stride.max(1),
-    );
-    let (dxs, dys, dcs) = strides_for(info.color_mode, dst_w, dst_h, color);
-    let total = dst_w * dst_h * color;
-
-    macro_rules! transform_buf {
-        ($vec:expr, $zero:expr) => {{
-            let mut out = vec![$zero; total];
-            for sy in 0..src_h {
-                for sx in 0..src_w {
-                    let (dx, dy) = map_coords(sx, sy, src_w, src_h, transform);
-                    let s_base = sy * sys + sx * sxs;
-                    let d_base = dy * dys + dx * dxs;
-                    for c in 0..color {
-                        out[d_base + c * dcs] = $vec[s_base + c * scs];
-                    }
-                }
-            }
-            out
-        }};
-    }
-
-    let out_data = match &src.data {
-        NDDataBuffer::U8(v) => NDDataBuffer::U8(transform_buf!(v, 0)),
-        NDDataBuffer::U16(v) => NDDataBuffer::U16(transform_buf!(v, 0)),
-        NDDataBuffer::I8(v) => NDDataBuffer::I8(transform_buf!(v, 0)),
-        NDDataBuffer::I16(v) => NDDataBuffer::I16(transform_buf!(v, 0)),
-        NDDataBuffer::I32(v) => NDDataBuffer::I32(transform_buf!(v, 0)),
-        NDDataBuffer::U32(v) => NDDataBuffer::U32(transform_buf!(v, 0)),
-        NDDataBuffer::I64(v) => NDDataBuffer::I64(transform_buf!(v, 0)),
-        NDDataBuffer::U64(v) => NDDataBuffer::U64(transform_buf!(v, 0)),
-        NDDataBuffer::F32(v) => NDDataBuffer::F32(transform_buf!(v, 0.0)),
-        NDDataBuffer::F64(v) => NDDataBuffer::F64(transform_buf!(v, 0.0)),
+    let geometry = Geometry {
+        src_w,
+        src_h,
+        color,
+        src_strides: (
+            info.x_stride,
+            info.y_stride.max(1),
+            info.color_stride.max(1),
+        ),
+        dst_strides: strides_for(info.color_mode, dst_w, dst_h, color),
+        transform,
     };
 
     let dims = dims_for(info.color_mode, dst_w, dst_h, color, src.dims.len());
-    let mut arr = NDArray::new(dims, src.data.data_type());
-    arr.data = out_data;
+    let mut arr = pool.alloc(dims, src.data.data_type())?;
+    macro_rules! same_type {
+        ($($variant:ident),*) => {
+            match (&src.data, &mut arr.data) {
+                $((NDDataBuffer::$variant(v), NDDataBuffer::$variant(o)) => {
+                    geometry.transform_into(v, o)
+                })*
+                _ => unreachable!("the output was allocated in the source type"),
+            }
+        };
+    }
+    same_type!(U8, U16, I8, I16, I32, U32, I64, U64, F32, F64);
+
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
-    arr
+    Ok(arr)
+}
+
+/// The index mapping of one transform: `(x_stride, y_stride, color_stride)`
+/// on each side, applied per source pixel.
+struct Geometry {
+    src_w: usize,
+    src_h: usize,
+    color: usize,
+    src_strides: (usize, usize, usize),
+    dst_strides: (usize, usize, usize),
+    transform: TransformType,
+}
+
+/// Rows and columns per tile of a transposing transform, so the
+/// destination lines a tile writes stay cached across its source rows.
+const TILE: usize = 64;
+
+impl Geometry {
+    /// The destination element index of source pixel `(sx, sy)`, color 0.
+    fn dst_index(&self, sx: usize, sy: usize) -> usize {
+        let (dx, dy) = map_coords(sx, sy, self.src_w, self.src_h, self.transform);
+        dy * self.dst_strides.1 + dx * self.dst_strides.0
+    }
+
+    fn transform_into<T: LaneVec>(&self, src: &[T], out: &mut [T]) {
+        #[cfg(feature = "simd")]
+        let lanes = self.transpose_lanes(ad_core_rs::simd::level(), src, out);
+        #[cfg(not(feature = "simd"))]
+        let lanes = (0, 0);
+        self.transform_rows(src, out, lanes);
+    }
+
+    /// The whole vectors of a transposing transform on lanes: every
+    /// channel as a planar matrix, or the three of RGB1 split off each
+    /// row and joined back. Returns the source columns and rows covered.
+    #[cfg(feature = "simd")]
+    fn transpose_lanes<T: LaneVec>(
+        &self,
+        level: fearless_simd::Level,
+        src: &[T],
+        out: &mut [T],
+    ) -> (usize, usize) {
+        use fearless_simd::dispatch;
+        let (flip_x, flip_y) = match self.transform {
+            TransformType::FlipDiag => (false, false),
+            TransformType::Rot90CW => (true, false),
+            TransformType::Rot90CCW => (false, true),
+            TransformType::FlipAntiDiag => (true, true),
+            _ => return (0, 0),
+        };
+        let (sxs, sys, scs) = self.src_strides;
+        let (dxs, dys, dcs) = self.dst_strides;
+        let (w, h) = (self.src_w, self.src_h);
+        let flips = (flip_x, flip_y);
+        if sxs == 1 && dxs == 1 {
+            let mut done = (0, 0);
+            for c in 0..self.color {
+                let (s, o) = (&src[c * scs..], &mut out[c * dcs..]);
+                done = dispatch!(level, s_ => simd_kernels::transpose_planar(s_, s, o, w, h, sys, dys, flips));
+            }
+            done
+        } else if sxs == 3 && scs == 1 && dxs == 3 && dcs == 1 {
+            dispatch!(level, s_ => simd_kernels::transpose_rgb1(s_, src, out, w, h, sys, dys, flips))
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// The scalar rows: from column `w0` on the rows below `h0`, and every
+    /// row from `h0` on.
+    fn transform_rows<T: Copy>(&self, src: &[T], out: &mut [T], (w0, h0): (usize, usize)) {
+        let (sxs, sys, scs) = self.src_strides;
+        let (_, _, dcs) = self.dst_strides;
+        let (w, h, color) = (self.src_w, self.src_h, self.color);
+        // Every transform maps a source row to a destination line the index
+        // walks with one constant signed step, so the mapping is evaluated
+        // once per row and the row itself is one of three copies.
+        let step = if w > 1 {
+            self.dst_index(1, 0) as isize - self.dst_index(0, 0) as isize
+        } else {
+            sxs as isize
+        };
+        // A row whose elements are one contiguous run on both sides.
+        let row_is_contiguous = step == sxs as isize
+            && dcs == scs
+            && ((color == 1 && sxs == 1) || (sxs == color && scs == 1) || (sxs == 1 && scs == w));
+        let row = |sy: usize, sx0: usize, len: usize, out: &mut [T]| {
+            let s_base = sy * sys + sx0 * sxs;
+            let d_base = (self.dst_index(0, sy) as isize + sx0 as isize * step) as usize;
+            if row_is_contiguous {
+                out[d_base..d_base + len * color]
+                    .copy_from_slice(&src[s_base..s_base + len * color]);
+                return;
+            }
+            if sxs == 1 && step == 1 {
+                for c in 0..color {
+                    let (s, d) = (s_base + c * scs, d_base + c * dcs);
+                    out[d..d + len].copy_from_slice(&src[s..s + len]);
+                }
+            } else if sxs == 1 && step == -1 {
+                for c in 0..color {
+                    let (s, d) = (s_base + c * scs, d_base + c * dcs);
+                    for (o, &i) in out[d + 1 - len..=d].iter_mut().rev().zip(&src[s..s + len]) {
+                        *o = i;
+                    }
+                }
+            } else {
+                // Strided on at least one side: the elements of one pixel
+                // stay together, which keeps interleaved stores adjacent.
+                for sx in 0..len {
+                    let s = s_base + sx * sxs;
+                    let d = (d_base as isize + sx as isize * step) as usize;
+                    for c in 0..color {
+                        out[d + c * dcs] = src[s + c * scs];
+                    }
+                }
+            }
+        };
+        if !self.transform.swaps_dims() {
+            for sy in 0..h {
+                row(sy, 0, w, out);
+            }
+            return;
+        }
+        if w0 < w {
+            for sy in 0..h0 {
+                row(sy, w0, w - w0, out);
+            }
+        }
+        for ty in (h0..h).step_by(TILE) {
+            for tx in (0..w).step_by(TILE) {
+                let len = TILE.min(w - tx);
+                for sy in ty..(ty + TILE).min(h) {
+                    row(sy, tx, len, out);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "simd")]
+use ad_core_rs::simd::LaneVec;
+/// Without lanes every element type qualifies; the bound is only there so
+/// the kernels can name the native vector.
+#[cfg(not(feature = "simd"))]
+trait LaneVec: Copy {}
+#[cfg(not(feature = "simd"))]
+impl<T: Copy> LaneVec for T {}
+
+/// The transposing transforms on explicit vectors. A `K` by `K` block, `K`
+/// the lane count of the element, is `K` row vectors; `log2 K` rounds of
+/// the perfect shuffle — every vector interleaved with the one `K / 2`
+/// after it, the two halves consecutive in the next round's order — leave
+/// the `K` column vectors. A rotation is that transpose with the rows
+/// loaded in reverse order (the columns of the result run backwards) or
+/// the columns stored in reverse order, so the flips cost no lane
+/// operation at all.
+#[cfg(feature = "simd")]
+mod simd_kernels {
+    use ad_core_rs::simd::{LaneVec, join_tables, load_vecs, shuffle, split_tables, store_vecs};
+    use fearless_simd::{Simd, prelude::*};
+    use fearless_simd_macros::simd;
+
+    /// Vectors of the widest block: the lane count of the narrowest
+    /// element on every level.
+    const MAX_K: usize = 64;
+
+    /// The `k` row vectors in `a` to the `k` column vectors, in `a` or `b`.
+    #[inline(always)]
+    fn transpose_block<'a, S: Simd, T: LaneVec>(
+        a: &'a mut [T::Vec<S>; MAX_K],
+        b: &'a mut [T::Vec<S>; MAX_K],
+        k: usize,
+    ) -> &'a [T::Vec<S>; MAX_K] {
+        let (mut from, mut to) = (a, b);
+        for _ in 0..k.trailing_zeros() {
+            for i in 0..k / 2 {
+                let (lo, hi) = from[i].interleave(from[i + k / 2]);
+                to[2 * i] = lo;
+                to[2 * i + 1] = hi;
+            }
+            std::mem::swap(&mut from, &mut to);
+        }
+        from
+    }
+
+    /// The source row of block row `i`, and the destination row of block
+    /// column `j` with the column the block's rows start at.
+    #[inline(always)]
+    fn block_rows(
+        (ry, cx, k): (usize, usize, usize),
+        (w, h): (usize, usize),
+        (flip_x, flip_y): (bool, bool),
+    ) -> (impl Fn(usize) -> usize, impl Fn(usize) -> usize, usize) {
+        let src_row = move |i: usize| if flip_x { ry + k - 1 - i } else { ry + i };
+        let dst_row = move |j: usize| if flip_y { w - 1 - (cx + j) } else { cx + j };
+        let col = if flip_x { h - k - ry } else { ry };
+        (src_row, dst_row, col)
+    }
+
+    /// Transpose `src`, `h` rows of `w` elements at the row stride `sys`,
+    /// into `out` at the row stride `dys`: source column `x` becomes row
+    /// `x` (`w - 1 - x` with `flip_y`) and source row `y` column `y`
+    /// (`h - 1 - y` with `flip_x`). Every whole block; returns the source
+    /// columns and rows covered.
+    #[simd]
+    pub(super) fn transpose_planar<S: Simd, T: LaneVec>(
+        simd: S,
+        src: &[T],
+        out: &mut [T],
+        w: usize,
+        h: usize,
+        sys: usize,
+        dys: usize,
+        flips: (bool, bool),
+    ) -> (usize, usize) {
+        let k = T::Vec::<S>::LEN;
+        let (w0, h0) = (w / k * k, h / k * k);
+        let zero = T::Vec::<S>::splat(simd, T::default());
+        let (mut a, mut b) = ([zero; MAX_K], [zero; MAX_K]);
+        for ry in (0..h0).step_by(k) {
+            for cx in (0..w0).step_by(k) {
+                let (src_row, dst_row, col) = block_rows((ry, cx, k), (w, h), flips);
+                for (i, v) in a[..k].iter_mut().enumerate() {
+                    *v = T::Vec::<S>::from_slice(simd, &src[src_row(i) * sys + cx..][..k]);
+                }
+                let t = transpose_block::<S, T>(&mut a, &mut b, k);
+                for (j, v) in t[..k].iter().enumerate() {
+                    v.store_slice(&mut out[dst_row(j) * dys + col..][..k]);
+                }
+            }
+        }
+        (w0, h0)
+    }
+
+    /// [`transpose_planar`] of an RGB1 frame: each block row splits into
+    /// its three planes, the planes transpose, and each column joins back.
+    #[simd]
+    pub(super) fn transpose_rgb1<S: Simd, T: LaneVec>(
+        simd: S,
+        src: &[T],
+        out: &mut [T],
+        w: usize,
+        h: usize,
+        sys: usize,
+        dys: usize,
+        flips: (bool, bool),
+    ) -> (usize, usize) {
+        let k = T::Vec::<S>::LEN;
+        let (w0, h0) = (w / k * k, h / k * k);
+        let e = std::mem::size_of::<T>();
+        let (split, join) = (split_tables::<S, 3>(simd, e), join_tables::<S, 3>(simd, e));
+        let zero = T::Vec::<S>::splat(simd, T::default());
+        let (mut a, mut b) = ([[zero; MAX_K]; 3], [[zero; MAX_K]; 3]);
+        for ry in (0..h0).step_by(k) {
+            for cx in (0..w0).step_by(k) {
+                let (src_row, dst_row, col) = block_rows((ry, cx, k), (w, h), flips);
+                for i in 0..k {
+                    let planes = shuffle::<S, 3>(
+                        &split,
+                        load_vecs::<S, T, 3>(simd, &src[src_row(i) * sys + 3 * cx..]),
+                    );
+                    for (c, p) in planes.into_iter().enumerate() {
+                        a[c][i] = T::Vec::<S>::from_bytes(p);
+                    }
+                }
+                let [a0, a1, a2] = &mut a;
+                let [b0, b1, b2] = &mut b;
+                let t = [
+                    transpose_block::<S, T>(a0, b0, k),
+                    transpose_block::<S, T>(a1, b1, k),
+                    transpose_block::<S, T>(a2, b2, k),
+                ];
+                for j in 0..k {
+                    let planes = std::array::from_fn(|c| t[c][j].to_bytes());
+                    store_vecs::<S, T, 3>(
+                        shuffle::<S, 3>(&join, planes),
+                        &mut out[dst_row(j) * dys + 3 * col..],
+                    );
+                }
+            }
+        }
+        (w0, h0)
+    }
 }
 
 // --- New TransformProcessor (NDPluginProcess-based) ---
@@ -211,14 +488,20 @@ impl TransformProcessor {
 }
 
 impl NDPluginProcess for TransformProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
         // straight into the call would live to the end of the statement and
         // hold across the whole rotation.
         let transform = *self.transform.lock();
-        let out = apply_transform(array, transform);
-        ProcessResult::arrays(vec![Arc::new(out)])
+        match apply_transform(pool, array, transform) {
+            Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),
+            Err(e) => {
+                // C's copy() returning NULL ends the frame without output.
+                tracing::warn!(error = %e, "transform output allocation failed; dropping frame");
+                ProcessResult::empty()
+            }
+        }
     }
 
     fn plugin_type(&self) -> &str {
@@ -252,6 +535,153 @@ mod tests {
     use super::*;
     use ad_core_rs::ndarray::NDDataType;
 
+    fn pool() -> std::sync::Arc<NDArrayPool> {
+        NDArrayPool::new(0)
+    }
+
+    /// The rotated frame is a pool array; the next frame reuses its buffer.
+    #[test]
+    fn transform_output_comes_from_the_pool_and_is_reused() {
+        let pool = pool();
+        let arr = make_3x2();
+        let first = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
+        assert_eq!(first.pool_id(), pool.id());
+        let ptr = first.data.as_u8_slice().as_ptr();
+        drop(first);
+        let second = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
+        assert_eq!(second.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(get_u8(&second), &[4, 1, 5, 2, 6, 3]);
+    }
+
+    /// Every transform on every color layout, on frames wider and taller
+    /// than a tile with a partial tile at both edges, against the element
+    /// by element mapping of `map_coords`.
+    #[test]
+    fn transform_into_matches_the_per_pixel_mapping() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let (w, h) = (TILE * 2 + 5, TILE + 3);
+        let modes = [
+            (NDColorMode::Mono, 1),
+            (NDColorMode::RGB1, 3),
+            (NDColorMode::RGB2, 3),
+            (NDColorMode::RGB3, 3),
+        ];
+        let transforms = [
+            TransformType::Rot90CW,
+            TransformType::Rot180,
+            TransformType::Rot90CCW,
+            TransformType::FlipHoriz,
+            TransformType::FlipVert,
+            TransformType::FlipDiag,
+            TransformType::FlipAntiDiag,
+        ];
+        for (mode, color) in modes {
+            let data: Vec<u16> = (0..w * h * color)
+                .map(|i| (i * 7919 % 65521) as u16)
+                .collect();
+            let dims = dims_for(mode, w, h, color, if color == 1 { 2 } else { 3 });
+            let mut arr = NDArray::with_data(dims, NDDataBuffer::U16(data.clone()));
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(mode as i32),
+            ));
+            let info = arr.info();
+            let (sxs, sys, scs) = (
+                info.x_stride,
+                info.y_stride.max(1),
+                info.color_stride.max(1),
+            );
+            for transform in transforms {
+                let out = apply_transform(&pool(), &arr, transform).unwrap();
+                let (dw, dh) = if transform.swaps_dims() {
+                    (h, w)
+                } else {
+                    (w, h)
+                };
+                let (dxs, dys, dcs) = strides_for(mode, dw, dh, color);
+                let mut want = vec![0u16; w * h * color];
+                for sy in 0..h {
+                    for sx in 0..w {
+                        let (dx, dy) = map_coords(sx, sy, w, h, transform);
+                        for c in 0..color {
+                            want[dy * dys + dx * dxs + c * dcs] =
+                                data[sy * sys + sx * sxs + c * scs];
+                        }
+                    }
+                }
+                let got = match &out.data {
+                    NDDataBuffer::U16(v) => v.as_slice(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(got, want.as_slice(), "{mode:?} {transform:?}");
+            }
+        }
+    }
+
+    /// The transposing transforms on every level and element type, on
+    /// every color layout, at sizes below, at and past one block of every
+    /// lane count, against the element by element mapping of `map_coords`.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn transpose_lanes_match_the_per_pixel_mapping_on_every_level() {
+        use fearless_simd::Level;
+        let top = ad_core_rs::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        let modes = [
+            (NDColorMode::Mono, 1),
+            (NDColorMode::RGB1, 3),
+            (NDColorMode::RGB2, 3),
+            (NDColorMode::RGB3, 3),
+        ];
+        let transforms = [
+            TransformType::Rot90CW,
+            TransformType::Rot90CCW,
+            TransformType::FlipDiag,
+            TransformType::FlipAntiDiag,
+        ];
+        macro_rules! check {
+            ($($t:ty),*) => {$(
+                for (w, h) in [(1, 1), (5, 3), (64, 64), (65, 66), (131, 70)] {
+                    for (mode, color) in modes {
+                        let data: Vec<$t> = (0..w * h * color).map(|i| (i * 7919 % 65521) as $t).collect();
+                        let (sxs, sys, scs) = strides_for(mode, w, h, color);
+                        for transform in transforms {
+                            let (dw, dh) = (h, w);
+                            let dst = strides_for(mode, dw, dh, color);
+                            let geometry = Geometry {
+                                src_w: w,
+                                src_h: h,
+                                color,
+                                src_strides: (sxs, sys, scs),
+                                dst_strides: dst,
+                                transform,
+                            };
+                            let mut want = vec![<$t>::default(); w * h * color];
+                            geometry.transform_rows(&data, &mut want, (0, 0));
+                            for &level in &levels {
+                                let mut got = vec![<$t>::default(); w * h * color];
+                                let (w0, h0) = geometry.transpose_lanes(level, &data, &mut got);
+                                assert!(w0 <= w && h0 <= h && (w < 64 || w0 > 0) && (h < 64 || h0 > 0), "{level:?} {} {mode:?} {transform:?} {w}x{h}: {w0}x{h0}", stringify!($t));
+                                geometry.transform_rows(&data, &mut got, (w0, h0));
+                                assert_eq!(got, want, "{level:?} {} {mode:?} {transform:?} {w}x{h}", stringify!($t));
+                            }
+                        }
+                    }
+                }
+            )*};
+        }
+        check!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
+    }
+
     /// Create a 3x2 array:
     /// [1, 2, 3]
     /// [4, 5, 6]
@@ -276,14 +706,14 @@ mod tests {
     #[test]
     fn test_none() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::None);
+        let out = apply_transform(&pool(), &arr, TransformType::None).unwrap();
         assert_eq!(get_u8(&out), &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn test_rot90cw() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot90CW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Expected:
@@ -296,7 +726,7 @@ mod tests {
     #[test]
     fn test_rot180() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot180);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot180).unwrap();
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(get_u8(&out), &[6, 5, 4, 3, 2, 1]);
@@ -305,7 +735,7 @@ mod tests {
     #[test]
     fn test_rot90ccw() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::Rot90CCW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CCW).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Expected:
@@ -318,21 +748,21 @@ mod tests {
     #[test]
     fn test_flip_horiz() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipHoriz);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipHoriz).unwrap();
         assert_eq!(get_u8(&out), &[3, 2, 1, 6, 5, 4]);
     }
 
     #[test]
     fn test_flip_vert() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipVert);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipVert).unwrap();
         assert_eq!(get_u8(&out), &[4, 5, 6, 1, 2, 3]);
     }
 
     #[test]
     fn test_flip_diag() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipDiag);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipDiag).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Transpose:
@@ -345,7 +775,7 @@ mod tests {
     #[test]
     fn test_flip_anti_diag() {
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::FlipAntiDiag);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipAntiDiag).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         // Anti-transpose:
@@ -358,10 +788,10 @@ mod tests {
     #[test]
     fn test_rot90_roundtrip() {
         let arr = make_3x2();
-        let r1 = apply_transform(&arr, TransformType::Rot90CW);
-        let r2 = apply_transform(&r1, TransformType::Rot90CW);
-        let r3 = apply_transform(&r2, TransformType::Rot90CW);
-        let r4 = apply_transform(&r3, TransformType::Rot90CW);
+        let r1 = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
+        let r2 = apply_transform(&pool(), &r1, TransformType::Rot90CW).unwrap();
+        let r3 = apply_transform(&pool(), &r2, TransformType::Rot90CW).unwrap();
+        let r4 = apply_transform(&pool(), &r3, TransformType::Rot90CW).unwrap();
         assert_eq!(get_u8(&r4), get_u8(&arr));
         assert_eq!(r4.dims[0].size, arr.dims[0].size);
         assert_eq!(r4.dims[1].size, arr.dims[1].size);
@@ -385,7 +815,7 @@ mod tests {
     fn test_transform_5_is_transpose() {
         // Selecting transform 5 from EPICS must produce a transpose.
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::from_u8(5));
+        let out = apply_transform(&pool(), &arr, TransformType::from_u8(5)).unwrap();
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 3);
         assert_eq!(get_u8(&out), &[1, 4, 2, 5, 3, 6]); // transpose
@@ -395,7 +825,7 @@ mod tests {
     fn test_transform_6_is_vertical_flip() {
         // Selecting transform 6 from EPICS must produce a vertical flip.
         let arr = make_3x2();
-        let out = apply_transform(&arr, TransformType::from_u8(6));
+        let out = apply_transform(&pool(), &arr, TransformType::from_u8(6)).unwrap();
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(get_u8(&out), &[4, 5, 6, 1, 2, 3]); // vertical flip
@@ -437,7 +867,7 @@ mod tests {
         // Horizontal flip of an RGB1 image: each pixel's 3 channels stay
         // together; only the x coordinate is mirrored.
         let arr = make_rgb1_2x2();
-        let out = apply_transform(&arr, TransformType::FlipHoriz);
+        let out = apply_transform(&pool(), &arr, TransformType::FlipHoriz).unwrap();
         // dims unchanged for a non-swapping transform
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
@@ -457,7 +887,7 @@ mod tests {
     #[test]
     fn test_rgb1_rot90cw_swaps_dims_and_keeps_color() {
         let arr = make_rgb1_2x2();
-        let out = apply_transform(&arr, TransformType::Rot90CW);
+        let out = apply_transform(&pool(), &arr, TransformType::Rot90CW).unwrap();
         // x/y swapped (both 2 here), color dim preserved
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
@@ -480,7 +910,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_3x2();
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims[0].size, 2); // swapped
         assert_eq!(result.output_arrays[0].dims[1].size, 3);

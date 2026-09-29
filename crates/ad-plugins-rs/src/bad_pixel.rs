@@ -276,7 +276,7 @@ impl BadPixelProcessor {
 }
 
 impl NDPluginProcess for BadPixelProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let info = array.info();
         let width = info.x_size;
         let height = info.y_size;
@@ -284,7 +284,7 @@ impl NDPluginProcess for BadPixelProcessor {
         let list = Arc::clone(&self.list.lock());
         if list.pixels.is_empty() {
             // No corrections needed, pass through
-            return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+            return ProcessResult::forward(array, vec![]);
         }
 
         // C `NDPluginBadPixel.cpp:99-109` reads the detector offset/binning from
@@ -302,7 +302,15 @@ impl NDPluginProcess for BadPixelProcessor {
             (0, 1)
         };
 
-        let mut out = array.clone();
+        // C copies the input through the pool before correcting it
+        // (NDPluginBadPixel.cpp:236).
+        let mut out = match pool.alloc_copy(array) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(error = %e, "bad pixel output allocation failed; dropping frame");
+                return ProcessResult::empty();
+            }
+        };
         Self::apply_corrections(
             &list,
             &mut out.data,
@@ -402,7 +410,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         assert_eq!(result.output_arrays.len(), 1);
         let out = &result.output_arrays[0];
@@ -449,7 +457,7 @@ mod tests {
         //   → x = 3, buffer offset 3.
         let proc = BadPixelProcessor::new(vec![set(3, 0, 7.0)]);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
 
         assert_eq!(out.data.get_as_f64(1), Some(7.0), "corrected element 1");
@@ -472,7 +480,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         // (3,2) = 3 + 2*4 = 11
@@ -494,7 +502,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         // (1,1) unchanged (50.0) since replacement source is bad
@@ -519,7 +527,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         // All 8 neighbors have value 10.0, so median = 10.0
@@ -553,6 +561,7 @@ mod tests {
         }];
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
         let out = &result.output_arrays[0];
         // 7x7 kernel minus center = 48 pixels. The radius-3 ring contributes
@@ -595,7 +604,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         // 7 valid neighbors (excluding center and (2,3)), all 10.0
@@ -616,7 +625,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         // Only 3 valid neighbors: (1,0), (0,1), (1,1)
@@ -635,7 +644,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         assert!((get_pixel(out, 0, 0, 4) - 50.0).abs() < 1e-10);
@@ -680,9 +689,11 @@ mod tests {
         let arr = make_2d_array(4, 4, |x, y| (x + y * 4) as f64);
         let proc = BadPixelProcessor::new(vec![]);
         let pool = NDArrayPool::new(1_000_000);
+        let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
 
         assert_eq!(result.output_arrays.len(), 1);
+        assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
         for iy in 0..4 {
             for ix in 0..4 {
                 let expected = (ix + iy * 4) as f64;
@@ -699,7 +710,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         assert!((get_pixel(out, 0, 0, 4) - 10.0).abs() < 1e-10);
@@ -721,7 +732,7 @@ mod tests {
 
         let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
-        let result = proc.process_array(&arr, &pool);
+        let result = proc.process_array(&Arc::new(arr), &pool);
 
         let out = &result.output_arrays[0];
         assert!((get_pixel(out, 1, 1, 4) - 0.0).abs() < 1e-10);
@@ -735,5 +746,30 @@ mod tests {
 
         proc.set_pixels(vec![set(0, 0, 0.0)]);
         assert_eq!(proc.pixels().len(), 1);
+    }
+
+    #[test]
+    fn bad_pixel_output_comes_from_the_pool_and_is_reused() {
+        let arr = make_2d_array(4, 4, |_, _| 100.0);
+        let proc = BadPixelProcessor::new(vec![set(1, 1, 0.0)]);
+        let pool = NDArrayPool::new(0);
+
+        let arr = Arc::new(arr);
+        let first = proc.process_array(&arr, &pool).output_arrays.remove(0);
+        assert_eq!(first.pool_id(), pool.id());
+        assert!((get_pixel(&first, 1, 1, 4) - 0.0).abs() < 1e-10);
+        assert!((get_pixel(&first, 0, 0, 4) - 100.0).abs() < 1e-10);
+        let NDDataBuffer::F64(v) = &first.data else {
+            panic!("expected F64 buffer");
+        };
+        let ptr = v.as_ptr();
+        drop(first);
+
+        let second = proc.process_array(&arr, &pool).output_arrays.remove(0);
+        let NDDataBuffer::F64(v) = &second.data else {
+            panic!("expected F64 buffer");
+        };
+        assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 }

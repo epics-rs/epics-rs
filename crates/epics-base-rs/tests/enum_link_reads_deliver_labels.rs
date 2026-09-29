@@ -120,7 +120,7 @@ async fn lsi_inp_at_char_array_source_reads_the_bytes() {
         let rec = db.get_record("WFC").unwrap();
         let mut inst = rec.write();
         inst.record
-            .put_field_internal("VAL", EpicsValue::CharArray(b"hello".to_vec()))
+            .put_field_internal("VAL", EpicsValue::CharArray(b"hello".to_vec().into()))
             .unwrap();
     }
     process(&db, "LIC").await;

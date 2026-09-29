@@ -302,10 +302,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// Process an incoming array: auto_save, capture buffering, stream write.
-    pub fn process_array(&mut self, array: &NDArray) -> ProcessResult {
+    ///
+    /// The frame is kept by reference, as C's `pArray->reserve()` keeps it
+    /// (NDPluginFile.cpp:744); nothing here copies the data.
+    pub fn process_array(&mut self, array: &Arc<NDArray>) -> ProcessResult {
         let mut proc_result = ProcessResult::empty();
-        let array = Arc::new(array.clone());
-        self.latest_array = Some(array.clone());
+        let array = Arc::clone(array);
+        self.latest_array = Some(Arc::clone(&array));
 
         // G9: FilePluginDestination routing — skip frames not for this plugin.
         if !self.destination_matches(&array) {
@@ -819,7 +822,7 @@ mod tests {
             self.opens += 1;
             Ok(())
         }
-        fn write_file(&mut self, _a: &NDArray) -> ADResult<()> {
+        fn write_file(&mut self, _a: &Arc<NDArray>) -> ADResult<()> {
             self.writes += 1;
             if let Some(n) = self.fail_write_after {
                 if self.writes > n {
@@ -879,15 +882,27 @@ mod tests {
         c.auto_save = true;
 
         // Destination = a different port → skipped.
-        c.process_array(&with_str_attr(array(1), "FilePluginDestination", "OTHER"));
+        c.process_array(&Arc::new(with_str_attr(
+            array(1),
+            "FilePluginDestination",
+            "OTHER",
+        )));
         assert_eq!(c.writer.writes, 0, "frame for OTHER port must be skipped");
 
         // Destination = this port → written.
-        c.process_array(&with_str_attr(array(2), "FilePluginDestination", "MYFILE"));
+        c.process_array(&Arc::new(with_str_attr(
+            array(2),
+            "FilePluginDestination",
+            "MYFILE",
+        )));
         assert_eq!(c.writer.writes, 1);
 
         // Destination = "all" → written.
-        c.process_array(&with_str_attr(array(3), "FilePluginDestination", "all"));
+        c.process_array(&Arc::new(with_str_attr(
+            array(3),
+            "FilePluginDestination",
+            "all",
+        )));
         assert_eq!(c.writer.writes, 2);
     }
 
@@ -902,7 +917,11 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Single);
         c.auto_save = true;
 
-        c.process_array(&with_i32_attr(array(1), "FilePluginDestination", 42));
+        c.process_array(&Arc::new(with_i32_attr(
+            array(1),
+            "FilePluginDestination",
+            42,
+        )));
         assert_eq!(
             c.writer.writes, 1,
             "numeric FilePluginDestination must be ignored (frame processed), \
@@ -948,7 +967,11 @@ mod tests {
         c.auto_save = true;
 
         // "all" 3-char prefix (C: epicsStrnCaseCmp(dest,"all",3)==0) → processed.
-        c.process_array(&with_str_attr(array(1), "FilePluginDestination", "allfoo"));
+        c.process_array(&Arc::new(with_str_attr(
+            array(1),
+            "FilePluginDestination",
+            "allfoo",
+        )));
         assert_eq!(
             c.writer.writes, 1,
             "destination with \"all\" prefix is processed (C 3-char prefix match)"
@@ -956,7 +979,11 @@ mod tests {
 
         // Non-empty 1-char destination that is neither an "all" prefix nor the
         // port name → skipped (C compares it; Rust must not blanket-process).
-        c.process_array(&with_str_attr(array(2), "FilePluginDestination", "x"));
+        c.process_array(&Arc::new(with_str_attr(
+            array(2),
+            "FilePluginDestination",
+            "x",
+        )));
         assert_eq!(
             c.writer.writes, 1,
             "1-char non-matching destination is skipped, not blanket-processed"
@@ -972,13 +999,13 @@ mod tests {
         c.file_base.set_num_capture(10);
         c.lazy_open = true;
         let mut updates = Vec::new();
-        c.process_array(&array(1)); // cache an array
+        c.process_array(&Arc::new(array(1))); // cache an array
         c.start_capture(&mut updates).unwrap();
         let _ = &updates;
-        c.process_array(&array(2)); // opens + writes
+        c.process_array(&Arc::new(array(2))); // opens + writes
         assert!(c.file_base.is_open());
 
-        c.process_array(&with_i32_attr(array(3), "FilePluginClose", 1));
+        c.process_array(&Arc::new(with_i32_attr(array(3), "FilePluginClose", 1)));
         assert!(
             !c.file_base.is_open(),
             "FilePluginClose must close the file"
@@ -1009,7 +1036,7 @@ mod tests {
         c.set_port_name("F");
         c.file_base.set_mode(NDFileMode::Stream);
         c.lazy_open = false;
-        c.process_array(&array(1)); // cache a frame for the layout
+        c.process_array(&Arc::new(array(1))); // cache a frame for the layout
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
         assert!(
@@ -1026,14 +1053,14 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Stream);
         c.file_base.set_num_capture(10);
         c.lazy_open = true;
-        c.process_array(&array(1));
+        c.process_array(&Arc::new(array(1)));
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
         assert!(
             !c.file_base.is_open(),
             "lazy stream does NOT open at capture start"
         );
-        c.process_array(&array(2));
+        c.process_array(&Arc::new(array(2)));
         assert!(c.file_base.is_open(), "lazy stream opens on first frame");
     }
 
@@ -1047,17 +1074,17 @@ mod tests {
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
 
-        c.process_array(&array(1)); // first frame: 4-element, recorded
+        c.process_array(&Arc::new(array(1))); // first frame: 4-element, recorded
         assert_eq!(c.file_base.num_captured(), 1);
 
         // Mismatched frame: different dimension size → rejected.
         let mut big = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt8);
         big.unique_id = 2;
-        c.process_array(&big);
+        c.process_array(&Arc::new(big));
         assert_eq!(c.file_base.num_captured(), 1, "mismatched frame rejected");
 
         // Matching frame: accepted.
-        c.process_array(&array(3));
+        c.process_array(&Arc::new(array(3)));
         assert_eq!(c.file_base.num_captured(), 2);
     }
 
@@ -1096,7 +1123,7 @@ mod tests {
         c.params.capture = Some(7);
         c.file_base.set_mode(NDFileMode::Stream);
         c.file_base.set_num_capture(0);
-        c.process_array(&array(1));
+        c.process_array(&Arc::new(array(1)));
 
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
@@ -1135,7 +1162,7 @@ mod tests {
         c.params.capture = Some(7);
         c.file_base.set_mode(NDFileMode::Stream);
         c.file_base.set_num_capture(0);
-        c.process_array(&array(1));
+        c.process_array(&Arc::new(array(1)));
 
         let on = PluginParamSnapshot {
             enable_callbacks: true,
@@ -1177,7 +1204,7 @@ mod tests {
         c.file_base.set_num_capture(10);
         c.params.write_mode = Some(5);
         c.lazy_open = false;
-        c.process_array(&array(1));
+        c.process_array(&Arc::new(array(1)));
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
         assert!(c.file_base.is_open());
@@ -1208,7 +1235,7 @@ mod tests {
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
         for id in 1..=5 {
-            c.process_array(&array(id));
+            c.process_array(&Arc::new(array(id)));
         }
         assert_eq!(
             c.file_base.num_captured(),
@@ -1217,6 +1244,17 @@ mod tests {
         );
         assert_eq!(c.writer.writes, 0, "num_capture==0 never auto-flushes");
         assert!(c.capture_active, "still capturing");
+    }
+
+    /// The controller keeps the frame it was handed, as C's `pArray->reserve()`
+    /// does (NDPluginFile.cpp:744); it never copies the data.
+    #[test]
+    fn the_latest_array_is_the_input_arc_itself() {
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        let input = Arc::new(array(1));
+        c.process_array(&input);
+        assert!(Arc::ptr_eq(c.latest_array.as_ref().unwrap(), &input));
     }
 
     #[test]
@@ -1231,10 +1269,10 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Stream);
         c.file_base.set_num_capture(0);
         let mut updates = Vec::new();
-        c.process_array(&array(1)); // latest_array for the eager open
+        c.process_array(&Arc::new(array(1))); // latest_array for the eager open
         c.start_capture(&mut updates).unwrap();
         for (id, expected) in [(2, 1), (3, 2)] {
-            let r = c.process_array(&array(id));
+            let r = c.process_array(&Arc::new(array(id)));
             let published = r.param_updates.iter().find_map(|u| match u {
                 ParamUpdate::Int32 {
                     reason: 42, value, ..
@@ -1257,7 +1295,7 @@ mod tests {
         c.params.array_counter = Some(99);
         c.file_base.set_mode(NDFileMode::Single);
         c.auto_save = true;
-        let r1 = c.process_array(&array(1));
+        let r1 = c.process_array(&Arc::new(array(1)));
         let counter1 = r1.param_updates.iter().find_map(|u| match u {
             ParamUpdate::Int32 {
                 reason: 99, value, ..
@@ -1265,7 +1303,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(counter1, Some(1), "first saved frame → ArrayCounter 1");
-        let r2 = c.process_array(&array(2));
+        let r2 = c.process_array(&Arc::new(array(2)));
         let counter2 = r2.param_updates.iter().find_map(|u| match u {
             ParamUpdate::Int32 {
                 reason: 99, value, ..
@@ -1324,7 +1362,7 @@ mod tests {
 
         let mut last = ProcessResult::empty();
         for id in 1..=4 {
-            last = c.process_array(&array(id));
+            last = c.process_array(&Arc::new(array(id)));
         }
 
         assert_eq!(
@@ -1362,7 +1400,7 @@ mod tests {
 
         let mut last = ProcessResult::empty();
         for id in 1..=4 {
-            last = c.process_array(&array(id));
+            last = c.process_array(&Arc::new(array(id)));
         }
 
         assert!(
@@ -1386,7 +1424,7 @@ mod tests {
         c.capture_active = true;
         c.writer.fail_close = true;
 
-        let r = c.process_array(&array(1));
+        let r = c.process_array(&Arc::new(array(1)));
 
         assert_eq!(
             int_update(&r.param_updates, NUM_CAPTURED),
@@ -1408,7 +1446,7 @@ mod tests {
         let mut c = capture_controller(false);
         c.file_base.set_num_capture(0); // buffer forever, never auto-flush
         for id in 1..=4 {
-            c.process_array(&array(id));
+            c.process_array(&Arc::new(array(id)));
         }
         assert_eq!(c.file_base.num_captured(), 4, "all four are buffered");
 
@@ -1438,7 +1476,7 @@ mod tests {
 
         let mut last = ProcessResult::empty();
         for id in 1..=4 {
-            last = c.process_array(&array(id));
+            last = c.process_array(&Arc::new(array(id)));
         }
 
         assert_eq!(c.file_base.num_captured(), 0);

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
@@ -153,9 +154,12 @@ impl MagickWriter {
             NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3
         );
 
-        // Convert to RGB1 layout if needed (image crate expects interleaved RGB)
+        // Convert to RGB1 layout if needed (image crate expects interleaved RGB).
+        // The scratch comes from the frame's own pool (C `pArray->pNDArrayPool`),
+        // or a throwaway one for a frame that has none.
         let src = if is_rgb && color != NDColorMode::RGB1 {
-            &convert_rgb_layout(array, color, NDColorMode::RGB1)?
+            let pool = array.pool().unwrap_or_else(|| NDArrayPool::new(0));
+            &convert_rgb_layout(&pool, array, color, NDColorMode::RGB1)?
         } else {
             array
         };
@@ -291,7 +295,7 @@ impl NDFileWriter for MagickWriter {
         Ok(())
     }
 
-    fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
         let path = self
             .current_path
             .as_ref()
@@ -450,7 +454,7 @@ impl MagickFileProcessor {
 }
 
 impl NDPluginProcess for MagickFileProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.ctrl.lock().process_array(array)
     }
 
@@ -540,7 +544,7 @@ mod tests {
         writer
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
-        let err = writer.write_file(&arr).unwrap_err();
+        let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
@@ -571,7 +575,7 @@ mod tests {
             .open_file(&path, NDFileMode::Single, &arr)
             .expect("open");
         writer
-            .write_file(&arr)
+            .write_file(&Arc::new(arr))
             .expect("3-D WITH ColorMode=RGB1 must still write");
         assert!(path.exists());
         std::fs::remove_file(&path).ok();
@@ -593,7 +597,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
         assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
@@ -621,7 +625,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
         assert_eq!(read_back.data.data_type(), NDDataType::UInt16);
@@ -661,7 +665,7 @@ mod tests {
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
 
         let read_back = writer.read_file().unwrap();
         assert_eq!(read_back.dims.len(), 3);
@@ -744,7 +748,7 @@ mod tests {
         w_none
             .open_file(&path_none, NDFileMode::Single, &arr)
             .unwrap();
-        w_none.write_file(&arr).unwrap();
+        w_none.write_file(&Arc::new(arr.clone())).unwrap();
         w_none.close_file().unwrap();
 
         let path_zip = temp_path("png");
@@ -753,7 +757,7 @@ mod tests {
         w_zip
             .open_file(&path_zip, NDFileMode::Single, &arr)
             .unwrap();
-        w_zip.write_file(&arr).unwrap();
+        w_zip.write_file(&Arc::new(arr)).unwrap();
         w_zip.close_file().unwrap();
 
         let size_none = std::fs::metadata(&path_none).unwrap().len();

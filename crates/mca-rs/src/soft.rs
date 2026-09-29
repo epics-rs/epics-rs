@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn a_read_publishes_nuse_channels_of_whatever_is_in_the_buffer() {
         let (mut dev, mut rec) = soft_mca(16);
-        rec.put_field("VAL", EpicsValue::LongArray(vec![7; 16]))
+        rec.put_field("VAL", EpicsValue::LongArray(vec![7; 16].into()))
             .unwrap();
         rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
         rec.put_field("READ", EpicsValue::Enum(1)).unwrap();
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(rec.nord, 4);
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::LongArray(vec![7, 7, 7, 7]))
+            Some(EpicsValue::LongArray(vec![7, 7, 7, 7].into()))
         );
     }
 
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn a_start_completes_within_the_cycle_and_the_spectrum_is_read() {
         let (mut dev, mut rec) = soft_mca(16);
-        rec.put_field("VAL", EpicsValue::LongArray(vec![3; 16]))
+        rec.put_field("VAL", EpicsValue::LongArray(vec![3; 16].into()))
             .unwrap();
         rec.nord = 0;
 
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn the_regions_are_summed_over_the_spectrum_a_client_supplied() {
         let (mut dev, mut rec) = soft_mca(16);
-        rec.put_field("VAL", EpicsValue::LongArray(vec![10; 16]))
+        rec.put_field("VAL", EpicsValue::LongArray(vec![10; 16].into()))
             .unwrap();
         rec.roi[0] = crate::record::Roi {
             lo: 0,

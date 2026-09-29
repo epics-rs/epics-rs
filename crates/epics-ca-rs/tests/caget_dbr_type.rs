@@ -67,7 +67,7 @@ async fn server_with_double_waveform(
     ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
-    ch.put(&EpicsValue::DoubleArray(seed))
+    ch.put(&EpicsValue::DoubleArray(seed.into()))
         .await
         .expect("seed waveform");
     (client, ch)

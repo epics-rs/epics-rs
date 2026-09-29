@@ -78,7 +78,7 @@ struct Unlocked {
 }
 
 impl NDPluginProcess for Unlocked {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
         ProcessResult::empty()
@@ -98,7 +98,7 @@ struct Locked {
 }
 
 impl NDPluginProcess for Locked {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);
         ProcessResult::empty()
@@ -205,7 +205,7 @@ fn report(what: &str, one: std::time::Duration, four: std::time::Duration) -> f6
 #[ignore = "wall-clock measurement"]
 fn measure_pool_throughput() {
     let wiring = Arc::new(WiringRegistry::new());
-    let pool = Arc::new(NDArrayPool::new(64_000_000));
+    let pool = NDArrayPool::new(64_000_000);
     let frames = frames();
 
     let (unlocked, _jh1) = create_plugin_runtime(
@@ -257,7 +257,7 @@ fn measure_pool_throughput() {
 #[ignore = "wall-clock measurement"]
 fn measure_shipped_plugin_throughput() {
     let wiring = Arc::new(WiringRegistry::new());
-    let pool = Arc::new(NDArrayPool::new(512_000_000));
+    let pool = NDArrayPool::new(512_000_000);
     let ts_registry = TsReceiverRegistry::new();
     let mut rows: Vec<(&str, std::time::Duration, std::time::Duration)> = Vec::new();
     let frames = frames();

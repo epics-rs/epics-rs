@@ -2100,13 +2100,13 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
         PvField::ScalarArrayTyped(arr) => {
             use epics_pva_rs::pvdata::TypedScalarArray;
             match arr {
-                TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_vec())),
-                TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_vec())),
-                TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_vec())),
+                TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_shared())),
+                TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_shared())),
+                TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_shared())),
                 // a remote `long[]` is 64-bit per element;
                 // preserve the full width as `Int64Array`.
-                TypedScalarArray::Long(a) => Some(EpicsValue::Int64Array(a.to_vec())),
-                TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_vec())),
+                TypedScalarArray::Long(a) => Some(EpicsValue::Int64Array(a.to_shared())),
+                TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_shared())),
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
@@ -2118,12 +2118,12 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 )),
                 // a remote `ulong[]` is 64-bit per element;
                 // preserve the full width as `UInt64Array`.
-                TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_vec())),
+                TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_shared())),
                 TypedScalarArray::Byte(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
-                TypedScalarArray::UByte(a) => Some(EpicsValue::CharArray(a.to_vec())),
-                TypedScalarArray::String(a) => Some(EpicsValue::StringArray(a.to_vec())),
+                TypedScalarArray::UByte(a) => Some(EpicsValue::CharArray(a.to_shared())),
+                TypedScalarArray::String(a) => Some(EpicsValue::StringArray(a.to_shared())),
                 TypedScalarArray::Boolean(a) => Some(EpicsValue::LongArray(
                     a.iter().map(|v| if *v { 1 } else { 0 }).collect(),
                 )),
@@ -2257,7 +2257,7 @@ mod tests {
         // already-selected field here).
         assert_eq!(
             pvfield_to_epics_value(&union),
-            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5].into())),
             "selected union must convert to its floatValue member"
         );
         // And on the whole NTNDArray struct: the `value`-child recursion
@@ -2266,7 +2266,7 @@ mod tests {
         nd.fields.push(("value".into(), union));
         assert_eq!(
             pvfield_to_epics_value(&PvField::Structure(nd)),
-            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5].into())),
         );
     }
 
@@ -2284,21 +2284,21 @@ mod tests {
                 ScalarValue::Float(1.5),
                 ScalarValue::Float(-2.5),
             ])),
-            Some(EpicsValue::FloatArray(vec![1.5, -2.5]))
+            Some(EpicsValue::FloatArray(vec![1.5, -2.5].into()))
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArray(vec![
                 ScalarValue::Short(-7),
                 ScalarValue::Short(8),
             ])),
-            Some(EpicsValue::ShortArray(vec![-7, 8]))
+            Some(EpicsValue::ShortArray(vec![-7, 8].into()))
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArray(vec![
                 ScalarValue::UByte(0x55),
                 ScalarValue::UByte(0xFF),
             ])),
-            Some(EpicsValue::CharArray(vec![0x55, 0xFF]))
+            Some(EpicsValue::CharArray(vec![0x55, 0xFF].into()))
         );
         // pvByte → ShortArray (signed widen).
         assert_eq!(
@@ -2306,14 +2306,14 @@ mod tests {
                 ScalarValue::Byte(-1),
                 ScalarValue::Byte(2),
             ])),
-            Some(EpicsValue::ShortArray(vec![-1, 2]))
+            Some(EpicsValue::ShortArray(vec![-1, 2].into()))
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArray(vec![
                 ScalarValue::String("a".into()),
                 ScalarValue::String("b".into()),
             ])),
-            Some(EpicsValue::StringArray(vec!["a".into(), "b".into()]))
+            Some(EpicsValue::StringArray(vec!["a".into(), "b".into()].into()))
         );
 
         // Typed-fast-path variants emitted by the wire decoder.
@@ -2321,19 +2321,19 @@ mod tests {
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::Float(
                 vec![3.25f32, -4.5].into()
             ))),
-            Some(EpicsValue::FloatArray(vec![3.25, -4.5]))
+            Some(EpicsValue::FloatArray(vec![3.25, -4.5].into()))
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::String(
                 vec!["x".into(), "y".into()].into()
             ))),
-            Some(EpicsValue::StringArray(vec!["x".into(), "y".into()]))
+            Some(EpicsValue::StringArray(vec!["x".into(), "y".into()].into()))
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::UByte(
                 vec![1u8, 2, 3].into()
             ))),
-            Some(EpicsValue::CharArray(vec![1, 2, 3]))
+            Some(EpicsValue::CharArray(vec![1, 2, 3].into()))
         );
     }
 
@@ -2372,7 +2372,7 @@ mod tests {
                 ScalarValue::ULong(big_u),
                 ScalarValue::ULong(1),
             ])),
-            Some(EpicsValue::UInt64Array(vec![big_u, 1])),
+            Some(EpicsValue::UInt64Array(vec![big_u, 1].into())),
             "remote ulong[] must keep all 64 bits per element"
         );
         // Untyped `long[]` → `Int64Array`.
@@ -2381,7 +2381,7 @@ mod tests {
                 ScalarValue::Long(big_i),
                 ScalarValue::Long(-1),
             ])),
-            Some(EpicsValue::Int64Array(vec![big_i, -1])),
+            Some(EpicsValue::Int64Array(vec![big_i, -1].into())),
             "remote long[] must keep all 64 bits per element"
         );
 
@@ -2390,7 +2390,7 @@ mod tests {
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::ULong(
                 vec![big_u, 2].into()
             ))),
-            Some(EpicsValue::UInt64Array(vec![big_u, 2])),
+            Some(EpicsValue::UInt64Array(vec![big_u, 2].into())),
             "typed remote ulong[] must keep all 64 bits per element"
         );
         // Typed-fast-path `long[]` → `Int64Array`.
@@ -2398,7 +2398,7 @@ mod tests {
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::Long(
                 vec![big_i, -2].into()
             ))),
-            Some(EpicsValue::Int64Array(vec![big_i, -2])),
+            Some(EpicsValue::Int64Array(vec![big_i, -2].into())),
             "typed remote long[] must keep all 64 bits per element"
         );
     }
@@ -2432,7 +2432,7 @@ mod tests {
                 ScalarValue::UInt(big),
                 ScalarValue::UInt(1),
             ])),
-            Some(EpicsValue::Int64Array(vec![big_i, 1])),
+            Some(EpicsValue::Int64Array(vec![big_i, 1].into())),
             "remote uint[] above i32::MAX must stay unsigned per element"
         );
 
@@ -2441,7 +2441,7 @@ mod tests {
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::UInt(
                 vec![big, 2].into()
             ))),
-            Some(EpicsValue::Int64Array(vec![big_i, 2])),
+            Some(EpicsValue::Int64Array(vec![big_i, 2].into())),
             "typed remote uint[] above i32::MAX must stay unsigned per element"
         );
     }
@@ -4443,7 +4443,7 @@ mod tests {
         out_array_typed_path_case(
             "MR_R23:PV",
             ScalarType::ULong,
-            EpicsValue::UInt64Array(vec![1, 2, u64::MAX]),
+            EpicsValue::UInt64Array(vec![1, 2, u64::MAX].into()),
             // u64::MAX as the i64 bit pattern is -1; the test
             // compares 64-bit words, so full-width u64 is preserved.
             &[1, 2, u64::MAX as i64],
@@ -4466,7 +4466,7 @@ mod tests {
         out_array_typed_path_case(
             "EX_R10:PV",
             ScalarType::Long,
-            EpicsValue::Int64Array(vec![-3, 0, i64::MAX]),
+            EpicsValue::Int64Array(vec![-3, 0, i64::MAX].into()),
             &[-3, 0, i64::MAX],
         )
         .await;

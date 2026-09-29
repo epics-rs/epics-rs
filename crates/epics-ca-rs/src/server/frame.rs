@@ -467,7 +467,7 @@ mod tests {
     fn size_dbr_reply_covers_every_requested_count_boundary() {
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
-        let elems = || EpicsValue::LongArray(vec![1, 2, 3, 4]);
+        let elems = || EpicsValue::LongArray(vec![1, 2, 3, 4].into());
 
         // requested < native: framed at the request count, and the surviving
         // bytes are the leading elements (nothing shifted).
@@ -511,12 +511,18 @@ mod tests {
         let meta = epics_base_rs::types::dbr_buffer_size(DBR_TIME_LONG, native, 0);
         assert!(meta > 0, "DBR_TIME_LONG must carry metadata");
 
-        let (mut frame, actual) = encoded(DBR_TIME_LONG, EpicsValue::LongArray(vec![1, 2, 3, 4]));
+        let (mut frame, actual) = encoded(
+            DBR_TIME_LONG,
+            EpicsValue::LongArray(vec![1, 2, 3, 4].into()),
+        );
         assert_eq!(frame.payload_len(), meta + 16);
         assert_eq!(size_dbr_reply(&mut frame, DBR_TIME_LONG, actual, 1), 1);
         assert_eq!(frame.payload_len(), meta + 4);
 
-        let (mut frame, actual) = encoded(DBR_TIME_LONG, EpicsValue::LongArray(vec![1, 2, 3, 4]));
+        let (mut frame, actual) = encoded(
+            DBR_TIME_LONG,
+            EpicsValue::LongArray(vec![1, 2, 3, 4].into()),
+        );
         assert_eq!(size_dbr_reply(&mut frame, DBR_TIME_LONG, actual, 5), 5);
         assert_eq!(frame.payload_len(), meta + 20);
     }

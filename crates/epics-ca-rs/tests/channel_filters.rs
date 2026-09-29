@@ -111,7 +111,7 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
     ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed write");
-    ch.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+    ch.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
         .await
         .expect("seed VAL with [0..9]");
 
@@ -172,7 +172,7 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
     seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
         .await
         .expect("seed VAL");
 
@@ -189,7 +189,7 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
 
     // Update VAL to [100..109]; the monitor must re-apply the chain on
     // the update → exactly [105,106,107] (unfiltered would start at 100).
-    seed.put(&EpicsValue::DoubleArray(ramp(100.0, 10)))
+    seed.put(&EpicsValue::DoubleArray(ramp(100.0, 10).into()))
         .await
         .expect("update VAL with [100..109]");
     let update = recv_value(&mut monitor).await;
@@ -210,7 +210,7 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
 async fn ca_fr_8_simplepv_monitor_applies_arr() {
     let server = CaServer::builder()
         .port(0)
-        .pv("CAFR8:SP:R3", EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .pv("CAFR8:SP:R3", EpicsValue::DoubleArray(ramp(0.0, 10).into()))
         .build()
         .await
         .expect("build CA server");
@@ -242,7 +242,7 @@ async fn ca_fr_8_simplepv_monitor_applies_arr() {
         .await
         .expect("connect writer channel");
     writer
-        .put(&EpicsValue::DoubleArray(ramp(100.0, 10)))
+        .put(&EpicsValue::DoubleArray(ramp(100.0, 10).into()))
         .await
         .expect("update SimplePv value");
     let update = recv_value(&mut monitor).await;
@@ -324,7 +324,7 @@ async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
     seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
         .await
         .expect("seed VAL");
 
@@ -389,7 +389,7 @@ async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
     seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
         .await
         .expect("seed VAL");
 

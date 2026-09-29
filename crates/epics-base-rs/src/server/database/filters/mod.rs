@@ -563,7 +563,7 @@ mod tests {
         let chain = parse_filter_chain(r#"{"arr":{"s":1,"e":2}}"#);
         let out = chain
             .apply_to_event_value(
-                EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+                EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
                 EventMask::VALUE,
             )
             .expect("arr passes the event through");

@@ -18,6 +18,7 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
 #[cfg(feature = "parallel")]
 use crate::par_util;
+use crate::stats::{StatsElem, merge_range};
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -256,114 +257,109 @@ impl ROIStatProcessor {
         size: [usize; 2],
         bgd_width: usize,
     ) -> ROIStatResult {
-        let offset_x = offset[0];
-        let size_x = size[0];
+        ad_core_rs::with_buffer!(data, |v| roi_stats_of(
+            v,
+            ndims,
+            array_size_x,
+            offset,
+            size,
+            bgd_width
+        ))
+    }
+}
 
-        let mut min = f64::MAX;
-        let mut max = f64::MIN;
-        let mut total = 0.0f64;
-        let mut bgd = 0.0f64;
-        let mut n_bgd = 0usize;
-        let n_elements;
+/// One ROI reduced over the typed frame. Each row of the rectangle goes
+/// through [`StatsElem::range`], the kernel `compute_stats` runs, so the
+/// extremes are taken in the element type under C's strict compare and the
+/// total in its exact accumulator; a background strip only needs the total.
+/// A rectangle that does not fit the buffer yields the zero result.
+fn roi_stats_of<T: StatsElem>(
+    v: &[T],
+    ndims: usize,
+    array_size_x: usize,
+    offset: [usize; 2],
+    size: [usize; 2],
+    bgd_width: usize,
+) -> ROIStatResult {
+    let (offset_x, size_x) = (offset[0], size[0]);
+    let mut bgd = 0.0f64;
+    let mut n_bgd = 0usize;
+    let n_elements;
 
-        if ndims == 1 {
-            if size_x == 0 {
-                return ROIStatResult::default();
-            }
-            n_elements = size_x;
-            for x in offset_x..offset_x + size_x {
-                let v = data.get_as_f64(x).unwrap_or(0.0);
-                min = min.min(v);
-                max = max.max(v);
-                total += v;
-            }
-            if bgd_width > 0 {
-                let bw_x = bgd_width.min(size_x);
-                for x in offset_x..offset_x + bw_x {
-                    n_bgd += 1;
-                    bgd += data.get_as_f64(x).unwrap_or(0.0);
-                }
-                for x in (offset_x + size_x - bw_x)..(offset_x + size_x) {
-                    n_bgd += 1;
-                    bgd += data.get_as_f64(x).unwrap_or(0.0);
-                }
-            }
-        } else if ndims == 2 {
-            let offset_y = offset[1];
-            let size_y = size[1];
-            if size_x == 0 || size_y == 0 {
-                return ROIStatResult::default();
-            }
-            n_elements = size_x * size_y;
-            for y in offset_y..offset_y + size_y {
-                let row = y * array_size_x;
-                for x in offset_x..offset_x + size_x {
-                    let v = data.get_as_f64(row + x).unwrap_or(0.0);
-                    min = min.min(v);
-                    max = max.max(v);
-                    total += v;
-                }
-            }
-            if bgd_width > 0 {
-                let bw_x = bgd_width.min(size_x);
-                let bw_y = bgd_width.min(size_y);
-                // Top and bottom bw_y rows (full ROI width).
-                for y in offset_y..offset_y + bw_y {
-                    let row = y * array_size_x;
-                    for x in offset_x..offset_x + size_x {
-                        n_bgd += 1;
-                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
-                    }
-                }
-                for y in (offset_y + size_y - bw_y)..(offset_y + size_y) {
-                    let row = y * array_size_x;
-                    for x in offset_x..offset_x + size_x {
-                        n_bgd += 1;
-                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
-                    }
-                }
-                // Left and right bw_x columns of the middle rows.
-                for y in (offset_y + bw_y)..(offset_y + size_y - bw_y) {
-                    let row = y * array_size_x;
-                    for x in offset_x..offset_x + bw_x {
-                        n_bgd += 1;
-                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
-                    }
-                    for x in (offset_x + size_x - bw_x)..(offset_x + size_x) {
-                        n_bgd += 1;
-                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
-                    }
-                }
-            }
-        } else {
+    let range = if ndims == 1 {
+        if size_x == 0 || offset_x + size_x > v.len() {
             return ROIStatResult::default();
         }
-
-        if n_elements == 0 {
+        n_elements = size_x;
+        let strip = &v[offset_x..offset_x + size_x];
+        if bgd_width > 0 {
+            let bw_x = bgd_width.min(size_x);
+            n_bgd += 2 * bw_x;
+            bgd += T::range(&strip[..bw_x]).total;
+            bgd += T::range(&strip[size_x - bw_x..]).total;
+        }
+        T::range(strip)
+    } else if ndims == 2 {
+        let (offset_y, size_y) = (offset[1], size[1]);
+        if size_x == 0 || size_y == 0 {
             return ROIStatResult::default();
         }
-
-        // C (NDPluginROIStat.cpp:128-135):
-        //   if (nBgd > 0) bgd = bgd/nBgd * nElements;
-        //   net  = total - bgd;          (bgd stays 0 when bgdWidth == 0)
-        //   mean = total / nElements;
-        let bgd_scaled = if n_bgd > 0 {
-            bgd / n_bgd as f64 * n_elements as f64
-        } else {
-            0.0
+        let row = |y: usize| -> Option<&[T]> {
+            let start = y * array_size_x + offset_x;
+            v.get(start..start + size_x)
         };
-        ROIStatResult {
-            min,
-            max,
-            mean: total / n_elements as f64,
-            total,
-            net: total - bgd_scaled,
+        let Some(rows) = (offset_y..offset_y + size_y)
+            .map(row)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return ROIStatResult::default();
+        };
+        n_elements = size_x * size_y;
+        if bgd_width > 0 {
+            let bw_x = bgd_width.min(size_x);
+            let bw_y = bgd_width.min(size_y);
+            // Top and bottom bw_y rows (full ROI width).
+            for &r in rows[..bw_y].iter().chain(&rows[size_y - bw_y..]) {
+                n_bgd += size_x;
+                bgd += T::range(r).total;
+            }
+            // Left and right bw_x columns of the middle rows: none when the
+            // top and bottom borders already overlap (C's loop bounds cross).
+            for &r in rows.get(bw_y..size_y - bw_y).unwrap_or(&[]) {
+                n_bgd += 2 * bw_x;
+                bgd += T::range(&r[..bw_x]).total;
+                bgd += T::range(&r[size_x - bw_x..]).total;
+            }
         }
+        rows.iter()
+            .map(|&r| T::range(r))
+            .reduce(merge_range)
+            .expect("size_y > 0")
+    } else {
+        return ROIStatResult::default();
+    };
+
+    // C (NDPluginROIStat.cpp:128-135):
+    //   if (nBgd > 0) bgd = bgd/nBgd * nElements;
+    //   net  = total - bgd;          (bgd stays 0 when bgdWidth == 0)
+    //   mean = total / nElements;
+    let bgd_scaled = if n_bgd > 0 {
+        bgd / n_bgd as f64 * n_elements as f64
+    } else {
+        0.0
+    };
+    let total = range.total;
+    ROIStatResult {
+        min: range.min.to_f64(),
+        max: range.max.to_f64(),
+        mean: total / n_elements as f64,
+        total,
+        net: total - bgd_scaled,
     }
 }
 
 impl NDPluginProcess for ROIStatProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // NDPluginROIStat operates on the raw array dimensions like the C
         // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
         // or 2-D arrays are supported; C errors and yields zero stats for
@@ -816,7 +812,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.min - 10.0).abs() < 1e-10);
@@ -839,7 +835,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // ROI pixels: (2,2)=18, (3,2)=19, (4,2)=20, (2,3)=26, (3,3)=27, (4,3)=28, (2,4)=34, (3,4)=35, (4,4)=36
@@ -871,7 +867,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r0 = &proc.results()[0];
         assert!((r0.min - 0.0).abs() < 1e-10);
@@ -902,7 +898,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // ROI is 4x4 at (1,1): border pixels = 12 (all with value 10), center = 4 (value 100)
@@ -927,7 +923,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // C clamps a zero-size ROI to a single pixel (size >= 1) at the
         // clamped offset (0,0), so stats reflect that one pixel, not zero.
@@ -948,7 +944,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!(
@@ -969,7 +965,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         // C clamps offset to dim-1 (3,3) and size to 1, so the ROI is the
         // single corner pixel — stats reflect it, not zero.
@@ -993,7 +989,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         // Should be clamped to 2x2 region
@@ -1016,7 +1012,7 @@ mod tests {
 
         for i in 0..5 {
             let arr = make_2d_array(4, 4, |_, _| (i + 1) as f64);
-            proc.process_array(&arr, &pool);
+            proc.process_array(&Arc::new(arr), &pool);
         }
 
         // Check mean time series (stat index 2)
@@ -1047,7 +1043,7 @@ mod tests {
 
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.min - 1.0).abs() < 1e-10);
@@ -1089,7 +1085,7 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_2d_array(4, 4, |_, _| 7.0);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let data = rx.try_recv().unwrap();
         // 2 ROIs * 5 stats = 10 values
@@ -1158,7 +1154,7 @@ mod tests {
         let p = *proc.params_handle().lock();
 
         let pool = NDArrayPool::new(1_000_000);
-        let res = proc.process_array(&arr, &pool);
+        let res = proc.process_array(&Arc::new(arr), &pool);
 
         let find = |reason: usize, addr: i32| {
             res.param_updates.iter().find_map(|u| match u {
@@ -1195,12 +1191,221 @@ mod tests {
         }];
         let proc = ROIStatProcessor::new(rois, 0);
         let pool = NDArrayPool::new(1_000_000);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         let r = &proc.results()[0];
         assert!((r.total - 20.0).abs() < 1e-10, "total={}", r.total);
         assert!((r.min - 0.0).abs() < 1e-10);
         assert!((r.max - 10.0).abs() < 1e-10);
         assert!((r.net + 40.0).abs() < 1e-10, "net={}", r.net);
+    }
+
+    /// C `doComputeStatisticsT` (NDPluginROIStat.cpp:33-139) loop for loop,
+    /// in f64, over an f64 copy of the frame.
+    fn reference_roi_stats(
+        vals: &[f64],
+        ndims: usize,
+        asx: usize,
+        offset: [usize; 2],
+        size: [usize; 2],
+        bgd_width: usize,
+    ) -> ROIStatResult {
+        let (ox, sx, oy, sy) = (offset[0], size[0], offset[1], size[1]);
+        let (mut min, mut max, mut total, mut bgd, mut n_bgd) = (0.0, 0.0, 0.0, 0.0, 0usize);
+        let mut initial = true;
+        let mut see = |v: f64| {
+            if initial {
+                min = v;
+                max = v;
+                initial = false;
+            }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+            total += v;
+        };
+        let n_elements;
+        if ndims == 1 {
+            n_elements = sx;
+            for x in ox..ox + sx {
+                see(vals[x]);
+            }
+            let bw = bgd_width.min(sx);
+            if bgd_width > 0 {
+                for x in (ox..ox + bw).chain(ox + sx - bw..ox + sx) {
+                    n_bgd += 1;
+                    bgd += vals[x];
+                }
+            }
+        } else {
+            n_elements = sx * sy;
+            for y in oy..oy + sy {
+                for x in ox..ox + sx {
+                    see(vals[y * asx + x]);
+                }
+            }
+            let (bwx, bwy) = (bgd_width.min(sx), bgd_width.min(sy));
+            if bgd_width > 0 {
+                for y in (oy..oy + bwy).chain(oy + sy - bwy..oy + sy) {
+                    for x in ox..ox + sx {
+                        n_bgd += 1;
+                        bgd += vals[y * asx + x];
+                    }
+                }
+                for y in oy + bwy..oy + sy - bwy {
+                    for x in (ox..ox + bwx).chain(ox + sx - bwx..ox + sx) {
+                        n_bgd += 1;
+                        bgd += vals[y * asx + x];
+                    }
+                }
+            }
+        }
+        if n_bgd > 0 {
+            bgd = bgd / n_bgd as f64 * n_elements as f64;
+        }
+        ROIStatResult {
+            min,
+            max,
+            total,
+            mean: total / n_elements as f64,
+            net: total - bgd,
+        }
+    }
+
+    fn check_roi_stats_against_reference<T: Copy>(
+        name: &str,
+        make: impl Fn(usize) -> T,
+        wrap: fn(Vec<T>) -> NDDataBuffer,
+        to_f64: fn(T) -> f64,
+    ) {
+        let (asx, asy) = (37usize, 23usize);
+        let raw: Vec<T> = (0..asx * asy).map(&make).collect();
+        let vals: Vec<f64> = raw.iter().map(|&e| to_f64(e)).collect();
+        let data = wrap(raw);
+        // `net` is a difference of two sums, so its error scales with the
+        // total, not with itself: a border covering the whole ROI leaves an
+        // exact 0 in C's single accumulator and an ulp of `total` here.
+        let close = |what: String, got: f64, want: f64, scale: f64| {
+            let tol = 1e-9 * want.abs().max(scale.abs()).max(1.0);
+            assert!((got - want).abs() <= tol, "{what}: got {got}, want {want}");
+        };
+        // Widths on both sides of a LANES multiple, borders thinner than,
+        // equal to and thicker than half the size (the overlapping case).
+        for (ox, sx) in [(0, 1), (3, 5), (0, 16), (2, 17), (1, 33), (0, 37)] {
+            for bgd_width in [0, 1, 2, 3, 9, 40] {
+                let what = format!("{name} 1-D x={ox}+{sx} bgd={bgd_width}");
+                let got =
+                    ROIStatProcessor::compute_roi_stats(&data, 1, asx, [ox, 0], [sx, 1], bgd_width);
+                let want = reference_roi_stats(&vals, 1, asx, [ox, 0], [sx, 1], bgd_width);
+                for (f, g, w) in [
+                    ("min", got.min, want.min),
+                    ("max", got.max, want.max),
+                    ("total", got.total, want.total),
+                    ("mean", got.mean, want.mean),
+                    ("net", got.net, want.net),
+                ] {
+                    close(format!("{what} {f}"), g, w, want.total);
+                }
+                for (oy, sy) in [(0, 1), (4, 3), (0, 23), (7, 16)] {
+                    let what = format!("{name} 2-D x={ox}+{sx} y={oy}+{sy} bgd={bgd_width}");
+                    let got = ROIStatProcessor::compute_roi_stats(
+                        &data,
+                        2,
+                        asx,
+                        [ox, oy],
+                        [sx, sy],
+                        bgd_width,
+                    );
+                    let want = reference_roi_stats(&vals, 2, asx, [ox, oy], [sx, sy], bgd_width);
+                    for (f, g, w) in [
+                        ("min", got.min, want.min),
+                        ("max", got.max, want.max),
+                        ("total", got.total, want.total),
+                        ("mean", got.mean, want.mean),
+                        ("net", got.net, want.net),
+                    ] {
+                        close(format!("{what} {f}"), g, w, want.total);
+                    }
+                }
+            }
+        }
+    }
+
+    fn seq(i: usize) -> u32 {
+        (i as u32).wrapping_mul(2_654_435_761) >> 12
+    }
+
+    #[test]
+    fn roi_stats_match_the_c_loops_for_every_element_type() {
+        check_roi_stats_against_reference(
+            "i8",
+            |i| (seq(i) % 256) as u8 as i8,
+            NDDataBuffer::I8,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "u8",
+            |i| (seq(i) % 256) as u8,
+            NDDataBuffer::U8,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "i16",
+            |i| (seq(i) % 65536) as u16 as i16,
+            NDDataBuffer::I16,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "u16",
+            |i| (seq(i) % 65536) as u16,
+            NDDataBuffer::U16,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "i32",
+            |i| seq(i) as i32 - 500_000,
+            NDDataBuffer::I32,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64);
+        check_roi_stats_against_reference(
+            "i64",
+            |i| seq(i) as i64 - 500_000,
+            NDDataBuffer::I64,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "u64",
+            |i| seq(i) as u64,
+            NDDataBuffer::U64,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "f32",
+            |i| seq(i) as f32 * 0.37 - 100.0,
+            NDDataBuffer::F32,
+            |e| e as f64,
+        );
+        check_roi_stats_against_reference(
+            "f64",
+            |i| seq(i) as f64 * 0.37 - 100.0,
+            NDDataBuffer::F64,
+            |e| e,
+        );
+    }
+
+    /// A rectangle the buffer cannot hold yields the zero result rather than
+    /// reading past it.
+    #[test]
+    fn roi_stats_of_a_rectangle_past_the_buffer_are_zero() {
+        let data = NDDataBuffer::U8((0..12).collect());
+        let r = ROIStatProcessor::compute_roi_stats(&data, 2, 4, [2, 1], [3, 2], 0);
+        assert_eq!(r.total, 0.0);
+        assert_eq!(r.max, 0.0);
+        let r = ROIStatProcessor::compute_roi_stats(&data, 1, 4, [10, 0], [3, 1], 0);
+        assert_eq!(r.total, 0.0);
     }
 }

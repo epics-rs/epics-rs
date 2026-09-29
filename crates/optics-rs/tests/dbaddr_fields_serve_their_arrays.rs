@@ -56,7 +56,7 @@ fn initialised() -> TableRecord {
 
 fn doubles(rec: &TableRecord, field: &str) -> Vec<f64> {
     match rec.get_field(field) {
-        Some(EpicsValue::DoubleArray(v)) => v,
+        Some(EpicsValue::DoubleArray(v)) => v.to_vec(),
         other => panic!("{field} served {other:?}, not a DoubleArray"),
     }
 }
@@ -157,7 +157,7 @@ fn all_eight_dbaddr_channels_take_a_put() {
         ("PPO2", 3),
     ] {
         let want: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
-        t.put_field(f, EpicsValue::DoubleArray(want.clone()))
+        t.put_field(f, EpicsValue::DoubleArray(want.clone().into()))
             .unwrap_or_else(|e| panic!("{f}: {e:?}"));
         assert_eq!(doubles(&t, f), want, "{f}");
     }
@@ -170,7 +170,7 @@ fn all_eight_dbaddr_channels_take_a_put() {
 fn a_matrix_put_lands_row_major() {
     let mut t = initialised();
     let flat: Vec<f64> = (1..=9).map(f64::from).collect();
-    t.put_field("A", EpicsValue::DoubleArray(flat.clone()))
+    t.put_field("A", EpicsValue::DoubleArray(flat.clone().into()))
         .unwrap();
     assert_eq!(doubles(&t, "A"), flat);
     // The `else` arm of `cvt_dbaddr` must not have been touched: a put to one
@@ -185,7 +185,8 @@ fn a_matrix_put_lands_row_major() {
 fn a_put_longer_than_the_channel_is_truncated() {
     let mut t = initialised();
     let long: Vec<f64> = (1..=12).map(f64::from).collect();
-    t.put_field("A", EpicsValue::DoubleArray(long)).unwrap();
+    t.put_field("A", EpicsValue::DoubleArray(long.into()))
+        .unwrap();
     assert_eq!(doubles(&t, "A"), (1..=9).map(f64::from).collect::<Vec<_>>());
 }
 
@@ -197,7 +198,7 @@ fn a_put_longer_than_the_channel_is_truncated() {
 fn a_put_shorter_than_the_channel_leaves_the_tail_standing() {
     let mut t = initialised();
     let before = doubles(&t, "PP1");
-    t.put_field("PP1", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    t.put_field("PP1", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
     assert_eq!(doubles(&t, "PP1"), vec![7.0, 8.0, before[2]]);
 }

@@ -28,7 +28,7 @@
 //! Forcing the distinct-carrier round-trip below onto that path would break
 //! the re-coercion.
 
-use crate::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
+use crate::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, TypedScalarArray};
 use epics_base_rs::types::EpicsValue;
 // Only the PVA → EpicsValue direction rebuilds a `PvString`.
 use epics_base_rs::types::PvString;
@@ -69,47 +69,34 @@ pub(crate) fn epics_value_to_pv_leaf(v: &EpicsValue) -> PvField {
         EpicsValue::ULong(u) => PvField::Scalar(ScalarValue::UInt(*u)),
         // C `DBF_UCHAR` → PVA `ubyte` (UInt8), pvxs `ioc/typeutils.cpp:34-35`.
         EpicsValue::UChar(c) => PvField::Scalar(ScalarValue::UByte(*c)),
-        EpicsValue::DoubleArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
-        }
-        EpicsValue::FloatArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Float(*x)).collect())
-        }
-        EpicsValue::LongArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x)).collect())
-        }
-        EpicsValue::ShortArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Short(*x)).collect())
-        }
+        // Arrays are served as the typed wire form over the record's own
+        // buffer (`PvArray::from(&SharedArray)` shares it); only the element
+        // casts (`u8 -> i8`, `u16 -> i32`) copy.
+        EpicsValue::DoubleArray(a) => typed(TypedScalarArray::Double(a.into())),
+        EpicsValue::FloatArray(a) => typed(TypedScalarArray::Float(a.into())),
+        EpicsValue::LongArray(a) => typed(TypedScalarArray::Int(a.into())),
+        EpicsValue::ShortArray(a) => typed(TypedScalarArray::Short(a.into())),
         // C `DBF_CHAR[]` → PVA `byte[]` (Int8), pvxs `ioc/typeutils.cpp:32-33`
         // — the signed twin of `UCharArray → ubyte[]` below.
-        EpicsValue::CharArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Byte(*x as i8)).collect())
-        }
-        EpicsValue::EnumArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
-        }
-        EpicsValue::StringArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::String(x.clone())).collect())
-        }
-        EpicsValue::Int64Array(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Long(*x)).collect())
-        }
-        EpicsValue::UInt64Array(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::ULong(*x)).collect())
-        }
-        EpicsValue::UShortArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UShort(*x)).collect())
-        }
-        EpicsValue::ULongArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UInt(*x)).collect())
-        }
+        EpicsValue::CharArray(a) => typed(TypedScalarArray::Byte(
+            a.iter().map(|x| *x as i8).collect::<Vec<i8>>().into(),
+        )),
+        EpicsValue::EnumArray(a) => typed(TypedScalarArray::Int(
+            a.iter().map(|x| *x as i32).collect::<Vec<i32>>().into(),
+        )),
+        EpicsValue::StringArray(a) => typed(TypedScalarArray::String(a.into())),
+        EpicsValue::Int64Array(a) => typed(TypedScalarArray::Long(a.into())),
+        EpicsValue::UInt64Array(a) => typed(TypedScalarArray::ULong(a.into())),
+        EpicsValue::UShortArray(a) => typed(TypedScalarArray::UShort(a.into())),
+        EpicsValue::ULongArray(a) => typed(TypedScalarArray::UInt(a.into())),
         // C `DBF_UCHAR[]` → PVA `ubyte[]` (the common image/byte-buffer shape),
         // pvxs `ioc/typeutils.cpp:34-35`. Element 200 stays 200, not −56.
-        EpicsValue::UCharArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
-        }
+        EpicsValue::UCharArray(a) => typed(TypedScalarArray::UByte(a.into())),
     }
+}
+
+fn typed(t: TypedScalarArray) -> PvField {
+    PvField::ScalarArrayTyped(t)
 }
 
 /// `EpicsValue` → PVA value-leaf `FieldDesc` (scalar or scalar-array type).
@@ -163,11 +150,11 @@ pub(crate) fn epics_value_to_field_desc_leaf(v: &EpicsValue) -> FieldDesc {
 /// transformed leaf on the same wire type. `Byte ↔ Char` and `UByte ↔ UChar`
 /// travel as distinct carriers precisely so this round-trip is unambiguous.
 ///
-/// Partial by design: types the filter engine does not carry (and shapes with
-/// no representable value leaf) return `None`, which the caller fails closed as
-/// a filter incompatible with the negotiated descriptor — never a fabricated
-/// stand-in. `UShort`/`UInt` are not carried here; that is a pre-existing
-/// forward-bridge gap, not part of the `DBF_CHAR` family.
+/// Partial by design: a leaf with no `EpicsValue` counterpart (`boolean`,
+/// and shapes with no representable value leaf) returns `None`, which the
+/// caller fails closed as a filter incompatible with the negotiated
+/// descriptor — never a fabricated stand-in. Every type the serve mapping
+/// emits comes back, so a served record can always be filtered.
 ///
 /// Both directions are target-neutral. This backward direction is only ever
 /// driven by an inbound PUT in `server_native::tcp`, which used to be
@@ -191,8 +178,12 @@ pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
             // signed leaf is reinterpreted with `as u8` (wire byte unchanged).
             ScalarValue::Byte(b) => EpicsValue::Char(*b as u8),
             ScalarValue::UByte(b) => EpicsValue::UChar(*b),
+            // `ushort` / `uint` are DBF_USHORT / DBF_ULONG, the inverse of
+            // the serve mapping above.
+            ScalarValue::UShort(u) => EpicsValue::UShort(*u),
+            ScalarValue::UInt(u) => EpicsValue::ULong(*u),
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
-            _ => return None,
+            ScalarValue::Boolean(_) => return None,
         })
     }
     fn array(items: &[ScalarValue]) -> Option<EpicsValue> {
@@ -288,16 +279,49 @@ pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
                     })
                     .collect(),
             ),
-            _ => return None,
+            Some(ScalarValue::UShort(_)) => EpicsValue::UShortArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::UShort(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::UInt(_)) => EpicsValue::ULongArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::UInt(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Boolean(_)) => return None,
         })
     }
     match f {
         PvField::Scalar(sv) => scalar(sv),
         PvField::ScalarArray(items) => array(items),
-        // Wire-decoded arrays arrive as the refcount-shared typed form; convert
-        // to the generic scalar vector so the `arr` filter sees the real array
-        // regardless of which variant the source produced.
-        PvField::ScalarArrayTyped(t) => array(&t.to_scalar_values()),
+        // Wire-decoded and served arrays are the typed form: the `arr`
+        // filter gets the same buffer, no elements copied. The element
+        // correspondence is the inverse of the serve mapping above.
+        PvField::ScalarArrayTyped(t) => Some(match t {
+            TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_shared()),
+            TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_shared()),
+            TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_shared()),
+            TypedScalarArray::Long(a) => EpicsValue::Int64Array(a.to_shared()),
+            TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_shared()),
+            TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_shared()),
+            TypedScalarArray::UShort(a) => EpicsValue::UShortArray(a.to_shared()),
+            TypedScalarArray::UInt(a) => EpicsValue::ULongArray(a.to_shared()),
+            TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_shared()),
+            TypedScalarArray::Byte(a) => {
+                EpicsValue::CharArray(a.iter().map(|b| *b as u8).collect())
+            }
+            TypedScalarArray::UByte(a) => EpicsValue::UCharArray(a.to_shared()),
+            TypedScalarArray::Boolean(_) => return None,
+        }),
         PvField::Structure(s) => s
             .fields
             .iter()
@@ -333,11 +357,7 @@ mod tests {
         );
         assert_eq!(
             epics_value_to_pv_leaf(&val),
-            PvField::ScalarArray(
-                [ScalarValue::UInt(3_000_000_000), ScalarValue::UInt(0)]
-                    .into_iter()
-                    .collect()
-            ),
+            PvField::ScalarArrayTyped(TypedScalarArray::UInt(vec![3_000_000_000u32, 0].into())),
             "the count crosses the wire unsigned"
         );
     }
@@ -356,12 +376,12 @@ mod tests {
             PvField::Scalar(ScalarValue::UByte(200)),
         );
         assert_eq!(
-            epics_value_to_pv_leaf(&EpicsValue::CharArray(vec![200, 0])),
-            PvField::ScalarArray(vec![ScalarValue::Byte(-56), ScalarValue::Byte(0)]),
+            epics_value_to_pv_leaf(&EpicsValue::CharArray(vec![200, 0].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Byte(vec![-56i8, 0].into())),
         );
         assert_eq!(
-            epics_value_to_pv_leaf(&EpicsValue::UCharArray(vec![200])),
-            PvField::ScalarArray(vec![ScalarValue::UByte(200)]),
+            epics_value_to_pv_leaf(&EpicsValue::UCharArray(vec![200].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UByte(vec![200u8].into())),
         );
         // serve descriptor (EpicsValue → FieldDesc)
         assert_eq!(
@@ -373,11 +393,11 @@ mod tests {
             FieldDesc::Scalar(ScalarType::UByte),
         );
         assert_eq!(
-            epics_value_to_field_desc_leaf(&EpicsValue::CharArray(vec![])),
+            epics_value_to_field_desc_leaf(&EpicsValue::CharArray(vec![].into())),
             FieldDesc::ScalarArray(ScalarType::Byte),
         );
         assert_eq!(
-            epics_value_to_field_desc_leaf(&EpicsValue::UCharArray(vec![])),
+            epics_value_to_field_desc_leaf(&EpicsValue::UCharArray(vec![].into())),
             FieldDesc::ScalarArray(ScalarType::UByte),
         );
         // monitor forward (PvField → EpicsValue)
@@ -407,9 +427,19 @@ mod tests {
             PvField::Scalar(ScalarValue::Byte(-56)),
             PvField::Scalar(ScalarValue::UByte(200)),
             PvField::Scalar(ScalarValue::String(PvString::from("s"))),
-            PvField::ScalarArray(vec![ScalarValue::Byte(-56), ScalarValue::Byte(1)]),
-            PvField::ScalarArray(vec![ScalarValue::UByte(200)]),
-            PvField::ScalarArray(vec![ScalarValue::ULong(4)]),
+            PvField::ScalarArrayTyped(TypedScalarArray::Byte(vec![-56i8, 1].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UByte(vec![200u8].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::ULong(vec![4u64].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.5].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Float(vec![2.5f32].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![-7].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Long(vec![-9i64].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::Short(vec![-3i16].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UShort(vec![3u16].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UInt(vec![5u32].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::String(vec![PvString::from("s")].into())),
+            PvField::Scalar(ScalarValue::UShort(65_535)),
+            PvField::Scalar(ScalarValue::UInt(3_000_000_000)),
         ];
         for leaf in carried {
             let ev = pv_leaf_to_epics_value(&leaf).expect("carried type decodes");
@@ -421,19 +451,37 @@ mod tests {
         }
     }
 
+    /// The served leaf is the record's own buffer, and the forward bridge
+    /// hands the `arr` filter the wire buffer: neither direction copies.
+    #[test]
+    fn arrays_are_served_and_bridged_without_copying() {
+        let val: epics_base_rs::types::SharedArray<f64> = vec![1.0, 2.0, 3.0].into();
+        let leaf = epics_value_to_pv_leaf(&EpicsValue::DoubleArray(val.clone()));
+        let PvField::ScalarArrayTyped(TypedScalarArray::Double(a)) = &leaf else {
+            panic!("{leaf:?}");
+        };
+        assert!(std::ptr::eq(a.as_ptr(), val.as_ptr()));
+        let Some(EpicsValue::DoubleArray(back)) = pv_leaf_to_epics_value(&leaf) else {
+            panic!("no array back");
+        };
+        assert!(std::ptr::eq(back.as_ptr(), val.as_ptr()));
+    }
+
     // The pre-existing forward-bridge gap: `ushort`/`uint` are not carried (the
     // serve/backward mapping can produce them, but the filter engine drops
     // them). Pinned so a later fill-in is a deliberate, tested change — not
     // silent drift, and not part of the DBF_CHAR family.
+    /// A boxed `ushort[]` / `uint[]` leaf (the pre-typed monitor shape)
+    /// carries as the same DBF types the typed form does.
     #[test]
-    fn forward_does_not_carry_ushort_or_uint() {
+    fn boxed_ushort_and_uint_arrays_carry_forward() {
         assert_eq!(
-            pv_leaf_to_epics_value(&PvField::Scalar(ScalarValue::UShort(1))),
-            None,
+            pv_leaf_to_epics_value(&PvField::ScalarArray(vec![ScalarValue::UShort(7)])),
+            Some(EpicsValue::UShortArray(vec![7].into())),
         );
         assert_eq!(
-            pv_leaf_to_epics_value(&PvField::Scalar(ScalarValue::UInt(1))),
-            None,
+            pv_leaf_to_epics_value(&PvField::ScalarArray(vec![ScalarValue::UInt(9)])),
+            Some(EpicsValue::ULongArray(vec![9].into())),
         );
     }
 }

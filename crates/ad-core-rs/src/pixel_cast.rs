@@ -93,8 +93,60 @@ macro_rules! with_buffer_mut {
     };
 }
 
+/// [`with_buffer_mut!`] that also names the element type: `$t` is a type
+/// alias for the arm's element type inside `$body`, for a body that has to
+/// cast into the buffer (`x as $t`).
+#[macro_export]
+macro_rules! with_buffer_mut_typed {
+    ($buffer:expr, |$v:ident : $t:ident| $body:expr) => {
+        match $buffer {
+            $crate::ndarray::NDDataBuffer::I8($v) => {
+                type $t = i8;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::U8($v) => {
+                type $t = u8;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::I16($v) => {
+                type $t = i16;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::U16($v) => {
+                type $t = u16;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::I32($v) => {
+                type $t = i32;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::U32($v) => {
+                type $t = u32;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::I64($v) => {
+                type $t = i64;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::U64($v) => {
+                type $t = u64;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::F32($v) => {
+                type $t = f32;
+                $body
+            }
+            $crate::ndarray::NDDataBuffer::F64($v) => {
+                type $t = f64;
+                $body
+            }
+        }
+    };
+}
+
 pub use with_buffer;
 pub use with_buffer_mut;
+pub use with_buffer_mut_typed;
 
 #[cfg(test)]
 mod tests {

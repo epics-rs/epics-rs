@@ -9,8 +9,6 @@
 //! - NDAttribute list management
 //! - NDArray copy/clone behavior
 
-use std::sync::Arc;
-
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -577,7 +575,7 @@ fn ndarray_clone_is_independent() {
 }
 
 #[test]
-fn pool_alloc_copy_preserves_data_and_assigns_new_id() {
+fn pool_alloc_copy_preserves_data_and_unique_id() {
     let pool = NDArrayPool::new(1_000_000);
     let mut source = pool
         .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
@@ -590,7 +588,8 @@ fn pool_alloc_copy_preserves_data_and_assigns_new_id() {
     }
 
     let copy = pool.alloc_copy(&source).unwrap();
-    assert_ne!(copy.unique_id, source.unique_id);
+    // C's NDArrayPool::copy carries uniqueId across (NDArrayPool.cpp:283).
+    assert_eq!(copy.unique_id, source.unique_id);
     assert_eq!(copy.dims.len(), source.dims.len());
     if let NDDataBuffer::U8(ref v) = copy.data {
         assert_eq!(v, &[1, 2, 3, 4]);
@@ -642,7 +641,7 @@ fn validate_fails_for_mismatched_buffer() {
 fn pool_concurrent_alloc_release() {
     use std::thread;
 
-    let pool = Arc::new(NDArrayPool::new(10_000_000));
+    let pool = NDArrayPool::new(10_000_000);
     let mut handles = Vec::new();
 
     for _ in 0..4 {

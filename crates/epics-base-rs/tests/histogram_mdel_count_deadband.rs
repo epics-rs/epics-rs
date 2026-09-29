@@ -127,7 +127,7 @@ async fn mdel_rate_limits_the_val_monitor() {
     );
     assert_eq!(
         events[0].snapshot.value,
-        EpicsValue::ULongArray(vec![0, 0, 4, 0]),
+        EpicsValue::ULongArray(vec![0, 0, 4, 0].into()),
         "the posted VAL carries the four counts binned so far"
     );
 }

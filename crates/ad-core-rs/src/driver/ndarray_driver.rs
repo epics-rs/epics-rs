@@ -1002,7 +1002,7 @@ impl NDArrayDriverBase {
         );
 
         let params = NDArrayDriverParams::create(&mut port_base)?;
-        let pool = Arc::new(NDArrayPool::new(max_memory));
+        let pool = NDArrayPool::new(max_memory);
 
         init_read_only_params(&mut port_base, &params, port_name)?;
         refresh_pool_stats(&mut port_base, &params, &pool)?;

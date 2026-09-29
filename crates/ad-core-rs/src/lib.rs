@@ -69,13 +69,14 @@ pub mod driver;
 pub mod error;
 pub mod finalize;
 pub mod ndarray;
-pub mod ndarray_handle;
 pub mod ndarray_pool;
 pub mod params;
 pub mod pixel_cast;
 pub mod plugin;
 pub mod roi;
 pub mod runtime;
+#[cfg(feature = "simd")]
+pub mod simd;
 pub mod timestamp;
 
 #[cfg(feature = "ioc")]

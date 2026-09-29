@@ -3898,7 +3898,7 @@ impl Record for AsynRecord {
             "F64IV" => Some(EpicsValue::Long(self.f64iv)),
             "AOUT" => Some(EpicsValue::String(self.aout.clone().into())),
             "OEOS" => Some(EpicsValue::String(self.oeos.clone().into())),
-            "BOUT" => Some(EpicsValue::CharArray(self.bout.clone())),
+            "BOUT" => Some(EpicsValue::CharArray(self.bout.clone().into())),
             "OMAX" => Some(EpicsValue::Long(self.omax)),
             "NOWT" => Some(EpicsValue::Long(self.nowt)),
             "NAWT" => Some(EpicsValue::Long(self.nawt)),
@@ -3906,7 +3906,7 @@ impl Record for AsynRecord {
             "AINP" => Some(EpicsValue::String(self.ainp.clone().into())),
             "TINP" => Some(EpicsValue::String(self.tinp.clone().into())),
             "IEOS" => Some(EpicsValue::String(self.ieos.clone().into())),
-            "BINP" => Some(EpicsValue::CharArray(self.binp.clone())),
+            "BINP" => Some(EpicsValue::CharArray(self.binp.clone().into())),
             "IMAX" => Some(EpicsValue::Long(self.imax)),
             "NRRD" => Some(EpicsValue::Long(self.nrrd)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
@@ -3964,7 +3964,7 @@ impl Record for AsynRecord {
             "ERRS" => {
                 let mut buf = self.errs.clone().into_bytes();
                 buf.resize(ERR_SIZE, 0);
-                Some(EpicsValue::CharArray(buf))
+                Some(EpicsValue::CharArray(buf.into()))
             }
             "AQR" => Some(EpicsValue::Char(self.aqr as u8)),
             _ => None,
@@ -3979,7 +3979,7 @@ impl Record for AsynRecord {
         let to_str = |v: &EpicsValue| -> String { format!("{v}") };
         let to_bytes = |v: &EpicsValue| -> Vec<u8> {
             match v {
-                EpicsValue::CharArray(b) => b.clone(),
+                EpicsValue::CharArray(b) => b.clone().to_vec(),
                 EpicsValue::String(s) => s.as_bytes().to_vec(),
                 _ => Vec::new(),
             }
@@ -4774,7 +4774,7 @@ impl Record for AsynRecord {
         if name == "ERRS" {
             let bytes = match &value {
                 EpicsValue::CharArray(b) => b.clone(),
-                other => format!("{other}").into_bytes(),
+                other => format!("{other}").into_bytes().into(),
             };
             // Drop the `ERR_SIZE` NUL padding `get_field` adds: C's buffer is
             // fixed-size but the text in it ends at the first NUL (`:2037`).
@@ -9188,7 +9188,7 @@ mod tests {
         let payload: Vec<u8> = (0..120u32).map(|i| (i % 251) as u8).collect();
         rec.omax = 1000;
         rec.ofmt = ASYN_FMT_BINARY;
-        rec.put_field("BOUT", EpicsValue::CharArray(payload.clone()))
+        rec.put_field("BOUT", EpicsValue::CharArray(payload.clone().into()))
             .unwrap();
 
         assert_eq!(rec.nowt, 120, "BOUT put must set NOWT = nNew");
@@ -9199,13 +9199,13 @@ mod tests {
         );
 
         // The same C function serves BINP: its count is NORD.
-        rec.put_field("BINP", EpicsValue::CharArray(vec![1, 2, 3]))
+        rec.put_field("BINP", EpicsValue::CharArray(vec![1, 2, 3].into()))
             .unwrap();
         assert_eq!(rec.nord, 3, "BINP put must set NORD = nNew");
 
         // A shorter put shrinks the count — nNew is the count that arrived, not
         // a high-water mark.
-        rec.put_field("BOUT", EpicsValue::CharArray(vec![9, 9]))
+        rec.put_field("BOUT", EpicsValue::CharArray(vec![9, 9].into()))
             .unwrap();
         assert_eq!(rec.nowt, 2);
         assert_eq!(rec.octet_output_buffer(), vec![9, 9]);
@@ -9226,8 +9226,14 @@ mod tests {
         assert_eq!(rec.field_native_count("BINP"), Some(80));
         // The value itself is still the current transferred bytes (empty here),
         // so channel count and value count are genuinely decoupled.
-        assert_eq!(rec.get_field("BOUT"), Some(EpicsValue::CharArray(vec![])));
-        assert_eq!(rec.get_field("BINP"), Some(EpicsValue::CharArray(vec![])));
+        assert_eq!(
+            rec.get_field("BOUT"),
+            Some(EpicsValue::CharArray(vec![].into()))
+        );
+        assert_eq!(
+            rec.get_field("BINP"),
+            Some(EpicsValue::CharArray(vec![].into()))
+        );
         // A non-buffer field keeps the value's own count.
         assert_eq!(rec.field_native_count("AOUT"), None);
         assert_eq!(rec.field_native_count("PORT"), None);
@@ -9881,7 +9887,7 @@ mod tests {
         // the whole buffer NUL-padded, never just the message (R18-85).
         let mut buf = text.as_bytes().to_vec();
         buf.resize(ERR_SIZE, 0);
-        EpicsValue::CharArray(buf)
+        EpicsValue::CharArray(buf.into())
     }
 
     #[tokio::test]

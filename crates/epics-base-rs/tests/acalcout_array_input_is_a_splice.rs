@@ -66,7 +66,7 @@ fn record_with_full_aa() -> AcalcoutRecord {
     rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
     rec.put_field(
         "AA",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0].into()),
     )
     .unwrap();
     rec
@@ -74,7 +74,7 @@ fn record_with_full_aa() -> AcalcoutRecord {
 
 fn aa(rec: &AcalcoutRecord) -> Vec<f64> {
     match rec.get_field("AA") {
-        Some(EpicsValue::DoubleArray(v)) => v,
+        Some(EpicsValue::DoubleArray(v)) => v.to_vec(),
         other => panic!("AA is not a DoubleArray: {other:?}"),
     }
 }
@@ -87,7 +87,7 @@ fn a_short_link_fetch_zeroes_the_window_and_preserves_the_hidden_tail() {
     let mut rec = record_with_full_aa();
     rec.put_field("NUSE", EpicsValue::ULong(5)).unwrap();
 
-    rec.put_field_internal("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    rec.put_field_internal("AA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
 
     // Inside the window: delivered, then zero-filled to numElements.
@@ -109,7 +109,7 @@ fn a_short_link_fetch_zeroes_the_window_and_preserves_the_hidden_tail() {
 fn a_short_client_put_zeroes_the_rest_of_the_window() {
     let mut rec = record_with_full_aa();
 
-    rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
 
     assert_eq!(
@@ -126,7 +126,7 @@ fn a_short_client_put_preserves_the_hidden_tail() {
     let mut rec = record_with_full_aa();
     rec.put_field("NUSE", EpicsValue::ULong(5)).unwrap();
 
-    rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
     assert_eq!(aa(&rec), vec![7.0, 8.0, 0.0, 0.0, 0.0]);
 
@@ -145,15 +145,17 @@ fn aval_and_oav_take_the_same_client_put_rule() {
     for field in ["AVAL", "OAV"] {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(6)).unwrap();
-        rec.put_field(field, EpicsValue::DoubleArray(vec![1.0; 6]))
+        rec.put_field(field, EpicsValue::DoubleArray(vec![1.0; 6].into()))
             .unwrap();
 
-        rec.put_field(field, EpicsValue::DoubleArray(vec![9.0, 9.0]))
+        rec.put_field(field, EpicsValue::DoubleArray(vec![9.0, 9.0].into()))
             .unwrap();
 
         assert_eq!(
             rec.get_field(field),
-            Some(EpicsValue::DoubleArray(vec![9.0, 9.0, 0.0, 0.0, 0.0, 0.0])),
+            Some(EpicsValue::DoubleArray(
+                vec![9.0, 9.0, 0.0, 0.0, 0.0, 0.0].into()
+            )),
             "{field}"
         );
     }
@@ -172,7 +174,7 @@ fn an_over_long_link_fetch_stops_at_the_window() {
     // Eight elements offered into a three-element window.
     rec.put_field_internal(
         "AA",
-        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0]),
+        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0].into()),
     )
     .unwrap();
 
@@ -200,7 +202,8 @@ fn a_client_put_may_fill_the_whole_nelm_buffer_past_the_nuse_window() {
     rec.put_field("NUSE", EpicsValue::ULong(4)).unwrap();
 
     let fresh: Vec<f64> = (0..10).map(|i| (90 + i) as f64).collect();
-    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh.into()))
+        .unwrap();
 
     // The window shows four...
     assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0, 93.0]);
@@ -222,7 +225,7 @@ fn a_short_client_put_zero_fills_the_window_and_leaves_the_hidden_tail() {
     let mut rec = record_with_full_aa();
     rec.put_field("NUSE", EpicsValue::ULong(4)).unwrap();
 
-    rec.put_field("AA", EpicsValue::DoubleArray(vec![90.0, 91.0]))
+    rec.put_field("AA", EpicsValue::DoubleArray(vec![90.0, 91.0].into()))
         .unwrap();
 
     // [2,4) zeroed inside the window.
@@ -242,7 +245,8 @@ fn a_short_client_put_zero_fills_the_window_and_leaves_the_hidden_tail() {
 fn a_client_put_longer_than_nelm_is_clamped_at_nelm() {
     let mut rec = record_with_full_aa();
     let fresh: Vec<f64> = (0..14).map(|i| (90 + i) as f64).collect();
-    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh.into()))
+        .unwrap();
 
     assert_eq!(
         aa(&rec),
@@ -261,7 +265,8 @@ fn under_size_nuse_a_client_put_is_bounded_at_the_window() {
     rec.put_field("SIZE", EpicsValue::Short(1)).unwrap(); // acalcoutSIZE_NUSE
 
     let fresh: Vec<f64> = (0..10).map(|i| (90 + i) as f64).collect();
-    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh.into()))
+        .unwrap();
 
     assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0, 93.0]);
 
@@ -279,7 +284,7 @@ fn a_full_length_write_replaces_the_whole_buffer() {
     let mut rec = record_with_full_aa();
     let fresh: Vec<f64> = (0..10).map(|i| (100 + i) as f64).collect();
 
-    rec.put_field("AA", EpicsValue::DoubleArray(fresh.clone()))
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh.clone().into()))
         .unwrap();
 
     assert_eq!(aa(&rec), fresh);
@@ -291,7 +296,7 @@ fn a_full_length_write_replaces_the_whole_buffer() {
 fn the_link_fetch_still_sets_newm_when_the_value_changed() {
     let mut rec = record_with_full_aa();
 
-    rec.put_field_internal("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+    rec.put_field_internal("AA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
 
     assert_eq!(rec.get_field("NEWM"), Some(EpicsValue::ULong(1)));

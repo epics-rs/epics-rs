@@ -21,11 +21,17 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 futures-util = "0.3"
 tracing = "0.1"
 thiserror = "2"
+# Same run-time level dispatch as ad-plugins-rs (`Level::new` + `dispatch!`):
+# the kernels here run under the plugins' `simd` feature, which forwards to
+# this one, so one switch turns the whole AD pipeline scalar.
+fearless_simd = { version = "1.0", optional = true }
+fearless_simd_macros = { version = "0.1", optional = true }
 parking_lot = "0.12"
 
 [features]
-default = []
+default = ["simd"]
 ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "asyn-rs/epics"]
+simd = ["dep:fearless_simd", "dep:fearless_simd_macros"]
 
 [dev-dependencies]
 # Dev-only and `path`-only, so `cargo package` drops it from the uploaded

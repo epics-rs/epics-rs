@@ -27,7 +27,10 @@ async fn sim_waveform_reads_siol_array_into_val() {
 
     // SIOL source: a waveform carrying a distinctive array.
     let mut src = WaveformRecord::new(8, DbFieldType::Double);
-    let _ = src.put_field("VAL", EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]));
+    let _ = src.put_field(
+        "VAL",
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()),
+    );
     db.add_record("WFIN_SRC", Box::new(src)).await.unwrap();
 
     let mut wf = WaveformRecord::new(8, DbFieldType::Double);

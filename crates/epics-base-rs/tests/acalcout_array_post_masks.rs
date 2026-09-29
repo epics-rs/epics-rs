@@ -61,8 +61,11 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// which is the only cycle on which the two C masks differ.
 async fn acalcout_with(db: &PvDatabase, calc: &str) {
     let mut wf = WaveformRecord::new(4, DbFieldType::Double);
-    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
+    wf.put_field(
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+    )
+    .unwrap();
     db.add_record("WF", Box::new(wf)).await.unwrap();
 
     let mut a = AcalcoutRecord::new();
@@ -128,7 +131,7 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
     );
     assert_eq!(
         held.snapshot.value,
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
     assert!(both_rx.try_recv().is_err());
 

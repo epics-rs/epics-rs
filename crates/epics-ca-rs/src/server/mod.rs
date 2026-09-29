@@ -65,7 +65,7 @@ pub(super) fn apply_long_string(snap: &mut epics_base_rs::server::snapshot::Snap
             let mut b = s.into_bytes();
             b.push(0); // NUL terminator
             b.resize(MAX_STRING_SIZE, 0); // zero-pad to field_size
-            EpicsValue::CharArray(b)
+            EpicsValue::CharArray(b.into())
         }
         other => other,
     };

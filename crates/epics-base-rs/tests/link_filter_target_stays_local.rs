@@ -86,7 +86,7 @@ async fn a_filtered_link_reads_the_selected_slice() {
 
     assert_eq!(
         db.get_pv("wf").unwrap(),
-        EpicsValue::DoubleArray(vec![3.0, 4.0, 5.0])
+        EpicsValue::DoubleArray(vec![3.0, 4.0, 5.0].into())
     );
     assert_eq!(db.get_pv("wf.NORD").unwrap().to_f64().unwrap(), 3.0);
 }

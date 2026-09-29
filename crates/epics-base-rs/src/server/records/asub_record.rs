@@ -274,18 +274,18 @@ fn channel_default(ft: i16, no: i32) -> EpicsValue {
 /// delivers `nRequest = 1`.
 fn wrap_one_element(scalar: EpicsValue, ftype: Ftype) -> EpicsValue {
     match (ftype, scalar) {
-        (Ftype::String, EpicsValue::String(v)) => EpicsValue::StringArray(vec![v]),
-        (Ftype::Char, EpicsValue::Char(v)) => EpicsValue::CharArray(vec![v]),
-        (Ftype::UChar, EpicsValue::UChar(v)) => EpicsValue::UCharArray(vec![v]),
-        (Ftype::Short, EpicsValue::Short(v)) => EpicsValue::ShortArray(vec![v]),
-        (Ftype::UShort, EpicsValue::UShort(v)) => EpicsValue::UShortArray(vec![v]),
-        (Ftype::Long, EpicsValue::Long(v)) => EpicsValue::LongArray(vec![v]),
-        (Ftype::ULong, EpicsValue::ULong(v)) => EpicsValue::ULongArray(vec![v]),
-        (Ftype::Int64, EpicsValue::Int64(v)) => EpicsValue::Int64Array(vec![v]),
-        (Ftype::UInt64, EpicsValue::UInt64(v)) => EpicsValue::UInt64Array(vec![v]),
-        (Ftype::Float, EpicsValue::Float(v)) => EpicsValue::FloatArray(vec![v]),
-        (Ftype::Double, EpicsValue::Double(v)) => EpicsValue::DoubleArray(vec![v]),
-        (Ftype::Enum, EpicsValue::Enum(v)) => EpicsValue::EnumArray(vec![v]),
+        (Ftype::String, EpicsValue::String(v)) => EpicsValue::StringArray(vec![v].into()),
+        (Ftype::Char, EpicsValue::Char(v)) => EpicsValue::CharArray(vec![v].into()),
+        (Ftype::UChar, EpicsValue::UChar(v)) => EpicsValue::UCharArray(vec![v].into()),
+        (Ftype::Short, EpicsValue::Short(v)) => EpicsValue::ShortArray(vec![v].into()),
+        (Ftype::UShort, EpicsValue::UShort(v)) => EpicsValue::UShortArray(vec![v].into()),
+        (Ftype::Long, EpicsValue::Long(v)) => EpicsValue::LongArray(vec![v].into()),
+        (Ftype::ULong, EpicsValue::ULong(v)) => EpicsValue::ULongArray(vec![v].into()),
+        (Ftype::Int64, EpicsValue::Int64(v)) => EpicsValue::Int64Array(vec![v].into()),
+        (Ftype::UInt64, EpicsValue::UInt64(v)) => EpicsValue::UInt64Array(vec![v].into()),
+        (Ftype::Float, EpicsValue::Float(v)) => EpicsValue::FloatArray(vec![v].into()),
+        (Ftype::Double, EpicsValue::Double(v)) => EpicsValue::DoubleArray(vec![v].into()),
+        (Ftype::Enum, EpicsValue::Enum(v)) => EpicsValue::EnumArray(vec![v].into()),
         // The scalar came out of `convert_to(ftype.element_type())`, so the
         // pair always matches; a framework-internal transient lands as the
         // typed zero element rather than a panic.
@@ -843,11 +843,11 @@ mod tests {
             // C requires the output capacity declared up front, like the
             // input side: the subroutine writes into an NOVx-element buffer.
             rec.put_field(nov, EpicsValue::Long(2)).unwrap();
-            rec.put_field(name, EpicsValue::DoubleArray(vec![1.0, 2.0]))
+            rec.put_field(name, EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
                 .unwrap();
             assert_eq!(
                 rec.get_field(name),
-                Some(EpicsValue::DoubleArray(vec![1.0, 2.0]))
+                Some(EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
             );
         }
         for name in ["NOM", "NOVU", "INPR", "OUTT"] {
@@ -870,11 +870,11 @@ mod tests {
         // C requires the capacity declared up front: NOx elements are
         // allocated at init, and `dbGetLink` clamps `nRequest` to NOx.
         rec.put_field("NOC", EpicsValue::Long(3)).unwrap();
-        rec.put_field("C", EpicsValue::LongArray(vec![10, 20, 30]))
+        rec.put_field("C", EpicsValue::LongArray(vec![10, 20, 30].into()))
             .unwrap();
         assert_eq!(
             rec.get_field("C"),
-            Some(EpicsValue::LongArray(vec![10, 20, 30]))
+            Some(EpicsValue::LongArray(vec![10, 20, 30].into()))
         );
         // NEC tracks elements used.
         assert_eq!(rec.get_field("NEC"), Some(EpicsValue::Long(3)));
@@ -890,7 +890,7 @@ mod tests {
         rec.put_field("NOA", EpicsValue::Long(4)).unwrap();
         assert_eq!(
             rec.get_field("A"),
-            Some(EpicsValue::DoubleArray(vec![0.0; 4]))
+            Some(EpicsValue::DoubleArray(vec![0.0; 4].into()))
         );
         assert_eq!(
             rec.get_field("NEA"),
@@ -908,7 +908,10 @@ mod tests {
             Some(EpicsValue::Short(1)),
             "aSubRecord.c:186-187: FTx past DBF_ENUM becomes CHAR"
         );
-        assert_eq!(rec.get_field("C"), Some(EpicsValue::CharArray(vec![0, 0])));
+        assert_eq!(
+            rec.get_field("C"),
+            Some(EpicsValue::CharArray(vec![0, 0].into()))
+        );
     }
 
     /// Values entering an input cell convert into the declared buffer — C
@@ -920,22 +923,28 @@ mod tests {
         rec.put_field("FTA", EpicsValue::Short(5)).unwrap(); // LONG
         rec.put_field("NOA", EpicsValue::Long(3)).unwrap();
         // An array source converts element-wise and clamps to NOx.
-        rec.put_field("A", EpicsValue::DoubleArray(vec![1.9, 2.2, 3.7, 4.4]))
-            .unwrap();
+        rec.put_field(
+            "A",
+            EpicsValue::DoubleArray(vec![1.9, 2.2, 3.7, 4.4].into()),
+        )
+        .unwrap();
         assert_eq!(
             rec.get_field("A"),
-            Some(EpicsValue::LongArray(vec![1, 2, 3]))
+            Some(EpicsValue::LongArray(vec![1, 2, 3].into()))
         );
         assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(3)));
 
         // A scalar source fills one element of an array cell (nRequest = 1).
         rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
-        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![7])));
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::LongArray(vec![7].into()))
+        );
         assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(1)));
 
         // An array into a one-element cell keeps element 0 (C's one-element
         // destination, same rule as the store's scalar reduction).
-        rec.put_field("B", EpicsValue::DoubleArray(vec![5.5, 6.6]))
+        rec.put_field("B", EpicsValue::DoubleArray(vec![5.5, 6.6].into()))
             .unwrap();
         assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(5.5)));
         assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(1)));
@@ -945,25 +954,30 @@ mod tests {
         // it (aSubRecord.c:287) — but the clamped count then runs NO
         // converter (dbAccess.c:1016-1017), so the cell keeps what the last
         // real delivery left there. Both cell shapes.
-        rec.put_field("B", EpicsValue::DoubleArray(vec![])).unwrap();
+        rec.put_field("B", EpicsValue::DoubleArray(vec![].into()))
+            .unwrap();
         assert_eq!(
             rec.get_field("B"),
             Some(EpicsValue::Double(5.5)),
             "one-element cell retains the previous delivery"
         );
         assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(0)));
-        rec.put_field("A", EpicsValue::DoubleArray(vec![])).unwrap();
+        rec.put_field("A", EpicsValue::DoubleArray(vec![].into()))
+            .unwrap();
         assert_eq!(
             rec.get_field("A"),
-            Some(EpicsValue::LongArray(vec![7])),
+            Some(EpicsValue::LongArray(vec![7].into())),
             "NOx > 1 cell retains the previous delivery"
         );
         assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(0)));
 
         // A non-empty delivery after the empty one overwrites normally.
-        rec.put_field("A", EpicsValue::DoubleArray(vec![8.0, 9.0]))
+        rec.put_field("A", EpicsValue::DoubleArray(vec![8.0, 9.0].into()))
             .unwrap();
-        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![8, 9])));
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::LongArray(vec![8, 9].into()))
+        );
         assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(2)));
     }
 
@@ -974,15 +988,15 @@ mod tests {
         let mut rec = ASubRecord::default();
         rec.put_field("FTVA", EpicsValue::Short(10)).unwrap(); // DOUBLE
         rec.put_field("NOVA", EpicsValue::Long(3)).unwrap();
-        rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+        rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
             .unwrap();
         assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(2)));
 
-        rec.put_field("VALA", EpicsValue::DoubleArray(vec![]))
+        rec.put_field("VALA", EpicsValue::DoubleArray(vec![].into()))
             .unwrap();
         assert_eq!(
             rec.get_field("VALA"),
-            Some(EpicsValue::DoubleArray(vec![1.0, 2.0]))
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
         );
         assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(0)));
     }
@@ -999,15 +1013,15 @@ mod tests {
         rec.put_field("NOVA", EpicsValue::Long(3)).unwrap();
         assert_eq!(
             rec.get_field("VALA"),
-            Some(EpicsValue::DoubleArray(vec![0.0; 3]))
+            Some(EpicsValue::DoubleArray(vec![0.0; 3].into()))
         );
         assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
 
-        rec.put_field("VALA", EpicsValue::LongArray(vec![1, 2, 3, 4]))
+        rec.put_field("VALA", EpicsValue::LongArray(vec![1, 2, 3, 4].into()))
             .unwrap();
         assert_eq!(
             rec.get_field("VALA"),
-            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])),
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())),
             "a subroutine write converts element-wise and clamps to NOVx"
         );
         assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));

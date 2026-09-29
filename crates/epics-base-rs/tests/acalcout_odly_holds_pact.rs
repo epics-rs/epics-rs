@@ -49,10 +49,10 @@ impl Record for OutProbe {
             self.writes.fetch_add(1, Ordering::SeqCst);
             let v = match value {
                 EpicsValue::DoubleArray(a) => a,
-                EpicsValue::Double(d) => vec![d],
-                _ => Vec::new(),
+                EpicsValue::Double(d) => vec![d].into(),
+                _ => Vec::new().into(),
             };
-            *self.last.lock().unwrap() = Some(v);
+            *self.last.lock().unwrap() = Some(v.to_vec());
         }
         Ok(())
     }

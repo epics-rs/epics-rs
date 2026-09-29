@@ -113,7 +113,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
     LinkSet::put_value(
         &resolver,
         "CALINK:CLAMP:WF",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
         LinkPutOp::Async,
     )
     .await
@@ -122,7 +122,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
     readback_becomes(
         &client,
         "CALINK:CLAMP:WF",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
     )
     .await;
 }
@@ -139,7 +139,7 @@ async fn a_plain_put_takes_the_same_clamp() {
     LinkSet::put_value(
         &resolver,
         "CALINK:CLAMP:WFP",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         LinkPutOp::Plain,
     )
     .await
@@ -148,7 +148,7 @@ async fn a_plain_put_takes_the_same_clamp() {
     readback_becomes(
         &client,
         "CALINK:CLAMP:WFP",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()),
     )
     .await;
 }
@@ -183,7 +183,7 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
     LinkSet::put_value(
         &resolver,
         "CALINK:CLAMP:AI",
-        EpicsValue::DoubleArray(vec![7.5, 8.5, 9.5]),
+        EpicsValue::DoubleArray(vec![7.5, 8.5, 9.5].into()),
         LinkPutOp::Async,
     )
     .await
@@ -207,7 +207,9 @@ async fn a_direct_client_put_is_still_refused() {
         .await
         .expect("direct channel");
     let err = ch
-        .put(&EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]))
+        .put(&EpicsValue::DoubleArray(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0].into(),
+        ))
         .await
         .expect_err("libca returns ECA_BADCOUNT for an oversized ca_array_put");
     assert!(

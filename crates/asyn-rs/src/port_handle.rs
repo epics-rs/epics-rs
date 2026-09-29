@@ -11,6 +11,8 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
+use epics_libcom_rs::SharedArray;
+
 use crate::param::ParamValue;
 use std::any::Any;
 use std::future::Future;
@@ -749,7 +751,7 @@ impl PortHandle {
         reason: usize,
         addr: i32,
         max_elements: usize,
-    ) -> AsynResult<Vec<i32>> {
+    ) -> AsynResult<SharedArray<i32>> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self
             .submit_async(RequestOp::Int32ArrayRead { max_elements }, user)
@@ -777,7 +779,7 @@ impl PortHandle {
         reason: usize,
         addr: i32,
         max_elements: usize,
-    ) -> AsynResult<Vec<f64>> {
+    ) -> AsynResult<SharedArray<f64>> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self
             .submit_async(RequestOp::Float64ArrayRead { max_elements }, user)

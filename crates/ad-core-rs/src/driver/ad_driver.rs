@@ -49,7 +49,7 @@ impl ADDriverBase {
         );
 
         let params = ADDriverParams::create(&mut port_base)?;
-        let pool = Arc::new(NDArrayPool::new(max_memory));
+        let pool = NDArrayPool::new(max_memory);
 
         // C `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
         // `asynNDArrayDriver::asynNDArrayDriver`, so its whole read-only block

@@ -309,17 +309,17 @@ pub fn result_to_reply(result: &RequestResult, request_id: u64) -> PortReply {
             choices: Vec::new(),
         })
     } else if let Some(ref v) = result.int32_array {
-        ReplyPayload::Value(ParamValue::Int32Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Int32Array(v.to_vec()))
     } else if let Some(ref v) = result.float64_array {
-        ReplyPayload::Value(ParamValue::Float64Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Float64Array(v.to_vec()))
     } else if let Some(ref v) = result.int8_array {
-        ReplyPayload::Value(ParamValue::Int8Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Int8Array(v.to_vec()))
     } else if let Some(ref v) = result.int16_array {
-        ReplyPayload::Value(ParamValue::Int16Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Int16Array(v.to_vec()))
     } else if let Some(ref v) = result.int64_array {
-        ReplyPayload::Value(ParamValue::Int64Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Int64Array(v.to_vec()))
     } else if let Some(ref v) = result.float32_array {
-        ReplyPayload::Value(ParamValue::Float32Array(v.clone()))
+        ReplyPayload::Value(ParamValue::Float32Array(v.to_vec()))
     } else if let Some(v) = result.reason {
         // DrvUserCreate returns reason index
         ReplyPayload::Value(ParamValue::Int32(v as i32))

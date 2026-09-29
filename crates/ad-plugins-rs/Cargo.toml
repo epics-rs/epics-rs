@@ -25,7 +25,12 @@ serde = { version = "1", features = ["derive"] }
 netcdf3 = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff"] }
 rayon = { version = "1", optional = true }
-rust-hdf5 = { version = "0.5.2", features = ["threadsafe", "all_filters", "parallel"] }
+# The SIMD level is chosen at run time (`Level::new` + `dispatch!`), which is
+# what reaches AVX2/AVX-512 from a binary built for the x86_64 baseline; the
+# `Fallback` level makes the same source compile scalar on every other target.
+fearless_simd = { version = "1.0", optional = true }
+fearless_simd_macros = { version = "0.1", optional = true }
+rust-hdf5 = { version = "0.6.0", features = ["threadsafe", "all_filters", "parallel"] }
 epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
 
@@ -39,7 +44,8 @@ tempfile = "3"
 tiff = "0.9"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "simd"]
 ioc = ["ad-core-rs/ioc"]
 pva = ["dep:epics-pva-rs", "dep:epics-bridge-rs"]
 parallel = ["rayon"]
+simd = ["dep:fearless_simd", "dep:fearless_simd_macros", "ad-core-rs/simd"]

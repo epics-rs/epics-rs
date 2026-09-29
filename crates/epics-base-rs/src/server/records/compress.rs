@@ -720,7 +720,7 @@ impl Record for CompressRecord {
                 // is purely a processing-time control (early-emit for
                 // N-to-1 algorithms); it does NOT change what a CA
                 // client sees on read.
-                Some(EpicsValue::DoubleArray(self.linearise_val()))
+                Some(EpicsValue::DoubleArray(self.linearise_val().into()))
             }
             // NSAM/N/OFF/NUSE/OUSE/INX are C's DBF_ULONG (INPN alone is
             // DBF_LONG, :503). The value variant is what CA and PVA project the
@@ -1148,7 +1148,7 @@ mod pbuf_tests {
         // Scalar Long delivery (e.g. INP from a longin/calc VAL).
         rec.put_field_internal("VAL", EpicsValue::Long(42)).unwrap();
         // Array Long delivery (e.g. INP from a waveform FTVL=LONG).
-        rec.put_field_internal("VAL", EpicsValue::LongArray(vec![10, 20, 30]))
+        rec.put_field_internal("VAL", EpicsValue::LongArray(vec![10, 20, 30].into()))
             .unwrap();
 
         match rec.get_field("VAL").unwrap() {

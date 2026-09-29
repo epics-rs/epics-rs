@@ -80,7 +80,7 @@ async fn a_dbaddr_field_the_port_stores_as_a_scalar_takes_the_array_arm() {
     let db = PvDatabase::new();
     load(&db, "M", "mbbo", &[("VAL", "3")]).await;
 
-    db.put_pv("M.VAL", EpicsValue::DoubleArray(vec![]))
+    db.put_pv("M.VAL", EpicsValue::DoubleArray(vec![].into()))
         .await
         .expect("C `dbPut` returns 0 for a zero-length request");
 
@@ -103,11 +103,11 @@ async fn a_dbaddr_field_the_port_stores_as_a_scalar_takes_the_array_arm() {
 async fn a_dbaddr_field_the_port_stores_as_a_vec_drops_its_valid_length() {
     let db = PvDatabase::new();
     load(&db, "W", "waveform", &[("FTVL", "DOUBLE"), ("NELM", "10")]).await;
-    db.put_pv("W.VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+    db.put_pv("W.VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .await
         .unwrap();
 
-    db.put_pv("W.VAL", EpicsValue::DoubleArray(vec![]))
+    db.put_pv("W.VAL", EpicsValue::DoubleArray(vec![].into()))
         .await
         .expect("C `dbPut` returns 0 for a zero-length request");
 
@@ -130,7 +130,7 @@ async fn a_plain_scalar_field_takes_the_alarm_arm() {
     let db = PvDatabase::new();
     load(&db, "A", "ai", &[("VAL", "7")]).await;
 
-    db.put_pv("A.VAL", EpicsValue::DoubleArray(vec![]))
+    db.put_pv("A.VAL", EpicsValue::DoubleArray(vec![].into()))
         .await
         .expect("`dbPut` returns 0 — the alarm is the effect, not a refusal");
 
@@ -159,7 +159,7 @@ async fn a_long_string_field_takes_the_array_arm_despite_its_runtime_special() {
     let db = PvDatabase::new();
     load(&db, "S", "lsi", &[("SIZV", "40")]).await;
 
-    db.put_pv("S.VAL", EpicsValue::CharArray(vec![]))
+    db.put_pv("S.VAL", EpicsValue::CharArray(vec![].into()))
         .await
         .expect("`dbPut` returns 0");
 

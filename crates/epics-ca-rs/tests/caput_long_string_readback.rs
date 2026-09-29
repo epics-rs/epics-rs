@@ -25,7 +25,7 @@ async fn caput_dash_s_prints_both_readbacks_as_long_strings() {
     // `udp_port()`); nothing probes a port and hands the number on.
     let server = CaServer::builder()
         .port(0)
-        .pv("R922:LSTR", EpicsValue::CharArray(initial))
+        .pv("R922:LSTR", EpicsValue::CharArray(initial.into()))
         .build()
         .await
         .expect("build CA server");

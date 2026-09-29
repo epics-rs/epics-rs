@@ -5,6 +5,7 @@
 //! `epics:nt/NTNDArray:1.0`, and stores it in the registry consumed by the
 //! qsrv adapter.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
@@ -17,7 +18,7 @@ use epics_pva_rs::nt::nd_array::{
     NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
     nt_nd_array_desc, nt_nd_array_value,
 };
-use epics_pva_rs::pvdata::{PvField, ScalarValue, VariantValue};
+use epics_pva_rs::pvdata::{PvArray, PvField, ScalarValue, VariantValue};
 
 /// PVA plugin processor: captures the latest NDArray, converts it to an
 /// NTNDArray [`PvField`], and posts it through its shared [`PvaPvHandle`].
@@ -59,7 +60,7 @@ impl Default for PvaProcessor {
 }
 
 impl NDPluginProcess for PvaProcessor {
-    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 
         // Regression.
@@ -76,7 +77,7 @@ impl NDPluginProcess for PvaProcessor {
         }
 
         // Pass through to downstream plugins.
-        ProcessResult::arrays(vec![Arc::new(array.clone())])
+        ProcessResult::forward(array, vec![])
     }
 
     fn plugin_type(&self) -> &str {
@@ -101,7 +102,7 @@ impl NDPluginProcess for PvaProcessor {
 // NDArray → PvField conversion
 // ---------------------------------------------------------------------------
 
-fn ndarray_to_pv_field(array: &NDArray) -> PvField {
+fn ndarray_to_pv_field(array: &Arc<NDArray>) -> PvField {
     // C ADCore's NTNDArray converter (ntndArrayConverter.cpp:396-453) applies a
     // uniform rule to compressed and uncompressed arrays: `uncompressedSize` is
     // always the ORIGINAL byte count (NDArrayInfo::totalBytes = nElements *
@@ -128,12 +129,12 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
 
     let (value, compressed_size, codec_name) = match &array.codec {
         Some(c) => (
-            NdArrayBuffer::UByte(array.data.as_u8_slice().to_vec()),
+            NdArrayBuffer::UByte(PvArray::from_owner(Arc::new(FrameBytes(Arc::clone(array))))),
             c.compressed_size as i64,
             codec_name_to_string(c.name),
         ),
         None => (
-            ndbuffer_to_buffer(&array.data),
+            frame_pixels(array),
             // C reads `src->compressedSize` on both branches — there is no
             // uncompressed special case (`ntndArrayConverter.cpp:407,410`).
             // `data_size` is the port's `NDArray::dataSize`, which the pool
@@ -212,18 +213,65 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
     nt_nd_array_value(&nt)
 }
 
-fn ndbuffer_to_buffer(buf: &NDDataBuffer) -> NdArrayBuffer {
-    match buf {
-        NDDataBuffer::I8(v) => NdArrayBuffer::Byte(v.clone()),
-        NDDataBuffer::U8(v) => NdArrayBuffer::UByte(v.clone()),
-        NDDataBuffer::I16(v) => NdArrayBuffer::Short(v.clone()),
-        NDDataBuffer::U16(v) => NdArrayBuffer::UShort(v.clone()),
-        NDDataBuffer::I32(v) => NdArrayBuffer::Int(v.clone()),
-        NDDataBuffer::U32(v) => NdArrayBuffer::UInt(v.clone()),
-        NDDataBuffer::I64(v) => NdArrayBuffer::Long(v.clone()),
-        NDDataBuffer::U64(v) => NdArrayBuffer::ULong(v.clone()),
-        NDDataBuffer::F32(v) => NdArrayBuffer::Float(v.clone()),
-        NDDataBuffer::F64(v) => NdArrayBuffer::Double(v.clone()),
+/// The frame itself, published as the owner of its pixel slice. C wraps
+/// `pData` in a `shared_vector` whose deleter releases the NDArray
+/// (ntndArrayConverter.cpp:423-429), so the value union carries the
+/// driver's buffer and no copy; holding the `Arc` is the same contract, the
+/// pool gets the buffer back when the last monitor snapshot drops it.
+struct Pixels<T>(Arc<NDArray>, PhantomData<T>);
+
+macro_rules! pixel_owner {
+    ($t:ty, $variant:ident) => {
+        impl AsRef<[$t]> for Pixels<$t> {
+            fn as_ref(&self) -> &[$t] {
+                match &self.0.data {
+                    NDDataBuffer::$variant(v) => v,
+                    _ => unreachable!("Pixels<T> is built from the matching NDDataBuffer variant"),
+                }
+            }
+        }
+    };
+}
+pixel_owner!(i8, I8);
+pixel_owner!(u8, U8);
+pixel_owner!(i16, I16);
+pixel_owner!(u16, U16);
+pixel_owner!(i32, I32);
+pixel_owner!(u32, U32);
+pixel_owner!(i64, I64);
+pixel_owner!(u64, U64);
+pixel_owner!(f32, F32);
+pixel_owner!(f64, F64);
+
+/// The frame as the owner of its raw byte view, for the compressed branch's
+/// `ubyteValue` arm.
+struct FrameBytes(Arc<NDArray>);
+
+impl AsRef<[u8]> for FrameBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.data.as_u8_slice()
+    }
+}
+
+fn frame_pixels(array: &Arc<NDArray>) -> NdArrayBuffer {
+    fn own<T>(array: &Arc<NDArray>) -> PvArray<T>
+    where
+        T: Send + Sync + 'static,
+        Pixels<T>: AsRef<[T]>,
+    {
+        PvArray::from_owner(Arc::new(Pixels(Arc::clone(array), PhantomData)))
+    }
+    match &array.data {
+        NDDataBuffer::I8(_) => NdArrayBuffer::Byte(own(array)),
+        NDDataBuffer::U8(_) => NdArrayBuffer::UByte(own(array)),
+        NDDataBuffer::I16(_) => NdArrayBuffer::Short(own(array)),
+        NDDataBuffer::U16(_) => NdArrayBuffer::UShort(own(array)),
+        NDDataBuffer::I32(_) => NdArrayBuffer::Int(own(array)),
+        NDDataBuffer::U32(_) => NdArrayBuffer::UInt(own(array)),
+        NDDataBuffer::I64(_) => NdArrayBuffer::Long(own(array)),
+        NDDataBuffer::U64(_) => NdArrayBuffer::ULong(own(array)),
+        NDDataBuffer::F32(_) => NdArrayBuffer::Float(own(array)),
+        NDDataBuffer::F64(_) => NdArrayBuffer::Double(own(array)),
     }
 }
 
@@ -322,7 +370,7 @@ fn attribute_value_to_variant(val: &ad_core_rs::attributes::NDAttrValue) -> Vari
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
-    use epics_pva_rs::pvdata::ScalarType;
+    use epics_pva_rs::pvdata::{ScalarType, TypedScalarArray};
 
     #[test]
     fn convert_simple_array() {
@@ -336,6 +384,7 @@ mod tests {
                 *v = i as u8;
             }
         }
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         match &payload {
             PvField::Structure(s) => {
@@ -345,6 +394,58 @@ mod tests {
             }
             _ => panic!("expected structure"),
         }
+    }
+
+    /// C publishes `pData` itself (ntndArrayConverter.cpp:423-429): the value
+    /// arm must point at the frame's buffer and keep the frame alive, not at
+    /// a copy.
+    #[test]
+    fn the_published_value_is_the_frame_buffer_itself() {
+        let arr = Arc::new(NDArray::new(
+            vec![NDDimension::new(64), NDDimension::new(64)],
+            NDDataType::UInt16,
+        ));
+        let NDDataBuffer::U16(pixels) = &arr.data else {
+            panic!("expected u16 pixels");
+        };
+        let frame_ptr = pixels.as_ptr();
+
+        let payload = ndarray_to_pv_field(&arr);
+        assert_eq!(Arc::strong_count(&arr), 2, "the payload holds the frame");
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure");
+        };
+        let Some(PvField::Union { value, .. }) = s.get_field("value") else {
+            panic!("expected value union");
+        };
+        let PvField::ScalarArrayTyped(TypedScalarArray::UShort(items)) = value.as_ref() else {
+            panic!("expected ushort scalar array, got {value:?}");
+        };
+        assert_eq!(items.as_ptr(), frame_ptr);
+        assert_eq!(items.len(), 64 * 64);
+
+        drop(arr);
+        assert_eq!(items.len(), 64 * 64, "the payload keeps the frame alive");
+    }
+
+    /// The compressed branch publishes the frame's byte stream the same way.
+    #[test]
+    fn the_published_compressed_bytes_are_the_frame_buffer_itself() {
+        let arr = NDArray::new(vec![NDDimension::new(64)], NDDataType::UInt16);
+        let arr = Arc::new(crate::codec::compress_lz4(&arr).unwrap());
+        let frame_ptr = arr.data.as_u8_slice().as_ptr();
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure");
+        };
+        let Some(PvField::Union { value, .. }) = s.get_field("value") else {
+            panic!("expected value union");
+        };
+        let PvField::ScalarArrayTyped(TypedScalarArray::UByte(items)) = value.as_ref() else {
+            panic!("expected ubyte scalar array, got {value:?}");
+        };
+        assert_eq!(items.as_ptr(), frame_ptr);
     }
 
     /// Regression: the NTNDArray `dimension[].binning` field must serialize the
@@ -357,6 +458,7 @@ mod tests {
         dim.binning = 0;
         let arr = NDArray::new(vec![dim], NDDataType::UInt8);
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -394,13 +496,14 @@ mod tests {
         }
         let uncompressed_bytes = (arr.data.len() * 2) as i64; // 8 elems * 2 bytes
 
-        let compressed = crate::codec::compress_lz4(&arr);
+        let compressed = crate::codec::compress_lz4(&arr).unwrap();
         let comp_size = compressed.codec.as_ref().unwrap().compressed_size as i64;
         assert!(
             matches!(compressed.data, NDDataBuffer::U8(_)),
             "compressed buffer must hold raw bytes"
         );
 
+        let compressed = Arc::new(compressed);
         let payload = ndarray_to_pv_field(&compressed);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -483,6 +586,7 @@ mod tests {
         assert_eq!(arr.data_size, 100, "pool must keep the reused buffer size");
         assert!(arr.codec.is_none());
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -525,7 +629,7 @@ mod tests {
 
         // The compressor records the original type structurally in the codec
         // and attaches no carrier attribute.
-        let compressed = crate::codec::compress_lz4(&arr);
+        let compressed = crate::codec::compress_lz4(&arr).unwrap();
         assert_eq!(
             compressed.codec.as_ref().unwrap().original_data_type,
             NDDataType::UInt16,
@@ -539,6 +643,7 @@ mod tests {
             "precondition: no carrier attribute is attached to the array"
         );
 
+        let compressed = Arc::new(compressed);
         let payload = ndarray_to_pv_field(&compressed);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -579,7 +684,7 @@ mod tests {
         let proc = PvaProcessor::new("TEST:Pva1:Image".into());
         let pool = NDArrayPool::new(1_000_000);
         let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        proc.process_array(&arr, &pool);
+        proc.process_array(&Arc::new(arr), &pool);
 
         assert!(proc.handle().current_value().is_some());
     }
@@ -607,6 +712,7 @@ mod tests {
             NDAttrValue::Undefined,
         ));
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -663,6 +769,7 @@ mod tests {
             NDAttrValue::Int32(7),
         ));
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -754,6 +861,7 @@ mod tests {
             NDAttrValue::String("a constant".into()),
         ));
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");
@@ -815,6 +923,7 @@ mod tests {
         arr.timestamp.sec = 1000;
         arr.timestamp.nsec = 42;
 
+        let arr = Arc::new(arr);
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
             panic!("expected structure, got {payload:?}");

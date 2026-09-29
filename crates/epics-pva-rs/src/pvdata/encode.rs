@@ -247,7 +247,7 @@ pub(crate) fn decode_typed_scalar_array(
             for _ in 0..n {
                 v.push(decode_string_value(cur, order)?.unwrap_or_default());
             }
-            TypedScalarArray::String(v.into())
+            TypedScalarArray::String(std::sync::Arc::<[PvString]>::from(v).into())
         }
     }))
 }
@@ -256,12 +256,12 @@ pub(crate) fn decode_typed_scalar_array(
 /// matches; per-element swap loop otherwise. Returns an `Arc<[T]>`
 /// to share data with downstream consumers without copying.
 #[inline]
-fn read_pod_array<T: Copy, const N: usize, F>(
+fn read_pod_array<T: Copy + Send + Sync + 'static, const N: usize, F>(
     n: usize,
     cur: &mut Cursor<&[u8]>,
     same_endian: bool,
     swap: F,
-) -> Result<std::sync::Arc<[T]>, DecodeError>
+) -> Result<super::PvArray<T>, DecodeError>
 where
     F: Fn([u8; N]) -> T,
 {
@@ -280,31 +280,29 @@ where
         ));
     }
     let bytes = cur.get_bytes(nbytes)?;
+    // Decode straight into an `Arc<[T]>` so the array is adopted, not
+    // copied, by every later holder (`PvArray::as_arc`): a `Vec` here
+    // would cost a second copy when the elements become a record's VAL.
+    let mut arc = std::sync::Arc::<[T]>::new_uninit_slice(n);
+    let slots = std::sync::Arc::get_mut(&mut arc).expect("a fresh Arc has no other holder");
     if same_endian {
-        // Allocate an aligned Vec<T>, memcpy bytes in.
-        let mut v: Vec<T> = Vec::with_capacity(n);
         // SAFETY: T is a fixed-size POD primitive (i16/i32/i64/u*/f32/f64);
-        // Vec<T>::with_capacity gives an alloc with align_of::<T>() and
-        // capacity for n*N bytes; copy_nonoverlapping fills the prefix.
-        // set_len(n) is sound because every byte was written.
+        // the slice holds n aligned slots of N bytes each and `bytes` is
+        // exactly n*N bytes, so copy_nonoverlapping initialises every slot.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr() as *mut u8, nbytes);
-            v.set_len(n);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slots.as_mut_ptr() as *mut u8, nbytes);
         }
-        Ok(v.into())
     } else {
         // Mismatched endian: per-element swap. Still no enum match,
         // tight inlinable loop; LLVM auto-vectorizes the byte-reverse.
-        let mut v: Vec<T> = Vec::with_capacity(n);
         let mut buf = [0u8; N];
-        let mut off = 0usize;
-        for _ in 0..n {
-            buf.copy_from_slice(&bytes[off..off + N]);
-            v.push(swap(buf));
-            off += N;
+        for (slot, chunk) in slots.iter_mut().zip(bytes.chunks_exact(N)) {
+            buf.copy_from_slice(chunk);
+            slot.write(swap(buf));
         }
-        Ok(v.into())
     }
+    // SAFETY: both branches wrote every one of the n slots.
+    Ok(unsafe { arc.assume_init() }.into())
 }
 
 /// Helper: emit a `Pod` slice as bulk bytes when endian matches,

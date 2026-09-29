@@ -273,7 +273,7 @@ async fn a_string_into_a_char_array_is_parsed_like_every_other_numeric() {
     );
 
     // DBR_CHAR (`caput -S`): the bytes, and no conversion row at all.
-    db.put_record_field_from_ca("W", "VAL", EpicsValue::CharArray(b"hi".to_vec()))
+    db.put_record_field_from_ca("W", "VAL", EpicsValue::CharArray(b"hi".to_vec().into()))
         .await
         .expect("a DBR_CHAR put carries the bytes");
     let EpicsValue::CharArray(bytes) = read(&db, "W.VAL").await else {

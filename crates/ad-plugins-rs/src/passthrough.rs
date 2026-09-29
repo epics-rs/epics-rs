@@ -6,6 +6,7 @@
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use std::sync::Arc;
 
 /// A no-op plugin processor that passes arrays through unchanged.
 pub struct PassthroughProcessor {
@@ -25,7 +26,7 @@ impl NDPluginProcess for PassthroughProcessor {
         &self.plugin_type
     }
 
-    fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::empty()
     }
 

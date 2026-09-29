@@ -66,7 +66,7 @@ fn served_val(db: &PvDatabase) -> Vec<f64> {
     let handle = db.get_record("CB").unwrap();
     let inst = handle.read();
     match inst.client_field_value("VAL").unwrap() {
-        EpicsValue::DoubleArray(v) => v,
+        EpicsValue::DoubleArray(v) => v.to_vec(),
         other => panic!("expected DoubleArray, got {other:?}"),
     }
 }
@@ -79,7 +79,7 @@ fn through_arr(values: Vec<f64>, start: i64, end: i64) -> Vec<f64> {
     };
     let event = FilteredMonitorEvent::new(MonitorEvent {
         snapshot: std::sync::Arc::new(Snapshot::new(
-            EpicsValue::DoubleArray(values),
+            EpicsValue::DoubleArray(values.into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
@@ -89,7 +89,7 @@ fn through_arr(values: Vec<f64>, start: i64, end: i64) -> Vec<f64> {
     });
     let out = ArrayFilter::new(cfg).apply(event).unwrap();
     match std::sync::Arc::unwrap_or_clone(out.event.snapshot).value {
-        EpicsValue::DoubleArray(v) => v,
+        EpicsValue::DoubleArray(v) => v.to_vec(),
         other => panic!("expected DoubleArray, got {other:?}"),
     }
 }

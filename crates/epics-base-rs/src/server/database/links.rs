@@ -3989,7 +3989,12 @@ mod out_link_put_fail_tests {
         };
         let mut visited = crate::server::database::ProcStack::new();
 
-        db.write_db_link_value(&link, EpicsValue::DoubleArray(vec![]), src, &mut visited);
+        db.write_db_link_value(
+            &link,
+            EpicsValue::DoubleArray(vec![].into()),
+            src,
+            &mut visited,
+        );
 
         // The put succeeded (status 0), so the PP target processed: CALC = "7".
         assert!(

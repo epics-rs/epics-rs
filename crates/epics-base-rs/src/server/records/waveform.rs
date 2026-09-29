@@ -200,7 +200,7 @@ impl Default for WaveformRecord {
     fn default() -> Self {
         Self {
             kind: ArrayKind::Waveform,
-            val: EpicsValue::StringArray(Vec::new()),
+            val: EpicsValue::StringArray(Vec::new().into()),
             nelm: 1,
             nord: 0,
             // `field(FTVL,DBF_MENU){ menu(menuFtype) }` carries no `initial(...)`
@@ -339,8 +339,8 @@ impl WaveformRecord {
     }
 
     /// Land a VAL source in the FTVL-typed buffer — the single owner of the
-    /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of
-    /// [`Self::val_capacity`] elements on every path, by construction.
+    /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of at
+    /// most [`Self::val_capacity`] elements on every path, by construction.
     ///
     /// C never replaces the buffer, whatever the source's shape: every write
     /// hands `dbGetLink`/`dbPutField` a pointer to the FTVL-typed `bptr` with
@@ -368,23 +368,30 @@ impl WaveformRecord {
     fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
         let cap = self.val_capacity();
         let converted = value.convert_to(self.ftvl_element_type());
-        // NORD is capped at the buffer capacity (C bounds every request to the
-        // allocated element count, so NORD <= capacity by construction) and the
-        // buffer keeps that capacity to preserve the CA channel element count.
+        // NORD is capped at the capacity (C bounds every request to the
+        // allocated element count). The buffer the record holds is at least
+        // NORD long and at most the capacity; the CA channel element count
+        // comes from `val_capacity`, not from the buffer.
         macro_rules! land {
-            ($src:expr, $variant:ident, $zero:expr) => {{
+            ($src:expr, $variant:ident) => {{
                 let mut arr = $src;
                 let n = arr.len().min(cap);
                 self.nord = n as i32;
                 match &mut self.val {
-                    // The buffer already has its shape: copy the head in and
-                    // leave the rest alone, as C's conversion into `bptr` does.
-                    // The elements past NORD are served to nobody.
-                    EpicsValue::$variant(buf) if buf.len() == cap => {
-                        buf[..n].clone_from_slice(&arr[..n]);
+                    // The buffer already has its shape and nobody else holds
+                    // it: copy the head in and leave the rest alone, as C's
+                    // conversion into `bptr` does. The elements past NORD are
+                    // served to nobody.
+                    EpicsValue::$variant(buf) if !buf.is_shared() && n < buf.len() => {
+                        buf.make_mut()[..n].clone_from_slice(&arr[..n]);
                     }
+                    // Otherwise the source becomes the record's buffer as it
+                    // is: the device's array is moved in, not copied, and the
+                    // previous buffer stays with whichever snapshot still
+                    // holds it. Copying into a shared buffer would cost the
+                    // whole capacity (`Arc::make_mut`) for a write of `n`.
                     _ => {
-                        arr.resize(cap, $zero);
+                        arr.truncate(n);
                         self.val = EpicsValue::$variant(arr);
                     }
                 }
@@ -392,31 +399,31 @@ impl WaveformRecord {
             }};
         }
         match converted {
-            EpicsValue::CharArray(a) => land!(a, CharArray, 0),
-            EpicsValue::UCharArray(a) => land!(a, UCharArray, 0),
-            EpicsValue::ShortArray(a) => land!(a, ShortArray, 0),
-            EpicsValue::UShortArray(a) => land!(a, UShortArray, 0),
-            EpicsValue::LongArray(a) => land!(a, LongArray, 0),
-            EpicsValue::ULongArray(a) => land!(a, ULongArray, 0),
-            EpicsValue::Int64Array(a) => land!(a, Int64Array, 0),
-            EpicsValue::UInt64Array(a) => land!(a, UInt64Array, 0),
-            EpicsValue::FloatArray(a) => land!(a, FloatArray, 0.0),
-            EpicsValue::DoubleArray(a) => land!(a, DoubleArray, 0.0),
-            EpicsValue::EnumArray(a) => land!(a, EnumArray, 0),
-            EpicsValue::StringArray(a) => land!(a, StringArray, PvString::new()),
+            EpicsValue::CharArray(a) => land!(a, CharArray),
+            EpicsValue::UCharArray(a) => land!(a, UCharArray),
+            EpicsValue::ShortArray(a) => land!(a, ShortArray),
+            EpicsValue::UShortArray(a) => land!(a, UShortArray),
+            EpicsValue::LongArray(a) => land!(a, LongArray),
+            EpicsValue::ULongArray(a) => land!(a, ULongArray),
+            EpicsValue::Int64Array(a) => land!(a, Int64Array),
+            EpicsValue::UInt64Array(a) => land!(a, UInt64Array),
+            EpicsValue::FloatArray(a) => land!(a, FloatArray),
+            EpicsValue::DoubleArray(a) => land!(a, DoubleArray),
+            EpicsValue::EnumArray(a) => land!(a, EnumArray),
+            EpicsValue::StringArray(a) => land!(a, StringArray),
             // Scalar source: one element, into bptr[0].
-            EpicsValue::Char(x) => land!(vec![x], CharArray, 0),
-            EpicsValue::UChar(x) => land!(vec![x], UCharArray, 0),
-            EpicsValue::Short(x) => land!(vec![x], ShortArray, 0),
-            EpicsValue::UShort(x) => land!(vec![x], UShortArray, 0),
-            EpicsValue::Long(x) => land!(vec![x], LongArray, 0),
-            EpicsValue::ULong(x) => land!(vec![x], ULongArray, 0),
-            EpicsValue::Int64(x) => land!(vec![x], Int64Array, 0),
-            EpicsValue::UInt64(x) => land!(vec![x], UInt64Array, 0),
-            EpicsValue::Float(x) => land!(vec![x], FloatArray, 0.0),
-            EpicsValue::Double(x) => land!(vec![x], DoubleArray, 0.0),
-            EpicsValue::Enum(x) => land!(vec![x], EnumArray, 0),
-            EpicsValue::String(x) => land!(vec![x], StringArray, PvString::new()),
+            EpicsValue::Char(x) => land!(crate::types::SharedArray::from(vec![x]), CharArray),
+            EpicsValue::UChar(x) => land!(crate::types::SharedArray::from(vec![x]), UCharArray),
+            EpicsValue::Short(x) => land!(crate::types::SharedArray::from(vec![x]), ShortArray),
+            EpicsValue::UShort(x) => land!(crate::types::SharedArray::from(vec![x]), UShortArray),
+            EpicsValue::Long(x) => land!(crate::types::SharedArray::from(vec![x]), LongArray),
+            EpicsValue::ULong(x) => land!(crate::types::SharedArray::from(vec![x]), ULongArray),
+            EpicsValue::Int64(x) => land!(crate::types::SharedArray::from(vec![x]), Int64Array),
+            EpicsValue::UInt64(x) => land!(crate::types::SharedArray::from(vec![x]), UInt64Array),
+            EpicsValue::Float(x) => land!(crate::types::SharedArray::from(vec![x]), FloatArray),
+            EpicsValue::Double(x) => land!(crate::types::SharedArray::from(vec![x]), DoubleArray),
+            EpicsValue::Enum(x) => land!(crate::types::SharedArray::from(vec![x]), EnumArray),
+            EpicsValue::String(x) => land!(crate::types::SharedArray::from(vec![x]), StringArray),
             other => Err(CaError::TypeMismatch(format!(
                 "VAL: {other:?} does not convert to the FTVL element type"
             ))),
@@ -645,7 +652,7 @@ impl WaveformRecord {
             macro_rules! shift {
                 ($v:expr) => {
                     if start > 0 {
-                        $v.copy_within(start..end, 0);
+                        $v.make_mut().copy_within(start..end, 0);
                     }
                 };
             }
@@ -666,7 +673,7 @@ impl WaveformRecord {
                 // result, C's `memmove` over `MAX_STRING_SIZE`-wide slots.
                 EpicsValue::StringArray(v) => {
                     if start > 0 {
-                        v[..end].rotate_left(start);
+                        v.make_mut()[..end].rotate_left(start);
                     }
                 }
                 _ => {}
@@ -1625,6 +1632,7 @@ impl Record for WaveformRecord {
 mod array_kind_tests {
     use super::*;
     use crate::server::record::FieldDeclaration;
+    use crate::types::SharedArray;
 
     #[test]
     fn epics_mem_hash_matches_c_reference_vectors() {
@@ -2021,7 +2029,7 @@ mod array_kind_tests {
     fn aao_val_put_sets_nord_for_dol_pull() {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.nelm = 8;
-        aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
             .unwrap();
         assert_eq!(aao.nord, 3, "NORD must equal the pulled element count");
     }
@@ -2045,18 +2053,89 @@ mod array_kind_tests {
         }
         let mut wf = WaveformRecord::new(4, DbFieldType::Long);
         wf.kind = ArrayKind::Waveform;
-        let allocated = buffer(&wf);
 
-        for src in [vec![1, 2, 3, 4], vec![9], vec![], vec![5, 6, 7, 8, 9]] {
+        // (source, whether the write fills the buffer and so adopts the source)
+        for (src, adopts) in [
+            (vec![1, 2, 3, 4], true),
+            (vec![9], false),
+            (vec![], false),
+            (vec![5, 6, 7, 8, 9], true),
+        ] {
             let served: Vec<i32> = src.iter().copied().take(4).collect();
+            let src: SharedArray<i32> = src.into();
+            let src_ptr = src.as_ptr();
+            let before = buffer(&wf);
             wf.put_field("VAL", EpicsValue::LongArray(src)).unwrap();
+            let after = buffer(&wf);
+            assert_eq!(after.1, 4, "the buffer keeps NELM elements");
+            if adopts {
+                assert_eq!(after.0, src_ptr, "a full write adopts the source buffer");
+            } else {
+                assert_eq!(
+                    after.0, before.0,
+                    "a shorter write lands in the existing buffer"
+                );
+            }
             assert_eq!(
-                buffer(&wf),
-                allocated,
-                "the buffer is neither moved nor resized"
+                wf.get_field("VAL"),
+                Some(EpicsValue::LongArray(served.into()))
             );
-            assert_eq!(wf.get_field("VAL"), Some(EpicsValue::LongArray(served)));
         }
+    }
+
+    /// A monitor snapshot shares the record's buffer; the next shorter write
+    /// adopts its source instead of copying the whole capacity out from under
+    /// the snapshot, and once no snapshot holds the buffer the record writes
+    /// in place again.
+    #[test]
+    fn a_shared_buffer_is_left_to_the_snapshot_and_the_write_adopts_its_source() {
+        fn buffer(v: &EpicsValue) -> &SharedArray<f64> {
+            match v {
+                EpicsValue::DoubleArray(v) => v,
+                other => panic!("VAL is {other:?}"),
+            }
+        }
+        let mut wf = WaveformRecord::new(4, DbFieldType::Double);
+        wf.kind = ArrayKind::Waveform;
+        wf.put_field(
+            "VAL",
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+        )
+        .unwrap();
+        let snapshot = wf.get_field("VAL").unwrap();
+        assert!(buffer(&snapshot).ptr_eq(buffer(&wf.val)));
+
+        let src: SharedArray<f64> = vec![9.0].into();
+        let src_ptr = src.as_ptr();
+        wf.put_field("VAL", EpicsValue::DoubleArray(src)).unwrap();
+        assert_eq!(
+            buffer(&wf.val).as_ptr(),
+            src_ptr,
+            "a held buffer is not copied"
+        );
+        assert_eq!(&**buffer(&snapshot), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            wf.get_field("VAL"),
+            Some(EpicsValue::DoubleArray(vec![9.0].into()))
+        );
+        assert_eq!(wf.field_native_count("VAL"), Some(4));
+        drop(snapshot);
+
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![5.0, 6.0, 7.0].into()))
+            .unwrap();
+        let p = buffer(&wf.val).as_ptr();
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
+            .unwrap();
+        assert_eq!(
+            buffer(&wf.val).as_ptr(),
+            p,
+            "the sole holder writes in place"
+        );
+        assert_eq!(&**buffer(&wf.val), &[7.0, 8.0, 7.0]);
+        assert_eq!(
+            wf.get_field("VAL"),
+            Some(EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
+        );
     }
 
     /// An NELM change keeps the elements already loaded, whatever the FTVL.
@@ -2065,13 +2144,13 @@ mod array_kind_tests {
         for (ftvl, loaded, grown) in [
             (
                 DbFieldType::UShort,
-                EpicsValue::UShortArray(vec![1, 2]),
-                EpicsValue::UShortArray(vec![1, 2, 0, 0]),
+                EpicsValue::UShortArray(vec![1, 2].into()),
+                EpicsValue::UShortArray(vec![1, 2, 0, 0].into()),
             ),
             (
                 DbFieldType::ULong,
-                EpicsValue::ULongArray(vec![1, 2]),
-                EpicsValue::ULongArray(vec![1, 2, 0, 0]),
+                EpicsValue::ULongArray(vec![1, 2].into()),
+                EpicsValue::ULongArray(vec![1, 2, 0, 0].into()),
             ),
         ] {
             let mut wf = WaveformRecord::new(2, ftvl);
@@ -2083,19 +2162,20 @@ mod array_kind_tests {
         }
     }
 
-    /// A buffer that is not yet the FTVL-typed NELM array is replaced by one.
+    /// A buffer that is not the FTVL-typed array is replaced by the source
+    /// landed as one.
     #[test]
     fn a_val_put_rebuilds_a_misshapen_buffer() {
         let mut wf = WaveformRecord::new(4, DbFieldType::Long);
         wf.kind = ArrayKind::Waveform;
         for misshapen in [
-            EpicsValue::LongArray(vec![0; 2]),
-            EpicsValue::DoubleArray(vec![0.0; 4]),
+            EpicsValue::LongArray(vec![0; 2].into()),
+            EpicsValue::DoubleArray(vec![0.0; 4].into()),
         ] {
             wf.val = misshapen;
-            wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))
+            wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2].into()))
                 .unwrap();
-            assert_eq!(wf.val, EpicsValue::LongArray(vec![1, 2, 0, 0]));
+            assert_eq!(wf.val, EpicsValue::LongArray(vec![1, 2].into()));
             assert_eq!(wf.nord, 2);
         }
     }
@@ -2109,18 +2189,21 @@ mod array_kind_tests {
         wf.kind = ArrayKind::Waveform;
 
         // source < NELM
-        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))
+        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2].into()))
             .unwrap();
         assert_eq!(wf.nord, 2, "source < NELM: NORD == source length");
 
         // source == NELM
-        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4]))
+        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4].into()))
             .unwrap();
         assert_eq!(wf.nord, 4, "source == NELM: NORD == NELM");
 
         // source > NELM: NORD must clamp to NELM, not the source length
-        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7]))
-            .unwrap();
+        wf.put_field(
+            "VAL",
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7].into()),
+        )
+        .unwrap();
         assert_eq!(wf.nord, 4, "source > NELM: NORD must clamp to NELM");
         // and the served VAL holds exactly NORD (== NELM) valid elements
         let val = wf.get_field("VAL").unwrap();
@@ -2148,7 +2231,7 @@ mod array_kind_tests {
         r.put_field("MALM", EpicsValue::Long(6)).unwrap();
         r.put_field("NELM", EpicsValue::Long(4)).unwrap();
         r.put_field("INDX", EpicsValue::Long(2)).unwrap();
-        let source = EpicsValue::DoubleArray(vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+        let source = EpicsValue::DoubleArray(vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0].into());
         r.set_val(source).unwrap();
         assert_eq!(r.nord, 4, "should copy 4 elements from offset 2");
         let val = r.get_field("VAL").unwrap();
@@ -2169,7 +2252,7 @@ mod array_kind_tests {
         r.put_field("MALM", EpicsValue::Long(20)).unwrap();
         r.put_field("NELM", EpicsValue::Long(3)).unwrap();
         r.put_field("INDX", EpicsValue::Long(10)).unwrap();
-        let source = EpicsValue::LongArray(vec![1, 2, 3]);
+        let source = EpicsValue::LongArray(vec![1, 2, 3].into());
         r.put_field("FTVL", EpicsValue::Short(5)).unwrap(); // LONG
         r.set_val(source).unwrap();
         assert_eq!(r.nord, 0, "INDX past source.len must zero NORD");
@@ -2184,7 +2267,7 @@ mod array_kind_tests {
         r.put_field("MALM", EpicsValue::Long(5)).unwrap();
         r.put_field("NELM", EpicsValue::Long(5)).unwrap();
         r.put_field("INDX", EpicsValue::Long(3)).unwrap();
-        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into());
         r.set_val(source).unwrap();
         assert_eq!(r.nord, 2, "only 2 elements available from offset 3");
         // get_field("VAL") truncates to NORD — caller-visible slice
@@ -2205,7 +2288,7 @@ mod array_kind_tests {
         // MALM caps how far into the source we look — even if the
         // source has 8 elements, MALM=3 keeps us to indices [0..3).
         r.put_field("MALM", EpicsValue::Long(3)).unwrap();
-        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into());
         r.set_val(source).unwrap();
         assert_eq!(r.nord, 3, "MALM=3 limits visible source to 3 elements");
         if let Some(EpicsValue::DoubleArray(v)) = r.get_field("VAL") {
@@ -2309,7 +2392,7 @@ mod array_kind_tests {
 
         // A value above i64::MAX round-trips without precision loss.
         let big = u64::MAX - 9;
-        r.put_field("VAL", EpicsValue::UInt64Array(vec![big, 0, 1]))
+        r.put_field("VAL", EpicsValue::UInt64Array(vec![big, 0, 1].into()))
             .unwrap();
         match r.get_field("VAL") {
             Some(EpicsValue::UInt64Array(v)) => assert_eq!(v[0], big),

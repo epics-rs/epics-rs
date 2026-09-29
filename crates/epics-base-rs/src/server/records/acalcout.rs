@@ -708,7 +708,7 @@ impl AcalcoutRecord {
         let n = self.num_elements();
         let mut out = data.to_vec();
         out.resize(n, 0.0);
-        EpicsValue::DoubleArray(out)
+        EpicsValue::DoubleArray(out.into())
     }
 
     /// Zero `[from, numElements)` — the REST OF THE WINDOW after a writer that
@@ -1007,7 +1007,7 @@ impl AcalcoutRecord {
     /// use).
     fn coerce_array(value: EpicsValue) -> Option<Vec<f64>> {
         match value {
-            EpicsValue::DoubleArray(v) => Some(v),
+            EpicsValue::DoubleArray(v) => Some(v.to_vec()),
             EpicsValue::FloatArray(v) => Some(v.into_iter().map(|x| x as f64).collect()),
             EpicsValue::LongArray(v) => Some(v.into_iter().map(|x| x as f64).collect()),
             EpicsValue::ShortArray(v) => Some(v.into_iter().map(|x| x as f64).collect()),
@@ -1698,7 +1698,7 @@ impl Record for AcalcoutRecord {
         let value = match Self::coerce_array(value) {
             Some(mut src) => {
                 src.truncate(self.num_elements());
-                EpicsValue::DoubleArray(src)
+                EpicsValue::DoubleArray(src.into())
             }
             None => return Err(CaError::TypeMismatch(name.into())),
         };
@@ -2484,7 +2484,7 @@ mod tests {
         // Scalar result broadcasts into AVAL (C aCalcPerform toArray).
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![7.0]))
+            Some(EpicsValue::DoubleArray(vec![7.0].into()))
         );
     }
 
@@ -2492,15 +2492,18 @@ mod tests {
     fn test_acalcout_array_calc_broadcasts_and_aval() {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
-        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
-            .unwrap();
+        rec.put_field(
+            "AA",
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
+        )
+        .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
         rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0, 5.0]))
+            Some(EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0, 5.0].into()))
         );
         // VAL is the array's first element (C to_double).
         assert_eq!(rec.val, 2.0);
@@ -2510,7 +2513,7 @@ mod tests {
     fn test_acalcout_dopt_use_ocal_array() {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(3)).unwrap();
-        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
@@ -2522,11 +2525,11 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         );
         assert_eq!(
             rec.get_field("OAV"),
-            Some(EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0]))
+            Some(EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0].into()))
         );
         assert_eq!(rec.oval, 2.0);
     }
@@ -2912,7 +2915,7 @@ mod tests {
     fn a_client_put_into_an_array_field_charges_posts_and_commits_at_once() {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
-        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
             .unwrap();
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(16)));
         assert_eq!(
@@ -2926,7 +2929,7 @@ mod tests {
             "C's literal DBE_VALUE|DBE_LOG (:698)"
         );
 
-        rec.put_field("AA", EpicsValue::DoubleArray(vec![3.0, 4.0]))
+        rec.put_field("AA", EpicsValue::DoubleArray(vec![3.0, 4.0].into()))
             .unwrap();
         assert_eq!(
             rec.get_field("AMEM"),
@@ -2966,7 +2969,7 @@ mod tests {
         );
         assert_eq!(
             rec.get_field("AA"),
-            Some(EpicsValue::DoubleArray(vec![0.0])),
+            Some(EpicsValue::DoubleArray(vec![0.0].into())),
             "the array half is not (:212)"
         );
         assert_eq!(
@@ -3112,8 +3115,11 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(8)).unwrap();
         rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
-        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]))
-            .unwrap();
+        rec.put_field(
+            "AA",
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
+        )
+        .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
         rec.special("CALC", true).unwrap();
@@ -3121,7 +3127,7 @@ mod tests {
         // num_elements = NUSE (3) since 0 < NUSE < NELM.
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         );
     }
 

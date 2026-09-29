@@ -48,7 +48,8 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 /// `WF` (4 elements) -> `A.INAA` -> AA, with a CALC that never stores into AA.
 async fn wf_into_aa(db: &PvDatabase, data: Vec<f64>) {
     let mut wf = WaveformRecord::new(data.len() as i32, DbFieldType::Double);
-    wf.put_field("VAL", EpicsValue::DoubleArray(data)).unwrap();
+    wf.put_field("VAL", EpicsValue::DoubleArray(data.into()))
+        .unwrap();
     db.add_record("WF", Box::new(wf)).await.unwrap();
 
     let mut a = AcalcoutRecord::new();
@@ -87,7 +88,7 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     let first = aa_rx.try_recv().expect("AA moved on the first fetch");
     assert_eq!(
         first.snapshot.value,
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
 
     // A client overwrites AA. The put posts its own value and processes the
@@ -97,13 +98,17 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     // restored value against the [1,2,3,4] it posted in cycle 1 and finds nothing
     // to say. C compares against the PRE-FETCH field — the caput's [9,9,9,9] —
     // sets NEWM bit 0, and posts.
-    db.put_record_field_from_ca("A", "AA", EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0]))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca(
+        "A",
+        "AA",
+        EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0].into()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         field(&db, "A", "AA").await,
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
         "the link must have overwritten the caput value"
     );
 
@@ -113,7 +118,7 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     }
     assert_eq!(
         seen.last(),
-        Some(&EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])),
+        Some(&EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())),
         "the LAST thing the subscriber hears about AA must be what the record \
          actually holds. fetch_values set NEWM bit 0 (pre-fetch [9,9,9,9] != \
          fetched [1,2,3,4]) and monitor() posts it; without NEWM the caput's \
@@ -173,9 +178,13 @@ async fn r11_c4_a_caput_alone_sets_no_newm_bit() {
     a.special("CALC", true).unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
 
-    db.put_record_field_from_ca("A", "AA", EpicsValue::DoubleArray(vec![5.0, 5.0, 5.0, 5.0]))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca(
+        "A",
+        "AA",
+        EpicsValue::DoubleArray(vec![5.0, 5.0, 5.0, 5.0].into()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         field(&db, "A", "NEWM").await,

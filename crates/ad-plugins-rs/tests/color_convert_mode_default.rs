@@ -32,6 +32,7 @@ use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use ad_plugins_rs::color_convert::{ColorConvertConfig, ColorConvertProcessor};
+use std::sync::Arc;
 
 fn processor(target: NDColorMode) -> ColorConvertProcessor {
     ColorConvertProcessor::new(ColorConvertConfig {
@@ -56,7 +57,8 @@ fn stack_3x4x4() -> NDArray {
 }
 
 fn run(proc: &mut ColorConvertProcessor, arr: &NDArray) -> ProcessResult {
-    proc.process_array(arr, &NDArrayPool::new(1 << 20))
+    let input = Arc::new(arr.clone());
+    proc.process_array(&input, &NDArrayPool::new(1 << 20))
 }
 
 /// The cited case: a 3-D array whose leading dimension happens to be 3. The port

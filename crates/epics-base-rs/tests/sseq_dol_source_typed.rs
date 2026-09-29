@@ -152,7 +152,7 @@ async fn sseq_char_array_dol_delivers_string_and_atof() {
     let mut src = WaveformRecord::new(40, DbFieldType::Char);
     src.put_field(
         "VAL",
-        EpicsValue::CharArray(b"12.5\0                                   ".to_vec()),
+        EpicsValue::CharArray(b"12.5\0                                   ".to_vec().into()),
     )
     .unwrap();
     db.add_record("SS_CHAR_SRC", Box::new(src)).await.unwrap();

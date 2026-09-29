@@ -179,7 +179,7 @@ impl SubscriptionFilter for TimestampFilter {
                 // C `ts_array` (ts.c:223-235) produces a 2-element
                 // `DBF_ULONG` array `[secPastEpoch, nsec]` of `epicsUInt32`.
                 let (sec, nsec) = ts_parts(snap.timestamp, self.epoch);
-                snap.value = EpicsValue::ULongArray(vec![sec as u32, nsec]);
+                snap.value = EpicsValue::ULongArray(vec![sec as u32, nsec].into());
             }
             TsMode::StringEpics => {
                 snap.value = EpicsValue::String(format_epics_string(snap.timestamp).into());

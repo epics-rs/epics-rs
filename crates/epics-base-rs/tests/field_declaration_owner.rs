@@ -109,7 +109,7 @@ fn r21_runtime_typed_field_has_no_declared_type() {
     let mut inst = instance("waveform");
     inst.record.put_field("FTVL", EpicsValue::Short(1)).unwrap(); // CHAR
     inst.record
-        .put_field("VAL", EpicsValue::CharArray(vec![0; 8]))
+        .put_field("VAL", EpicsValue::CharArray(vec![0; 8].into()))
         .unwrap();
     assert_eq!(inst.declared_field_type("VAL"), None);
     // A field with a real declaration still answers.

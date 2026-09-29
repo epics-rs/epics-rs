@@ -119,7 +119,7 @@ fn r21_an_ftvl_past_the_menu_is_rejected_and_changes_nothing() {
             .put_field("FTVL", EpicsValue::Short(5))
             .expect("LONG is a choice");
         inst.record
-            .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+            .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
             .expect("a LONG buffer takes a long array");
 
         for bad in [MENU_FTYPE.len() as i16, 99, -1] {

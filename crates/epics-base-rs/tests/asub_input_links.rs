@@ -48,7 +48,7 @@ async fn asub_db() -> PvDatabase {
     let mut wf = WaveformRecord::new(8, DbFieldType::Double);
     wf.put_field(
         "VAL",
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
     )
     .unwrap();
     db.add_record("WF", Box::new(wf)).await.unwrap();
@@ -91,7 +91,9 @@ async fn array_source_lands_whole_in_a_declared_array_channel() {
 
     assert_eq!(
         field(&db, "ASUB", "A").await,
-        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+        Some(EpicsValue::DoubleArray(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0].into()
+        )),
         "the waveform's NORD elements must all reach A"
     );
     assert_eq!(

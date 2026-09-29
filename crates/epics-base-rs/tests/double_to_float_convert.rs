@@ -107,17 +107,20 @@ fn dbr_float_scalar_convert_to_clamps() {
 
 #[test]
 fn dbr_float_array_convert_to_clamps() {
-    let src = EpicsValue::DoubleArray(vec![1e300, -1e300, 1e-300, -1e-300, 0.0, 2.5]);
+    let src = EpicsValue::DoubleArray(vec![1e300, -1e300, 1e-300, -1e-300, 0.0, 2.5].into());
     assert_eq!(
         src.convert_to(DbFieldType::Float),
-        EpicsValue::FloatArray(vec![
-            f32::MAX,
-            -f32::MAX,
-            f32::MIN_POSITIVE,
-            -f32::MIN_POSITIVE,
-            0.0,
-            2.5,
-        ])
+        EpicsValue::FloatArray(
+            vec![
+                f32::MAX,
+                -f32::MAX,
+                f32::MIN_POSITIVE,
+                -f32::MIN_POSITIVE,
+                0.0,
+                2.5,
+            ]
+            .into()
+        )
     );
 }
 

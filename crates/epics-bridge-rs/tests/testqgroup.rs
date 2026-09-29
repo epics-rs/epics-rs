@@ -1289,9 +1289,12 @@ async fn br76_any_member_is_variant_descriptor_value_and_put() {
     )
     .await
     .unwrap();
-    db.put_pv("B76:wf", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
-        .await
-        .unwrap();
+    db.put_pv(
+        "B76:wf",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()),
+    )
+    .await
+    .unwrap();
 
     let json = r#"{
         "B76:grp": {
@@ -1707,9 +1710,12 @@ async fn r17_31_group_scalar_member_serves_long_string() {
         let rec = db.get_record("TEST:lstrwf").expect("record");
         rec.write().set_info("Q:form", "String");
     }
-    db.put_pv("TEST:lstrwf", EpicsValue::CharArray(b"hi\0".to_vec()))
-        .await
-        .expect("seed");
+    db.put_pv(
+        "TEST:lstrwf",
+        EpicsValue::CharArray(b"hi\0".to_vec().into()),
+    )
+    .await
+    .expect("seed");
 
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     provider.load_group_config(JSON).expect("load");
@@ -1772,7 +1778,7 @@ async fn r18_26_plain_long_string_member_descriptor_matches_value() {
         let rec = db.get_record("TEST:plls").expect("record");
         rec.write().set_info("Q:form", "String");
     }
-    db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec()))
+    db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec().into()))
         .await
         .expect("seed");
 
@@ -1833,7 +1839,7 @@ async fn r18_26_plain_char_waveform_without_qform_stays_a_byte_array() {
     )
     .await
     .unwrap();
-    db.put_pv("TEST:plraw", EpicsValue::CharArray(vec![1, 0, 3]))
+    db.put_pv("TEST:plraw", EpicsValue::CharArray(vec![1, 0, 3].into()))
         .await
         .expect("seed");
 
@@ -1859,7 +1865,9 @@ async fn r18_26_plain_char_waveform_without_qform_stays_a_byte_array() {
 
     let got = ch.get(&empty_request()).await.expect("get");
     match find_field(&got, "raw") {
-        Some(PvField::ScalarArray(a)) => assert_eq!(a.len(), 3, "the NUL is a value, not a stop"),
+        Some(PvField::ScalarArrayTyped(a)) => {
+            assert_eq!(a.len(), 3, "the NUL is a value, not a stop")
+        }
         other => panic!("expected a byte array, got {other:?}"),
     }
 }
@@ -2040,7 +2048,7 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
 
     assert_eq!(
         db.get_pv("TEST:lstrwf.VAL").unwrap(),
-        EpicsValue::CharArray(b"hello\0".to_vec()),
+        EpicsValue::CharArray(b"hello\0".to_vec().into()),
         "long-string member PUT must write the NUL-terminated char image"
     );
 

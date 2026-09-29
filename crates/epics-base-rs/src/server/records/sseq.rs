@@ -1593,7 +1593,7 @@ impl Record for SseqRecord {
                     let n = target.element_count.min(SSEQ_STRING_SIZE as i64) as usize;
                     let mut buf = step.str_val.as_bytes().to_vec();
                     buf.resize(n, 0);
-                    Some(EpicsValue::CharArray(buf))
+                    Some(EpicsValue::CharArray(buf.into()))
                 } else {
                     Some(EpicsValue::Double(step.dov))
                 }

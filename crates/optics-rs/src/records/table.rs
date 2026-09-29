@@ -2785,14 +2785,14 @@ impl Record for TableRecord {
             // redirect — an array `EpicsValue` already carries the element
             // type `cvt_dbaddr` sets and the count it reports, so no
             // separate `Special::DbAddr` path is needed for the value.
-            "A" => Some(EpicsValue::DoubleArray(self.a.concat())),
-            "B" => Some(EpicsValue::DoubleArray(self.b.concat())),
-            "PP0" => Some(EpicsValue::DoubleArray(self.pp0.to_vec())),
-            "PP1" => Some(EpicsValue::DoubleArray(self.pp1.to_vec())),
-            "PP2" => Some(EpicsValue::DoubleArray(self.pp2.to_vec())),
-            "PPO0" => Some(EpicsValue::DoubleArray(self.ppo0.to_vec())),
-            "PPO1" => Some(EpicsValue::DoubleArray(self.ppo1.to_vec())),
-            "PPO2" => Some(EpicsValue::DoubleArray(self.ppo2.to_vec())),
+            "A" => Some(EpicsValue::DoubleArray(self.a.concat().into())),
+            "B" => Some(EpicsValue::DoubleArray(self.b.concat().into())),
+            "PP0" => Some(EpicsValue::DoubleArray(self.pp0.to_vec().into())),
+            "PP1" => Some(EpicsValue::DoubleArray(self.pp1.to_vec().into())),
+            "PP2" => Some(EpicsValue::DoubleArray(self.pp2.to_vec().into())),
+            "PPO0" => Some(EpicsValue::DoubleArray(self.ppo0.to_vec().into())),
+            "PPO1" => Some(EpicsValue::DoubleArray(self.ppo1.to_vec().into())),
+            "PPO2" => Some(EpicsValue::DoubleArray(self.ppo2.to_vec().into())),
             _ => None,
         }
     }

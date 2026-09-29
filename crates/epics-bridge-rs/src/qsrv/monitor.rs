@@ -561,7 +561,7 @@ mod tests {
         .unwrap();
         db.put_pv(
             "WF_ARR.VAL",
-            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         )
         .await
         .unwrap();
@@ -603,12 +603,12 @@ mod tests {
             .map(|(_, v)| v)
             .expect("NTScalarArray has a value field");
         match value {
-            PvField::ScalarArray(v) => assert_eq!(
+            PvField::ScalarArrayTyped(v) => assert_eq!(
                 v.len(),
                 2,
                 "PROPERTY event must ship the arr-sliced value (len 2), not the full array (len 4)"
             ),
-            other => panic!("value must be a ScalarArray, got {other:?}"),
+            other => panic!("value must be a typed scalar array, got {other:?}"),
         }
 
         mon.stop().await;

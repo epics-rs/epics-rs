@@ -2145,7 +2145,7 @@ pub trait PortDriver: Any + Send + Sync {
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
         self.base_mut()
             .params
-            .set_float64_array(user.reason, user.addr, data.to_vec())?;
+            .set_float64_array(user.reason, user.addr, data)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
 
@@ -2156,7 +2156,7 @@ pub trait PortDriver: Any + Send + Sync {
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
         self.base_mut()
             .params
-            .set_int32_array(user.reason, user.addr, data.to_vec())?;
+            .set_int32_array(user.reason, user.addr, data)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
 

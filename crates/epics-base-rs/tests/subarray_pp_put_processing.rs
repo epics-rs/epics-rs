@@ -60,7 +60,7 @@ async fn nelm_put_narrows_the_slice_it_does_not_empty_val() {
 
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0]),
+        EpicsValue::DoubleArray(vec![1.0, 2.0].into()),
         "NELM=2 keeps the first two elements of the constant, it does not wipe VAL"
     );
     assert_eq!(
@@ -94,7 +94,7 @@ async fn nelm_put_above_malm_clamps_at_process() {
     );
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
 }
 
@@ -110,7 +110,7 @@ async fn indx_put_moves_the_window() {
 
     assert_eq!(
         db.get_pv("SA:CONST").unwrap(),
-        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0])
+        EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0].into())
     );
     assert_eq!(
         field(&db, "SA:CONST", "NORD").await,
@@ -151,13 +151,13 @@ async fn empty_inp_val_put_processes_and_nelm_put_re_subsets() {
     db.put_record_field_from_ca(
         "SA:EMPTY",
         "VAL",
-        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0].into()),
     )
     .await
     .unwrap();
     assert_eq!(
         db.get_pv("SA:EMPTY").unwrap(),
-        EpicsValue::DoubleArray(vec![20.0, 30.0, 40.0]),
+        EpicsValue::DoubleArray(vec![20.0, 30.0, 40.0].into()),
         "VAL is pp(TRUE): the put itself processes and slices"
     );
 
@@ -166,7 +166,7 @@ async fn empty_inp_val_put_processes_and_nelm_put_re_subsets() {
         .unwrap();
     assert_eq!(
         db.get_pv("SA:EMPTY").unwrap(),
-        EpicsValue::DoubleArray(vec![30.0, 40.0])
+        EpicsValue::DoubleArray(vec![30.0, 40.0].into())
     );
     assert_eq!(
         field(&db, "SA:EMPTY", "NORD").await,

@@ -125,11 +125,26 @@ pub fn mono_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
     ];
     let mut arr = output(pool, src, dims, src.data.data_type())?;
     same_type!(&src.data, &mut arr.data, |v, out| {
-        for (i, px) in out.chunks_exact_mut(3).enumerate().take(n) {
-            px.fill(v[i]);
-        }
+        broadcast3(&v[..n], &mut out[..3 * n])
     });
     Ok(arr)
+}
+
+/// Every value of `v` three times over into `out`: on lanes as far as
+/// whole vectors reach, then scalar.
+fn broadcast3<T: LaneElem>(v: &[T], out: &mut [T]) {
+    #[cfg(feature = "simd")]
+    let done =
+        fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::broadcast3(s, v, out));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    broadcast3_scalar(&v[done..], &mut out[3 * done..]);
+}
+
+fn broadcast3_scalar<T: Copy>(v: &[T], out: &mut [T]) {
+    for (&p, px) in v.iter().zip(out.chunks_exact_mut(3)) {
+        px.fill(p);
+    }
 }
 
 /// Convert RGB1 (3-channel interleaved) to mono.
@@ -237,31 +252,11 @@ pub fn convert_rgb_layout(
         }
     };
 
-    // Each layout is a stride triple over (ix, c, iy); a run along x in
-    // either layout is then a strided copy, contiguous in RGB2 and RGB3.
-    let strides = |mode: NDColorMode| match mode {
-        NDColorMode::RGB1 => (3, 1, x * 3),
-        NDColorMode::RGB2 => (1, x, x * 3),
-        NDColorMode::RGB3 => (1, x * y, x),
-        _ => unreachable!("checked above"),
-    };
-    let (sx, sc, sy) = strides(src_mode);
-    let (dx, dc, dy) = strides(dst_mode);
+    let src_strides = rgb_strides(src_mode, x, y);
+    let dst_strides = rgb_strides(dst_mode, x, y);
     let mut arr = output(pool, src, out_dims, src.data.data_type())?;
     same_type!(&src.data, &mut arr.data, |v, out| {
-        for iy in 0..y {
-            for c in 0..3usize {
-                let s = &v[c * sc + iy * sy..];
-                let d = &mut out[c * dc + iy * dy..];
-                if sx == 1 && dx == 1 {
-                    d[..x].copy_from_slice(&s[..x]);
-                } else {
-                    for (o, i) in d.iter_mut().step_by(dx).zip(s.iter().step_by(sx)).take(x) {
-                        *o = *i;
-                    }
-                }
-            }
-        }
+        rgb_layout_rows(v, out, x, y, src_strides, dst_strides)
     });
     // The output is laid out as `dst_mode`, so its ColorMode attribute must say
     // so. Cloning the source attributes copied the *source* ColorMode, which
@@ -279,6 +274,69 @@ pub fn convert_rgb_layout(
         ));
     }
     Ok(arr)
+}
+
+/// The element strides over (ix, c, iy) of an RGB layout of `x` by `y`
+/// pixels; a run along x is then a strided copy, contiguous in RGB2 and
+/// RGB3.
+fn rgb_strides(mode: NDColorMode, x: usize, y: usize) -> (usize, usize, usize) {
+    match mode {
+        NDColorMode::RGB1 => (3, 1, x * 3),
+        NDColorMode::RGB2 => (1, x, x * 3),
+        NDColorMode::RGB3 => (1, x * y, x),
+        _ => unreachable!("checked above"),
+    }
+}
+
+/// `v` with the strides `src` into `out` with the strides `dst`: the
+/// pixel-interleaved side of the conversion on lanes as far as whole
+/// vectors reach along each row, the rest of every row scalar.
+fn rgb_layout_rows<T: LaneElem>(
+    v: &[T],
+    out: &mut [T],
+    x: usize,
+    y: usize,
+    src: (usize, usize, usize),
+    dst: (usize, usize, usize),
+) {
+    #[cfg(feature = "simd")]
+    let x0 = fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::rgb1_rows(s, v, out, x, y, src, dst));
+    #[cfg(not(feature = "simd"))]
+    let x0 = 0;
+    rgb_layout_rows_scalar(v, out, x, y, x0, src, dst);
+}
+
+/// [`rgb_layout_rows`] from column `x0` of every row on.
+fn rgb_layout_rows_scalar<T: Copy>(
+    v: &[T],
+    out: &mut [T],
+    x: usize,
+    y: usize,
+    x0: usize,
+    (sx, sc, sy): (usize, usize, usize),
+    (dx, dc, dy): (usize, usize, usize),
+) {
+    if x0 == x {
+        return;
+    }
+    for iy in 0..y {
+        for c in 0..3usize {
+            let s = &v[c * sc + iy * sy + x0 * sx..];
+            let d = &mut out[c * dc + iy * dy + x0 * dx..];
+            if sx == 1 && dx == 1 {
+                d[..x - x0].copy_from_slice(&s[..x - x0]);
+            } else {
+                for (o, i) in d
+                    .iter_mut()
+                    .step_by(dx)
+                    .zip(s.iter().step_by(sx))
+                    .take(x - x0)
+                {
+                    *o = *i;
+                }
+            }
+        }
+    }
 }
 
 /// Convert NDArray element type using C cast semantics.
@@ -1054,6 +1112,25 @@ mod simd_kernels {
         })
     }
 
+    /// The tables that join the planes back into pixels; the inverse of
+    /// [`split_tables`].
+    #[inline(always)]
+    fn join_tables<S: Simd>(simd: S, e: usize) -> Tables<S> {
+        let n = S::u8s::LEN;
+        std::array::from_fn(|k| {
+            std::array::from_fn(|c| {
+                S::u8s::from_fn(simd, |j| {
+                    let q = (k * n + j) / e;
+                    if q % 3 == c {
+                        ((q / 3) * e + j % e) as u8
+                    } else {
+                        0xFF
+                    }
+                })
+            })
+        })
+    }
+
     /// `out[i] = v[0][t[i][0]] | v[1][t[i][1]] | v[2][t[i][2]]`, per byte.
     #[inline(always)]
     fn shuffle3<S: Simd>(t: &Tables<S>, v: [S::u8s; 3]) -> [S::u8s; 3] {
@@ -1071,6 +1148,15 @@ mod simd_kernels {
         std::array::from_fn(|k| {
             T::Vec::<S>::from_slice(simd, &v[k * per..(k + 1) * per]).to_bytes()
         })
+    }
+
+    /// `v` into three consecutive vectors of `out`.
+    #[inline(always)]
+    fn store3<S: Simd, T: LaneElem>(v: [S::u8s; 3], out: &mut [T]) {
+        let per = T::Vec::<S>::LEN;
+        for (k, b) in v.into_iter().enumerate() {
+            T::Vec::<S>::from_bytes(b).store_slice(&mut out[k * per..(k + 1) * per]);
+        }
     }
 
     /// `f64` vectors per vector of the narrowest element, on every level.
@@ -1102,6 +1188,66 @@ mod simd_kernels {
             T::narrow_vec(simd, &mean[..k]).store_slice(dst);
         }
         steps * per
+    }
+
+    /// [`super::broadcast3_scalar`] on lanes: a vector of values joins
+    /// with two copies of itself. Returns the values done.
+    #[simd]
+    pub(super) fn broadcast3<S: Simd, T: LaneElem>(simd: S, v: &[T], out: &mut [T]) -> usize {
+        let per = T::Vec::<S>::LEN;
+        let t = join_tables::<S>(simd, std::mem::size_of::<T>());
+        let steps = v.len().min(out.len() / 3) / per;
+        for (src, dst) in v.chunks_exact(per).zip(out.chunks_exact_mut(3 * per)) {
+            let p = T::Vec::<S>::from_slice(simd, src).to_bytes();
+            store3::<S, T>(shuffle3::<S>(&t, [p; 3]), dst);
+        }
+        steps * per
+    }
+
+    /// The pixel-interleaved side of an RGB layout conversion on lanes, a
+    /// vector of pixels per step: RGB1 → RGB2/RGB3 splits each row into
+    /// its channel runs, RGB2/RGB3 → RGB1 joins them. `src` and `dst` are
+    /// the (ix, c, iy) strides of the two layouts. Returns the columns of
+    /// every row that are done: 0 when neither side is RGB1.
+    #[simd]
+    pub(super) fn rgb1_rows<S: Simd, T: LaneElem>(
+        simd: S,
+        v: &[T],
+        out: &mut [T],
+        x: usize,
+        y: usize,
+        (sx, sc, sy): (usize, usize, usize),
+        (dx, dc, dy): (usize, usize, usize),
+    ) -> usize {
+        let per = T::Vec::<S>::LEN;
+        let e = std::mem::size_of::<T>();
+        let x0 = x / per * per;
+        if sx == 3 && dx == 1 {
+            let t = split_tables::<S>(simd, e);
+            for iy in 0..y {
+                for ix in (0..x0).step_by(per) {
+                    let split = shuffle3::<S>(&t, load3::<S, T>(simd, &v[iy * sy + ix * 3..]));
+                    for (c, p) in split.into_iter().enumerate() {
+                        T::Vec::<S>::from_bytes(p)
+                            .store_slice(&mut out[c * dc + iy * dy + ix..][..per]);
+                    }
+                }
+            }
+            x0
+        } else if sx == 1 && dx == 3 {
+            let t = join_tables::<S>(simd, e);
+            for iy in 0..y {
+                for ix in (0..x0).step_by(per) {
+                    let planes = std::array::from_fn(|c| {
+                        T::Vec::<S>::from_slice(simd, &v[c * sc + iy * sy + ix..][..per]).to_bytes()
+                    });
+                    store3::<S, T>(shuffle3::<S>(&t, planes), &mut out[iy * dy + ix * 3..]);
+                }
+            }
+            x0
+        } else {
+            0
+        }
     }
 
     #[simd]
@@ -1398,6 +1544,63 @@ mod simd_tests {
             },
             |g, w| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan())
         );
+    }
+
+    /// Every element type on a value count that leaves a tail.
+    #[test]
+    fn broadcast3_matches_scalar_on_every_level() {
+        let n = 3 * 64 + 5;
+        macro_rules! check {
+            ($($t:ty),*) => {$({
+                let v: Vec<$t> = (0..n).map(|i| (i * 37 + 11) as $t).collect();
+                let mut want = vec![<$t>::default(); 3 * n];
+                broadcast3_scalar(&v, &mut want);
+                for level in levels() {
+                    let mut got = vec![<$t>::default(); 3 * n];
+                    let done = dispatch!(level, s => simd_kernels::broadcast3(s, &v, &mut got));
+                    assert!(done > 0 && done <= n, "{level:?} {}", stringify!($t));
+                    broadcast3_scalar(&v[done..], &mut got[3 * done..]);
+                    assert_eq!(got, want, "{level:?} {}", stringify!($t));
+                }
+            })*};
+        }
+        check!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
+    }
+
+    /// Every layout pair on every element type, at widths below, at and
+    /// past one vector of every lane count so the row tails are covered.
+    #[test]
+    fn rgb1_rows_match_scalar_on_every_level() {
+        use NDColorMode::{RGB1, RGB2, RGB3};
+        let pairs = [
+            (RGB1, RGB2),
+            (RGB1, RGB3),
+            (RGB2, RGB1),
+            (RGB3, RGB1),
+            (RGB2, RGB3),
+        ];
+        macro_rules! check {
+            ($($t:ty),*) => {$(
+                for (src, dst) in pairs {
+                    for (x, y) in [(1, 2), (7, 3), (64, 1), (65, 2), (131, 3)] {
+                        let v: Vec<$t> = (0..3 * x * y).map(|i| (i * 37 + 11) as $t).collect();
+                        let s = rgb_strides(src, x, y);
+                        let d = rgb_strides(dst, x, y);
+                        let mut want = vec![<$t>::default(); 3 * x * y];
+                        rgb_layout_rows_scalar(&v, &mut want, x, y, 0, s, d);
+                        for level in levels() {
+                            let mut got = vec![<$t>::default(); 3 * x * y];
+                            let x0 = dispatch!(level, s_ => simd_kernels::rgb1_rows(s_, &v, &mut got, x, y, s, d));
+                            let lanes = src == RGB1 || dst == RGB1;
+                            assert!(if lanes { x < 64 || x0 > 0 } else { x0 == 0 }, "{level:?} {} {src:?}->{dst:?} {x}x{y}: x0 {x0}", stringify!($t));
+                            rgb_layout_rows_scalar(&v, &mut got, x, y, x0, s, d);
+                            assert_eq!(got, want, "{level:?} {} {src:?}->{dst:?} {x}x{y}", stringify!($t));
+                        }
+                    }
+                }
+            )*};
+        }
+        check!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
     }
 
     #[test]

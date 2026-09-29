@@ -204,8 +204,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
     /// One row of a [`Projection`]: `col_sum` and `col_thr` gain the row's
     /// values and threshold values column by column, and the row's own
     /// Σvalue, Σthreshold value and Σthreshold value·ix come back. The lane
-    /// loop below, or, with the `simd` feature, [`simd_kernels`] for every
-    /// type but the 64-bit integers.
+    /// loop below, or, with the `simd` feature, [`simd_kernels`].
     fn project_row(
         row: &[Self],
         threshold: f64,
@@ -297,13 +296,17 @@ macro_rules! stats_elem {
             }
         }
     )*};
-    (wide: $($t:ty => $lane:ty => $acc:ty [$range:ident]),* $(,)?) => {$(
+    (wide: $($t:ty => $lane:ty => $acc:ty [$range:ident, $project:ident]),* $(,)?) => {$(
         impl StatsElem for $t {
             type Acc = $acc;
             type Lane = $lane;
             #[cfg(feature = "simd")]
             fn range(v: &[Self]) -> Range<Self> {
                 fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
+            }
+            #[cfg(feature = "simd")]
+            fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
             }
             #[inline(always)]
             fn to_lane(self) -> $lane {
@@ -390,7 +393,7 @@ stats_elem! {
     u16 => u32 => u64 [range_u16, variance_u16, project_u16] Some(1 << 16),
     u32 => u64 => u64 [range_u32, variance_u32, project_u32, hist hist_u32] None,
 }
-stats_elem!(wide: i64 => f64 => f64 [range_i64], u64 => f64 => f64 [range_u64]);
+stats_elem!(wide: i64 => f64 => f64 [range_i64, project_i64], u64 => f64 => f64 [range_u64, project_u64]);
 stats_elem!(float: f32 [range_f32, project_f32, hist_f32], f64 [range_f64, project_f64, hist_f64]);
 
 /// Independent accumulators per reduction. Fixing the association this way is
@@ -583,6 +586,8 @@ mod simd_kernels {
         [a, b]
     });
     project_kernel!(f64, f64s, project_f64, |y| [y]);
+    project_kernel!(i64, i64s, project_i64, |y| [S::f64s::float_from(y)]);
+    project_kernel!(u64, u64s, project_u64, |y| [S::f64s::float_from(y)]);
 
     /// [`super::formula_count_pass`] on vectors: C's bin arithmetic on `f64`
     /// lanes, each lane classified before the truncation so that it lands

@@ -17,7 +17,9 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use lz4_flex::block::{compress, decompress};
+use lz4_flex::block::{
+    compress, compress_into, decompress, decompress_into, get_maximum_output_size,
+};
 use parking_lot::Mutex;
 use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters,
@@ -173,11 +175,28 @@ fn codec_output(
     bytes: &[u8],
     alloc_failure: &'static str,
 ) -> Result<NDArray, CodecFailure> {
+    codec_output_with(src, dims, data_type, bytes.len(), alloc_failure, |dst| {
+        dst.copy_from_slice(bytes);
+        Ok(())
+    })
+}
+
+/// [`codec_output`] for a producer that writes the `len` output bytes in
+/// place, so a decoder fills the pooled array itself instead of a buffer
+/// that is then copied.
+fn codec_output_with(
+    src: &NDArray,
+    dims: Vec<NDDimension>,
+    data_type: NDDataType,
+    len: usize,
+    alloc_failure: &'static str,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), CodecFailure>,
+) -> Result<NDArray, CodecFailure> {
     let pool = src.pool().unwrap_or_else(|| NDArrayPool::new(0));
     let mut arr = pool
-        .alloc_sized(dims, data_type, bytes.len())
+        .alloc_sized(dims, data_type, len)
         .map_err(|_| CodecFailure::from(alloc_failure))?;
-    arr.data.as_u8_slice_mut().copy_from_slice(bytes);
+    fill(arr.data.as_u8_slice_mut())?;
     // `pool->copy(input, output, false, true, false)`: the metadata, not the data.
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
@@ -661,18 +680,54 @@ fn bshuf_trans_bitrow_eight(input: &[u8], out: &mut [u8], size: usize, elem_size
     }
 }
 
+/// The stage buffers of one block's transposes, sized for the largest
+/// block of a stream and reused across its blocks.
+struct BshufScratch {
+    a: Vec<u8>,
+    b: Vec<u8>,
+    c: Vec<u8>,
+}
+
+impl BshufScratch {
+    fn new(nbyte: usize) -> Self {
+        Self {
+            a: vec![0u8; nbyte],
+            b: vec![0u8; nbyte],
+            c: vec![0u8; nbyte],
+        }
+    }
+}
+
 /// Bit-transpose one block of `size` elements (a multiple of 8) — library
 /// `bshuf_trans_bit_elem_scal` (bitshuffle_core.c:256): byte transpose, then
-/// bit-within-byte transpose, then bit-row transpose.
-fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+/// bit-within-byte transpose, then bit-row transpose — into `out`.
+fn bshuf_trans_bit_elem_into(
+    input: &[u8],
+    scratch: &mut BshufScratch,
+    out: &mut [u8],
+    size: usize,
+    elem_size: usize,
+) {
     debug_assert_eq!(size % 8, 0);
     let nbyte = size * elem_size;
-    let mut a = vec![0u8; nbyte];
-    bshuf_trans_byte_elem(input, &mut a, size, elem_size);
-    let mut b = vec![0u8; nbyte];
-    bshuf_trans_bit_byte(&a, &mut b, size, elem_size);
+    let (a, b) = (&mut scratch.a[..nbyte], &mut scratch.b[..nbyte]);
+    bshuf_trans_byte_elem(input, a, size, elem_size);
+    bshuf_trans_bit_byte(a, b, size, elem_size);
+    bshuf_trans_bitrow_eight(b, out, size, elem_size);
+}
+
+/// [`bshuf_trans_bit_elem_into`] into a fresh buffer.
+#[cfg(test)]
+fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+    let nbyte = size * elem_size;
     let mut out = vec![0u8; nbyte];
-    bshuf_trans_bitrow_eight(&b, &mut out, size, elem_size);
+    bshuf_trans_bit_elem_into(
+        input,
+        &mut BshufScratch::new(nbyte),
+        &mut out,
+        size,
+        elem_size,
+    );
     out
 }
 
@@ -1004,15 +1059,34 @@ mod bshuf_simd {
     }
 }
 
-/// Inverse of [`bshuf_trans_bit_elem`] — library `bshuf_untrans_bit_elem_scal`
-/// (bitshuffle_core.c:349).
-fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+/// Inverse of [`bshuf_trans_bit_elem_into`] — library
+/// `bshuf_untrans_bit_elem_scal` (bitshuffle_core.c:349) — into `out`.
+fn bshuf_untrans_bit_elem_into(
+    input: &[u8],
+    scratch: &mut BshufScratch,
+    out: &mut [u8],
+    size: usize,
+    elem_size: usize,
+) {
     debug_assert_eq!(size % 8, 0);
     let nbyte = size * elem_size;
-    let mut tmp = vec![0u8; nbyte];
-    bshuf_trans_byte_bitrow(input, &mut tmp, size, elem_size);
+    let tmp = &mut scratch.b[..nbyte];
+    bshuf_trans_byte_bitrow(input, tmp, size, elem_size);
+    bshuf_shuffle_bit_eightelem(tmp, out, size, elem_size);
+}
+
+/// [`bshuf_untrans_bit_elem_into`] into a fresh buffer.
+#[cfg(test)]
+fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+    let nbyte = size * elem_size;
     let mut out = vec![0u8; nbyte];
-    bshuf_shuffle_bit_eightelem(&tmp, &mut out, size, elem_size);
+    bshuf_untrans_bit_elem_into(
+        input,
+        &mut BshufScratch::new(nbyte),
+        &mut out,
+        size,
+        elem_size,
+    );
     out
 }
 
@@ -1025,23 +1099,38 @@ fn bshuf_compress_lz4_block(
     elem_start: usize,
     size: usize,
     elem_size: usize,
+    scratch: &mut BshufScratch,
 ) {
     let off = elem_start * elem_size;
-    let shuffled = bshuf_trans_bit_elem(&raw[off..off + size * elem_size], size, elem_size);
-    let comp = compress(&shuffled);
-    out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
-    out.extend_from_slice(&comp);
+    let nbyte = size * elem_size;
+    let mut shuffled = std::mem::take(&mut scratch.c);
+    bshuf_trans_bit_elem_into(
+        &raw[off..off + nbyte],
+        scratch,
+        &mut shuffled[..nbyte],
+        size,
+        elem_size,
+    );
+    let start = out.len();
+    out.resize(start + 4 + get_maximum_output_size(nbyte), 0);
+    let clen = compress_into(&shuffled[..nbyte], &mut out[start + 4..])
+        .expect("get_maximum_output_size bounds the block");
+    out[start..start + 4].copy_from_slice(&(clen as u32).to_be_bytes());
+    out.truncate(start + 4 + clen);
+    scratch.c = shuffled;
 }
 
 /// Read one `[u32 nbytes_BE][lz4]` frame at `pos`, LZ4-decode and bit-untranspose
-/// it (library `bshuf_decompress_lz4_block`, bitshuffle.c:78). Returns the
-/// unshuffled block bytes and the buffer offset past the frame.
+/// it (library `bshuf_decompress_lz4_block`, bitshuffle.c:78) into `dst`.
+/// Returns the buffer offset past the frame.
 fn bshuf_decompress_lz4_block(
     buf: &[u8],
     pos: usize,
     size: usize,
     elem_size: usize,
-) -> Option<(Vec<u8>, usize)> {
+    scratch: &mut BshufScratch,
+    dst: &mut [u8],
+) -> Option<usize> {
     if pos + 4 > buf.len() {
         return None;
     }
@@ -1050,14 +1139,14 @@ fn bshuf_decompress_lz4_block(
     if dstart + clen > buf.len() {
         return None;
     }
-    let shuffled = decompress(&buf[dstart..dstart + clen], size * elem_size).ok()?;
-    if shuffled.len() != size * elem_size {
-        return None;
+    let nbyte = size * elem_size;
+    let mut shuffled = std::mem::take(&mut scratch.a);
+    let n = decompress_into(&buf[dstart..dstart + clen], &mut shuffled[..nbyte]).ok();
+    if n == Some(nbyte) {
+        bshuf_untrans_bit_elem_into(&shuffled[..nbyte], scratch, dst, size, elem_size);
     }
-    Some((
-        bshuf_untrans_bit_elem(&shuffled, size, elem_size),
-        dstart + clen,
-    ))
+    scratch.a = shuffled;
+    (n == Some(nbyte)).then_some(dstart + clen)
 }
 
 /// Compress an NDArray with the Bitshuffle + LZ4 (`bslz4`) codec.
@@ -1084,18 +1173,19 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let block_size = bshuf_default_block_size(elem_size);
 
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() / 2 + 16);
+    let mut scratch = BshufScratch::new(block_size * elem_size);
 
     let n_full = total_elems / block_size;
     let mut elem = 0usize;
     for _ in 0..n_full {
-        bshuf_compress_lz4_block(&mut out, raw, elem, block_size, elem_size);
+        bshuf_compress_lz4_block(&mut out, raw, elem, block_size, elem_size, &mut scratch);
         elem += block_size;
     }
     // One trailing partial block, rounded down to a multiple of 8.
     let mut last_block = total_elems % block_size;
     last_block -= last_block % BSHUF_BLOCKED_MULT;
     if last_block > 0 {
-        bshuf_compress_lz4_block(&mut out, raw, elem, last_block, elem_size);
+        bshuf_compress_lz4_block(&mut out, raw, elem, last_block, elem_size, &mut scratch);
         elem += last_block;
     }
     // The final `size % 8` elements are copied raw (no shuffle, no frame).
@@ -1131,62 +1221,65 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
 /// the payload), so the codec buffer carries no global header. Returns `None`
 /// if the codec is not BSLZ4 or the stream is malformed.
 pub fn decompress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
-    let (data_type, bytes) = decode_bslz4(src).ok_or("Failed to Blosc decompress")?;
-    decompressed_output(
+    // C's own text (NDPluginCodec.cpp): the BSLZ4 branch reports as Blosc.
+    let failure = "Failed to Blosc decompress";
+    let (data_type, total_bytes) = bslz4_layout(src).ok_or(failure)?;
+    codec_output_with(
         src,
         src.dims.clone(),
         data_type,
-        &bytes,
-        "Failed to Blosc decompress",
+        total_bytes,
         "Failed to allocate BSLZ4 output array",
+        |dst| decode_bslz4_into(src, dst).ok_or_else(|| failure.into()),
     )
 }
 
-/// The decoded bytes of a bslz4 container and their element type.
-fn decode_bslz4(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
+/// The element type and byte count a BSLZ4 payload decodes to.
+fn bslz4_layout(src: &NDArray) -> Option<(NDDataType, usize)> {
     let codec = src.codec.as_ref()?;
     if codec.name != CodecName::BSLZ4 {
         return None;
     }
-    let buf = src.data.as_u8_slice();
     let original_type = original_data_type(src);
     let elem_size = original_type.element_size();
     if elem_size == 0 {
         return None;
     }
     let total_elems: usize = src.dims.iter().map(|d| d.size).product();
-    let total_bytes = total_elems * elem_size;
+    Some((original_type, total_elems * elem_size))
+}
+
+/// Decode the block stream of `src` into `dst`, the [`bslz4_layout`] bytes.
+fn decode_bslz4_into(src: &NDArray, dst: &mut [u8]) -> Option<()> {
+    let buf = src.data.as_u8_slice();
+    let elem_size = original_data_type(src).element_size();
+    let total_elems = dst.len() / elem_size;
     let block_size = bshuf_default_block_size(elem_size);
+    let mut scratch = BshufScratch::new(block_size * elem_size);
 
-    let mut out: Vec<u8> = Vec::with_capacity(total_bytes);
     let mut pos = 0usize;
-
+    let mut elem = 0usize;
     let n_full = total_elems / block_size;
     for _ in 0..n_full {
-        let (block, next) = bshuf_decompress_lz4_block(buf, pos, block_size, elem_size)?;
-        out.extend_from_slice(&block);
-        pos = next;
+        let block = &mut dst[elem * elem_size..(elem + block_size) * elem_size];
+        pos = bshuf_decompress_lz4_block(buf, pos, block_size, elem_size, &mut scratch, block)?;
+        elem += block_size;
     }
     // One trailing partial block, rounded down to a multiple of 8.
     let mut last_block = total_elems % block_size;
     last_block -= last_block % BSHUF_BLOCKED_MULT;
     if last_block > 0 {
-        let (block, next) = bshuf_decompress_lz4_block(buf, pos, last_block, elem_size)?;
-        out.extend_from_slice(&block);
-        pos = next;
+        let block = &mut dst[elem * elem_size..(elem + last_block) * elem_size];
+        pos = bshuf_decompress_lz4_block(buf, pos, last_block, elem_size, &mut scratch, block)?;
+        elem += last_block;
     }
     // The final `size % 8` elements were copied raw.
-    let leftover_bytes = (total_elems % BSHUF_BLOCKED_MULT) * elem_size;
-    if leftover_bytes > 0 {
-        if pos + leftover_bytes > buf.len() {
-            return None;
-        }
-        out.extend_from_slice(&buf[pos..pos + leftover_bytes]);
-    }
-    if out.len() != total_bytes {
+    let leftover = &mut dst[elem * elem_size..];
+    if pos + leftover.len() > buf.len() {
         return None;
     }
-    Some((original_type, out))
+    leftover.copy_from_slice(&buf[pos..pos + leftover.len()]);
+    Some(())
 }
 
 /// Compress an NDArray to JPEG.

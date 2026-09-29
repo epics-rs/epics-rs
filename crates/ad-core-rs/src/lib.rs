@@ -75,6 +75,8 @@ pub mod pixel_cast;
 pub mod plugin;
 pub mod roi;
 pub mod runtime;
+#[cfg(feature = "simd")]
+pub mod simd;
 pub mod timestamp;
 
 #[cfg(feature = "ioc")]

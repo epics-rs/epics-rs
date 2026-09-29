@@ -250,20 +250,20 @@ macro_rules! stats_elem {
             }
             #[cfg(feature = "simd")]
             fn range(v: &[Self]) -> Range<Self> {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$range(s, v))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$range(s, v))
             }
             #[cfg(feature = "simd")]
             fn variance(v: &[Self], mean: f64) -> f64 {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$variance(s, v, mean))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$variance(s, v, mean))
             }
             #[cfg(feature = "simd")]
             fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
             }
             $(
             #[cfg(feature = "simd")]
             fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$hist(s, v, f, slots))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$hist(s, v, f, slots))
             }
             )?
             #[inline(always)]
@@ -336,11 +336,11 @@ macro_rules! stats_elem {
             type Lane = f64;
             #[cfg(feature = "simd")]
             fn project_row(row: &[Self], threshold: f64, col_sum: &mut [f64], col_thr: &mut [f64]) -> [f64; 3] {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$project(s, row, threshold, col_sum, col_thr))
             }
             #[cfg(feature = "simd")]
             fn formula_count(v: &[Self], f: &Formula, slots: &mut [u64]) {
-                fearless_simd::dispatch!(simd_kernels::level(), s => simd_kernels::$hist(s, v, f, slots))
+                fearless_simd::dispatch!(ad_core_rs::simd::level(), s => simd_kernels::$hist(s, v, f, slots))
             }
             #[inline(always)]
             fn to_lane(self) -> f64 {
@@ -513,9 +513,8 @@ fn first_index<T: PartialEq + Copy>(v: &[T], x: T) -> usize {
 #[cfg(feature = "simd")]
 mod simd_kernels {
     use super::{FLUSH, Formula, Range};
-    use fearless_simd::{Level, Simd, prelude::*};
+    use fearless_simd::{Simd, prelude::*};
     use fearless_simd_macros::simd;
-    use std::sync::OnceLock;
 
     /// [`super::project_row_pass`] on vectors: `$to_f64` splits a chunk of
     /// `$vec` into its `f64` vectors in element order, and each of those
@@ -628,12 +627,6 @@ mod simd_kernels {
         let (p0, p1) = y.widen();
         [S::f64s::float_from(p0), S::f64s::float_from(p1)]
     });
-
-    /// The detected level, once per process.
-    pub(super) fn level() -> Level {
-        static LEVEL: OnceLock<Level> = OnceLock::new();
-        *LEVEL.get_or_init(Level::new)
-    }
 
     /// One kernel pair per element type. `$vec` is the element's native
     /// vector, `$lanes` the accumulator vector its chunk sum widens into

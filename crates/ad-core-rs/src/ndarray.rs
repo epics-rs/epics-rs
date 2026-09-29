@@ -359,33 +359,75 @@ impl NDDataBuffer {
     /// each time (at 2048x2048 the fault-in costs several times the
     /// conversion).
     pub fn copy_to_f64(&self, out: &mut Vec<f64>) {
-        out.clear();
-        crate::with_buffer!(self, |v| out
-            .extend(v.iter().map(|&x| crate::pixel_cast::PixelCast::to_f64(x))));
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd;
+            out.resize(self.len(), 0.0);
+            macro_rules! kernel {
+                ($v:expr, $k:ident) => {
+                    fearless_simd::dispatch!(simd::level(), s => simd::$k(s, $v, out))
+                };
+            }
+            match self {
+                Self::I8(v) => kernel!(v, to_f64_i8),
+                Self::U8(v) => kernel!(v, to_f64_u8),
+                Self::I16(v) => kernel!(v, to_f64_i16),
+                Self::U16(v) => kernel!(v, to_f64_u16),
+                Self::I32(v) => kernel!(v, to_f64_i32),
+                Self::U32(v) => kernel!(v, to_f64_u32),
+                Self::I64(v) => kernel!(v, to_f64_i64),
+                Self::U64(v) => kernel!(v, to_f64_u64),
+                Self::F32(v) => kernel!(v, to_f64_f32),
+                Self::F64(v) => out.copy_from_slice(v),
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        {
+            out.clear();
+            crate::with_buffer!(self, |v| out
+                .extend(v.iter().map(|&x| crate::pixel_cast::PixelCast::to_f64(x))));
+        }
     }
 
     /// A buffer of `data_type` holding `values`, each cast as
     /// [`set_from_f64`](Self::set_from_f64) casts it: `as`, which truncates,
     /// saturates the integer types and takes a NaN to 0.
     pub fn from_f64(data_type: NDDataType, values: &[f64]) -> Self {
-        match data_type {
-            NDDataType::Int8 => Self::I8(values.iter().map(|&x| x as i8).collect()),
-            NDDataType::UInt8 => Self::U8(values.iter().map(|&x| x as u8).collect()),
-            NDDataType::Int16 => Self::I16(values.iter().map(|&x| x as i16).collect()),
-            NDDataType::UInt16 => Self::U16(values.iter().map(|&x| x as u16).collect()),
-            NDDataType::Int32 => Self::I32(values.iter().map(|&x| x as i32).collect()),
-            NDDataType::UInt32 => Self::U32(values.iter().map(|&x| x as u32).collect()),
-            NDDataType::Int64 => Self::I64(values.iter().map(|&x| x as i64).collect()),
-            NDDataType::UInt64 => Self::U64(values.iter().map(|&x| x as u64).collect()),
-            NDDataType::Float32 => Self::F32(values.iter().map(|&x| x as f32).collect()),
-            NDDataType::Float64 => Self::F64(values.to_vec()),
-        }
+        let mut out = Self::zeros(data_type, 0);
+        out.fill_from_f64(values);
+        out
     }
 
     /// Refill this buffer with `values`, keeping its element type and, when
     /// the capacity suffices, its allocation: the in-place form of
     /// [`from_f64`](Self::from_f64) for a pooled output buffer.
     pub fn fill_from_f64(&mut self, values: &[f64]) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd;
+            macro_rules! kernel {
+                ($v:expr, $k:ident) => {{
+                    $v.resize(values.len(), 0 as _);
+                    fearless_simd::dispatch!(simd::level(), s => simd::$k(s, values, $v))
+                }};
+            }
+            match self {
+                Self::I8(v) => kernel!(v, from_f64_i8),
+                Self::U8(v) => kernel!(v, from_f64_u8),
+                Self::I16(v) => kernel!(v, from_f64_i16),
+                Self::U16(v) => kernel!(v, from_f64_u16),
+                Self::I32(v) => kernel!(v, from_f64_i32),
+                Self::U32(v) => kernel!(v, from_f64_u32),
+                Self::I64(v) => kernel!(v, from_f64_i64),
+                Self::U64(v) => kernel!(v, from_f64_u64),
+                Self::F32(v) => kernel!(v, from_f64_f32),
+                Self::F64(v) => {
+                    v.resize(values.len(), 0.0);
+                    v.copy_from_slice(values);
+                }
+            }
+        }
+        #[cfg(not(feature = "simd"))]
         crate::with_buffer_mut_typed!(self, |v: T| {
             v.clear();
             v.extend(values.iter().map(|&x| x as T));

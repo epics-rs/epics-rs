@@ -34,34 +34,82 @@ use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 trait BinAcc: Copy {
     const ZERO: Self;
     fn bin_add(self, rhs: Self) -> Self;
+
+    /// The bin widths [`bin_native`](Self::bin_native) adds on lanes; every
+    /// other width is added one element at a time.
+    const LANE_BINS: &'static [usize];
+
+    /// Adds `src` into `acc`, `bin` consecutive elements per accumulator in
+    /// element order: `src.len() == acc.len() * bin`.
+    fn bin_native(src: &[Self], bin: usize, acc: &mut [Self]);
 }
 
-macro_rules! bin_acc_int {
-    ($($t:ty),*) => {$(
+/// The [`BinAcc`] bin loop with `cast` applied to every source element: the
+/// scalar path of every row operation below. The bin sum is kept in a local
+/// so the inner loop carries a register and not a store, and is unrolled.
+#[inline]
+fn bin_row_with<S: Copy, D: BinAcc>(src: &[S], bin: usize, acc: &mut [D], cast: impl Fn(S) -> D) {
+    if bin == 1 {
+        for (a, &s) in acc.iter_mut().zip(src) {
+            *a = a.bin_add(cast(s));
+        }
+    } else {
+        for (a, w) in acc.iter_mut().zip(src.chunks_exact(bin)) {
+            let mut t = *a;
+            for &s in w {
+                t = t.bin_add(cast(s));
+            }
+            *a = t;
+        }
+    }
+}
+
+/// `$zero`, the add, and the `bin2`/`bin4` kernels of one target type.
+macro_rules! bin_acc {
+    ($t:ty, $zero:expr, |$a:ident, $b:ident| $add:expr, $bin2:ident, $bin4:ident) => {
         impl BinAcc for $t {
-            const ZERO: Self = 0;
+            const ZERO: Self = $zero;
+
             #[inline]
             fn bin_add(self, rhs: Self) -> Self {
-                self.wrapping_add(rhs)
+                let ($a, $b) = (self, rhs);
+                $add
             }
-        }
-    )*};
-}
 
-macro_rules! bin_acc_float {
-    ($($t:ty),*) => {$(
-        impl BinAcc for $t {
-            const ZERO: Self = 0.0;
+            #[cfg(feature = "simd")]
+            const LANE_BINS: &'static [usize] = &[2, 4];
+
+            #[cfg(feature = "simd")]
+            fn bin_native(src: &[Self], bin: usize, acc: &mut [Self]) {
+                match bin {
+                    2 => fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::$bin2(s, src, acc)),
+                    4 => fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::$bin4(s, src, acc)),
+                    _ => bin_row_with(src, bin, acc, |x| x),
+                }
+            }
+
+            #[cfg(not(feature = "simd"))]
+            const LANE_BINS: &'static [usize] = &[];
+
+            #[cfg(not(feature = "simd"))]
             #[inline]
-            fn bin_add(self, rhs: Self) -> Self {
-                self + rhs
+            fn bin_native(src: &[Self], bin: usize, acc: &mut [Self]) {
+                bin_row_with(src, bin, acc, |x| x);
             }
         }
-    )*};
+    };
 }
 
-bin_acc_int!(i8, u8, i16, u16, i32, u32, i64, u64);
-bin_acc_float!(f32, f64);
+bin_acc!(i8, 0, |a, b| a.wrapping_add(b), bin2_i8, bin4_i8);
+bin_acc!(u8, 0, |a, b| a.wrapping_add(b), bin2_u8, bin4_u8);
+bin_acc!(i16, 0, |a, b| a.wrapping_add(b), bin2_i16, bin4_i16);
+bin_acc!(u16, 0, |a, b| a.wrapping_add(b), bin2_u16, bin4_u16);
+bin_acc!(i32, 0, |a, b| a.wrapping_add(b), bin2_i32, bin4_i32);
+bin_acc!(u32, 0, |a, b| a.wrapping_add(b), bin2_u32, bin4_u32);
+bin_acc!(i64, 0, |a, b| a.wrapping_add(b), bin2_i64, bin4_i64);
+bin_acc!(u64, 0, |a, b| a.wrapping_add(b), bin2_u64, bin4_u64);
+bin_acc!(f32, 0.0, |a, b| a + b, bin2_f32, bin4_f32);
+bin_acc!(f64, 0.0, |a, b| a + b, bin2_f64, bin4_f64);
 
 /// The C cast `(D)value` of a source element, and the row operations of
 /// [`convert_dims`] built on it.
@@ -83,37 +131,70 @@ trait CCast<D: BinAcc>: Copy {
     }
 
     /// Adds the cast of `src` into `acc`, `bin` consecutive source elements
-    /// per accumulator: `src.len() == acc.len() * bin`.
+    /// per accumulator: `src.len() == acc.len() * bin`. A bin width the
+    /// target adds on lanes is cast a chunk at a time and added as the
+    /// target type; any other width is cast and added in one scalar loop.
     #[inline]
     fn bin_row(src: &[Self], bin: usize, acc: &mut [D]) {
-        bin_row_scalar(src, bin, acc);
+        if D::LANE_BINS.contains(&bin) {
+            bin_row_chunked(src, bin, acc, |c, o| {
+                for (o, &s) in o.iter_mut().zip(c) {
+                    *o = s.c_cast();
+                }
+            });
+        } else {
+            bin_row_with(src, bin, acc, CCast::c_cast);
+        }
     }
 }
 
-/// [`CCast::bin_row`] one element at a time; the float to integer pairs run
-/// their vector cast first and take this on the cast chunk.
-#[inline]
-fn bin_row_scalar<S: CCast<D>, D: BinAcc>(src: &[S], bin: usize, acc: &mut [D]) {
-    if bin == 1 {
-        for (a, &s) in acc.iter_mut().zip(src) {
-            *a = a.bin_add(s.c_cast());
-        }
+/// [`CCast::bin_row`] through a cast chunk: `cast` fills `out[i] = src[i]`
+/// as `D` for a run of whole bins that stays in cache, and the run is added
+/// by [`BinAcc::bin_native`].
+fn bin_row_chunked<S: Copy, D: BinAcc>(
+    src: &[S],
+    bin: usize,
+    acc: &mut [D],
+    cast: impl Fn(&[S], &mut [D]),
+) {
+    const CHUNK: usize = 1024;
+    let mut stack = [D::ZERO; CHUNK];
+    let mut heap = Vec::new();
+    let (buf, step): (&mut [D], usize) = if bin <= CHUNK {
+        (&mut stack, CHUNK / bin * bin)
     } else {
-        for (a, w) in acc.iter_mut().zip(src.chunks_exact(bin)) {
-            // The bin sum in a local, so the loop carries a register and
-            // not a store, and is unrolled.
-            let mut t = *a;
-            for &s in w {
-                t = t.bin_add(s.c_cast());
-            }
-            *a = t;
-        }
+        heap.resize(bin, D::ZERO);
+        (&mut heap, bin)
+    };
+    for (c, a) in src.chunks(step).zip(acc.chunks_mut(step / bin)) {
+        let buf = &mut buf[..c.len()];
+        cast(c, buf);
+        D::bin_native(buf, bin, a);
     }
 }
+
+/// The identity cast: the row is the target type already, so binning is
+/// [`BinAcc::bin_native`] on the source itself.
+macro_rules! c_cast_same {
+    ($($t:ty),*) => {$(
+        impl CCast<$t> for $t {
+            #[inline]
+            fn c_cast(self) -> $t {
+                self
+            }
+
+            #[inline]
+            fn bin_row(src: &[Self], bin: usize, acc: &mut [$t]) {
+                <$t as BinAcc>::bin_native(src, bin, acc);
+            }
+        }
+    )*};
+}
+
+c_cast_same!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
 
 macro_rules! c_cast_as {
-    ($($s:ty),* => $d:tt) => {$( c_cast_as!(@one $s => $d); )*};
-    (@one $s:ty => [$($d:ty),*]) => {$(
+    ($s:ty => $($d:ty),*) => {$(
         impl CCast<$d> for $s {
             #[inline]
             fn c_cast(self) -> $d {
@@ -123,8 +204,16 @@ macro_rules! c_cast_as {
     )*};
 }
 
-c_cast_as!(i8, u8, i16, u16, i32, u32, i64, u64 => [i8, u8, i16, u16, i32, u32, i64, u64, f32, f64]);
-c_cast_as!(f32, f64 => [f32, f64]);
+c_cast_as!(i8 => u8, i16, u16, i32, u32, i64, u64, f32, f64);
+c_cast_as!(u8 => i8, i16, u16, i32, u32, i64, u64, f32, f64);
+c_cast_as!(i16 => i8, u8, u16, i32, u32, i64, u64, f32, f64);
+c_cast_as!(u16 => i8, u8, i16, i32, u32, i64, u64, f32, f64);
+c_cast_as!(i32 => i8, u8, i16, u16, u32, i64, u64, f32, f64);
+c_cast_as!(u32 => i8, u8, i16, u16, i32, i64, u64, f32, f64);
+c_cast_as!(i64 => i8, u8, i16, u16, i32, u32, u64, f32, f64);
+c_cast_as!(u64 => i8, u8, i16, u16, i32, u32, i64, f32, f64);
+c_cast_as!(f32 => f64);
+c_cast_as!(f64 => f32);
 
 macro_rules! c_cast_float_to_int {
     ($s:ty => $($d:ty : $kernel:ident),*) => {$(
@@ -141,23 +230,13 @@ macro_rules! c_cast_float_to_int {
                 fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::$kernel(s, src, &mut out[n..]));
             }
 
-            /// The row is cast a cache-resident chunk at a time, `step`
-            /// source elements that hold whole bins, and each chunk is
-            /// added as cast integers.
+            /// Every width goes through the cast chunk, on the vector cast.
             #[cfg(feature = "simd")]
             fn bin_row(src: &[Self], bin: usize, acc: &mut [$d]) {
-                const CHUNK: usize = 1024;
-                if bin > CHUNK {
-                    return bin_row_scalar(src, bin, acc);
-                }
-                let step = CHUNK / bin * bin;
-                let mut cast = [0 as $d; CHUNK];
                 let level = crate::simd::level();
-                for (c, a) in src.chunks(step).zip(acc.chunks_mut(step / bin)) {
-                    let cast = &mut cast[..c.len()];
-                    fearless_simd::dispatch!(level, s => simd_kernels::$kernel(s, c, cast));
-                    bin_row_scalar(cast, bin, a);
-                }
+                bin_row_chunked(src, bin, acc, |c, o| {
+                    fearless_simd::dispatch!(level, s => simd_kernels::$kernel(s, c, o));
+                });
             }
         }
     )*};
@@ -168,7 +247,8 @@ c_cast_float_to_int!(f32 => i8: cast_f32_i8, u8: cast_f32_u8, i16: cast_f32_i16,
 c_cast_float_to_int!(f64 => i8: cast_f64_i8, u8: cast_f64_u8, i16: cast_f64_i16, u16: cast_f64_u16,
     i32: cast_f64_i32, u32: cast_f64_u32, i64: cast_f64_i64, u64: cast_f64_u64);
 
-/// The float to integer [`CCast::cast_row`]s on `fearless_simd` lanes.
+/// The float to integer [`CCast::cast_extend`]s and the [`BinAcc::bin_native`]
+/// bin 2 and bin 4 adds on `fearless_simd` lanes.
 #[cfg(feature = "simd")]
 mod simd_kernels {
     use fearless_simd::{Simd, prelude::*};
@@ -261,6 +341,60 @@ mod simd_kernels {
     cast_f32_kernel!(u32, cast_f32_u32, cast_f64_u32);
     cast_f32_kernel!(i64, cast_f32_i64, cast_f64_i64);
     cast_f32_kernel!(u64, cast_f32_u64, cast_f64_u64);
+
+    /// `acc[i] += src[2i]; acc[i] += src[2i+1]` and the bin 4 form, lane
+    /// for lane: `deinterleave` splits a run of two vectors into the even
+    /// and the odd elements, twice over for bin 4, and the parts are added
+    /// in element order so a float sum rounds as the scalar loop does.
+    macro_rules! bin_kernels {
+        ($t:ty, $vec:ident, $bin2:ident, $bin4:ident) => {
+            #[simd]
+            pub(super) fn $bin2<S: Simd>(simd: S, src: &[$t], acc: &mut [$t]) {
+                assert_eq!(src.len(), acc.len() * 2);
+                let n = S::$vec::LEN;
+                let mut chunks = src.chunks_exact(2 * n);
+                let mut accs = acc.chunks_exact_mut(n);
+                for (c, a) in (&mut chunks).zip(&mut accs) {
+                    let v0 = S::$vec::from_slice(simd, &c[..n]);
+                    let v1 = S::$vec::from_slice(simd, &c[n..]);
+                    let (p, q) = v0.deinterleave(v1);
+                    ((S::$vec::from_slice(simd, a) + p) + q).store_slice(a);
+                }
+                super::bin_row_with(chunks.remainder(), 2, accs.into_remainder(), |x| x);
+            }
+
+            #[simd]
+            pub(super) fn $bin4<S: Simd>(simd: S, src: &[$t], acc: &mut [$t]) {
+                assert_eq!(src.len(), acc.len() * 4);
+                let n = S::$vec::LEN;
+                let mut chunks = src.chunks_exact(4 * n);
+                let mut accs = acc.chunks_exact_mut(n);
+                for (c, a) in (&mut chunks).zip(&mut accs) {
+                    let v0 = S::$vec::from_slice(simd, &c[..n]);
+                    let v1 = S::$vec::from_slice(simd, &c[n..2 * n]);
+                    let v2 = S::$vec::from_slice(simd, &c[2 * n..3 * n]);
+                    let v3 = S::$vec::from_slice(simd, &c[3 * n..]);
+                    let (e01, o01) = v0.deinterleave(v1);
+                    let (e23, o23) = v2.deinterleave(v3);
+                    let (q0, q2) = e01.deinterleave(e23);
+                    let (q1, q3) = o01.deinterleave(o23);
+                    ((((S::$vec::from_slice(simd, a) + q0) + q1) + q2) + q3).store_slice(a);
+                }
+                super::bin_row_with(chunks.remainder(), 4, accs.into_remainder(), |x| x);
+            }
+        };
+    }
+
+    bin_kernels!(i8, i8s, bin2_i8, bin4_i8);
+    bin_kernels!(u8, u8s, bin2_u8, bin4_u8);
+    bin_kernels!(i16, i16s, bin2_i16, bin4_i16);
+    bin_kernels!(u16, u16s, bin2_u16, bin4_u16);
+    bin_kernels!(i32, i32s, bin2_i32, bin4_i32);
+    bin_kernels!(u32, u32s, bin2_u32, bin4_u32);
+    bin_kernels!(i64, i64s, bin2_i64, bin4_i64);
+    bin_kernels!(u64, u64s, bin2_u64, bin4_u64);
+    bin_kernels!(f32, f32s, bin2_f32, bin4_f32);
+    bin_kernels!(f64, f64s, bin2_f64, bin4_f64);
 }
 
 /// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`).
@@ -586,8 +720,9 @@ mod tests {
 
     #[cfg(feature = "simd")]
     mod simd {
-        use super::super::{CCast, simd_kernels};
+        use super::super::{BinAcc, CCast, bin_row_with, simd_kernels};
         use crate::simd::{edge_values, levels};
+        use fearless_simd::Level;
 
         macro_rules! check_cast {
             ($s:ty, $d:ty, $kernel:ident) => {
@@ -635,6 +770,81 @@ mod tests {
             check_cast!(f64, u32, cast_f64_u32);
             check_cast!(f64, i64, cast_f64_i64);
             check_cast!(f64, u64, cast_f64_u64);
+        }
+
+        macro_rules! check_bin {
+            ($t:ty, $bin2:ident, $bin4:ident, $f:expr) => {{
+                let f: fn(usize) -> $t = $f;
+                // 3 * 4 * 64 elements plus a tail that is whole bins.
+                let src: Vec<$t> = (0..780).map(f).collect();
+                let runs: [(usize, &dyn Fn(Level, &[$t], &mut [$t])); 2] = [
+                    (2, &|lvl, s, a| fearless_simd::dispatch!(lvl, sm => simd_kernels::$bin2(sm, s, a))),
+                    (4, &|lvl, s, a| fearless_simd::dispatch!(lvl, sm => simd_kernels::$bin4(sm, s, a))),
+                ];
+                for (bin, run) in runs {
+                    let n = src.len() / bin * bin;
+                    let init: Vec<$t> = (0..n / bin).map(|i| f(i + 3)).collect();
+                    let mut want = init.clone();
+                    bin_row_with(&src[..n], bin, &mut want, |x| x);
+                    for lvl in levels() {
+                        let mut got = init.clone();
+                        run(lvl, &src[..n], &mut got);
+                        let same = got.iter().zip(&want).all(|(g, w)| g.to_bits() == w.to_bits());
+                        assert!(same, "{} bin {bin} at {lvl:?}: {got:?} vs {want:?}", stringify!($t));
+                    }
+                    let mut got = init.clone();
+                    <$t as BinAcc>::bin_native(&src[..n], bin, &mut got);
+                    let same = got.iter().zip(&want).all(|(g, w)| g.to_bits() == w.to_bits());
+                    assert!(same, "{} bin {bin} native", stringify!($t));
+                }
+            }};
+        }
+
+        trait Bits {
+            fn to_bits(self) -> u64;
+        }
+        macro_rules! bits {
+            ($($t:ty),*) => {$(
+                impl Bits for $t {
+                    fn to_bits(self) -> u64 {
+                        self as u64
+                    }
+                }
+            )*};
+        }
+        bits!(i8, u8, i16, u16, i32, u32, i64, u64);
+
+        /// The kernels add on lanes what the scalar loop adds in order:
+        /// integer bins that wrap, float bins whose rounding depends on
+        /// the order.
+        #[test]
+        fn bin_kernels_match_the_scalar_loop_on_every_level() {
+            check_bin!(i8, bin2_i8, bin4_i8, |i| (i.wrapping_mul(97) % 251) as i8);
+            check_bin!(u8, bin2_u8, bin4_u8, |i| (i.wrapping_mul(97) % 251) as u8);
+            check_bin!(i16, bin2_i16, bin4_i16, |i| (i.wrapping_mul(7919) % 65521)
+                as i16);
+            check_bin!(u16, bin2_u16, bin4_u16, |i| (i.wrapping_mul(7919) % 65521)
+                as u16);
+            check_bin!(
+                i32,
+                bin2_i32,
+                bin4_i32,
+                |i| (i.wrapping_mul(2654435761) % 4294967291) as i32
+            );
+            check_bin!(
+                u32,
+                bin2_u32,
+                bin4_u32,
+                |i| (i.wrapping_mul(2654435761) % 4294967291) as u32
+            );
+            check_bin!(i64, bin2_i64, bin4_i64, |i| (i as i64)
+                .wrapping_mul(0x9e3779b97f4a7c15u64 as i64));
+            check_bin!(u64, bin2_u64, bin4_u64, |i| (i as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15));
+            check_bin!(f32, bin2_f32, bin4_f32, |i| (i as f32 - 390.0) * 0.37
+                + 1.0 / (i as f32 + 1.0));
+            check_bin!(f64, bin2_f64, bin4_f64, |i| (i as f64 - 390.0) * 0.37
+                + 1.0 / (i as f64 + 1.0));
         }
     }
 }

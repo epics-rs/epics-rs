@@ -205,7 +205,6 @@ pub struct TSParams {
     pub ts_acquire_mode: usize,
     pub ts_time_axis: usize,
     /// Per-channel waveform param indices (length = num_channels).
-    pub ts_channels: Vec<usize>,
     /// Channel names (kept for registry building).
     pub channel_names: Vec<String>,
     /// Generic time series waveform (for NDTimeSeries.template).
@@ -310,9 +309,14 @@ impl TimeSeriesPortDriver {
         pool: Arc<NDArrayPool>,
     ) -> Self {
         let num_channels = channel_names.len();
+        // C `NDPluginTimeSeries` takes one asyn address per signal plus one for
+        // the 2-D array callback (`NDPluginTimeSeries.cpp:49-51`), and every db
+        // template reads `TS_TIME_SERIES` at `addr == signal`
+        // (`NDStats.template:396-567`, addresses 0..22). A single-address port
+        // has no entry to publish a signal into.
         let mut base = PortDriverBase::new(
             port_name,
-            1,
+            num_channels + 1,
             PortFlags {
                 multi_device: false,
                 can_block: false,
@@ -375,21 +379,18 @@ impl TimeSeriesPortDriver {
         let time_axis: Vec<f64> = (0..num_points).map(|i| i as f64 * time_per_point).collect();
         let _ = base.params.set_float64_array(ts_time_axis, 0, time_axis);
 
-        // Channel waveform params — one Float64Array per channel
-        let mut ts_channels = Vec::with_capacity(num_channels);
-        for name in channel_names {
-            let param_name = format!("TS_CHAN_{name}");
-            let idx = base
-                .create_param(&param_name, ParamType::Float64Array)
-                .unwrap();
-            let _ = base.params.set_float64_array(idx, 0, vec![0.0; num_points]);
-            ts_channels.push(idx);
-        }
-
-        // Generic time series and timestamp waveform params
+        // The per-signal series param, published at `addr == signal`: C creates
+        // exactly this one (`NDPluginTimeSeries.cpp:82`) and the db templates
+        // read it, so it is the only place series data is published. A
+        // per-channel param would have no reader.
         let ts_time_series = base
             .create_param("TS_TIME_SERIES", ParamType::Float64Array)
             .unwrap();
+        for signal in 0..num_channels {
+            let _ =
+                base.params
+                    .set_float64_array(ts_time_series, signal as i32, vec![0.0; num_points]);
+        }
         let ts_timestamp = base
             .create_param("TS_TIMESTAMP", ParamType::Float64Array)
             .unwrap();
@@ -405,7 +406,6 @@ impl TimeSeriesPortDriver {
             ts_elapsed_time,
             ts_acquire_mode,
             ts_time_axis,
-            ts_channels,
             channel_names: channel_names.iter().map(|s| s.to_string()).collect(),
             ts_time_series,
             ts_timestamp,
@@ -453,18 +453,23 @@ impl TimeSeriesPortDriver {
     }
 
     /// Copy buffer data to Float64Array params and call callbacks.
+    ///
+    /// C `doTimeSeriesCallbacksT` (`NDPluginTimeSeries.cpp:263-290`) emits one
+    /// `TS_TIME_SERIES` array per signal at `addr == signal`, carrying the
+    /// filled prefix in Fixed mode and the ring rotated oldest-first in
+    /// Circular mode — which is what [`TimeSeries::values`] returns, so it goes
+    /// out unpadded: the waveform's NORD is the number of points acquired, as
+    /// in C.
     fn update_waveform_params(&mut self) {
         let state = self.shared.lock();
-        let num_points = state.num_points;
 
-        // Update per-channel waveform params
-        for (i, buf) in state.buffers.iter().enumerate() {
-            let mut values = buf.values();
-            values.resize(num_points, 0.0);
-            let _ = self
-                .base
-                .params
-                .set_float64_array(self.params.ts_channels[i], 0, values);
+        // Publish each signal at its own asyn address.
+        for (signal, buf) in state.buffers.iter().enumerate() {
+            let _ = self.base.params.set_float64_array(
+                self.params.ts_time_series,
+                signal as i32,
+                buf.values(),
+            );
         }
 
         // Update current point
@@ -489,8 +494,13 @@ impl TimeSeriesPortDriver {
             .base
             .set_int32_param(self.params.ts_acquire, 0, if acquiring { 1 } else { 0 });
 
-        // Notify listeners
+        // Notify listeners. Each signal's series lives at its own address, so
+        // the per-address flush is what reaches the `I/O Intr` waveforms;
+        // `call_param_callbacks(0)` alone would flush only signal 0.
         let _ = self.base.call_param_callbacks(0);
+        for signal in 1..self.num_channels {
+            let _ = self.base.call_param_callbacks(signal as i32);
+        }
     }
 }
 
@@ -562,11 +572,11 @@ impl PortDriver for TimeSeriesPortDriver {
             // Rebuild the time axis for the current mode.
             self.refresh_time_axis();
 
-            // Re-initialize channel waveforms
-            for i in 0..self.num_channels {
+            // Re-initialize the per-signal series (C `allocateArrays`).
+            for signal in 0..self.num_channels {
                 let _ = self.base.params.set_float64_array(
-                    self.params.ts_channels[i],
-                    0,
+                    self.params.ts_time_series,
+                    signal as i32,
                     vec![0.0; new_size],
                 );
             }
@@ -706,7 +716,6 @@ pub fn create_ts_port_runtime(
         ts_elapsed_time: driver.params.ts_elapsed_time,
         ts_acquire_mode: driver.params.ts_acquire_mode,
         ts_time_axis: driver.params.ts_time_axis,
-        ts_channels: driver.params.ts_channels.clone(),
         channel_names: driver.params.channel_names.clone(),
         ts_time_series: driver.params.ts_time_series,
         ts_timestamp: driver.params.ts_timestamp,
@@ -1034,10 +1043,60 @@ mod tests {
         let data = driver
             .base
             .params
-            .get_float64_array(driver.params.ts_channels[0], 0)
+            .get_float64_array(driver.params.ts_time_series, 0)
             .unwrap();
         assert_eq!(data[0], 42.0);
         assert_eq!(data[1], 43.0);
+    }
+
+    #[test]
+    fn test_ts_time_series_is_published_per_signal_addr() {
+        // The db templates read `TS_TIME_SERIES` at `addr == signal`
+        // (`NDStats.template:396-567`: TSMeanValue is addr 6), which is where C
+        // emits it (`NDPluginTimeSeries.cpp:277,287`). Publishing the series
+        // anywhere else — a per-channel param, or every signal at addr 0 —
+        // leaves every TS waveform in the IOC empty, so this asserts the
+        // address mapping with a distinct value per signal rather than just
+        // that something was written.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(3, 10)));
+        let mut driver = TimeSeriesPortDriver::new(
+            "TEST_TS_ADDR",
+            &TEST_CHANNELS,
+            10,
+            shared.clone(),
+            test_pool(),
+        );
+
+        {
+            let mut state = shared.lock();
+            state.acquiring = true;
+            state.start_time = Some(Instant::now());
+            for (signal, buf) in state.buffers.iter_mut().enumerate() {
+                buf.add_value(100.0 + signal as f64);
+                buf.add_value(200.0 + signal as f64);
+            }
+        }
+        driver.update_waveform_params();
+
+        for signal in 0..TEST_CHANNELS.len() {
+            let data = driver
+                .base
+                .params
+                .get_float64_array(driver.params.ts_time_series, signal as i32)
+                .unwrap();
+            // Fixed mode emits the filled prefix, not the padded buffer.
+            assert_eq!(
+                data.len(),
+                2,
+                "signal {signal} must carry the two acquired points"
+            );
+            assert_eq!(
+                data[0],
+                100.0 + signal as f64,
+                "signal {signal} at its own addr"
+            );
+            assert_eq!(data[1], 200.0 + signal as f64);
+        }
     }
 
     #[test]
@@ -1279,7 +1338,7 @@ mod tests {
         let (handle, params, _actor_jh, _data_jh) =
             create_ts_port_runtime("TEST_TS_RT", &TEST_CHANNELS, 100, rx, test_pool());
         assert_eq!(handle.port_name(), "TEST_TS_RT");
-        assert_eq!(params.ts_channels.len(), 3);
+        assert_eq!(params.channel_names.len(), 3);
         handle.shutdown();
     }
 }

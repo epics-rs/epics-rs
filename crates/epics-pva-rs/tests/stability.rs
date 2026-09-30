@@ -787,6 +787,56 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
+/// Boundary: a full `cacheClear`, which is the point at which the client holds
+/// no channel and no operation on the circuit any more. The connection must be
+/// gone from `report()`, not merely idle in it.
+///
+/// pvxs asserts exactly this (`a0422ec`, test/testput.cpp: one connection
+/// before, zero after), and it holds there because `connByAddr` is a
+/// `weak_ptr` — the channel is the owner. This port cached a strong handle, so
+/// the socket, its reader, its writer and its heartbeat outlived every user of
+/// them and kept being reported until `close()`.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_cache_clear_releases_the_server_connection() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:CACHECLR", 3.25).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.pvget("STAB:CACHECLR"))
+        .await
+        .expect("get did not time out");
+    assert_eq!(
+        client.report().connections.len(),
+        1,
+        "the GET leaves one cached channel holding one connection"
+    );
+
+    client
+        .cache_clear_action("", epics_pva_rs::client_native::CacheAction::Disconnect)
+        .await;
+
+    // The teardown runs when the last owner drops, which happens inside the
+    // call above; the circuit's tasks then wind down on their own schedule, so
+    // the report is the assertion and it is a bounded eventually.
+    let mut released = false;
+    for _ in 0..200 {
+        if client.report().connections.is_empty() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "after a full cache clear the client reports no connections, got {}",
+        client.report().connections.len()
+    );
+
+    h.abort();
+}
+
 /// Two PVs monitored through ONE shared client share a single server
 /// connection — the property the `pvmonitor-rs` command relies on after
 /// it was changed to build one client for the whole command instead of

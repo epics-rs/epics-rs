@@ -195,7 +195,24 @@ impl Resolver {
 /// new connection is upgraded to TLS via `pvas://` semantics.
 #[derive(Default)]
 pub struct ConnectionPool {
-    inner: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Arc<ServerConn>>>,
+    /// Cached circuits, held **weakly**.
+    ///
+    /// INVARIANT: the pool caches a connection, it does not own one. The owners
+    /// are the channels bound to it (`ChannelState::Active::server`) and the
+    /// in-flight operations holding `(Arc<ServerConn>, sid, ioid)`; when the
+    /// last of those goes away the circuit is torn down by
+    /// `ServerConn::drop`, and this entry expires with it.
+    ///
+    /// pvxs keys the same map `std::weak_ptr<Connection>` (`clientimpl.h:299`)
+    /// for exactly this reason, and `Context::report` skips an entry whose weak
+    /// no longer locks (`client.cpp:470-474`). A strong entry here kept an idle
+    /// zero-channel circuit — socket, reader, writer and heartbeat task — alive
+    /// until `close()`, and kept reporting it as a client connection, because no
+    /// side path (`cacheClear`, `Channel::close`, the cache GC sweep) released
+    /// the entry.
+    inner: parking_lot::Mutex<
+        std::collections::HashMap<std::net::SocketAddr, std::sync::Weak<ServerConn>>,
+    >,
     /// Single-flight gate: per-address async mutex held for the duration
     /// of a `ServerConn::connect`. Two concurrent `get_or_connect` calls
     /// for the same `addr` serialize on this lock — the first dials, the
@@ -284,12 +301,16 @@ impl ConnectionPool {
         bool,
         Vec<(String, u32, u64, u64)>,
     )> {
+        // An expired weak is a circuit whose last channel and operation are
+        // gone, so it is not a connection this client holds — pvxs `report`
+        // skips the entry for the same reason (`client.cpp:470-474`).
         self.inner
             .lock()
             .iter()
-            .map(|(addr, c)| {
+            .filter_map(|(addr, w)| {
+                let c = w.upgrade()?;
                 let (rx, tx) = c.byte_counters(zero);
-                (*addr, rx, tx, c.is_alive(), c.channel_reports(zero))
+                Some((*addr, rx, tx, c.is_alive(), c.channel_reports(zero)))
             })
             .collect()
     }
@@ -300,6 +321,15 @@ impl ConnectionPool {
     /// transport.
     pub fn tls(&self) -> Option<Arc<crate::auth::TlsClientConfig>> {
         self.tls.lock().clone()
+    }
+
+    /// The cached circuit for `addr`, if one is still owned by a channel or an
+    /// operation *and* still alive. The single reader of the weak map: an
+    /// expired weak and a dead connection are the same answer to every caller,
+    /// so neither is distinguished here.
+    fn live(&self, addr: std::net::SocketAddr) -> Option<Arc<ServerConn>> {
+        let conn = self.inner.lock().get(&addr)?.upgrade()?;
+        conn.is_alive().then_some(conn)
     }
 
     pub async fn get_or_connect(
@@ -321,13 +351,8 @@ impl ConnectionPool {
             return Err(PvaError::Protocol("context closed".into()));
         }
         // Fast path: existing alive conn.
-        {
-            let map = self.inner.lock();
-            if let Some(conn) = map.get(&addr).cloned() {
-                if conn.is_alive() {
-                    return Ok(conn);
-                }
-            }
+        if let Some(conn) = self.live(addr) {
+            return Ok(conn);
         }
         // Single-flight: acquire (or create) the per-address gate and
         // hold it across the dial so concurrent callers for `addr` open
@@ -357,15 +382,10 @@ impl ConnectionPool {
 
             // Re-check under the gate: a peer caller may have just
             // connected and published to `inner`.
-            {
-                let map = self.inner.lock();
-                if let Some(conn) = map.get(&addr).cloned() {
-                    if conn.is_alive() {
-                        // A peer dialer owns this gate slot; it will
-                        // remove it from `connecting`. We must not.
-                        return Ok(conn);
-                    }
-                }
+            if let Some(conn) = self.live(addr) {
+                // A peer dialer owns this gate slot; it will
+                // remove it from `connecting`. We must not.
+                return Ok(conn);
             }
 
             // The slot we acquired may be a stale gate that a previous
@@ -403,15 +423,10 @@ impl ConnectionPool {
                 gate: &gate,
             };
 
-            // Drop dead entry and connect fresh.
-            {
-                let mut map = self.inner.lock();
-                if let Some(conn) = map.get(&addr) {
-                    if !conn.is_alive() {
-                        map.remove(&addr);
-                    }
-                }
-            }
+            // Drop an expired or dead entry and connect fresh.
+            self.inner
+                .lock()
+                .retain(|a, w| *a != addr || w.upgrade().is_some_and(|c| c.is_alive()));
             let tls = self.tls.lock().clone();
             let conn_config = ConnConfig {
                 op_timeout,
@@ -440,16 +455,13 @@ impl ConnectionPool {
                 None => ServerConn::connect(reactor, addr, user, host, conn_config).await,
             };
             let fresh = connect_result?;
-            let mut map = self.inner.lock();
             // The gate serialized dialing; still prefer an alive existing
             // one in case a dead entry was re-inserted between the
             // re-check and here.
-            if let Some(existing) = map.get(&addr).cloned() {
-                if existing.is_alive() {
-                    return Ok(existing);
-                }
+            if let Some(existing) = self.live(addr) {
+                return Ok(existing);
             }
-            map.insert(addr, fresh.clone());
+            self.inner.lock().insert(addr, Arc::downgrade(&fresh));
             // `_slot_guard` removes the gate slot from `connecting` here,
             // after the connection is visible in `inner`, so a caller
             // arriving next either finds the cached conn or — if it
@@ -460,7 +472,7 @@ impl ConnectionPool {
 
     pub fn close_dead(&self) {
         let mut map = self.inner.lock();
-        map.retain(|_, conn| conn.is_alive());
+        map.retain(|_, w| w.upgrade().is_some_and(|c| c.is_alive()));
     }
 
     /// Drop the cached connection for `addr` regardless of liveness
@@ -491,7 +503,12 @@ impl ConnectionPool {
             .store(true, std::sync::atomic::Ordering::Release);
         // Drain under the lock, then close after releasing it so a
         // connection teardown can never re-enter the pool while held.
-        let conns: Vec<Arc<ServerConn>> = self.inner.lock().drain().map(|(_, c)| c).collect();
+        let conns: Vec<Arc<ServerConn>> = self
+            .inner
+            .lock()
+            .drain()
+            .filter_map(|(_, w)| w.upgrade())
+            .collect();
         for conn in conns {
             conn.close();
         }

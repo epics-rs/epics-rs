@@ -29,6 +29,7 @@ use tracing::{debug, error, warn};
 
 use crate::error::{PvaError, PvaResult};
 
+use super::peers::ConnSlot;
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
@@ -145,23 +146,31 @@ pub async fn run_tcp_server_on_listener(
                 // endpoint via a name server / cached beacon / static
                 // address. The UDP path keeps the filter (`filter_inbound`).
                 let cur = active.fetch_add(1, Ordering::SeqCst);
+                // Single owner of the release from here on: the guard hands
+                // back both the slot and the peer entry on every exit path,
+                // including an unwind out of a source callback deep in the
+                // connection body. No arm below touches `active` by hand.
+                let slot = ConnSlot::new(peers.clone(), active.clone(), peer);
                 if cur >= config.max_connections {
-                    active.fetch_sub(1, Ordering::SeqCst);
                     warn!(
                         ?peer,
                         "rejecting connection: max_connections={}", config.max_connections
                     );
                     drop(stream);
+                    drop(slot);
                     continue;
                 }
                 let src = source.clone();
                 let cfg = config.clone();
-                let active_dec = active.clone();
                 let acceptor = tls_acceptor.clone();
                 let peers_for_task = peers.clone();
                 let conn_invalidator = channel_invalidator.clone();
                 let conn_reactor = reactor.clone();
                 conn_tasks.spawn(async move {
+                    // declared first so it drops last: every `return` below
+                    // and any panic unwinding out of the connection body
+                    // passes through this drop.
+                    let _slot = slot;
                     stream.set_nodelay(true).ok();
                     // Enable OS-level TCP keepalive so half-open connections
                     // (NAT timeout, dead client) are detected within ~30s
@@ -218,12 +227,10 @@ pub async fn run_tcp_server_on_listener(
                                 Ok(Ok(1)) => b[0] == 0x16,
                                 Ok(Ok(_)) => {
                                     debug!(?peer, "peer closed before first byte");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
                                     return;
                                 }
                                 Ok(Err(e)) => {
                                     debug!(?peer, "first-byte peek error: {e}");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
                                     return;
                                 }
                                 // Timeout → plain PVA client (server initiates).
@@ -248,7 +255,6 @@ pub async fn run_tcp_server_on_listener(
                             ?peer,
                             "refusing plaintext connection: disable_plaintext set (TLS required)"
                         );
-                        active_dec.fetch_sub(1, Ordering::SeqCst);
                         return;
                     }
 
@@ -355,10 +361,6 @@ pub async fn run_tcp_server_on_listener(
                     if let Err(e) = result {
                         debug!(?peer, "connection ended: {e}");
                     }
-                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                    // drop the per-peer entry whether the
-                    // connection ended cleanly or via I/O error.
-                    peers_for_task.remove(peer);
                 });
             }
             Err(e) => {
@@ -375,7 +377,119 @@ pub async fn run_tcp_server_on_listener(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use source_guard::{Comments, production};
+
+    /// The invariant as source inspection: the accept loop releases a
+    /// connection's slot and peer entry ONLY through [`ConnSlot::drop`].
+    ///
+    /// Six hand-written releases used to be spread over the refusal, the two
+    /// peek failures, the plaintext refusal and the tail — and a seventh path
+    /// (an unwind out of the connection body) released nothing, so a panicking
+    /// source callback burned a `max_connections` slot for the life of the
+    /// process. Counting them is what stops the next exit path from being
+    /// added with its own copy.
+    #[test]
+    fn the_accept_loop_releases_a_slot_only_through_the_guard() {
+        let prod = production(include_str!("accept.rs"), Comments::Strip);
+        assert!(
+            prod.contains("ConnSlot::new"),
+            "production slice no longer covers the slot guard"
+        );
+        for token in ["fetch_sub", "peers.remove", "peers_for_task.remove"] {
+            assert_eq!(
+                prod.matches(token).count(),
+                0,
+                "the accept loop must not release a connection's place by hand; \
+                 found `{token}`. Both halves belong to `ConnSlot::drop`."
+            );
+        }
+    }
+
+    /// Boundary: at the limit. A refused connection must not consume the place
+    /// it was refused for, and a served one must give its place back — so the
+    /// limit is a limit and not a latch.
+    ///
+    /// Both releases now run in `ConnSlot::drop`, and the refusal one is the
+    /// interesting half: its guard is built before the limit is checked, so
+    /// the check has nothing left to undo.
+    // The whole module is `#[cfg(tokio_backend)]` in `mod.rs`, but the
+    // exec-backend census reads this file on its own, so the gate is stated
+    // here too: this test drives a real listener and needs the reactor.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_connection_leaves_the_limit_where_it_was() {
+        use std::io::Read;
+        use std::net::Ipv4Addr;
+
+        /// Connect and report whether the server served the connection.
+        /// A served peer gets SET_BYTE_ORDER immediately (the server speaks
+        /// first); a refused one gets EOF.
+        fn connect(addr: SocketAddr) -> (std::net::TcpStream, bool) {
+            let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+            sock.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut byte = [0u8; 1];
+            let served = match sock.read(&mut byte) {
+                Ok(0) => false,
+                Ok(_) => true,
+                Err(e) => panic!("neither served nor refused: {e}"),
+            };
+            (sock, served)
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peers = crate::server_native::peers::PeerRegistry::new();
+        let config = PvaServerConfig {
+            max_connections: 1,
+            ..PvaServerConfig::default()
+        };
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let serving = peers.clone();
+        let accept = tokio::spawn(async move {
+            let _ = run_tcp_server_on_listener(
+                source,
+                listener,
+                config,
+                serving,
+                ChannelInvalidator::new(),
+            )
+            .await;
+        });
+
+        let (first, served) = connect(addr);
+        assert!(served, "the first connection is within the limit");
+
+        let (_refused, served) = connect(addr);
+        assert!(
+            !served,
+            "over the limit the server must close the socket, not hold it open"
+        );
+
+        drop(first);
+        // Teardown finishes on the connection's own task, so this is an
+        // eventually — and it must be a bounded one.
+        let mut released = false;
+        for _ in 0..500 {
+            if peers.is_empty() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "the served connection's peer entry is removed");
+
+        let (_third, served) = connect(addr);
+        assert!(
+            served,
+            "the refusal must not have consumed the slot it was refused for"
+        );
+
+        accept.abort();
+    }
     /// Stage A's invariant, stated as source inspection: the TCP protocol
     /// module names no socket type. That is what makes a second, blocking
     /// driver an addition beside this file rather than a `cfg` threaded

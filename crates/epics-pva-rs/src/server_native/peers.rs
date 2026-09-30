@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 /// Per-channel report entry — mirrors pvxs `Report::Channel`
@@ -270,6 +270,48 @@ impl PeerRegistry {
     }
 }
 
+/// A connection's accept-time bookkeeping, undone on every exit path.
+///
+/// The `max_connections` slot and the per-peer report entry are both taken
+/// *before* the connection body runs, so both have to come back however that
+/// body ends — clean return, I/O error, an early `return` on a refused
+/// handshake, or a panic unwinding out of a source callback. A guard is the
+/// only shape that covers the last two, and it is the single owner of the
+/// release: no exit path releases either resource by hand.
+///
+/// Shared by both accept sides — `super::accept` (hosted, task-per-connection)
+/// and `super::blocking` (RTEMS, thread-per-connection).
+pub(crate) struct ConnSlot {
+    peers: Arc<PeerRegistry>,
+    active: Arc<AtomicUsize>,
+    peer: SocketAddr,
+}
+
+impl ConnSlot {
+    /// Take ownership of the slot the caller has already counted with
+    /// `active.fetch_add`, plus the peer entry under `peer` whether it is
+    /// registered yet or not — [`PeerRegistry::remove`] of an absent peer is a
+    /// no-op, so the accept side may register the entry after the guard exists.
+    pub(crate) fn new(
+        peers: Arc<PeerRegistry>,
+        active: Arc<AtomicUsize>,
+        peer: SocketAddr,
+    ) -> Self {
+        Self {
+            peers,
+            active,
+            peer,
+        }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.peers.remove(self.peer);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Per-channel entry in a [`PeerSnapshot`] — mirrors pvxs
 /// `Report::Channel` (`netcommon.h:43-52`): name + per-channel tx/rx byte
 /// counters + optional source-supplied `ReportInfo`.
@@ -343,6 +385,44 @@ fn now_nanos() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boundary: a slot released while the thread is already unwinding. This is
+    /// the path that used to release nothing — every accept-side exit had its
+    /// own hand-written pair of releases, and an unwind out of the connection
+    /// body ran none of them, so one panicking source callback burned a
+    /// `max_connections` place and left a phantom peer in `report()` for the
+    /// life of the process.
+    #[test]
+    fn a_slot_comes_back_even_when_its_holder_unwinds() {
+        let peers = PeerRegistry::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peer: SocketAddr = "127.0.0.1:65002".parse().expect("peer");
+
+        active.fetch_add(1, Ordering::AcqRel);
+        peers.insert(peer, PeerEntry::new(false));
+        let slot = ConnSlot::new(peers.clone(), active.clone(), peer);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _slot = slot;
+            panic!("a source callback panicked");
+        }));
+        assert!(unwound.is_err(), "the body really did unwind");
+        assert_eq!(active.load(Ordering::Acquire), 0, "the place comes back");
+        assert!(peers.is_empty(), "and the peer entry with it");
+    }
+
+    /// Boundary: the refusal path, where the guard exists but the peer entry
+    /// was never registered. `PeerRegistry::remove` of an absent peer is what
+    /// lets the accept loop build the guard before it knows whether it will
+    /// keep the connection.
+    #[test]
+    fn a_slot_for_an_unregistered_peer_still_releases_the_place() {
+        let peers = PeerRegistry::new();
+        let active = Arc::new(AtomicUsize::new(1));
+        let peer: SocketAddr = "127.0.0.1:65003".parse().expect("peer");
+        drop(ConnSlot::new(peers.clone(), active.clone(), peer));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(peers.is_empty());
+    }
 
     #[test]
     fn insert_remove_snapshot_roundtrip() {

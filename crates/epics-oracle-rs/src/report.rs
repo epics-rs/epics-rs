@@ -1229,9 +1229,9 @@ why = "C's special() rejects SPC_MOD; port accepts."
     /// `Phase::All`, so for a row whose only surfaces are PVA ones the old
     /// advice — "widen the run (e.g. --phase all)" — named a phase that
     /// structurally cannot reach it, no matter how wide the record-type set is.
-    /// Four of the five rows a `--phase all` run leaves unexercised on this
-    /// tree are exactly that shape (CBUG-G1, DESIGN-ASYN-BOUT,
-    /// INSTR-QSRV2-LONGIN-UTAG, INSTR-QSRV2-WAVEFORM-DEMO).
+    /// The rows a `--phase all` run leaves unexercised on this tree are mostly
+    /// that shape (DESIGN-ASYN-BOUT, INSTR-QSRV2-LONGIN-UTAG,
+    /// INSTR-QSRV2-WAVEFORM-DEMO).
     #[test]
     fn an_unexercised_row_names_the_phase_that_can_drive_it() {
         const ROWS: &str = r#"

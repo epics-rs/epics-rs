@@ -148,15 +148,15 @@ impl Record for BoRecord {
     /// (`:301-308`) answers `boHIGHprecision`; every other field falls to
     /// `recGblGetPrec`.
     ///
-    /// Over PVA, pvxs nests the `display.precision` assignment inside the
-    /// `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-292`), and bo's rset serves
-    /// no graphic limits for `HIGH`, so pvxs never assigns the precision leaf —
-    /// `softIocPVX` prints `display.units "s"` and no `display.precision` at
-    /// all for `bo.HIGH`. That is CBUG-G1, an upstream metadata-loss bug; the
-    /// port declines to reproduce it. `nt::qsrv_marks::property_leaves` gates
-    /// `display.precision` on its own `DBR_PRECISION` slot, so this transcribed
-    /// value (2) reaches the wire — a deliberate deviation from `softIocPVX`,
-    /// carried on the oracle allowlist.
+    /// Over PVA, `nt::qsrv_marks::property_leaves` gates `display.precision` on
+    /// its own `DBR_PRECISION` slot, so this transcribed value (2) reaches the
+    /// wire even though bo's rset serves no graphic limits for `HIGH`. pvxs
+    /// agrees from 1.5.3: `getProperties` nested the precision assignment inside
+    /// the `DBR_GR_DOUBLE` branch until `8d9455a` "ioc: serve display.precision
+    /// independent of DBR_GR_DOUBLE" (later than this crate's pvxs pin), so
+    /// `softIocPVX` printed `display.units "s"` and no `display.precision` at all
+    /// for `bo.HIGH`. Measured on 1.5.3: the leaf is now served, and the oracle
+    /// row that carried the difference was retired.
     ///
     /// `get_control_double` (`boRecord.c:310-318` — the nearer citation above
     /// is pvxs, so this one names its file) is the same one-field shape and DOES

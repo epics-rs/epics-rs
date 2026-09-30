@@ -2597,11 +2597,11 @@ mod tests {
         );
         assert!(lo.contains(&"display.limitLow".to_string()));
 
-        // pvxs nests precision INSIDE the graphic-limits branch, dropping it
-        // for a field that supplies get_precision but NULLs get_graphic_double
-        // (CBUG-G1). The port declines to reproduce that: precision gates on its
-        // own DBR_PRECISION slot, so a graphic_double-less numeric marks
-        // display.precision (its independent slot) but not display.limitLow.
+        // Precision gates on its own DBR_PRECISION slot, so a
+        // graphic_double-less numeric marks display.precision but not
+        // display.limitLow. pvxs nested precision INSIDE the graphic-limits
+        // branch until 1.5.3 (`8d9455a`, later than this crate's pvxs pin) and
+        // dropped it for exactly these fields.
         let no_gr = marks(PropertySupport {
             graphic_double: false,
             ..PropertySupport::NUMERIC
@@ -2610,7 +2610,7 @@ mod tests {
             no_gr.contains(&"display.precision".to_string())
                 && !no_gr.contains(&"display.limitLow".to_string()),
             "precision is its own DBR_PRECISION slot, independent of the \
-             DBR_GR_DOUBLE limits (CBUG-G1 deviation): {no_gr:?}"
+             DBR_GR_DOUBLE limits: {no_gr:?}"
         );
 
         let no_ctrl = marks(PropertySupport {

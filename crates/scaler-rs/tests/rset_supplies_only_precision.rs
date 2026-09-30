@@ -69,10 +69,11 @@ fn scaler_claims_no_slot_its_rset_nulls() {
 /// The positive side, so the row is pinned as a transcription and not merely
 /// emptied: `get_precision` (`:152`) IS supplied, and the row must say so.
 ///
-/// It marks nothing today — pvxs assigns `display.precision` only inside its
-/// `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-291`) and scaler's
-/// `get_graphic_double` is NULL — which is exactly why the bit has to record
-/// the rset rather than the observable leaf: the two are not the same question.
+/// The bit records the rset, not the observable leaf, and the two are not the
+/// same question: what reaches the wire depends on how the PVA server gates the
+/// slot. pvxs assigned `display.precision` only inside its `DBR_GR_DOUBLE`
+/// branch until 1.5.3 (`8d9455a`), and scaler's `get_graphic_double` is NULL, so
+/// this supplied slot was invisible over PVA on an older `softIocPVX`.
 #[test]
 fn scaler_still_claims_the_one_slot_its_rset_supplies() {
     let props = scaler().record.property_support();

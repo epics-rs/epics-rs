@@ -957,12 +957,11 @@ fn errored_cases(refs: &[CaseRef], errors: &[ToolError]) -> Vec<MonCase> {
 /// 2. No differences => AGREED.
 /// 3. Anything left => DEFECT.
 ///
-/// A difference is EXPECTED DEVIATION only when a NOT-REPRODUCED row justifies
-/// it — the same contract as [`crate::pvaread::adjudicate`]. The monitor SEED
-/// carries the same `getProperties` leaves a read does, so CBUG-G1's
-/// `display.precision` add shows on `MonSurface::SeedEvent` for the family VAL a
-/// monitor drives (`transform.VAL`); the row (surface `seed_event`) justifies
-/// it. As on the read side, a case is EXPECTED DEVIATION only if EVERY
+/// A difference is EXPECTED DEVIATION only when a row justifies it — the same
+/// contract as [`crate::pvaread::adjudicate`]. The monitor SEED carries the same
+/// `getProperties` leaves a read does, so a marking deviation on a read shows
+/// again on `MonSurface::SeedEvent`, and a row that covers both names both
+/// surfaces. As on the read side, a case is EXPECTED DEVIATION only if EVERY
 /// difference is justified — one unjustified diff makes it a DEFECT.
 pub fn adjudicate(
     cr: &CaseRef,
@@ -1207,20 +1206,24 @@ mod tests {
         }
     }
 
-    /// CBUG-G1 on the monitor seed: `transform.VAL`'s seed differs from pvxs by
-    /// the one `display.precision` line the port serves and pvxs drops. With the
-    /// row loaded (surface `seed_event`) the case is EXPECTED DEVIATION; the
-    /// update stream is identical, so nothing else is at stake.
+    /// A `port_adds_leaves` row on the monitor SEED, which is the surface's own
+    /// half of the read-side content constraint: the seed carries the same
+    /// `getProperties` leaves a read does, so a row scoped to `seed_event`
+    /// justifies one added leaf there. The update stream is identical, so
+    /// nothing else is at stake.
+    ///
+    /// The id is a probe, not a shipped row — see
+    /// [`crate::pvaread`]'s `adds_leaf_allowlist`.
     #[test]
-    fn cbug_g1_seed_precision_add_is_expected_deviation() {
+    fn one_added_seed_leaf_is_an_expected_deviation() {
         let al_text = "schema = 1\n\
             [[deviation]]\n\
-            id = \"CBUG-G1\"\n\
-            bucket = \"NOT-REPRODUCED\"\n\
+            id = \"PROBE-PORT-ADDS-SEED-LEAF\"\n\
+            bucket = \"DESIGN-DIVERGENCE\"\n\
             record_types = [\"transform\"]\n\
             surface = [\"seed_event\"]\n\
             port_adds_leaves = [\"display.precision\"]\n\
-            why = \"port serves precision pvxs drops on the seed\"\n";
+            why = \"the port serves one seed leaf the ground truth omits\"\n";
         let mut al = Allowlist::parse(al_text).expect("valid allowlist");
         let cr = CaseRef {
             record_type: "transform".into(),
@@ -1239,8 +1242,11 @@ mod tests {
         );
         let case = adjudicate(&cr, &c, &r, &mut al);
         assert_eq!(case.verdict, Verdict::ExpectedDeviation);
-        assert_eq!(case.allowlisted, vec!["CBUG-G1".to_string()]);
-        assert!(al.fired_rows().contains("CBUG-G1"));
+        assert_eq!(
+            case.allowlisted,
+            vec!["PROBE-PORT-ADDS-SEED-LEAF".to_string()]
+        );
+        assert!(al.fired_rows().contains("PROBE-PORT-ADDS-SEED-LEAF"));
     }
 
     /// The rule the whole harness rests on, at this phase's most dangerous

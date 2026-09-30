@@ -363,10 +363,11 @@ the merged list above is not an artifact the harness emits.
 `enum-negative-ordinal` and `over-max`/`under-min` on integer and enum
 destinations, which the put table above counts as DEFECT. `CBUG-F12` was enabled
 2026-08-03 with its scope corrected to `histogram.SGNL` `stat`/`sevr`; it was
-disabled here, so nothing above counts it. `CBUG-G1`, `DESIGN-ASYN-BOUT`,
-`INSTR-QSRV2-LONGIN-UTAG` and `INSTR-QSRV2-WAVEFORM-DEMO` are the four PVA rows:
+disabled here, so nothing above counts it. `DESIGN-ASYN-BOUT`,
+`INSTR-QSRV2-LONGIN-UTAG` and `INSTR-QSRV2-WAVEFORM-DEMO` are the PVA rows:
 this document has no PVA phase, so they change nothing above and nothing above
-vouches for them.
+vouches for them. A fourth, `CBUG-G1`, was retired after this run — pvxs 1.5.3
+(`8d9455a`) serves the `display.precision` leaf the row existed to excuse.
 
 **still-valid — 0.**
 

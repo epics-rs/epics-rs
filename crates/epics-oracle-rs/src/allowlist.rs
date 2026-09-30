@@ -160,9 +160,9 @@ pub struct Deviation {
     /// difference). When non-empty, the deviation matches ONLY if the port's
     /// side adds one or more leaf lines whose path is listed here and the two
     /// renderings are otherwise identical — no line removed, no other line
-    /// changed. This keeps a row that justifies "the port serves a leaf pvxs
-    /// omits" (e.g. CBUG-G1's `display.precision`) from laundering any other
-    /// marking difference on the same channel. Empty => no content constraint,
+    /// changed. This keeps a row that justifies "the port serves a leaf the
+    /// ground truth omits" from laundering any other marking difference on the
+    /// same channel. Empty => no content constraint,
     /// the surface+scope match alone decides (the CA behaviour).
     #[serde(default)]
     pub port_adds_leaves: Vec<String>,

@@ -1142,6 +1142,105 @@ mod tests {
         }
     }
 
+    /// Boundary: one panicking child in the fan-out. `notify_monitor_start`
+    /// and `notify_watermark` loop over every registered source, so a panic
+    /// out of one child used to skip every child ordered after it — a gateway
+    /// registered second would never learn the monitor paused, and its
+    /// upstream would stay subscribed for the life of the process. The
+    /// containment in the `ChannelSourceObj` forwarder is per child, so the
+    /// loop reaches all of them.
+    #[test]
+    fn a_panicking_child_does_not_swallow_its_siblings_edges() {
+        struct EdgeSrc {
+            panics: bool,
+            seen: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+            tag: &'static str,
+        }
+        impl ChannelSource for EdgeSrc {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { true }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Ok(()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
+            {
+                async { None }
+            }
+            fn notify_monitor_start(
+                &self,
+                _name: &str,
+                _ctx: &crate::server_native::source::ChannelContext,
+                _start: bool,
+            ) {
+                self.seen.lock().push(self.tag);
+                if self.panics {
+                    panic!("child source callback panicked");
+                }
+            }
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = CompositeSource::new();
+        // `order` decides the fan-out position, so the panicking child is
+        // registered first and the surviving one strictly after it.
+        for (name, tag, panics, order) in [("bad", "bad", true, 0), ("good", "good", false, 1)] {
+            let src: DynSource = Arc::new(EdgeSrc {
+                panics,
+                seen: seen.clone(),
+                tag,
+            });
+            composite
+                .add_source(name, src, order)
+                .expect("register the child source");
+        }
+
+        let ctx = crate::server_native::source::ChannelContext {
+            peer: "127.0.0.1:5075".parse().expect("peer"),
+            creds: Arc::new(crate::server_native::config::ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
+            pv_request: None,
+            log: Default::default(),
+        };
+        <CompositeSource as ChannelSource>::notify_monitor_start(&composite, "dut", &ctx, true);
+
+        let seen = seen.lock().clone();
+        assert!(
+            seen.contains(&"good"),
+            "the child after the panicking one must still see the edge; saw {seen:?}"
+        );
+    }
+
     /// Composite's top-level
     /// gate must reflect inner sub-gate version bumps. Pre-fix the
     /// composite inherited the default `Open` gate (always

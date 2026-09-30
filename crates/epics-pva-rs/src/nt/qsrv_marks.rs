@@ -135,14 +135,15 @@ pub fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
     }
     // `display.precision` is the `DBR_PRECISION` slot (`get_precision`), which
     // is independent of `DBR_GR_DOUBLE` (`get_graphic_double`): a record type
-    // can supply one without the other. pvxs nests the precision assignment
-    // INSIDE the `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-292`), dropping
-    // precision for any field that supplies `get_precision` but NULLs
-    // `get_graphic_double` — e.g. `bo.HIGH` (`boHIGHprecision = 2`). That is
-    // CBUG-G1; the port declines to reproduce it. Gate precision on its own
-    // slot so the served value (already filled by `fill_nt_scalar`) reaches
-    // the wire. Deliberate deviation from `softIocPVX`; see the oracle
-    // allowlist.
+    // can supply one without the other. Gate precision on its own slot so the
+    // served value (already filled by `fill_nt_scalar`) reaches the wire.
+    //
+    // pvxs agrees as of 1.5.3: `getProperties` used to nest this assignment
+    // INSIDE the `DBR_GR_DOUBLE` branch, dropping precision for any field that
+    // supplies `get_precision` but NULLs `get_graphic_double` — `bo.HIGH`
+    // (`boHIGHprecision = 2`) among them. `8d9455a` "ioc: serve
+    // display.precision independent of DBR_GR_DOUBLE" (later than this
+    // crate's pvxs pin) made it a sibling branch, which is the shape here.
     if props.precision {
         leaves.push("display.precision");
     }
@@ -262,11 +263,11 @@ mod tests {
         assert_eq!(property_leaves(props), vec!["display.description"]);
     }
 
-    /// CBUG-G1 deviation: a field that supplies `get_precision` but NULLs
-    /// `get_graphic_double` (e.g. `bo.HIGH`) DOES assign `display.precision`
-    /// and NOT the graphic limits. pvxs nests precision inside the
-    /// `DBR_GR_DOUBLE` branch and drops it here; the port serves it on its
-    /// own `DBR_PRECISION` slot. Deliberate deviation from `softIocPVX`.
+    /// A field that supplies `get_precision` but NULLs `get_graphic_double`
+    /// (e.g. `bo.HIGH`) DOES assign `display.precision` and NOT the graphic
+    /// limits — the two are independent `rset` slots. pvxs served this shape
+    /// from 1.5.3 (`8d9455a`); before it, precision was nested inside the
+    /// `DBR_GR_DOUBLE` branch and dropped for exactly these fields.
     #[test]
     fn precision_without_graphic_limits_assigns_precision_only() {
         let props = PropertySupport {

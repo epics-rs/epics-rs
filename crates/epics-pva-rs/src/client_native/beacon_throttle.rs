@@ -35,6 +35,13 @@ struct ServerEntry {
     /// header version of the last beacon. A change in *either* GUID or
     /// peerVersion is a `Change`.
     peer_version: u8,
+    /// pvxs `BeaconInfo::beaconChange` (clientimpl.h:268, added by `b63700c`):
+    /// the server's own change counter, which it advances whenever its PV set
+    /// changes without the server restarting. A bump is the server saying "ask
+    /// me again" — the only signal a client gets that a name it failed to
+    /// resolve may now exist — so it counts as a `Change` alongside the GUID
+    /// and the peer version.
+    beacon_change: u16,
     last_seen: Instant,
 }
 
@@ -52,16 +59,19 @@ type BeaconKey = (SocketAddr, String);
 pub enum BeaconAction {
     /// First beacon for this `(server, proto)` — emit `Online`, poke.
     New,
-    /// Known `(server, proto)` reported a different GUID or peerVersion —
+    /// Known `(server, proto)` reported a different GUID, peerVersion or
+    /// beacon change counter —
     /// emit `Timeout` for the old identity then `Online` for the new one,
-    /// and poke (src/client.cpp:807-821). pvxs builds that `Timeout` from the
+    /// and poke (src/client.cpp:807-821). A bump of the server's own
+    /// `beaconChange` counter is equally a `Change` (pvxs `b63700c`). pvxs builds that `Timeout` from the
     /// *previous* GUID and peerVersion (`cur.guid` / `cur.peerVersion`,
     /// src/client.cpp:814-819), so both are carried out for the emitter.
     Changed {
         old_guid: [u8; 12],
         old_peer_version: u8,
     },
-    /// Same identity (same GUID and peerVersion) — no event, no poke.
+    /// Same identity (same GUID, peerVersion and change counter) — no event,
+    /// no poke.
     Update,
     /// New entry refused because the tracker is at its size cap.
     CapDropped,
@@ -83,16 +93,18 @@ impl BeaconTracker {
     }
 
     /// Record an observed beacon and classify it. pvxs keys by
-    /// `(server, proto)` and treats a change in GUID *or* peerVersion as a
-    /// `Change` (src/client.cpp:780-808). A GUID/version change is reported
-    /// immediately — there is no per-server suppression window; pacing is
-    /// the engine's global `pokeHoldoff`.
+    /// `(server, proto)` and treats a change in GUID, peerVersion *or* the
+    /// server's `beaconChange` counter as a `Change` (src/client.cpp:780-808
+    /// plus `b63700c`). A change is reported immediately — there is no
+    /// per-server suppression window; pacing is the engine's global
+    /// `pokeHoldoff`.
     pub fn observe(
         &self,
         server: SocketAddr,
         proto: &str,
         guid: [u8; 12],
         peer_version: u8,
+        beacon_change: u16,
     ) -> BeaconAction {
         let mut map = self.inner.write();
         let now = Instant::now();
@@ -123,6 +135,7 @@ impl BeaconTracker {
                     ServerEntry {
                         guid,
                         peer_version,
+                        beacon_change,
                         last_seen: now,
                     },
                 );
@@ -130,11 +143,15 @@ impl BeaconTracker {
             }
             Some(entry) => {
                 entry.last_seen = now;
-                if entry.guid != guid || entry.peer_version != peer_version {
+                if entry.guid != guid
+                    || entry.peer_version != peer_version
+                    || entry.beacon_change != beacon_change
+                {
                     let old_guid = entry.guid;
                     let old_peer_version = entry.peer_version;
                     entry.guid = guid;
                     entry.peer_version = peer_version;
+                    entry.beacon_change = beacon_change;
                     BeaconAction::Changed {
                         old_guid,
                         old_peer_version,
@@ -205,15 +222,21 @@ mod tests {
     #[test]
     fn first_observation_is_new() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V, 0), BeaconAction::New);
     }
 
     #[test]
     fn same_identity_repeats_are_update() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::New);
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::Update);
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::Update);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V, 0), BeaconAction::New);
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], V, 0),
+            BeaconAction::Update
+        );
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], V, 0),
+            BeaconAction::Update
+        );
     }
 
     /// pvxs keys beacon tracking by `(server, proto)` (src/client.cpp:780-782):
@@ -222,13 +245,16 @@ mod tests {
     #[test]
     fn distinct_protocols_are_distinct_identities() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V, 0), BeaconAction::New);
         assert_eq!(
-            t.observe(addr(), "tls", [1u8; 12], V),
+            t.observe(addr(), "tls", [1u8; 12], V, 0),
             BeaconAction::New,
             "tls is a separate identity from tcp for the same server/GUID"
         );
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::Update);
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], V, 0),
+            BeaconAction::Update
+        );
     }
 
     /// A GUID change (server restart) is a `Change` reporting the old GUID
@@ -237,9 +263,9 @@ mod tests {
     #[test]
     fn guid_change_is_a_change() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V, 0), BeaconAction::New);
         assert_eq!(
-            t.observe(addr(), "tcp", [2u8; 12], V),
+            t.observe(addr(), "tcp", [2u8; 12], V, 0),
             BeaconAction::Changed {
                 old_guid: [1u8; 12],
                 old_peer_version: V,
@@ -248,15 +274,44 @@ mod tests {
         assert_eq!(t.guid_for(addr()), Some([2u8; 12]));
     }
 
+    /// The third identity field, held against the other two: the server's own
+    /// `beaconChange` counter (pvxs `b63700c`). A server that adds or removes
+    /// PVs without restarting keeps its GUID and its peerVersion, so this
+    /// counter is the only thing that moves — and a client that ignores it
+    /// never re-searches for the name that just appeared.
+    #[test]
+    fn beacon_change_bump_is_a_change() {
+        let t = BeaconTracker::new();
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2, 5), BeaconAction::New);
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], 2, 5),
+            BeaconAction::Update,
+            "the same counter is a steady beacon"
+        );
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], 2, 6),
+            BeaconAction::Changed {
+                old_guid: [1u8; 12],
+                old_peer_version: 2,
+            },
+            "same GUID and peerVersion but a bumped counter is a Change"
+        );
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], 2, 6),
+            BeaconAction::Update,
+            "and the bumped value then becomes the steady one"
+        );
+    }
+
     /// pvxs classifies a peerVersion change as a `Change` even when the
     /// GUID is unchanged (src/client.cpp:807): the version field participates
     /// in identity.
     #[test]
     fn peer_version_change_is_a_change() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2, 0), BeaconAction::New);
         assert_eq!(
-            t.observe(addr(), "tcp", [1u8; 12], 3),
+            t.observe(addr(), "tcp", [1u8; 12], 3, 0),
             BeaconAction::Changed {
                 old_guid: [1u8; 12],
                 old_peer_version: 2,
@@ -269,7 +324,7 @@ mod tests {
     #[test]
     fn forget_clears_state() {
         let t = BeaconTracker::new();
-        t.observe(addr(), "tcp", [1u8; 12], V);
+        t.observe(addr(), "tcp", [1u8; 12], V, 0);
         t.forget(addr());
         assert!(t.guid_for(addr()).is_none());
     }
@@ -280,7 +335,7 @@ mod tests {
     #[test]
     fn prune_stale_returns_aged_out_entries() {
         let t = BeaconTracker::new();
-        t.observe(addr(), "tcp", [9u8; 12], V);
+        t.observe(addr(), "tcp", [9u8; 12], V, 0);
         // Immediate prune with a far-future age cutoff drops nothing.
         let pruned = t.prune_stale(Duration::from_secs(3600));
         assert!(pruned.is_empty());
@@ -305,8 +360,8 @@ mod tests {
     fn prune_stale_distinguishes_protocols_on_one_endpoint() {
         let t = BeaconTracker::new();
         // Same endpoint + GUID, two protocols, two peerVersions.
-        assert_eq!(t.observe(addr(), "tcp", [7u8; 12], 2), BeaconAction::New);
-        assert_eq!(t.observe(addr(), "tls", [7u8; 12], 3), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [7u8; 12], 2, 0), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tls", [7u8; 12], 3, 0), BeaconAction::New);
         let mut pruned = t.prune_stale(Duration::from_secs(0));
         assert_eq!(pruned.len(), 2, "tcp and tls must prune as two entries");
         // Sort by proto for a deterministic assert.
@@ -326,11 +381,11 @@ mod tests {
     #[test]
     fn proto_scoped_change_does_not_retire_sibling_proto() {
         let t = BeaconTracker::new();
-        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2), BeaconAction::New);
-        assert_eq!(t.observe(addr(), "tls", [1u8; 12], 2), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2, 0), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tls", [1u8; 12], 2, 0), BeaconAction::New);
         // tls server restarts: new GUID + peerVersion on the tls identity.
         assert_eq!(
-            t.observe(addr(), "tls", [2u8; 12], 3),
+            t.observe(addr(), "tls", [2u8; 12], 3, 0),
             BeaconAction::Changed {
                 old_guid: [1u8; 12],
                 old_peer_version: 2,
@@ -339,7 +394,7 @@ mod tests {
         );
         // The tcp identity is untouched — same GUID/version → Update.
         assert_eq!(
-            t.observe(addr(), "tcp", [1u8; 12], 2),
+            t.observe(addr(), "tcp", [1u8; 12], 2, 0),
             BeaconAction::Update,
             "a tls change must not retire or alter the tcp identity"
         );
@@ -355,14 +410,14 @@ mod tests {
                 std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]).into(),
                 5075,
             );
-            assert_eq!(t.observe(sa, "tcp", [0u8; 12], V), BeaconAction::New);
+            assert_eq!(t.observe(sa, "tcp", [0u8; 12], V, 0), BeaconAction::New);
         }
         // Next insertion is refused — reported as CapDropped and the map
         // size stays at the cap.
         let extra: SocketAddr =
             SocketAddr::new(std::net::Ipv4Addr::new(255, 255, 255, 254).into(), 5075);
         assert_eq!(
-            t.observe(extra, "tcp", [1u8; 12], V),
+            t.observe(extra, "tcp", [1u8; 12], V, 0),
             BeaconAction::CapDropped
         );
         assert_eq!(t.inner.read().len(), BEACON_TRACK_LIMIT);

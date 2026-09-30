@@ -787,6 +787,121 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
+/// The credential this port's own client sends, read back from the server that
+/// received it. pvxs shipped 1.5.2 through 1.5.3 replying to
+/// CONNECTION_VALIDATION with `caMethod.cloneEmpty()`, so every `ca`
+/// authentication carried an empty user and host and nothing caught it
+/// (pvxs #207, fixed in `63520d1`, guarded by the whoami test in `8af9e8c`).
+///
+/// The port's own coverage had the same hole: the server-side parse is tested
+/// with hand-built frames, and the client-side encode is tested as a frame, but
+/// no test ran a real Rust client against a real Rust server and looked at what
+/// arrived. An empty-credential regression on either side would have passed
+/// every existing case.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clients_ca_credential_arrives_filled_at_the_server() {
+    use epics_pva_rs::server_native::config::ClientCredentials;
+    use std::sync::Mutex as StdMutex;
+
+    let seen: Arc<StdMutex<Option<(String, String, String)>>> = Arc::new(StdMutex::new(None));
+    let seen_hook = seen.clone();
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:WHOAMI", 1.0).await;
+    let cfg = PvaServerConfig {
+        tcp_port: 0,
+        udp_port: 0,
+        max_connections: 16,
+        auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
+            *seen_hook.lock().expect("hook lock") =
+                Some((cred.method.clone(), cred.account.clone(), cred.host.clone()));
+        })),
+        ..Default::default()
+    };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
+    let h = tokio::spawn(async move {
+        let _ = server.wait().await;
+    });
+
+    let client = client_for(tcp);
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.pvget("STAB:WHOAMI"))
+        .await
+        .expect("get did not time out")
+        .expect("get succeeded");
+
+    let (method, account, host) = seen
+        .lock()
+        .expect("hook lock")
+        .clone()
+        .expect("the server ran its auth_complete hook");
+    assert_eq!(
+        method, "ca",
+        "the client must select `ca` when the server advertises it"
+    );
+    assert!(
+        !account.is_empty(),
+        "the `ca` credential must carry the client's account, not an empty string"
+    );
+    assert!(
+        !host.is_empty(),
+        "and the host the client filled in, not an empty string"
+    );
+
+    h.abort();
+}
+
+/// Boundary: a full `cacheClear`, which is the point at which the client holds
+/// no channel and no operation on the circuit any more. The connection must be
+/// gone from `report()`, not merely idle in it.
+///
+/// pvxs asserts exactly this (`a0422ec`, test/testput.cpp: one connection
+/// before, zero after), and it holds there because `connByAddr` is a
+/// `weak_ptr` — the channel is the owner. This port cached a strong handle, so
+/// the socket, its reader, its writer and its heartbeat outlived every user of
+/// them and kept being reported until `close()`.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_cache_clear_releases_the_server_connection() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:CACHECLR", 3.25).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.pvget("STAB:CACHECLR"))
+        .await
+        .expect("get did not time out");
+    assert_eq!(
+        client.report().connections.len(),
+        1,
+        "the GET leaves one cached channel holding one connection"
+    );
+
+    client
+        .cache_clear_action("", epics_pva_rs::client_native::CacheAction::Disconnect)
+        .await;
+
+    // The teardown runs when the last owner drops, which happens inside the
+    // call above; the circuit's tasks then wind down on their own schedule, so
+    // the report is the assertion and it is a bounded eventually.
+    let mut released = false;
+    for _ in 0..200 {
+        if client.report().connections.is_empty() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "after a full cache clear the client reports no connections, got {}",
+        client.report().connections.len()
+    );
+
+    h.abort();
+}
+
 /// Two PVs monitored through ONE shared client share a single server
 /// connection — the property the `pvmonitor-rs` command relies on after
 /// it was changed to build one client for the whole command instead of

@@ -6232,8 +6232,7 @@ fn cmd_epics_env_set() -> CommandDef {
             // `iocshLoad("inner.cmd","PORT=OLD")` macro stops shadowing
             // the variable the loaded script is setting.
             super::iocsh_env_clear(name);
-            // SAFETY: We're single-threaded in the REPL, and this matches C EPICS behavior
-            unsafe { std::env::set_var(name, value) };
+            crate::runtime::env::set(name, value);
             Ok(CommandOutcome::Continue)
         },
     )

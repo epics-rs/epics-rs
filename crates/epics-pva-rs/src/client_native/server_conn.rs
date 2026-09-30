@@ -1359,6 +1359,25 @@ impl ServerConn {
     }
 }
 
+/// The last owner to let go tears the circuit down.
+///
+/// A `ServerConn` owns a socket and three tasks (reader, writer, heartbeat),
+/// and none of them holds an `Arc<Self>` — they are spawned with the shared
+/// sub-`Arc`s before `Arc::new(Self { .. })` — so this destructor really runs
+/// when the last channel and the last in-flight operation release their handle.
+/// Without it, `ConnectionPool` caching a `Weak` would leak the socket and the
+/// tasks instead of closing them, and `wait_closed` would never return for a
+/// waiter that outlived every owner.
+///
+/// pvxs puts the same teardown in `~Connection` → `Connection::cleanup()`
+/// (clientconn.cpp:176-204), which is what lets its `connByAddr` be a
+/// `weak_ptr`.
+impl Drop for ServerConn {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 // match pvxs clientconn.cpp:292-293 — serverReceiveBufferSize = 0x10000 ("not used").

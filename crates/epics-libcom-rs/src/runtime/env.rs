@@ -314,6 +314,23 @@ pub fn register_iocsh_env_vars() {
     });
 }
 
+/// Set an environment variable — the environment half of C `epicsEnvSet`
+/// (`os/default/osdEnv.c:47-52`).
+///
+/// The shell-macro half is not here: `epicsEnvSet` also clears the iocsh macro
+/// of the same name, and that macro scope is thread-local to the shell, so only
+/// a caller running on the shell thread can clear it. The `epicsEnvSet` command
+/// does both; a caller off that thread (a server publishing a port it has just
+/// bound) reaches only the environment, which is what it owns.
+///
+/// # Safety
+/// Uses `std::env::set_var`, which is unsafe in multi-threaded programs. Call it
+/// from IOC startup or from a single known thread, not from arbitrary tasks.
+pub fn set(name: &str, value: &str) {
+    // SAFETY: as documented — startup or a single owning thread.
+    unsafe { std::env::set_var(name, value) };
+}
+
 /// Set an environment variable only if it is not already set.
 ///
 /// # Safety

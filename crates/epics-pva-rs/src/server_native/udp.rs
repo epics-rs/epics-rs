@@ -28,11 +28,13 @@ use crate::proto::{
 
 use super::source::DynSource;
 // The SEARCH protocol proper — frame parsing, name matching, response
-// framing — moved to [`super::search`] so the TCP-circuit SEARCH handler can
-// name it without inheriting this module's host-only gate. Re-exported here
-// so every `server_native::udp::` path keeps resolving, including the frame
-// builders `client_native` uses in its tests.
-pub(crate) use super::search::{SearchRequest, build_search_response_proto, parse_search_request};
+// framing — lives in [`super::search`] so the TCP-circuit SEARCH handler can
+// name it without inheriting this module's host-only gate. Imported for this
+// module's own use, NOT re-exported: a `server_native::udp::` path to a
+// protocol item resolves only on `tokio_backend`, so every caller must name
+// `super::search` directly — see the cfg-out this re-export produced in
+// `client_native::search_engine`'s tests.
+use super::search::{SearchRequest, build_search_response_proto, parse_search_request};
 // The socket-free datagram half — chained-message drain, ORIGIN_TAG forward
 // decision, reply-destination resolution, source filter, and the server GUID —
 // moved to [`super::search_engine`] for the same reason and by the same move:

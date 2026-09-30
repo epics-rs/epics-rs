@@ -1054,14 +1054,14 @@ fn merge(types: Vec<Reading>, values: Vec<Reading>) -> Vec<PvaObservation> {
 /// 2. No differences => AGREED.
 /// 3. Anything left => DEFECT.
 ///
-/// A difference is EXPECTED DEVIATION only when a NOT-REPRODUCED row in
+/// A difference is EXPECTED DEVIATION only when a row in
 /// `expected-deviations.toml` justifies it — the same contract the CA phases
-/// hold. The first such PVA row
-/// is CBUG-G1 (pvxs drops `display.precision` for a field that NULLs
-/// `get_graphic_double`; the port declines to reproduce it). A case is
-/// EXPECTED DEVIATION only if EVERY difference on it is justified — one
-/// unjustified diff makes the whole case a DEFECT, so a real bug cannot be
-/// laundered by a justified one sharing the channel.
+/// hold. `DESIGN-SCALCOUT-PREV-STRING-SCALAR` is one (the port serves
+/// `scalcout.PAA..PLL` as read-only scalars where the released C IOC serves
+/// 40-element string arrays). A case is EXPECTED DEVIATION only if EVERY
+/// difference on it is justified — one unjustified diff makes the whole case a
+/// DEFECT, so a real bug cannot be laundered by a justified one sharing the
+/// channel.
 pub fn adjudicate(
     ch: &ChannelRef,
     c: &PvaObservation,
@@ -1340,24 +1340,28 @@ mod tests {
         }
     }
 
-    /// The shipped row's shape, narrowed to one field so the test states its
-    /// own scope rather than depending on the file.
+    /// An `INSTRUMENT-DEFECT` row over the `server_abort` surface, written here
+    /// rather than read from the shipped allowlist so the test states its own
+    /// scope. The id is a probe: the row that used to ship this shape
+    /// (`INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW`) was retired when pvxs 1.5.3
+    /// stopped overflowing on `scalcout.PAA..PLL`, and the machinery it
+    /// exercised has to stay tested without it.
     fn abort_allowlist() -> Allowlist {
         Allowlist::parse(
             "schema = 1\n\
              [[deviation]]\n\
-             id = \"INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW\"\n\
+             id = \"PROBE-INSTRUMENT-SERVER-ABORT\"\n\
              bucket = \"INSTRUMENT-DEFECT\"\n\
              record_types = [\"ai\"]\n\
              surface = [\"server_abort\"]\n\
-             why = \"pvxs ioc/iocsource.cpp:124 sizes 40 bytes and :142 writes 1600\"\n",
+             why = \"reading the channel destroys the ground-truth server\"\n",
         )
         .expect("valid allowlist")
     }
 
     /// Adjudicate against an empty allowlist — the pre-allowlist behaviour, so
     /// every difference is a DEFECT. Tests that exercise the allowlist build one
-    /// explicitly (see [`cbug_g1_precision_add_is_expected_deviation`]).
+    /// explicitly (see [`one_added_leaf_is_an_expected_deviation`]).
     fn adj(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> PvaCase {
         adjudicate(ch, c, r, &mut Allowlist::empty())
     }
@@ -1538,7 +1542,7 @@ mod tests {
         assert_eq!(case.verdict, Verdict::ExpectedDeviation);
         assert_eq!(
             case.allowlisted,
-            vec!["INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW".to_string()]
+            vec!["PROBE-INSTRUMENT-SERVER-ABORT".to_string()]
         );
         let s: Vec<_> = case.differences.iter().map(|d| d.surface).collect();
         assert_eq!(s, [PvaSurface::ServerAbort], "decided on the abort alone");
@@ -1548,10 +1552,7 @@ mod tests {
             "the dying words are the evidence: {:?}",
             case.differences[0].reference
         );
-        assert!(
-            al.fired_rows()
-                .contains("INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW")
-        );
+        assert!(al.fired_rows().contains("PROBE-INSTRUMENT-SERVER-ABORT"));
         assert!(al.stale_rows().is_empty(), "a fired row is not stale");
     }
 
@@ -1596,8 +1597,7 @@ mod tests {
             "the surviving side did not complete either — that is an absence, not a deviation",
         );
         assert!(
-            !al.fired_rows()
-                .contains("INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW"),
+            !al.fired_rows().contains("PROBE-INSTRUMENT-SERVER-ABORT"),
             "a row may not fire on a case that was never measured"
         );
     }
@@ -1692,19 +1692,30 @@ mod tests {
         );
     }
 
-    /// The CBUG-G1 allowlist row: a bo channel whose only marking difference is
-    /// the port adding a `display.precision` line pvxs omits is EXPECTED
+    /// A `port_adds_leaves` row, written here rather than read from the shipped
+    /// allowlist so the tests state their own scope: a channel whose only
+    /// marking difference is the port adding one named leaf line is EXPECTED
     /// DEVIATION, not DEFECT — and it fires the row so it is not stale.
-    fn g1_allowlist() -> Allowlist {
+    ///
+    /// The id is deliberately not a shipped one. This exercises the content
+    /// constraint, and the shipped row that used it (`CBUG-G1`, pvxs dropping
+    /// `display.precision`) was retired when pvxs 1.5.3 fixed the drop — a test
+    /// naming it would then assert a deviation that no longer exists.
+    ///
+    /// `DESIGN-DIVERGENCE` rather than `NOT-REPRODUCED` because the parser holds
+    /// the latter to citing a `CBUG-…` id, and a probe transcribes no upstream
+    /// bug to cite. The content constraint is bucket-agnostic, which is the
+    /// whole point of testing it through one that is exempt.
+    fn adds_leaf_allowlist() -> Allowlist {
         Allowlist::parse(
             "schema = 1\n\
              [[deviation]]\n\
-             id = \"CBUG-G1\"\n\
-             bucket = \"NOT-REPRODUCED\"\n\
+             id = \"PROBE-PORT-ADDS-LEAF\"\n\
+             bucket = \"DESIGN-DIVERGENCE\"\n\
              record_types = [\"bo\"]\n\
              surface = [\"value_marking\"]\n\
              port_adds_leaves = [\"display.precision\"]\n\
-             why = \"port serves precision pvxs drops\"\n",
+             why = \"the port serves one leaf the ground truth omits\"\n",
         )
         .expect("valid allowlist")
     }
@@ -1721,38 +1732,38 @@ mod tests {
     }
 
     #[test]
-    fn cbug_g1_precision_add_is_expected_deviation() {
+    fn one_added_leaf_is_an_expected_deviation() {
         // Same leaves, in different orders, plus one display.precision line the
-        // port adds — exactly CBUG-G1's shape.
+        // port adds — exactly the shape the content constraint is for.
         let c = good("value = 0\ncontrol.limitHigh double = 100000");
         let r = good("control.limitHigh double = 100000\ndisplay.precision int32_t = 2\nvalue = 0");
-        let mut al = g1_allowlist();
+        let mut al = adds_leaf_allowlist();
         let case = adjudicate(&bo_chan(), &c, &r, &mut al);
         assert_eq!(case.verdict, Verdict::ExpectedDeviation);
-        assert_eq!(case.allowlisted, vec!["CBUG-G1".to_string()]);
-        assert!(al.fired_rows().contains("CBUG-G1"));
+        assert_eq!(case.allowlisted, vec!["PROBE-PORT-ADDS-LEAF".to_string()]);
+        assert!(al.fired_rows().contains("PROBE-PORT-ADDS-LEAF"));
         assert!(al.stale_rows().is_empty(), "a fired row is not stale");
     }
 
     #[test]
-    fn cbug_g1_does_not_launder_a_second_marking_difference() {
+    fn an_added_leaf_does_not_launder_a_second_marking_difference() {
         // The port adds display.precision AND disagrees on control.limitHigh.
         // The precision add is justified, the limit change is not, so the whole
         // case must stay a DEFECT — a real diff cannot ride in on the row.
         let c = good("value = 0\ncontrol.limitHigh double = 100000");
         let r = good("value = 0\ncontrol.limitHigh double = 999\ndisplay.precision int32_t = 2");
-        let mut al = g1_allowlist();
+        let mut al = adds_leaf_allowlist();
         let case = adjudicate(&bo_chan(), &c, &r, &mut al);
         assert_eq!(case.verdict, Verdict::Defect);
     }
 
     #[test]
-    fn cbug_g1_scope_stops_at_the_named_types() {
+    fn an_added_leaf_rows_scope_stops_at_the_named_types() {
         // The identical precision-add shape on a type NOT in the row's scope is
         // still a DEFECT — the row does not generalise to every record type.
         let c = good("value = 0");
         let r = good("value = 0\ndisplay.precision int32_t = 2");
-        let mut al = g1_allowlist();
+        let mut al = adds_leaf_allowlist();
         let ai = ChannelRef {
             record_type: "ai".into(),
             ..bo_chan()

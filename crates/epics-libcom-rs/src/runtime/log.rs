@@ -329,6 +329,21 @@ fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
 /// below. A host application that wants the backtrace should not install this
 /// hook — it is written for an image with no environment and no debugger.
 ///
+/// Deliberately **not** routed through
+/// [`cant_proceed`](crate::runtime::cant_proceed::cant_proceed), and not a reader
+/// of `EPICS_ABORT_ON_ASSERT` either. The reason is structural rather than a
+/// preference: a panic hook runs **before** `catch_unwind` catches, so it cannot
+/// tell a panic that is about to be contained from one that will end the thread.
+/// Any exit taken here is therefore taken for both, and it would defeat every
+/// containment boundary in the port — `source::contain_callback_panic` among
+/// them, whose whole job is to keep a third-party `ChannelSource` from ending a
+/// connection.
+///
+/// The knob's owner is `cant_proceed`, called at sites that have already decided
+/// they cannot continue. A panic is by construction not such a site: it is a
+/// decision its catcher may still overrule. This hook only makes sure the
+/// operator can read it.
+///
 /// Returns `false` when it was already installed, having changed nothing.
 pub fn install_panic_hook() -> bool {
     use std::sync::atomic::Ordering as AtomicOrdering;

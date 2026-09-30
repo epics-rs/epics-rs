@@ -172,7 +172,7 @@ use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, Work
 use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
-use super::peers::{PeerEntry, PeerRegistry};
+use super::peers::{ConnSlot, PeerEntry, PeerRegistry};
 use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
@@ -625,26 +625,6 @@ pub(super) fn serve_connection_blocking(
 // Accept loop (item 7 stage C)
 // ---------------------------------------------------------------------------
 
-/// The accept loop's per-connection bookkeeping, undone on every exit path.
-///
-/// The peer entry and the `max_connections` slot are both taken *before* the
-/// connection thread starts, so both have to come back however that thread
-/// ends — clean return, I/O error, or a panic unwinding out of the connection.
-/// A guard is the only shape that covers the third, and the thread body is the
-/// one place that can hold it.
-struct ConnSlot {
-    peers: Arc<PeerRegistry>,
-    active: Arc<AtomicUsize>,
-    peer: SocketAddr,
-}
-
-impl Drop for ConnSlot {
-    fn drop(&mut self) {
-        self.peers.remove(self.peer);
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// A blocking, thread-per-connection PVA TCP server — the accept side of the
 /// driver in this module, and the RTEMS counterpart of `super::accept`.
 ///
@@ -973,11 +953,7 @@ impl BlockingPvaServer {
         self.active.fetch_add(1, Ordering::AcqRel);
         let peer_entry = PeerEntry::new(false);
         self.peers.insert(peer, peer_entry.clone());
-        let slot = ConnSlot {
-            peers: self.peers.clone(),
-            active: self.active.clone(),
-            peer,
-        };
+        let slot = ConnSlot::new(self.peers.clone(), self.active.clone(), peer);
 
         let source = self.source.clone();
         let config = self.config.clone();

@@ -292,6 +292,17 @@ impl PvaServer {
                 // have been registered by `iocsh::register_pvxs_commands`
                 // at an application head this server knows nothing about.
                 super::iocsh::publish_pvxs_report(handle.clone());
+                // The same function publishes the effective TCP port into the
+                // environment, as pvxs `initialisePvxsServer` does: recsync and
+                // any later `$(PVAS_SERVER_PORT)` expansion in `st.cmd` read it
+                // from there. It has to be the bound port and not the requested
+                // one, because an ephemeral (`0`) or EADDRINUSE-fallen-back bind
+                // is exactly when a reader cannot derive it. The second name is
+                // pvAccessCPP's, which pvxs sets too so either stack answers.
+                let portstr = handle.bound_tcp_port().to_string();
+                for name in ["PVXS_SERVER_PORT", "PVAS_SERVER_PORT"] {
+                    epics_base_rs::runtime::env::set(name, &portstr);
+                }
                 if let Some(tx) = report_tx {
                     // Best-effort: a dropped receiver (no shell) just
                     // means nobody is watching the report.
@@ -487,6 +498,18 @@ mod tests {
             "udp_port = tcp_port + 1 must not apply to the ephemeral sentinel: \
              port 1 is privileged and is not what `Some(0)` asks for",
         );
+
+        // The port published into the environment is the BOUND one. The
+        // ephemeral bind is the case that proves it: a reader cannot derive
+        // this number from the request, which was `0`.
+        for name in ["PVXS_SERVER_PORT", "PVAS_SERVER_PORT"] {
+            assert_eq!(
+                std::env::var(name).ok().as_deref(),
+                Some(report.tcp_port.to_string().as_str()),
+                "{name} must carry the bound TCP port (pvxs initialisePvxsServer)"
+            );
+        }
+        assert_eq!(handle.bound_tcp_port(), report.tcp_port);
         run.abort();
     }
 }

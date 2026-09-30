@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(4): checked, not waived — all 4 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
-// --all-features`, 556/556). ad-plugins-rs became a census subject when
+// --all-features`, 590/590). ad-plugins-rs became a census subject when
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -51,6 +51,15 @@ impl NDPluginProcess for StdArraysProcessor {
     /// serves pixel data via the StdArray waveforms, not downstream callbacks.
     fn does_array_callbacks(&self) -> bool {
         false
+    }
+
+    /// C `NDPluginStdArrays` passes `compressionAware=true`
+    /// (`NDPluginStdArrays.cpp:332`), so the waveform carries whatever bytes
+    /// the frame holds. Without this the runtime drop gate discards every
+    /// compressed array and `ArrayData` freezes on the last uncompressed
+    /// frame.
+    fn compression_aware(&self) -> bool {
+        true
     }
 
     fn array_data_handle(&self) -> Option<Arc<Mutex<Option<Arc<NDArray>>>>> {
@@ -193,6 +202,74 @@ mod tests {
 
         // A non-terminal plugin keeps the default: it does deliver downstream.
         assert!(PassthroughProcessor::new("NDPluginProcess").does_array_callbacks());
+    }
+
+    #[test]
+    fn test_std_arrays_compressed_frame_is_not_dropped() {
+        // C NDPluginStdArrays passes compressionAware=true
+        // (NDPluginStdArrays.cpp:332), so the runtime admission gate
+        // (`plugin/channel.rs` `classify`: `codec.is_some() &&
+        // !compression_aware` => DropCompressed) must let a compressed frame
+        // through. Without the override every frame behind an NDCodec is
+        // dropped and the ArrayData waveform freezes on the last uncompressed
+        // one.
+        use std::sync::atomic::Ordering;
+
+        let mut raw = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+        raw.unique_id = 7;
+        let compressed = crate::codec::compress_lz4(&raw).unwrap();
+        assert!(compressed.codec.is_some(), "input must carry a codec");
+
+        let pool = NDArrayPool::new(1_000_000);
+        let wiring = Arc::new(WiringRegistry::new());
+        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let dropped = handle.array_sender().dropped_arrays_counter().clone();
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        params_applied(&handle);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+        wait_until("StdArrays to store the compressed frame", || {
+            data.lock().as_ref().is_some_and(|a| a.unique_id == 7)
+        });
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            0,
+            "compression-aware StdArrays must not count its input as dropped"
+        );
+    }
+
+    #[test]
+    fn test_compression_aware_plugins_match_c() {
+        // The ADCore plugins constructed with compressionAware=true are
+        // NDPluginCodec (`:870`), NDFileHDF5 (`:2268`), NDPluginPva (`:157`)
+        // and NDPluginStdArrays (`:332`); NDPluginPvxs also does but postdates
+        // R3-14 and has no Rust counterpart. Every other plugin passes false,
+        // which is the trait default, so this is the whole family — the flag is
+        // a defaulted trait method here where C++ makes it a constructor
+        // argument, so a missing override is silent.
+        use crate::codec::{CodecMode, CodecProcessor};
+        use crate::file_hdf5::Hdf5FileProcessor;
+        use crate::passthrough::PassthroughProcessor;
+
+        assert!(StdArraysProcessor::new().compression_aware());
+        #[cfg(feature = "pva")]
+        assert!(
+            crate::pva::PvaProcessor::new("TEST:Pva1:Image".into()).compression_aware(),
+            "NDPluginPva.cpp:157 passes compressionAware=true"
+        );
+        assert!(CodecProcessor::new(CodecMode::Decompress).compression_aware());
+        assert!(Hdf5FileProcessor::new().compression_aware());
+
+        // A plugin that works on raw pixels keeps the default.
+        assert!(!PassthroughProcessor::new("NDPluginProcess").compression_aware());
     }
 
     #[test]

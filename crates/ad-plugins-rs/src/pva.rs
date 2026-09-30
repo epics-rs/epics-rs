@@ -5,6 +5,13 @@
 //! `epics:nt/NTNDArray:1.0`, and stores it in the registry consumed by the
 //! qsrv adapter.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — the one site ran and
+// passed on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
+// --all-features`, 590/590). The reactor it needs is the current-thread
+// runtime the test builds itself in order to await `publish`; the backend
+// removes no reactor a test owns.
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -82,6 +89,17 @@ impl NDPluginProcess for PvaProcessor {
 
     fn plugin_type(&self) -> &str {
         "NDPluginPva"
+    }
+
+    /// C `NDPluginPva` passes `compressionAware=true` to the base constructor
+    /// (`NDPluginPva.cpp:157`): the NTNDArray value carries the compressed
+    /// bytes with `codec`/`compressedSize` describing them, so a compressed
+    /// frame is published as it arrives and is never decompressed here.
+    /// Without this the runtime drop gate discards every compressed array
+    /// before `process_array`, and a `driver -> NDCodec -> Pva` chain serves
+    /// the last uncompressed frame forever.
+    fn compression_aware(&self) -> bool {
+        true
     }
 
     fn register_params(
@@ -687,6 +705,85 @@ mod tests {
         proc.process_array(&Arc::new(arr), &pool);
 
         assert!(proc.handle().current_value().is_some());
+    }
+
+    #[test]
+    fn compressed_frame_reaches_the_pv_instead_of_being_dropped() {
+        // C NDPluginPva passes compressionAware=true (NDPluginPva.cpp:157), so
+        // the runtime admission gate (`plugin/channel.rs` `classify`:
+        // `codec.is_some() && !compression_aware` => DropCompressed) must let a
+        // compressed frame through. Without the override a
+        // driver -> NDCodec -> Pva chain publishes nothing and the PV keeps
+        // serving the last uncompressed frame. The wire-shape tests above call
+        // `ndarray_to_pv_field` directly and never cross the gate, so only a
+        // runtime-level publish shows the drop.
+        use ad_core_rs::plugin::runtime::create_plugin_runtime;
+        use ad_core_rs::plugin::wiring::WiringRegistry;
+        use std::sync::atomic::Ordering;
+
+        let mut raw = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+        raw.unique_id = 1;
+        let compressed = crate::codec::compress_lz4(&raw).unwrap();
+        assert!(compressed.codec.is_some(), "input must carry a codec");
+
+        let processor = PvaProcessor::new("TEST:Pva1:Image".into());
+        let pv = processor.handle();
+        let pool = NDArrayPool::new(1_000_000);
+        let (handle, _jh) = create_plugin_runtime(
+            "PVA1",
+            processor,
+            pool,
+            10,
+            "",
+            Arc::new(WiringRegistry::new()),
+        );
+        let dropped = handle.array_sender().dropped_arrays_counter().clone();
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        // Fence: the write only queues the enable for the data thread.
+        assert!(
+            handle.wait_params_applied(std::time::Duration::from_secs(10)),
+            "data thread did not apply EnableCallbacks"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let served = loop {
+            if let Some(v) = pv.current_value() {
+                break v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the compressed frame never reached the PV (dropped={})",
+                dropped.load(Ordering::Acquire)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            0,
+            "compression-aware Pva must not count its compressed input as dropped"
+        );
+
+        let PvField::Structure(s) = served else {
+            panic!("expected an NTNDArray structure, got {served:?}");
+        };
+        let Some(PvField::Structure(codec)) = s.get_field("codec") else {
+            panic!("expected codec structure");
+        };
+        assert_eq!(
+            codec.get_field("name"),
+            Some(&PvField::Scalar(ScalarValue::String("lz4".into()))),
+            "the served snapshot must be the compressed frame"
+        );
     }
 
     #[test]

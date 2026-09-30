@@ -225,14 +225,27 @@ fn check_link_put(
             "dbPutFieldLink: {field} takes a string or a NUL-terminated char array"
         ))
     };
+    // `S_db_onlyOne` ("Illegal number of elements"). Both it and
+    // `S_db_badDbrtype` answer a CA client with ECA_PUTFAIL, so the two are
+    // distinguishable only in the message an internal caller (`dbpf`, a group
+    // put, autosave restore) reads back.
+    let only_one = || {
+        CaError::BadDbrType(format!(
+            "dbPutFieldLink: {field} takes exactly one string (S_db_onlyOne)"
+        ))
+    };
     let text = match value {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-        // `DBR_STRING` with `nRequest > 1`: C reads `pstring` and so takes the
-        // first string, without objecting to the count.
-        EpicsValue::StringArray(v) => v
-            .first()
-            .map(|s| s.as_str_lossy().into_owned())
-            .unwrap_or_default(),
+        // `DBR_STRING` takes `nRequest == 1` and nothing else: any other count
+        // is `S_db_onlyOne`, because C reads only `pstring` and a caller asking
+        // to write several strings into one link is asking for something the
+        // field cannot express.
+        EpicsValue::StringArray(v) => {
+            if v.len() != 1 {
+                return Err(only_one());
+            }
+            v[0].as_str_lossy().into_owned()
+        }
         // `nRequest == 1`, so the one byte IS `pstring[nRequest - 1]` and must
         // be the terminator; the link text is then empty, which is how a CA
         // client clears a link with a single NUL.
@@ -243,11 +256,19 @@ fn check_link_put(
             String::new()
         }
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
-            if b.last() != Some(&0) {
-                return Err(bad_type());
+            // `nRequest == 0` is spelled the same as one NUL byte: no bytes to
+            // terminate, and the link text is empty. Indexing
+            // `pstring[nRequest - 1]` on an empty buffer is what C read before
+            // the gate, so the zero case has to be answered ahead of it.
+            if b.is_empty() {
+                String::new()
+            } else {
+                if b.last() != Some(&0) {
+                    return Err(bad_type());
+                }
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                String::from_utf8_lossy(&b[..end]).into_owned()
             }
-            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-            String::from_utf8_lossy(&b[..end]).into_owned()
         }
         _ => return Err(bad_type()),
     };
@@ -4549,6 +4570,54 @@ mod tests {
             assert!(
                 super::check_link_put(record_type, "", field, &hw).is_err(),
                 "{record_type}.{field} must refuse a VME_IO link"
+            );
+        }
+    }
+
+    /// The element-count boundaries of `dbPutFieldLink`'s request-type switch,
+    /// one case per boundary. C gained both gates in the `nRequest` fix: a
+    /// `DBR_CHAR` buffer of zero bytes means "clear the link", spelled the same
+    /// as one NUL byte, and a `DBR_STRING` put takes exactly one element.
+    #[test]
+    fn a_link_put_takes_one_string_or_a_terminated_char_buffer() {
+        let clear = |v: EpicsValue| super::check_link_put("ai", "", "SDIS", &v);
+
+        // DBR_CHAR / DBR_UCHAR by count: 0 clears, 1 NUL clears, an
+        // unterminated buffer refuses, a terminated one takes its text.
+        for empty in [
+            EpicsValue::CharArray(Vec::new().into()),
+            EpicsValue::UCharArray(Vec::new().into()),
+        ] {
+            assert_eq!(
+                clear(empty).unwrap(),
+                Some(EpicsValue::String(String::new().into())),
+                "nRequest == 0 clears the link, as one NUL byte does"
+            );
+        }
+        assert_eq!(
+            clear(EpicsValue::CharArray(vec![0].into())).unwrap(),
+            Some(EpicsValue::String(String::new().into()))
+        );
+        assert!(
+            clear(EpicsValue::CharArray(vec![b'X', b'Y'].into())).is_err(),
+            "a char buffer whose last element is not the NUL is S_db_badDbrtype"
+        );
+        assert_eq!(
+            clear(EpicsValue::CharArray(vec![b'O', b'K', 0].into())).unwrap(),
+            Some(EpicsValue::String("OK".into()))
+        );
+
+        // DBR_STRING by count: only one element is legal.
+        assert_eq!(
+            clear(EpicsValue::StringArray(vec!["OK".into()].into())).unwrap(),
+            Some(EpicsValue::String("OK".into()))
+        );
+        for n in [0usize, 2, 3] {
+            let v = EpicsValue::StringArray(vec!["OK".into(); n].into());
+            let err = clear(v).unwrap_err().to_string();
+            assert!(
+                err.contains("S_db_onlyOne"),
+                "a {n}-element string put must be S_db_onlyOne, got {err}"
             );
         }
     }

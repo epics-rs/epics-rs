@@ -1629,7 +1629,9 @@ async fn run_engine(
                     // version is our own protocol version. The tracker
                     // classifies New/Changed/Update and `emit_beacon_action`
                     // turns that into the right Discovered events.
-                    let action = beacons.observe(server, "tcp", guid, PVA_VERSION);
+                    // No datagram, hence no change counter: 0, the same value
+                    // pvxs's synthesised beacons carry.
+                    let action = beacons.observe(server, "tcp", guid, PVA_VERSION, 0);
                     let should_poke = emit_beacon_action(
                         action,
                         server,
@@ -2544,7 +2546,14 @@ fn handle_search_response(
             // emit_beacon_action produces Online (or Timeout+Online on a
             // changed identity). peerVersion is the reply frame's header
             // version, matching pvxs `peerVersion=head.version`.
-            let action = beacons.observe(server, &resp.protocol, resp.guid, frame.header.version);
+            // pvxs's fake beacon leaves `beaconChange` at its default 0
+            // (src/client.cpp:892-897 sets proto/server/guid/peerVersion and
+            // nothing else), so a pong interleaved with real beacons carrying a
+            // non-zero counter reads as a Change in both directions. Mirrored
+            // rather than corrected: the `Discovered` event stream a discoverer
+            // sees is observable behaviour, and this is what pvxs produces.
+            let action =
+                beacons.observe(server, &resp.protocol, resp.guid, frame.header.version, 0);
             let should_poke = emit_beacon_action(
                 action,
                 server,
@@ -2673,16 +2682,17 @@ fn handle_beacon(
     let Ok(guid) = cur.get_bytes(12) else {
         return consumed;
     };
-    // pvxs udp_collector.cpp::CMD_BEACON skips 4 bytes here:
-    // flags(u8) + seq(u8) + change(u16). server.cpp::doBeacons emits
-    // exactly this layout.
+    // pvxs udp_collector.cpp::CMD_BEACON reads flags(u8) + seq(u8) and then
+    // the server's change counter (`from_wire(M, beaconMsg.beaconChange)`,
+    // `b63700c`); it skipped all four bytes before that commit.
+    // server.cpp::doBeacons emits exactly this layout.
     let Ok(_flags) = cur.get_u8() else {
         return consumed;
     };
     let Ok(_seq) = cur.get_u8() else {
         return consumed;
     };
-    let Ok(_change) = cur.get_u16(order) else {
+    let Ok(beacon_change) = cur.get_u16(order) else {
         return consumed;
     };
     let Ok(addr_bytes) = cur.get_bytes(16) else {
@@ -2742,7 +2752,13 @@ fn handle_beacon(
     // tracker classifies New/Changed/Update keyed by (server, proto), so a
     // tcp and a tls beacon for the same server/GUID are distinct identities
     // and a peerVersion bump on the same GUID is a Change (src/client.cpp:807).
-    let action = beacons.observe(server, &proto, guid_arr, frame.header.version);
+    let action = beacons.observe(
+        server,
+        &proto,
+        guid_arr,
+        frame.header.version,
+        beacon_change,
+    );
     // pvxs poke()/event emission fires only on New or Change (not a steady
     // Update) — mirror of the SearchCommand::BeaconObserved path. Set the
     // poke_request flag so the main loop can flip the tick cadence to fast
@@ -3640,6 +3656,102 @@ mod tests {
     /// discovery pong from an ignored GUID are dropped, but a BEACON from
     /// the same GUID still announces the server and fires
     /// `Discovered::Online`.
+    /// Boundary: the server's own change counter, with GUID and peerVersion
+    /// held constant. A bump means the server's PV set changed without a
+    /// restart — the one signal that a name a client failed to resolve may now
+    /// exist — so it must poke pending searches. pvxs skipped those two bytes
+    /// until `b63700c`, and this port discarded them into `_change`.
+    #[epics_macros_rs::epics_test]
+    async fn a_bumped_beacon_change_counter_pokes_pending_searches() {
+        const G: [u8; 12] = [3u8; 12];
+        let order = ByteOrder::Little;
+        let peer: SocketAddr = "127.0.0.1:5076".parse().expect("peer");
+
+        fn beacon_frame(guid: [u8; 12], change: u16, order: ByteOrder) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&guid);
+            payload.put_u8(0); // flags
+            payload.put_u8(0); // seq
+            payload.put_u16(change, order);
+            payload.extend_from_slice(&[0u8; 16]); // wildcard addr → peer
+            payload.put_u16(5075, order);
+            encode_string_into("tcp", order, &mut payload);
+            let header =
+                PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+            let mut frame = Vec::new();
+            header.write_into(&mut frame);
+            frame.extend_from_slice(&payload);
+            frame
+        }
+
+        let beacons = BeaconTracker::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs = vec![tx];
+
+        // Case 1: first beacon — New, pokes.
+        let mut poke = false;
+        handle_beacon(
+            &beacon_frame(G, 7, order),
+            &beacons,
+            &mut subs,
+            &mut poke,
+            peer,
+        );
+        assert!(poke, "a new server pokes");
+        assert!(matches!(rx.try_recv(), Ok(Discovered::Online { .. })));
+
+        // Case 2: identical beacon, same counter — Update, no poke, no event.
+        let mut poke = false;
+        handle_beacon(
+            &beacon_frame(G, 7, order),
+            &beacons,
+            &mut subs,
+            &mut poke,
+            peer,
+        );
+        assert!(!poke, "a steady beacon must not poke");
+        assert!(rx.try_recv().is_err(), "and must emit no event");
+
+        // Case 3: same GUID and version, counter bumped — Change, pokes.
+        let mut poke = false;
+        handle_beacon(
+            &beacon_frame(G, 8, order),
+            &beacons,
+            &mut subs,
+            &mut poke,
+            peer,
+        );
+        assert!(poke, "a bumped change counter pokes pending searches");
+        assert!(
+            matches!(rx.try_recv(), Ok(Discovered::Timeout { .. })),
+            "the old identity times out first"
+        );
+        assert!(matches!(rx.try_recv(), Ok(Discovered::Online { .. })));
+
+        // Case 4: the counter wraps (the server emits it as a u16). A wrap is
+        // still a change, not a return to a known state.
+        let mut poke = false;
+        handle_beacon(
+            &beacon_frame(G, u16::MAX, order),
+            &beacons,
+            &mut subs,
+            &mut poke,
+            peer,
+        );
+        assert!(poke);
+        let _ = rx.try_recv();
+        let _ = rx.try_recv();
+        let mut poke = false;
+        handle_beacon(
+            &beacon_frame(G, 0, order),
+            &beacons,
+            &mut subs,
+            &mut poke,
+            peer,
+        );
+        assert!(poke, "wrapping past u16::MAX is a change like any other");
+    }
+
     #[test]
     fn ignore_guids_drops_search_replies_not_beacons() {
         use tokio::sync::oneshot;
@@ -3957,7 +4069,7 @@ mod tests {
 
         let beacons = BeaconTracker::new();
         // A tls beacon for the same endpoint carries a different transient GUID.
-        beacons.observe(server, "tls", G_TLS, 2);
+        beacons.observe(server, "tls", G_TLS, 2, 0);
         assert_eq!(
             beacons.guid_for(server),
             Some(G_TLS),

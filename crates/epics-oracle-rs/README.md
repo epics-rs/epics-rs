@@ -92,6 +92,16 @@ The PVA phases additionally need the pvxs tree (`PVXS_BIN`) and the fat
 prerequisite is absent — a silently skipped oracle is the false-clean we are
 escaping.
 
+**The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
+be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`
+the fat `softIocPVX` links. The default `PVXS_BIN` is therefore a `git worktree`
+at the tag (`/home/stevek/work/pvxs-wt-153`) and not the pvxs working checkout,
+which sits on whatever branch its owner is developing on. This is not a
+formality: `8d9455a` "ioc: serve display.precision independent of
+DBR_GR_DOUBLE", released in 1.5.3, moved 63 `pva-read` channels from EXPECTED
+DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
+`softIocPVX` and those 63 come back as DEFECTs against a port that is correct.
+
 ## Port discipline (this has bitten the repo before)
 
 Every port is taken **by binding**, never by hard-coding and never by

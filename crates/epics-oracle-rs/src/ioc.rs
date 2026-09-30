@@ -1014,7 +1014,12 @@ pub struct PvxTools {
 }
 
 impl PvxTools {
-    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-modules/pvxs/bin/linux-x86_64";
+    /// A **tagged** pvxs tree, not the working checkout. The PVA lane's verdicts
+    /// are only meaningful against one stated pvxs version — `display.precision`
+    /// alone moved 63 channels between 1.5.2 and 1.5.3 (`8d9455a`) — and the
+    /// working checkout sits on whatever branch its owner is developing on.
+    /// A `git worktree` at the pin gives the lane a version it can name.
+    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/pvxs-wt-153/bin/linux-x86_64";
 
     /// The **fat** `softIocPVX` — QSRV2 plus the same busy/calc/asyn support the
     /// fat CA [`CTools::DEFAULT_IOC_BIN`] links, so the PVA ground truth serves

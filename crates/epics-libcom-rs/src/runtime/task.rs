@@ -3019,10 +3019,15 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
 
 /// The single fatal exit for a mandatory thread that could not be created.
 ///
-/// `eprintln!` and not `tracing`/`errlog`: on the RTEMS and VxWorks targets no
-/// subscriber is installed, so a `tracing` event at this point is discarded and
-/// the operator sees an IOC that simply went quiet. Only `eprintln!` and panic
-/// output reach the console there.
+/// `eprintln!` and not `errlog`: `errlog_printf` hands the line to the errlog
+/// **worker thread**, which `errlog_pvt` spawns lazily through the fallible
+/// `spawn_dedicated_thread` — and thread creation is exactly what just failed.
+/// The one message that must survive cannot depend on winning the race it was
+/// printed to report. `eprintln!` needs no thread.
+///
+/// (Not, as this once said, because `tracing` has no subscriber on RTEMS and
+/// VxWorks: `errlog`'s own `console_fallback` writes synchronously to stderr
+/// when nothing is listening, so that reason does not hold on its own.)
 ///
 /// `abort` and not `exit`: unwinding would run every other thread's destructors
 /// against a half-built IOC, and the boot state that made the spawn fail is not
@@ -3030,11 +3035,21 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
 ///
 /// Deliberately **not** routed through
 /// [`cant_proceed`](crate::runtime::cant_proceed::cant_proceed), whose
-/// `EPICS_ABORT_ON_ASSERT` default is to park the calling thread. Parking here
-/// is the defect that exit exists to close — measured on a VxWorks 7 RTP, where
-/// the surviving process went on serving CA with no periodic scanning. C reaches
-/// `epicsThreadMustCreate` → `assert`, which the same knob also lets suspend, so
-/// this is a stated deviation rather than a gap.
+/// `EPICS_ABORT_ON_ASSERT` default is to park the calling thread.
+///
+/// C can afford that default because its equivalent failures happen where
+/// something is waiting: `dbScan.c:939-955` wedges `iocInit`, so a parked thread
+/// means the boot never completes and the server never starts. Parking holds the
+/// invariant there by stalling the owner.
+///
+/// [`MandatoryThread::spawn`] has no such owner — that is what distinguishes it
+/// from [`MandatoryThread::try_spawn`], and its own docs enumerate the callers:
+/// a constructor returning `Self`, a `OnceLock` initialiser, a future that parks
+/// forever. Parking one of those does not stall a boot; it deadlocks every
+/// thread that later touches the same `OnceLock`, or silently never yields the
+/// object while whoever called the constructor carries on. So for this family
+/// the knob's default is not a weaker exit, it is an unsound one, and the
+/// deviation is in the exit rather than in the invariant.
 fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
     eprintln!("{}", mandatory_thread_failure_message(name, err));
     std::process::abort()

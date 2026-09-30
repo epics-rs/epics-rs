@@ -787,6 +787,71 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
+/// The credential this port's own client sends, read back from the server that
+/// received it. pvxs shipped 1.5.2 through 1.5.3 replying to
+/// CONNECTION_VALIDATION with `caMethod.cloneEmpty()`, so every `ca`
+/// authentication carried an empty user and host and nothing caught it
+/// (pvxs #207, fixed in `63520d1`, guarded by the whoami test in `8af9e8c`).
+///
+/// The port's own coverage had the same hole: the server-side parse is tested
+/// with hand-built frames, and the client-side encode is tested as a frame, but
+/// no test ran a real Rust client against a real Rust server and looked at what
+/// arrived. An empty-credential regression on either side would have passed
+/// every existing case.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clients_ca_credential_arrives_filled_at_the_server() {
+    use epics_pva_rs::server_native::config::ClientCredentials;
+    use std::sync::Mutex as StdMutex;
+
+    let seen: Arc<StdMutex<Option<(String, String, String)>>> = Arc::new(StdMutex::new(None));
+    let seen_hook = seen.clone();
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:WHOAMI", 1.0).await;
+    let cfg = PvaServerConfig {
+        tcp_port: 0,
+        udp_port: 0,
+        max_connections: 16,
+        auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
+            *seen_hook.lock().expect("hook lock") =
+                Some((cred.method.clone(), cred.account.clone(), cred.host.clone()));
+        })),
+        ..Default::default()
+    };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
+    let h = tokio::spawn(async move {
+        let _ = server.wait().await;
+    });
+
+    let client = client_for(tcp);
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.pvget("STAB:WHOAMI"))
+        .await
+        .expect("get did not time out")
+        .expect("get succeeded");
+
+    let (method, account, host) = seen
+        .lock()
+        .expect("hook lock")
+        .clone()
+        .expect("the server ran its auth_complete hook");
+    assert_eq!(
+        method, "ca",
+        "the client must select `ca` when the server advertises it"
+    );
+    assert!(
+        !account.is_empty(),
+        "the `ca` credential must carry the client's account, not an empty string"
+    );
+    assert!(
+        !host.is_empty(),
+        "and the host the client filled in, not an empty string"
+    );
+
+    h.abort();
+}
+
 /// Boundary: a full `cacheClear`, which is the point at which the client holds
 /// no channel and no operation on the circuit any more. The connection must be
 /// gone from `report()`, not merely idle in it.

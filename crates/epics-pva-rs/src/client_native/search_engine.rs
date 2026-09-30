@@ -3497,7 +3497,7 @@ mod tests {
     /// `SEARCH_SEQ` we stamp into the discovery SEARCH, which the pong
     /// path requires (pvxs src/client.cpp:889).
     fn found_false_response() -> Vec<u8> {
-        crate::server_native::udp::build_search_response_proto(
+        crate::server_native::search::build_search_response_proto(
             [0x42u8; 12],
             SEARCH_SEQ,
             5075,
@@ -3607,7 +3607,7 @@ mod tests {
     #[test]
     fn discovery_pong_rejected_on_wrong_sequence() {
         // Same shape as found_false_response() but with a stray sequence.
-        let frame = crate::server_native::udp::build_search_response_proto(
+        let frame = crate::server_native::search::build_search_response_proto(
             [0x42u8; 12],
             SEARCH_SEQ ^ 0x1,
             5075,
@@ -3777,7 +3777,7 @@ mod tests {
         let beacons = BeaconTracker::new();
         let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
-        let found_true = crate::server_native::udp::build_search_response_proto(
+        let found_true = crate::server_native::search::build_search_response_proto(
             IG,
             0,
             5075,
@@ -3806,7 +3806,7 @@ mod tests {
         let (txd, mut rxd) = mpsc::unbounded_channel::<Discovered>();
         let mut subs2: Vec<mpsc::UnboundedSender<Discovered>> = vec![txd];
         let mut poke2 = false;
-        let pong = crate::server_native::udp::build_search_response_proto(
+        let pong = crate::server_native::search::build_search_response_proto(
             IG,
             SEARCH_SEQ,
             5075,
@@ -3878,7 +3878,7 @@ mod tests {
         use crate::proto::header::HeaderFlags;
         use tokio::sync::oneshot;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
-        let base = crate::server_native::udp::build_search_response_proto(
+        let base = crate::server_native::search::build_search_response_proto(
             [0x42u8; 12],
             0,
             5075,
@@ -4013,7 +4013,7 @@ mod tests {
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
-        let frame = crate::server_native::udp::build_search_response_proto(
+        let frame = crate::server_native::search::build_search_response_proto(
             G,
             0,
             5075,
@@ -4093,7 +4093,7 @@ mod tests {
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
-        let frame = crate::server_native::udp::build_search_response_proto(
+        let frame = crate::server_native::search::build_search_response_proto(
             G_TCP,
             0,
             5075,
@@ -4185,7 +4185,7 @@ mod tests {
             let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             // Second reply: same cid, different GUID B, from server B.
-            let frame = crate::server_native::udp::build_search_response_proto(
+            let frame = crate::server_native::search::build_search_response_proto(
                 G_B,
                 0,
                 5075,
@@ -4423,7 +4423,7 @@ mod tests {
         };
 
         let found_true = |proto: &str| -> Vec<u8> {
-            crate::server_native::udp::build_search_response_proto(
+            crate::server_native::search::build_search_response_proto(
                 [0x42u8; 12],
                 0,
                 5075,
@@ -4789,7 +4789,7 @@ mod tests {
         let mut poke = false;
         // found=false (empty cids), seq == SEARCH_SEQ, fresh GUID → a New
         // beacon identity → should_poke.
-        let pong = crate::server_native::udp::build_search_response_proto(
+        let pong = crate::server_native::search::build_search_response_proto(
             [0x99u8; 12],
             SEARCH_SEQ,
             5075,
@@ -5680,7 +5680,7 @@ mod tests {
                         if pl.len() >= 37 {
                             let search_id = u32::from_le_bytes(pl[33..37].try_into().unwrap());
                             let guid = [0x42u8; 12];
-                            let resp = crate::server_native::udp::build_search_response_proto(
+                            let resp = crate::server_native::search::build_search_response_proto(
                                 guid,
                                 0,
                                 ns_addr.port(),

@@ -1340,17 +1340,21 @@ mod tests {
         }
     }
 
-    /// The shipped row's shape, narrowed to one field so the test states its
-    /// own scope rather than depending on the file.
+    /// An `INSTRUMENT-DEFECT` row over the `server_abort` surface, written here
+    /// rather than read from the shipped allowlist so the test states its own
+    /// scope. The id is a probe: the row that used to ship this shape
+    /// (`INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW`) was retired when pvxs 1.5.3
+    /// stopped overflowing on `scalcout.PAA..PLL`, and the machinery it
+    /// exercised has to stay tested without it.
     fn abort_allowlist() -> Allowlist {
         Allowlist::parse(
             "schema = 1\n\
              [[deviation]]\n\
-             id = \"INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW\"\n\
+             id = \"PROBE-INSTRUMENT-SERVER-ABORT\"\n\
              bucket = \"INSTRUMENT-DEFECT\"\n\
              record_types = [\"ai\"]\n\
              surface = [\"server_abort\"]\n\
-             why = \"pvxs ioc/iocsource.cpp:124 sizes 40 bytes and :142 writes 1600\"\n",
+             why = \"reading the channel destroys the ground-truth server\"\n",
         )
         .expect("valid allowlist")
     }
@@ -1538,7 +1542,7 @@ mod tests {
         assert_eq!(case.verdict, Verdict::ExpectedDeviation);
         assert_eq!(
             case.allowlisted,
-            vec!["INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW".to_string()]
+            vec!["PROBE-INSTRUMENT-SERVER-ABORT".to_string()]
         );
         let s: Vec<_> = case.differences.iter().map(|d| d.surface).collect();
         assert_eq!(s, [PvaSurface::ServerAbort], "decided on the abort alone");
@@ -1548,10 +1552,7 @@ mod tests {
             "the dying words are the evidence: {:?}",
             case.differences[0].reference
         );
-        assert!(
-            al.fired_rows()
-                .contains("INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW")
-        );
+        assert!(al.fired_rows().contains("PROBE-INSTRUMENT-SERVER-ABORT"));
         assert!(al.stale_rows().is_empty(), "a fired row is not stale");
     }
 
@@ -1596,8 +1597,7 @@ mod tests {
             "the surviving side did not complete either — that is an absence, not a deviation",
         );
         assert!(
-            !al.fired_rows()
-                .contains("INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW"),
+            !al.fired_rows().contains("PROBE-INSTRUMENT-SERVER-ABORT"),
             "a row may not fire on a case that was never measured"
         );
     }

@@ -1422,20 +1422,32 @@ impl GroupChannel {
     /// otherwise, is the field `pp(TRUE)` on a `SCAN=Passive` record (and the
     /// client neither forced nor inhibited). Only then `dbProcess`.
     ///
-    /// The port used to process a `+type:"proc"` member's record
-    /// UNCONDITIONALLY — every group PUT, whatever the member's field, whatever
-    /// the record's SCAN, even under `process=false` (R18-30). The gate is not
-    /// specific to `proc` members: it is the gate for every member whose write
-    /// did not go through `dbPutField` — which is `proc` (no value to write) and
-    /// the `changing`-but-unwritable members (Meta, R17-37). One owner, so a
-    /// second such member class cannot re-open it.
+    /// A `+type:"proc"` member is the one member that asks for processing and
+    /// nothing else, so it supplies its own answer to the first question rather
+    /// than borrowing the client's: pvxs hands `doPostProcessing` a hard
+    /// `TriState::True` for a Proc member and the client's `forceProcessing`
+    /// for every other (`groupsource.cpp:567-571`). Reading the mapping here,
+    /// rather than at the call sites, is what keeps that from becoming a second
+    /// gate — the decision has one owner and the answer cannot differ between
+    /// the atomic and non-atomic PUT paths.
+    ///
+    /// The distinction matters because the member's field need not be
+    /// `pp(TRUE)`: a Proc member bound to a `calc` record's `VAL`, or to any
+    /// record whose SCAN is not Passive, asked for processing and gets it. The
+    /// gate still applies in full to the other member class that writes outside
+    /// `dbPutField` — the `changing`-but-unwritable Meta members (R17-37) —
+    /// which pvxs leaves on `forceProcessing`.
     fn member_process_it(
         &self,
         record_name: &str,
         field_name: &str,
+        mapping: FieldMapping,
         process: super::channel::ProcessMode,
     ) -> bool {
         use super::channel::ProcessMode;
+        if mapping == FieldMapping::Proc {
+            return true;
+        }
         match process {
             // `forceProcessing == True` — process regardless of field and SCAN.
             ProcessMode::Force => true,
@@ -1463,7 +1475,7 @@ impl GroupChannel {
         process: super::channel::ProcessMode,
     ) -> BridgeResult<()> {
         let (record_name, field_name) = member.names();
-        if !self.member_process_it(record_name, field_name, process) {
+        if !self.member_process_it(record_name, field_name, member.def.mapping, process) {
             return Ok(());
         }
         // The DECISION is the group's (pvxs asks it in `doPostProcessing`); the
@@ -1492,7 +1504,7 @@ impl GroupChannel {
         process: super::channel::ProcessMode,
     ) -> BridgeResult<()> {
         let (record_name, field_name) = member.names();
-        if !self.member_process_it(record_name, field_name, process) {
+        if !self.member_process_it(record_name, field_name, member.def.mapping, process) {
             return Ok(());
         }
         self.db
@@ -4233,24 +4245,26 @@ mod tests {
         }
     }
 
-    /// R18-30: a `+type:"proc"` member does not process its record
-    /// unconditionally — it goes through `IOCSource::doPostProcessing`
-    /// (`iocsource.cpp:397-403`), which processes only when the bound field is
-    /// the record's `PROC`, when the client forced processing, or when the
-    /// field is `pp(TRUE)` on a `SCAN=Passive` record.
+    /// A `+type:"proc"` member processes its record whatever field it binds and
+    /// whatever the record's SCAN, because pvxs hands `doPostProcessing` a hard
+    /// `TriState::True` for a Proc member (`groupsource.cpp:567-571`) instead of
+    /// the client's `forceProcessing`. Upstream's own test is this shape: it
+    /// changed `$(N)Save` from a `longout`, whose VAL is `pp(TRUE)`, to a
+    /// `calc`, whose VAL is not, and asserts the record still processes.
     ///
-    /// Here the backing record is `SCAN=1 second`, so the `pp && Passive` term
-    /// is false: a proc member bound to `VAL` must NOT process it, while one
-    /// bound to `PROC` must (the first term of C's disjunction ignores both
-    /// SCAN and forceProcessing). Pre-fix both processed, on every group PUT.
+    /// The backing record here is `SCAN=1 second`, so the `pp && Passive` term
+    /// of the general gate is false. Both a `VAL`-bound and a `PROC`-bound proc
+    /// member must still process it. The narrower reading this replaces
+    /// (R18-30) processed only the PROC-bound one.
     #[tokio::test]
-    async fn r18_30_proc_member_honors_the_dopostprocessing_gate() {
+    async fn a_proc_member_processes_whatever_field_it_binds() {
         use epics_base_rs::server::record::ScanType;
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
 
-        // (bound field, must the record process?)
-        for (channel_field, expect_processed) in [("VAL", false), ("PROC", true)] {
+        // (bound field, must the record process?) — both, because the member
+        // is `proc`: its field is not what the decision turns on.
+        for (channel_field, expect_processed) in [("VAL", true), ("PROC", true)] {
             for atomic in [false, true] {
                 let db = Arc::new(PvDatabase::new());
                 db.add_record("SCANNED:rec", Box::new(AiRecord::new(0.0)))
@@ -4289,13 +4303,14 @@ mod tests {
         }
     }
 
-    /// R18-30, the force term: `record._options.process=true` processes the
-    /// backing record whatever its SCAN and whatever field the `+proc` member
-    /// binds (`forceProcessing == True`, iocsource.cpp:399). `process=false`
-    /// (`Inhibit`) suppresses it — except for a PROC-bound member, whose term
-    /// in C's disjunction never consults `forceProcessing`.
+    /// A proc member's own `TriState::True` outranks the client's
+    /// `record._options.process`, so neither `Force` nor `Inhibit` changes the
+    /// answer for one: pvxs never forwards `forceProcessing` for a Proc member
+    /// (`groupsource.cpp:567-571`). `Inhibit` still suppresses processing for
+    /// the member classes that do consult it, which is what
+    /// `member_process_it`'s `ProcessMode` arms cover.
     #[tokio::test]
-    async fn r18_30_proc_member_force_and_inhibit_terms() {
+    async fn a_proc_member_ignores_the_clients_process_option() {
         use super::super::channel::{ProcessMode, PutOptions};
         use epics_base_rs::server::record::ScanType;
         use epics_base_rs::server::records::ai::AiRecord;
@@ -4304,7 +4319,7 @@ mod tests {
         // (bound field, process mode, must the record process?)
         let cases = [
             ("VAL", ProcessMode::Force, true),
-            ("VAL", ProcessMode::Inhibit, false),
+            ("VAL", ProcessMode::Inhibit, true),
             ("PROC", ProcessMode::Inhibit, true),
         ];
         for (channel_field, process, expect_processed) in cases {

@@ -2616,6 +2616,34 @@ impl std::fmt::Debug for MonitorGate {
 /// `Arc<MySource>` directly; this is mainly for the runtime internals.
 pub type DynSource = Arc<dyn ChannelSourceObj>;
 
+/// Run one synchronous source lifecycle callback, containing a panic in it.
+///
+/// INVARIANT: a panic out of user source code MUST NOT reach the connection
+/// state machine. pvxs learned this the hard way — a throw from `onSubscribe`,
+/// `onStart`, `onCancel` or `onClose` reached `ConnBase::bevRead`, which
+/// `reset()`s the circuit and so drops every *other* channel on that
+/// connection; and a throw escaping `ServerOp::cleanup` left the op short of
+/// `Dead`, which `~ServerOp` then asserts on (pvxs `cfcdff4`, `serverchan.cpp`
+/// / `serverconn.cpp` / `servermon.cpp`). Panicking is strictly worse here than
+/// throwing is there: two of the port's call sites run inside a `Drop`
+/// (`MonitorStartControl::drop`, the connection-teardown `channels.drain()`
+/// loop), where an unwind is either an immediate process abort or a silent loss
+/// of every remaining channel's close notification.
+///
+/// OWNER: this function, reached only through the [`ChannelSourceObj`] blanket
+/// forwarders below. The server holds every source as [`DynSource`], so the
+/// vtable is the *only* way it can enter user code — which makes the
+/// containment structural rather than a rule each call site has to remember.
+/// No call site in `server_native` wraps these callbacks itself.
+fn contain_callback_panic(what: &str, name: &str, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        // pvxs logs and carries on (`log_err_printf(connsetup, ...)`); the
+        // transition the callback was reporting has already been committed by
+        // the caller, so there is nothing to roll back.
+        tracing::error!(pv = %name, "source {what} panicked; connection continues");
+    }
+}
+
 /// Object-safe variant of [`ChannelSource`]. Auto-implemented via blanket
 /// for any `T: ChannelSource`.
 pub trait ChannelSourceObj: Send + Sync {
@@ -3256,16 +3284,24 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
-        <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);
+        contain_callback_panic("notify_watermark", name, || {
+            <Self as ChannelSource>::notify_watermark(self, name, ctx, ev)
+        });
     }
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
-        <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
+        contain_callback_panic("notify_monitor_start", name, || {
+            <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start)
+        });
     }
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
-        <Self as ChannelSource>::notify_channel_open(self, name, ctx);
+        contain_callback_panic("notify_channel_open", name, || {
+            <Self as ChannelSource>::notify_channel_open(self, name, ctx)
+        });
     }
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
-        <Self as ChannelSource>::notify_channel_close(self, name, ctx);
+        contain_callback_panic("notify_channel_close", name, || {
+            <Self as ChannelSource>::notify_channel_close(self, name, ctx)
+        });
     }
     fn set_channel_invalidator(&self, invalidator: ChannelInvalidator) {
         <Self as ChannelSource>::set_channel_invalidator(self, invalidator);
@@ -3283,6 +3319,104 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
 mod tests {
     use super::*;
     use crate::server_native::shared_pv::{MonitorRing, SquashTail};
+
+    /// Boundary, one case per lifecycle callback: every synchronous
+    /// notification a source can override is contained at the
+    /// [`ChannelSourceObj`] forwarder, so a panicking one returns normally to
+    /// the connection state machine and the *next* notification still runs.
+    ///
+    /// Stated per callback rather than per scenario because the containment is
+    /// what makes the four call sites in `server_native` safe without any of
+    /// them knowing: a fifth callback added to the trait without a wrapper here
+    /// is the regression this catches.
+    #[test]
+    fn a_panicking_lifecycle_callback_never_reaches_the_connection() {
+        #[derive(Default)]
+        struct PanickyLifecycle {
+            /// Which callbacks were entered, in order — proof the panic came
+            /// from user code and not from the harness.
+            seen: Mutex<Vec<&'static str>>,
+        }
+        impl ChannelSource for PanickyLifecycle {
+            async fn list_pvs(&self) -> Vec<String> {
+                Vec::new()
+            }
+            async fn has_pv(&self, _n: &str) -> bool {
+                false
+            }
+            async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+                None
+            }
+            async fn get_value(&self, _n: &str) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _n: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+                None
+            }
+            fn notify_watermark(&self, _n: &str, _c: &ChannelContext, _e: WatermarkEvent) {
+                self.seen.lock().expect("seen").push("notify_watermark");
+                panic!("notify_watermark");
+            }
+            fn notify_monitor_start(&self, _n: &str, _c: &ChannelContext, _s: bool) {
+                self.seen.lock().expect("seen").push("notify_monitor_start");
+                panic!("notify_monitor_start");
+            }
+            fn notify_channel_open(&self, _n: &str, _c: &ChannelContext) {
+                self.seen.lock().expect("seen").push("notify_channel_open");
+                panic!("notify_channel_open");
+            }
+            fn notify_channel_close(&self, _n: &str, _c: &ChannelContext) {
+                self.seen.lock().expect("seen").push("notify_channel_close");
+                panic!("notify_channel_close");
+            }
+        }
+
+        let src = Arc::new(PanickyLifecycle::default());
+        let dyn_src: DynSource = src.clone();
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().expect("peer"),
+            creds: Arc::new(crate::server_native::config::ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
+            pv_request: None,
+            log: Default::default(),
+        };
+
+        // Each call must return; reaching the line after it IS the assertion.
+        dyn_src.notify_channel_open("dut", &ctx);
+        dyn_src.notify_monitor_start("dut", &ctx, true);
+        dyn_src.notify_watermark(
+            "dut",
+            &ctx,
+            WatermarkEvent {
+                op_id: 1,
+                seq: 1,
+                kind: WatermarkKind::Pause,
+            },
+        );
+        dyn_src.notify_channel_close("dut", &ctx);
+
+        assert_eq!(
+            *src.seen.lock().expect("seen"),
+            vec![
+                "notify_channel_open",
+                "notify_monitor_start",
+                "notify_watermark",
+                "notify_channel_close",
+            ],
+            "every callback ran, and a panic in one did not skip the next"
+        );
+    }
 
     fn batch(names: &[&str]) -> Arc<[String]> {
         names.iter().map(|s| s.to_string()).collect()

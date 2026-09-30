@@ -21182,6 +21182,62 @@ mod tests {
         }
     }
 
+    /// Boundary: the lifecycle callback that runs inside a `Drop`.
+    ///
+    /// `MonitorStartControl::drop` fires the terminal
+    /// `notify_monitor_start(false)` for a monitor torn down without a
+    /// STOP/CANCEL first. A panic out of that callback escapes a destructor:
+    /// on a normal drop it unwinds the read loop and takes every other channel
+    /// on the connection with it, and on a drop that is *already* unwinding it
+    /// is a double panic, which aborts the process. Containment lives in the
+    /// `ChannelSourceObj` forwarder, so the drop cannot propagate it.
+    #[test]
+    fn a_panicking_monitor_start_callback_cannot_escape_the_drop() {
+        struct PanickingSource;
+        impl crate::server_native::source::ChannelSource for PanickingSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            async fn has_pv(&self, n: &str) -> bool {
+                n == "dut"
+            }
+            async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+                None
+            }
+            async fn get_value(&self, _n: &str) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _n: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+                None
+            }
+            fn notify_monitor_start(
+                &self,
+                _name: &str,
+                _ctx: &crate::server_native::source::ChannelContext,
+                _start: bool,
+            ) {
+                panic!("a source callback panicked");
+            }
+        }
+
+        let src: DynSource = Arc::new(PanickingSource);
+        let (exec_tx, _exec_rx) = tokio::sync::watch::channel(false);
+        let ctl = MonitorStartControl::new(src, "dut".into(), bfr12_anon_ctx(), exec_tx);
+        // The Idle->Executing edge, so the terminal edge has something to
+        // undo and `drop` really calls the callback.
+        ctl.set(true);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(ctl))).is_ok(),
+            "the terminal notify_monitor_start must not unwind out of Drop"
+        );
+    }
+
     fn bfr12_anon_ctx() -> crate::server_native::source::ChannelContext {
         crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),

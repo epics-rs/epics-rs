@@ -859,6 +859,14 @@ impl ServerReportHandle {
     /// for the very same tasks. Counters are never zeroed through this
     /// handle (`zero = false`); the resetting variant stays on
     /// [`PvaServer::report_zeroed`], which owns the JoinHandles.
+    /// The TCP port the listeners actually bound, which is the only value
+    /// that answers an ephemeral (`0`) or fallen-back request. Separate from
+    /// [`Self::report`] because a caller that wants the port should not have
+    /// to snapshot the peer registry to read it.
+    pub fn bound_tcp_port(&self) -> u16 {
+        self.bound_tcp_port
+    }
+
     pub fn report(&self) -> ServerReport {
         assemble_report(ReportFields {
             tcp_port: self.bound_tcp_port,

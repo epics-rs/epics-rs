@@ -201,6 +201,8 @@ mod pi_mutex {
     use std::ffi::c_int;
     use std::ops::{Deref, DerefMut};
 
+    use crate::runtime::cant_proceed::cant_proceed;
+
     #[cfg(target_os = "rtems")]
     use super::rtems_pi;
     #[cfg(target_os = "rtems")]
@@ -227,13 +229,13 @@ mod pi_mutex {
     /// (`:81-85`). `epicsMutexShowAll` then reports which it got
     /// (`:199-205`).
     ///
-    /// We match that rather than the Linux arm's `assert_eq!`, and the reason
-    /// is target-specific: the RTEMS IOC installs no `tracing` subscriber and
-    /// has no iocsh, so a panic in a lock constructor during boot is the worst
-    /// available failure mode — it is both fatal and silent. Degrading to a
-    /// plain mutex loses priority inheritance and says so through
-    /// [`is_pi_mutex_active`](super::is_pi_mutex_active); panicking loses the
-    /// IOC.
+    /// We match that probe rather than treating a PI-unavailable result as
+    /// fatal, and the reason is target-specific: the RTEMS IOC has no iocsh, so
+    /// a lock constructor that kills the boot thread leaves nobody to ask what
+    /// happened. Degrading to a plain mutex loses priority inheritance and says
+    /// so through [`is_pi_mutex_active`](super::is_pi_mutex_active); dying
+    /// loses the IOC. The ENOMEM class is the other half of that split and is
+    /// still fatal — see `new` below.
     ///
     /// Probed once per process, so the answer is one fact and not a per-mutex
     /// race — the `OnceLock` is this file's analogue of C's `pthread_once`.
@@ -280,7 +282,7 @@ mod pi_mutex {
     /// Held inline, that is exactly what happened. `new` initialised the mutex
     /// in a stack local and then moved the struct out by value (and callers
     /// move it again — `record_lock`'s gates are `Box::leak(Box::new(…))`), so
-    /// on target the first `lock()` returned 22 and the assertion below took
+    /// on target the first `lock()` returned 22 and the fatal exit below took
     /// the IOC down at boot. Measured; invisible on Linux because glibc's
     /// mutex carries no address in its state and survives the move.
     ///
@@ -314,18 +316,26 @@ mod pi_mutex {
             unsafe {
                 let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
                 let r = libc::pthread_mutexattr_init(&mut attr);
-                assert_eq!(r, 0, "pthread_mutexattr_init failed");
+                if r != 0 {
+                    cant_proceed(&format!("pthread_mutexattr_init failed: {r}"));
+                }
                 // On RTEMS `protocol()` is the probed value, so this call and
                 // the `pthread_mutex_init` below are being made with exactly
                 // the arguments the probe already proved acceptable. What
-                // remains assertable here is the ENOMEM class, which is C's
+                // remains fatal here is the ENOMEM class, which is C's
                 // `cantProceed` path (`osdMutex.c:98`), not the
                 // PI-unavailable path C degrades on.
                 let protocol = protocol();
                 let r = pthread_mutexattr_setprotocol(&mut attr, protocol);
-                assert_eq!(r, 0, "pthread_mutexattr_setprotocol({protocol}) failed");
+                if r != 0 {
+                    cant_proceed(&format!(
+                        "pthread_mutexattr_setprotocol({protocol}) failed: {r}"
+                    ));
+                }
                 let r = libc::pthread_mutex_init(mutex.get(), &attr);
-                assert_eq!(r, 0, "pthread_mutex_init failed");
+                if r != 0 {
+                    cant_proceed(&format!("pthread_mutex_init failed: {r}"));
+                }
                 libc::pthread_mutexattr_destroy(&mut attr);
             }
             Self {
@@ -359,7 +369,11 @@ mod pi_mutex {
         pub fn lock(&self) -> PiMutexGuard<'_, T> {
             unsafe {
                 let r = libc::pthread_mutex_lock(self.inner.get());
-                assert_eq!(r, 0, "pthread_mutex_lock failed");
+                if r != 0 {
+                    // C `epicsMutexMustLock` (`epicsMutex.h:216-221`), which
+                    // `3206c817c` left as the `cantProceed` call it always was.
+                    cant_proceed(&format!("epics_mutex_must_lock() failed: {r}"));
+                }
             }
             PiMutexGuard {
                 mutex: self,
@@ -709,6 +723,60 @@ pub fn osd_show_all_line() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Invariant:** a `pthread_*` call inside `pi_mutex` that fails must
+    /// leave through `cant_proceed`, never through a panic.
+    ///
+    /// The four sites here used to be four independent `assert_eq!`s, and the
+    /// reason that is not merely untidy is that a panic's outcome is decided
+    /// somewhere else: by the panic strategy, by whether the frame is already
+    /// unwinding, and by whether a caller happens to sit inside a
+    /// `catch_unwind`. `EPICS_ABORT_ON_ASSERT` cannot reach any of those.
+    ///
+    /// Read as source rather than exercised because the alternative is a test
+    /// that makes `pthread_mutex_init` return ENOMEM and then survives what
+    /// follows. The module is `#[cfg]`-gated to the PI targets, so the guard
+    /// runs against the text on every host.
+    #[test]
+    fn a_failed_pthread_call_in_pi_mutex_cannot_panic() {
+        let src = source_guard::production(include_str!("sync.rs"), source_guard::Comments::Strip);
+        let body = pi_mutex_body(src);
+        for forbidden in ["assert", "panic!", ".unwrap(", ".expect("] {
+            let hits: Vec<&str> = body
+                .lines()
+                .filter(|l| l.contains(forbidden))
+                .map(|l| l.trim())
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "`pi_mutex` must reach `cant_proceed`, not `{forbidden}`: {hits:?}"
+            );
+        }
+        assert!(
+            body.matches("cant_proceed(").count() >= 4,
+            "the four fallible `pthread_*` calls must each name the owner"
+        );
+    }
+
+    /// The `mod pi_mutex { .. }` body of this file, brace-matched.
+    fn pi_mutex_body(src: &str) -> &str {
+        let start = src.find("\nmod pi_mutex {").expect("pi_mutex module");
+        let open = src[start..].find('{').expect("module brace") + start;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in pi_mutex");
+    }
 
     /// The creation site C records as `__FILE__`/`__LINE__`, and the two
     /// moments the entry exists between: C `ellAdd` in `epicsMutexOsiCreate`

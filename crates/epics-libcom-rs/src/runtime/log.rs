@@ -329,6 +329,13 @@ fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
 /// below. A host application that wants the backtrace should not install this
 /// hook — it is written for an image with no environment and no debugger.
 ///
+/// Deliberately **not** routed through
+/// [`cant_proceed`](crate::runtime::cant_proceed::cant_proceed): a hook that
+/// never returned would convert every panic in the process into a dead thread,
+/// taking the test suite and `catch_unwind`-based containment with it. A panic
+/// that reaches here has already chosen its own exit — this hook only makes sure
+/// the operator can read it.
+///
 /// Returns `false` when it was already installed, having changed nothing.
 pub fn install_panic_hook() -> bool {
     use std::sync::atomic::Ordering as AtomicOrdering;

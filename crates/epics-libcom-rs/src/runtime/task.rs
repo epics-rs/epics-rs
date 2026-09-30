@@ -3027,6 +3027,14 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
 /// `abort` and not `exit`: unwinding would run every other thread's destructors
 /// against a half-built IOC, and the boot state that made the spawn fail is not
 /// one to tear down tidily.
+///
+/// Deliberately **not** routed through
+/// [`cant_proceed`](crate::runtime::cant_proceed::cant_proceed), whose
+/// `EPICS_ABORT_ON_ASSERT` default is to park the calling thread. Parking here
+/// is the defect that exit exists to close — measured on a VxWorks 7 RTP, where
+/// the surviving process went on serving CA with no periodic scanning. C reaches
+/// `epicsThreadMustCreate` → `assert`, which the same knob also lets suspend, so
+/// this is a stated deviation rather than a gap.
 fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
     eprintln!("{}", mandatory_thread_failure_message(name, err));
     std::process::abort()

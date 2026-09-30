@@ -2462,20 +2462,24 @@ impl IocApplication {
         // wire their own signal handlers when used standalone; this one covers
         // the `IocApplication::run` entry point where the runner closure may
         // not (e.g., a custom user runner that only sleeps on `pending()`).
-        // SIGINT/SIGTERM racing is host-only: `tokio::signal` needs the tokio
-        // `signal` feature (signal-hook-registry + mio), which is dropped for
-        // both embedded targets (RTEMS, VxWorks). On either, both arms are
-        // `pending()`, so `run` simply awaits the runner; process-signal
-        // shutdown is the embedded driver's concern (a later increment).
-        // Both embedded targets are `cfg(unix)` too, so the guard is
-        // `all(unix, not(epics_embedded_target))`, not `unix` alone.
-        #[cfg(not(epics_embedded_target))]
+        // SIGINT/SIGTERM racing needs a tokio REACTOR, which is what
+        // `tokio_backend` names — not merely a non-embedded target.
+        // `tokio::signal` registers with the runtime's signal driver and
+        // PANICS ("there is no reactor running") when none is entered; it does
+        // not report that as the `Err` the `sigterm` arm below handles. On
+        // `exec_backend` these futures are polled on the park loop or a
+        // callback-band worker, neither of which enters a runtime, so both
+        // arms must be `pending()` there — including on a host build, where
+        // `cfg(unix)` holds and `epics_embedded_target` does not. `run` then
+        // simply awaits the runner; process-signal shutdown is the exec
+        // driver's concern (a later increment).
+        #[cfg(tokio_backend)]
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        #[cfg(epics_embedded_target)]
+        #[cfg(not(tokio_backend))]
         let ctrl_c = std::future::pending::<()>();
-        #[cfg(all(unix, not(epics_embedded_target)))]
+        #[cfg(all(unix, tokio_backend))]
         let sigterm = async {
             if let Ok(mut sig) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -2485,7 +2489,7 @@ impl IocApplication {
                 std::future::pending::<()>().await;
             }
         };
-        #[cfg(not(all(unix, not(epics_embedded_target))))]
+        #[cfg(not(all(unix, tokio_backend)))]
         let sigterm = std::future::pending::<()>();
 
         let outcome = tokio::select! {

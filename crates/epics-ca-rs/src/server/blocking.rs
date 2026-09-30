@@ -4148,14 +4148,14 @@ mod tests {
 
     /// epics-base PR #944 (regression #943): a scalar DBR_STRING put is
     /// exempt from the `dbr_size_n` check — libca frames it as
-    /// `CA_MESSAGE_ALIGN(strlen+1)`, not 40 bytes — but the payload must
-    /// be NUL-terminated within `m_postsize`
-    /// (`epicsStrnLen >= m_postsize` → RSRV_ERROR). The accept arm is
-    /// covered end-to-end by the CLI tests (real `caput` framing).
+    /// `CA_MESSAGE_ALIGN(strlen+1)`, not 40 bytes. C requires no
+    /// terminator: `write_action` copies the short body into a 40-byte
+    /// scratch and zero-fills the remainder, so the received bytes are
+    /// the whole string. An unterminated body must therefore be accepted
+    /// verbatim, not dropped.
     #[test]
-    fn write_scalar_string_without_nul_drops_silently() {
-        let (db, mut state, outbox, mut drain) =
-            write_test_session("WR:STR", EpicsValue::Double(1.0));
+    fn write_scalar_string_without_nul_is_accepted_whole() {
+        let (db, mut state, outbox, _drain) = write_test_session("WR:STR", EpicsValue::Double(1.0));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
         let f = put_frame(
@@ -4181,14 +4181,52 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            res.is_err(),
-            "scalar string with no NUL in the payload must be RSRV_ERROR (PR #944)"
+            res.is_ok(),
+            "scalar string with no NUL must be accepted: C zero-fills past m_postsize"
         );
-        assert!(
-            drain.try_next().is_none(),
-            "C write_action sends nothing before this RSRV_ERROR"
+        assert_eq!(
+            simple_pv(&db, "WR:STR").get(),
+            EpicsValue::String("AAAAAAAA".into()),
+            "the whole received body is the string, terminator or not"
         );
-        assert_eq!(simple_pv(&db, "WR:STR").get(), EpicsValue::Double(1.0));
+    }
+
+    /// The zero-length body of the same exemption: `caput PV ''` frames
+    /// `m_postsize` 0, which C's scratch copy turns into 40 NULs, i.e.
+    /// the empty string. It must not be read as a truncated frame.
+    #[test]
+    fn write_scalar_string_with_an_empty_body_stores_the_empty_string() {
+        let (db, mut state, outbox, _drain) =
+            write_test_session("WR:STR", EpicsValue::String("seed".into()));
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        let f = put_frame(
+            CA_PROTO_WRITE,
+            epics_base_rs::types::DBR_STRING,
+            1,
+            1,
+            0x54,
+            b"",
+        );
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        block_on_sync(dispatch_message(
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            simple_pv(&db, "WR:STR").get(),
+            EpicsValue::String(String::new().into())
+        );
     }
 
     fn events_off_frame() -> Vec<u8> {

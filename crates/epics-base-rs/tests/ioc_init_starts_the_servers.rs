@@ -142,3 +142,29 @@ async fn a_script_line_after_ioc_init_reaches_the_running_server() {
         "the protocol runner must not outlive the `run` that started it"
     );
 }
+
+/// The signal arms of the same `select!` must not be polled without a reactor.
+///
+/// `tokio::signal` registers with the runtime's signal driver and PANICS when
+/// none is entered, so on `exec_backend` — where `run` is driven by the park
+/// loop — the SIGINT/SIGTERM arms have to be `pending()` rather than `Err`-
+/// handled. `biased` hides a wrong gate whenever the runner is already ready
+/// at the first poll, which is what a runner that returns at once gives; this
+/// one is still sleeping when the script ends, so the select has to fall
+/// through the runner arm onto the signal arms.
+#[epics_macros_rs::epics_test]
+async fn the_signal_arms_are_not_polled_without_a_reactor() {
+    IocApplication::new()
+        .port(0)
+        .startup_script(&st_cmd(
+            "ioc_init_signal_arms.cmd",
+            &["on error break", "iocInit"],
+        ))
+        .run(move |_config| async move {
+            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+            Ok(())
+        })
+        .await
+        .expect("the runner finishes without the signal arms panicking");
+}

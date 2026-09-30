@@ -376,7 +376,7 @@ struct ClientInner {
     host: String,
     pipeline_size: u32,
     pool: Arc<ConnectionPool>,
-    channels: RwLock<HashMap<String, Arc<Channel>>>,
+    channels: RwLock<HashMap<String, CacheEntry>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
     search: OnceLock<SearchEngine>,
     /// Spawns the periodic [`cache_clean_loop`] exactly once, on the first
@@ -430,6 +430,35 @@ static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
 /// retain every idle channel until the context is closed.
 const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// One channel-cache entry: the cached channel plus the GC's mark bit.
+///
+/// INVARIANT: `garbage` means "a `Clean` sweep has already seen this entry
+/// unused". It is written in exactly two places — [`apply_cache_action`] sets
+/// it, [`PvaClient::channel`] clears it on a cache hit — and the field is
+/// private to this module, so no holder of an `Arc<Channel>` can reach it.
+///
+/// pvxs keeps the same bit on the `Channel` itself (`clientimpl.h:194`), where
+/// every channel holder can write it, and the bug `928d572` fixed was a write
+/// in the wrong place: `cacheClean` set `garbage` *before* testing it, so the
+/// mark always read as already-set and every idle channel was swept on the
+/// first pass that saw it rather than the second. Keeping the bit with the
+/// cache entry is why that shape cannot be written here.
+struct CacheEntry {
+    chan: Arc<Channel>,
+    garbage: bool,
+}
+
+impl CacheEntry {
+    /// A freshly cached channel is never born marked — it is in use by the
+    /// caller that just built it.
+    fn new(chan: Arc<Channel>) -> Self {
+        Self {
+            chan,
+            garbage: false,
+        }
+    }
+}
+
 /// Apply a [`CacheAction`] to the channel map, returning the channels that were
 /// removed so the caller can close `Disconnect`ed ones after releasing the map
 /// lock. An empty `pv_name` is the pvxs wildcard over every cached name
@@ -438,7 +467,7 @@ const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
 /// `use_count > 1`); `Drop`/`Disconnect` remove unconditionally
 /// (src/client.cpp:1350-1366).
 fn apply_cache_action(
-    chans: &mut HashMap<String, Arc<Channel>>,
+    chans: &mut HashMap<String, CacheEntry>,
     pv_name: &str,
     action: CacheAction,
 ) -> Vec<Arc<Channel>> {
@@ -450,16 +479,25 @@ fn apply_cache_action(
     let mut removed = Vec::new();
     for name in names {
         if action == CacheAction::Clean {
-            if let Some(c) = chans.get(&name) {
+            if let Some(e) = chans.get_mut(&name) {
                 // The map's own `Arc` is the single expected reference; any
                 // extra clone means an in-use channel that `Clean` preserves.
-                if Arc::strong_count(c) > 1 {
+                if Arc::strong_count(&e.chan) > 1 {
+                    continue;
+                }
+                // Unused, but this is only the first sweep to see it that way:
+                // mark and let the next one collect it. The grace is what makes
+                // a reconnect-in-a-loop client reuse its channel instead of
+                // re-searching for it, since `channel()` clears the mark on the
+                // way out of the cache.
+                if !e.garbage {
+                    e.garbage = true;
                     continue;
                 }
             }
         }
-        if let Some(ch) = chans.remove(&name) {
-            removed.push(ch);
+        if let Some(e) = chans.remove(&name) {
+            removed.push(e.chan);
         }
     }
     removed
@@ -717,8 +755,15 @@ impl PvaClient {
         // Forced-server channels skip the cache entirely — pinning is a
         // per-call request, not a global property of the PV name.
         if forced.is_none() {
-            if let Some(c) = self.inner.channels.read().get(pv_name).cloned() {
-                return Ok(c);
+            // A hit is use, so it clears the GC mark — pvxs `Channel::build`
+            // does the same on its cache hit (`client.cpp:364-367`). Taking the
+            // write lock for the read is what keeps the clear and the lookup one
+            // operation: a `Clean` sweep cannot land between them and collect
+            // the entry this caller is about to return.
+            let mut chans = self.inner.channels.write();
+            if let Some(e) = chans.get_mut(pv_name) {
+                e.garbage = false;
+                return Ok(e.chan.clone());
             }
         }
 
@@ -769,10 +814,11 @@ impl PvaClient {
         });
 
         let mut map = self.inner.channels.write();
-        if let Some(existing) = map.get(pv_name).cloned() {
-            return Ok(existing);
+        if let Some(existing) = map.get_mut(pv_name) {
+            existing.garbage = false;
+            return Ok(existing.chan.clone());
         }
-        map.insert(pv_name.to_string(), ch.clone());
+        map.insert(pv_name.to_string(), CacheEntry::new(ch.clone()));
         Ok(ch)
     }
 
@@ -1227,7 +1273,7 @@ impl PvaClient {
         // lock is held.
         let channels: Vec<Arc<Channel>> = {
             let mut map = self.inner.channels.write();
-            map.drain().map(|(_, ch)| ch).collect()
+            map.drain().map(|(_, e)| e.chan).collect()
         };
         for ch in channels {
             ch.close();
@@ -2476,7 +2522,7 @@ impl PvaClient {
         let mut searching = 0usize;
         let mut connecting = 0usize;
         let mut closed = 0usize;
-        for ch in channels.values() {
+        for ch in channels.values().map(|e| &e.chan) {
             // Use `is_active()` so server-destroyed channels (whose
             // raw state is still `Active` until the next
             // ensure_active runs) don't get counted as live. The
@@ -3309,31 +3355,105 @@ mod tests {
         ))
     }
 
-    #[epics_macros_rs::epics_test]
-    async fn cache_action_clean_keeps_in_use_removes_unused() {
-        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
-        chans.insert("unused".into(), cache_test_channel("unused"));
-        let in_use = cache_test_channel("in_use");
-        chans.insert("in_use".into(), Arc::clone(&in_use)); // extra live ref
+    /// One cached entry, as the cache holds it.
+    fn cache_test_entry(name: &str) -> CacheEntry {
+        CacheEntry::new(cache_test_channel(name))
+    }
 
-        // Wildcard Clean over the whole map.
+    /// Boundary: the sweep that first sees an entry unused, versus the one
+    /// after it. `Clean` is mark-then-sweep, so an unused entry survives its
+    /// first pass and is collected on the second — pvxs `928d572`, whose bug
+    /// was that the mark was set before it was tested and so every pass acted
+    /// as the second one.
+    #[epics_macros_rs::epics_test]
+    async fn cache_action_clean_marks_before_it_sweeps() {
+        let mut chans: HashMap<String, CacheEntry> = HashMap::new();
+        chans.insert("unused".into(), cache_test_entry("unused"));
+        let in_use = cache_test_channel("in_use");
+        chans.insert("in_use".into(), CacheEntry::new(Arc::clone(&in_use))); // extra live ref
+
+        // First pass: unused but unmarked, so it is marked and kept.
+        let removed = apply_cache_action(&mut chans, "", CacheAction::Clean);
+        assert!(
+            chans.contains_key("unused"),
+            "the first Clean to see an entry unused only marks it"
+        );
+        assert!(removed.is_empty(), "and removes nothing");
+
+        // Second pass: already marked, so it is collected.
         let removed = apply_cache_action(&mut chans, "", CacheAction::Clean);
         assert!(
             !chans.contains_key("unused"),
-            "Clean removes a channel with no live external reference"
-        );
-        assert!(
-            chans.contains_key("in_use"),
-            "Clean preserves an in-use channel (use_count > 1)"
+            "the next Clean sweeps the marked entry"
         );
         assert_eq!(removed.len(), 1, "only the unused channel is removed");
+        assert!(
+            chans.contains_key("in_use"),
+            "Clean preserves an in-use channel (use_count > 1) on every pass"
+        );
+
+        // And an in-use entry is never marked, however many passes run — so it
+        // is not one sweep away from collection the moment its last op ends.
+        apply_cache_action(&mut chans, "", CacheAction::Clean);
+        assert!(
+            !chans.get("in_use").expect("in_use entry").garbage,
+            "an in-use entry carries no mark"
+        );
+        drop(in_use);
+        let removed = apply_cache_action(&mut chans, "", CacheAction::Clean);
+        assert!(
+            chans.contains_key("in_use"),
+            "the pass that first finds it unused marks it rather than sweeping it"
+        );
+        assert!(removed.is_empty());
+    }
+
+    /// Boundary: a cache hit between the mark and the sweep. Use clears the
+    /// mark, so a client that keeps re-opening the same PV name never loses its
+    /// cached channel to the GC — the point of the grace period.
+    #[epics_macros_rs::epics_test]
+    async fn a_cache_hit_clears_the_gc_mark() {
+        let client = PvaClient::builder().build();
+        // Direct-server so `channel()` needs no UDP search.
+        client
+            .inner
+            .channels
+            .write()
+            .insert("pv".into(), cache_test_entry("pv"));
+
+        // One pass marks it.
+        {
+            let mut chans = client.inner.channels.write();
+            apply_cache_action(&mut chans, "", CacheAction::Clean);
+            assert!(chans.get("pv").expect("entry").garbage, "marked");
+        }
+        // A hit is use.
+        let held = client.channel("pv").await.expect("cache hit");
+        assert!(
+            !client
+                .inner
+                .channels
+                .read()
+                .get("pv")
+                .expect("entry")
+                .garbage,
+            "a cache hit clears the mark"
+        );
+        drop(held);
+        // So the next pass is a first pass again, and marks rather than sweeps.
+        let removed = {
+            let mut chans = client.inner.channels.write();
+            apply_cache_action(&mut chans, "", CacheAction::Clean)
+        };
+        assert!(removed.is_empty(), "the grace period restarted");
+        assert!(client.inner.channels.read().contains_key("pv"));
     }
 
     #[epics_macros_rs::epics_test]
     async fn cache_action_drop_removes_in_use_unconditionally() {
-        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        let mut chans: HashMap<String, CacheEntry> = HashMap::new();
         let in_use = cache_test_channel("pv");
-        chans.insert("pv".into(), Arc::clone(&in_use));
+        chans.insert("pv".into(), CacheEntry::new(Arc::clone(&in_use)));
 
         let removed = apply_cache_action(&mut chans, "pv", CacheAction::Drop);
         assert!(
@@ -3346,9 +3466,9 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn cache_action_disconnect_removes_and_closes() {
         use crate::client_native::channel::ChannelState;
-        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        let mut chans: HashMap<String, CacheEntry> = HashMap::new();
         let in_use = cache_test_channel("pv");
-        chans.insert("pv".into(), Arc::clone(&in_use));
+        chans.insert("pv".into(), CacheEntry::new(Arc::clone(&in_use)));
 
         let removed = apply_cache_action(&mut chans, "pv", CacheAction::Disconnect);
         assert!(!chans.contains_key("pv"), "Disconnect removes the channel");
@@ -3366,9 +3486,9 @@ mod tests {
 
     #[epics_macros_rs::epics_test]
     async fn cache_action_empty_name_is_wildcard() {
-        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
-        chans.insert("a".into(), cache_test_channel("a"));
-        chans.insert("b".into(), cache_test_channel("b"));
+        let mut chans: HashMap<String, CacheEntry> = HashMap::new();
+        chans.insert("a".into(), cache_test_entry("a"));
+        chans.insert("b".into(), cache_test_entry("b"));
 
         let removed = apply_cache_action(&mut chans, "", CacheAction::Drop);
         assert!(chans.is_empty(), "empty name sweeps every cached channel");
@@ -3390,7 +3510,7 @@ mod tests {
             .inner
             .channels
             .write()
-            .insert("unused".into(), cache_test_channel("unused"));
+            .insert("unused".into(), cache_test_entry("unused"));
         let mut swept = false;
         for _ in 0..200 {
             if !client.inner.channels.read().contains_key("unused") {
@@ -3410,7 +3530,7 @@ mod tests {
             .inner
             .channels
             .write()
-            .insert("held".into(), Arc::clone(&held));
+            .insert("held".into(), CacheEntry::new(Arc::clone(&held)));
         epics_base_rs::runtime::task::sleep(period * 5).await;
         assert!(
             client.inner.channels.read().contains_key("held"),

@@ -1,4 +1,8 @@
+use std::cell::RefCell;
+use std::fs::File;
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue};
@@ -14,6 +18,69 @@ use ad_core_rs::plugin::runtime::{
 
 use netcdf3::{DataSet, FileReader, FileWriter, Version};
 use parking_lot::Mutex;
+
+/// The output stream handed to `netcdf3::FileWriter`.
+///
+/// `netcdf3` serialises one element at a time -- each value's `to_be_bytes()`
+/// goes straight to the stream (file_writer.rs:30-33) -- and the writer its
+/// `open()` builds wraps a bare `std::fs::File`, so a frame costs one
+/// `write(2)` per pixel. Buffering the stream changes no byte of the file:
+/// `open_seek_write` accepts any `Seek + Write`, and the netCDF-3 format is
+/// whatever the crate wrote before.
+///
+/// The handle is shared rather than moved into the writer because
+/// `FileWriter::close` consumes the writer and never flushes. Leaving the
+/// final flush to `BufWriter`'s `Drop` would discard its error, and a short
+/// write on a full disk has to be reported -- see [`BufferedFile::finish`].
+#[derive(Clone)]
+struct BufferedFile(Rc<RefCell<BufWriter<File>>>);
+
+impl BufferedFile {
+    /// One MiB: the writer seeks once per variable and per record chunk, and
+    /// `BufWriter` flushes on seek, so the buffer only has to outlast one
+    /// contiguous run of elements.
+    const CAPACITY: usize = 1 << 20;
+
+    fn create(path: &Path) -> io::Result<Self> {
+        // The options `netcdf3::FileWriter::open` uses, so a missing parent or
+        // an unwritable directory still fails here, before any frame is
+        // serialised.
+        let file = std::fs::OpenOptions::new()
+            .read(false)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .append(false)
+            .open(path)?;
+        Ok(Self(Rc::new(RefCell::new(BufWriter::with_capacity(
+            Self::CAPACITY,
+            file,
+        )))))
+    }
+
+    /// Flush what is still buffered, reporting the error. Must be called after
+    /// `FileWriter::close`; until it returns the tail of the file is not on
+    /// disk.
+    fn finish(self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+impl Write for BufferedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+impl Seek for BufferedFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.borrow_mut().seek(pos)
+    }
+}
 
 const VAR_NAME: &str = "array_data";
 const DIM_UNLIMITED: &str = "numArrays";
@@ -548,8 +615,15 @@ impl NDFileWriter for NetcdfWriter {
             let multi = w.open_multiple;
             let (ds, attr_var_names) = define_data_set(first, w.frames.len(), multi)?;
 
+            let map_io = |e: std::io::Error| {
+                ADError::UnsupportedConversion(format!("NetCDF write error: {e}"))
+            };
+
             // Write
-            let mut writer = FileWriter::open(&path).map_err(map_write)?;
+            let sink = BufferedFile::create(&path).map_err(map_io)?;
+            let mut writer =
+                FileWriter::open_seek_write(&path.to_string_lossy(), Box::new(sink.clone()))
+                    .map_err(map_write)?;
             writer
                 .set_def(&ds, Version::Classic, 0)
                 .map_err(map_write)?;
@@ -600,6 +674,7 @@ impl NDFileWriter for NetcdfWriter {
             }
 
             writer.close().map_err(map_write)?;
+            sink.finish().map_err(map_io)?;
             Ok(())
         })
     }
@@ -1661,5 +1736,68 @@ mod tests {
         assert!(writer.frames.is_empty(), "no frame may be buffered");
         assert!(!fb.is_open());
         assert_eq!(fb.num_captured(), 0);
+    }
+
+    /// Buffering the output stream puts a `BufWriter` between `netcdf3` and the
+    /// file, and `netcdf3` seeks per variable and per record chunk. Both sides
+    /// of the buffer boundary have to come back byte-exact: one frame larger
+    /// than `BufferedFile::CAPACITY`, and a two-record file whose chunks are
+    /// each larger than it, so a seek lands in the middle of a buffered run.
+    #[test]
+    fn frames_larger_than_the_write_buffer_round_trip() {
+        // Deliberately not a multiple of the capacity.
+        let n = BufferedFile::CAPACITY + 12_345;
+        let make = |seed: u8| {
+            let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::UInt8);
+            if let NDDataBuffer::U8(v) = &mut arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = (i as u8).wrapping_add(seed);
+                }
+            }
+            arr
+        };
+
+        let path = temp_path("nc_big_single");
+        let arr = make(0);
+        let mut writer = NetcdfWriter::new();
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&Arc::new(arr.clone())).unwrap();
+        writer.close_file().unwrap();
+
+        writer.current_path = Some(path.clone());
+        let read_back = writer.read_file().unwrap();
+        let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) else {
+            panic!("data type mismatch on roundtrip");
+        };
+        assert_eq!(orig, read);
+        std::fs::remove_file(&path).ok();
+
+        // Capture: two records, each chunk larger than the buffer.
+        let path = temp_path("nc_big_capture");
+        let (first, second) = (make(0), make(77));
+        let mut writer = NetcdfWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Capture, &first)
+            .unwrap();
+        writer.write_file(&Arc::new(first.clone())).unwrap();
+        writer.write_file(&Arc::new(second.clone())).unwrap();
+        writer.close_file().unwrap();
+
+        let mut reader = FileReader::open(&path).unwrap();
+        for (record, expected) in [(0, &first), (1, &second)] {
+            let netcdf3::DataVector::I8(got) = reader.read_record(VAR_NAME, record).unwrap() else {
+                panic!("UInt8 frames are written as NC_BYTE");
+            };
+            let NDDataBuffer::U8(want) = &expected.data else {
+                unreachable!();
+            };
+            assert_eq!(got.len(), want.len(), "record {record} length");
+            assert!(
+                got.iter().zip(want).all(|(g, w)| *g as u8 == *w),
+                "record {record} data"
+            );
+        }
+        drop(reader);
+        std::fs::remove_file(&path).ok();
     }
 }

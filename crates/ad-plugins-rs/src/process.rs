@@ -583,8 +583,18 @@ impl ProcessState {
     /// same steps itself so it can hold the state lock for `begin_frame`,
     /// `run_filter` and `end_frame` only.
     pub fn process(&mut self, pool: &NDArrayPool, src: &NDArray) -> ADResult<Option<Arc<NDArray>>> {
+        let frame = self.begin_frame(src.data.len());
+        if !frame.any_process() {
+            // C still runs `endProcessCallbacks` on this path (it reaches
+            // `doCallbacks` with `doCallbacks` still 1), so the output is
+            // cached as pArrays[0] like any other frame. The arming half of
+            // `end_frame` cannot fire here: `auto_offset_scale_now` is part of
+            // `any_process`.
+            let arr = Arc::new(frame.pass_through(pool, src)?);
+            self.end_frame(&frame, src, &arr);
+            return Ok(Some(arr));
+        }
         let mut values = elements_as_f64(src);
-        let frame = self.begin_frame(values.len());
         frame.apply_element_ops(&mut values);
         if !self.run_filter(&frame, &mut values) {
             return Ok(None);
@@ -856,6 +866,32 @@ struct ProcessFrame {
 }
 
 impl ProcessFrame {
+    /// C's `anyProcess` (NDPluginProcess.cpp:132-138): does any stage actually
+    /// touch a value this frame? A correction buffer counts only when it is
+    /// both enabled AND valid for this frame, and `auto_offset_scale_now`
+    /// counts because the trigger frame still has to be measured.
+    ///
+    /// When this is false the frame's output is the input converted to the
+    /// output data type -- no f64 round-trip, no element pass, no filter.
+    fn any_process(&self) -> bool {
+        (self.config.enable_background && self.config.valid_background)
+            || (self.config.enable_flat_field && self.config.valid_flat_field)
+            || self.config.enable_offset_scale
+            || self.auto_offset_scale_now
+            || self.config.enable_high_clip
+            || self.config.enable_low_clip
+            || self.config.enable_filter
+    }
+
+    /// The `!anyProcess` output (NDPluginProcess.cpp:140-144): C converts the
+    /// INPUT array -- not an f64 scratch copy -- straight to the output data
+    /// type and jumps to the callbacks. Same-type output is then a buffer copy
+    /// of the input, which is what `convert_type` does through `alloc_copy`.
+    fn pass_through(&self, pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
+        let out_type = self.config.output_type.unwrap_or(src.data.data_type());
+        pool.convert_type(src, out_type)
+    }
+
     /// Stages 1-4, the element-wise pass. Reads only this snapshot, so it runs
     /// with the state lock released -- which is the whole point of taking the
     /// snapshot, since this is the frame-sized loop.
@@ -1016,23 +1052,18 @@ impl NDPluginProcess for ProcessProcessor {
         // to post the readbacks. Drive `ProcessState`'s steps here rather than
         // calling `process`, so the two frame-sized loops -- the element-wise
         // pass and the output conversion -- run with the lock down.
-        let mut values = self.scratch.lock();
-        array.data.copy_to_f64(&mut values);
-        let frame = self.state.lock().begin_frame(values.len());
-        frame.apply_element_ops(&mut values);
+        let frame = self.state.lock().begin_frame(array.data.len());
 
-        let (emitted, num_filtered) = {
-            let mut state = self.state.lock();
-            let emitted = state.run_filter(&frame, &mut values);
-            (emitted, state.num_filtered)
-        };
-
-        let out = if emitted {
-            match frame.build_output(pool, array, &values) {
+        // No stage is on: convert the INPUT to the output type and emit, as C
+        // does at NDPluginProcess.cpp:140-144. The f64 round-trip below is the
+        // whole cost of a pass-through frame, and none of it is observable.
+        let (out, num_filtered) = if !frame.any_process() {
+            match frame.pass_through(pool, array) {
                 Ok(arr) => {
                     let arr = Arc::new(arr);
-                    self.state.lock().end_frame(&frame, array, &arr);
-                    Some(arr)
+                    let mut state = self.state.lock();
+                    state.end_frame(&frame, array, &arr);
+                    (Some(arr), state.num_filtered)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "process output allocation failed; dropping frame");
@@ -1040,7 +1071,32 @@ impl NDPluginProcess for ProcessProcessor {
                 }
             }
         } else {
-            None
+            let mut values = self.scratch.lock();
+            array.data.copy_to_f64(&mut values);
+            frame.apply_element_ops(&mut values);
+
+            let (emitted, num_filtered) = {
+                let mut state = self.state.lock();
+                let emitted = state.run_filter(&frame, &mut values);
+                (emitted, state.num_filtered)
+            };
+
+            let out = if emitted {
+                match frame.build_output(pool, array, &values) {
+                    Ok(arr) => {
+                        let arr = Arc::new(arr);
+                        self.state.lock().end_frame(&frame, array, &arr);
+                        Some(arr)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "process output allocation failed; dropping frame");
+                        return ProcessResult::empty();
+                    }
+                }
+            } else {
+                None
+            };
+            (out, num_filtered)
         };
 
         // A suppressed frame (filter_callbacks) produces no output array but
@@ -2343,5 +2399,176 @@ mod tests {
         assert_eq!(v, &[4.0, 5.0, 6.0]);
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");
         assert_eq!(pool.num_alloc_buffers(), 1);
+    }
+
+    // --- Pass-through (C `anyProcess`) ---
+
+    /// One case per term of C's `anyProcess` (NDPluginProcess.cpp:132-138),
+    /// including both sides of the enabled-AND-valid boundary on the two
+    /// correction buffers.
+    #[test]
+    fn any_process_is_false_only_when_every_stage_is_off() {
+        let frame = |state: &mut ProcessState| state.begin_frame(3).any_process();
+
+        let mut off = ProcessState::new(ProcessConfig::default());
+        assert!(!frame(&mut off), "every stage off");
+
+        // Background: enabled and valid, enabled with no buffer, enabled with
+        // a buffer of the wrong length.
+        let mut bg = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            ..Default::default()
+        });
+        seed_background(&mut bg, &make_array(&[1, 2, 3]));
+        assert!(frame(&mut bg), "background enabled and valid");
+
+        let mut bg_none = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            ..Default::default()
+        });
+        assert!(!frame(&mut bg_none), "background enabled, never saved");
+
+        let mut bg_short = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            ..Default::default()
+        });
+        seed_background(&mut bg_short, &make_array(&[1, 2]));
+        assert!(!frame(&mut bg_short), "background enabled, wrong length");
+
+        // Flat field: the same two sides.
+        let mut ff = ProcessState::new(ProcessConfig {
+            enable_flat_field: true,
+            ..Default::default()
+        });
+        seed_flat_field(&mut ff, &make_array(&[1, 2, 3]));
+        assert!(frame(&mut ff), "flat field enabled and valid");
+
+        let mut ff_none = ProcessState::new(ProcessConfig {
+            enable_flat_field: true,
+            ..Default::default()
+        });
+        assert!(!frame(&mut ff_none), "flat field enabled, never saved");
+
+        // The five remaining terms each stand alone.
+        for (name, config) in [
+            (
+                "offset/scale",
+                ProcessConfig {
+                    enable_offset_scale: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "auto offset/scale",
+                ProcessConfig {
+                    auto_offset_scale_pending: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "low clip",
+                ProcessConfig {
+                    enable_low_clip: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "high clip",
+                ProcessConfig {
+                    enable_high_clip: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "filter",
+                ProcessConfig {
+                    enable_filter: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut state = ProcessState::new(config);
+            assert!(frame(&mut state), "{name} alone must process");
+        }
+    }
+
+    /// The pass-through frame is the input, converted to the output type, with
+    /// its identity intact -- C converts `pArray` itself
+    /// (NDPluginProcess.cpp:142) and `NDArrayPool::convert` carries uniqueId
+    /// and both stamps (NDArrayPool.cpp:658-660).
+    #[test]
+    fn pass_through_emits_the_input_unchanged() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut input = make_array(&[10, 20, 30]);
+        input.unique_id = 42;
+        input.time_stamp = 1.5;
+
+        let proc = ProcessProcessor::new(ProcessConfig::default());
+        let out = proc.process_array(&Arc::new(input), &pool);
+        assert_eq!(out.output_arrays.len(), 1);
+        let arr = &out.output_arrays[0];
+        let NDDataBuffer::U8(v) = &arr.data else {
+            panic!("expected the input's UInt8 type");
+        };
+        assert_eq!(v, &[10, 20, 30]);
+        assert_eq!(arr.unique_id, 42);
+        assert_eq!(arr.time_stamp, 1.5);
+
+        // With an output type set, the pass-through still converts.
+        let proc = ProcessProcessor::new(ProcessConfig {
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+        let out = proc.process_array(&Arc::new(make_array(&[10, 20, 30])), &pool);
+        let NDDataBuffer::F64(v) = &out.output_arrays[0].data else {
+            panic!("expected Float64 output");
+        };
+        assert_eq!(v, &[10.0, 20.0, 30.0]);
+    }
+
+    /// C reaches `doCallbacks` with `doCallbacks` still 1 on the `!anyProcess`
+    /// path, so the readbacks and `pArrays[0]` are published exactly as on a
+    /// processed frame (NDPluginProcess.cpp:253-262).
+    #[test]
+    fn pass_through_still_posts_the_readbacks_and_caches_the_output() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let mut proc = ProcessProcessor::new(ProcessConfig {
+            // Enabled but never saved: invalid, so the frame passes through and
+            // ValidBackground must read back 0.
+            enable_background: true,
+            ..Default::default()
+        });
+        let mut base = PortDriverBase::new("R132", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+
+        let pool = NDArrayPool::new(1_000_000);
+        proc.state.lock().reset_filter();
+        let out = proc.process_array(&Arc::new(make_array(&[7, 8, 9])), &pool);
+
+        let int_update = |r: usize| {
+            out.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: ur, value, ..
+                } if *ur == r => Some(*value),
+                _ => None,
+            })
+        };
+        assert_eq!(int_update(proc.params.valid_background.unwrap()), Some(0));
+        assert_eq!(int_update(proc.params.valid_flat_field.unwrap()), Some(0));
+        assert_eq!(int_update(proc.params.num_filtered.unwrap()), Some(0));
+        assert_eq!(int_update(proc.params.reset_filter.unwrap()), Some(0));
+        assert!(
+            !proc.state.lock().reset_filter_pending,
+            "the one-shot reset is consumed on the pass-through path too"
+        );
+
+        // pArrays[0]: SaveBackground works off the emitted frame.
+        proc.state.lock().save_background();
+        assert_eq!(
+            proc.state.lock().background.as_ref().unwrap().as_slice(),
+            &[7.0, 8.0, 9.0]
+        );
     }
 }

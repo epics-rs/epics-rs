@@ -37,7 +37,6 @@ dependencies = [
  "jpeg-decoder",
  "jpeg-encoder",
  "lz4_flex",
- "netcdf3",
  "parking_lot",
  "rayon",
  "rust-hdf5",
@@ -2407,16 +2406,6 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
-]
-
-[[package]]
-name = "netcdf3"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b3a6a97b0a402ab751b89c4536a9ba3e36264a29d1b66db44466b2ab6524bb5"
-dependencies = [
- "byteorder",
- "nom",
 ]
 
 [[package]]

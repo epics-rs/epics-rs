@@ -22,7 +22,6 @@ jpeg-encoder = "0.6"
 jpeg-decoder = "0.3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-netcdf3 = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff"] }
 rayon = { version = "1", optional = true }
 # The SIMD level is chosen at run time (`Level::new` + `dispatch!`), which is

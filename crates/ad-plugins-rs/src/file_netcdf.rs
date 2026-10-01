@@ -42,12 +42,6 @@ const DIM_WITHOUT_VARIABLE: &str = "This is a netCDF dimension but not a netCDF 
 /// `MAX_ATTRIBUTE_STRING_SIZE` (netCDF-3 spelled the same limit as the
 /// `attrStringSize` dimension).
 const ATTR_STRING_SIZE: usize = 256;
-/// `strlen("DIMENSION_SCALE") + 1`, the width `H5DSis_scale` requires of a
-/// dimension scale's `CLASS` attribute (hl/src/H5DS.c:2296 `string_size != 16`).
-const CLASS_ATTR_SIZE: usize = 16;
-/// `strlen(DIM_WITHOUT_VARIABLE) + 10 + 1`: the text, the length right-aligned
-/// in ten columns, and C's extra null terminator (H5LT.c:3358).
-const DIM_NAME_ATTR_SIZE: usize = DIM_WITHOUT_VARIABLE.len() + 10 + 1;
 /// Records the exact `NDDataType` ordinal on `array_data`, so read-back does
 /// not have to infer the type from the HDF5 element width. netCDF-4 has the
 /// full signed/unsigned set, so this only disambiguates what the file already
@@ -184,45 +178,25 @@ fn map_h5(e: rust_hdf5::Hdf5Error) -> ADError {
     ADError::UnsupportedConversion(format!("netCDF-4 write error: {e}"))
 }
 
-/// Create one dimension scale: a rank-1 dataset of `len` carrying the two
-/// attributes `H5DSset_scale` writes.
-///
-/// A netCDF dimension that has no coordinate variable is exactly this — a
-/// scale dataset whose values are never written, identified by the `NAME`
-/// text. The reciprocal link, the `DIMENSION_LIST` attribute that names these
-/// scales from `array_data`, is a variable-length array of object references;
-/// rust-hdf5 0.6 writes object references but not a variable-length array of
-/// them, so a netCDF reader sees these dimensions by name and the data
-/// variable's own axes as anonymous.
-fn create_dim_scale(file: &H5File, name: &str, len: usize, extensible: bool) -> ADResult<()> {
+/// Create one dimension scale: a rank-1 dataset of `len` whose values are
+/// never written, which is what a netCDF dimension with no coordinate variable
+/// is. `set_scale` writes the `CLASS`/`NAME` pair in the fixed-length form
+/// `H5DSis_scale` requires, and the returned handle is what the data variables
+/// attach to.
+fn create_dim_scale(
+    file: &H5File,
+    name: &str,
+    len: usize,
+    extensible: bool,
+) -> ADResult<H5Dataset> {
     let mut builder = file.new_dataset::<f32>().shape(&[len][..]);
     if extensible {
         builder = builder.chunk(&[len.max(1)]).max_shape(&[None]);
     }
     let ds = builder.create(name).map_err(map_h5)?;
-    // Both attributes are fixed-length and null-terminated because that is the
-    // only shape `H5DSis_scale` accepts: it refuses a `CLASS` whose datatype is
-    // not a NULLTERM string of exactly 16 bytes (hl/src/H5DS.c:2285-2300), and
-    // the variable-length branch beside it exists only from libhdf5 2.2.0
-    // (commit 853451a3a7e). A vlen `CLASS` therefore makes the scale invisible
-    // to every deployed libhdf5, netcdf-c included.
-    set_fixed_str_attr::<CLASS_ATTR_SIZE>(&ds, "CLASS", "DIMENSION_SCALE")?;
-    set_fixed_str_attr::<DIM_NAME_ATTR_SIZE>(
-        &ds,
-        "NAME",
-        &format!("{DIM_WITHOUT_VARIABLE}{len:10}"),
-    )?;
-    Ok(())
-}
-
-/// Write a fixed-length null-terminated string attribute on a dataset, the
-/// `H5LT_set_attribute_string` shape.
-fn set_fixed_str_attr<const N: usize>(ds: &H5Dataset, name: &str, value: &str) -> ADResult<()> {
-    ds.new_attr::<FixedStr<N>>()
-        .shape(())
-        .create(name)
-        .and_then(|a| a.write_numeric(&FixedStr::<N>::new(value)))
-        .map_err(map_h5)
+    ds.set_scale(Some(&format!("{DIM_WITHOUT_VARIABLE}{len:10}")))
+        .map_err(map_h5)?;
+    Ok(ds)
 }
 
 /// Create a `[frames]` dataset and fill it with one value per frame.
@@ -231,7 +205,7 @@ fn write_per_frame<T: rust_hdf5::types::H5Type + Copy>(
     name: &str,
     values: &[T],
     extensible: bool,
-) -> ADResult<()> {
+) -> ADResult<H5Dataset> {
     let mut builder = file.new_dataset::<T>().shape(&[values.len()][..]);
     // HDF5 only extends a chunked dataset, so an unlimited maximum extent
     // comes with a chunk shape.
@@ -239,7 +213,8 @@ fn write_per_frame<T: rust_hdf5::types::H5Type + Copy>(
         builder = builder.chunk(&[values.len().max(1)]).max_shape(&[None]);
     }
     let ds = builder.create(name).map_err(map_h5)?;
-    ds.write_raw(values).map_err(map_h5)
+    ds.write_raw(values).map_err(map_h5)?;
+    Ok(ds)
 }
 
 /// Create `array_data` with the leading frame axis and write every frame into
@@ -251,7 +226,7 @@ fn write_per_frame<T: rust_hdf5::types::H5Type + Copy>(
 /// (:123-132). Both hold here: the HDF5 dataspace is
 /// `[frames, dim[n-1], … dim[0]]`, chunked one frame deep so each frame is one
 /// chunk write.
-fn write_array_data(file: &H5File, frames: &[FrameData], extensible: bool) -> ADResult<()> {
+fn write_array_data(file: &H5File, frames: &[FrameData], extensible: bool) -> ADResult<H5Dataset> {
     let first = &frames[0];
     let dims = &first.frame.dims;
     let mut shape = vec![frames.len()];
@@ -287,7 +262,7 @@ fn write_array_data(file: &H5File, frames: &[FrameData], extensible: bool) -> AD
                 starts[0] = i;
                 ds.write_slice::<$t>(&starts, &counts, v).map_err(map_h5)?;
             }
-            Ok(())
+            Ok(ds)
         }};
     }
 
@@ -317,11 +292,11 @@ fn write_attr_dataset(
     name: &str,
     values: &[NDAttrValue],
     extensible: bool,
-) -> ADResult<()> {
+) -> ADResult<Option<H5Dataset>> {
     macro_rules! numeric {
         ($t:ty, $get:expr) => {{
             let column: Vec<$t> = values.iter().map($get).collect();
-            write_per_frame(file, name, &column, extensible)
+            write_per_frame(file, name, &column, extensible).map(Some)
         }};
     }
 
@@ -343,12 +318,12 @@ fn write_attr_dataset(
                 .iter()
                 .map(|v| FixedStr::new(&v.as_string()))
                 .collect();
-            write_per_frame(file, name, &column, extensible)
+            write_per_frame(file, name, &column, extensible).map(Some)
         }
         // C skips an undefined attribute rather than defining a variable for
         // it (NDFileNetCDF.cpp:254-258 leaves `dataTypeString` "Undefined"
         // and :312 defines nothing).
-        NDAttrValue::Undefined => Ok(()),
+        NDAttrValue::Undefined => Ok(None),
     }
 }
 
@@ -474,9 +449,15 @@ impl NDFileWriter for NetcdfWriter {
             // numArrays first, then the array dimensions reversed: netCDF's
             // first dimension varies slowest, the opposite of the NDArray
             // convention (:123-132).
-            create_dim_scale(&file, DIM_UNLIMITED, frames.len(), extensible)?;
+            let frame_scale = create_dim_scale(&file, DIM_UNLIMITED, frames.len(), extensible)?;
+            let mut dim_scales = Vec::with_capacity(ndims);
             for i in 0..ndims {
-                create_dim_scale(&file, &format!("dim{i}"), dims[ndims - 1 - i].size, false)?;
+                dim_scales.push(create_dim_scale(
+                    &file,
+                    &format!("dim{i}"),
+                    dims[ndims - 1 - i].size,
+                    false,
+                )?);
             }
 
             // --- Per-array metadata and the data (C :183-204) ---------------
@@ -490,11 +471,24 @@ impl NDFileWriter for NetcdfWriter {
                 .iter()
                 .map(|f| f.frame.timestamp.nsec as i32)
                 .collect();
-            write_per_frame(&file, "uniqueId", &unique_ids, extensible)?;
-            write_per_frame(&file, "timeStamp", &time_stamps, extensible)?;
-            write_per_frame(&file, "epicsTSSec", &secs, extensible)?;
-            write_per_frame(&file, "epicsTSNsec", &nsecs, extensible)?;
-            write_array_data(&file, frames, extensible)?;
+            // Every variable's leading axis is the frame dimension, and
+            // `array_data` carries the array dimensions after it: a netCDF
+            // variable's dimensions are the dimension scales attached to its
+            // axes, and an unattached axis is read as an anonymous
+            // `phony_dim_N` instead of as `numArrays`.
+            for ds in [
+                write_per_frame(&file, "uniqueId", &unique_ids, extensible)?,
+                write_per_frame(&file, "timeStamp", &time_stamps, extensible)?,
+                write_per_frame(&file, "epicsTSSec", &secs, extensible)?,
+                write_per_frame(&file, "epicsTSNsec", &nsecs, extensible)?,
+            ] {
+                ds.attach_scale(0, &frame_scale).map_err(map_h5)?;
+            }
+            let data = write_array_data(&file, frames, extensible)?;
+            data.attach_scale(0, &frame_scale).map_err(map_h5)?;
+            for (axis, scale) in dim_scales.iter().enumerate() {
+                data.attach_scale(axis + 1, scale).map_err(map_h5)?;
+            }
 
             // --- Per-attribute datasets (C :312-321) ------------------------
             // Every frame's `attrs` is a snapshot of the same sticky list,
@@ -512,7 +506,11 @@ impl NDFileWriter for NetcdfWriter {
                             .map_or(NDAttrValue::Undefined, |a| a.value.clone())
                     })
                     .collect();
-                write_attr_dataset(&file, &format!("Attr_{}", attr.name), &column, extensible)?;
+                if let Some(ds) =
+                    write_attr_dataset(&file, &format!("Attr_{}", attr.name), &column, extensible)?
+                {
+                    ds.attach_scale(0, &frame_scale).map_err(map_h5)?;
+                }
             }
 
             // Not left to `Drop`: closing writes the superblock and the root
@@ -1187,6 +1185,25 @@ mod tests {
                 "uniqueId",
             ]
         );
+        // Every variable names its dimensions through DIMENSION_LIST: without
+        // the attachment a netCDF reader invents an anonymous `phony_dim_N` for
+        // the axis instead of reading `numArrays`.
+        for name in [
+            "array_data",
+            "uniqueId",
+            "timeStamp",
+            "epicsTSSec",
+            "epicsTSNsec",
+        ] {
+            assert!(
+                file.dataset(name)
+                    .unwrap()
+                    .attr_names()
+                    .unwrap()
+                    .contains(&"DIMENSION_LIST".to_string()),
+                "{name} DIMENSION_LIST"
+            );
+        }
         for (name, len) in [("numArrays", 1), ("dim0", 2), ("dim1", 4)] {
             let ds = file.dataset(name).unwrap();
             assert_eq!(ds.shape(), vec![len], "{name} length");
@@ -1198,19 +1215,24 @@ mod tests {
             );
             assert_eq!(
                 class.datatype().unwrap(),
-                DatatypeMessage::fixed_string(CLASS_ATTR_SIZE as u32),
+                DatatypeMessage::fixed_string(16),
                 "{name} CLASS datatype"
             );
             let label = ds.attr("NAME").unwrap();
-            assert_eq!(
-                label.read_string().unwrap(),
-                format!("{DIM_WITHOUT_VARIABLE}{len:10}"),
-                "{name} NAME"
-            );
+            let text = format!("{DIM_WITHOUT_VARIABLE}{len:10}");
+            assert_eq!(label.read_string().unwrap(), text, "{name} NAME");
             assert_eq!(
                 label.datatype().unwrap(),
-                DatatypeMessage::fixed_string(DIM_NAME_ATTR_SIZE as u32),
+                DatatypeMessage::fixed_string(text.len() as u32 + 1),
                 "{name} NAME datatype"
+            );
+            // The scale is on the receiving end of an attachment, so it carries
+            // the reciprocal REFERENCE_LIST.
+            assert!(
+                ds.attr_names()
+                    .unwrap()
+                    .contains(&"REFERENCE_LIST".to_string()),
+                "{name} REFERENCE_LIST"
             );
         }
         drop(file);

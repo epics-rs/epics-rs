@@ -469,6 +469,7 @@ pub fn convert_dims(
     let mut data = NDDataBuffer::zeros(target_type, 0);
     convert_dims_into(src, dims_out, &mut data)?;
     let mut arr = NDArray::with_data(out_dims, data);
+    arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
     arr.attributes.copy_from(&src.attributes);
@@ -686,6 +687,33 @@ mod tests {
         assert_eq!(<f64 as CCast<u64>>::c_cast(-1.0), u64::MAX);
         assert_eq!(<f64 as CCast<u16>>::c_cast(f64::NAN), 0);
         assert_eq!(<f32 as CCast<i32>>::c_cast(f32::INFINITY), -1);
+    }
+
+    /// Both free-function converts carry the source `uniqueId`, as C++
+    /// `NDArrayPool::convert` does (NDArrayPool.cpp:660).
+    #[test]
+    fn both_converts_carry_the_source_unique_id() {
+        use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+        let mut src = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            NDDataBuffer::U8(vec![1, 2, 3, 4]),
+        );
+        src.unique_id = 91;
+
+        assert_eq!(
+            super::convert_type(&src, NDDataType::Float64)
+                .unwrap()
+                .unique_id,
+            91
+        );
+        let mut d = NDDimension::new(2);
+        d.offset = 1;
+        assert_eq!(
+            super::convert_dims(&src, &[d], NDDataType::UInt8)
+                .unwrap()
+                .unique_id,
+            91
+        );
     }
 
     #[test]

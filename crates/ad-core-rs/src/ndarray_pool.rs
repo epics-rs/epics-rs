@@ -435,6 +435,7 @@ impl NDArrayPool {
         // allocated_bytes / num_alloc_buffers.
         let mut out = self.alloc(src.dims.clone(), target_type)?;
         crate::color::convert_data_type_into(src, &mut out.data)?;
+        out.unique_id = src.unique_id;
         out.time_stamp = src.time_stamp;
         out.timestamp = src.timestamp;
         out.attributes.copy_from(&src.attributes);
@@ -458,6 +459,7 @@ impl NDArrayPool {
         let out_dims = crate::convert::output_dims(src, dims_out)?;
         let mut arr = self.alloc(out_dims, target_type)?;
         crate::convert::convert_dims_into(src, dims_out, &mut arr.data)?;
+        arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.time_stamp = src.time_stamp;
         arr.attributes.copy_from(&src.attributes);
@@ -1805,5 +1807,31 @@ mod tests {
 
         // A payload that is not whole elements is refused, not truncated.
         assert!(pool.alloc_sized(dims, NDDataType::UInt16, 7).is_err());
+    }
+
+    /// C++ `NDArrayPool::convert` copies `uniqueId` along with both stamps
+    /// (NDArrayPool.cpp:658-660), on every one of its paths. One case per
+    /// branch that decides where the output buffer comes from.
+    #[test]
+    fn convert_carries_the_source_unique_id() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = pool
+            .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
+            .unwrap();
+        src.unique_id = 77;
+
+        // Same type: the alloc_copy branch.
+        let same = pool.convert_type(&src, NDDataType::UInt8).unwrap();
+        assert_eq!(same.unique_id, 77);
+
+        // Differing type: the convert_data_type_into branch.
+        let widened = pool.convert_type(&src, NDDataType::Float64).unwrap();
+        assert_eq!(widened.unique_id, 77);
+
+        // Dimension-changing convert.
+        let mut d = NDDimension::new(2);
+        d.offset = 1;
+        let cropped = pool.convert(&src, &[d], NDDataType::UInt8).unwrap();
+        assert_eq!(cropped.unique_id, 77);
     }
 }

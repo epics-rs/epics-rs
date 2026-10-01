@@ -321,7 +321,6 @@ pub fn extract_roi_3d(pool: &NDArrayPool, src: &NDArray, config: &ROIConfig) -> 
         };
     }
 
-    arr.unique_id = src.unique_id;
     // A single selected color plane is mono (C NDPluginROI.cpp:185/192/199
     // overrides the ColorMode attribute on the collapsed output).
     if single_color {
@@ -415,7 +414,6 @@ pub fn extract_roi_2d(pool: &NDArrayPool, src: &NDArray, config: &ROIConfig) -> 
         };
     }
 
-    arr.unique_id = src.unique_id;
     Some(arr)
 }
 

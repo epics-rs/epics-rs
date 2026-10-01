@@ -42,6 +42,12 @@ const DIM_WITHOUT_VARIABLE: &str = "This is a netCDF dimension but not a netCDF 
 /// `MAX_ATTRIBUTE_STRING_SIZE` (netCDF-3 spelled the same limit as the
 /// `attrStringSize` dimension).
 const ATTR_STRING_SIZE: usize = 256;
+/// `strlen("DIMENSION_SCALE") + 1`, the width `H5DSis_scale` requires of a
+/// dimension scale's `CLASS` attribute (hl/src/H5DS.c:2296 `string_size != 16`).
+const CLASS_ATTR_SIZE: usize = 16;
+/// `strlen(DIM_WITHOUT_VARIABLE) + 10 + 1`: the text, the length right-aligned
+/// in ten columns, and C's extra null terminator (H5LT.c:3358).
+const DIM_NAME_ATTR_SIZE: usize = DIM_WITHOUT_VARIABLE.len() + 10 + 1;
 /// Records the exact `NDDataType` ordinal on `array_data`, so read-back does
 /// not have to infer the type from the HDF5 element width. netCDF-4 has the
 /// full signed/unsigned set, so this only disambiguates what the file already
@@ -70,36 +76,39 @@ struct FrameData {
     attrs: Vec<AttrData>,
 }
 
-/// Element marker for a fixed-length HDF5 string.
+/// A fixed-length, null-terminated ASCII string of `N` bytes — libhdf5's
+/// `H5Tcopy(H5T_C_S1)` + `H5Tset_size(N)` + `H5Tset_strpad(H5T_STR_NULLTERM)`,
+/// which is what `H5LT_set_attribute_string` builds (H5LT.c:3355-3363) and the
+/// only string shape the dimension-scale API accepts.
 ///
-/// A string-valued NDAttribute was a 2-D NC_CHAR variable `[numArrays,
-/// attrStringSize]` in netCDF-3. The netCDF-4 equivalent of that char array is
-/// a rank-1 dataset whose element datatype is `H5T_C_S1` sized to
-/// `ATTR_STRING_SIZE` (null-terminated), which is what a fixed-length string
-/// `H5Type` makes the dataset builder emit.
+/// Both users need exactly this and not a variable-length string: a
+/// string-valued NDAttribute was a 2-D NC_CHAR variable `[numArrays,
+/// attrStringSize]` in netCDF-3, whose netCDF-4 equivalent is a rank-1 dataset
+/// of `H5T_C_S1` sized to `ATTR_STRING_SIZE`; and `H5DSis_scale` reads a
+/// scale's `CLASS` with a fixed-size expectation (see `create_dim_scale`).
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-struct AttrStr([u8; ATTR_STRING_SIZE]);
+struct FixedStr<const N: usize>([u8; N]);
 
-impl AttrStr {
+impl<const N: usize> FixedStr<N> {
     /// Truncate to the field width, keeping room for the terminator, as C's
     /// `strncpy` into a `MAX_ATTRIBUTE_STRING_SIZE` field does.
     fn new(s: &str) -> Self {
-        let mut bytes = [0u8; ATTR_STRING_SIZE];
+        let mut bytes = [0u8; N];
         let src = s.as_bytes();
-        let n = src.len().min(ATTR_STRING_SIZE - 1);
+        let n = src.len().min(N - 1);
         bytes[..n].copy_from_slice(&src[..n]);
         Self(bytes)
     }
 }
 
-impl rust_hdf5::types::H5Type for AttrStr {
+impl<const N: usize> rust_hdf5::types::H5Type for FixedStr<N> {
     fn hdf5_type() -> DatatypeMessage {
-        DatatypeMessage::fixed_string(ATTR_STRING_SIZE as u32)
+        DatatypeMessage::fixed_string(N as u32)
     }
 
     fn element_size() -> usize {
-        ATTR_STRING_SIZE
+        N
     }
 }
 
@@ -191,18 +200,28 @@ fn create_dim_scale(file: &H5File, name: &str, len: usize, extensible: bool) -> 
         builder = builder.chunk(&[len.max(1)]).max_shape(&[None]);
     }
     let ds = builder.create(name).map_err(map_h5)?;
-    set_str_attr(&ds, "CLASS", "DIMENSION_SCALE")?;
-    set_str_attr(&ds, "NAME", &format!("{DIM_WITHOUT_VARIABLE}{len:10}"))?;
+    // Both attributes are fixed-length and null-terminated because that is the
+    // only shape `H5DSis_scale` accepts: it refuses a `CLASS` whose datatype is
+    // not a NULLTERM string of exactly 16 bytes (hl/src/H5DS.c:2285-2300), and
+    // the variable-length branch beside it exists only from libhdf5 2.2.0
+    // (commit 853451a3a7e). A vlen `CLASS` therefore makes the scale invisible
+    // to every deployed libhdf5, netcdf-c included.
+    set_fixed_str_attr::<CLASS_ATTR_SIZE>(&ds, "CLASS", "DIMENSION_SCALE")?;
+    set_fixed_str_attr::<DIM_NAME_ATTR_SIZE>(
+        &ds,
+        "NAME",
+        &format!("{DIM_WITHOUT_VARIABLE}{len:10}"),
+    )?;
     Ok(())
 }
 
-/// Write a fixed-length string attribute on a dataset.
-fn set_str_attr(ds: &H5Dataset, name: &str, value: &str) -> ADResult<()> {
-    let text = rust_hdf5::types::VarLenUnicode(value.to_string());
-    ds.new_attr::<rust_hdf5::types::VarLenUnicode>()
+/// Write a fixed-length null-terminated string attribute on a dataset, the
+/// `H5LT_set_attribute_string` shape.
+fn set_fixed_str_attr<const N: usize>(ds: &H5Dataset, name: &str, value: &str) -> ADResult<()> {
+    ds.new_attr::<FixedStr<N>>()
         .shape(())
         .create(name)
-        .and_then(|a| a.write_scalar(&text))
+        .and_then(|a| a.write_numeric(&FixedStr::<N>::new(value)))
         .map_err(map_h5)
 }
 
@@ -320,9 +339,9 @@ fn write_attr_dataset(
         NDAttrValue::Float32(_) => numeric!(f32, |v| as_f(v) as f32),
         NDAttrValue::Float64(_) => numeric!(f64, as_f),
         NDAttrValue::String(_) => {
-            let column: Vec<AttrStr> = values
+            let column: Vec<FixedStr<ATTR_STRING_SIZE>> = values
                 .iter()
-                .map(|v| AttrStr::new(&v.as_string()))
+                .map(|v| FixedStr::new(&v.as_string()))
                 .collect();
             write_per_frame(file, name, &column, extensible)
         }
@@ -1143,6 +1162,11 @@ mod tests {
     /// per array dimension, reversed as the dataspace is. The scales are
     /// dimensions without coordinate variables, which is what the `NAME` text
     /// records.
+    ///
+    /// `CLASS` and `NAME` are fixed-length null-terminated strings, and the
+    /// widths are not free: `H5DSis_scale` reports "not a dimension scale" for
+    /// a `CLASS` that is variable-length or not exactly 16 bytes on every
+    /// libhdf5 before 2.2.0 (hl/src/H5DS.c:2285-2300).
     #[test]
     fn every_dimension_gets_a_named_scale() {
         let path = write_frames("nc_dims", NDFileMode::Single, &[make_u8(&[4, 2], |_| 0)]);
@@ -1166,15 +1190,27 @@ mod tests {
         for (name, len) in [("numArrays", 1), ("dim0", 2), ("dim1", 4)] {
             let ds = file.dataset(name).unwrap();
             assert_eq!(ds.shape(), vec![len], "{name} length");
+            let class = ds.attr("CLASS").unwrap();
             assert_eq!(
-                ds.attr("CLASS").unwrap().read_string().unwrap(),
+                class.read_string().unwrap(),
                 "DIMENSION_SCALE",
                 "{name} CLASS"
             );
             assert_eq!(
-                ds.attr("NAME").unwrap().read_string().unwrap(),
+                class.datatype().unwrap(),
+                DatatypeMessage::fixed_string(CLASS_ATTR_SIZE as u32),
+                "{name} CLASS datatype"
+            );
+            let label = ds.attr("NAME").unwrap();
+            assert_eq!(
+                label.read_string().unwrap(),
                 format!("{DIM_WITHOUT_VARIABLE}{len:10}"),
                 "{name} NAME"
+            );
+            assert_eq!(
+                label.datatype().unwrap(),
+                DatatypeMessage::fixed_string(DIM_NAME_ATTR_SIZE as u32),
+                "{name} NAME datatype"
             );
         }
         drop(file);

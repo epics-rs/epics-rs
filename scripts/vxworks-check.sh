@@ -143,10 +143,13 @@ TARGET="x86_64-wrs-vxworks"
 #      `[patch.crates-io] libc` git+rev pin by `scripts/libc-std-patch.sh`
 #      (a clone of the pinned rev, version-relabelled for the toolchain — see
 #      the header). Requires only
-#      `rustup toolchain install nightly --component rust-src`.
+#      `rustup toolchain install nightly --component rust-src`. A DATED stock
+#      nightly (`VXWORKS_TOOLCHAIN=nightly-2026-09-13`) is the same shape and
+#      derives the same way: which nightly it is only moves which of the two
+#      libc reasons above you would have hit, never whether a patch is needed.
 #   2. VXWORKS_TOOLCHAIN names a self-contained prepared toolchain whose
 #      bundled rust-src already carries the fixes. Nothing else to set.
-#   3. VXWORKS_TOOLCHAIN names a stock toolchain (`nightly`) and
+#   3. VXWORKS_TOOLCHAIN names a stock toolchain (`nightly`, bare or dated) and
 #      VXWORKS_CARGO_CONFIG carries a config-level patch pointing at a LOCAL
 #      checkout of a patched libc — the shape for developing the libc fixes
 #      themselves before they are pushed anywhere, and the shape the original
@@ -162,11 +165,21 @@ CARGO_CONFIG="${VXWORKS_CARGO_CONFIG:-}"
 # derivation. An EXPLICIT `VXWORKS_TOOLCHAIN=nightly` without a config is the
 # same shape — a stock nightly with a stock libc cannot go green, so deriving
 # is the only reading of it that measures anything.
+#
+# The test is the `nightly*` GLOB, matching `embedded-image.sh`'s: a stock
+# nightly is bare `nightly` OR a dated `nightly-YYYY-MM-DD`, both of which need
+# the patch, while a prepared toolchain is named something else and falls
+# through to shape 2. An exact `== nightly` here put the two scripts at odds —
+# `embedded-image.sh`'s own default is the dated `nightly-2026-08-30`, so the
+# gate went red on `killpg` for a toolchain the image script derives for, and
+# the red said nothing about the tree. MEASURED on the bring-up box: the gate
+# is green under `VXWORKS_TOOLCHAIN=nightly-2026-09-13` with the derivation the
+# glob restores, and red under the same toolchain without it.
 DERIVED_PATCH=0
 if [[ -z "$TOOLCHAIN" ]]; then
     TOOLCHAIN=nightly
 fi
-if [[ "$TOOLCHAIN" == nightly && -z "$CARGO_CONFIG" ]]; then
+if [[ "$TOOLCHAIN" == nightly* && -z "$CARGO_CONFIG" ]]; then
     DERIVED_PATCH=1
 fi
 

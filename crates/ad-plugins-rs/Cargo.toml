@@ -22,7 +22,6 @@ jpeg-encoder = "0.6"
 jpeg-decoder = "0.3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-netcdf3 = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff"] }
 rayon = { version = "1", optional = true }
 # The SIMD level is chosen at run time (`Level::new` + `dispatch!`), which is
@@ -30,7 +29,7 @@ rayon = { version = "1", optional = true }
 # `Fallback` level makes the same source compile scalar on every other target.
 fearless_simd = { version = "1.0", optional = true }
 fearless_simd_macros = { version = "0.1", optional = true }
-rust-hdf5 = { version = "0.6.0", features = ["threadsafe", "all_filters", "parallel"] }
+rust-hdf5 = { version = "0.6.1", features = ["threadsafe", "all_filters", "parallel"] }
 epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
 

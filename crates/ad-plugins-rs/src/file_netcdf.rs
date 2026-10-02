@@ -12,17 +12,43 @@ use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
 
-use netcdf3::{DataSet, FileReader, FileWriter, Version};
 use parking_lot::Mutex;
+use rust_hdf5::format::messages::datatype::DatatypeMessage;
+use rust_hdf5::{H5Dataset, H5File};
 
 const VAR_NAME: &str = "array_data";
+/// The frame axis. netCDF-3 named this dimension `numArrays` and made it
+/// NC_UNLIMITED for a multi-array file; here it is the leading axis of every
+/// dataset and the name of its dimension scale.
 const DIM_UNLIMITED: &str = "numArrays";
 /// File-format version written as the NDNetCDFFileVersion global attribute so
 /// readers can gate on format changes (C NDFileNetCDF.h:19 `#define
 /// NDNetCDFFileVersion 3.1`).
 const ND_NETCDF_FILE_VERSION: f64 = 3.1;
+/// Provenance, in the `version=2,<library>=<version>` form libnetcdf writes.
+/// netCDF-4 is an HDF5 container, and this attribute is how a reader learns
+/// which library produced the file.
+const NC_PROPERTIES: &str = concat!(
+    "version=2,ad-plugins-rs=",
+    env!("CARGO_PKG_VERSION"),
+    ",rust-hdf5=0.6"
+);
+/// The `NAME` a dimension scale carries when it is a dimension only and not a
+/// coordinate variable. netcdf-c writes this exact text, the length
+/// right-aligned in ten columns (nc4hdf5.c `dimscale_wo_var`), and reads it
+/// back to tell a pure dimension from a coordinate variable.
+const DIM_WITHOUT_VARIABLE: &str = "This is a netCDF dimension but not a netCDF variable.";
+/// Fixed field width of a string-valued attribute dataset's element, C
+/// `MAX_ATTRIBUTE_STRING_SIZE` (netCDF-3 spelled the same limit as the
+/// `attrStringSize` dimension).
+const ATTR_STRING_SIZE: usize = 256;
+/// Records the exact `NDDataType` ordinal on `array_data`, so read-back does
+/// not have to infer the type from the HDF5 element width. netCDF-4 has the
+/// full signed/unsigned set, so this only disambiguates what the file already
+/// says; the root-level `dataType` global attribute carries the same value for
+/// netCDF readers, which have no per-variable place to look.
+const DTYPE_ATTR: &str = "dataType";
 
-/// Dimension metadata captured from NDArray dimensions.
 /// A single captured NDAttribute, preserving its typed value and metadata.
 struct AttrData {
     name: String,
@@ -42,6 +68,42 @@ struct AttrData {
 struct FrameData {
     frame: Arc<NDArray>,
     attrs: Vec<AttrData>,
+}
+
+/// A fixed-length, null-terminated ASCII string of `N` bytes — libhdf5's
+/// `H5Tcopy(H5T_C_S1)` + `H5Tset_size(N)` + `H5Tset_strpad(H5T_STR_NULLTERM)`,
+/// which is what `H5LT_set_attribute_string` builds (H5LT.c:3355-3363) and the
+/// only string shape the dimension-scale API accepts.
+///
+/// Both users need exactly this and not a variable-length string: a
+/// string-valued NDAttribute was a 2-D NC_CHAR variable `[numArrays,
+/// attrStringSize]` in netCDF-3, whose netCDF-4 equivalent is a rank-1 dataset
+/// of `H5T_C_S1` sized to `ATTR_STRING_SIZE`; and `H5DSis_scale` reads a
+/// scale's `CLASS` with a fixed-size expectation (see `create_dim_scale`).
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct FixedStr<const N: usize>([u8; N]);
+
+impl<const N: usize> FixedStr<N> {
+    /// Truncate to the field width, keeping room for the terminator, as C's
+    /// `strncpy` into a `MAX_ATTRIBUTE_STRING_SIZE` field does.
+    fn new(s: &str) -> Self {
+        let mut bytes = [0u8; N];
+        let src = s.as_bytes();
+        let n = src.len().min(N - 1);
+        bytes[..n].copy_from_slice(&src[..n]);
+        Self(bytes)
+    }
+}
+
+impl<const N: usize> rust_hdf5::types::H5Type for FixedStr<N> {
+    fn hdf5_type() -> DatatypeMessage {
+        DatatypeMessage::fixed_string(N as u32)
+    }
+
+    fn element_size() -> usize {
+        N
+    }
 }
 
 /// Map an `NDAttrSource` to the C++ `sourceTypeString_` label
@@ -75,13 +137,17 @@ fn attr_data_type_string(value: &NDAttrValue) -> &'static str {
     }
 }
 
-/// NetCDF-3 file writer.
+/// netCDF-4 file writer.
 ///
-/// Because `netcdf3::FileWriter` is `!Send` (uses `Rc` internally), we cannot
-/// store it as a field on a `Send + Sync` struct.  Instead we buffer frame data
-/// in memory and materialise the `FileWriter` only inside `close_file()`, where
-/// it is created, used, and dropped within a single method call.  The same
-/// approach is used for `read_file()` with `FileReader`.
+/// netCDF-4 is an HDF5 container, so the file is written through `rust-hdf5`
+/// rather than a netCDF library: `array_data` and the per-array metadata are
+/// HDF5 datasets, the netCDF global attributes are root-group attributes, and
+/// each dimension gets an HDF5 dimension scale.
+///
+/// Frames are buffered and the file is written in `close_file`, as the
+/// netCDF-3 writer had to do. HDF5 can extend a dataset per frame, so this is
+/// no longer forced by the format; changing it would change what
+/// `writes_incrementally` promises and is left alone here.
 pub struct NetcdfWriter {
     current_path: Option<PathBuf>,
     frames: Vec<FrameData>,
@@ -90,7 +156,7 @@ pub struct NetcdfWriter {
     /// for Capture and Stream and withholds it for Single (NDPluginFile.cpp:245,
     /// :281, :335), so it is fixed when the file is opened and cannot be
     /// re-derived later from how many frames happened to arrive: a Capture file
-    /// that captured exactly one frame is still NC_UNLIMITED.
+    /// that captured exactly one frame still has an extensible frame axis.
     open_multiple: bool,
     /// C `pFileAttributes` (NDFileNetCDF.cpp:72, :362): the writer's own
     /// attribute list, sticky for the life of the file.
@@ -108,368 +174,157 @@ impl NetcdfWriter {
     }
 }
 
-/// nc_type of the `array_data` variable, i.e. C's `switch (pArray->dataType)`
-/// (NDFileNetCDF.cpp:154-180).
-///
-/// netCDF-3 has no unsigned types, so C maps *both* Int8 and UInt8 to NC_BYTE
-/// and lets the `dataType` global attribute carry the sign back to the reader
-/// (:92-94). It has no 64-bit integer either, so Int64/UInt64 are cast to
-/// NC_DOUBLE (:171-173).
-///
-/// Beware the netcdf3 crate's spelling: `DataType::I8` is NC_BYTE (nc_type 1),
-/// but `DataType::U8` is NC_CHAR (nc_type 2) — a *text* type. C never stores
-/// image data as NC_CHAR, so `U8` must not appear here.
-fn nc_data_type(dt: NDDataType) -> ADResult<netcdf3::DataType> {
-    match dt {
-        NDDataType::Int8 | NDDataType::UInt8 => Ok(netcdf3::DataType::I8),
-        NDDataType::Int16 | NDDataType::UInt16 => Ok(netcdf3::DataType::I16),
-        NDDataType::Int32 | NDDataType::UInt32 => Ok(netcdf3::DataType::I32),
-        NDDataType::Float32 => Ok(netcdf3::DataType::F32),
-        NDDataType::Float64 => Ok(netcdf3::DataType::F64),
-        NDDataType::Int64 | NDDataType::UInt64 => Ok(netcdf3::DataType::F64),
-    }
+fn map_h5(e: rust_hdf5::Hdf5Error) -> ADError {
+    ADError::UnsupportedConversion(format!("netCDF-4 write error: {e}"))
 }
 
-/// Write a single frame's data to a fixed-dimension variable.
-fn write_var_data(writer: &mut FileWriter, data: &NDDataBuffer) -> ADResult<()> {
-    let err = |e: netcdf3::error::WriteError| {
-        ADError::UnsupportedConversion(format!("NetCDF write error: {:?}", e))
-    };
-    match data {
-        NDDataBuffer::I8(v) => writer.write_var_i8(VAR_NAME, v).map_err(err),
-        // NC_BYTE variable: C `nc_put_vara_uchar` into an NC_BYTE variable is a
-        // straight bit-pattern copy (NDFileNetCDF.cpp:385-388), so values above
-        // 127 land as negative bytes on disk.
-        NDDataBuffer::U8(v) => {
-            let reinterp: Vec<i8> = v.iter().map(|&x| x as i8).collect();
-            writer.write_var_i8(VAR_NAME, &reinterp).map_err(err)
-        }
-        NDDataBuffer::I16(v) => writer.write_var_i16(VAR_NAME, v).map_err(err),
-        NDDataBuffer::U16(v) => {
-            let reinterp: Vec<i16> = v.iter().map(|&x| x as i16).collect();
-            writer.write_var_i16(VAR_NAME, &reinterp).map_err(err)
-        }
-        NDDataBuffer::I32(v) => writer.write_var_i32(VAR_NAME, v).map_err(err),
-        NDDataBuffer::U32(v) => {
-            let reinterp: Vec<i32> = v.iter().map(|&x| x as i32).collect();
-            writer.write_var_i32(VAR_NAME, &reinterp).map_err(err)
-        }
-        NDDataBuffer::F32(v) => writer.write_var_f32(VAR_NAME, v).map_err(err),
-        NDDataBuffer::F64(v) => writer.write_var_f64(VAR_NAME, v).map_err(err),
-        NDDataBuffer::I64(v) => {
-            let reinterp: Vec<f64> = v.iter().map(|&x| x as f64).collect();
-            writer.write_var_f64(VAR_NAME, &reinterp).map_err(err)
-        }
-        NDDataBuffer::U64(v) => {
-            let reinterp: Vec<f64> = v.iter().map(|&x| x as f64).collect();
-            writer.write_var_f64(VAR_NAME, &reinterp).map_err(err)
-        }
+/// Create one dimension scale: a rank-1 dataset of `len` whose values are
+/// never written, which is what a netCDF dimension with no coordinate variable
+/// is. `set_scale` writes the `CLASS`/`NAME` pair in the fixed-length form
+/// `H5DSis_scale` requires, and the returned handle is what the data variables
+/// attach to.
+fn create_dim_scale(
+    file: &H5File,
+    name: &str,
+    len: usize,
+    extensible: bool,
+) -> ADResult<H5Dataset> {
+    let mut builder = file.new_dataset::<f32>().shape(&[len][..]);
+    if extensible {
+        builder = builder.chunk(&[len.max(1)]).max_shape(&[None]);
     }
+    let ds = builder.create(name).map_err(map_h5)?;
+    ds.set_scale(Some(&format!("{DIM_WITHOUT_VARIABLE}{len:10}")))
+        .map_err(map_h5)?;
+    Ok(ds)
 }
 
-/// Write a single record (one frame) to a record variable.
-fn write_record_data(
-    writer: &mut FileWriter,
-    record_index: usize,
-    data: &NDDataBuffer,
-) -> ADResult<()> {
-    let err = |e: netcdf3::error::WriteError| {
-        ADError::UnsupportedConversion(format!("NetCDF write error: {:?}", e))
-    };
-    match data {
-        NDDataBuffer::I8(v) => writer
-            .write_record_i8(VAR_NAME, record_index, v)
-            .map_err(err),
-        // NC_BYTE variable — see `write_var_data`.
-        NDDataBuffer::U8(v) => {
-            let reinterp: Vec<i8> = v.iter().map(|&x| x as i8).collect();
-            writer
-                .write_record_i8(VAR_NAME, record_index, &reinterp)
-                .map_err(err)
-        }
-        NDDataBuffer::I16(v) => writer
-            .write_record_i16(VAR_NAME, record_index, v)
-            .map_err(err),
-        NDDataBuffer::U16(v) => {
-            let reinterp: Vec<i16> = v.iter().map(|&x| x as i16).collect();
-            writer
-                .write_record_i16(VAR_NAME, record_index, &reinterp)
-                .map_err(err)
-        }
-        NDDataBuffer::I32(v) => writer
-            .write_record_i32(VAR_NAME, record_index, v)
-            .map_err(err),
-        NDDataBuffer::U32(v) => {
-            let reinterp: Vec<i32> = v.iter().map(|&x| x as i32).collect();
-            writer
-                .write_record_i32(VAR_NAME, record_index, &reinterp)
-                .map_err(err)
-        }
-        NDDataBuffer::F32(v) => writer
-            .write_record_f32(VAR_NAME, record_index, v)
-            .map_err(err),
-        NDDataBuffer::F64(v) => writer
-            .write_record_f64(VAR_NAME, record_index, v)
-            .map_err(err),
-        NDDataBuffer::I64(v) => {
-            let reinterp: Vec<f64> = v.iter().map(|&x| x as f64).collect();
-            writer
-                .write_record_f64(VAR_NAME, record_index, &reinterp)
-                .map_err(err)
-        }
-        NDDataBuffer::U64(v) => {
-            let reinterp: Vec<f64> = v.iter().map(|&x| x as f64).collect();
-            writer
-                .write_record_f64(VAR_NAME, record_index, &reinterp)
-                .map_err(err)
-        }
+/// Create a `[frames]` dataset and fill it with one value per frame.
+fn write_per_frame<T: rust_hdf5::types::H5Type + Copy>(
+    file: &H5File,
+    name: &str,
+    values: &[T],
+    extensible: bool,
+) -> ADResult<H5Dataset> {
+    let mut builder = file.new_dataset::<T>().shape(&[values.len()][..]);
+    // HDF5 only extends a chunked dataset, so an unlimited maximum extent
+    // comes with a chunk shape.
+    if extensible {
+        builder = builder.chunk(&[values.len().max(1)]).max_shape(&[None]);
     }
+    let ds = builder.create(name).map_err(map_h5)?;
+    ds.write_raw(values).map_err(map_h5)?;
+    Ok(ds)
 }
 
-const ATTR_STRING_DIM: &str = "attrStringSize";
-const ATTR_STRING_SIZE: usize = 256;
-
-/// nc_type of the `Attr_<name>` variable, i.e. C's second
-/// `switch (attrDataType)` (NDFileNetCDF.cpp:283-310).
+/// Create `array_data` with the leading frame axis and write every frame into
+/// it.
 ///
-/// String attributes are NC_CHAR — `DataType::U8` in the netcdf3 crate's
-/// spelling — and are the *only* NC_CHAR variables C writes. Everything else
-/// follows the same signed/64-bit collapse as [`nc_data_type`], with
-/// `Undefined` falling back to NC_BYTE (:305).
-fn attr_nc_type(value: &NDAttrValue) -> netcdf3::DataType {
-    match value {
-        NDAttrValue::Int8(_) | NDAttrValue::UInt8(_) | NDAttrValue::Undefined => {
-            netcdf3::DataType::I8
-        }
-        NDAttrValue::Int16(_) | NDAttrValue::UInt16(_) => netcdf3::DataType::I16,
-        NDAttrValue::Int32(_) | NDAttrValue::UInt32(_) => netcdf3::DataType::I32,
-        NDAttrValue::Float32(_) => netcdf3::DataType::F32,
-        NDAttrValue::Float64(_) | NDAttrValue::Int64(_) | NDAttrValue::UInt64(_) => {
-            netcdf3::DataType::F64
-        }
-        NDAttrValue::String(_) => netcdf3::DataType::U8,
-    }
-}
-
-/// Write one frame's value into the `Attr_<name>` variable at `record_index`.
-/// For single-frame files `record_index` is 0 and the variable is non-record.
-fn write_attr_value(
-    writer: &mut FileWriter,
-    var_name: &str,
-    record_index: usize,
-    multi: bool,
-    value: &NDAttrValue,
-) -> ADResult<()> {
-    let werr = |e: netcdf3::error::WriteError| {
-        ADError::UnsupportedConversion(format!("NetCDF attr write error: {:?}", e))
-    };
-    // String values are stored as a fixed-width NC_CHAR row. C writes only
-    // `strlen(attrString)` characters (NDFileNetCDF.cpp:462-465) and leaves the
-    // tail at the NC_CHAR fill value, which is NUL — the same bytes this
-    // NUL-padded full-width write produces.
-    if let NDAttrValue::String(s) = value {
-        let mut bytes: Vec<u8> = s.bytes().take(ATTR_STRING_SIZE).collect();
-        bytes.resize(ATTR_STRING_SIZE, 0);
-        return if multi {
-            writer
-                .write_record_u8(var_name, record_index, &bytes)
-                .map_err(werr)
-        } else {
-            writer.write_var_u8(var_name, &bytes).map_err(werr)
-        };
-    }
-    match attr_nc_type(value) {
-        netcdf3::DataType::I8 => {
-            let v = value.as_i64().unwrap_or(0) as i8;
-            if multi {
-                writer
-                    .write_record_i8(var_name, record_index, &[v])
-                    .map_err(werr)
-            } else {
-                writer.write_var_i8(var_name, &[v]).map_err(werr)
-            }
-        }
-        netcdf3::DataType::I16 => {
-            let v = value.as_i64().unwrap_or(0) as i16;
-            if multi {
-                writer
-                    .write_record_i16(var_name, record_index, &[v])
-                    .map_err(werr)
-            } else {
-                writer.write_var_i16(var_name, &[v]).map_err(werr)
-            }
-        }
-        netcdf3::DataType::I32 => {
-            let v = value.as_i64().unwrap_or(0) as i32;
-            if multi {
-                writer
-                    .write_record_i32(var_name, record_index, &[v])
-                    .map_err(werr)
-            } else {
-                writer.write_var_i32(var_name, &[v]).map_err(werr)
-            }
-        }
-        netcdf3::DataType::F32 => {
-            let v = value.as_f64().unwrap_or(0.0) as f32;
-            if multi {
-                writer
-                    .write_record_f32(var_name, record_index, &[v])
-                    .map_err(werr)
-            } else {
-                writer.write_var_f32(var_name, &[v]).map_err(werr)
-            }
-        }
-        netcdf3::DataType::F64 => {
-            let v = value.as_f64().unwrap_or(0.0);
-            if multi {
-                writer
-                    .write_record_f64(var_name, record_index, &[v])
-                    .map_err(werr)
-            } else {
-                writer.write_var_f64(var_name, &[v]).map_err(werr)
-            }
-        }
-        // NC_CHAR is reached only for string attributes, handled above.
-        netcdf3::DataType::U8 => unreachable!("attr_nc_type returns U8 only for strings"),
-    }
-}
-
-/// Build the netCDF-3 header, mirroring C `NDFileNetCDF::openFile`
-/// (NDFileNetCDF.cpp:41-333) statement for statement.
-///
-/// A netCDF-3 header stores its dimensions, its global attributes and its
-/// variables as three ordered lists, and every reader that walks a file by
-/// index — rather than by name — sees that order. So the order in which C
-/// defines things *is* file format, and this function is the one place that
-/// owns it: dimensions and definitions are emitted here in C's order, and
-/// nowhere else, so no later edit can re-order the header by adding a
-/// definition next to the code that happens to need it.
-///
-/// Returns the data set plus the `Attr_<name>` variable names in definition
-/// order, so the write pass visits the attribute variables in the same order.
-fn define_data_set(
-    first: &FrameData,
-    num_frames: usize,
-    multi: bool,
-) -> ADResult<(DataSet, Vec<String>)> {
-    let map_def = |e: netcdf3::error::InvalidDataSet| {
-        ADError::UnsupportedConversion(format!("NetCDF definition error: {:?}", e))
-    };
-
-    let mut ds = DataSet::new();
+/// C `NDFileNetCDF` gives `array_data` the `numArrays` dimension even for a
+/// single-array file (NDFileNetCDF.cpp:202-204), and reverses the NDArray
+/// dimensions because a netCDF file's first dimension varies slowest
+/// (:123-132). Both hold here: the HDF5 dataspace is
+/// `[frames, dim[n-1], … dim[0]]`, chunked one frame deep so each frame is one
+/// chunk write.
+fn write_array_data(file: &H5File, frames: &[FrameData], extensible: bool) -> ADResult<H5Dataset> {
+    let first = &frames[0];
     let dims = &first.frame.dims;
-    let ndims = dims.len();
+    let mut shape = vec![frames.len()];
+    shape.extend(dims.iter().rev().map(|d| d.size));
+    let mut chunk = vec![1usize];
+    chunk.extend(dims.iter().rev().map(|d| d.size));
+    let dtype_ordinal = first.frame.data.data_type() as i32;
+    // Unlimited on the frame axis only; the frame's own dimensions are fixed.
+    let mut max_shape: Vec<Option<usize>> = shape.iter().map(|&s| Some(s)).collect();
+    max_shape[0] = None;
 
-    // --- Global attributes, part 1 (C :92-101, :108-110, :140-151) ---------
-    // C emits dataType and NDNetCDFFileVersion before it defines any
-    // dimension, and the dim* metadata attributes right after; the gatt list
-    // therefore starts with these seven, in this order.
-    ds.add_global_attr_i32("dataType", vec![first.frame.data.data_type() as i32])
-        .map_err(map_def)?;
-    ds.add_global_attr_f64("NDNetCDFFileVersion", vec![ND_NETCDF_FILE_VERSION])
-        .map_err(map_def)?;
-    ds.add_global_attr_i32("numArrayDims", vec![ndims as i32])
-        .map_err(map_def)?;
-    // C reads dims[i] here — natural order, *not* the reversed order used for
-    // the dimension definitions below (:125-131).
-    let dim_size: Vec<i32> = dims.iter().map(|d| d.size as i32).collect();
-    ds.add_global_attr_i32("dimSize", dim_size)
-        .map_err(map_def)?;
-    let dim_offset: Vec<i32> = dims.iter().map(|d| d.offset as i32).collect();
-    ds.add_global_attr_i32("dimOffset", dim_offset)
-        .map_err(map_def)?;
-    let dim_binning: Vec<i32> = dims.iter().map(|d| d.binning as i32).collect();
-    ds.add_global_attr_i32("dimBinning", dim_binning)
-        .map_err(map_def)?;
-    let dim_reverse: Vec<i32> = dims.iter().map(|d| if d.reverse { 1 } else { 0 }).collect();
-    ds.add_global_attr_i32("dimReverse", dim_reverse)
-        .map_err(map_def)?;
-
-    // --- Dimensions (C :117-137) ------------------------------------------
-    // numArrays first: NC_UNLIMITED for a multi-array file, fixed size 1
-    // otherwise (:117-120).
-    if multi {
-        ds.set_unlimited_dim(DIM_UNLIMITED, num_frames)
-            .map_err(map_def)?;
-    } else {
-        ds.add_fixed_dim(DIM_UNLIMITED, 1).map_err(map_def)?;
+    macro_rules! write_typed {
+        ($t:ty, $variant:ident) => {{
+            let mut builder = file.new_dataset::<$t>().shape(&shape[..]).chunk(&chunk[..]);
+            if extensible {
+                builder = builder.max_shape(&max_shape[..]);
+            }
+            let ds = builder.create(VAR_NAME).map_err(map_h5)?;
+            ds.new_attr::<i32>()
+                .shape(())
+                .create(DTYPE_ATTR)
+                .and_then(|a| a.write_numeric(&dtype_ordinal))
+                .map_err(map_h5)?;
+            let mut starts = vec![0usize; shape.len()];
+            let mut counts = shape.clone();
+            counts[0] = 1;
+            for (i, frame) in frames.iter().enumerate() {
+                let NDDataBuffer::$variant(v) = &frame.frame.data else {
+                    return Err(ADError::UnsupportedConversion(format!(
+                        "frame {i} changed element type mid-file"
+                    )));
+                };
+                starts[0] = i;
+                ds.write_slice::<$t>(&starts, &counts, v).map_err(map_h5)?;
+            }
+            Ok(ds)
+        }};
     }
-    // Then the array dimensions, reversed: netCDF's first dimension varies
-    // slowest, the opposite of the NDArray convention (:123-132).
-    let mut dim_names: Vec<String> = Vec::new();
-    for i in 0..ndims {
-        let name = format!("dim{}", i);
-        ds.add_fixed_dim(&name, dims[ndims - 1 - i].size)
-            .map_err(map_def)?;
-        dim_names.push(name);
+
+    // netCDF-4 has the full signed/unsigned integer set, so every NDArray type
+    // is stored as itself. netCDF-3 had neither unsigned nor 64-bit integers,
+    // which is why C reinterprets UInt8 as NC_BYTE and casts Int64/UInt64 to
+    // NC_DOUBLE (NDFileNetCDF.cpp:154-180); none of that is needed here, and
+    // the 64-bit integer frames are no longer rounded through a double.
+    match first.frame.data {
+        NDDataBuffer::I8(_) => write_typed!(i8, I8),
+        NDDataBuffer::U8(_) => write_typed!(u8, U8),
+        NDDataBuffer::I16(_) => write_typed!(i16, I16),
+        NDDataBuffer::U16(_) => write_typed!(u16, U16),
+        NDDataBuffer::I32(_) => write_typed!(i32, I32),
+        NDDataBuffer::U32(_) => write_typed!(u32, U32),
+        NDDataBuffer::I64(_) => write_typed!(i64, I64),
+        NDDataBuffer::U64(_) => write_typed!(u64, U64),
+        NDDataBuffer::F32(_) => write_typed!(f32, F32),
+        NDDataBuffer::F64(_) => write_typed!(f64, F64),
     }
-    // attrStringSize last — defined unconditionally (:135-137), even when no
-    // string attribute uses it. It is part of the header C always writes.
-    ds.add_fixed_dim(ATTR_STRING_DIM, ATTR_STRING_SIZE)
-        .map_err(map_def)?;
+}
 
-    // --- Variables (C :183-204) -------------------------------------------
-    // The four per-array metadata variables come first, array_data fifth.
-    ds.add_var("uniqueId", &[DIM_UNLIMITED], netcdf3::DataType::I32)
-        .map_err(map_def)?;
-    ds.add_var("timeStamp", &[DIM_UNLIMITED], netcdf3::DataType::F64)
-        .map_err(map_def)?;
-    ds.add_var("epicsTSSec", &[DIM_UNLIMITED], netcdf3::DataType::I32)
-        .map_err(map_def)?;
-    ds.add_var("epicsTSNsec", &[DIM_UNLIMITED], netcdf3::DataType::I32)
-        .map_err(map_def)?;
+/// Create one `Attr_<name>` dataset holding that attribute's value for every
+/// frame, typed as the attribute is (C NDFileNetCDF.cpp:312-321).
+fn write_attr_dataset(
+    file: &H5File,
+    name: &str,
+    values: &[NDAttrValue],
+    extensible: bool,
+) -> ADResult<Option<H5Dataset>> {
+    macro_rules! numeric {
+        ($t:ty, $get:expr) => {{
+            let column: Vec<$t> = values.iter().map($get).collect();
+            write_per_frame(file, name, &column, extensible).map(Some)
+        }};
+    }
 
-    // array_data always carries the leading numArrays dimension, so a
-    // single-array file is still rank ndims+1 (:202-204).
-    let mut var_dims: Vec<&str> = vec![DIM_UNLIMITED];
-    var_dims.extend(dim_names.iter().map(|s| s.as_str()));
-    ds.add_var(
-        VAR_NAME,
-        &var_dims,
-        nc_data_type(first.frame.data.data_type())?,
-    )
-    .map_err(map_def)?;
-
-    // --- Per-attribute variables and their text attributes (C :208-330) ----
-    // One pass over the attribute list, exactly as C does: the four
-    // Attr_<name>_* global text attributes, then the Attr_<name> variable.
-    // The attribute set is the first frame's — C snapshots the list at
-    // openFile time and requires it not to change (C's comment at :418).
-    let mut attr_var_names: Vec<String> = Vec::new();
-    for attr in &first.attrs {
-        ds.add_global_attr_string(
-            &format!("Attr_{}_DataType", attr.name),
-            &attr.data_type_string,
-        )
-        .map_err(map_def)?;
-        ds.add_global_attr_string(
-            &format!("Attr_{}_Description", attr.name),
-            &attr.description,
-        )
-        .map_err(map_def)?;
-        ds.add_global_attr_string(&format!("Attr_{}_Source", attr.name), &attr.source)
-            .map_err(map_def)?;
-        ds.add_global_attr_string(&format!("Attr_{}_SourceType", attr.name), &attr.source_type)
-            .map_err(map_def)?;
-
-        let var_name = format!("Attr_{}", attr.name);
-        // A string attribute is a 2-D NC_CHAR variable [numArrays,
-        // attrStringSize]; everything else is 1-D over numArrays (:312-321).
-        if matches!(attr.value, NDAttrValue::String(_)) {
-            ds.add_var(
-                &var_name,
-                &[DIM_UNLIMITED, ATTR_STRING_DIM],
-                attr_nc_type(&attr.value),
-            )
-            .map_err(map_def)?;
-        } else {
-            ds.add_var(&var_name, &[DIM_UNLIMITED], attr_nc_type(&attr.value))
-                .map_err(map_def)?;
+    let as_i = |v: &NDAttrValue| v.as_i64().unwrap_or(0);
+    let as_f = |v: &NDAttrValue| v.as_f64().unwrap_or(0.0);
+    match &values[0] {
+        NDAttrValue::Int8(_) => numeric!(i8, |v| as_i(v) as i8),
+        NDAttrValue::UInt8(_) => numeric!(u8, |v| as_i(v) as u8),
+        NDAttrValue::Int16(_) => numeric!(i16, |v| as_i(v) as i16),
+        NDAttrValue::UInt16(_) => numeric!(u16, |v| as_i(v) as u16),
+        NDAttrValue::Int32(_) => numeric!(i32, |v| as_i(v) as i32),
+        NDAttrValue::UInt32(_) => numeric!(u32, |v| as_i(v) as u32),
+        NDAttrValue::Int64(_) => numeric!(i64, as_i),
+        NDAttrValue::UInt64(_) => numeric!(u64, |v| as_i(v) as u64),
+        NDAttrValue::Float32(_) => numeric!(f32, |v| as_f(v) as f32),
+        NDAttrValue::Float64(_) => numeric!(f64, as_f),
+        NDAttrValue::String(_) => {
+            let column: Vec<FixedStr<ATTR_STRING_SIZE>> = values
+                .iter()
+                .map(|v| FixedStr::new(&v.as_string()))
+                .collect();
+            write_per_frame(file, name, &column, extensible).map(Some)
         }
-        attr_var_names.push(var_name);
+        // C skips an undefined attribute rather than defining a variable for
+        // it (NDFileNetCDF.cpp:254-258 leaves `dataTypeString` "Undefined"
+        // and :312 defines nothing).
+        NDAttrValue::Undefined => Ok(None),
     }
-
-    Ok((ds, attr_var_names))
 }
 
 impl NDFileWriter for NetcdfWriter {
@@ -488,9 +343,6 @@ impl NDFileWriter for NetcdfWriter {
     }
 
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {
-        // Validate data type early
-        nc_data_type(array.data.data_type())?;
-
         // C `writeFile` merges this frame into `pFileAttributes` and then
         // writes every attribute variable out of that list
         // (NDFileNetCDF.cpp:359-362, :419-483), so an attribute that drops out
@@ -519,8 +371,8 @@ impl NDFileWriter for NetcdfWriter {
         Ok(())
     }
 
-    /// Close the open file — for netCDF this is where the whole file is
-    /// written, from the frames `write_file` buffered.
+    /// Close the open file — this is where the whole file is written, from the
+    /// frames `write_file` buffered.
     ///
     /// The buffer belongs to the finalizer for the same reason `current_path`
     /// is taken up front: every write below is fallible, and frames of a file
@@ -538,69 +390,132 @@ impl NDFileWriter for NetcdfWriter {
                 return Ok(());
             }
 
-            let map_write = |e: netcdf3::error::WriteError| {
-                ADError::UnsupportedConversion(format!("NetCDF write error: {:?}", e))
-            };
+            let frames = &w.frames;
+            let first = &frames[0];
+            let dims = &first.frame.dims;
+            let ndims = dims.len();
+            // C keys the extensible frame axis on the *open mode*, never on how
+            // many frames the file ended up holding (NDFileNetCDF.cpp:117-119).
+            // netCDF-3 spelled that NC_UNLIMITED; the netCDF-4 spelling of an
+            // unlimited dimension is an HDF5 dataspace whose maximum extent on
+            // that axis is unlimited.
+            let extensible = w.open_multiple;
 
-            let first = &w.frames[0];
-            // C keys the numArrays dimension on the *open mode*, never on how many
-            // frames the file ended up holding (NDFileNetCDF.cpp:117-119).
-            let multi = w.open_multiple;
-            let (ds, attr_var_names) = define_data_set(first, w.frames.len(), multi)?;
+            let file = H5File::create(&path).map_err(map_h5)?;
 
-            // Write
-            let mut writer = FileWriter::open(&path).map_err(map_write)?;
-            writer
-                .set_def(&ds, Version::Classic, 0)
-                .map_err(map_write)?;
-
-            if multi {
-                for (i, frame) in w.frames.iter().enumerate() {
-                    let array = &frame.frame;
-                    write_record_data(&mut writer, i, &array.data)?;
-                    writer
-                        .write_record_i32("uniqueId", i, &[array.unique_id])
-                        .map_err(map_write)?;
-                    writer
-                        .write_record_f64("timeStamp", i, &[array.time_stamp])
-                        .map_err(map_write)?;
-                    writer
-                        .write_record_i32("epicsTSSec", i, &[array.timestamp.sec as i32])
-                        .map_err(map_write)?;
-                    writer
-                        .write_record_i32("epicsTSNsec", i, &[array.timestamp.nsec as i32])
-                        .map_err(map_write)?;
-                    // Per-attribute values. Every frame's `attrs` is a
-                    // snapshot of the same sticky list, which only ever grows
-                    // and never re-orders, so the header's variables line up
-                    // positionally with this frame's entries and there is no
-                    // lookup left to miss.
-                    for (attr, var_name) in frame.attrs.iter().zip(&attr_var_names) {
-                        write_attr_value(&mut writer, var_name, i, true, &attr.value)?;
-                    }
-                }
-            } else {
-                let array = &first.frame;
-                write_var_data(&mut writer, &array.data)?;
-                writer
-                    .write_var_i32("uniqueId", &[array.unique_id])
-                    .map_err(map_write)?;
-                writer
-                    .write_var_f64("timeStamp", &[array.time_stamp])
-                    .map_err(map_write)?;
-                writer
-                    .write_var_i32("epicsTSSec", &[array.timestamp.sec as i32])
-                    .map_err(map_write)?;
-                writer
-                    .write_var_i32("epicsTSNsec", &[array.timestamp.nsec as i32])
-                    .map_err(map_write)?;
-                for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
-                    write_attr_value(&mut writer, var_name, 0, false, &attr.value)?;
+            // --- Global attributes (C :92-101, :108-110, :140-151) ----------
+            // The same set and values C writes, as root-group attributes:
+            // that is where a netCDF-4 file keeps its global attributes.
+            // `_NCProperties` is the one addition the container asks for.
+            // HDF5 stores attributes in a name-indexed header, so unlike a
+            // netCDF-3 header this order is not file format.
+            file.set_attr_string("_NCProperties", NC_PROPERTIES)
+                .map_err(map_h5)?;
+            file.set_attr_numeric(DTYPE_ATTR, &(first.frame.data.data_type() as i32))
+                .map_err(map_h5)?;
+            file.set_attr_numeric("NDNetCDFFileVersion", &ND_NETCDF_FILE_VERSION)
+                .map_err(map_h5)?;
+            file.set_attr_numeric("numArrayDims", &(ndims as i32))
+                .map_err(map_h5)?;
+            // C reads dims[i] here — natural order, *not* the reversed order
+            // the dimensions themselves are declared in (:125-131).
+            let dim_size: Vec<i32> = dims.iter().map(|d| d.size as i32).collect();
+            let dim_offset: Vec<i32> = dims.iter().map(|d| d.offset as i32).collect();
+            let dim_binning: Vec<i32> = dims.iter().map(|d| d.binning as i32).collect();
+            let dim_reverse: Vec<i32> = dims.iter().map(|d| i32::from(d.reverse)).collect();
+            for (name, values) in [
+                ("dimSize", &dim_size),
+                ("dimOffset", &dim_offset),
+                ("dimBinning", &dim_binning),
+                ("dimReverse", &dim_reverse),
+            ] {
+                file.set_attr_array_numeric(name, &values[..])
+                    .map_err(map_h5)?;
+            }
+            // The four text attributes C writes per NDAttribute (:208-310).
+            for attr in &first.attrs {
+                for (suffix, value) in [
+                    ("DataType", &attr.data_type_string),
+                    ("Description", &attr.description),
+                    ("Source", &attr.source),
+                    ("SourceType", &attr.source_type),
+                ] {
+                    file.set_attr_string(&format!("Attr_{}_{suffix}", attr.name), value)
+                        .map_err(map_h5)?;
                 }
             }
 
-            writer.close().map_err(map_write)?;
-            Ok(())
+            // --- Dimensions (C :117-137) -----------------------------------
+            // numArrays first, then the array dimensions reversed: netCDF's
+            // first dimension varies slowest, the opposite of the NDArray
+            // convention (:123-132).
+            let frame_scale = create_dim_scale(&file, DIM_UNLIMITED, frames.len(), extensible)?;
+            let mut dim_scales = Vec::with_capacity(ndims);
+            for i in 0..ndims {
+                dim_scales.push(create_dim_scale(
+                    &file,
+                    &format!("dim{i}"),
+                    dims[ndims - 1 - i].size,
+                    false,
+                )?);
+            }
+
+            // --- Per-array metadata and the data (C :183-204) ---------------
+            let unique_ids: Vec<i32> = frames.iter().map(|f| f.frame.unique_id).collect();
+            let time_stamps: Vec<f64> = frames.iter().map(|f| f.frame.time_stamp).collect();
+            let secs: Vec<i32> = frames
+                .iter()
+                .map(|f| f.frame.timestamp.sec as i32)
+                .collect();
+            let nsecs: Vec<i32> = frames
+                .iter()
+                .map(|f| f.frame.timestamp.nsec as i32)
+                .collect();
+            // Every variable's leading axis is the frame dimension, and
+            // `array_data` carries the array dimensions after it: a netCDF
+            // variable's dimensions are the dimension scales attached to its
+            // axes, and an unattached axis is read as an anonymous
+            // `phony_dim_N` instead of as `numArrays`.
+            for ds in [
+                write_per_frame(&file, "uniqueId", &unique_ids, extensible)?,
+                write_per_frame(&file, "timeStamp", &time_stamps, extensible)?,
+                write_per_frame(&file, "epicsTSSec", &secs, extensible)?,
+                write_per_frame(&file, "epicsTSNsec", &nsecs, extensible)?,
+            ] {
+                ds.attach_scale(0, &frame_scale).map_err(map_h5)?;
+            }
+            let data = write_array_data(&file, frames, extensible)?;
+            data.attach_scale(0, &frame_scale).map_err(map_h5)?;
+            for (axis, scale) in dim_scales.iter().enumerate() {
+                data.attach_scale(axis + 1, scale).map_err(map_h5)?;
+            }
+
+            // --- Per-attribute datasets (C :312-321) ------------------------
+            // Every frame's `attrs` is a snapshot of the same sticky list,
+            // which only ever grows and never re-orders, so column `i` is the
+            // same attribute in every frame and there is no lookup left to
+            // miss. The set is the first frame's: C snapshots the list at
+            // openFile time and requires it not to change (C's comment
+            // at :418).
+            for (i, attr) in first.attrs.iter().enumerate() {
+                let column: Vec<NDAttrValue> = frames
+                    .iter()
+                    .map(|f| {
+                        f.attrs
+                            .get(i)
+                            .map_or(NDAttrValue::Undefined, |a| a.value.clone())
+                    })
+                    .collect();
+                if let Some(ds) =
+                    write_attr_dataset(&file, &format!("Attr_{}", attr.name), &column, extensible)?
+                {
+                    ds.attach_scale(0, &frame_scale).map_err(map_h5)?;
+                }
+            }
+
+            // Not left to `Drop`: closing writes the superblock and the root
+            // header, and that failure has to be reported.
+            file.close().map_err(map_h5)
         })
     }
 
@@ -610,95 +525,76 @@ impl NDFileWriter for NetcdfWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
-        let map_read = |e: netcdf3::error::ReadError| {
-            ADError::UnsupportedConversion(format!("NetCDF read error: {:?}", e))
-        };
+        let file = H5File::open(path)
+            .map_err(|e| ADError::UnsupportedConversion(format!("netCDF-4 open error: {e}")))?;
+        let ds = file.dataset(VAR_NAME).map_err(|e| {
+            ADError::UnsupportedConversion(format!("dataset '{VAR_NAME}' not found: {e}"))
+        })?;
 
-        let mut reader = FileReader::open(path).map_err(map_read)?;
+        // `array_data` is `[frames, dim[n-1], … dim[0]]`: drop the frame axis
+        // and undo the reversal to get NDArray dimension order back.
+        let shape = ds.shape();
+        if shape.is_empty() {
+            return Err(ADError::UnsupportedConversion(format!(
+                "'{VAR_NAME}' has no frame axis"
+            )));
+        }
+        let dims: Vec<NDDimension> = shape[1..]
+            .iter()
+            .rev()
+            .map(|&s| NDDimension::new(s))
+            .collect();
 
-        // Extract metadata from data_set() before any mutable read calls
-        let (is_record, dims, original_type_ordinal) = {
-            let ds = reader.data_set();
-            let var = ds.get_var(VAR_NAME).ok_or_else(|| {
+        let data_type = ds
+            .attr(DTYPE_ATTR)
+            .ok()
+            .and_then(|a| a.read_numeric::<i32>().ok())
+            .and_then(|v| NDDataType::from_ordinal(v as u8))
+            .ok_or_else(|| {
                 ADError::UnsupportedConversion(format!(
-                    "variable '{}' not found in NetCDF file",
-                    VAR_NAME
+                    "'{VAR_NAME}' carries no {DTYPE_ATTR} attribute"
                 ))
             })?;
 
-            let is_record = ds.is_record_var(VAR_NAME).unwrap_or(false);
+        // The first frame only, as the netCDF-3 reader returned record 0.
+        let mut starts = vec![0usize; shape.len()];
+        starts[0] = 0;
+        let mut counts = shape.clone();
+        counts[0] = 1;
 
-            let var_dims_rc = var.get_dims();
-            let mut dims: Vec<NDDimension> = Vec::new();
-            for d in &var_dims_rc {
-                // Skip the leading numArrays dimension. It is unlimited for
-                // multi-frame files and a fixed dim of size 1 for single-frame
-                // files, so match it by name as well as the unlimited flag.
-                if d.is_unlimited() || d.name() == DIM_UNLIMITED {
-                    continue;
-                }
-                dims.push(NDDimension::new(d.size()));
-            }
+        macro_rules! read_typed {
+            ($t:ty, $variant:ident) => {{
+                let data = ds.read_slice::<$t>(&starts, &counts).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("netCDF-4 read error: {e}"))
+                })?;
+                let mut arr = NDArray::new(dims, data_type);
+                arr.data = NDDataBuffer::$variant(data);
+                Ok(arr)
+            }};
+        }
 
-            let original_type_ordinal = ds
-                .get_global_attr_i32("dataType")
-                .and_then(|slice| slice.first().copied());
-
-            (is_record, dims, original_type_ordinal)
-        };
-
-        // Read first frame (record 0 if record variable, else full var)
-        let data_vec = if is_record {
-            reader.read_record(VAR_NAME, 0).map_err(map_read)?
-        } else {
-            reader.read_var(VAR_NAME).map_err(map_read)?
-        };
-
-        let (nd_type, buf) = match data_vec {
-            netcdf3::DataVector::I8(v) => (NDDataType::Int8, NDDataBuffer::I8(v)),
-            netcdf3::DataVector::U8(v) => (NDDataType::UInt8, NDDataBuffer::U8(v)),
-            netcdf3::DataVector::I16(v) => (NDDataType::Int16, NDDataBuffer::I16(v)),
-            netcdf3::DataVector::I32(v) => (NDDataType::Int32, NDDataBuffer::I32(v)),
-            netcdf3::DataVector::F32(v) => (NDDataType::Float32, NDDataBuffer::F32(v)),
-            netcdf3::DataVector::F64(v) => (NDDataType::Float64, NDDataBuffer::F64(v)),
-        };
-
-        // Check global attr "dataType" to recover original NDDataType
-        let actual_type = original_type_ordinal
-            .and_then(|v| NDDataType::from_ordinal(v as u8))
-            .unwrap_or(nd_type);
-
-        // Re-interpret if the original type was unsigned and stored as signed.
-        // netCDF-3 has no unsigned types, so `dataType` is the only record of
-        // the sign; UInt8 comes back from an NC_BYTE variable as i8.
-        let buf = match (actual_type, buf) {
-            (NDDataType::UInt8, NDDataBuffer::I8(v)) => {
-                NDDataBuffer::U8(v.into_iter().map(|x| x as u8).collect())
-            }
-            (NDDataType::UInt16, NDDataBuffer::I16(v)) => {
-                NDDataBuffer::U16(v.into_iter().map(|x| x as u16).collect())
-            }
-            (NDDataType::UInt32, NDDataBuffer::I32(v)) => {
-                NDDataBuffer::U32(v.into_iter().map(|x| x as u32).collect())
-            }
-            (_, buf) => buf,
-        };
-
-        let mut arr = NDArray::new(dims, actual_type);
-        arr.data = buf;
-        Ok(arr)
+        match data_type {
+            NDDataType::Int8 => read_typed!(i8, I8),
+            NDDataType::UInt8 => read_typed!(u8, U8),
+            NDDataType::Int16 => read_typed!(i16, I16),
+            NDDataType::UInt16 => read_typed!(u16, U16),
+            NDDataType::Int32 => read_typed!(i32, I32),
+            NDDataType::UInt32 => read_typed!(u32, U32),
+            NDDataType::Int64 => read_typed!(i64, I64),
+            NDDataType::UInt64 => read_typed!(u64, U64),
+            NDDataType::Float32 => read_typed!(f32, F32),
+            NDDataType::Float64 => read_typed!(f64, F64),
+        }
     }
 
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
 
-    /// netCDF-3 keeps the record count in the header, and `netcdf3` 0.6 fixes
-    /// it when `FileWriter::set_def` writes that header: `set_def` may be
-    /// called once, `write_record_*` rejects any index past the count it
-    /// declared, and `FileWriter::open` truncates rather than appends. The
-    /// whole file therefore has to be written from `close_file`, so a frame is
-    /// not on disk when `write_file` returns.
+    /// The frames are written in `close_file`, so a frame is not on disk when
+    /// `write_file` returns. HDF5 could extend the datasets per frame; the
+    /// writer keeps the netCDF-3 writer's buffer-then-write shape, and Stream
+    /// mode stays refused rather than silently accumulating frames in RAM.
     fn writes_incrementally(&self) -> bool {
         false
     }
@@ -769,24 +665,54 @@ mod tests {
         ))
     }
 
+    fn make_u8(dims: &[usize], fill: impl Fn(usize) -> u8) -> NDArray {
+        let n: usize = dims.iter().product();
+        let mut arr = NDArray::new(
+            dims.iter().map(|&d| NDDimension::new(d)).collect(),
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(v) = &mut arr.data {
+            for i in 0..n {
+                v[i] = fill(i);
+            }
+        }
+        arr
+    }
+
+    /// Write one file in the given mode and return its path.
+    fn write_frames(prefix: &str, mode: NDFileMode, frames: &[NDArray]) -> PathBuf {
+        let path = temp_path(prefix);
+        let mut writer = NetcdfWriter::new();
+        writer.open_file(&path, mode, &frames[0]).unwrap();
+        for f in frames {
+            writer.write_file(&Arc::new(f.clone())).unwrap();
+        }
+        writer.close_file().unwrap();
+        path
+    }
+
+    fn read_back(path: &Path) -> NDArray {
+        let mut writer = NetcdfWriter::new();
+        writer.current_path = Some(path.to_path_buf());
+        writer.read_file().unwrap()
+    }
+
     /// D2 sibling: `NetcdfWriter::close_file` is where the buffered frames are
     /// written, and `frames.clear()` used to sit after all ten fallible writes.
     /// A failed flush then held the frames resident until some later
     /// `open_file` happened to clear them.
     #[test]
     fn close_file_clears_the_frame_buffer_when_the_write_fails() {
-        // The precondition is a parent that does NOT exist, so `FileWriter::open`
-        // fails. Spelling it as an implausible name under the shared temp dir made
-        // that a hope about every process on the host; an exclusive root we own and
-        // then leave unpopulated makes it a fact about this test.
+        // The precondition is a parent that does NOT exist, so creating the
+        // file fails. Spelling it as an implausible name under the shared temp
+        // dir made that a hope about every process on the host; an exclusive
+        // root we own and then leave unpopulated makes it a fact about this
+        // test.
         let root = tempfile::tempdir().expect("fixture root");
         let path = root.path().join("no-such-dir").join("frames.nc");
         let mut writer = NetcdfWriter::new();
 
-        let arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
+        let arr = make_u8(&[4, 4], |_| 0);
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         assert_eq!(writer.frames.len(), 1);
@@ -801,16 +727,11 @@ mod tests {
         );
     }
 
-    /// The file is written at close, so the frames wait in `frames`; they
-    /// wait as the driver's own `Arc` (C `pArray->reserve()`), not as a copy.
     #[test]
     fn the_buffered_frame_is_the_input_arc_itself() {
         let path = temp_path("nc_arc");
         let mut writer = NetcdfWriter::new();
-        let arr = Arc::new(NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        ));
+        let arr = Arc::new(make_u8(&[4, 4], |_| 0));
         writer.open_file(&path, NDFileMode::Capture, &arr).unwrap();
         writer.write_file(&arr).unwrap();
         assert!(Arc::ptr_eq(&writer.frames[0].frame, &arr));
@@ -822,36 +743,18 @@ mod tests {
 
     #[test]
     fn test_write_u8_mono() {
-        let path = temp_path("nc_u8");
-        let mut writer = NetcdfWriter::new();
-
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
-            for i in 0..16 {
-                v[i] = i as u8;
-            }
-        }
-
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
-
-        // Verify file exists and has NetCDF magic bytes: "CDF\x01" or "CDF\x02"
-        let data = std::fs::read(&path).unwrap();
-        assert!(data.len() > 16);
-        assert_eq!(&data[0..3], b"CDF", "Expected NetCDF magic bytes");
-
+        let arr = make_u8(&[4, 4], |i| (i * 10) as u8);
+        let path = write_frames("nc_u8", NDFileMode::Single, std::slice::from_ref(&arr));
+        let back = read_back(&path);
+        let (NDDataBuffer::U8(want), NDDataBuffer::U8(got)) = (&arr.data, &back.data) else {
+            panic!("expected UInt8 on both sides");
+        };
+        assert_eq!(want, got);
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_write_u16() {
-        let path = temp_path("nc_u16");
-        let mut writer = NetcdfWriter::new();
-
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
@@ -861,232 +764,154 @@ mod tests {
                 v[i] = (i * 1000) as u16;
             }
         }
-
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
-
-        let data = std::fs::read(&path).unwrap();
-        assert!(data.len() > 32);
-        assert_eq!(&data[0..3], b"CDF");
-
+        let path = write_frames("nc_u16", NDFileMode::Single, std::slice::from_ref(&arr));
+        let back = read_back(&path);
+        let (NDDataBuffer::U16(want), NDDataBuffer::U16(got)) = (&arr.data, &back.data) else {
+            panic!("expected UInt16 on both sides");
+        };
+        assert_eq!(want, got);
         std::fs::remove_file(&path).ok();
     }
 
+    /// One case per element type: the frame that goes in is the frame that
+    /// comes back, with its type intact. netCDF-3 could store neither the
+    /// unsigned nor the 64-bit integer types, so C reinterpreted UInt8/16/32 as
+    /// signed and rounded Int64/UInt64 through a double
+    /// (NDFileNetCDF.cpp:154-180); netCDF-4 has all ten, and the two 64-bit
+    /// cases here are values no double can hold exactly.
     #[test]
-    fn test_roundtrip_u8() {
-        let path = temp_path("nc_rt_u8");
-        let mut writer = NetcdfWriter::new();
-
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
-            for i in 0..16 {
-                v[i] = (i * 10) as u8;
-            }
+    fn every_element_type_round_trips_losslessly() {
+        macro_rules! case {
+            ($prefix:literal, $t:ty, $variant:ident, $dt:expr, $values:expr) => {{
+                let values: Vec<$t> = $values;
+                let mut arr = NDArray::new(vec![NDDimension::new(values.len())], $dt);
+                arr.data = NDDataBuffer::$variant(values.clone());
+                let path = write_frames($prefix, NDFileMode::Single, &[arr]);
+                let back = read_back(&path);
+                let NDDataBuffer::$variant(got) = &back.data else {
+                    panic!("{} came back as {:?}", $prefix, back.data.data_type());
+                };
+                assert_eq!(got, &values, "{}", $prefix);
+                assert_eq!(back.data.data_type(), $dt);
+                std::fs::remove_file(&path).ok();
+            }};
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr.clone())).unwrap();
-        writer.close_file().unwrap();
-
-        writer.current_path = Some(path.clone());
-        let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        } else {
-            panic!("data type mismatch on roundtrip");
-        }
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_roundtrip_i16() {
-        let path = temp_path("nc_rt_i16");
-        let mut writer = NetcdfWriter::new();
-
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
+        case!("nc_t_i8", i8, I8, NDDataType::Int8, vec![-128, -1, 0, 127]);
+        case!("nc_t_u8", u8, U8, NDDataType::UInt8, vec![0, 1, 200, 255]);
+        case!(
+            "nc_t_i16",
+            i16,
+            I16,
             NDDataType::Int16,
+            vec![-32768, 0, 32767]
         );
-        if let NDDataBuffer::I16(v) = &mut arr.data {
-            for i in 0..16 {
-                v[i] = (i as i16) * 100 - 500;
-            }
-        }
-
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr.clone())).unwrap();
-        writer.close_file().unwrap();
-
-        writer.current_path = Some(path.clone());
-        let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::I16(orig), NDDataBuffer::I16(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        } else {
-            panic!("data type mismatch on roundtrip");
-        }
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_roundtrip_f32() {
-        let path = temp_path("nc_rt_f32");
-        let mut writer = NetcdfWriter::new();
-
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::Float32,
+        case!(
+            "nc_t_u16",
+            u16,
+            U16,
+            NDDataType::UInt16,
+            vec![0, 1000, 65535]
         );
-        if let NDDataBuffer::F32(v) = &mut arr.data {
-            for i in 0..16 {
-                v[i] = i as f32 * 0.5;
-            }
-        }
-
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr.clone())).unwrap();
-        writer.close_file().unwrap();
-
-        writer.current_path = Some(path.clone());
-        let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::F32(orig), NDDataBuffer::F32(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        } else {
-            panic!("data type mismatch on roundtrip");
-        }
-
-        std::fs::remove_file(&path).ok();
+        case!(
+            "nc_t_i32",
+            i32,
+            I32,
+            NDDataType::Int32,
+            vec![i32::MIN, 0, 7]
+        );
+        case!("nc_t_u32", u32, U32, NDDataType::UInt32, vec![0, u32::MAX]);
+        // 2^53+1 and 2^64-1: not representable in an f64.
+        case!(
+            "nc_t_i64",
+            i64,
+            I64,
+            NDDataType::Int64,
+            vec![9_007_199_254_740_993, i64::MIN]
+        );
+        case!("nc_t_u64", u64, U64, NDDataType::UInt64, vec![u64::MAX, 0]);
+        case!("nc_t_f32", f32, F32, NDDataType::Float32, vec![1.5, -0.25]);
+        case!("nc_t_f64", f64, F64, NDDataType::Float64, vec![1.5, -0.25]);
     }
 
     #[test]
     fn test_multiple_frames() {
-        let path = temp_path("nc_multi");
-        let mut writer = NetcdfWriter::new();
+        let frames: Vec<NDArray> = (0u8..3)
+            .map(|k| make_u8(&[4, 4], move |i| (i as u8).wrapping_add(k * 100)))
+            .collect();
+        let path = write_frames("nc_multi", NDFileMode::Stream, &frames);
 
-        let mut arr1 = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr1.data {
-            for i in 0..16 {
-                v[i] = i as u8;
-            }
-        }
-
-        let mut arr2 = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr2.data {
-            for i in 0..16 {
-                v[i] = (i as u8).wrapping_add(100);
-            }
-        }
-
-        let mut arr3 = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr3.data {
-            for i in 0..16 {
-                v[i] = (i as u8).wrapping_add(200);
-            }
-        }
-
-        writer.open_file(&path, NDFileMode::Stream, &arr1).unwrap();
-        writer.write_file(&Arc::new(arr1)).unwrap();
-        writer.write_file(&Arc::new(arr2)).unwrap();
-        writer.write_file(&Arc::new(arr3)).unwrap();
-        writer.close_file().unwrap();
-
-        // Read back first frame
-        writer.current_path = Some(path.clone());
-        let read_back = writer.read_file().unwrap();
-        if let NDDataBuffer::U8(v) = &read_back.data {
-            assert_eq!(v.len(), 16);
-            for i in 0..16 {
-                assert_eq!(v[i], i as u8, "mismatch at index {}", i);
-            }
-        } else {
+        // read_file returns the first frame, as the netCDF-3 reader returned
+        // record 0.
+        let back = read_back(&path);
+        let NDDataBuffer::U8(v) = &back.data else {
             panic!("expected U8 data");
+        };
+        assert_eq!(v.len(), 16);
+        for i in 0..16 {
+            assert_eq!(v[i], i as u8, "mismatch at index {i}");
         }
 
+        // Every frame is in the file, each on its own row of the frame axis.
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset(VAR_NAME).unwrap();
+        assert_eq!(ds.shape(), vec![3, 4, 4]);
+        for (k, frame) in frames.iter().enumerate() {
+            let got = ds.read_slice::<u8>(&[k, 0, 0], &[1, 4, 4]).unwrap();
+            let NDDataBuffer::U8(want) = &frame.data else {
+                unreachable!()
+            };
+            assert_eq!(&got, want, "frame {k}");
+        }
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 
+    /// R8-73. C picks the numArrays dimension from the open mode alone —
+    /// `if (openMode & NDFileModeMultiple) dim0 = NC_UNLIMITED`
+    /// (NDFileNetCDF.cpp:117-119) — and NDPluginFile passes that bit for
+    /// Capture and Stream but not Single (NDPluginFile.cpp:245, :281, :335).
+    /// A Capture/Stream file that ends up holding exactly ONE frame therefore
+    /// still has an unlimited frame axis; deriving it from `frames.len() > 1`
+    /// made it a fixed axis of 1. In netCDF-4 an unlimited dimension is an
+    /// HDF5 dataspace with no maximum on that axis.
     #[test]
-    fn test_num_arrays_dim_keyed_on_open_mode_not_frame_count() {
-        // R8-73. C picks the numArrays dimension from the open mode alone —
-        // `if (openMode & NDFileModeMultiple) dim0 = NC_UNLIMITED`
-        // (NDFileNetCDF.cpp:117-119) — and NDPluginFile passes that bit for
-        // Capture and Stream but not Single (NDPluginFile.cpp:245, :281, :335).
-        // A Capture/Stream file that ends up holding exactly ONE frame is
-        // therefore still NC_UNLIMITED; deriving it from `frames.len() > 1` made
-        // it a fixed dim of 1, a header divergence.
-        let frame = || NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        let num_arrays_is_unlimited = |path: &PathBuf| -> bool {
-            let reader = FileReader::open(path).unwrap();
-            reader
-                .data_set()
-                .get_dim(DIM_UNLIMITED)
-                .expect("numArrays dimension")
-                .is_unlimited()
+    fn the_frame_axis_is_extensible_for_capture_and_stream_not_single() {
+        let frame_axis_max = |path: &Path| -> Option<usize> {
+            let file = H5File::open(path).unwrap();
+            let ds = file.dataset(VAR_NAME).unwrap();
+            ds.max_shape().unwrap()[0]
         };
 
-        // One frame, Capture mode → NC_UNLIMITED (this is the R8-73 case).
-        let path = temp_path("nc_mode_capture_one");
-        let mut writer = NetcdfWriter::new();
-        writer
-            .open_file(&path, NDFileMode::Capture, &frame())
-            .unwrap();
-        writer.write_file(&Arc::new(frame())).unwrap();
-        writer.close_file().unwrap();
-        assert!(
-            num_arrays_is_unlimited(&path),
-            "Capture with 1 frame must still be NC_UNLIMITED"
-        );
-        std::fs::remove_file(&path).ok();
+        for (prefix, mode) in [
+            ("nc_mode_capture_one", NDFileMode::Capture),
+            ("nc_mode_stream_one", NDFileMode::Stream),
+        ] {
+            let path = write_frames(prefix, mode, &[make_u8(&[4], |_| 0)]);
+            assert_eq!(
+                frame_axis_max(&path),
+                None,
+                "{prefix} with 1 frame must still be unlimited"
+            );
+            std::fs::remove_file(&path).ok();
+        }
 
-        // One frame, Stream mode → NC_UNLIMITED.
-        let path = temp_path("nc_mode_stream_one");
-        let mut writer = NetcdfWriter::new();
-        writer
-            .open_file(&path, NDFileMode::Stream, &frame())
-            .unwrap();
-        writer.write_file(&Arc::new(frame())).unwrap();
-        writer.close_file().unwrap();
-        assert!(
-            num_arrays_is_unlimited(&path),
-            "Stream with 1 frame must still be NC_UNLIMITED"
+        let path = write_frames(
+            "nc_mode_single_one",
+            NDFileMode::Single,
+            &[make_u8(&[4], |_| 0)],
         );
-        std::fs::remove_file(&path).ok();
-
-        // One frame, Single mode → fixed dim of 1 (C's `dim0 = 1`).
-        let path = temp_path("nc_mode_single_one");
-        let mut writer = NetcdfWriter::new();
-        writer
-            .open_file(&path, NDFileMode::Single, &frame())
-            .unwrap();
-        writer.write_file(&Arc::new(frame())).unwrap();
-        writer.close_file().unwrap();
-        assert!(
-            !num_arrays_is_unlimited(&path),
-            "Single must be a fixed numArrays dimension"
+        assert_eq!(
+            frame_axis_max(&path),
+            Some(1),
+            "Single must be a fixed frame axis"
         );
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_attributes_stored_as_per_frame_variables() {
-        let path = temp_path("nc_attrs");
-        let mut writer = NetcdfWriter::new();
-
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+    fn attributes_are_per_frame_datasets_with_their_text_metadata() {
+        let mut arr = make_u8(&[4], |_| 0);
         arr.attributes.add(NDAttribute::new_static(
             "exposure",
             "Exposure time",
@@ -1099,48 +924,36 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(42),
         ));
+        let path = write_frames("nc_attrs", NDFileMode::Single, &[arr]);
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
-
-        let mut reader = FileReader::open(&path).unwrap();
-        {
-            let ds = reader.data_set();
-            // Per-attribute Attr_<name> variables exist with the leading dim.
-            assert!(ds.get_var("Attr_exposure").is_some());
-            assert!(ds.get_var("Attr_gain").is_some());
-            // Four descriptive global text attributes per NDAttribute.
-            assert_eq!(
-                ds.get_global_attr_as_string("Attr_exposure_DataType"),
-                Some("Float64".to_string())
-            );
-            assert_eq!(
-                ds.get_global_attr_as_string("Attr_gain_DataType"),
-                Some("Int32".to_string())
-            );
-            assert_eq!(
-                ds.get_global_attr_as_string("Attr_exposure_Description"),
-                Some("Exposure time".to_string())
-            );
-            assert_eq!(
-                ds.get_global_attr_as_string("Attr_gain_SourceType"),
-                Some("NDAttrSourceDriver".to_string())
-            );
+        let file = H5File::open(&path).unwrap();
+        // The per-frame value is recoverable from the dataset, typed as the
+        // attribute is.
+        assert_eq!(
+            file.dataset("Attr_exposure")
+                .unwrap()
+                .read_raw::<f64>()
+                .unwrap(),
+            vec![0.5]
+        );
+        assert_eq!(
+            file.dataset("Attr_gain")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            vec![42]
+        );
+        // Four descriptive text attributes per NDAttribute, on the root group
+        // where a netCDF-4 file keeps its global attributes.
+        for (name, want) in [
+            ("Attr_exposure_DataType", "Float64"),
+            ("Attr_gain_DataType", "Int32"),
+            ("Attr_exposure_Description", "Exposure time"),
+            ("Attr_gain_SourceType", "NDAttrSourceDriver"),
+        ] {
+            assert_eq!(file.attr_string(name).unwrap(), want, "{name}");
         }
-        // The per-frame value is recoverable from the variable.
-        if let netcdf3::DataVector::F64(v) = reader.read_var("Attr_exposure").unwrap() {
-            assert_eq!(v, vec![0.5]);
-        } else {
-            panic!("Attr_exposure should be F64");
-        }
-        if let netcdf3::DataVector::I32(v) = reader.read_var("Attr_gain").unwrap() {
-            assert_eq!(v, vec![42]);
-        } else {
-            panic!("Attr_gain should be I32");
-        }
-
-        drop(reader);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 
@@ -1151,11 +964,8 @@ mod tests {
     /// frame's value, which is the same only until the attribute changes.
     #[test]
     fn attribute_that_drops_out_records_its_last_value() {
-        let path = temp_path("nc_attr_sticky");
-        let mut writer = NetcdfWriter::new();
-
         let mk = |exposure: Option<f64>| {
-            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            let mut arr = make_u8(&[4], |_| 0);
             if let Some(v) = exposure {
                 arr.attributes.add(NDAttribute::new_static(
                     "exposure",
@@ -1166,133 +976,123 @@ mod tests {
             }
             arr
         };
-
-        let a0 = mk(Some(0.5));
-        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
-        writer.write_file(&Arc::new(a0)).unwrap();
-        writer.write_file(&Arc::new(mk(Some(0.75)))).unwrap();
-        writer.write_file(&Arc::new(mk(None))).unwrap();
-        writer.close_file().unwrap();
-
-        let mut reader = FileReader::open(&path).unwrap();
-        match reader.read_var("Attr_exposure").unwrap() {
-            netcdf3::DataVector::F64(v) => assert_eq!(v, vec![0.5, 0.75, 0.75]),
-            other => panic!("Attr_exposure should be F64, got {other:?}"),
-        }
-
-        drop(reader);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_single_frame_array_data_has_leading_numarrays_dim() {
-        let path = temp_path("nc_rank");
-        let mut writer = NetcdfWriter::new();
-
-        let arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(3)],
-            NDDataType::UInt8,
+        let path = write_frames(
+            "nc_attr_sticky",
+            NDFileMode::Stream,
+            &[mk(Some(0.5)), mk(Some(0.75)), mk(None)],
         );
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
 
-        let reader = FileReader::open(&path).unwrap();
-        let ds = reader.data_set();
-        let var = ds.get_var("array_data").unwrap();
-        // C++ always defines array_data with rank ndims+1; a 2-D NDArray
-        // single-frame file must therefore have a 3-D array_data variable.
-        assert_eq!(var.get_dims().len(), 3);
-        assert_eq!(var.get_dims()[0].name(), "numArrays");
-        assert_eq!(var.get_dims()[0].size(), 1);
-
-        drop(reader);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_global_attrs_match_c_set() {
-        // C (NDFileNetCDF.cpp:92-101) writes dataType then the
-        // NDNetCDFFileVersion=3.1 double as global attributes. uniqueId is a
-        // per-frame variable (:183) and numArrays is the unlimited dimension
-        // (:119) — neither must appear as a global attribute.
-        let path = temp_path("nc_globals");
-        let mut writer = NetcdfWriter::new();
-
-        let arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(3)],
-            NDDataType::UInt8,
-        );
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
-
-        let reader = FileReader::open(&path).unwrap();
-        let ds = reader.data_set();
-
+        let file = H5File::open(&path).unwrap();
         assert_eq!(
-            ds.get_global_attr_f64("NDNetCDFFileVersion"),
-            Some([3.1f64].as_slice()),
-            "NDNetCDFFileVersion global must be the 3.1 double"
+            file.dataset("Attr_exposure")
+                .unwrap()
+                .read_raw::<f64>()
+                .unwrap(),
+            vec![0.5, 0.75, 0.75]
         );
-        assert!(ds.has_global_attr("dataType"));
-        assert!(
-            !ds.has_global_attr("uniqueId"),
-            "uniqueId is a variable in C, not a global attribute"
-        );
-        assert!(
-            !ds.has_global_attr("numArrays"),
-            "numArrays is a dimension in C, not a global attribute"
-        );
-        // uniqueId must still be present as a variable.
-        assert!(ds.get_var("uniqueId").is_some());
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
 
-        drop(reader);
+    /// C++ always defines array_data with rank ndims+1 (NDFileNetCDF.cpp:202-204),
+    /// reversing the NDArray dimensions because the first netCDF dimension
+    /// varies slowest (:123-132). A 2-D single-frame file is therefore a 3-D
+    /// dataset, and the reader has to undo both to get the NDArray back.
+    #[test]
+    fn single_frame_array_data_keeps_the_leading_frame_axis() {
+        let path = write_frames("nc_rank", NDFileMode::Single, &[make_u8(&[4, 3], |_| 0)]);
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset(VAR_NAME).unwrap().shape(), vec![1, 3, 4]);
+        drop(file);
+
+        let back = read_back(&path);
+        assert_eq!(
+            back.dims.iter().map(|d| d.size).collect::<Vec<_>>(),
+            vec![4, 3],
+            "read_file must undo the reversal"
+        );
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_all_four_metadata_variables_written_single_frame() {
-        let path = temp_path("nc_meta");
-        let mut writer = NetcdfWriter::new();
+    fn global_attrs_match_the_c_set_plus_the_container_provenance() {
+        // C (NDFileNetCDF.cpp:92-151) writes dataType, the
+        // NDNetCDFFileVersion=3.1 double and the five dim* attributes as
+        // global attributes. uniqueId is a per-frame variable (:183) and
+        // numArrays is a dimension (:119) — neither may appear as a global
+        // attribute. `_NCProperties` is the netCDF-4 container's own
+        // provenance.
+        let path = write_frames("nc_globals", NDFileMode::Single, &[make_u8(&[4, 3], |_| 0)]);
 
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let file = H5File::open(&path).unwrap();
+        let mut names = file.attr_names().unwrap();
+        names.sort();
+        let mut want = vec![
+            "_NCProperties",
+            "dataType",
+            "NDNetCDFFileVersion",
+            "numArrayDims",
+            "dimSize",
+            "dimOffset",
+            "dimBinning",
+            "dimReverse",
+        ];
+        want.sort();
+        assert_eq!(names, want);
+        assert!(
+            file.attr_string("_NCProperties")
+                .unwrap()
+                .starts_with("version=2,")
+        );
+        // uniqueId is a dataset, not a global attribute.
+        assert!(file.dataset("uniqueId").is_ok());
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_four_metadata_datasets_carry_the_frame_identity() {
+        let mut arr = make_u8(&[4], |_| 0);
         arr.unique_id = 99;
         arr.time_stamp = 12.5;
         arr.timestamp.sec = 555;
         arr.timestamp.nsec = 777;
+        let path = write_frames("nc_meta", NDFileMode::Single, &[arr]);
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&Arc::new(arr)).unwrap();
-        writer.close_file().unwrap();
-
-        let mut reader = FileReader::open(&path).unwrap();
-        for name in ["uniqueId", "timeStamp", "epicsTSSec", "epicsTSNsec"] {
-            assert!(
-                reader.data_set().get_var(name).is_some(),
-                "{name} variable missing"
-            );
-        }
-        match reader.read_var("uniqueId").unwrap() {
-            netcdf3::DataVector::I32(v) => assert_eq!(v, vec![99]),
-            other => panic!("uniqueId wrong type: {other:?}"),
-        }
-        match reader.read_var("epicsTSSec").unwrap() {
-            netcdf3::DataVector::I32(v) => assert_eq!(v, vec![555]),
-            other => panic!("epicsTSSec wrong type: {other:?}"),
-        }
-        match reader.read_var("epicsTSNsec").unwrap() {
-            netcdf3::DataVector::I32(v) => assert_eq!(v, vec![777]),
-            other => panic!("epicsTSNsec wrong type: {other:?}"),
-        }
-
-        drop(reader);
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("uniqueId").unwrap().read_raw::<i32>().unwrap(),
+            vec![99]
+        );
+        assert_eq!(
+            file.dataset("timeStamp")
+                .unwrap()
+                .read_raw::<f64>()
+                .unwrap(),
+            vec![12.5]
+        );
+        assert_eq!(
+            file.dataset("epicsTSSec")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            vec![555]
+        );
+        assert_eq!(
+            file.dataset("epicsTSNsec")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            vec![777]
+        );
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_nddatatype_ordinals_match_c() {
-        // The `dataType` global attribute stores `NDDataType as i32`, which the
+        // The `dataType` attribute stores `NDDataType as i32`, which the
         // reader uses to recover the original type. The discriminants must
         // match the C `NDDataType_t` enum (NDInt8=0 .. NDFloat64=9).
         assert_eq!(NDDataType::Int8 as i32, 0);
@@ -1307,340 +1107,136 @@ mod tests {
         assert_eq!(NDDataType::Float64 as i32, 9);
     }
 
-    // ---------------------------------------------------------------------
-    // R8-68: the on-disk header. These tests parse the raw CDF-1 bytes rather
-    // than going through the netcdf3 crate, because the defect they pin was a
-    // wrong nc_type *code* in the file — something an API-level round-trip
-    // through the same crate cannot see.
-    // ---------------------------------------------------------------------
-
-    /// netCDF-3 nc_type codes (classic format spec).
-    const NC_BYTE: u32 = 1;
-    const NC_CHAR: u32 = 2;
-    const NC_SHORT: u32 = 3;
-    const NC_INT: u32 = 4;
-    const NC_DOUBLE: u32 = 6;
-
-    struct RawVar {
-        name: String,
-        nc_type: u32,
-        dim_ids: Vec<u32>,
-        begin: usize,
-    }
-
-    struct RawHeader {
-        dims: Vec<(String, u32)>,
-        gatt_names: Vec<String>,
-        vars: Vec<RawVar>,
-    }
-
-    impl RawHeader {
-        fn var(&self, name: &str) -> &RawVar {
-            self.vars
-                .iter()
-                .find(|v| v.name == name)
-                .unwrap_or_else(|| panic!("no variable {} in file", name))
-        }
-        fn var_names(&self) -> Vec<&str> {
-            self.vars.iter().map(|v| v.name.as_str()).collect()
-        }
-        fn dim_names(&self) -> Vec<&str> {
-            self.dims.iter().map(|(n, _)| n.as_str()).collect()
-        }
-    }
-
-    /// Minimal reader for the CDF-1 header: magic, numrecs, dim_list,
-    /// gatt_list, var_list. Independent of the netcdf3 crate on purpose.
-    struct Cursor<'a> {
-        b: &'a [u8],
-        p: usize,
-    }
-
-    impl<'a> Cursor<'a> {
-        fn u32(&mut self) -> u32 {
-            let v = u32::from_be_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
-            self.p += 4;
-            v
-        }
-        /// name = nelems + chars, zero-padded to a 4-byte boundary.
-        fn name(&mut self) -> String {
-            let n = self.u32() as usize;
-            let s = String::from_utf8(self.b[self.p..self.p + n].to_vec()).unwrap();
-            self.p += n.div_ceil(4) * 4;
-            s
-        }
-        fn skip_att_list(&mut self) {
-            let tag = self.u32();
-            let n = self.u32() as usize;
-            assert!(
-                tag == 0x0C || (tag == 0 && n == 0),
-                "bad att_list tag {tag}"
-            );
-            for _ in 0..n {
-                let _name = self.name();
-                let nc_type = self.u32();
-                let nelems = self.u32() as usize;
-                let size = match nc_type {
-                    1 | 2 => 1,
-                    3 => 2,
-                    4 | 5 => 4,
-                    6 => 8,
-                    t => panic!("bad nc_type {t}"),
-                };
-                self.p += (nelems * size).div_ceil(4) * 4;
-            }
-        }
-    }
-
-    fn parse_header(bytes: &[u8]) -> RawHeader {
-        assert_eq!(&bytes[0..4], b"CDF\x01", "not a CDF-1 file");
-        let mut c = Cursor { b: bytes, p: 4 };
-        let _numrecs = c.u32();
-
-        // dim_list
-        let tag = c.u32();
-        let ndims = c.u32() as usize;
-        assert!(tag == 0x0A || (tag == 0 && ndims == 0));
-        let mut dims = Vec::new();
-        for _ in 0..ndims {
-            let name = c.name();
-            let len = c.u32();
-            dims.push((name, len));
-        }
-
-        // gatt_list — capture the names in file order, skip the values.
-        let tag = c.u32();
-        let natts = c.u32() as usize;
-        assert!(tag == 0x0C || (tag == 0 && natts == 0));
-        let mut gatt_names = Vec::new();
-        for _ in 0..natts {
-            let name = c.name();
-            let nc_type = c.u32();
-            let nelems = c.u32() as usize;
-            let size = match nc_type {
-                1 | 2 => 1,
-                3 => 2,
-                4 | 5 => 4,
-                6 => 8,
-                t => panic!("bad nc_type {t}"),
-            };
-            c.p += (nelems * size).div_ceil(4) * 4;
-            gatt_names.push(name);
-        }
-
-        // var_list
-        let tag = c.u32();
-        let nvars = c.u32() as usize;
-        assert!(tag == 0x0B || (tag == 0 && nvars == 0));
-        let mut vars = Vec::new();
-        for _ in 0..nvars {
-            let name = c.name();
-            let rank = c.u32() as usize;
-            let dim_ids: Vec<u32> = (0..rank).map(|_| c.u32()).collect();
-            c.skip_att_list();
-            let nc_type = c.u32();
-            let _vsize = c.u32();
-            let begin = c.u32() as usize;
-            vars.push(RawVar {
+    /// An attribute dataset's element is the attribute's own type, and a
+    /// string attribute's is the fixed 256-byte field C writes
+    /// (NDFileNetCDF.cpp:302-316 spelled it `[numArrays, attrStringSize]`).
+    #[test]
+    fn attr_datasets_are_typed_like_the_attribute() {
+        let mut arr = make_u8(&[2, 2], |_| 0);
+        for (name, value) in [
+            ("Str", NDAttrValue::String("hello".into())),
+            ("I8", NDAttrValue::Int8(-3)),
+            ("I16", NDAttrValue::Int16(-3)),
+            ("I32", NDAttrValue::Int32(-3)),
+            ("I64", NDAttrValue::Int64(-3)),
+            ("F32", NDAttrValue::Float32(-3.0)),
+        ] {
+            arr.attributes.add(NDAttribute::new_static(
                 name,
-                nc_type,
-                dim_ids,
-                begin,
-            });
+                "",
+                NDAttrSource::Driver,
+                value,
+            ));
         }
-        RawHeader {
-            dims,
-            gatt_names,
-            vars,
+        let path = write_frames("nc_attr_types", NDFileMode::Single, &[arr]);
+
+        let file = H5File::open(&path).unwrap();
+        for (name, width) in [
+            ("Attr_I8", 1),
+            ("Attr_I16", 2),
+            ("Attr_I32", 4),
+            // netCDF-3 had to cast a 64-bit integer to a double (:299-301);
+            // netCDF-4 stores it as itself.
+            ("Attr_I64", 8),
+            ("Attr_F32", 4),
+            ("Attr_Str", ATTR_STRING_SIZE),
+        ] {
+            let ds = file.dataset(name).unwrap();
+            assert_eq!(ds.element_size(), width, "{name} element width");
+            assert_eq!(ds.shape(), vec![1], "{name} shape");
         }
-    }
-
-    fn write_one(path: &PathBuf, arr: &NDArray) -> Vec<u8> {
-        let mut writer = NetcdfWriter::new();
-        writer.open_file(path, NDFileMode::Single, arr).unwrap();
-        writer.write_file(&Arc::new(arr.clone())).unwrap();
-        writer.close_file().unwrap();
-        let bytes = std::fs::read(path).unwrap();
-        std::fs::remove_file(path).ok();
-        bytes
-    }
-
-    /// C maps NDUInt8 to NC_BYTE (NDFileNetCDF.cpp:155-158). The port wrote
-    /// NC_CHAR, which is a text type: readers get characters, not numbers.
-    #[test]
-    fn test_r8_68_uint8_array_data_is_nc_byte() {
-        let path = temp_path("nc_r8_68_byte");
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(2), NDDimension::new(2)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
-            v.copy_from_slice(&[0, 1, 200, 255]);
-        }
-        let bytes = write_one(&path, &arr);
-        let hdr = parse_header(&bytes);
-
-        let var = hdr.var("array_data");
         assert_eq!(
-            var.nc_type, NC_BYTE,
-            "array_data must be NC_BYTE, not NC_CHAR"
+            file.dataset("Attr_I64").unwrap().read_raw::<i64>().unwrap(),
+            vec![-3]
         );
-
-        // C's nc_put_vara_uchar into an NC_BYTE variable copies the bit
-        // pattern, so 200 and 255 land as 0xC8 and 0xFF on disk.
-        assert_eq!(&bytes[var.begin..var.begin + 4], &[0x00, 0x01, 0xC8, 0xFF]);
+        let text = file.dataset("Attr_Str").unwrap().read_raw_bytes().unwrap();
+        assert_eq!(text.len(), ATTR_STRING_SIZE);
+        assert_eq!(&text[..6], b"hello\0", "NUL-terminated in a fixed field");
+        drop(file);
+        std::fs::remove_file(&path).ok();
     }
 
-    /// Int8 keeps NC_BYTE too — both signednesses collapse onto it in C, and
-    /// the `dataType` global attribute carries the sign.
+    /// Every netCDF dimension is an HDF5 dimension scale: `numArrays` and one
+    /// per array dimension, reversed as the dataspace is. The scales are
+    /// dimensions without coordinate variables, which is what the `NAME` text
+    /// records.
+    ///
+    /// `CLASS` and `NAME` are fixed-length null-terminated strings, and the
+    /// widths are not free: `H5DSis_scale` reports "not a dimension scale" for
+    /// a `CLASS` that is variable-length or not exactly 16 bytes on every
+    /// libhdf5 before 2.2.0 (hl/src/H5DS.c:2285-2300).
     #[test]
-    fn test_r8_68_int8_array_data_is_nc_byte() {
-        let path = temp_path("nc_r8_68_i8");
-        let arr = NDArray::new(
-            vec![NDDimension::new(2), NDDimension::new(2)],
-            NDDataType::Int8,
-        );
-        let hdr = parse_header(&write_one(&path, &arr));
-        assert_eq!(hdr.var("array_data").nc_type, NC_BYTE);
-    }
+    fn every_dimension_gets_a_named_scale() {
+        let path = write_frames("nc_dims", NDFileMode::Single, &[make_u8(&[4, 2], |_| 0)]);
 
-    /// C defines a string attribute's variable as NC_CHAR
-    /// (NDFileNetCDF.cpp:302-304); the port used NC_BYTE. Non-string
-    /// attributes keep C's numeric types.
-    #[test]
-    fn test_r8_68_attr_variable_nc_types_match_c() {
-        let path = temp_path("nc_r8_68_attrs");
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(2), NDDimension::new(2)],
-            NDDataType::UInt16,
-        );
-        arr.attributes.add(NDAttribute::new_static(
-            "Str",
-            "a string",
-            NDAttrSource::Driver,
-            NDAttrValue::String("hello".into()),
-        ));
-        arr.attributes.add(NDAttribute::new_static(
-            "I8",
-            "a byte",
-            NDAttrSource::Driver,
-            NDAttrValue::Int8(-3),
-        ));
-        arr.attributes.add(NDAttribute::new_static(
-            "I16",
-            "a short",
-            NDAttrSource::Driver,
-            NDAttrValue::Int16(-3),
-        ));
-        arr.attributes.add(NDAttribute::new_static(
-            "I32",
-            "an int",
-            NDAttrSource::Driver,
-            NDAttrValue::Int32(-3),
-        ));
-        arr.attributes.add(NDAttribute::new_static(
-            "I64",
-            "a long",
-            NDAttrSource::Driver,
-            NDAttrValue::Int64(-3),
-        ));
-        let bytes = write_one(&path, &arr);
-        let hdr = parse_header(&bytes);
-
+        let file = H5File::open(&path).unwrap();
+        let mut names = file.dataset_names();
+        names.sort();
         assert_eq!(
-            hdr.var("Attr_Str").nc_type,
-            NC_CHAR,
-            "string attr must be NC_CHAR"
-        );
-        assert_eq!(hdr.var("Attr_I8").nc_type, NC_BYTE);
-        assert_eq!(hdr.var("Attr_I16").nc_type, NC_SHORT);
-        assert_eq!(hdr.var("Attr_I32").nc_type, NC_INT);
-        // netCDF-3 has no 64-bit integer: C casts to double (:299-301).
-        assert_eq!(hdr.var("Attr_I64").nc_type, NC_DOUBLE);
-
-        // The string variable is 2-D: [numArrays, attrStringSize] (:313-316).
-        let str_var = hdr.var("Attr_Str");
-        assert_eq!(str_var.dim_ids.len(), 2);
-        let attr_dim = str_var.dim_ids[1] as usize;
-        assert_eq!(hdr.dims[attr_dim], ("attrStringSize".to_string(), 256));
-        // Text on disk, NUL-padded to the fixed width.
-        assert_eq!(&bytes[str_var.begin..str_var.begin + 6], b"hello\0");
-    }
-
-    /// C defines attrStringSize unconditionally (NDFileNetCDF.cpp:134-136).
-    /// The port defined it only when a string attribute existed, so files with
-    /// no string attribute had a dimension list C never writes.
-    #[test]
-    fn test_r8_68_attr_string_dim_defined_without_string_attrs() {
-        let path = temp_path("nc_r8_68_nodim");
-        let arr = NDArray::new(
-            vec![NDDimension::new(2), NDDimension::new(2)],
-            NDDataType::UInt16,
-        );
-        let hdr = parse_header(&write_one(&path, &arr));
-        assert_eq!(
-            hdr.dim_names(),
-            vec!["numArrays", "dim0", "dim1", "attrStringSize"]
-        );
-        assert_eq!(hdr.dims[3].1, 256);
-    }
-
-    /// The header's three lists are ordered, and C's order is the format.
-    /// Dimensions: numArrays, the reversed array dims, attrStringSize.
-    /// Variables: the four metadata variables, array_data, then the
-    /// attributes. Global attributes: the seven fixed ones, then four per
-    /// attribute (NDFileNetCDF.cpp:92-330).
-    #[test]
-    fn test_r8_68_definition_order_matches_c() {
-        let path = temp_path("nc_r8_68_order");
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(2)],
-            NDDataType::UInt16,
-        );
-        arr.attributes.add(NDAttribute::new_static(
-            "Gain",
-            "detector gain",
-            NDAttrSource::Driver,
-            NDAttrValue::Float64(2.5),
-        ));
-        let hdr = parse_header(&write_one(&path, &arr));
-
-        assert_eq!(
-            hdr.dim_names(),
-            vec!["numArrays", "dim0", "dim1", "attrStringSize"]
-        );
-        // Reversed: netCDF's first dimension varies slowest (:123-132).
-        assert_eq!(hdr.dims[1].1, 2);
-        assert_eq!(hdr.dims[2].1, 4);
-
-        assert_eq!(
-            hdr.var_names(),
+            names,
             vec![
-                "uniqueId",
-                "timeStamp",
-                "epicsTSSec",
-                "epicsTSNsec",
                 "array_data",
-                "Attr_Gain",
+                "dim0",
+                "dim1",
+                "epicsTSNsec",
+                "epicsTSSec",
+                "numArrays",
+                "timeStamp",
+                "uniqueId",
             ]
         );
-
-        assert_eq!(
-            hdr.gatt_names,
-            vec![
-                "dataType",
-                "NDNetCDFFileVersion",
-                "numArrayDims",
-                "dimSize",
-                "dimOffset",
-                "dimBinning",
-                "dimReverse",
-                "Attr_Gain_DataType",
-                "Attr_Gain_Description",
-                "Attr_Gain_Source",
-                "Attr_Gain_SourceType",
-            ]
-        );
+        // Every variable names its dimensions through DIMENSION_LIST: without
+        // the attachment a netCDF reader invents an anonymous `phony_dim_N` for
+        // the axis instead of reading `numArrays`.
+        for name in [
+            "array_data",
+            "uniqueId",
+            "timeStamp",
+            "epicsTSSec",
+            "epicsTSNsec",
+        ] {
+            assert!(
+                file.dataset(name)
+                    .unwrap()
+                    .attr_names()
+                    .unwrap()
+                    .contains(&"DIMENSION_LIST".to_string()),
+                "{name} DIMENSION_LIST"
+            );
+        }
+        for (name, len) in [("numArrays", 1), ("dim0", 2), ("dim1", 4)] {
+            let ds = file.dataset(name).unwrap();
+            assert_eq!(ds.shape(), vec![len], "{name} length");
+            let class = ds.attr("CLASS").unwrap();
+            assert_eq!(
+                class.read_string().unwrap(),
+                "DIMENSION_SCALE",
+                "{name} CLASS"
+            );
+            assert_eq!(
+                class.datatype().unwrap(),
+                DatatypeMessage::fixed_string(16),
+                "{name} CLASS datatype"
+            );
+            let label = ds.attr("NAME").unwrap();
+            let text = format!("{DIM_WITHOUT_VARIABLE}{len:10}");
+            assert_eq!(label.read_string().unwrap(), text, "{name} NAME");
+            assert_eq!(
+                label.datatype().unwrap(),
+                DatatypeMessage::fixed_string(text.len() as u32 + 1),
+                "{name} NAME datatype"
+            );
+            // The scale is on the receiving end of an attachment, so it carries
+            // the reciprocal REFERENCE_LIST.
+            assert!(
+                ds.attr_names()
+                    .unwrap()
+                    .contains(&"REFERENCE_LIST".to_string()),
+                "{name} REFERENCE_LIST"
+            );
+        }
+        drop(file);
+        std::fs::remove_file(&path).ok();
     }
 
     /// F4: with `FileWriteMode=Stream` and `NumCapture=0` the controller never
@@ -1661,5 +1257,36 @@ mod tests {
         assert!(writer.frames.is_empty(), "no frame may be buffered");
         assert!(!fb.is_open());
         assert_eq!(fb.num_captured(), 0);
+    }
+
+    /// `array_data` is chunked one frame deep, so a frame larger than a chunk
+    /// cache or an HDF5 I/O block is the case that crosses whatever buffering
+    /// sits under the write. Both modes: a single frame, and two frames whose
+    /// rows have to land in the right chunk.
+    #[test]
+    fn frames_larger_than_one_megabyte_round_trip() {
+        let n = (1 << 20) + 12_345;
+        let mk = |seed: u8| make_u8(&[n], move |i| (i as u8).wrapping_add(seed));
+
+        let path = write_frames("nc_big_single", NDFileMode::Single, &[mk(0)]);
+        let back = read_back(&path);
+        let (NDDataBuffer::U8(want), NDDataBuffer::U8(got)) = (&mk(0).data, &back.data) else {
+            panic!("expected UInt8 on both sides");
+        };
+        assert_eq!(want, got);
+        std::fs::remove_file(&path).ok();
+
+        let path = write_frames("nc_big_capture", NDFileMode::Capture, &[mk(0), mk(77)]);
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset(VAR_NAME).unwrap();
+        for (record, seed) in [(0usize, 0u8), (1, 77)] {
+            let got = ds.read_slice::<u8>(&[record, 0], &[1, n]).unwrap();
+            let NDDataBuffer::U8(want) = &mk(seed).data else {
+                unreachable!()
+            };
+            assert_eq!(&got, want, "record {record}");
+        }
+        drop(file);
+        std::fs::remove_file(&path).ok();
     }
 }

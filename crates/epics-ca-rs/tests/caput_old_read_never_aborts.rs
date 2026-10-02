@@ -31,35 +31,30 @@ use epics_ca_rs::server::CaServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
-
-/// Bind the proxy's UDP socket and TCP listener on the SAME port number,
-/// holding both — a port is TAKEN by binding it, never probed and handed on.
+/// Bind the proxy's UDP search socket and its TCP circuit listener, each on
+/// its own ephemeral number, holding both — a port is TAKEN by binding it,
+/// never probed and handed on.
 ///
-/// The proxy needs one number on both protocols, so it cannot use the plain
-/// `.port(0)` + read-back pattern of a single socket: bind TCP on `:0` to
-/// take a number, then bind UDP on that number; retry the pair with a fresh
-/// number if the UDP side is taken. There is no drop→rebind window at any
-/// point — under a parallel test run the old probe-then-drop pattern lost
-/// the number to a neighbour and the bind `expect` panicked the test.
-///
-/// TCP anchors the pair, not UDP: Windows CI runners carry Hyper-V
-/// administered port exclusions on the TCP side, and the UDP ephemeral
-/// allocator is sequential — a UDP-first anchor that wanders into a
-/// TCP-excluded block stays inside it for every retry (observed on GitHub
-/// runners: 10 straight anchors in one block, every TCP bind refused). The
-/// TCP allocator never hands out a number from its own excluded ranges.
-async fn bind_proxy_pair() -> (UdpSocket, TcpListener, u16) {
-    const ATTEMPTS: usize = 10;
-    for _ in 0..ATTEMPTS {
-        let tcp = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind proxy TCP");
-        let port = tcp.local_addr().expect("proxy TCP addr").port();
-        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)).await {
-            return (udp, tcp, port);
-        }
-    }
-    panic!("no same-numbered UDP+TCP port pair in {ATTEMPTS} attempts");
+/// The two numbers are deliberately unrelated. A CA client learns the data
+/// circuit's port from the SEARCH reply header's `data_type` field, never from
+/// where it sent the search — C `udpiiu.cpp:1077-1090` ("the type field is
+/// abused to carry the port number so that we can have multiple servers on one
+/// host"), Rust `client/search.rs:1841`. The proxy rewrites that field below,
+/// so one number on both protocols buys nothing, and insisting on it is what
+/// broke this test on Windows CI: Hyper-V's administered port exclusions are
+/// per-protocol and both ephemeral allocators are sequential, so an anchor
+/// that lands in a block excluded on the *other* protocol stays inside it for
+/// every retry — whichever protocol anchors the pair.
+async fn bind_proxy_sockets() -> (UdpSocket, TcpListener, u16, u16) {
+    let udp = UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind proxy UDP");
+    let tcp = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind proxy TCP");
+    let search_port = udp.local_addr().expect("proxy UDP addr").port();
+    let circuit_port = tcp.local_addr().expect("proxy TCP addr").port();
+    (udp, tcp, search_port, circuit_port)
 }
 
 /// Relay one direction of a CA circuit frame by frame. In the server→client
@@ -100,13 +95,14 @@ async fn relay(
 
 /// Search-and-relay proxy: UDP searches are forwarded to `server_udp` and
 /// their replies re-pointed at the proxy's TCP port; the circuit to
-/// `server_tcp` is relayed with every read reply denied.
+/// `server_tcp` is relayed with every read reply denied. Returns the proxy's
+/// UDP search port, the one the client is pointed at.
 ///
 /// The two server ports are distinct: the server bound them itself from
 /// `.port(0)`, so the UDP search port and the TCP data port are separate
 /// ephemerals.
 async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
-    let (udp, tcp, proxy_port) = bind_proxy_pair().await;
+    let (udp, tcp, search_port, circuit_port) = bind_proxy_sockets().await;
     let search: SocketAddr = ([127, 0, 0, 1], server_udp).into();
     let circuit: SocketAddr = ([127, 0, 0, 1], server_tcp).into();
 
@@ -133,7 +129,7 @@ async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
                 let cmmd = u16::from_be_bytes([reply[off], reply[off + 1]]);
                 let postsize = u16::from_be_bytes([reply[off + 2], reply[off + 3]]) as usize;
                 if cmmd == CA_PROTO_SEARCH {
-                    reply[off + 4..off + 6].copy_from_slice(&proxy_port.to_be_bytes());
+                    reply[off + 4..off + 6].copy_from_slice(&circuit_port.to_be_bytes());
                 }
                 off += CaHeader::SIZE + postsize;
             }
@@ -156,7 +152,7 @@ async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
         }
     });
 
-    proxy_port
+    search_port
 }
 
 /// `caput` against a PV whose every get fails: C prints the `*** no read
@@ -173,13 +169,13 @@ async fn caput_writes_a_read_denied_pv_and_exits_zero() {
     let db = server.database().clone();
     tokio::spawn(async move { server.run().await });
 
-    let proxy_port = read_denying_proxy(server_udp, server_tcp).await;
+    let search_port = read_denying_proxy(server_udp, server_tcp).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "2", "R921:WRITEONLY", "42"])
-        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{proxy_port}"))
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"))
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CA_SERVER_PORT", proxy_port.to_string())
+        .env("EPICS_CA_SERVER_PORT", search_port.to_string())
         .output()
         .await
         .expect("run caput-rs");
@@ -233,13 +229,13 @@ async fn caput_new_read_error_prints_the_marker_not_the_submitted_value() {
     let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
     tokio::spawn(async move { server.run().await });
 
-    let proxy_port = read_denying_proxy(server_udp, server_tcp).await;
+    let search_port = read_denying_proxy(server_udp, server_tcp).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "2", "R923:NOREAD", "42"])
-        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{proxy_port}"))
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"))
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CA_SERVER_PORT", proxy_port.to_string())
+        .env("EPICS_CA_SERVER_PORT", search_port.to_string())
         .output()
         .await
         .expect("run caput-rs");

@@ -1444,17 +1444,23 @@ mod tests {
         let pq = Arc::new(PriorityQueue::new(CAPACITY, 1));
         let claimed = Arc::new(AtomicUsize::new(0));
         let popped = Arc::new(AtomicUsize::new(0));
-        let deep = |pq: &PriorityQueue| {
+        // A broken count panics the thread that reads it, and the remaining
+        // threads would then wait out the harness timeout for entries nobody
+        // is pushing any more. Every loop watches for that, so a regression
+        // reports in milliseconds.
+        let broken = Arc::new(AtomicBool::new(false));
+        let deep = |pq: &PriorityQueue, broken: &AtomicBool| {
             let used = pq.queue.ring_used();
-            assert!(
-                used <= CAPACITY,
-                "the ring of {CAPACITY} reported {used} entries queued"
-            );
+            if used > CAPACITY {
+                broken.store(true, Ordering::SeqCst);
+                panic!("the ring of {CAPACITY} reported {used} entries queued");
+            }
         };
 
         std::thread::scope(|s| {
             for _ in 0..2 {
-                let (pq, claimed) = (Arc::clone(&pq), Arc::clone(&claimed));
+                let (pq, claimed, broken) =
+                    (Arc::clone(&pq), Arc::clone(&claimed), Arc::clone(&broken));
                 s.spawn(move || {
                     // An entry is claimed before it is pushed, so exactly
                     // `TOTAL` reach the ring however the two pushers
@@ -1463,17 +1469,21 @@ mod tests {
                     // behind that the poppers have already stopped counting.
                     while claimed.fetch_add(1, Ordering::Relaxed) < TOTAL {
                         while pq.request("cbLow", Box::new(|| {})).is_err() {
-                            deep(&pq);
+                            deep(&pq, &broken);
                             // A full ring is the poppers' turn: spinning on it
                             // instead starves them on an oversubscribed box.
                             std::thread::yield_now();
                         }
-                        deep(&pq);
+                        deep(&pq, &broken);
+                        if broken.load(Ordering::SeqCst) {
+                            return;
+                        }
                     }
                 });
             }
             for _ in 0..2 {
-                let (pq, popped) = (Arc::clone(&pq), Arc::clone(&popped));
+                let (pq, popped, broken) =
+                    (Arc::clone(&pq), Arc::clone(&popped), Arc::clone(&broken));
                 s.spawn(move || {
                     loop {
                         match pq.queue.pop() {
@@ -1487,14 +1497,16 @@ mod tests {
                             // `TOTAL` pops can only have happened after
                             // `TOTAL` pushes, so nothing can still arrive.
                             None if popped.load(Ordering::Relaxed) >= TOTAL => return,
+                            None if broken.load(Ordering::SeqCst) => return,
                             None => std::thread::yield_now(),
                         }
-                        deep(&pq);
+                        deep(&pq, &broken);
                     }
                 });
             }
         });
 
+        assert!(!broken.load(Ordering::SeqCst), "see the panic above");
         assert_eq!(
             pq.queue.ring_used(),
             0,

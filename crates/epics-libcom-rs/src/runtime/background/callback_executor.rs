@@ -57,9 +57,17 @@
 //! C sets a per-band `queueOverflow` flag when a push finds the ring full; a
 //! subsequent `callbackRequest` returns `S_db_bufFull` *immediately*
 //! (`callback.c:365`) without even attempting a push, until a worker pops an
-//! entry and clears the flag (`callback.c:227`). We reproduce that exact
-//! latch: once `overflow` is set, `request` rejects until a worker drains one
-//! entry.
+//! entry and clears the flag (`callback.c:227`).
+//!
+//! The flag here does what C's does for the *message* — one
+//! `callbackRequest: ERROR` and one `queueOverflows` tick per overflow
+//! episode, cleared by the pop that makes room — but it does not gate the
+//! push, because C's gate can wedge the band for good. The flag is set after
+//! the failed push, so a worker that drains the ring in between clears it
+//! first and the set lands on an empty ring: every later `callbackRequest`
+//! is then refused with every slot free, and only a pop would clear the flag,
+//! which needs a push. Whether a band is full is the slot supply's answer
+//! alone (`callback_queue::Pool`), which cannot disagree with itself.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -271,9 +279,8 @@ impl CallbackPriority {
 /// surfacing an error to the caller (`callback.c:237-284`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
-    /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`). Either
-    /// the push found the ring at capacity, or the overflow latch is still set
-    /// from a prior full push (`callback.c:365`).
+    /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`): the
+    /// push found every slot of the ring taken.
     QueueFull,
 }
 
@@ -299,7 +306,10 @@ struct PriorityQueue {
     /// derivable after the fact, so it is latched on the pushes that deepen
     /// the ring; a push that does not deepen it only reads.
     high_water: AtomicUsize,
-    /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
+    /// C `cbQueueSet.queueOverflow` (`callback.c:56`) — which overflow
+    /// episode has already been named. Claimed by [`Self::report_full`],
+    /// released by the pop that makes room; it never decides whether a push
+    /// is allowed.
     overflow: AtomicBool,
     /// C `cbQueueSet.queueOverflows` — lifetime overflow count
     /// (`callback.c:57`).
@@ -337,18 +347,24 @@ impl PriorityQueue {
         }
     }
 
-    /// Latch the band full and count the episode — C `callback.c:367-374`.
+    /// Count the overflow episode and name it once — C `callback.c:367-374`.
+    ///
+    /// C reaches its `epicsInterruptContextMessage` and its
+    /// `queueOverflows` increment at most once per episode, because its gate
+    /// at `callback.c:365` turns every later request back before the push.
+    /// The latch is claimed here instead, so the message and the count stay
+    /// per-episode without a gate that can outlive the full ring.
     fn report_full(&self, name: &str) -> CallbackError {
-        self.overflow.store(true, Ordering::Release);
-        self.overflows.fetch_add(1, Ordering::Relaxed);
-        // callback.c:370 — `fullMessage[priority]`, printed once per overflow
-        // episode (the latch above suppresses repeats).
-        tracing::error!(
-            target: "epics_base_rs::runtime::callback",
-            band = name,
-            "callbackRequest: ERROR {} ring buffer full",
-            name
-        );
+        if !self.overflow.swap(true, Ordering::AcqRel) {
+            self.overflows.fetch_add(1, Ordering::Relaxed);
+            // callback.c:370 — `fullMessage[priority]`.
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callbackRequest: ERROR {} ring buffer full",
+                name
+            );
+        }
         CallbackError::QueueFull
     }
 
@@ -367,10 +383,6 @@ impl PriorityQueue {
                 "callbackRequest after shutdown dropped"
             );
             return Ok(());
-        }
-        // callback.c:365 — reject immediately while the overflow latch is set.
-        if self.overflow.load(Ordering::Acquire) {
-            return Err(CallbackError::QueueFull);
         }
         let depth = match self.queue.push_ring(Queued::Ring(cb)) {
             Ok(depth) => depth,
@@ -1393,6 +1405,38 @@ mod tests {
     /// `a_parallel_band_loses_no_entry_however_its_workers_are_parked`, and
     /// `stats` would have spun forever on it rather than reported it. The
     /// count is the slot supply's own, so this holds by construction.
+    /// The overflow latch is claimed *after* the push that failed, so a worker
+    /// can drain the whole ring in between and clear it before the claim
+    /// lands. C gates the next request on that flag (`callback.c:365`), which
+    /// leaves the band refusing every `callbackRequest` with every slot free —
+    /// and only a pop clears the flag, which now needs a push that cannot
+    /// happen. Whether the band is full has to be the ring's answer.
+    #[test]
+    fn a_band_whose_latch_outlived_its_full_ring_still_takes_requests() {
+        let pq = PriorityQueue::new(2, 1);
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull),
+            "a ring of two holds two"
+        );
+
+        // Drain without clearing the latch — the state a worker's pop and a
+        // requester's `report_full` land in when they cross.
+        while pq.queue.pop().is_some() {}
+        assert!(
+            pq.overflow.load(Ordering::Acquire),
+            "the latch is the premise"
+        );
+        assert_eq!(pq.queue.ring_used(), 0, "and an empty ring is the premise");
+
+        assert!(
+            pq.request("cbLow", Box::new(|| {})).is_ok(),
+            "every slot is free, so the band is not full"
+        );
+    }
+
     #[test]
     fn the_ring_count_never_reads_below_the_entries_queued() {
         const CAPACITY: usize = 4;

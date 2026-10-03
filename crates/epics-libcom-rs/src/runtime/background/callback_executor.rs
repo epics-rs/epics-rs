@@ -12,36 +12,45 @@
 //! signals the band's event; `callbackTask` (`callback.c:210`) waits on the
 //! event, drains the ring, and invokes each callback.
 //!
-//! This module keeps that structure but with **plain `std` threads +
-//! `Mutex`/`Condvar`** and boxed closures instead of C function pointers, so
-//! it carries **no tokio-runtime dependency** and runs on RTEMS
+//! This module keeps that structure but with **plain `std` threads and a
+//! lock-free band queue** and boxed closures instead of C function pointers,
+//! so it carries **no tokio-runtime dependency** and runs on RTEMS
 //! (armv7-rtems-eabihf). The OS thread priority per band is applied
 //! best-effort via the existing [`apply_to_current_thread`](crate::runtime::task::apply_to_current_thread) abstraction in
 //! [`crate::runtime::task`] — this module does **not** duplicate that logic.
 //!
-//! ## Waking the band (epics-base PR #996)
+//! ## No lock on the band (epics-base PR #996)
 //!
-//! C signals the band's event on every push (`callback.c:375`) and
-//! `callbackTask` re-triggers it on every pop it leaves work behind
-//! (`callback.c:224`), so a band pays a wake-up per entry whether or not a
-//! worker is actually asleep. That is what epics-base PR #996 attacks, with a
-//! lock-free inbox and a wake-up token per worker.
+//! A band is crossed by every priority in the IOC, so whatever guards it is a
+//! priority-inversion site. C guards its ring with `epicsSpin`, which on Linux
+//! is a priority-inheriting `pthread_mutex` whenever POSIX thread priority
+//! scheduling is available (`osdSpin.c:126`); inheritance bounds the inversion
+//! by boosting the holder. This port has nothing to boost on that path: a
+//! `callbackRequest` is one CAS onto `callback_queue::BandQueue`'s inbox and
+//! owns nothing, so a requester descheduled anywhere in it delays no one,
+//! whatever its priority. Inside the band, one worker does briefly own the
+//! root it is refilling — see that module for why that window is not an
+//! inversion site, and for why the queue is addressed by arena index rather
+//! than by pointer.
 //!
-//! The same cost existed here with a different cause: `Condvar::notify_one`
-//! is an unconditional `FUTEX_WAKE`, so a push paid a syscall even with every
-//! worker of the band running. `QueueState::waiters` removes it — a push
-//! signals only while a worker is blocked in `wait`, and because the counter
-//! is incremented and decremented under the same lock that holds the queue, a
-//! worker cannot be asleep without the next pusher seeing it.
+//! C also signals the band's event on every push (`callback.c:375`) and
+//! re-triggers it on every pop that leaves work behind (`callback.c:224`), so
+//! a band pays a wake-up per entry whether or not a worker is actually asleep.
+//! That is the other half of what epics-base PR #996 attacks, with a wake-up
+//! token per worker. Here a push wakes a worker only while one is parked, and
+//! the announce/poll pair that makes that safe is in
+//! `callback_queue::Parking`.
 //!
-//! The PR's other half, a take-all inbox, was implemented, measured and
-//! withdrawn. A batch taken out of a shared queue becomes private to the
-//! worker that took it, so one callback that blocks strands the rest of its
-//! batch even while other workers of the band sit idle — two callbacks that
-//! have to meet deadlock, which C's shared ring does not
-//! (`a_blocked_callback_does_not_strand_its_neighbours`). It was also slower
-//! than the counter on every shape measured, one to eight pushers against one
-//! and four workers.
+//! What PR #996 shows is worth taking is the take-all inbox; what it keeps
+//! that this does not is the *private* batch. A batch that becomes the
+//! property of the worker that took it strands its tail behind one callback
+//! that blocks, even while other workers of the band sit idle — two callbacks
+//! that have to meet then deadlock, which C's shared ring does not
+//! (`a_blocked_callback_does_not_strand_its_neighbours`). The private batch
+//! was implemented here, measured against that invariant, and withdrawn; the
+//! band now takes the inbox all at once and publishes it to a stack every
+//! worker pops from, so an entry becomes a worker's property only as that
+//! worker takes it.
 //!
 //! ## Overflow hysteresis (`callback.c:365-374`, `:227`)
 //!
@@ -52,12 +61,12 @@
 //! latch: once `overflow` is set, `request` rejects until a worker drains one
 //! entry.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 
-use super::facility::{recover, run_facility_loop, run_isolated};
+use super::callback_queue::{BandQueue, Parking};
+use super::facility::{run_facility_loop, run_isolated};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
@@ -279,67 +288,108 @@ enum Queued {
     Task(Callback),
 }
 
-/// Mutable, lock-guarded state of one priority band's ring.
-struct QueueState {
-    queue: VecDeque<Queued>,
-    /// Ring slots in use — the `Queued::Ring` entries in `queue`. This, not
-    /// `queue.len()`, is what C's bounded ring measures: a task's run-queue
-    /// entry shares the FIFO but holds no ring slot.
-    ring_used: usize,
-    /// C `epicsRingPointerGetHighWaterMark` on the band's ring — the
-    /// deepest the queue has ever been. `callbackQueueShow` reports it
-    /// and `callbackQueueStatus(reset=1)` clears it
-    /// (`callback.c:115-139`), so it is not derivable from `queue.len()`
-    /// after the fact and has to be latched on every push.
-    high_water: usize,
-    /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
-    overflow: bool,
-    /// C `cbQueueSet.queueOverflows` — lifetime overflow count
-    /// (`callback.c:57`).
-    overflows: u64,
-    shutdown: bool,
-    /// Workers parked on `wake` right now. The condvar's `notify_one` is an
-    /// unconditional `FUTEX_WAKE` syscall in std, so a push with no waiter
-    /// pays a syscall for nobody.
-    waiters: usize,
+/// Entries preallocated per band at construction. The band honours a larger
+/// configured `callbackQueueSize` by growing its arena on demand instead of
+/// reserving it all up front, which is what the `VecDeque` this replaced did
+/// with its own 1024-entry floor.
+const PREALLOC_MAX: usize = 64 * 1024;
+
+/// `used` lives in the low half of [`PriorityQueue::used_hw`], the high-water
+/// mark in the high half, so one CAS moves both — as C moves the ring's index
+/// and its high-water mark together under the ring's spinlock.
+#[inline]
+fn used_of(v: u64) -> usize {
+    (v & 0xffff_ffff) as usize
 }
 
-/// One priority band: a bounded ring plus its wake-up condvar. Mirrors C
-/// `cbQueueSet` (`callback.c:53-62`).
+#[inline]
+fn high_water_of(v: u64) -> usize {
+    (v >> 32) as usize
+}
+
+/// One priority band: a bounded lock-free FIFO plus the park slots its workers
+/// sleep in. Mirrors C `cbQueueSet` (`callback.c:53-62`).
 struct PriorityQueue {
     capacity: usize,
-    state: Mutex<QueueState>,
-    /// C `cbQueueSet.semWakeUp` (`callback.c:54`).
-    wake: Condvar,
+    queue: BandQueue<Queued>,
+    /// Ring slots in use, paired with the deepest the ring has ever been.
+    ///
+    /// `used` is what C's bounded ring measures, and it is not the queue's
+    /// length: a task's run-queue entry shares the FIFO but holds no ring
+    /// slot. The high-water half is C
+    /// `epicsRingPointerGetHighWaterMark` — `callbackQueueShow` reports it and
+    /// `callbackQueueStatus(reset=1)` clears it (`callback.c:115-139`), so it
+    /// is not derivable after the fact and has to be latched on every push.
+    used_hw: AtomicU64,
+    /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
+    overflow: AtomicBool,
+    /// C `cbQueueSet.queueOverflows` — lifetime overflow count
+    /// (`callback.c:57`).
+    overflows: AtomicU64,
+    shutdown: AtomicBool,
+    /// C `cbQueueSet.semWakeUp` (`callback.c:54`), as one park slot per
+    /// worker.
+    parking: Parking,
 }
 
 impl PriorityQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, workers: usize) -> Self {
         PriorityQueue {
             capacity,
-            state: Mutex::new(QueueState {
-                queue: VecDeque::with_capacity(capacity.min(1024)),
-                ring_used: 0,
-                high_water: 0,
-                overflow: false,
-                overflows: 0,
-                shutdown: false,
-                waiters: 0,
-            }),
-            wake: Condvar::new(),
+            queue: BandQueue::with_capacity(capacity.min(PREALLOC_MAX)),
+            used_hw: AtomicU64::new(0),
+            overflow: AtomicBool::new(false),
+            overflows: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            parking: Parking::new(workers),
         }
+    }
+
+    /// Claim one of the ring's `capacity` slots, or report the ring full.
+    /// Moves `used` and the high-water mark in the same CAS.
+    fn claim_ring_slot(&self) -> Result<(), CallbackError> {
+        loop {
+            let v = self.used_hw.load(Ordering::Acquire);
+            let used = used_of(v);
+            if used >= self.capacity {
+                return Err(CallbackError::QueueFull);
+            }
+            let next = (used + 1) as u64;
+            let hw = (high_water_of(v) as u64).max(next);
+            if self
+                .used_hw
+                .compare_exchange_weak(v, (hw << 32) | next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Latch the band full and count the episode — C `callback.c:367-374`.
+    fn report_full(&self, name: &str) -> CallbackError {
+        self.overflow.store(true, Ordering::Release);
+        self.overflows.fetch_add(1, Ordering::Relaxed);
+        // callback.c:370 — `fullMessage[priority]`, printed once per overflow
+        // episode (the latch above suppresses repeats).
+        tracing::error!(
+            target: "epics_base_rs::runtime::callback",
+            band = name,
+            "callbackRequest: ERROR {} ring buffer full",
+            name
+        );
+        CallbackError::QueueFull
     }
 
     /// Port of `callbackRequest` for a single band (`callback.c:341-377`).
     fn request(&self, name: &str, cb: Callback) -> Result<(), CallbackError> {
-        let mut st = recover(FACILITY, self.state.lock());
-        if st.shutdown {
+        if self.shutdown.load(Ordering::Acquire) {
             // Pool stopped: C drops late callbackRequests after callbackStop
             // without surfacing an error (`callback.c:237-284`). Drop `cb`
             // (deallocated here, never invoked) and report success. This also
             // absorbs the teardown race where the delayed timer fires into a
             // pool that has just been dropped.
-            drop(st);
+            drop(cb);
             tracing::trace!(
                 target: "epics_base_rs::runtime::callback",
                 band = name,
@@ -348,34 +398,19 @@ impl PriorityQueue {
             return Ok(());
         }
         // callback.c:365 — reject immediately while the overflow latch is set.
-        if st.overflow {
+        if self.overflow.load(Ordering::Acquire) {
             return Err(CallbackError::QueueFull);
         }
-        // callback.c:367-374 — push; on a full ring, latch overflow and count.
-        if st.ring_used >= self.capacity {
-            st.overflow = true;
-            st.overflows += 1;
-            // callback.c:370 — `fullMessage[priority]`, printed once per
-            // overflow episode (the latch above suppresses repeats).
-            tracing::error!(
-                target: "epics_base_rs::runtime::callback",
-                band = name,
-                "callbackRequest: ERROR {} ring buffer full",
-                name
-            );
-            return Err(CallbackError::QueueFull);
+        self.claim_ring_slot().map_err(|_| self.report_full(name))?;
+        if self.queue.push(Queued::Ring(cb)).is_err() {
+            // The arena's index space is exhausted — 4 G entries on one band,
+            // which no `callbackQueueSize` reaches. Give the slot back and
+            // report the band full, the error C has for this.
+            self.used_hw.fetch_sub(1, Ordering::AcqRel);
+            return Err(self.report_full(name));
         }
-        st.queue.push_back(Queued::Ring(cb));
-        st.ring_used += 1;
-        // The ring's high-water mark moves on the push that made it
-        // deepest, exactly where `epicsRingPointer` moves its own.
-        st.high_water = st.high_water.max(st.ring_used);
-        let waiting = st.waiters > 0;
-        drop(st);
-        // callback.c:375 — signal the band's wake-up event.
-        if waiting {
-            self.wake.notify_one();
-        }
+        // callback.c:375 — wake the band, but only if a worker is parked.
+        self.parking.wake_one();
         Ok(())
     }
 
@@ -383,33 +418,64 @@ impl PriorityQueue {
     /// see [`Queued::Task`]. After shutdown `cb` is dropped un-run, which is
     /// how the task learns it was cancelled.
     fn schedule_task(&self, cb: Callback) {
-        let mut st = recover(FACILITY, self.state.lock());
-        if st.shutdown {
+        if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        st.queue.push_back(Queued::Task(cb));
-        let waiting = st.waiters > 0;
-        drop(st);
-        if waiting {
-            self.wake.notify_one();
+        if let Err(entry) = self.queue.push(Queued::Task(cb)) {
+            // Only reachable with the whole 4 G index space queued; dropping
+            // the entry finalizes its task rather than stranding it.
+            drop(entry);
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                "callback band queue arena exhausted; task entry dropped"
+            );
+            return;
         }
+        self.parking.wake_one();
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
     /// sample size/used/high-water/overflows, and clear the high-water
     /// mark when `reset` is set.
     fn stats(&self, reset: bool) -> CallbackQueueStats {
-        let mut st = recover(FACILITY, self.state.lock());
-        let out = CallbackQueueStats {
-            size: self.capacity,
-            num_used: st.ring_used,
-            max_used: st.high_water,
-            num_overflow: st.overflows,
+        let v = if reset {
+            // Clear the high-water half without disturbing `used`.
+            loop {
+                let v = self.used_hw.load(Ordering::Acquire);
+                if self
+                    .used_hw
+                    .compare_exchange_weak(
+                        v,
+                        used_of(v) as u64,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break v;
+                }
+            }
+        } else {
+            self.used_hw.load(Ordering::Acquire)
         };
-        if reset {
-            st.high_water = 0;
+        CallbackQueueStats {
+            size: self.capacity,
+            num_used: used_of(v),
+            max_used: high_water_of(v),
+            num_overflow: self.overflows.load(Ordering::Relaxed),
         }
-        out
+    }
+
+    /// Lifetime overflow count — C `queueOverflows` (`callback.c:57`).
+    fn overflow_count(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
+    }
+
+    /// Stop the band and wake every worker so each re-tests its exit
+    /// condition. Idempotent.
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.parking.wake_all();
     }
 }
 
@@ -430,32 +496,40 @@ pub struct CallbackQueueStats {
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "callback band";
 
-/// Port of `callbackTask` for one band (`callback.c:210-235`).
-fn worker_loop(pq: &PriorityQueue) {
+/// C `callbackTask` (`callback.c:210-235`) for one worker of one band.
+/// `slot` is the worker's ordinal within the band — its park slot.
+fn worker_loop(pq: &PriorityQueue, slot: usize) {
+    pq.parking.register(slot);
     loop {
-        let mut st = recover(FACILITY, pq.state.lock());
-        // callback.c:220-221 — sleep on the wake event while the ring is empty.
-        while st.queue.is_empty() && !st.shutdown {
-            st.waiters += 1;
-            st = recover(FACILITY, pq.wake.wait(st));
-            st.waiters -= 1;
+        // callback.c:223 — take the next entry.
+        let Some(entry) = pq.queue.pop() else {
+            // callback.c:220-221 — nothing to run: exit if the band has
+            // stopped and is drained, otherwise sleep until a push arrives.
+            if pq.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            pq.parking.park_until(slot, || {
+                !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst)
+            });
+            continue;
+        };
+        // callback.c:224 — a pop that leaves work behind re-triggers the
+        // band, so a second worker is not left asleep beside a queue that is
+        // not empty. C triggers unconditionally; this costs a load unless a
+        // worker really is parked.
+        if !pq.queue.is_empty() {
+            pq.parking.wake_one();
         }
-        if st.queue.is_empty() {
-            // Empty *and* shutdown — drain complete, exit.
-            return;
-        }
-        // callback.c:223 — pop next entry.
-        let cb = match st.queue.pop_front().unwrap() {
+        let cb = match entry {
             Queued::Ring(cb) => {
-                st.ring_used -= 1;
+                pq.used_hw.fetch_sub(1, Ordering::AcqRel);
                 // callback.c:227 — clear the overflow latch on every pop.
-                st.overflow = false;
+                pq.overflow.store(false, Ordering::Release);
                 cb
             }
             Queued::Task(cb) => cb,
         };
-        drop(st);
-        // callback.c:228 — run the callback with the ring lock released.
+        // callback.c:228 — run the callback owning no band state.
         run_isolated(FACILITY, cb);
     }
 }
@@ -488,7 +562,7 @@ impl CallbackHandle {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
+        self.queues[priority.index()].overflow_count()
     }
 
     /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
@@ -537,11 +611,13 @@ impl CallbackPool {
     ) -> Self {
         let capacity = queue_size.max(1);
         let threads_per_priority = threads_per_priority.map(|n| n.max(1));
-        let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] = [
-            Arc::new(PriorityQueue::new(capacity)),
-            Arc::new(PriorityQueue::new(capacity)),
-            Arc::new(PriorityQueue::new(capacity)),
-        ];
+        let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] =
+            CallbackPriority::ALL.map(|p| {
+                Arc::new(PriorityQueue::new(
+                    capacity,
+                    threads_per_priority[p.index()],
+                ))
+            });
 
         let mut workers = Vec::with_capacity(threads_per_priority.iter().sum::<usize>());
         for prio in CallbackPriority::ALL {
@@ -581,11 +657,7 @@ impl CallbackPool {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
-                    run_facility_loop(
-                        FACILITY,
-                        || worker_loop(&pq),
-                        || recover(FACILITY, pq.state.lock()).shutdown = true,
-                    );
+                    run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 });
                 workers.push(handle);
             }
@@ -610,7 +682,7 @@ impl CallbackPool {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
+        self.queues[priority.index()].overflow_count()
     }
 
     /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
@@ -623,8 +695,7 @@ impl CallbackPool {
     /// `callbackStop`/`callbackCleanup` (`callback.c:237-284`). Idempotent.
     pub fn shutdown(&mut self) {
         for pq in &self.queues {
-            recover(FACILITY, pq.state.lock()).shutdown = true;
-            pq.wake.notify_all();
+            pq.request_shutdown();
         }
         for w in self.workers.drain(..) {
             let _ = w.join();
@@ -682,6 +753,7 @@ impl DedicatedExecutor {
         let threads = threads.max(1);
         let queue = Arc::new(PriorityQueue::new(
             CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed).max(1),
+            threads,
         ));
         let mut workers = Vec::with_capacity(threads);
         for j in 0..threads {
@@ -704,11 +776,7 @@ impl DedicatedExecutor {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
-                    run_facility_loop(
-                        FACILITY,
-                        || worker_loop(&pq),
-                        || recover(FACILITY, pq.state.lock()).shutdown = true,
-                    );
+                    run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 },
             );
             match spawned {
@@ -738,8 +806,7 @@ impl DedicatedExecutor {
 
     /// Stop the workers and join them. Idempotent; [`Drop`] calls it.
     pub fn shutdown(&mut self) {
-        recover(FACILITY, self.queue.state.lock()).shutdown = true;
-        self.queue.wake.notify_all();
+        self.queue.request_shutdown();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -1404,6 +1471,79 @@ mod tests {
         second.expect(
             "the second entry never ran while the first callback was blocked \
              and a worker of the band was idle",
+        );
+    }
+
+    /// `used` and the high-water mark share one word now, so the two
+    /// boundaries of that word are worth separating: a reset must clear the
+    /// mark without disturbing the count, and a later push must still be able
+    /// to raise the mark from the count it finds. `callbackQueueStatus` is
+    /// called on a live band, not a drained one.
+    ///
+    /// Tested on the band directly: a band with a worker has no state a test
+    /// can hold still.
+    #[test]
+    fn a_high_water_reset_leaves_the_queued_entries_counted() {
+        let pq = PriorityQueue::new(4, 1);
+        for _ in 0..3 {
+            pq.request("cbLow", Box::new(|| {})).unwrap();
+        }
+        let st = pq.stats(false);
+        assert_eq!((st.num_used, st.max_used), (3, 3));
+
+        let st = pq.stats(true);
+        assert_eq!(
+            (st.num_used, st.max_used),
+            (3, 3),
+            "the reset sampled first"
+        );
+        let st = pq.stats(false);
+        assert_eq!(st.num_used, 3, "the reset dropped the entries' count");
+        assert_eq!(st.max_used, 0);
+
+        pq.request("cbLow", Box::new(|| {})).unwrap();
+        let st = pq.stats(false);
+        assert_eq!((st.num_used, st.max_used), (4, 4));
+    }
+
+    /// The ring's capacity boundary, on the band itself: `capacity` pushes go
+    /// in, the next one latches the band full, and the one after that is
+    /// refused by the latch without being tried (`callback.c:365`) — so the
+    /// episode counts once.
+    #[test]
+    fn the_capacity_boundary_latches_once() {
+        let pq = PriorityQueue::new(2, 1);
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        assert_eq!(pq.overflow_count(), 1);
+        assert_eq!(pq.stats(false).num_used, 2, "a refused push took no slot");
+    }
+
+    /// A task entry takes no ring slot, so a band latched full still accepts
+    /// one — the property `Queued::Task` exists for. The band-level twin of
+    /// `a_latched_ring_still_takes_a_task_entry`, at the boundary where the
+    /// ring is exactly full.
+    #[test]
+    fn a_full_band_still_takes_a_task_entry() {
+        let pq = PriorityQueue::new(1, 1);
+        pq.request("cbLow", Box::new(|| {})).unwrap();
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        pq.schedule_task(Box::new(|| {}));
+        assert_eq!(
+            pq.stats(false).num_used,
+            1,
+            "the task entry was charged to the ring"
         );
     }
 }

@@ -418,8 +418,9 @@ pub fn background_started() -> bool {
 /// background executor has not been built yet — C `callbackQueueStatus`
 /// (`callback.c:115-141`), whose `-1` return is exactly this `None` and
 /// is what `callbackQueueShow` turns into its "not initialized, yet"
-/// diagnostic. `reset` clears every band's high-water mark, as C's does
-/// for the whole array regardless of which band is being read.
+/// diagnostic. `reset` puts every band's high-water mark back to the
+/// entries it still holds — as C's does, for the whole array regardless of
+/// which band is being read.
 ///
 /// Reads `BACKGROUND` rather than calling `background()`, because a
 /// report must not be the thing that starts the facility it reports on.

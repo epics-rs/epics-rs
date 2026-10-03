@@ -435,18 +435,25 @@ impl PriorityQueue {
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
-    /// sample size/used/high-water/overflows, and clear the high-water
-    /// mark when `reset` is set.
+    /// sample size/used/high-water/overflows, then reset the high-water mark
+    /// when asked — in that order, as C does, so the row reports the mark the
+    /// reset is about to drop.
+    ///
+    /// A reset leaves the mark at the entries still queued, not at zero:
+    /// `epicsRingPointerResetHighWaterMark` is
+    /// `highWaterMark = getUsedNoLock()` (`epicsRingPointer.h:339-343`). The
+    /// mark is the deepest the ring has been *since the reset*, and the ring
+    /// is already that deep at the moment the reset happens.
     fn stats(&self, reset: bool) -> CallbackQueueStats {
         let v = if reset {
-            // Clear the high-water half without disturbing `used`.
             loop {
                 let v = self.used_hw.load(Ordering::Acquire);
+                let used = used_of(v) as u64;
                 if self
                     .used_hw
                     .compare_exchange_weak(
                         v,
-                        used_of(v) as u64,
+                        (used << 32) | used,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
@@ -1313,7 +1320,8 @@ mod tests {
         assert_eq!(
             pool.stats(CallbackPriority::Medium, false).max_used,
             0,
-            "callbackQueueStatus(reset=1) must clear the high-water mark"
+            "callbackQueueStatus(reset=1) must put the mark back to the \
+             entries still queued, and the ring is drained here"
         );
         pool.shutdown();
     }
@@ -1474,11 +1482,12 @@ mod tests {
         );
     }
 
-    /// `used` and the high-water mark share one word now, so the two
-    /// boundaries of that word are worth separating: a reset must clear the
-    /// mark without disturbing the count, and a later push must still be able
-    /// to raise the mark from the count it finds. `callbackQueueStatus` is
-    /// called on a live band, not a drained one.
+    /// `used` and the high-water mark share one word, so the two boundaries of
+    /// that word are worth separating: a reset must not disturb the count, and
+    /// it must leave the mark at that count rather than at zero —
+    /// `epicsRingPointerResetHighWaterMark` is `highWaterMark = used`
+    /// (`epicsRingPointer.h:339-343`), and `callbackQueueStatus` is called on
+    /// a live band, not a drained one.
     ///
     /// Tested on the band directly: a band with a worker has no state a test
     /// can hold still.
@@ -1499,7 +1508,10 @@ mod tests {
         );
         let st = pq.stats(false);
         assert_eq!(st.num_used, 3, "the reset dropped the entries' count");
-        assert_eq!(st.max_used, 0);
+        assert_eq!(
+            st.max_used, 3,
+            "the reset put the mark below the entries already queued"
+        );
 
         pq.request("cbLow", Box::new(|| {})).unwrap();
         let st = pq.stats(false);

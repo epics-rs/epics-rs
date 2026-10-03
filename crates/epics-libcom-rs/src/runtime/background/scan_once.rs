@@ -167,6 +167,12 @@ impl Inner {
     }
 
     /// Port of `scanOnceQueueStatus` (`dbScan.c:734-751`).
+    ///
+    /// A reset leaves the mark at the entries still queued, not at zero:
+    /// `dbScan.c:752` calls `epicsRingBytesResetHighWaterMark`, which is
+    /// `highWaterMark = used` (`epicsRingBytes.c:242-251`). The mark is the
+    /// deepest the ring has been *since the reset*, and the ring is already
+    /// that deep when the reset happens.
     fn stats(&self, reset: bool) -> ScanOnceQueueStats {
         let mut st = recover(FACILITY, self.state.lock());
         let out = ScanOnceQueueStats {
@@ -176,7 +182,7 @@ impl Inner {
             num_overflow: st.overflows,
         };
         if reset {
-            st.high_water = 0;
+            st.high_water = st.queue.len();
         }
         out
     }
@@ -488,5 +494,33 @@ mod tests {
             "scanOnce tail ran after shutdown; it must be dropped, not processed"
         );
         assert_eq!(h.overflow_count(), 0); // a shutdown drop is not an overflow.
+    }
+
+    /// The two boundaries of a high-water reset on a live ring: the entries
+    /// still queued stay counted, and the mark comes back to that count rather
+    /// than to zero — `dbScan.c:752` resets through
+    /// `epicsRingBytesResetHighWaterMark`, which is `highWaterMark = used`
+    /// (`epicsRingBytes.c:242-251`). A drained ring is the special case where
+    /// the two readings agree, so it cannot tell the behaviours apart.
+    ///
+    /// Queued without starting the drain thread, so the ring holds still.
+    #[test]
+    fn a_high_water_reset_comes_back_to_the_entries_still_queued() {
+        let q = ScanOnceQueue::with_capacity(8);
+        for _ in 0..5 {
+            q.scan_once(Box::new(|| {})).unwrap();
+        }
+        let st = q.stats(true);
+        assert_eq!(
+            (st.num_used, st.max_used),
+            (5, 5),
+            "the row reports the mark the reset is about to drop"
+        );
+        let st = q.stats(false);
+        assert_eq!(st.num_used, 5, "the reset dropped the entries' count");
+        assert_eq!(
+            st.max_used, 5,
+            "the reset put the mark below the entries already queued"
+        );
     }
 }

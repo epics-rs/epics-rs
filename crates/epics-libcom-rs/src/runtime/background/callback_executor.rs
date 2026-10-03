@@ -1471,13 +1471,20 @@ mod tests {
         );
         assert_eq!(st.max_used, 6);
 
-        gate_tx.send(()).unwrap();
+        // The seventh has to be claimed while the band is still gated, or the
+        // worker may already have drained some of the six and the mark would
+        // never reach seven.
         let (tx, rx) = mpsc::channel();
         pool.request(
             CallbackPriority::Medium,
             Box::new(move || tx.send(()).unwrap()),
         )
         .unwrap();
+        assert_eq!(pool.stats(CallbackPriority::Medium, false).num_used, 7);
+
+        // One worker, so FIFO makes the seventh the last to run and its own
+        // slot the last to be released.
+        gate_tx.send(()).unwrap();
         rx.recv_timeout(T).unwrap();
         let st = pool.stats(CallbackPriority::Medium, true);
         assert_eq!(st.num_used, 0, "every entry ran, so the ring is empty");

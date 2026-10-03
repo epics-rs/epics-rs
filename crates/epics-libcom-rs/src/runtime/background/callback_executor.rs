@@ -288,39 +288,22 @@ enum Queued {
     Task(Callback),
 }
 
-/// Entries preallocated per band at construction. The band honours a larger
-/// configured `callbackQueueSize` by growing its arena on demand instead of
-/// reserving it all up front, which is what the `VecDeque` this replaced did
-/// with its own 1024-entry floor.
-const PREALLOC_MAX: usize = 64 * 1024;
-
-/// `used` lives in the low half of [`PriorityQueue::used_hw`], the high-water
-/// mark in the high half, so one CAS moves both — as C moves the ring's index
-/// and its high-water mark together under the ring's spinlock.
-#[inline]
-fn used_of(v: u64) -> usize {
-    (v & 0xffff_ffff) as usize
-}
-
-#[inline]
-fn high_water_of(v: u64) -> usize {
-    (v >> 32) as usize
-}
-
 /// One priority band: a bounded lock-free FIFO plus the park slots its workers
 /// sleep in. Mirrors C `cbQueueSet` (`callback.c:53-62`).
 struct PriorityQueue {
     capacity: usize,
     queue: BandQueue<Queued>,
-    /// Ring slots in use, paired with the deepest the ring has ever been.
-    ///
-    /// `used` is what C's bounded ring measures, and it is not the queue's
-    /// length: a task's run-queue entry shares the FIFO but holds no ring
-    /// slot. The high-water half is C
-    /// `epicsRingPointerGetHighWaterMark` — `callbackQueueShow` reports it and
-    /// `callbackQueueStatus(reset=1)` clears it (`callback.c:115-139`), so it
-    /// is not derivable after the fact and has to be latched on every push.
-    used_hw: AtomicU64,
+    /// Ring slots in use — what C's bounded ring measures, and not the
+    /// queue's length: a run-queue entry shares the FIFO but holds no ring
+    /// slot. A statistic only: the band's bound is its slot supply, so this
+    /// is moved by a `fetch_add`, never consulted to decide a push.
+    used: AtomicUsize,
+    /// The deepest the ring has been since the last reset — C
+    /// `epicsRingPointerGetHighWaterMark`, which `callbackQueueShow` reports
+    /// and `callbackQueueStatus(reset=1)` clears (`callback.c:115-139`). Not
+    /// derivable after the fact, so it is latched on the pushes that deepen
+    /// the ring; a push that does not deepen it only reads.
+    high_water: AtomicUsize,
     /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
     overflow: AtomicBool,
     /// C `cbQueueSet.queueOverflows` — lifetime overflow count
@@ -328,7 +311,7 @@ struct PriorityQueue {
     overflows: AtomicU64,
     shutdown: AtomicBool,
     /// C `cbQueueSet.semWakeUp` (`callback.c:54`), as one park slot per
-    /// worker. Cache-line aligned, and kept out of `used_hw`'s line — see
+    /// worker. Cache-line aligned, and kept out of `used`'s line — see
     /// `callback_queue::Parking`.
     parking: Parking,
 }
@@ -337,8 +320,9 @@ impl PriorityQueue {
     fn new(capacity: usize, workers: usize) -> Self {
         PriorityQueue {
             capacity,
-            queue: BandQueue::with_capacity(capacity.min(PREALLOC_MAX)),
-            used_hw: AtomicU64::new(0),
+            queue: BandQueue::with_capacity(capacity),
+            used: AtomicUsize::new(0),
+            high_water: AtomicUsize::new(0),
             overflow: AtomicBool::new(false),
             overflows: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
@@ -346,24 +330,18 @@ impl PriorityQueue {
         }
     }
 
-    /// Claim one of the ring's `capacity` slots, or report the ring full.
-    /// Moves `used` and the high-water mark in the same CAS.
-    fn claim_ring_slot(&self) -> Result<(), CallbackError> {
-        loop {
-            let v = self.used_hw.load(Ordering::Acquire);
-            let used = used_of(v);
-            if used >= self.capacity {
-                return Err(CallbackError::QueueFull);
-            }
-            let next = (used + 1) as u64;
-            let hw = (high_water_of(v) as u64).max(next);
-            if self
-                .used_hw
-                .compare_exchange_weak(v, (hw << 32) | next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(());
-            }
+    /// Count a ring slot the band has already granted, and deepen the
+    /// high-water mark if this entry is the deepest yet.
+    ///
+    /// A `fetch_add` and, in the steady state, one relaxed load: the mark only
+    /// moves while the ring is reaching depths it has not reached since the
+    /// last reset. Nothing here can refuse a push — the slot was granted by
+    /// taking it, so this counter cannot disagree with the band about whether
+    /// there was room.
+    fn count_ring_slot(&self) {
+        let used = self.used.fetch_add(1, Ordering::AcqRel) + 1;
+        if used > self.high_water.load(Ordering::Relaxed) {
+            self.high_water.fetch_max(used, Ordering::AcqRel);
         }
     }
 
@@ -402,14 +380,14 @@ impl PriorityQueue {
         if self.overflow.load(Ordering::Acquire) {
             return Err(CallbackError::QueueFull);
         }
-        self.claim_ring_slot().map_err(|_| self.report_full(name))?;
-        if self.queue.push(Queued::Ring(cb)).is_err() {
-            // The arena's index space is exhausted — 4 G entries on one band,
-            // which no `callbackQueueSize` reaches. Give the slot back and
-            // report the band full, the error C has for this.
-            self.used_hw.fetch_sub(1, Ordering::AcqRel);
+        if let Err(entry) = self.queue.push_ring(Queued::Ring(cb)) {
+            // No ring slot was free: the band is full, the one place that
+            // decides it. Dropping the entry deallocates the callback that
+            // was never queued.
+            drop(entry);
             return Err(self.report_full(name));
         }
+        self.count_ring_slot();
         // callback.c:375 — wake the band, but only if a worker is parked.
         self.parking.wake_one();
         Ok(())
@@ -422,7 +400,7 @@ impl PriorityQueue {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        if let Err(entry) = self.queue.push(Queued::Task(cb)) {
+        if let Err(entry) = self.queue.push_task(Queued::Task(cb)) {
             // Only reachable with the whole 4 G index space queued; dropping
             // the entry finalizes its task rather than stranding it.
             drop(entry);
@@ -446,30 +424,34 @@ impl PriorityQueue {
     /// mark is the deepest the ring has been *since the reset*, and the ring
     /// is already that deep at the moment the reset happens.
     fn stats(&self, reset: bool) -> CallbackQueueStats {
-        let v = if reset {
-            loop {
-                let v = self.used_hw.load(Ordering::Acquire);
-                let used = used_of(v) as u64;
+        // `used` and the mark are two words, so a row is sampled until they
+        // agree — a push raises `used` before the mark and would otherwise be
+        // caught between the two, reporting a mark below the depth. The retry
+        // is on this side because it is `callbackQueueStatus`, run from iocsh,
+        // and the alternative is a CAS loop on every request.
+        let (used, mark) = loop {
+            let used = self.used.load(Ordering::Acquire);
+            let mark = self.high_water.load(Ordering::Acquire);
+            if mark >= used {
+                if !reset {
+                    break (used, mark);
+                }
+                // The mark the reset drops is the one reported, and the one it
+                // installs is the depth the ring is at right now
+                // (`epicsRingPointer.h:339-343`).
                 if self
-                    .used_hw
-                    .compare_exchange_weak(
-                        v,
-                        (used << 32) | used,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .high_water
+                    .compare_exchange_weak(mark, used, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    break v;
+                    break (used, mark);
                 }
             }
-        } else {
-            self.used_hw.load(Ordering::Acquire)
         };
         CallbackQueueStats {
             size: self.capacity,
-            num_used: used_of(v),
-            max_used: high_water_of(v),
+            num_used: used,
+            max_used: mark,
             num_overflow: self.overflows.load(Ordering::Relaxed),
         }
     }
@@ -530,7 +512,7 @@ fn worker_loop(pq: &PriorityQueue, slot: usize) {
         }
         let cb = match entry {
             Queued::Ring(cb) => {
-                pq.used_hw.fetch_sub(1, Ordering::AcqRel);
+                pq.used.fetch_sub(1, Ordering::AcqRel);
                 // callback.c:227 — clear the overflow latch on every pop.
                 pq.overflow.store(false, Ordering::Release);
                 cb
@@ -1566,7 +1548,7 @@ mod tests {
     /// pop; `sleepers` is written by a worker on every park.
     #[test]
     fn the_ring_counter_and_the_park_counter_are_in_different_lines() {
-        let used_hw = std::mem::offset_of!(PriorityQueue, used_hw);
+        let used_hw = std::mem::offset_of!(PriorityQueue, used);
         let parking = std::mem::offset_of!(PriorityQueue, parking);
         assert_ne!(
             used_hw / 64,

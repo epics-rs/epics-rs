@@ -14,17 +14,24 @@
 //! whenever POSIX thread priority scheduling is available, `osdSpin.c:126`),
 //! which bounds the inversion by boosting whoever holds the lock.
 //!
-//! This queue removes the holder from that path instead. `push` is one CAS
-//! onto a LIFO inbox: it owns nothing, so a requester descheduled anywhere in
-//! it delays nobody and there is no priority to inherit.
+//! This queue removes the holder from that path instead. A requester takes a
+//! slot and links it into a LIFO inbox — two CAS, owning nothing in between —
+//! so a requester descheduled anywhere in it delays nobody and there is no
+//! priority to inherit.
 //!
 //! # Inbox and ready, not one FIFO
 //!
 //! Two stacks, following the shape epics-base PR #996 arrived at by
 //! measurement:
 //!
-//! - `inbox` — where requesters push, one CAS, newest first.
+//! - `inbox` — where requesters push, newest first.
 //! - `ready` — where workers pop, one CAS per entry.
+//!
+//! A request costs the slot CAS, the publish CAS, and a `fetch_add` on the
+//! band's `used` statistic — the profile #996 measured, with the difference
+//! that the slot CAS is also the capacity check. The bound lives in the slot
+//! supply (see [`Pool`]), so no requester CASes a counter to find out whether
+//! there was room, and no counter can disagree with the queue about it.
 //!
 //! A worker pops `ready`. Finding it empty, it takes the *whole* inbox in one
 //! CAS, reverses that chain into submission order, keeps the oldest entry for
@@ -56,9 +63,9 @@
 //! Two properties this buys over a single Michael–Scott FIFO, which was
 //! implemented first and withdrawn:
 //!
-//! - **One CAS per push, not two.** MS needs a `next` link CAS plus a `tail`
-//!   swing, and the requester path is the band's only hot path, so every
-//!   request pays for both.
+//! - **One CAS to publish, not two.** MS needs a `next` link CAS plus a
+//!   `tail` swing on top of taking the node, and the requester path is the
+//!   band's only hot path, so every request pays for both.
 //! - **The requester's line is not the worker's line.** MS keeps `head` and
 //!   `tail` on the same node whenever the queue is short — the IOC's normal
 //!   state — so a requester and a worker contend on one cache line however
@@ -183,46 +190,69 @@ impl<T> Default for Node<T> {
     }
 }
 
-/// A growable, never-shrinking arena with a tagged Treiber free list.
+/// A never-shrinking arena with two tagged Treiber free lists.
 ///
 /// Chunks are published by index reservation (`fetch_add` on `reserved`), so
 /// two growers never contend for the same chunk and neither has to retry. A
 /// published chunk pointer is never cleared and never freed before [`Drop`],
 /// which is what makes resolving a stale index defined rather than a
 /// use-after-free.
+///
+/// The arena is split by index at `ring_slots`: below it are the ring's slots,
+/// above it the nodes that serve run-queue entries. **That split is what
+/// bounds the band.** A ring entry exists only if a ring node was free, so
+/// "the ring is full" is one fact in one place — not a counter a requester has
+/// to CAS and then reconcile with an arena that could also run out.
 struct Pool<T> {
     chunks: [AtomicPtr<Node<T>>; MAX_CHUNKS],
     /// Chunks handed out to growers — may briefly exceed the number actually
     /// published. Nothing resolves an index through it.
     reserved: AtomicUsize,
-    /// Tagged head of the free list.
-    free: AtomicU64,
+    /// Tagged head of the ring's slot supply. Empty means the band is full.
+    free_ring: AtomicU64,
+    /// Tagged head of the run-queue supply, grown on demand: a run-queue entry
+    /// is never refused for capacity.
+    free_task: AtomicU64,
+    /// First index that is not a ring slot.
+    ring_slots: usize,
 }
 
 impl<T> Pool<T> {
-    fn new(min_elements: usize) -> Self {
+    /// An arena whose ring supply is exactly `ring_slots` nodes, allocated up
+    /// front the way C allocates its whole ring in `callbackInit` — so neither
+    /// the request path nor a worker allocates once the band is running.
+    ///
+    /// Chunks are allocated whole, so the nodes past `ring_slots` in the last
+    /// chunk become the initial run-queue supply instead of being wasted. One
+    /// node costs more than C's one ring pointer, which is what a band of a
+    /// configured `callbackQueueSize` costs over C.
+    fn new(ring_slots: usize) -> Self {
         let pool = Pool {
             chunks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
             reserved: AtomicUsize::new(0),
-            free: AtomicU64::new(pack(IDX_NONE, 0)),
+            free_ring: AtomicU64::new(pack(IDX_NONE, 0)),
+            free_task: AtomicU64::new(pack(IDX_NONE, 0)),
+            ring_slots,
         };
-        // Preallocate the steady state, so neither the request path nor a
-        // worker allocates once the band is running.
-        let mut have = 0usize;
-        while have < min_elements && pool.grow() {
-            have = chunk_base(pool.reserved.load(Ordering::Relaxed));
+        while chunk_base(pool.reserved.load(Ordering::Relaxed)) < ring_slots {
+            let Some((base, len)) = pool.grow() else {
+                break;
+            };
+            let split = (base + len).min(ring_slots).max(base);
+            pool.link(&pool.free_ring, base, split);
+            pool.link(&pool.free_task, split, base + len);
         }
         pool
     }
 
-    /// Reserve, allocate and publish one more chunk, then hand its elements to
-    /// the free list as a single pre-linked chain (one CAS for the whole
-    /// chunk). `false` once the index space is exhausted.
-    fn grow(&self) -> bool {
+    /// Reserve, allocate and publish one more chunk, returning its index range.
+    /// The elements are on no list yet — [`Pool::link`] decides which supply
+    /// they join. `None` once the index space is exhausted.
+    fn grow(&self) -> Option<(usize, usize)> {
         let c = self.reserved.fetch_add(1, Ordering::AcqRel);
         if c >= MAX_CHUNKS {
             self.reserved.fetch_sub(1, Ordering::AcqRel);
-            return false;
+            return None;
         }
         let len = chunk_len(c);
         let base = chunk_base(c);
@@ -230,30 +260,35 @@ impl<T> Pool<T> {
         let ptr = Box::leak(elements.into_boxed_slice()).as_mut_ptr();
         // We reserved `c`, so this slot is ours alone.
         self.chunks[c].store(ptr, Ordering::Release);
+        Some((base, len))
+    }
 
-        // Chain the chunk internally; the tail link closes over the current
-        // free head on each attempt.
-        for off in 0..len - 1 {
-            let node = unsafe { &*ptr.add(off) };
-            node.link
-                .store(pack((base + off + 1) as u32, 1), Ordering::Relaxed);
+    /// Hand `[from, to)` to `list` as a single pre-linked chain — one CAS for
+    /// the whole range, however long it is.
+    fn link(&self, list: &AtomicU64, from: usize, to: usize) {
+        if from >= to {
+            return;
         }
-        let last = unsafe { &*ptr.add(len - 1) };
+        for g in from..to - 1 {
+            let node = unsafe { self.get(g as u32) };
+            node.link.store(pack((g + 1) as u32, 1), Ordering::Relaxed);
+        }
+        // The tail link closes over the current head on each attempt.
+        let last = unsafe { self.get((to - 1) as u32) };
         loop {
-            let head = self.free.load(Ordering::Acquire);
+            let head = list.load(Ordering::Acquire);
             let prev = last.link.load(Ordering::Relaxed);
             last.link.store(bump(prev, idx_of(head)), Ordering::Release);
-            if self
-                .free
+            if list
                 .compare_exchange_weak(
                     head,
-                    bump(head, base as u32),
+                    bump(head, from as u32),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
                 .is_ok()
             {
-                return true;
+                return;
             }
         }
     }
@@ -270,23 +305,35 @@ impl<T> Pool<T> {
         unsafe { &*base.add(off) }
     }
 
-    /// Take one node off the free list, growing the arena if it is empty.
+    /// Take one of the ring's slots. One CAS, and `None` is the band being
+    /// full — the supply is the bound, so nothing else has to be consulted.
+    fn alloc_ring(&self) -> Option<u32> {
+        self.pop(&self.free_ring)
+    }
+
+    /// Take one run-queue node, growing the arena when the supply is empty.
     /// `None` only when the index space itself is exhausted.
-    fn alloc(&self) -> Option<u32> {
+    fn alloc_task(&self) -> Option<u32> {
         loop {
-            let head = self.free.load(Ordering::Acquire);
+            if let Some(i) = self.pop(&self.free_task) {
+                return Some(i);
+            }
+            let (base, len) = self.grow()?;
+            self.link(&self.free_task, base, base + len);
+        }
+    }
+
+    fn pop(&self, list: &AtomicU64) -> Option<u32> {
+        loop {
+            let head = list.load(Ordering::Acquire);
             let i = idx_of(head);
             if i == IDX_NONE {
-                if !self.grow() {
-                    return None;
-                }
-                continue;
+                return None;
             }
             // Possibly stale — only the CAS below decides, and the tag makes a
             // stale head impossible to confuse with the current one.
             let next = unsafe { self.get(i) }.link.load(Ordering::Acquire);
-            if self
-                .free
+            if list
                 .compare_exchange_weak(
                     head,
                     bump(head, idx_of(next)),
@@ -300,16 +347,20 @@ impl<T> Pool<T> {
         }
     }
 
-    /// Return `i` to the free list. The caller must own it — off both stacks
-    /// and with its value taken.
+    /// Return `i` to the supply it came from — its index says which. The
+    /// caller must own it: off both stacks and with its value taken.
     fn dealloc(&self, i: u32) {
+        let list = if (i as usize) < self.ring_slots {
+            &self.free_ring
+        } else {
+            &self.free_task
+        };
         let node = unsafe { self.get(i) };
         loop {
-            let head = self.free.load(Ordering::Acquire);
+            let head = list.load(Ordering::Acquire);
             let prev = node.link.load(Ordering::Relaxed);
             node.link.store(bump(prev, idx_of(head)), Ordering::Release);
-            if self
-                .free
+            if list
                 .compare_exchange_weak(head, bump(head, i), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
@@ -360,7 +411,7 @@ unsafe impl<T: Send> Send for BandQueue<T> {}
 unsafe impl<T: Send> Sync for BandQueue<T> {}
 
 impl<T> BandQueue<T> {
-    /// A queue preallocated for `capacity` entries.
+    /// A queue whose ring holds exactly `capacity` entries.
     pub(super) fn with_capacity(capacity: usize) -> Self {
         BandQueue {
             inbox: Root(AtomicU64::new(pack(IDX_NONE, 0))),
@@ -369,8 +420,34 @@ impl<T> BandQueue<T> {
         }
     }
 
-    /// Submit `v`. One CAS, owning nothing. `Err(v)` hands the value back only
-    /// when the arena's index space is exhausted — 4 G entries on one band.
+    /// Submit `v` into one of the band's `capacity` ring slots. Two CAS — one
+    /// takes the slot, one publishes it — and the requester owns nothing in
+    /// between. `Err(v)` hands the value back when no slot is free, which is
+    /// the band being full.
+    pub(super) fn push_ring(&self, v: T) -> Result<(), T> {
+        match self.nodes.alloc_ring() {
+            Some(i) => {
+                self.publish(i, v);
+                Ok(())
+            }
+            None => Err(v),
+        }
+    }
+
+    /// Submit `v` without taking a ring slot — the run-queue entries that
+    /// share the band's FIFO but not its bound. `Err(v)` only when the arena's
+    /// index space is exhausted, which is 4 G entries on one band.
+    pub(super) fn push_task(&self, v: T) -> Result<(), T> {
+        match self.nodes.alloc_task() {
+            Some(i) => {
+                self.publish(i, v);
+                Ok(())
+            }
+            None => Err(v),
+        }
+    }
+
+    /// Put `v` in node `i` and link it into the inbox.
     ///
     /// The CAS that publishes the node is sequentially consistent, not merely
     /// release: the caller goes on to test whether a worker is parked, and a
@@ -379,10 +456,7 @@ impl<T> BandQueue<T> {
     /// then complete while the push sits in the store buffer, and the pusher
     /// decides not to wake the worker that is deciding not to see the entry.
     /// Lock `cmpxchg` already carries this on x86.
-    pub(super) fn push(&self, v: T) -> Result<(), T> {
-        let Some(i) = self.nodes.alloc() else {
-            return Err(v);
-        };
+    fn publish(&self, i: u32, v: T) {
         let node = unsafe { self.nodes.get(i) };
         // Ours until the CAS below links it.
         unsafe { *node.value.get() = Some(v) };
@@ -396,7 +470,7 @@ impl<T> BandQueue<T> {
                 .compare_exchange_weak(head, bump(head, i), Ordering::SeqCst, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(());
+                return;
             }
         }
     }
@@ -683,26 +757,26 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.pop(), None);
         assert!(q.is_empty());
-        q.push(7).unwrap();
+        q.push_ring(7).unwrap();
         assert!(!q.is_empty());
         assert_eq!(q.pop(), Some(7));
         assert!(q.is_empty());
-        q.push(8).unwrap();
+        q.push_ring(8).unwrap();
         assert_eq!(q.pop(), Some(8));
     }
 
     /// `CHUNK0` is the first chunk boundary and every later one doubles, so a
-    /// queue preallocated for two elements has to cross several of them. The
-    /// index arithmetic is what is on trial: a mislocated element shows up as
-    /// a value that comes back in the wrong order or not at all.
+    /// ring of this many slots spans several of them. The index arithmetic is
+    /// what is on trial: a mislocated element shows up as a value that comes
+    /// back in the wrong order or not at all.
     #[test]
-    fn the_queue_grows_across_chunk_boundaries_in_order() {
-        let q = BandQueue::<usize>::with_capacity(1);
+    fn a_ring_spanning_several_chunks_keeps_its_order() {
         // Miri interprets every one of these, so it gets the smallest span
         // that still crosses several boundaries.
         let n = if cfg!(miri) { CHUNK0 * 3 } else { CHUNK0 * 40 };
+        let q = BandQueue::<usize>::with_capacity(n);
         for i in 0..n {
-            q.push(i).unwrap();
+            q.push_ring(i).unwrap();
         }
         for i in 0..n {
             assert_eq!(q.pop(), Some(i), "entry {i} came back out of order");
@@ -719,23 +793,23 @@ mod tests {
         let q = BandQueue::<usize>::with_capacity(2);
         let rounds = if cfg!(miri) { 40usize } else { 2000 };
         for round in 0..rounds {
-            q.push(round).unwrap();
-            q.push(round + 1_000_000).unwrap();
+            q.push_ring(round).unwrap();
+            q.push_ring(round + 1_000_000).unwrap();
             assert_eq!(q.pop(), Some(round));
             assert_eq!(q.pop(), Some(round + 1_000_000));
         }
         assert!(q.is_empty());
     }
 
-    /// Four producers against four consumers on an arena of eight: every
-    /// entry is delivered exactly once. Order is not asserted here — above one
+    /// Four producers against four consumers: every entry is delivered
+    /// exactly once. Order is not asserted here — above one
     /// worker a batch can be published onto the previous batch's remainder,
     /// which is the band's documented order at that worker count.
     #[test]
     fn every_entry_is_delivered_exactly_once_under_many_consumers() {
         const PRODUCERS: usize = 4;
         let per: usize = if cfg!(miri) { 60 } else { 5_000 };
-        let q = Arc::new(BandQueue::<(usize, usize)>::with_capacity(8));
+        let q = Arc::new(BandQueue::<(usize, usize)>::with_capacity(PRODUCERS * per));
         let taken = Arc::new(std::sync::Mutex::new(vec![Vec::new(); PRODUCERS]));
         let done = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicUsize::new(0));
@@ -746,7 +820,7 @@ mod tests {
                 let finished = Arc::clone(&finished);
                 s.spawn(move || {
                     for i in 0..per {
-                        q.push((p, i)).unwrap();
+                        q.push_ring((p, i)).unwrap();
                     }
                     finished.fetch_add(1, Ordering::SeqCst);
                 });
@@ -808,9 +882,9 @@ mod tests {
     fn dropping_the_queue_drops_the_entries_still_in_it() {
         let live = Arc::new(());
         {
-            let q = BandQueue::<Arc<()>>::with_capacity(4);
+            let q = BandQueue::<Arc<()>>::with_capacity(5);
             for _ in 0..5 {
-                q.push(Arc::clone(&live)).unwrap();
+                q.push_ring(Arc::clone(&live)).unwrap();
             }
             assert_eq!(Arc::strong_count(&live), 6);
             assert!(q.pop().is_some());
@@ -884,12 +958,12 @@ mod tests {
     /// that was not empty.
     #[test]
     fn entries_leave_in_submission_order_across_batches() {
-        let q = BandQueue::<usize>::with_capacity(8);
+        let q = BandQueue::<usize>::with_capacity(2_000);
         let mut pushed = 0usize;
         let mut popped = 0usize;
         for round in 0..200usize {
             for _ in 0..=(round % 5) {
-                q.push(pushed).unwrap();
+                q.push_ring(pushed).unwrap();
                 pushed += 1;
             }
             for _ in 0..=(round % 3) {
@@ -907,6 +981,32 @@ mod tests {
         assert!(q.is_empty());
     }
 
+    /// The invariant the band's bound rests on: a ring entry exists only if a
+    /// ring slot was free, and the supply is exactly `capacity` slots. The
+    /// run-queue supply is a different list, so a full ring does not refuse a
+    /// run-queue entry — and a slot returns to the ring the moment its entry
+    /// is consumed, not when the band next looks at a counter.
+    #[test]
+    fn the_ring_supply_is_the_bound_and_a_task_entry_sits_outside_it() {
+        let q = BandQueue::<usize>::with_capacity(3);
+        for v in 0..3 {
+            q.push_ring(v).unwrap();
+        }
+        assert_eq!(
+            q.push_ring(99),
+            Err(99),
+            "a fourth entry fit a ring of three"
+        );
+        q.push_task(7).unwrap();
+        assert_eq!(q.pop(), Some(0));
+        q.push_ring(100).unwrap();
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.pop(), Some(7));
+        assert_eq!(q.pop(), Some(100));
+        assert!(q.is_empty());
+    }
+
     /// The other side of the refill boundary: a batch published onto a `ready`
     /// that still holds the previous batch's remainder. Reachable only above
     /// one worker, so it is driven here by calling `refill` directly. Nothing
@@ -916,12 +1016,12 @@ mod tests {
     fn a_batch_published_onto_a_non_empty_ready_keeps_every_entry() {
         let q = BandQueue::<usize>::with_capacity(8);
         for v in 0..3 {
-            q.push(v).unwrap();
+            q.push_ring(v).unwrap();
         }
         // Refills, hands back the oldest and leaves 1 and 2 in `ready`.
         assert_eq!(q.pop(), Some(0));
         for v in 3..6 {
-            q.push(v).unwrap();
+            q.push_ring(v).unwrap();
         }
         assert_eq!(q.refill(), Some(3), "the second batch's oldest entry");
         assert_eq!(q.pop(), Some(4));

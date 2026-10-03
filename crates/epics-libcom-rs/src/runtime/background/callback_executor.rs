@@ -489,7 +489,7 @@ const FACILITY: &str = "callback band";
 /// C `callbackTask` (`callback.c:210-235`) for one worker of one band.
 /// `slot` is the worker's ordinal within the band — its park slot.
 fn worker_loop(pq: &PriorityQueue, slot: usize) {
-    pq.parking.register(slot);
+    let parked = pq.parking.waiter(slot);
     loop {
         // callback.c:223 — take the next entry.
         let Some(entry) = pq.queue.pop() else {
@@ -498,9 +498,7 @@ fn worker_loop(pq: &PriorityQueue, slot: usize) {
             if pq.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            pq.parking.park_until(slot, || {
-                !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst)
-            });
+            parked.park_until(|| !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst));
             continue;
         };
         // callback.c:224 — a pop that leaves work behind re-triggers the

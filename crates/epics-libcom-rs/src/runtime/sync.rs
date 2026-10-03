@@ -720,6 +720,190 @@ pub fn osd_show_all_line() -> &'static str {
     }
 }
 
+/// C `epicsEventId` with one waiting thread — the wake-up half of a facility
+/// whose state is guarded by a [`PriorityInheritanceMutex`].
+///
+/// Every background facility C has is built from two primitives, not one: a
+/// mutex over the state, and a **separate** event the worker sleeps on —
+/// `msgQueueLock` beside `waitForWork` (`errlog.c:93-95`), the `onceQ` ring's
+/// spinlock beside `onceSem` (`dbScan.c:65-68`), the timer queue's mutex
+/// beside its event (`timerPrivate.h:115,188`). A Rust port reaches for
+/// `Mutex` + `Condvar` instead, which fuses them, and the fusion is what
+/// costs the priority-inheritance property: a `Condvar` can only wait on the
+/// `std::sync::Mutex` it is paired with, so every requester of the facility —
+/// a scan thread at ScanHigh, a device callback at High — ends up blocking on
+/// a non-PI lock that the facility's own Low-priority worker holds, for as
+/// long as anything in between cares to run.
+///
+/// Keeping the two apart is what lets the state lock be the PI one. The wake
+/// then needs no lock at all: this is one latch plus the waiter's thread
+/// handle, so a signaller touches the waiter's parker and nothing any other
+/// requester shares. C's `epicsEvent` is itself a PI mutex and a condvar
+/// (`osdEvent.c:29-31`, `:54` through `globalAttrDefault`,
+/// `osdMutex.c:71-73`); this has no mutex of its own to invert.
+///
+/// # It is a condition wait, not a token
+///
+/// [`signal`](Self::signal) releases a waiter that has announced itself and
+/// does nothing at all otherwise — unlike C's `epicsEventSignal`, which
+/// latches `isFull` for a wait that has not happened yet (`osdEvent.c:87-90`).
+/// What makes that safe is that the waiter never sleeps on the event alone:
+/// it sleeps on a *condition over the shared state*, re-polled on every
+/// announcement. So a caller MUST publish its work before signalling, and the
+/// waiter's `ready` MUST read that work. A signal whose work is not yet
+/// visible is not a lost wake-up — it is a wake-up the waiter's own poll will
+/// make for itself.
+///
+/// The announce/poll pair is sequentially consistent on both sides, which is
+/// what closes the window a plain flag would leave: a signaller publishes its
+/// work and then tests the latch, a waiter stores the latch and then polls for
+/// work, so at least one of the two sees the other.
+pub struct Event {
+    /// `SLEEPING` only between the waiter announcing that it is about to park
+    /// and the wake that releases it, so a signaller's compare-exchange is
+    /// itself the test for whether anyone is there to wake.
+    state: std::sync::atomic::AtomicU32,
+    /// The waiting thread, published by [`Event::waiter`] before the state can
+    /// ever read `SLEEPING` — a signaller that finds the event sleeping finds
+    /// a handle in it.
+    thread: std::sync::OnceLock<std::thread::Thread>,
+}
+
+/// Nobody is parked: either the waiter is running, or it has not claimed the
+/// event yet. The two are told apart by [`Event::thread`], which is the only
+/// thing a wake needs from either.
+const EVENT_AWAKE: u32 = 0;
+/// The waiter has announced that its next step is to park.
+const EVENT_SLEEPING: u32 = 1;
+
+impl Event {
+    pub const fn new() -> Self {
+        Event {
+            state: std::sync::atomic::AtomicU32::new(EVENT_AWAKE),
+            thread: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Claim the waiting side of this event.
+    ///
+    /// The returned token is the only thing that can wait, which is how
+    /// "the thread handle is published before the first park" holds by
+    /// construction instead of by a call-order rule the next caller has to
+    /// know about.
+    ///
+    /// One event has one waiter: a second token for the same event would park
+    /// a second thread behind one latch, and a signal meant for either would
+    /// release only one. A facility that needs N waiters owns N events — that
+    /// is what the callback band's `Parking` is.
+    pub fn waiter(&self) -> EventWaiter<'_> {
+        let _ = self.thread.set(std::thread::current());
+        EventWaiter { event: self }
+    }
+
+    /// Release the waiter if it is parked, and cost one atomic if it is not.
+    /// `true` when a parked waiter was released, which is what lets a pool of
+    /// events (the callback band's `Parking`) stop at the first one it wakes.
+    ///
+    /// The work being signalled must already be published — see *It is a
+    /// condition wait, not a token* above.
+    pub fn signal(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(
+                EVENT_SLEEPING,
+                EVENT_AWAKE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+        true
+    }
+
+    /// Release the waiter whether or not it has announced itself — the
+    /// shutdown path, where the condition the waiter re-tests is its own exit
+    /// and a signal dropped inside the announce window would hang a join.
+    pub fn wake(&self) {
+        use std::sync::atomic::Ordering;
+        self.state.store(EVENT_AWAKE, Ordering::SeqCst);
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field(
+                "sleeping",
+                &(self.state.load(std::sync::atomic::Ordering::Relaxed) == EVENT_SLEEPING),
+            )
+            .field("claimed", &self.thread.get().is_some())
+            .finish()
+    }
+}
+
+/// The waiting side of one [`Event`] — see [`Event::waiter`].
+pub struct EventWaiter<'a> {
+    event: &'a Event,
+}
+
+impl EventWaiter<'_> {
+    /// Park until `ready` holds.
+    ///
+    /// The announcement is re-made before every poll, so a signaller that
+    /// misses it is a signaller whose work the poll that follows sees.
+    pub fn wait_until(&self, mut ready: impl FnMut() -> bool) {
+        use std::sync::atomic::Ordering;
+        loop {
+            self.event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+            if ready() {
+                break;
+            }
+            std::thread::park();
+        }
+        self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
+    }
+
+    /// [`wait_until`](Self::wait_until) with a deadline. `true` when `ready`
+    /// held, `false` when the deadline arrived first — C
+    /// `epicsEventWaitWithTimeout`'s two answers (`osdEvent.c:119-144`).
+    pub fn wait_until_deadline(
+        &self,
+        deadline: std::time::Instant,
+        mut ready: impl FnMut() -> bool,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let answered = loop {
+            self.event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+            if ready() {
+                break true;
+            }
+            // `park_timeout` may return early for any reason, which is why the
+            // deadline is re-derived from the clock rather than counted down.
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break false;
+            };
+            std::thread::park_timeout(left);
+        };
+        self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
+        answered
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1203,107 @@ mod tests {
             w.join().expect("worker panicked");
         }
         assert_eq!(*m.lock(), THREADS * PER_THREAD);
+    }
+
+    /// The first boundary of [`EventWaiter::wait_until`]: a condition that
+    /// already holds must not reach `park` at all, because the signal that
+    /// would have released it may already have been spent.
+    #[test]
+    fn an_event_does_not_park_on_a_condition_that_already_holds() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            true
+        });
+        assert_eq!(polls, 1, "a condition already true was polled twice");
+    }
+
+    /// The other boundary: a waiter that *has* announced itself is released by
+    /// a signal, and a signal with nobody announced is the one-atomic no-op
+    /// the band's per-push wake-up depends on for its cost.
+    #[test]
+    fn a_signal_releases_an_announced_waiter_and_costs_nothing_otherwise() {
+        let event = std::sync::Arc::new(Event::new());
+        assert!(
+            !event.signal(),
+            "an event with no waiter at all reported a wake"
+        );
+
+        let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (e, g, p) = (
+            std::sync::Arc::clone(&event),
+            std::sync::Arc::clone(&go),
+            std::sync::Arc::clone(&parked),
+        );
+        let worker = std::thread::spawn(move || {
+            let waiter = e.waiter();
+            waiter.wait_until(|| {
+                p.store(true, std::sync::atomic::Ordering::SeqCst);
+                g.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        });
+        while !parked.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        go.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The waiter may be anywhere between its announcement and `park`, so
+        // the wake has to be retried — which is the contract: a signal is not
+        // a latch, it releases a waiter that is there to be released.
+        while !event.signal() {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        worker.join().expect("waiter panicked");
+    }
+
+    /// [`EventWaiter::wait_until_deadline`]'s two answers, at the boundary
+    /// between them: a condition that holds answers `true` without waiting,
+    /// and a condition that never holds answers `false` no earlier than the
+    /// deadline.
+    #[test]
+    fn a_deadline_wait_answers_which_of_the_two_happened() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            waiter.wait_until_deadline(far, || true),
+            "a condition that holds was reported as a timeout"
+        );
+
+        let wait = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        assert!(
+            !waiter.wait_until_deadline(started + wait, || false),
+            "a condition that never holds was reported as met"
+        );
+        assert!(
+            started.elapsed() >= wait,
+            "the deadline wait returned early: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Shutdown: [`Event::wake`] has to release a waiter whichever side of its
+    /// announcement it is on, so a facility's join cannot hang on a wake that
+    /// landed in the window [`Event::signal`] deliberately ignores.
+    #[test]
+    fn a_forced_wake_releases_a_waiter_that_has_not_announced_itself() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        // Nobody is announced — `signal` is a no-op here by design, `wake`
+        // still leaves a token, so the park below returns.
+        assert!(!event.signal());
+        event.wake();
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            polls > 1
+        });
+        assert_eq!(polls, 2, "the forced wake did not release the park");
     }
 }

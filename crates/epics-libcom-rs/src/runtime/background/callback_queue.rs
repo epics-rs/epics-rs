@@ -106,9 +106,9 @@
 //! (`a_blocked_callback_does_not_strand_its_neighbours`).
 
 use std::cell::UnsafeCell;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::thread::Thread;
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+use crate::runtime::sync::{Event, EventWaiter};
 
 /// The empty-stack index. No arena can hold this many elements — [`MAX_CHUNKS`]
 /// stops 64 short of it — so it cannot collide with a real node.
@@ -621,39 +621,17 @@ impl<T> BandQueue<T> {
     }
 }
 
-/// Park state of one worker slot.
-const SLOT_FREE: u32 = 0;
-const SLOT_AWAKE: u32 = 1;
-const SLOT_SLEEPING: u32 = 2;
-
-struct Slot {
-    state: AtomicU32,
-    /// Published by the worker that claims the slot, before it can ever
-    /// announce `SLOT_SLEEPING`, so a waker that observes sleeping observes a
-    /// handle.
-    thread: OnceLock<Thread>,
-}
-
-impl Default for Slot {
-    fn default() -> Self {
-        Slot {
-            state: AtomicU32::new(SLOT_FREE),
-            thread: OnceLock::new(),
-        }
-    }
-}
-
-/// The band's wake-up path: one park slot per worker, and no lock.
+/// The band's wake-up path: one [`Event`] per worker, and no lock.
 ///
 /// C signals a counting event per push and re-triggers it per pop that leaves
 /// work behind (`callback.c:375`, `:224`); #996 replaces that with a wake
 /// token per worker. This is the same shape — a pusher wakes at most one
 /// worker, and only one that is actually parked.
 ///
-/// The announce/poll pair is sequentially consistent on both sides, which is
-/// what closes the lost-wake-up window a plain flag would leave: a pusher
-/// stores the entry then loads `sleepers`, a worker stores `SLOT_SLEEPING`
-/// then loads the queue, so at least one of them sees the other.
+/// What this adds over one bare `Event` is the `sleepers` count: with several
+/// workers the signaller would otherwise have to walk every slot to learn
+/// that none of them is parked, and a band running flat out is exactly the
+/// case where none is.
 ///
 /// Given its own cache-line block, for the same reason [`Root`] has one:
 /// `sleepers` is written by a worker on every park and unpark, while the band's
@@ -662,47 +640,33 @@ impl Default for Slot {
 /// and 9% at eight.
 #[repr(align(128))]
 pub(super) struct Parking {
-    /// Workers inside [`Parking::park_until`] — the pusher's test for whether
+    /// Workers inside [`ParkSlot::park_until`] — the pusher's test for whether
     /// a scan is worth anything at all.
     sleepers: AtomicUsize,
-    /// One slot per worker, indexed by the worker's ordinal — the same `j` the
+    /// One event per worker, indexed by the worker's ordinal — the same `j` the
     /// band names its thread after. A worker therefore cannot end up sharing a
     /// slot with another, which would turn one worker's "I am awake" into the
     /// other's lost wake-up.
-    slots: Box<[Slot]>,
+    slots: Box<[Event]>,
 }
 
 impl Parking {
     pub(super) fn new(workers: usize) -> Self {
         Parking {
             sleepers: AtomicUsize::new(0),
-            slots: (0..workers.max(1)).map(|_| Slot::default()).collect(),
+            slots: (0..workers.max(1)).map(|_| Event::new()).collect(),
         }
     }
 
-    /// Publish this thread's handle in its slot. Called once by each worker
-    /// before it can park, so a waker that finds a slot sleeping finds a
-    /// handle in it.
-    pub(super) fn register(&self, slot: usize) {
-        let slot = &self.slots[slot];
-        let _ = slot.thread.set(std::thread::current());
-        slot.state.store(SLOT_AWAKE, Ordering::SeqCst);
-    }
-
-    /// Park until `ready` holds. Announces before every poll, so a pusher that
-    /// misses the announcement is a pusher whose entry this poll sees.
-    pub(super) fn park_until(&self, slot: usize, mut ready: impl FnMut() -> bool) {
-        let state = &self.slots[slot].state;
-        self.sleepers.fetch_add(1, Ordering::SeqCst);
-        loop {
-            state.store(SLOT_SLEEPING, Ordering::SeqCst);
-            if ready() {
-                break;
-            }
-            std::thread::park();
+    /// Claim worker `slot`'s park slot for as long as the worker runs. Holding
+    /// the token is what publishes the worker's thread handle, so a signaller
+    /// that finds a slot parked finds a handle in it without the worker having
+    /// had to remember to announce itself first.
+    pub(super) fn waiter(&self, slot: usize) -> ParkSlot<'_> {
+        ParkSlot {
+            sleepers: &self.sleepers,
+            waiter: self.slots[slot].waiter(),
         }
-        state.store(SLOT_AWAKE, Ordering::SeqCst);
-        self.sleepers.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Wake one parked worker, if any is parked. A push with every worker of
@@ -712,19 +676,7 @@ impl Parking {
             return;
         }
         for slot in &self.slots {
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_SLEEPING,
-                    SLOT_AWAKE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                if let Some(t) = slot.thread.get() {
-                    t.unpark();
-                }
+            if slot.signal() {
                 return;
             }
         }
@@ -734,11 +686,24 @@ impl Parking {
     /// its own exit condition.
     pub(super) fn wake_all(&self) {
         for slot in &self.slots {
-            if let Some(t) = slot.thread.get() {
-                slot.state.store(SLOT_AWAKE, Ordering::SeqCst);
-                t.unpark();
-            }
+            slot.wake();
         }
+    }
+}
+
+/// One worker's claim on its park slot — see [`Parking::waiter`].
+pub(super) struct ParkSlot<'a> {
+    sleepers: &'a AtomicUsize,
+    waiter: EventWaiter<'a>,
+}
+
+impl ParkSlot<'_> {
+    /// Park until `ready` holds, counted in `sleepers` for the whole sleep so
+    /// a pusher's one-load fast path is only taken when nobody is there.
+    pub(super) fn park_until(&self, ready: impl FnMut() -> bool) {
+        self.sleepers.fetch_add(1, Ordering::SeqCst);
+        self.waiter.wait_until(ready);
+        self.sleepers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -919,12 +884,12 @@ mod tests {
                 Arc::clone(&woke),
             );
             s.spawn(move || {
-                p.register(0);
+                let parked = p.waiter(0);
                 // Already true: returns without ever parking.
-                p.park_until(0, || gate.load(Ordering::SeqCst));
+                parked.park_until(|| gate.load(Ordering::SeqCst));
                 announced2.store(true, Ordering::SeqCst);
                 // False until the main thread flips it.
-                p.park_until(0, || go2.load(Ordering::SeqCst));
+                parked.park_until(|| go2.load(Ordering::SeqCst));
                 woke2.store(true, Ordering::SeqCst);
             });
             while !announced.load(Ordering::SeqCst) {
@@ -947,7 +912,7 @@ mod tests {
         let parking = Parking::new(2);
         parking.wake_one();
         parking.wake_all();
-        parking.register(0);
+        let _parked = parking.waiter(0);
         parking.wake_one();
     }
 

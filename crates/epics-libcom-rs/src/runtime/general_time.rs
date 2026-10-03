@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+
+use crate::runtime::sync::PriorityInheritanceMutex;
 use std::time::SystemTime;
 
 /// Priority the built-in OS clock is registered at. C parity:
@@ -100,8 +102,16 @@ impl GeneralTimeInner {
     }
 }
 
-static GENERAL_TIME: LazyLock<Mutex<GeneralTimeInner>> =
-    LazyLock::new(|| Mutex::new(GeneralTimeInner::new()));
+/// C's `gtPvt.timeListLock` (`epicsGeneralTime.c:63`), and an `epicsMutex`
+/// there — so a [`PriorityInheritanceMutex`] here.
+///
+/// Every record timestamp in the IOC passes through this one lock, from
+/// whatever band the record is scanned on, and it is held across a provider's
+/// `get()` (C does the same, `:119-136`) — so the holder can be a provider
+/// doing real work while a High-band record waits behind it. That is the
+/// convergence point priority inheritance exists for.
+static GENERAL_TIME: LazyLock<PriorityInheritanceMutex<GeneralTimeInner>> =
+    LazyLock::new(|| PriorityInheritanceMutex::new(GeneralTimeInner::new()));
 
 static ERROR_COUNTS: AtomicU64 = AtomicU64::new(0);
 
@@ -161,7 +171,7 @@ fn register_current_provider_impl(
     get_time: CurrentTimeFn,
     interrupt_safe: bool,
 ) {
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
     let provider = CurrentTimeProvider {
         name,
         priority,
@@ -211,7 +221,7 @@ fn register_event_provider_impl(
     get_event: EventTimeFn,
     interrupt_safe: bool,
 ) {
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
     let provider = EventTimeProvider {
         name,
         priority,
@@ -245,7 +255,7 @@ pub fn register_clock_sync_hook<F>(hook: F)
 where
     F: Fn(SystemTime) + Send + Sync + 'static,
 {
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
     inner.sync_hooks.push(Box::new(hook));
 }
 
@@ -261,7 +271,7 @@ where
 /// channel for downstream consumers (records that want to log a
 /// step, archivers that want to insert a discontinuity marker).
 pub fn notify_clock_sync(t_synced: SystemTime) {
-    let inner = GENERAL_TIME.lock().unwrap();
+    let inner = GENERAL_TIME.lock();
     for hook in &inner.sync_hooks {
         hook(t_synced);
     }
@@ -287,7 +297,7 @@ pub fn get_current() -> SystemTime {
         return osd_time_get_current();
     }
 
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
     for i in 0..inner.current_providers.len() {
         if let Some(t) = (inner.current_providers[i].get_time)() {
             let name = inner.current_providers[i].name.clone();
@@ -334,7 +344,7 @@ pub fn get_current_except_priority(ignore_priority: i32) -> Option<(SystemTime, 
         return Some((osd_time_get_current(), OS_CLOCK_PRIORITY));
     }
 
-    let inner = GENERAL_TIME.lock().unwrap();
+    let inner = GENERAL_TIME.lock();
     for p in &inner.current_providers {
         if (ignore_priority > 0 && p.priority == ignore_priority)
             || (ignore_priority < 0 && p.priority != -ignore_priority)
@@ -358,7 +368,7 @@ pub fn get_current_except_priority(ignore_priority: i32) -> Option<(SystemTime, 
 /// `*Int` path does not touch the shared ratchet state (it must be
 /// interrupt-safe).
 pub fn get_current_int() -> Option<SystemTime> {
-    let inner = GENERAL_TIME.lock().unwrap();
+    let inner = GENERAL_TIME.lock();
     for p in &inner.current_providers {
         if !p.interrupt_safe {
             continue;
@@ -377,7 +387,7 @@ pub fn get_current_int() -> Option<SystemTime> {
 /// [`register_int_event_provider`]. Returns `None` when no
 /// interrupt-safe event provider answers. **No ratchet.**
 pub fn get_event_int(event: i32) -> Option<SystemTime> {
-    let inner = GENERAL_TIME.lock().unwrap();
+    let inner = GENERAL_TIME.lock();
     for p in &inner.event_providers {
         if !p.interrupt_safe {
             continue;
@@ -398,7 +408,6 @@ pub fn get_event_int(event: i32) -> Option<SystemTime> {
 pub fn highest_current_name() -> Option<String> {
     GENERAL_TIME
         .lock()
-        .unwrap()
         .current_providers
         .first()
         .map(|p| p.name.to_string())
@@ -430,7 +439,7 @@ pub fn get_event(event: i32) -> Option<SystemTime> {
         return Some(get_current());
     }
 
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
 
     if event == -1 {
         // BestTime: query current providers, apply separate ratchet.
@@ -506,13 +515,13 @@ pub fn reset_error_counts() {
 
 /// Return the name of the provider that last supplied current time.
 pub fn current_provider_name() -> Option<String> {
-    let name = GENERAL_TIME.lock().unwrap().last_current_name.clone();
+    let name = GENERAL_TIME.lock().last_current_name.clone();
     name.as_deref().map(str::to_string)
 }
 
 /// Return the name of the provider that last supplied event time.
 pub fn event_provider_name() -> Option<String> {
-    let name = GENERAL_TIME.lock().unwrap().last_event_name.clone();
+    let name = GENERAL_TIME.lock().last_event_name.clone();
     name.as_deref().map(str::to_string)
 }
 
@@ -579,7 +588,7 @@ pub fn clock_time_report(level: i32) -> String {
 ///
 /// `level`: 0 = brief, 1+ = detailed.
 pub fn report(level: i32) -> String {
-    let inner = GENERAL_TIME.lock().unwrap();
+    let inner = GENERAL_TIME.lock();
     let mut out = String::new();
 
     // C: printf("Backwards time errors prevented %u times.\n\n", ...)
@@ -625,7 +634,7 @@ pub fn report(level: i32) -> String {
 /// Reset all state for test isolation. Only available in tests.
 #[cfg(test)]
 fn _reset_for_testing() {
-    let mut inner = GENERAL_TIME.lock().unwrap();
+    let mut inner = GENERAL_TIME.lock();
     *inner = GeneralTimeInner::new();
     ERROR_COUNTS.store(0, Ordering::Relaxed);
     USE_OSD_GET_CURRENT.store(true, Ordering::Relaxed);
@@ -634,10 +643,41 @@ fn _reset_for_testing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     /// Serialize all tests that touch the global GENERAL_TIME state.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// C creates `gtPvt.timeListLock` with `epicsMutexMustCreate`
+    /// (`epicsGeneralTime.c:63`), which puts it in the process `mutexList`
+    /// that `epicsMutexShowAll` walks — so an IOC stuck behind a time
+    /// provider can be diagnosed from iocsh. A `std::sync::Mutex` was
+    /// invisible to that command, as well as carrying no priority
+    /// inheritance for the High-band records that queue behind it.
+    #[test]
+    fn the_general_time_lock_is_one_epics_mutex_show_all_can_see() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let ours = |r: &crate::runtime::sync::MutexReport| {
+            r.shown
+                .iter()
+                .any(|m| m.file().ends_with("general_time.rs"))
+        };
+        let held = GENERAL_TIME.lock();
+        assert!(
+            ours(&crate::runtime::sync::mutex_report(true)),
+            "the general-time lock is held and epicsMutexShowAll cannot see it"
+        );
+        drop(held);
+        assert!(
+            !ours(&crate::runtime::sync::mutex_report(true)),
+            "a released general-time lock still reads as locked"
+        );
+        assert!(
+            ours(&crate::runtime::sync::mutex_report(false)),
+            "the general-time lock is missing from the full list"
+        );
+    }
 
     #[test]
     fn os_clock_default_returns_reasonable_time() {
@@ -833,7 +873,7 @@ mod tests {
         // Force an error via best-time ratchet.
         let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000_000);
         {
-            let mut inner = GENERAL_TIME.lock().unwrap();
+            let mut inner = GENERAL_TIME.lock();
             inner.last_best_time = t_high;
         }
         // Now any current provider returning < t_high on event -1 path will error.
@@ -906,7 +946,7 @@ mod tests {
         _reset_for_testing();
 
         let ahead = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        GENERAL_TIME.lock().unwrap().last_provided_time = ahead;
+        GENERAL_TIME.lock().last_provided_time = ahead;
 
         reset_error_counts();
         let t = get_current();
@@ -920,7 +960,7 @@ mod tests {
             "OS-clock-only backward step must not count an error"
         );
         assert_eq!(
-            GENERAL_TIME.lock().unwrap().last_provided_time,
+            GENERAL_TIME.lock().last_provided_time,
             ahead,
             "the short-circuit must not write shared ratchet state"
         );
@@ -1080,7 +1120,7 @@ mod tests {
 
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let inner = GENERAL_TIME.lock().unwrap();
+        let inner = GENERAL_TIME.lock();
         assert_eq!(inner.last_provided_time, epics_epoch());
         assert_eq!(inner.last_best_time, epics_epoch());
         assert!(inner.event_times.iter().all(|t| *t == epics_epoch()));

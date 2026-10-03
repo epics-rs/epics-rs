@@ -14,16 +14,25 @@
 //!
 //! The Rust port keeps that split of responsibility: **one timer thread** owns
 //! a deadline-ordered queue and, on expiry, submits the callback into the
-//! [`CallbackHandle`] executor pool. It uses `Condvar::wait_timeout` on the
-//! nearest deadline — plain `std`, no tokio timer wheel — so it runs on RTEMS.
+//! [`CallbackHandle`] executor pool. It waits on the nearest deadline with
+//! plain `std` parking — no tokio timer wheel — so it runs on RTEMS.
+//!
+//! C's split of *primitives* is kept too: the queue is a
+//! [`PriorityInheritanceMutex`] because C guards its timer queue with an
+//! `epicsMutex` (`timerPrivate.h:115`), and the thread sleeps on a separate
+//! [`Event`] because C waits on a separate `epicsEvent` (`:188`). A `Mutex` +
+//! `Condvar` would fuse the two, and every caller of
+//! `callbackRequestDelayed` — a record at High, a scan thread — would be
+//! blocking on a non-PI lock held by this one ScanHigh thread.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
-use super::facility::{recover, run_facility_loop, run_isolated};
+use super::facility::{run_facility_loop, run_isolated};
+use crate::runtime::sync::{Event, PriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, ThreadPriority};
 
 /// What this facility is called when it has to report something about itself.
@@ -80,8 +89,10 @@ struct TimerState {
 }
 
 struct Inner {
-    state: Mutex<TimerState>,
-    wake: Condvar,
+    state: PriorityInheritanceMutex<TimerState>,
+    /// C's `epicsEvent` on the timer queue (`timerPrivate.h:188`) — separate
+    /// from `state`, which is what leaves `state` free to be the PI one.
+    wake: Event,
     sink: CallbackHandle,
 }
 
@@ -92,7 +103,7 @@ impl Inner {
     /// when the timer has already shut down and the callback was dropped.
     fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) -> Option<WakeKey> {
         let deadline = crate::runtime::time::deadline_from_now(delay);
-        let mut st = recover(FACILITY, self.state.lock());
+        let mut st = self.state.lock();
         if st.shutdown {
             // Timer thread stopped: match C dropping late delayed requests
             // during shutdown. Drop `cb` (never scheduled or fired) instead of
@@ -111,7 +122,7 @@ impl Inner {
         st.next_seq += 1;
         st.queue.insert(key, TimerEntry { action, cb });
         drop(st);
-        self.wake.notify_one();
+        self.wake.signal();
         Some(key)
     }
 
@@ -121,7 +132,7 @@ impl Inner {
         // Taken out of the lock before it drops: a callback's drop glue is
         // arbitrary user code and must never run while the queue is held.
         let entry = {
-            let mut st = recover(FACILITY, self.state.lock());
+            let mut st = self.state.lock();
             st.queue.remove(&key)
         };
         drop(entry);
@@ -132,41 +143,55 @@ impl Inner {
 /// every due callback to the executor pool via `notify`
 /// (`callback.c:404-408`).
 fn timer_loop(inner: &Inner) {
-    let mut st = recover(FACILITY, inner.state.lock());
+    let parked = inner.wake.waiter();
     loop {
-        if st.shutdown {
-            return;
-        }
-        let now = Instant::now();
-        // `deadline` is `Copy`, so this releases the borrow immediately.
-        match st.queue.first_key_value().map(|(k, _)| k.deadline) {
-            Some(deadline) if deadline <= now => {
-                // Due: run it. A wakeup (`Inline`) runs here on the timer thread
-                // — it only unparks a driver, needs no worker, and must not queue
-                // on the callback pool (that is the sleep-wake self-deadlock). A
-                // deferred-work callback (`Pool`) is handed to the executor pool.
-                let (_, entry) = st.queue.pop_first().unwrap();
-                drop(st);
-                match entry.action {
-                    TimerAction::Inline => {
-                        run_isolated(FACILITY, entry.cb);
-                    }
-                    TimerAction::Pool(priority) => {
-                        let _ = inner.sink.request(priority, entry.cb);
-                    }
+        // What the thread does next is decided from one sample of the queue,
+        // and the lock is held across none of it: not across a callback, and
+        // not across a sleep.
+        let next = {
+            let mut st = inner.state.lock();
+            if st.shutdown {
+                return;
+            }
+            match st.queue.first_key_value().map(|(k, _)| k.deadline) {
+                Some(deadline) if deadline <= Instant::now() => {
+                    Some(st.queue.pop_first().expect("the entry just sampled").1)
                 }
-                st = recover(FACILITY, inner.state.lock());
+                earliest => {
+                    drop(st);
+                    // The two things worth waking for: the earliest deadline
+                    // is no longer the one being slept on (a nearer request,
+                    // or this one cancelled), or shutdown.
+                    let changed = || {
+                        let st = inner.state.lock();
+                        st.shutdown
+                            || st.queue.first_key_value().map(|(k, _)| k.deadline) != earliest
+                    };
+                    match earliest {
+                        // Not yet due: sleep until it is, or until a nearer
+                        // request wakes us.
+                        Some(deadline) => {
+                            parked.wait_until_deadline(deadline, changed);
+                        }
+                        // Nothing scheduled: sleep until a request or shutdown.
+                        None => parked.wait_until(changed),
+                    }
+                    None
+                }
             }
-            Some(deadline) => {
-                // Not yet due: sleep until it is, or until a nearer request
-                // wakes us.
-                let wait = deadline.saturating_duration_since(now);
-                let (guard, _timeout) = recover(FACILITY, inner.wake.wait_timeout(st, wait));
-                st = guard;
-            }
-            None => {
-                // Nothing scheduled: sleep until a request or shutdown.
-                st = recover(FACILITY, inner.wake.wait(st));
+        };
+        // Due: run it. A wakeup (`Inline`) runs here on the timer thread — it
+        // only unparks a driver, needs no worker, and must not queue on the
+        // callback pool (that is the sleep-wake self-deadlock). A
+        // deferred-work callback (`Pool`) is handed to the executor pool.
+        if let Some(entry) = next {
+            match entry.action {
+                TimerAction::Inline => {
+                    run_isolated(FACILITY, entry.cb);
+                }
+                TimerAction::Pool(priority) => {
+                    let _ = inner.sink.request(priority, entry.cb);
+                }
             }
         }
     }
@@ -226,7 +251,7 @@ impl TimerHandle {
     /// How many entries are queued. For tests and on-target probes: the
     /// per-sleep retention this queue used to carry is only visible as a count.
     pub fn scheduled_count(&self) -> usize {
-        recover(FACILITY, self.inner.state.lock()).queue.len()
+        self.inner.state.lock().queue.len()
     }
 }
 
@@ -246,12 +271,12 @@ impl DelayedTimer {
     /// (`callback.c:300`) whose `notify` routes to `callbackRequest`.
     pub fn new(sink: CallbackHandle) -> Self {
         let inner = Arc::new(Inner {
-            state: Mutex::new(TimerState {
+            state: PriorityInheritanceMutex::new(TimerState {
                 queue: BTreeMap::new(),
                 next_seq: 0,
                 shutdown: false,
             }),
-            wake: Condvar::new(),
+            wake: Event::new(),
             sink,
         });
         let worker_inner = Arc::clone(&inner);
@@ -282,7 +307,7 @@ impl DelayedTimer {
             run_facility_loop(
                 FACILITY,
                 || timer_loop(&worker_inner),
-                || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+                || worker_inner.state.lock().shutdown = true,
             );
         });
         DelayedTimer {
@@ -308,10 +333,10 @@ impl DelayedTimer {
 impl Drop for DelayedTimer {
     fn drop(&mut self) {
         {
-            let mut st = recover(FACILITY, self.inner.state.lock());
+            let mut st = self.inner.state.lock();
             st.shutdown = true;
         }
-        self.inner.wake.notify_all();
+        self.inner.wake.wake();
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
@@ -414,23 +439,26 @@ mod tests {
         );
     }
 
-    /// Boundary: the state mutex is poisoned. Every scheduling path in this
-    /// file took it with `.unwrap()`, so one panic anywhere under the lock
-    /// stopped all timed work.
+    /// Boundary: a caller panics while holding the state lock. With a
+    /// `std::sync::Mutex` that poisoned the lock and every later scheduling
+    /// path propagated it, so one caller's panic stopped all timed work; the
+    /// lock the facility uses now cannot be poisoned, and the panic costs the
+    /// lock window and nothing else.
     #[test]
-    fn a_poisoned_state_still_schedules_and_fires() {
+    fn a_panic_under_the_state_lock_still_leaves_the_timer_scheduling() {
         let pool = CallbackPool::new();
         let timer = DelayedTimer::new(pool.handle());
 
         let inner = Arc::clone(&timer.inner);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = inner.state.lock().expect("first lock");
-            panic!("poison the timer state");
+            let _held = inner.state.lock();
+            panic!("unwind out of the lock window");
         }));
-        assert!(
-            timer.inner.state.lock().is_err(),
-            "the state mutex must actually be poisoned for this to test anything"
-        );
+        // Taken, not try-locked: the timer thread polls its own queue under
+        // this lock, so a `try_lock` here races it. Blocking is the honest
+        // probe — a lock the panic leaked never comes back and the test times
+        // out instead of flaking.
+        drop(timer.inner.state.lock());
 
         let (tx, rx) = mpsc::channel();
         timer.schedule(
@@ -441,7 +469,7 @@ mod tests {
         assert_eq!(
             rx.recv_timeout(T),
             Ok(()),
-            "a poisoned state stopped the timer facility"
+            "a panic under the state lock stopped the timer facility"
         );
     }
 

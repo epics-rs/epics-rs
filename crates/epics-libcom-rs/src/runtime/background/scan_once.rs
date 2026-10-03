@@ -13,10 +13,16 @@
 //! (`dbScan.c:715-717`) plus an optional completion callback
 //! (`dbScan.c:718-719`).
 //!
-//! The Rust port keeps that exact shape with **plain `std` threads +
-//! `Mutex`/`Condvar`** and a boxed closure per entry (the closure carries the
-//! "lock + process this record" tail the seam supplies later — this increment
-//! does not touch `pv.rs`/`processing.rs`). No tokio-runtime dependency, so it
+//! The Rust port keeps that exact shape — and C's split of primitives with
+//! it: the ring is guarded by a [`PriorityInheritanceMutex`] because C guards
+//! it with a PI primitive (`epicsRingBytesLockedCreate`,
+//! `epicsRingBytes.c:58-65`, over `epicsSpin`, which is a
+//! `PTHREAD_PRIO_INHERIT` mutex on Linux, `osdSpin.c:126`), and the worker
+//! sleeps on a separate [`Event`] because C signals a separate `onceSem`. A
+//! `Mutex` + `Condvar` would fuse the two and leave every requester — a scan
+//! thread, a device callback — blocking on a non-PI lock held by this
+//! facility's own worker. A boxed closure carries the "lock + process this
+//! record" tail the seam supplies later. No tokio-runtime dependency, so it
 //! runs on RTEMS.
 //!
 //! ## Overflow hysteresis (`dbScan.c:672`, `:683-690`)
@@ -28,11 +34,12 @@
 //! We reproduce that latch exactly.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use super::facility::{recover, run_facility_loop, run_isolated};
+use super::facility::{run_facility_loop, run_isolated};
+use crate::runtime::sync::{Event, PriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A queued "process this record" tail. C stores `{prec, cb, usr}`
@@ -65,12 +72,14 @@ struct OnceState {
 
 struct Inner {
     capacity: usize,
-    state: Mutex<OnceState>,
-    /// C `onceSem` (`dbScan.c`), the worker's wake-up event.
-    wake: Condvar,
+    state: PriorityInheritanceMutex<OnceState>,
+    /// C `onceSem` (`dbScan.c:68`), the worker's wake-up event — a separate
+    /// primitive, which is what leaves `state` free to be the PI one.
+    wake: Event,
     /// The drain thread, started on the first request rather than at
-    /// construction — see [`Inner::ensure_worker`].
-    worker: Mutex<Option<JoinHandle<()>>>,
+    /// construction — see [`Inner::ensure_worker`]. PI for the same reason
+    /// `state` is: every request passes through it.
+    worker: PriorityInheritanceMutex<Option<JoinHandle<()>>>,
 }
 
 impl Inner {
@@ -86,7 +95,7 @@ impl Inner {
     /// record system has frozen the menu and pushed the count down with
     /// [`set_periodic_scan_band_count`].
     fn ensure_worker(self: &Arc<Self>) {
-        let mut worker = recover(FACILITY, self.worker.lock());
+        let mut worker = self.worker.lock();
         if worker.is_some() {
             return;
         }
@@ -121,7 +130,7 @@ impl Inner {
                 run_facility_loop(
                     FACILITY,
                     || once_loop(&worker_inner),
-                    || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+                    || worker_inner.state.lock().shutdown = true,
                 );
             }),
         );
@@ -129,7 +138,7 @@ impl Inner {
 
     /// Port of `scanOnceCallback` (`dbScan.c:670-694`).
     fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
-        let mut st = recover(FACILITY, self.state.lock());
+        let mut st = self.state.lock();
         if st.shutdown {
             // Worker stopped: C drops late scanOnce requests during shutdown
             // without surfacing an error (parity with `callbackStop` handling
@@ -162,7 +171,7 @@ impl Inner {
         drop(st);
         // dbScan.c:691 — `epicsEventSignal(onceSem)` is issued unconditionally,
         // outside the push success/failure branch.
-        self.wake.notify_one();
+        self.wake.signal();
         result
     }
 
@@ -174,7 +183,7 @@ impl Inner {
     /// deepest the ring has been *since the reset*, and the ring is already
     /// that deep when the reset happens.
     fn stats(&self, reset: bool) -> ScanOnceQueueStats {
-        let mut st = recover(FACILITY, self.state.lock());
+        let mut st = self.state.lock();
         let out = ScanOnceQueueStats {
             size: self.capacity,
             num_used: st.queue.len(),
@@ -230,18 +239,28 @@ fn scan_once_priority() -> ThreadPriority {
 /// Port of `onceTask` (`dbScan.c:696-726`): wait on the wake event, drain the
 /// ring, run each queued tail.
 fn once_loop(inner: &Inner) {
+    let parked = inner.wake.waiter();
     loop {
-        let mut st = recover(FACILITY, inner.state.lock());
-        while st.queue.is_empty() && !st.shutdown {
-            st = recover(FACILITY, inner.wake.wait(st));
+        let next = {
+            let mut st = inner.state.lock();
+            match st.queue.pop_front() {
+                Some(cb) => Some(cb),
+                // Empty and stopping is the only way out, as in C: a shutdown
+                // with entries left drains them first.
+                None if st.shutdown => return,
+                None => None,
+            }
+        };
+        match next {
+            // dbScan.c:715-719 — the queued tail owns lock/dbProcess/unlock/cb.
+            Some(cb) => {
+                run_isolated(FACILITY, cb);
+            }
+            None => parked.wait_until(|| {
+                let st = inner.state.lock();
+                !st.queue.is_empty() || st.shutdown
+            }),
         }
-        if st.queue.is_empty() {
-            return; // empty + shutdown
-        }
-        let cb = st.queue.pop_front().unwrap();
-        drop(st);
-        // dbScan.c:715-719 — the queued tail owns lock/dbProcess/unlock/cb.
-        run_isolated(FACILITY, cb);
     }
 }
 
@@ -263,7 +282,7 @@ impl ScanOnceHandle {
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:67`).
     pub fn overflow_count(&self) -> u64 {
-        recover(FACILITY, self.inner.state.lock()).overflows
+        self.inner.state.lock().overflows
     }
 
     /// C `scanOnceQueueStatus` (`dbScan.c:734-751`).
@@ -315,15 +334,15 @@ impl ScanOnceQueue {
     pub fn with_capacity(capacity: usize) -> Self {
         let inner = Arc::new(Inner {
             capacity: capacity.max(1),
-            state: Mutex::new(OnceState {
+            state: PriorityInheritanceMutex::new(OnceState {
                 queue: VecDeque::new(),
                 high_water: 0,
                 overflows: 0,
                 new_overflow: true,
                 shutdown: false,
             }),
-            wake: Condvar::new(),
-            worker: Mutex::new(None),
+            wake: Event::new(),
+            worker: PriorityInheritanceMutex::new(None),
         });
         ScanOnceQueue { inner }
     }
@@ -359,7 +378,7 @@ impl ScanOnceQueue {
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:67`).
     pub fn overflow_count(&self) -> u64 {
-        recover(FACILITY, self.inner.state.lock()).overflows
+        self.inner.state.lock().overflows
     }
 
     /// C `scanOnceQueueStatus` (`dbScan.c:734-751`): sample the ring and,
@@ -378,11 +397,11 @@ impl Default for ScanOnceQueue {
 impl Drop for ScanOnceQueue {
     fn drop(&mut self) {
         {
-            let mut st = recover(FACILITY, self.inner.state.lock());
+            let mut st = self.inner.state.lock();
             st.shutdown = true;
         }
-        self.inner.wake.notify_all();
-        let worker = recover(FACILITY, self.inner.worker.lock()).take();
+        self.inner.wake.wake();
+        let worker = self.inner.worker.lock().take();
         if let Some(w) = worker {
             let _ = w.join();
         }

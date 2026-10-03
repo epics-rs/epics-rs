@@ -25,7 +25,8 @@
 //! queue is a smaller fraction here.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use epics_libcom_rs::runtime::background::CallbackPriority;
@@ -35,20 +36,24 @@ const BAND: CallbackPriority = CallbackPriority::Medium;
 const QUEUE: usize = 65_536;
 
 /// Occupy every worker of the band, so a push neither wakes anyone nor races a
-/// pop. Returns the gate the workers are spinning on.
-fn occupy(pool: &CallbackPool, workers: usize) -> Arc<AtomicBool> {
-    let gate = Arc::new(AtomicBool::new(false));
+/// pop. The workers *block* rather than spin: the push phase is a measurement
+/// of the requester path, and a spinning worker would take a core off the
+/// requesters and measure the scheduler instead. A worker inside a callback is
+/// not parked either way, so the band's wake state is the same.
+///
+/// Returns the sender that releases them.
+fn occupy(pool: &CallbackPool, workers: usize) -> mpsc::Sender<()> {
+    let (tx, rx) = mpsc::channel::<()>();
+    let rx = Arc::new(std::sync::Mutex::new(rx));
     let running = Arc::new(AtomicUsize::new(0));
     for _ in 0..workers {
-        let gate = Arc::clone(&gate);
+        let rx = Arc::clone(&rx);
         let running = Arc::clone(&running);
         pool.request(
             BAND,
             Box::new(move || {
                 running.fetch_add(1, Ordering::SeqCst);
-                while !gate.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
+                let _ = rx.lock().unwrap().recv();
             }),
         )
         .unwrap();
@@ -56,7 +61,7 @@ fn occupy(pool: &CallbackPool, workers: usize) -> Arc<AtomicBool> {
     while running.load(Ordering::SeqCst) < workers {
         std::hint::spin_loop();
     }
-    gate
+    tx
 }
 
 fn submit(pool: &CallbackPool, n: usize, done: &Arc<AtomicUsize>, spin: usize) -> usize {
@@ -110,7 +115,7 @@ fn main() {
         // push + drain: the two halves measured apart.
         let pool = Arc::new(CallbackPool::with_config(QUEUE, workers));
         let done = Arc::new(AtomicUsize::new(0));
-        let gate = occupy(&pool, workers);
+        let release = occupy(&pool, workers);
 
         let t0 = Instant::now();
         std::thread::scope(|s| {
@@ -122,7 +127,9 @@ fn main() {
         push.push(t0.elapsed().as_nanos() as f64 / total as f64);
 
         let t0 = Instant::now();
-        gate.store(true, Ordering::Release);
+        for _ in 0..workers {
+            release.send(()).unwrap();
+        }
         while done.load(Ordering::Relaxed) < total {
             std::hint::spin_loop();
         }

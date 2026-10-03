@@ -210,6 +210,17 @@ struct Pool<T> {
     reserved: AtomicUsize,
     /// Tagged head of the ring's slot supply. Empty means the band is full.
     free_ring: AtomicU64,
+    /// Ring slots currently out — C `epicsRingPointerGetUsed`.
+    ///
+    /// **Why it lives here and nowhere else.** It is raised by the
+    /// [`Pool::alloc_ring`] that took the slot and lowered by the
+    /// [`Pool::dealloc`] that gave it back, which are the real forward and
+    /// reverse of one ring entry. Counted from outside instead — a requester
+    /// incrementing after its push, a worker decrementing after its pop — the
+    /// decrement can land before its own increment, because the entry is
+    /// visible to a worker from the moment it is linked: the band then reads
+    /// one below zero, which is `usize::MAX`.
+    ring_used: AtomicUsize,
     /// Tagged head of the run-queue supply, grown on demand: a run-queue entry
     /// is never refused for capacity.
     free_task: AtomicU64,
@@ -231,6 +242,7 @@ impl<T> Pool<T> {
             chunks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
             reserved: AtomicUsize::new(0),
             free_ring: AtomicU64::new(pack(IDX_NONE, 0)),
+            ring_used: AtomicUsize::new(0),
             free_task: AtomicU64::new(pack(IDX_NONE, 0)),
             ring_slots,
         };
@@ -305,10 +317,22 @@ impl<T> Pool<T> {
         unsafe { &*base.add(off) }
     }
 
-    /// Take one of the ring's slots. One CAS, and `None` is the band being
-    /// full — the supply is the bound, so nothing else has to be consulted.
-    fn alloc_ring(&self) -> Option<u32> {
-        self.pop(&self.free_ring)
+    /// Take one of the ring's slots, with the ring's depth including it. One
+    /// CAS plus one `fetch_add`, and `None` is the band being full — the
+    /// supply is the bound, so nothing else has to be consulted.
+    ///
+    /// The depth is returned rather than read back later because this is the
+    /// only moment it is this entry's: a load after the push can already have
+    /// been lowered by the worker that ran it.
+    fn alloc_ring(&self) -> Option<(u32, usize)> {
+        let i = self.pop(&self.free_ring)?;
+        let depth = self.ring_used.fetch_add(1, Ordering::AcqRel) + 1;
+        Some((i, depth))
+    }
+
+    /// Ring slots out right now — C `epicsRingPointerGetUsed`.
+    fn ring_used(&self) -> usize {
+        self.ring_used.load(Ordering::Acquire)
     }
 
     /// Take one run-queue node, growing the arena when the supply is empty.
@@ -351,6 +375,7 @@ impl<T> Pool<T> {
     /// caller must own it: off both stacks and with its value taken.
     fn dealloc(&self, i: u32) {
         let list = if (i as usize) < self.ring_slots {
+            self.ring_used.fetch_sub(1, Ordering::AcqRel);
             &self.free_ring
         } else {
             &self.free_task
@@ -420,18 +445,29 @@ impl<T> BandQueue<T> {
         }
     }
 
-    /// Submit `v` into one of the band's `capacity` ring slots. Two CAS — one
-    /// takes the slot, one publishes it — and the requester owns nothing in
-    /// between. `Err(v)` hands the value back when no slot is free, which is
-    /// the band being full.
-    pub(super) fn push_ring(&self, v: T) -> Result<(), T> {
+    /// Submit `v` into one of the band's `capacity` ring slots, answering with
+    /// the ring's depth including this entry. Two CAS — one takes the slot,
+    /// one publishes it — and the requester owns nothing in between. `Err(v)`
+    /// hands the value back when no slot is free, which is the band being
+    /// full.
+    ///
+    /// The depth comes back from the push because it is only this entry's
+    /// before the entry is published: the band's high-water mark is latched
+    /// from it, and a load afterwards would read a depth a worker has already
+    /// lowered.
+    pub(super) fn push_ring(&self, v: T) -> Result<usize, T> {
         match self.nodes.alloc_ring() {
-            Some(i) => {
+            Some((i, depth)) => {
                 self.publish(i, v);
-                Ok(())
+                Ok(depth)
             }
             None => Err(v),
         }
+    }
+
+    /// Ring entries queued right now — C `epicsRingPointerGetUsed`.
+    pub(super) fn ring_used(&self) -> usize {
+        self.nodes.ring_used()
     }
 
     /// Submit `v` without taking a ring slot — the run-queue entries that
@@ -1001,8 +1037,10 @@ mod tests {
     /// guarantee is that no field of the enclosing band can be placed in
     /// `Parking`'s extent, which is what the 128-byte alignment buys — where
     /// `sleepers` sits inside that extent does not matter, since the whole
-    /// block is the park state's. Asserted rather than commented, because an
-    /// attribute is easy to drop and nothing else makes alignment visible.
+    /// block is the park state's, and the ring counter the loss was measured
+    /// against cannot land there wherever it is declared. Asserted rather
+    /// than commented, because an attribute is easy to drop and nothing else
+    /// makes alignment visible.
     #[test]
     fn the_park_counter_keeps_a_cache_line_to_itself() {
         assert!(

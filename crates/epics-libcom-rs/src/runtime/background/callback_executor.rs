@@ -293,11 +293,6 @@ enum Queued {
 struct PriorityQueue {
     capacity: usize,
     queue: BandQueue<Queued>,
-    /// Ring slots in use — what C's bounded ring measures, and not the
-    /// queue's length: a run-queue entry shares the FIFO but holds no ring
-    /// slot. A statistic only: the band's bound is its slot supply, so this
-    /// is moved by a `fetch_add`, never consulted to decide a push.
-    used: AtomicUsize,
     /// The deepest the ring has been since the last reset — C
     /// `epicsRingPointerGetHighWaterMark`, which `callbackQueueShow` reports
     /// and `callbackQueueStatus(reset=1)` clears (`callback.c:115-139`). Not
@@ -321,7 +316,6 @@ impl PriorityQueue {
         PriorityQueue {
             capacity,
             queue: BandQueue::with_capacity(capacity),
-            used: AtomicUsize::new(0),
             high_water: AtomicUsize::new(0),
             overflow: AtomicBool::new(false),
             overflows: AtomicU64::new(0),
@@ -330,18 +324,16 @@ impl PriorityQueue {
         }
     }
 
-    /// Count a ring slot the band has already granted, and deepen the
-    /// high-water mark if this entry is the deepest yet.
+    /// Deepen the high-water mark if `depth` — the ring's depth as the push
+    /// that just succeeded saw it — is the deepest yet.
     ///
-    /// A `fetch_add` and, in the steady state, one relaxed load: the mark only
-    /// moves while the ring is reaching depths it has not reached since the
-    /// last reset. Nothing here can refuse a push — the slot was granted by
-    /// taking it, so this counter cannot disagree with the band about whether
-    /// there was room.
-    fn count_ring_slot(&self) {
-        let used = self.used.fetch_add(1, Ordering::AcqRel) + 1;
-        if used > self.high_water.load(Ordering::Relaxed) {
-            self.high_water.fetch_max(used, Ordering::AcqRel);
+    /// In the steady state one relaxed load: the mark only moves while the
+    /// ring is reaching depths it has not reached since the last reset. The
+    /// depth is the pusher's own, not a load, because by now the entry may
+    /// already have run.
+    fn deepen_high_water(&self, depth: usize) {
+        if depth > self.high_water.load(Ordering::Relaxed) {
+            self.high_water.fetch_max(depth, Ordering::AcqRel);
         }
     }
 
@@ -380,14 +372,17 @@ impl PriorityQueue {
         if self.overflow.load(Ordering::Acquire) {
             return Err(CallbackError::QueueFull);
         }
-        if let Err(entry) = self.queue.push_ring(Queued::Ring(cb)) {
+        let depth = match self.queue.push_ring(Queued::Ring(cb)) {
+            Ok(depth) => depth,
             // No ring slot was free: the band is full, the one place that
             // decides it. Dropping the entry deallocates the callback that
             // was never queued.
-            drop(entry);
-            return Err(self.report_full(name));
-        }
-        self.count_ring_slot();
+            Err(entry) => {
+                drop(entry);
+                return Err(self.report_full(name));
+            }
+        };
+        self.deepen_high_water(depth);
         // callback.c:375 — wake the band, but only if a worker is parked.
         self.parking.wake_one();
         Ok(())
@@ -430,7 +425,7 @@ impl PriorityQueue {
         // is on this side because it is `callbackQueueStatus`, run from iocsh,
         // and the alternative is a CAS loop on every request.
         let (used, mark) = loop {
-            let used = self.used.load(Ordering::Acquire);
+            let used = self.queue.ring_used();
             let mark = self.high_water.load(Ordering::Acquire);
             if mark >= used {
                 if !reset {
@@ -510,7 +505,6 @@ fn worker_loop(pq: &PriorityQueue, slot: usize) {
         }
         let cb = match entry {
             Queued::Ring(cb) => {
-                pq.used.fetch_sub(1, Ordering::AcqRel);
                 // callback.c:227 — clear the overflow latch on every pop.
                 pq.overflow.store(false, Ordering::Release);
                 cb
@@ -1388,6 +1382,77 @@ mod tests {
         pool.shutdown();
     }
 
+    /// The boundary the ring's accounting has to hold at: zero, with a worker
+    /// consuming one entry while a requester takes the slot for the next.
+    ///
+    /// Counted from outside the band — raised after the push, lowered after
+    /// the pop — the two are not ordered against each other, because the entry
+    /// is a worker's to run from the moment it is linked: the decrement lands
+    /// before its own increment and the count reads `usize::MAX`. That showed
+    /// up as 5 failures in 25 runs of
+    /// `a_parallel_band_loses_no_entry_however_its_workers_are_parked`, and
+    /// `stats` would have spun forever on it rather than reported it. The
+    /// count is the slot supply's own, so this holds by construction.
+    #[test]
+    fn the_ring_count_never_reads_below_the_entries_queued() {
+        const CAPACITY: usize = 4;
+        const TOTAL: usize = 20_000;
+        let pq = Arc::new(PriorityQueue::new(CAPACITY, 1));
+        let pushed = Arc::new(AtomicUsize::new(0));
+        let popped = Arc::new(AtomicUsize::new(0));
+        let deep = |pq: &PriorityQueue| {
+            let used = pq.queue.ring_used();
+            assert!(
+                used <= CAPACITY,
+                "the ring of {CAPACITY} reported {used} entries queued"
+            );
+        };
+
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let (pq, pushed) = (Arc::clone(&pq), Arc::clone(&pushed));
+                s.spawn(move || {
+                    while pushed.load(Ordering::Relaxed) < TOTAL {
+                        if pq.request("cbLow", Box::new(|| {})).is_ok() {
+                            pushed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        deep(&pq);
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let (pq, pushed, popped) =
+                    (Arc::clone(&pq), Arc::clone(&pushed), Arc::clone(&popped));
+                s.spawn(move || {
+                    loop {
+                        match pq.queue.pop() {
+                            Some(entry) => {
+                                drop(entry);
+                                // callback.c:227 — a pop clears the latch, so
+                                // the pushers above keep making progress.
+                                pq.overflow.store(false, Ordering::Release);
+                                popped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None if pushed.load(Ordering::Relaxed) >= TOTAL
+                                && popped.load(Ordering::Relaxed) >= TOTAL =>
+                            {
+                                return;
+                            }
+                            None => std::thread::yield_now(),
+                        }
+                        deep(&pq);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            pq.queue.ring_used(),
+            0,
+            "every entry ran and the ring still holds slots"
+        );
+    }
+
     /// A task entry takes no ring slot, so a latched ring must not refuse it:
     /// a refused wake would strand the task forever.
     #[test]
@@ -1537,21 +1602,6 @@ mod tests {
             pq.stats(false).num_used,
             1,
             "the task entry was charged to the ring"
-        );
-    }
-
-    /// The other half of `callback_queue::tests::the_park_counter_keeps_a_cache_line_to_itself`:
-    /// `Parking` owning a line is worth nothing if the band's own counter is
-    /// placed inside it. `used_hw` is written by every requester and by every
-    /// pop; `sleepers` is written by a worker on every park.
-    #[test]
-    fn the_ring_counter_and_the_park_counter_are_in_different_lines() {
-        let used_hw = std::mem::offset_of!(PriorityQueue, used);
-        let parking = std::mem::offset_of!(PriorityQueue, parking);
-        assert_ne!(
-            used_hw / 64,
-            parking / 64,
-            "used_hw at {used_hw} shares a 64-byte line with parking at {parking}"
         );
     }
 }

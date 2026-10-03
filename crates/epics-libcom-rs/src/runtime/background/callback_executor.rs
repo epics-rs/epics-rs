@@ -1442,7 +1442,7 @@ mod tests {
         const CAPACITY: usize = 4;
         const TOTAL: usize = 20_000;
         let pq = Arc::new(PriorityQueue::new(CAPACITY, 1));
-        let pushed = Arc::new(AtomicUsize::new(0));
+        let claimed = Arc::new(AtomicUsize::new(0));
         let popped = Arc::new(AtomicUsize::new(0));
         let deep = |pq: &PriorityQueue| {
             let used = pq.queue.ring_used();
@@ -1454,19 +1454,26 @@ mod tests {
 
         std::thread::scope(|s| {
             for _ in 0..2 {
-                let (pq, pushed) = (Arc::clone(&pq), Arc::clone(&pushed));
+                let (pq, claimed) = (Arc::clone(&pq), Arc::clone(&claimed));
                 s.spawn(move || {
-                    while pushed.load(Ordering::Relaxed) < TOTAL {
-                        if pq.request("cbLow", Box::new(|| {})).is_ok() {
-                            pushed.fetch_add(1, Ordering::Relaxed);
+                    // An entry is claimed before it is pushed, so exactly
+                    // `TOTAL` reach the ring however the two pushers
+                    // interleave. Counting pushes afterwards instead lets both
+                    // read one short of `TOTAL`, push, and leave an entry
+                    // behind that the poppers have already stopped counting.
+                    while claimed.fetch_add(1, Ordering::Relaxed) < TOTAL {
+                        while pq.request("cbLow", Box::new(|| {})).is_err() {
+                            deep(&pq);
+                            // A full ring is the poppers' turn: spinning on it
+                            // instead starves them on an oversubscribed box.
+                            std::thread::yield_now();
                         }
                         deep(&pq);
                     }
                 });
             }
             for _ in 0..2 {
-                let (pq, pushed, popped) =
-                    (Arc::clone(&pq), Arc::clone(&pushed), Arc::clone(&popped));
+                let (pq, popped) = (Arc::clone(&pq), Arc::clone(&popped));
                 s.spawn(move || {
                     loop {
                         match pq.queue.pop() {
@@ -1477,11 +1484,9 @@ mod tests {
                                 pq.overflow.store(false, Ordering::Release);
                                 popped.fetch_add(1, Ordering::Relaxed);
                             }
-                            None if pushed.load(Ordering::Relaxed) >= TOTAL
-                                && popped.load(Ordering::Relaxed) >= TOTAL =>
-                            {
-                                return;
-                            }
+                            // `TOTAL` pops can only have happened after
+                            // `TOTAL` pushes, so nothing can still arrive.
+                            None if popped.load(Ordering::Relaxed) >= TOTAL => return,
                             None => std::thread::yield_now(),
                         }
                         deep(&pq);

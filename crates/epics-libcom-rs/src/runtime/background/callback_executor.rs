@@ -328,7 +328,8 @@ struct PriorityQueue {
     overflows: AtomicU64,
     shutdown: AtomicBool,
     /// C `cbQueueSet.semWakeUp` (`callback.c:54`), as one park slot per
-    /// worker.
+    /// worker. Cache-line aligned, and kept out of `used_hw`'s line — see
+    /// `callback_queue::Parking`.
     parking: Parking,
 }
 
@@ -1556,6 +1557,21 @@ mod tests {
             pq.stats(false).num_used,
             1,
             "the task entry was charged to the ring"
+        );
+    }
+
+    /// The other half of `callback_queue::tests::the_park_counter_keeps_a_cache_line_to_itself`:
+    /// `Parking` owning a line is worth nothing if the band's own counter is
+    /// placed inside it. `used_hw` is written by every requester and by every
+    /// pop; `sleepers` is written by a worker on every park.
+    #[test]
+    fn the_ring_counter_and_the_park_counter_are_in_different_lines() {
+        let used_hw = std::mem::offset_of!(PriorityQueue, used_hw);
+        let parking = std::mem::offset_of!(PriorityQueue, parking);
+        assert_ne!(
+            used_hw / 64,
+            parking / 64,
+            "used_hw at {used_hw} shares a 64-byte line with parking at {parking}"
         );
     }
 }

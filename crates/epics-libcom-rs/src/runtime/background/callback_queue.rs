@@ -581,22 +581,29 @@ impl Default for Slot {
 /// what closes the lost-wake-up window a plain flag would leave: a pusher
 /// stores the entry then loads `sleepers`, a worker stores `SLOT_SLEEPING`
 /// then loads the queue, so at least one of them sees the other.
+///
+/// Given its own cache-line block, for the same reason [`Root`] has one:
+/// `sleepers` is written by a worker on every park and unpark, while the band's
+/// ring counter is written by every requester. Measured in C with the two in one
+/// 64-byte line, a band loses 46% of its throughput at one worker, 33% at four
+/// and 9% at eight.
+#[repr(align(128))]
 pub(super) struct Parking {
+    /// Workers inside [`Parking::park_until`] — the pusher's test for whether
+    /// a scan is worth anything at all.
+    sleepers: AtomicUsize,
     /// One slot per worker, indexed by the worker's ordinal — the same `j` the
     /// band names its thread after. A worker therefore cannot end up sharing a
     /// slot with another, which would turn one worker's "I am awake" into the
     /// other's lost wake-up.
     slots: Box<[Slot]>,
-    /// Workers inside [`Parking::park_until`] — the pusher's test for whether
-    /// a scan is worth anything at all.
-    sleepers: AtomicUsize,
 }
 
 impl Parking {
     pub(super) fn new(workers: usize) -> Self {
         Parking {
-            slots: (0..workers.max(1)).map(|_| Slot::default()).collect(),
             sleepers: AtomicUsize::new(0),
+            slots: (0..workers.max(1)).map(|_| Slot::default()).collect(),
         }
     }
 
@@ -904,5 +911,24 @@ mod tests {
             popped += 1;
         }
         assert!(q.is_empty());
+    }
+
+    /// The layout the 46%/33%/9% loss above was measured against. The
+    /// guarantee is that no field of the enclosing band can be placed in
+    /// `Parking`'s extent, which is what the 128-byte alignment buys — where
+    /// `sleepers` sits inside that extent does not matter, since the whole
+    /// block is the park state's. Asserted rather than commented, because an
+    /// attribute is easy to drop and nothing else makes alignment visible.
+    #[test]
+    fn the_park_counter_keeps_a_cache_line_to_itself() {
+        assert!(
+            std::mem::align_of::<Parking>() >= 128,
+            "Parking lost its cache-line alignment"
+        );
+        assert_eq!(
+            std::mem::size_of::<Parking>() % 128,
+            0,
+            "Parking no longer occupies whole cache-line blocks"
+        );
     }
 }

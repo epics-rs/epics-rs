@@ -26,18 +26,32 @@
 //! - `inbox` — where requesters push, one CAS, newest first.
 //! - `ready` — where workers pop, one CAS per entry.
 //!
-//! A worker pops `ready`. Finding it empty, it claims the right to refill it —
-//! one CAS on the `ready` root itself — and only then takes the *whole* inbox
-//! in one CAS, reverses that chain into submission order, keeps the oldest
-//! entry for itself and stores the rest as the new `ready`.
+//! A worker pops `ready`. Finding it empty, it takes the *whole* inbox in one
+//! CAS, reverses that chain into submission order, keeps the oldest entry for
+//! itself and publishes the rest as `ready` with one more CAS.
 //!
-//! Claiming the root is what keeps the band in submission order. Observing
-//! `ready` empty is not enough: between that observation and the inbox claim
-//! another worker can admit a batch, and a batch landing on top of the
-//! previous one's remainder would run ahead of entries submitted before it.
-//! Claiming the root closes that window instead of narrowing it, so a band is
-//! strictly FIFO at any worker count — C guarantees that only for a band with
-//! one worker.
+//! # Order
+//!
+//! A band with one worker — `callbackThreadsDefault` (`callback.c:66`) — is
+//! strictly FIFO: it is the only thread that refills `ready`, so every batch
+//! it publishes lands on an empty root, and a batch is in submission order.
+//!
+//! Above one worker, two workers can each be holding a batch, and the second
+//! to publish prepends onto the first's remainder: its entries run ahead of
+//! entries submitted before them. Only cross-batch order is affected, and only
+//! at a worker count where dequeue order decides nothing anyway, since the
+//! workers then run their callbacks concurrently.
+//!
+//! An earlier version closed that window by having a worker claim the `ready`
+//! root before touching the inbox, which made the band strictly FIFO at any
+//! worker count. It was withdrawn: a claimed root is a window in which one
+//! thread's preemption stops every other thread that needs the role, for the
+//! full length of the preemption. Measured in C against a 300 µs hog, a
+//! requester's p99 goes 67 µs to 271 µs and its over-100 µs count 42 to 1637;
+//! against a 5 ms hog, 117 requests in a run stall the whole 4 ms cap, where
+//! the version without the role stalls none. It also cost 13% of the
+//! throughput at one worker — the configuration the claim was buying nothing
+//! in, since one worker can never contend for the role.
 //!
 //! Two properties this buys over a single Michael–Scott FIFO, which was
 //! implemented first and withdrawn:
@@ -72,16 +86,12 @@
 //!
 //! # What is lock-free and what is not
 //!
-//! `push` is lock-free: no state it can be preempted in blocks anyone.
-//!
-//! A worker that has claimed the `ready` root owns it until it publishes — a
-//! bounded window with no lock, no allocation and no syscall, during which the
-//! other workers of the band spin rather than sleep. That window is not a
-//! priority-inversion site: every worker of a band runs at the band's one
-//! priority (`callback.c:322`), so the thread holding the root is never a
-//! lower priority than a thread waiting on it. The root is released before the
-//! admitter runs anything, so a callback that blocks or panics never holds
-//! it.
+//! Both sides are lock-free: there is no state a thread can be preempted in
+//! that blocks another thread. A worker refilling `ready` holds nothing — it
+//! owns the batch it took out of the inbox, and a worker preempted mid-refill
+//! leaves the other workers free to take the inbox themselves and to pop
+//! whatever is already in `ready`. That is the property the withdrawn
+//! root-claiming version gave up, and the reason it was withdrawn.
 //!
 //! An entry becomes some worker's property only when that worker pops it, so a
 //! callback that blocks strands nothing: everything behind it is still in
@@ -96,11 +106,6 @@ use std::thread::Thread;
 /// The empty-stack index. No arena can hold this many elements — [`MAX_CHUNKS`]
 /// stops 64 short of it — so it cannot collide with a real node.
 const IDX_NONE: u32 = u32::MAX;
-
-/// `ready`'s index while one worker is admitting a batch into it. Also outside
-/// the arena's index space, and distinct from [`IDX_NONE`] so a worker that
-/// finds it knows there is work coming rather than no work at all.
-const IDX_ADMIT: u32 = u32::MAX - 1;
 
 /// Pack an arena index and its location's ABA tag into one word, so a CAS
 /// moves both at once. 32 bits of index, 32 of tag — exactly #996's split on a
@@ -415,34 +420,15 @@ impl<T> BandQueue<T> {
         loop {
             let head = self.ready.0.load(Ordering::Acquire);
             match idx_of(head) {
-                // Another worker is turning a batch into `ready`. Its window
-                // holds no lock, allocates nothing and makes no syscall, and
-                // every worker of a band runs at the band's one priority, so
-                // waiting it out cannot invert a priority.
-                IDX_ADMIT => {
-                    std::hint::spin_loop();
-                }
                 IDX_NONE => {
+                    // Nothing published and nothing submitted. A batch another
+                    // worker is mid-refill with reads as submitted, since it
+                    // comes out of the inbox in one CAS.
                     if idx_of(self.inbox.0.load(Ordering::Acquire)) == IDX_NONE {
                         return None;
                     }
-                    // Take the admitting role. Winning it is what makes the
-                    // batch land behind whatever is already in `ready` —
-                    // nothing is, and nothing can arrive, because a batch is
-                    // the only thing that refills `ready` and this is now the
-                    // only worker that may admit one.
-                    if self
-                        .ready
-                        .0
-                        .compare_exchange_weak(
-                            head,
-                            bump(head, IDX_ADMIT),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return unsafe { self.admit() };
+                    if let Some(v) = self.refill() {
+                        return Some(v);
                     }
                 }
                 i => {
@@ -466,19 +452,14 @@ impl<T> BandQueue<T> {
         }
     }
 
-    /// Claim the inbox, turn it into submission order, publish all but the
-    /// oldest entry as `ready`, and return that oldest entry.
+    /// Take the inbox, turn it into submission order, publish all but the
+    /// oldest entry onto `ready`, and return that oldest entry.
     ///
-    /// `ready` is released before the entry is handed back, so a callback that
-    /// blocks — or panics — cannot leave the band's root claimed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must hold the admitting role, won by moving `ready` to
-    /// [`IDX_ADMIT`].
-    unsafe fn admit(&self) -> Option<T> {
-        // Take the whole inbox in one CAS. Pushers can contend; no other
-        // worker can, since only the admitter reads the inbox.
+    /// `None` means another worker took the inbox first — the caller retries
+    /// its pop rather than reporting the band empty.
+    fn refill(&self) -> Option<T> {
+        // Take the whole inbox in one CAS. Pushers and other workers can
+        // contend; exactly one of them comes away with the chain.
         let newest = loop {
             let batch = self.inbox.0.load(Ordering::Acquire);
             if self
@@ -496,9 +477,7 @@ impl<T> BandQueue<T> {
             }
         };
         if newest == IDX_NONE {
-            // The push that was there has already been taken by the batch
-            // before this one. Release the root and report the band empty.
-            self.release_ready(IDX_NONE);
+            // Another worker took the chain this one had seen.
             return None;
         }
         // Reverse in place: the inbox is newest-first, submission order is the
@@ -518,31 +497,51 @@ impl<T> BandQueue<T> {
                 .link
                 .load(Ordering::Relaxed),
         );
-        self.release_ready(rest);
+        if rest != IDX_NONE {
+            // `newest` is the chain's last node after the reversal.
+            self.publish_ready(rest, newest);
+        }
         unsafe { self.consume(oldest) }
     }
 
-    /// Hand `ready` back, pointing it at `idx`. Only the admitter calls this,
-    /// so the root is this thread's to store.
+    /// Link a batch's tail onto `ready` and swing the root to its first entry.
     ///
     /// Sequentially consistent for the same reason as [`BandQueue::push`]: the
-    /// admitter's own next step is to check whether a worker is parked next to
+    /// publisher's own next step is to check whether a worker is parked next to
     /// the batch it just published.
-    #[inline]
-    fn release_ready(&self, idx: u32) {
-        let held = self.ready.0.load(Ordering::Relaxed);
-        debug_assert_eq!(idx_of(held), IDX_ADMIT, "ready was not held for admission");
-        self.ready.0.store(bump(held, idx), Ordering::SeqCst);
+    fn publish_ready(&self, first: u32, tail: u32) {
+        // The chain is this thread's until the CAS below links it, so its tail
+        // can be re-pointed on every attempt.
+        let tail_node = unsafe { self.nodes.get(tail) };
+        loop {
+            let head = self.ready.0.load(Ordering::Acquire);
+            let prev = tail_node.link.load(Ordering::Relaxed);
+            tail_node
+                .link
+                .store(bump(prev, idx_of(head)), Ordering::Release);
+            if self
+                .ready
+                .0
+                .compare_exchange_weak(head, bump(head, first), Ordering::SeqCst, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// Whether the queue looks empty. Sequentially consistent, because the
     /// worker's sleep decision pairs this against a pusher's wake decision
     /// (see [`Parking`]). It may read non-empty for an entry another worker is
     /// already taking, which costs one extra poll and never a lost entry.
+    ///
+    /// It also reads *empty* for a batch a worker holds mid-refill: the inbox
+    /// is already drained and `ready` not yet published. The entries are that
+    /// worker's to publish, and the band's worker loop re-tests this after
+    /// every pop (`callback.c:224`), so the publish is followed by a wake —
+    /// which is what keeps a worker that parks inside this window from
+    /// sleeping on a queue that has work in it.
     pub(super) fn is_empty(&self) -> bool {
-        // `IDX_ADMIT` is not `IDX_NONE`, so a band mid-admission reads
-        // non-empty — a worker must not park while a batch is on its way into
-        // `ready`, since the admitter publishes without waking anyone.
         idx_of(self.ready.0.load(Ordering::SeqCst)) == IDX_NONE
             && idx_of(self.inbox.0.load(Ordering::SeqCst)) == IDX_NONE
     }
@@ -729,11 +728,11 @@ mod tests {
     }
 
     /// Four producers against four consumers on an arena of eight: every
-    /// entry is delivered exactly once, and each producer's own entries stay
-    /// in the order it pushed them. FIFO across producers is not a property of
-    /// a concurrent queue — per-producer order is.
+    /// entry is delivered exactly once. Order is not asserted here — above one
+    /// worker a batch can be published onto the previous batch's remainder,
+    /// which is the band's documented order at that worker count.
     #[test]
-    fn every_entry_is_delivered_once_and_in_its_producer_order() {
+    fn every_entry_is_delivered_exactly_once_under_many_consumers() {
         const PRODUCERS: usize = 4;
         let per: usize = if cfg!(miri) { 60 } else { 5_000 };
         let q = Arc::new(BandQueue::<(usize, usize)>::with_capacity(8));
@@ -772,12 +771,6 @@ mod tests {
                     let mut all = taken.lock().unwrap();
                     for p in 0..PRODUCERS {
                         all[p].extend_from_slice(&mine[p]);
-                        // This consumer's own slice of producer `p` must be
-                        // increasing: the queue handed it entries in order.
-                        assert!(
-                            mine[p].windows(2).all(|w| w[0] < w[1]),
-                            "producer {p} entries arrived out of order at one consumer"
-                        );
                     }
                 });
             }
@@ -884,10 +877,11 @@ mod tests {
         parking.wake_one();
     }
 
-    /// Submission order across batch boundaries. One consumer, with pushes
-    /// landing while earlier entries are still in `ready`, so the queue has to
-    /// admit several batches — the case where "`ready` looked empty" and "the
-    /// inbox is mine" being two separate steps would reorder entries.
+    /// Submission order at one worker, the band's default. Pushes land while
+    /// earlier entries are still in `ready`, so the queue refills several
+    /// times and the batch boundaries fall at varying depths — the boundary a
+    /// stack would reorder entries at if a refill published onto a `ready`
+    /// that was not empty.
     #[test]
     fn entries_leave_in_submission_order_across_batches() {
         let q = BandQueue::<usize>::with_capacity(8);
@@ -911,6 +905,31 @@ mod tests {
             popped += 1;
         }
         assert!(q.is_empty());
+    }
+
+    /// The other side of the refill boundary: a batch published onto a `ready`
+    /// that still holds the previous batch's remainder. Reachable only above
+    /// one worker, so it is driven here by calling `refill` directly. Nothing
+    /// may be lost or duplicated, and the order is the documented one — the
+    /// newer batch ahead of the older batch's tail.
+    #[test]
+    fn a_batch_published_onto_a_non_empty_ready_keeps_every_entry() {
+        let q = BandQueue::<usize>::with_capacity(8);
+        for v in 0..3 {
+            q.push(v).unwrap();
+        }
+        // Refills, hands back the oldest and leaves 1 and 2 in `ready`.
+        assert_eq!(q.pop(), Some(0));
+        for v in 3..6 {
+            q.push(v).unwrap();
+        }
+        assert_eq!(q.refill(), Some(3), "the second batch's oldest entry");
+        assert_eq!(q.pop(), Some(4));
+        assert_eq!(q.pop(), Some(5));
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert!(q.is_empty());
+        assert_eq!(q.pop(), None);
     }
 
     /// The layout the 46%/33%/9% loss above was measured against. The

@@ -530,6 +530,11 @@ fn drain_band<const BATCHED: bool>(
                 return;
             }
             parked.park_until(|| !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst));
+            // callback.c:607 — a sleep makes the carried root worthless: every
+            // entry this worker could have taken from it was taken by whoever
+            // emptied the band, so the next pop starts from a fresh read
+            // rather than from a word whose compare-exchange can only fail.
+            at = ReadyCursor::new();
             continue;
         };
         // callback.c:558-560 — a pop that leaves work behind wakes a sleeper,

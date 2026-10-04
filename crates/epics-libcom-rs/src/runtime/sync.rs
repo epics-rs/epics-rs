@@ -785,6 +785,23 @@ const EVENT_SLEEPING: u32 = 1;
 /// a later announcement with a stale store.
 const EVENT_CLAIMED: u32 = 2;
 
+/// What one [`Event::signal`] did — see that method.
+///
+/// `Claimed` and `Pending` both leave the waiter bound to wake; they differ in
+/// whether *this* caller is the one that took it out of its sleep, which is
+/// the only question a caller waking one waiter out of several can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signalled {
+    /// This call moved a parked waiter out of its sleep.
+    Claimed,
+    /// Another signaller holds the claim and is on its way to the waiter's
+    /// `unpark`; this call unparked it too, and took nothing of its own.
+    Pending,
+    /// The waiter was not parked. It polls its condition before it parks
+    /// again, so the work this signal is for is already its to find.
+    Running,
+}
+
 impl Event {
     pub const fn new() -> Self {
         Event {
@@ -809,9 +826,23 @@ impl Event {
         EventWaiter { event: self }
     }
 
+    /// Put this event in the state a parked waiter leaves behind, with no
+    /// thread actually parked on it — the only way a test can hold the window
+    /// between a signaller's claim and the waiter's next poll still, since a
+    /// real waiter leaves it the moment it is unparked.
+    #[cfg(test)]
+    pub(crate) fn announce_for_test(&self) {
+        self.state
+            .store(EVENT_SLEEPING, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Release the waiter if it is parked, and cost one atomic if it is not.
-    /// `true` when a parked waiter was released, which is what lets a pool of
-    /// events (the callback band's `Parking`) stop at the first one it wakes.
+    /// The answer says *who* took the announcement, which is what lets a pool
+    /// of events (the callback band's `Parking`) stop at the waiter it took
+    /// off the pool and keep looking past one another signaller already holds:
+    /// [`Signalled::Claimed`] is a waiter this call moved out of its sleep,
+    /// [`Signalled::Pending`] one that is already somebody else's to release,
+    /// and [`Signalled::Running`] one that was not asleep at all.
     ///
     /// The work being signalled must already be published — see *It is a
     /// condition wait, not a token* above.
@@ -827,26 +858,26 @@ impl Event {
     /// `epicsEvent` by triggering the futex whenever a waiter is registered
     /// (`osdEvent.c`, `fe0e949b9`). A redundant `unpark` costs the waiter one
     /// extra poll of its condition and nothing else.
-    pub fn signal(&self) -> bool {
+    pub fn signal(&self) -> Signalled {
         use std::sync::atomic::Ordering;
-        match self.state.compare_exchange(
+        let answer = match self.state.compare_exchange(
             EVENT_SLEEPING,
             EVENT_CLAIMED,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             // Ours to release.
-            Ok(_) => {}
+            Ok(_) => Signalled::Claimed,
             // Claimed, by a signaller that may not have reached its `unpark`.
-            Err(EVENT_CLAIMED) => {}
+            Err(EVENT_CLAIMED) => Signalled::Pending,
             // Running: it polls its condition before it parks again, and the
             // work this signal is for is already published.
-            Err(_) => return false,
-        }
+            Err(_) => return Signalled::Running,
+        };
         if let Some(t) = self.thread.get() {
             t.unpark();
         }
-        true
+        answer
     }
 
     /// Release the waiter whether or not it has announced itself — the
@@ -1249,8 +1280,9 @@ mod tests {
     #[test]
     fn a_signal_releases_an_announced_waiter_and_costs_nothing_otherwise() {
         let event = std::sync::Arc::new(Event::new());
-        assert!(
-            !event.signal(),
+        assert_eq!(
+            event.signal(),
+            Signalled::Running,
             "an event with no waiter at all reported a wake"
         );
 
@@ -1275,7 +1307,7 @@ mod tests {
         // The waiter may be anywhere between its announcement and `park`, so
         // the wake has to be retried — which is the contract: a signal is not
         // a latch, it releases a waiter that is there to be released.
-        while !event.signal() {
+        while event.signal() != Signalled::Claimed {
             if worker.is_finished() {
                 break;
             }
@@ -1322,18 +1354,28 @@ mod tests {
 
         let event = Event::new();
         let waiter = event.waiter();
-        assert!(!event.signal(), "nobody has announced itself");
+        assert_eq!(
+            event.signal(),
+            Signalled::Running,
+            "nobody has announced itself"
+        );
 
         event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
-        assert!(event.signal(), "an announced waiter has to be released");
+        assert_eq!(
+            event.signal(),
+            Signalled::Claimed,
+            "an announced waiter has to be released"
+        );
         assert_eq!(
             event.state.load(Ordering::SeqCst),
             EVENT_CLAIMED,
             "the claim has to outlive the signaller that took it"
         );
-        assert!(
+        assert_eq!(
             event.signal(),
-            "a claim nobody may have acted on yet is not `nobody to wake`"
+            Signalled::Pending,
+            "a claim nobody may have acted on yet is released, by a signaller \
+             that takes no credit for a sleep it did not end"
         );
 
         // Both signals unparked this thread, so the park below returns on a
@@ -1358,7 +1400,7 @@ mod tests {
         let waiter = event.waiter();
         // Nobody is announced — `signal` is a no-op here by design, `wake`
         // still leaves a token, so the park below returns.
-        assert!(!event.signal());
+        assert_eq!(event.signal(), Signalled::Running);
         event.wake();
         let mut polls = 0usize;
         waiter.wait_until(|| {

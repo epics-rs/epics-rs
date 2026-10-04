@@ -108,7 +108,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::runtime::sync::{Event, EventWaiter};
+use crate::runtime::sync::{Event, EventWaiter, Signalled};
 
 /// The empty-stack index. No arena can hold this many elements — [`MAX_CHUNKS`]
 /// stops 64 short of it — so it cannot collide with a real node.
@@ -770,14 +770,23 @@ impl Parking {
         sleepers != 0 && (sleepers == self.slots.len() || fresh)
     }
 
-    /// Wake one parked worker, if any is parked. A push with every worker of
-    /// the band running pays one load and no syscall.
+    /// Take one parked worker out of its sleep, if any is parked. A push with
+    /// every worker of the band running pays one load and no syscall.
+    ///
+    /// Only a slot this call claims itself ends the scan. A slot another
+    /// signaller has already claimed is a worker that is *going* to wake, but
+    /// one whose next read of the queue may be ordered before this entry was
+    /// published — the earlier signaller's entry is what it is bound to find.
+    /// Counting it would spend this entry's one recruitment on a worker that
+    /// owes nothing to this entry and leave a genuinely parked worker asleep
+    /// beside it, which is the band's one way to strand an entry: a worker
+    /// that then blocks inside its callback never looks again.
     pub(super) fn wake_one(&self) {
         if self.sleepers.load(Ordering::SeqCst) == 0 {
             return;
         }
         for slot in &self.slots {
-            if slot.signal() {
+            if slot.signal() == Signalled::Claimed {
                 return;
             }
         }
@@ -1010,6 +1019,31 @@ mod tests {
     /// on: nothing parked owes nothing, every worker parked owes a wake
     /// whatever the push found, and in between only a push that begins a batch
     /// owes one — spreading that batch is the workers' cascade.
+    /// A wake must come out of a worker's sleep, not out of a claim another
+    /// signaller already holds: the claimed worker's next read of the queue
+    /// can be ordered before this entry was published, so crediting it leaves
+    /// this entry with no observer and a parked worker beside it.
+    #[test]
+    fn a_wake_passes_over_a_slot_another_signaller_has_already_claimed() {
+        let parking = Parking::new(2);
+        // Both workers parked — the count a requester reads.
+        parking.slots[0].announce_for_test();
+        parking.slots[1].announce_for_test();
+        parking.sleepers.store(2, Ordering::SeqCst);
+
+        // One signaller claims the first slot and is stopped before its
+        // `unpark`.
+        assert_eq!(parking.slots[0].signal(), Signalled::Claimed);
+
+        parking.wake_one();
+        assert_eq!(
+            parking.slots[1].signal(),
+            Signalled::Pending,
+            "the wake stopped at a claim it did not make and left the second \
+             worker asleep"
+        );
+    }
+
     #[test]
     fn a_push_owes_a_wake_only_with_every_worker_parked_or_a_batch_to_begin() {
         let parking = Parking::new(3);

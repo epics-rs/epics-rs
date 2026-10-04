@@ -1492,6 +1492,81 @@ mod tests {
         );
     }
 
+    /// Work queued behind a callback that blocks must run on another worker
+    /// as soon as one is free — epics-base `callbackBlockedTest.c` (PR #996,
+    /// `21a7f980e`). A worker that took a whole batch instead of one entry
+    /// would hold the short callbacks behind the blocking one, and freeing a
+    /// different worker would not release them.
+    #[test]
+    fn work_behind_a_blocked_callback_runs_on_a_freed_worker() {
+        const NWORKERS: usize = 3;
+        const NSHORT: usize = 20;
+        let mut pool = CallbackPool::with_per_priority_config(64, [NWORKERS, 1, 1]);
+
+        // C's `gate`: a callback that reports it started, then waits.
+        let gate = |pool: &CallbackPool| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }),
+            )
+            .unwrap();
+            (started_rx, release_tx)
+        };
+
+        // Hold every worker inside a callback.
+        let held: Vec<_> = (0..NWORKERS - 1)
+            .map(|_| {
+                let g = gate(&pool);
+                g.0.recv_timeout(T).unwrap();
+                g
+            })
+            .collect();
+        let hold = gate(&pool);
+        hold.0.recv_timeout(T).unwrap();
+
+        // Nobody is free: a blocking callback and the short ones queue up, so
+        // they land in one batch.
+        let blocked = gate(&pool);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        for _ in 0..NSHORT {
+            let (ran, done_tx) = (Arc::clone(&ran), done_tx.clone());
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || {
+                    if ran.fetch_add(1, Ordering::SeqCst) + 1 == NSHORT {
+                        done_tx.send(()).unwrap();
+                    }
+                }),
+            )
+            .unwrap();
+        }
+
+        // The released worker takes the blocking callback — it is the oldest
+        // of the batch — and blocks in it.
+        hold.1.send(()).unwrap();
+        blocked.0.recv_timeout(T).unwrap();
+
+        // Free one worker: it has to run the short ones while the worker that
+        // took them out of the inbox stays blocked.
+        held[0].1.send(()).unwrap();
+        done_rx
+            .recv_timeout(T)
+            .expect("the short callbacks behind the blocked one never ran");
+        assert_eq!(ran.load(Ordering::SeqCst), NSHORT);
+
+        for h in &held[1..] {
+            h.1.send(()).unwrap();
+        }
+        blocked.1.send(()).unwrap();
+        pool.shutdown();
+    }
+
     /// A task entry takes no ring slot, so a full ring must not refuse it:
     /// a refused wake would strand the task forever.
     #[test]

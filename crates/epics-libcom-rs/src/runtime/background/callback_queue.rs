@@ -600,41 +600,48 @@ impl<T> BandQueue<T> {
     pub(super) fn pop_into<const BATCHED: bool>(
         &self,
         returns: &mut Returns<'_, T>,
+        at: &mut ReadyCursor,
     ) -> Option<Popped<T>> {
+        let mut head = at.0;
+        if idx_of(head) == IDX_NONE {
+            head = self.ready.0.load(Ordering::Acquire);
+        }
         loop {
-            let head = self.ready.0.load(Ordering::Acquire);
             match idx_of(head) {
                 IDX_NONE => {
+                    at.0 = head;
                     // Nothing published and nothing submitted. A batch another
                     // worker is mid-refill with reads as submitted, since it
                     // comes out of the inbox in one CAS.
                     if idx_of(self.inbox.0.load(Ordering::Acquire)) == IDX_NONE {
                         return None;
                     }
-                    if let Some(popped) = self.refill::<BATCHED>(returns) {
+                    if let Some(popped) = self.refill::<BATCHED>(returns, at) {
                         return Some(popped);
                     }
+                    head = self.ready.0.load(Ordering::Acquire);
                 }
                 i => {
                     // Possibly stale; the tag decides.
                     let next = unsafe { self.nodes.get(i) }.link.load(Ordering::Acquire);
-                    if self
-                        .ready
-                        .0
-                        .compare_exchange_weak(
-                            head,
-                            bump(head, idx_of(next)),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        let v = unsafe { self.take(i) };
-                        returns.stage::<BATCHED>(i);
-                        return v.map(|value| Popped {
-                            value,
-                            more: idx_of(next) != IDX_NONE,
-                        });
+                    let taken = bump(head, idx_of(next));
+                    match self.ready.0.compare_exchange_weak(
+                        head,
+                        taken,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            at.0 = taken;
+                            let v = unsafe { self.take(i) };
+                            returns.stage::<BATCHED>(i);
+                            return v.map(|value| Popped {
+                                value,
+                                more: idx_of(next) != IDX_NONE,
+                            });
+                        }
+                        // The root as it is now, to go round with.
+                        Err(now) => head = now,
                     }
                 }
             }
@@ -646,7 +653,11 @@ impl<T> BandQueue<T> {
     ///
     /// `None` means another worker took the inbox first — the caller retries
     /// its pop rather than reporting the band empty.
-    fn refill<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<Popped<T>> {
+    fn refill<const BATCHED: bool>(
+        &self,
+        returns: &mut Returns<'_, T>,
+        at: &mut ReadyCursor,
+    ) -> Option<Popped<T>> {
         // Take the whole inbox in one CAS. Pushers and other workers can
         // contend; exactly one of them comes away with the chain.
         let newest = loop {
@@ -688,7 +699,7 @@ impl<T> BandQueue<T> {
         );
         if rest != IDX_NONE {
             // `newest` is the chain's last node after the reversal.
-            self.publish_ready(rest, newest);
+            self.publish_ready(rest, newest, at);
         }
         let v = unsafe { self.take(oldest) };
         returns.stage::<BATCHED>(oldest);
@@ -703,23 +714,29 @@ impl<T> BandQueue<T> {
     /// Sequentially consistent for the same reason as [`BandQueue::push`]: the
     /// publisher's own next step is to check whether a worker is parked next to
     /// the batch it just published.
-    fn publish_ready(&self, first: u32, tail: u32) {
+    fn publish_ready(&self, first: u32, tail: u32, at: &mut ReadyCursor) {
         // The chain is this thread's until the CAS below links it, so its tail
         // can be re-pointed on every attempt.
         let tail_node = unsafe { self.nodes.get(tail) };
+        let mut head = at.0;
         loop {
-            let head = self.ready.0.load(Ordering::Acquire);
             let prev = tail_node.link.load(Ordering::Relaxed);
             tail_node
                 .link
                 .store(bump(prev, idx_of(head)), Ordering::Release);
-            if self
-                .ready
-                .0
-                .compare_exchange_weak(head, bump(head, first), Ordering::SeqCst, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
+            let linked = bump(head, first);
+            match self.ready.0.compare_exchange_weak(
+                head,
+                linked,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    at.0 = linked;
+                    return;
+                }
+                // The root as it is now, to re-point the tail onto.
+                Err(now) => head = now,
             }
         }
     }
@@ -739,6 +756,37 @@ impl<T> BandQueue<T> {
     pub(super) fn is_empty(&self) -> bool {
         idx_of(self.ready.0.load(Ordering::SeqCst)) == IDX_NONE
             && idx_of(self.inbox.0.load(Ordering::SeqCst)) == IDX_NONE
+    }
+}
+
+/// The `ready` root as one worker last left it — C's `*ph`
+/// (`callback.c:368-410`).
+///
+/// A pop's CAS needs a value to compare against, and the value this worker's
+/// own last CAS wrote is that value for as long as nobody else has touched the
+/// root. So the read is not skipped on a guess: the CAS itself is the test,
+/// and a failed one hands back the current root to go round with. What is
+/// saved is the load before it, once per callback, on the one word every
+/// worker of the band writes.
+///
+/// It is a hint about one word and nothing else — never an index to resolve,
+/// never a count. An empty cursor means "read the root", not "the band is
+/// empty", which is why [`BandQueue::pop_into`] re-reads before it reports
+/// `None`.
+///
+/// A worker holds the word across the callback its pop handed over, so the
+/// window in which the root could come back round to that exact value — the
+/// 32-bit tag wrapping, 2^32 root writes — is a callback long rather than two
+/// instructions long. That is the bound the band already stands on: a worker
+/// preempted between its load and its CAS holds a word for however long the
+/// scheduler keeps it off the CPU, and C holds `*ph` across its callback for
+/// exactly the same reason (`callback.c:537-615`).
+pub(super) struct ReadyCursor(u64);
+
+impl ReadyCursor {
+    /// A cursor that has seen nothing, so the first pop reads the root.
+    pub(super) fn new() -> Self {
+        ReadyCursor(bump(0, IDX_NONE))
     }
 }
 
@@ -1030,7 +1078,8 @@ mod tests {
     /// `RETURN_EVERY` entries, done one at a time so a test can speak about
     /// the ring after every pop.
     fn pop1<T>(q: &BandQueue<T>) -> Option<T> {
-        q.pop_into::<true>(&mut q.returns(1)).map(|p| p.value)
+        q.pop_into::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+            .map(|p| p.value)
     }
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1389,7 +1438,8 @@ mod tests {
             q.push_ring(v, || {}).unwrap();
         }
         assert_eq!(
-            q.refill::<true>(&mut q.returns(1)).map(|p| p.value),
+            q.refill::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+                .map(|p| p.value),
             Some(3),
             "the second batch's oldest entry"
         );
@@ -1399,6 +1449,67 @@ mod tests {
         assert_eq!(pop1(&q), Some(2));
         assert!(q.is_empty());
         assert_eq!(pop1(&q), None);
+    }
+
+    /// **Invariant:** a cursor is a comparison value for the next CAS, never a
+    /// statement about the band.
+    ///
+    /// The second half is the boundary that matters: a cursor that has seen
+    /// the root empty must read it again, because reporting the band empty
+    /// here is how a worker would park beside queued work. Every other test
+    /// in this module pops with a fresh cursor, so nothing else carries one
+    /// across pops at all.
+    #[test]
+    fn a_carried_cursor_pops_a_batch_and_still_re_reads_an_empty_root() {
+        let q = BandQueue::<usize>::with_capacity(8);
+        let mut returns = q.returns(1);
+        let mut at = ReadyCursor::new();
+        for v in 0..3 {
+            q.push_ring(v, || {}).unwrap();
+        }
+        for expect in 0..3 {
+            let p = q.pop_into::<true>(&mut returns, &mut at).unwrap();
+            assert_eq!(p.value, expect, "submission order off one cursor");
+        }
+        assert!(q.pop_into::<true>(&mut returns, &mut at).is_none());
+
+        q.push_ring(10, || {}).unwrap();
+        let p = q.pop_into::<true>(&mut returns, &mut at).unwrap();
+        assert_eq!(p.value, 10, "an empty cursor is not an empty band");
+    }
+
+    /// A cursor another worker has made stale costs its owner one failed CAS
+    /// and nothing else — no entry lost, none run twice, order kept.
+    #[test]
+    fn a_cursor_another_worker_made_stale_takes_the_real_head() {
+        let q = BandQueue::<usize>::with_capacity(8);
+        let mut mine = q.returns(1);
+        let mut at = ReadyCursor::new();
+        for v in 0..3 {
+            q.push_ring(v, || {}).unwrap();
+        }
+        // Leaves 1 and 2 on `ready`, and this cursor holding that root.
+        assert_eq!(q.pop_into::<true>(&mut mine, &mut at).unwrap().value, 0);
+
+        // Another worker takes the next batch and publishes its remainder,
+        // which bumps the root's tag past the one this cursor holds.
+        for v in 10..12 {
+            q.push_ring(v, || {}).unwrap();
+        }
+        let mut theirs = q.returns(1);
+        let mut theirs_at = ReadyCursor::new();
+        assert_eq!(
+            q.refill::<true>(&mut theirs, &mut theirs_at).unwrap().value,
+            10
+        );
+
+        for expect in [11, 1, 2] {
+            assert_eq!(
+                q.pop_into::<true>(&mut mine, &mut at).unwrap().value,
+                expect
+            );
+        }
+        assert!(q.pop_into::<true>(&mut mine, &mut at).is_none());
     }
 
     /// **Invariant:** `Popped::more` is true exactly when the pop's own CAS
@@ -1416,21 +1527,29 @@ mod tests {
 
         // A one-entry batch: the refill publishes nothing.
         q.push_ring(10, || {}).unwrap();
-        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        let p = q
+            .pop_into::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+            .unwrap();
         assert_eq!((p.value, p.more), (10, false));
 
         // A three-entry batch: the refill publishes two.
         for v in 20..23 {
             q.push_ring(v, || {}).unwrap();
         }
-        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        let p = q
+            .pop_into::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+            .unwrap();
         assert_eq!((p.value, p.more), (20, true), "two left on ready");
-        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        let p = q
+            .pop_into::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+            .unwrap();
         assert_eq!((p.value, p.more), (21, true), "one left on ready");
 
         // The last of the batch, with a fresh batch sitting in the inbox.
         q.push_ring(30, || {}).unwrap();
-        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        let p = q
+            .pop_into::<true>(&mut q.returns(1), &mut ReadyCursor::new())
+            .unwrap();
         assert_eq!(
             (p.value, p.more),
             (22, false),

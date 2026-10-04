@@ -74,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 
-use super::callback_queue::{BandQueue, Parking, Returns};
+use super::callback_queue::{BandQueue, Parking, ReadyCursor, Returns};
 use super::facility::{run_facility_loop, run_isolated};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
@@ -516,9 +516,11 @@ fn drain_band<const BATCHED: bool>(
     mut returns: Returns<'_, Queued>,
 ) {
     let parked = pq.parking.waiter(slot);
+    // callback.c:537 — the root as this worker last left it.
+    let mut at = ReadyCursor::new();
     loop {
         // callback.c:223 — take the next entry.
-        let Some(popped) = pq.queue.pop_into::<BATCHED>(&mut returns) else {
+        let Some(popped) = pq.queue.pop_into::<BATCHED>(&mut returns, &mut at) else {
             // callback.c:220-221 — nothing to run: exit if the band has
             // stopped and is drained, otherwise sleep until a push arrives.
             // callback.c:574-581 — give the slots back before sleeping, so a
@@ -1451,7 +1453,7 @@ mod tests {
 
         while pq
             .queue
-            .pop_into::<true>(&mut pq.queue.returns(1))
+            .pop_into::<true>(&mut pq.queue.returns(1), &mut ReadyCursor::new())
             .is_some()
         {}
         assert_eq!(pq.queue.ring_used(), 0, "the ring drained");
@@ -1514,7 +1516,10 @@ mod tests {
                     (Arc::clone(&pq), Arc::clone(&popped), Arc::clone(&broken));
                 s.spawn(move || {
                     loop {
-                        match pq.queue.pop_into::<true>(&mut pq.queue.returns(1)) {
+                        match pq
+                            .queue
+                            .pop_into::<true>(&mut pq.queue.returns(1), &mut ReadyCursor::new())
+                        {
                             Some(took) => {
                                 drop(took.value);
                                 popped.fetch_add(1, Ordering::Relaxed);

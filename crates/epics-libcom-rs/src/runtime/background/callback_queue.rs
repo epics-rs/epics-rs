@@ -824,6 +824,16 @@ pub(super) struct Popped<T> {
 /// and [`return_batch`] is 1 for a one-worker band, which is every band until
 /// `callbackParallelThreads` widens one — so the default band's count stays
 /// exactly the entries queued.
+///
+/// #996 pays the same price and reports it the same way: `nQueued` comes down
+/// by `-ran` only at the `CB_FREE_EVERY` boundary and at the two exits
+/// (`callback.c:566-569`, `:579`, `:612`), and that counter is what
+/// `callbackQueueStatus` hands back as `numUsed` (`:252`). Its declaration
+/// calls it "nodes taken but not yet run" (`:162`), which is what it stops
+/// being for the length of a chain. The difference is the width it applies
+/// at: #996 chains 16 on every band, so this is the one-worker band — the
+/// `callbackParallelThreads` default, and every band in a C IOC that has not
+/// widened one — where the port's count is exact and #996's is not.
 pub(super) struct Returns<'a, T> {
     queue: &'a BandQueue<T>,
     /// Newest staged node, or `IDX_NONE`.

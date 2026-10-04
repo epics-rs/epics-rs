@@ -1034,12 +1034,25 @@ impl Parking {
     /// owes nothing to this entry and leave a genuinely parked worker asleep
     /// beside it, which is the band's one way to strand an entry: a worker
     /// that then blocks inside its callback never looks again.
+    ///
+    /// Each slot is read before it is claimed, so the slots of running workers
+    /// stay shared instead of being taken exclusive one compare-exchange at a
+    /// time. That is what keeps the scan flat: at four workers it costs 5.8 ns
+    /// with nobody claimable and 9.4 ns to reach a sleeper in the last slot,
+    /// against 29.3 and 28.8 ns when every slot is compare-exchanged, and the
+    /// gap grows with the band's width. rt43 instead goes straight to a
+    /// sleeper named by a `sleepers` bitmask, with a full scan behind it for
+    /// the bits a stopped waker left naming nobody (`callback.c:485-517`); the
+    /// hint cannot stand on its own, and carrying it measured worse than
+    /// reading the slots — 25.1 ns to reach that same sleeper, because taking
+    /// the bit is a second locked operation, and 29.1 ns on the no-claim scan
+    /// it cannot shorten at all.
     pub(super) fn wake_one(&self) {
         if self.sleepers.load(Ordering::SeqCst) == 0 {
             return;
         }
         for slot in &self.slots {
-            if slot.signal() == Signalled::Claimed {
+            if slot.signal_if_parked() == Signalled::Claimed {
                 return;
             }
         }

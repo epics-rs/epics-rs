@@ -865,6 +865,33 @@ impl Event {
     /// `epicsEvent` by triggering the futex whenever a waiter is registered
     /// (`osdEvent.c`, `fe0e949b9`). A redundant `unpark` costs the waiter one
     /// extra poll of its condition and nothing else.
+    /// [`signal`](Self::signal) for a caller scanning a pool of events for one
+    /// to claim: it reads the state first and compare-exchanges only a slot
+    /// that is actually parked, so passing over a running waiter leaves that
+    /// waiter's line shared instead of taking it exclusive. The answers are
+    /// the same, and so is the race the scan is built on — a slot that parks
+    /// between the load and the next slot's read is a slot the push's own
+    /// SeqCst pairing has already handed its entry to.
+    ///
+    /// The read is SeqCst, and that is load-bearing rather than cautious: the
+    /// announcement it is testing is a SeqCst store, and an announcement is
+    /// only worth testing against the publication that preceded this call.
+    /// With an `Acquire` load the two sit in no common order, so the scan may
+    /// read `AWAKE` from a waiter that has already announced itself and whose
+    /// own poll ran before the work was published — and then nobody wakes it.
+    /// The compare-exchange this replaces could not read that stale value, so
+    /// the ordering is what the cheaper read has to pay back.
+    ///
+    /// The single-waiter callers keep [`signal`](Self::signal): there the
+    /// waiter is usually parked, and the extra load would buy nothing.
+    pub fn signal_if_parked(&self) -> Signalled {
+        use std::sync::atomic::Ordering;
+        if self.state.load(Ordering::SeqCst) == EVENT_AWAKE {
+            return Signalled::Running;
+        }
+        self.signal()
+    }
+
     pub fn signal(&self) -> Signalled {
         use std::sync::atomic::Ordering;
         let answer = match self.state.compare_exchange(
@@ -1414,6 +1441,25 @@ mod tests {
         assert_eq!(polls, 2, "the park blocked instead of taking its token");
         // Leave no token behind for whatever runs next on this thread.
         std::thread::park_timeout(std::time::Duration::ZERO);
+    }
+
+    /// [`Event::signal_if_parked`] must answer exactly what
+    /// [`Event::signal`] answers on each of the three states, since a scan
+    /// that reads one of them differently either claims a worker twice or
+    /// walks past the only one it could have woken.
+    #[test]
+    fn reading_before_the_claim_answers_the_same_on_all_three_states() {
+        let awake = Event::new();
+        assert_eq!(awake.signal_if_parked(), Signalled::Running);
+        assert_eq!(awake.signal(), Signalled::Running);
+
+        let sleeping = Event::new();
+        sleeping.announce_for_test();
+        assert_eq!(sleeping.signal_if_parked(), Signalled::Claimed);
+
+        // Claimed by that call; a second signaller gets `Pending` either way.
+        assert_eq!(sleeping.signal_if_parked(), Signalled::Pending);
+        assert_eq!(sleeping.signal(), Signalled::Pending);
     }
 
     /// Shutdown: [`Event::wake`] has to release a waiter whichever side of its

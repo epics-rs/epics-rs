@@ -469,27 +469,46 @@ mod pi_mutex {
 ///
 /// The whole module exists so `epicsMutexShowAll` can answer the question it
 /// is run to answer — *which lock is held right now* — rather than only how
-/// many exist. That answer needs a try-lock through a stable address, which is
-/// what pins the `Box` and the `Drop`.
+/// many exist. That answer needs a try-lock on a backend that is still there,
+/// which is what the shared `Arc` and the `Drop` give it.
 mod epics_mutex {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::MutexBackend;
 
+    /// C's `onlyLocked` try-lock, type-erased. C needs no equivalent because
+    /// its node's payload is opaque bytes; here the backend is generic and the
+    /// list must be one list.
+    trait LockProbe: Send + Sync {
+        fn is_locked(&self) -> bool;
+    }
+
+    impl<T: Send> LockProbe for MutexBackend<T> {
+        fn is_locked(&self) -> bool {
+            match self.try_lock() {
+                Some(guard) => {
+                    drop(guard);
+                    false
+                }
+                None => true,
+            }
+        }
+    }
+
     /// One entry of C's `mutexList` (`epicsMutex.cpp:39`).
     ///
-    /// `probe` is the entry's own `try_lock`, monomorphised for the `T` that
-    /// registered it and then type-erased to a plain function pointer. C needs
-    /// no equivalent because its node's payload is opaque bytes; here the
-    /// backend is generic, and the list must be one list.
+    /// The entry holds the backend by `Arc` rather than by address, so the
+    /// thing [`report`] try-locks is alive because the entry exists, not
+    /// because deregistration happens to run first. `addr` and `osd_addr` are
+    /// the numbers C prints and are never turned back into a pointer.
     struct Entry {
         id: u64,
         file: &'static str,
         line: u32,
         addr: usize,
         osd_addr: usize,
-        probe: unsafe fn(usize) -> bool,
+        backend: Arc<dyn LockProbe>,
     }
 
     /// Creation order, as C's `ellAdd` appends.
@@ -507,29 +526,37 @@ mod epics_mutex {
     /// [`PriorityInheritanceMutex`](super::PriorityInheritanceMutex) for why
     /// this is a newtype and not an alias.
     pub struct EpicsMutex<T> {
-        /// Allocated before registration and freed after deregistration, so
-        /// the address in the list is valid for exactly as long as the list
-        /// holds it.
-        inner: Box<MutexBackend<T>>,
+        /// Heap-allocated so the address the list reports is stable for the
+        /// mutex's whole life, and shared with the list entry so that address
+        /// cannot name freed memory.
+        inner: Arc<MutexBackend<T>>,
         id: u64,
     }
 
-    impl<T> EpicsMutex<T> {
+    impl<T: Send + 'static> EpicsMutex<T> {
         /// C `epicsMutexCreate()` — `epicsMutexOsiCreate(__FILE__, __LINE__)`.
         #[track_caller]
         pub fn new(value: T) -> Self {
-            let inner = Box::new(MutexBackend::new(value));
+            let inner = Arc::new(MutexBackend::new(value));
             let caller = std::panic::Location::caller();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             lock().push(Entry {
                 id,
                 file: caller.file(),
                 line: caller.line(),
-                addr: &*inner as *const MutexBackend<T> as usize,
+                addr: Arc::as_ptr(&inner) as usize,
                 osd_addr: osd_addr(&inner),
-                probe: probe_locked::<T>,
+                backend: Arc::clone(&inner) as Arc<dyn LockProbe>,
             });
             Self { inner, id }
+        }
+    }
+
+    impl<T> EpicsMutex<T> {
+        /// The address this mutex is listed under — C's `epicsMutexId`, the
+        /// same number [`MutexInfo::addr`] reports.
+        pub fn registered_addr(&self) -> usize {
+            Arc::as_ptr(&self.inner) as usize
         }
 
         pub fn lock(&self) -> super::PriorityInheritanceMutexGuard<'_, T> {
@@ -551,8 +578,9 @@ mod epics_mutex {
     }
 
     /// C `epicsMutexDestroy` (`epicsMutex.cpp:105-113`): off the list first,
-    /// under the list lock, and only then freed. A walk holding that lock can
-    /// therefore dereference every address it is looking at.
+    /// under the list lock. Dropping the entry drops the list's reference to
+    /// the backend, and the last reference to go frees it — so a walk holding
+    /// that lock is looking at live mutexes by construction.
     impl<T> Drop for EpicsMutex<T> {
         fn drop(&mut self) {
             let id = self.id;
@@ -579,23 +607,6 @@ mod epics_mutex {
     #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
     fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
         inner as *const MutexBackend<T> as usize
-    }
-
-    /// # Safety
-    ///
-    /// `addr` must be the address a live `Box<MutexBackend<T>>` was registered
-    /// with, for the same `T`. [`report`] calls this only while holding the
-    /// list lock, and [`EpicsMutex::drop`] removes the entry under that same
-    /// lock before the box is freed, so an address reachable here is live.
-    unsafe fn probe_locked<T>(addr: usize) -> bool {
-        let backend = unsafe { &*(addr as *const MutexBackend<T>) };
-        match backend.try_lock() {
-            Some(guard) => {
-                drop(guard);
-                false
-            }
-            None => true,
-        }
     }
 
     /// One row of C's `epicsMutexShow` (`epicsMutex.cpp:118-127`).
@@ -665,12 +676,8 @@ mod epics_mutex {
         let entries = lock();
         let mut shown = Vec::new();
         for entry in entries.iter() {
-            if only_locked {
-                // SAFETY: see `probe_locked`. The list lock is held here, and
-                // deregistration takes it before freeing.
-                if !unsafe { (entry.probe)(entry.addr) } {
-                    continue;
-                }
+            if only_locked && !entry.backend.is_locked() {
+                continue;
             }
             shown.push(MutexInfo {
                 addr: entry.addr,
@@ -1039,30 +1046,47 @@ mod tests {
     /// Locate `m`'s own row, which is the only way to test a process-global
     /// list that other code also registers into.
     fn find_entry<T>(m: &PriorityInheritanceMutex<T>) -> Option<MutexInfo> {
-        let want = mutex_addr(m);
+        let want = m.registered_addr();
         mutex_report(false)
             .shown
             .into_iter()
             .find(|e| e.addr() == want)
     }
 
-    /// The address the list holds, reached the same way `new` computed it.
-    fn mutex_addr<T>(m: &PriorityInheritanceMutex<T>) -> usize {
-        // One row per mutex, so the row that reports this file and this
-        // mutex's line is this mutex — except that two mutexes can share a
-        // line, which is why the tests that need identity capture the addr
-        // once and compare against it afterwards.
-        let guard = m.try_lock();
-        let held = guard.is_none();
-        drop(guard);
-        assert!(!held, "helper must not be called on a held mutex");
-        // The registered address is the boxed backend's, and `try_lock`
-        // proved this mutex is the free one; find it by elimination on the
-        // locked probe.
-        let before: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
-        let _g = m.lock();
-        let after: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
-        after.into_iter().find(|a| !before.contains(a)).unwrap()
+    /// The row is found by the mutex's own registered address, so a mutex
+    /// another thread creates and holds cannot be mistaken for this one. The
+    /// helper this replaced identified a row by elimination against the
+    /// process-global list and failed exactly here.
+    #[test]
+    fn an_entry_is_identified_while_other_threads_register_and_hold() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let addr = m.registered_addr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let noise = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+                    let _held = other.lock();
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            let held = m.lock();
+            assert_eq!(find_entry(&m).unwrap().addr(), addr);
+            assert!(
+                mutex_report(true).shown.iter().any(|e| e.addr() == addr),
+                "this mutex is held, so onlyLocked must list it"
+            );
+            drop(held);
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        noise.join().unwrap();
     }
 
     /// C's `onlyLocked` boundary, both sides of it: the filter try-locks every
@@ -1070,11 +1094,11 @@ mod tests {
     #[test]
     fn only_locked_keeps_exactly_the_held_mutexes() {
         let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
-        let addr = mutex_addr(&m);
+        let addr = m.registered_addr();
         // A second, never-held mutex, so "the filter excludes something" is a
         // property of this test and not of whatever else the process created.
         let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
-        let other_addr = mutex_addr(&other);
+        let other_addr = other.registered_addr();
 
         let free = mutex_report(true);
         assert!(
@@ -1088,18 +1112,19 @@ mod tests {
             held.shown.iter().any(|e| e.addr() == addr),
             "a held mutex must be listed under onlyLocked"
         );
-        assert_eq!(
-            held.total, free.total,
-            "the count is the whole list, not the filtered rows — C prints \
-             `ellCount(&mutexList)` before it filters"
-        );
+        // One report, so no mutex created or dropped elsewhere in the process
+        // can make the two halves disagree: unfiltered, `total` must equal the
+        // rows themselves, which is what makes it C's `ellCount(&mutexList)`
+        // and not the filtered count.
+        let all = mutex_report(false);
+        assert_eq!(all.total, all.shown.len());
         assert!(
             !held.shown.iter().any(|e| e.addr() == other_addr),
             "the filter must exclude the mutex nobody holds"
         );
         assert!(
             held.shown.len() < held.total,
-            "{} of {}",
+            "filtering must not change the count: {} of {}",
             held.shown.len(),
             held.total
         );
@@ -1108,15 +1133,15 @@ mod tests {
         assert!(!mutex_report(true).shown.iter().any(|e| e.addr() == addr));
     }
 
-    /// The address in the list is the boxed backend's, so it survives moving
+    /// The address in the list is the shared backend's, so it survives moving
     /// the mutex — the property that makes the `onlyLocked` probe sound. A
     /// registry of addresses of the values themselves would dangle here.
     #[test]
     fn the_registered_address_survives_moving_the_mutex() {
         let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(1);
-        let addr = mutex_addr(&m);
+        let addr = m.registered_addr();
         let moved = Box::new(m);
-        assert_eq!(mutex_addr(&moved), addr);
+        assert_eq!(moved.registered_addr(), addr);
         assert!(mutex_report(false).shown.iter().any(|e| e.addr() == addr));
         drop(moved);
         assert!(!mutex_report(false).shown.iter().any(|e| e.addr() == addr));

@@ -455,23 +455,17 @@ impl<T> BandQueue<T> {
     /// before the entry is published: the band's high-water mark is latched
     /// from it, and a load afterwards would read a depth a worker has already
     /// lowered.
-    pub(super) fn push_ring(&self, v: T) -> Result<usize, T> {
+    ///
+    /// `recruit` is called by the push that *began* a batch — see
+    /// [`BandQueue::publish`].
+    pub(super) fn push_ring(&self, v: T, recruit: impl FnOnce()) -> Result<usize, T> {
         match self.nodes.alloc_ring() {
             Some((i, depth)) => {
-                self.publish(i, v);
+                self.publish(i, v, recruit);
                 Ok(depth)
             }
             None => Err(v),
         }
-    }
-
-    /// Whether the inbox holds nothing right now — a hint for the band's wake
-    /// decision and nothing else (see [`Parking`]). A requester reads it
-    /// before its push, so by the time the push lands the answer may be stale
-    /// in either direction; neither direction can lose an entry, because what
-    /// keeps every entry observed is the `sleepers` load *after* the push.
-    pub(super) fn inbox_is_empty(&self) -> bool {
-        idx_of(self.inbox.0.load(Ordering::Relaxed)) == IDX_NONE
     }
 
     /// Ring entries queued right now — C `epicsRingPointerGetUsed`.
@@ -482,26 +476,37 @@ impl<T> BandQueue<T> {
     /// Submit `v` without taking a ring slot — the run-queue entries that
     /// share the band's FIFO but not its bound. `Err(v)` only when the arena's
     /// index space is exhausted, which is 4 G entries on one band.
-    pub(super) fn push_task(&self, v: T) -> Result<(), T> {
+    pub(super) fn push_task(&self, v: T, recruit: impl FnOnce()) -> Result<(), T> {
         match self.nodes.alloc_task() {
             Some(i) => {
-                self.publish(i, v);
+                self.publish(i, v, recruit);
                 Ok(())
             }
             None => Err(v),
         }
     }
 
-    /// Put `v` in node `i` and link it into the inbox.
+    /// Put `v` in node `i`, link it into the inbox, and call `recruit` when
+    /// this entry *began* the batch the inbox is accumulating.
     ///
-    /// The CAS that publishes the node is sequentially consistent, not merely
-    /// release: the caller goes on to test whether a worker is parked, and a
-    /// store followed by a load of another location is exactly the pair that
-    /// release ordering does not constrain. On armv7 — RTEMS — the load may
-    /// then complete while the push sits in the store buffer, and the pusher
-    /// decides not to wake the worker that is deciding not to see the entry.
-    /// Lock `cmpxchg` already carries this on x86.
-    fn publish(&self, i: u32, v: T) {
+    /// Only the CAS that links the node can answer that, which is why the
+    /// recruitment decision lives here rather than in the requester: an empty
+    /// inbox read before the push is a different claim, and a batch taken
+    /// between that read and this CAS turns it into the wrong one — the
+    /// requester declines to recruit for a batch that has nobody coming, and
+    /// a worker already inside a callback never looks again. An inbox that is
+    /// *not* empty at this CAS is a batch no worker has taken yet, because a
+    /// refill takes the whole chain in one CAS; whoever answers that batch's
+    /// recruitment therefore answers for this entry too.
+    ///
+    /// The CAS is sequentially consistent, not merely release: `recruit` goes
+    /// on to test whether a worker is parked, and a store followed by a load
+    /// of another location is exactly the pair that release ordering does not
+    /// constrain. On armv7 — RTEMS — the load may then complete while the push
+    /// sits in the store buffer, and the pusher decides not to wake the worker
+    /// that is deciding not to see the entry. Lock `cmpxchg` already carries
+    /// this on x86.
+    fn publish(&self, i: u32, v: T, recruit: impl FnOnce()) {
         let node = unsafe { self.nodes.get(i) };
         // Ours until the CAS below links it.
         unsafe { *node.value.get() = Some(v) };
@@ -515,6 +520,9 @@ impl<T> BandQueue<T> {
                 .compare_exchange_weak(head, bump(head, i), Ordering::SeqCst, Ordering::Acquire)
                 .is_ok()
             {
+                if idx_of(head) == IDX_NONE {
+                    recruit();
+                }
                 return;
             }
         }
@@ -681,37 +689,43 @@ impl<T> BandQueue<T> {
 /// ## Who wakes a worker
 ///
 /// **Every published entry has a committed observer** — a worker that reads the
-/// queue after the entry is visible and before it next sleeps. A worker that is
-/// not parked is one: the push is sequentially consistent and a worker polls its
-/// wake condition only after counting itself in `sleepers`, so either the poll
-/// sees the entry or the count the requester read came after the push. That pair
-/// is why [`BandQueue::publish`] and [`BandQueue::is_empty`] are both SeqCst, and
-/// it leaves the requester owing a wake for only one case: every worker parked.
+/// queue after the entry is visible and before it next sleeps. One rule gives
+/// every entry one: *the push that begins a batch wakes a sleeper, if any
+/// worker is asleep*. Whether a push began a batch is not an opinion about the
+/// band's state but a property of the push's own linking CAS — the inbox head
+/// it displaced ([`BandQueue::publish`]) — and a refill takes the whole inbox
+/// chain in one CAS, so a push that joined a batch is taken by whoever takes
+/// that batch, whose own starter already answered for it.
 ///
-/// Above that minimum the requester recruits once per batch. An entry that found
-/// the inbox empty begins work no worker has been woken for, so it wakes one
-/// sleeper; an entry that found the inbox occupied inherits that batch's
-/// observer. That reading is a hint — it is taken before the push and can be
-/// stale in either direction, which costs at worst a wake nobody needed, never
-/// an entry nobody reads. Spreading the batch over more workers belongs to the
-/// workers —
-/// each pop that leaves work behind wakes another ([`Parking::wake_one`] in the
-/// band's loop), so the cascade is paid for on the band's threads and not on the
+/// What a requester must *not* do is infer an observer from a worker being
+/// awake. An awake worker's last queue read may already be behind it, and a
+/// worker inside a callback that blocks never reads again — so an entry
+/// credited to it waits for the next push. The wake therefore has to come out
+/// of a worker's sleep ([`Parking::wake_one`], which is why a claim another
+/// signaller holds does not end its scan), and the `sleepers` load that gates
+/// it is paired with the SeqCst push: either the parked worker's poll sees the
+/// entry or the requester's load sees it parked. That pair is why
+/// [`BandQueue::publish`] and [`BandQueue::is_empty`] are both SeqCst.
+///
+/// Spreading the batch over more workers belongs to the workers — each pop
+/// that leaves work behind wakes another ([`Parking::wake_one`] in the band's
+/// loop), so the cascade is paid for on the band's threads and not on the
 /// requester's. A scan thread pushing into a band that is keeping up issues no
 /// syscall at all.
 ///
-/// #996 puts a third rule between those two: it also declines the recruiting
-/// wake while some awake worker sits between callbacks and so will read the
+/// #996 declines the recruiting wake on exactly the inference above: it skips
+/// it while some awake worker sits between callbacks and so will read the
 /// inbox next (`anyReady`, `callback.c:519`). That worker is trusted without
 /// being verified, which is why #996 then needs `CB_STALE_US` — no worker
 /// finishing a batch for 20 µs is read as the trusted worker having been
 /// preempted, and the requester wakes a sleeper after all
-/// (`callback.c:808-822`). Neither is here. The window `anyReady` reports is the
-/// few instructions between a worker's `busy = 0` and its next queue read, so
-/// what the rule saves is a wake the band almost never needed to skip, and
+/// (`callback.c:808-822`). Neither is here. The window `anyReady` reports is
+/// the few instructions between a worker's `busy = 0` and its next queue read,
+/// so what the rule saves is a wake the band almost never needed to skip, and
 /// declining on it is precisely what made a timeout necessary to get liveness
-/// back. One wake per batch needs no clock on the request path, no progress
-/// counter and no per-worker `busy` flag.
+/// back. One wake per batch, decided by the batch's own first push, needs no
+/// clock on the request path, no progress counter and no per-worker `busy`
+/// flag.
 ///
 /// Given its own cache-line block, for the same reason [`Root`] has one:
 /// `sleepers` is written by a worker on every park and unpark, while the band's
@@ -747,27 +761,6 @@ impl Parking {
             sleepers: &self.sleepers,
             waiter: self.slots[slot].waiter(),
         }
-    }
-
-    /// The requester's wake decision — `callback.c:789-824` as of #996,
-    /// narrowed to the two rules under [`Parking`]. `fresh` is
-    /// [`BandQueue::inbox_is_empty`] as the requester read it just before its
-    /// push, and only the recruiting rule uses it.
-    pub(super) fn wake_for_push(&self, fresh: bool) {
-        if self.owes_wake(self.sleepers.load(Ordering::SeqCst), fresh) {
-            self.wake_one();
-        }
-    }
-
-    /// Whether a push owes the band a wake, as a rule over the count alone —
-    /// the two cases are stated once here and tested over every boundary of
-    /// `sleepers` rather than inferred from which worker happened to be
-    /// parked. The first is not an optimization: with every worker parked the
-    /// entry waits for the next push unless this push wakes someone. The
-    /// second recruits one worker for a batch that has none; a batch that
-    /// already has one is spread by the workers themselves.
-    fn owes_wake(&self, sleepers: usize, fresh: bool) -> bool {
-        sleepers != 0 && (sleepers == self.slots.len() || fresh)
     }
 
     /// Take one parked worker out of its sleep, if any is parked. A push with
@@ -832,11 +825,11 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.pop(), None);
         assert!(q.is_empty());
-        q.push_ring(7).unwrap();
+        q.push_ring(7, || {}).unwrap();
         assert!(!q.is_empty());
         assert_eq!(q.pop(), Some(7));
         assert!(q.is_empty());
-        q.push_ring(8).unwrap();
+        q.push_ring(8, || {}).unwrap();
         assert_eq!(q.pop(), Some(8));
     }
 
@@ -851,7 +844,7 @@ mod tests {
         let n = if cfg!(miri) { CHUNK0 * 3 } else { CHUNK0 * 40 };
         let q = BandQueue::<usize>::with_capacity(n);
         for i in 0..n {
-            q.push_ring(i).unwrap();
+            q.push_ring(i, || {}).unwrap();
         }
         for i in 0..n {
             assert_eq!(q.pop(), Some(i), "entry {i} came back out of order");
@@ -868,8 +861,8 @@ mod tests {
         let q = BandQueue::<usize>::with_capacity(2);
         let rounds = if cfg!(miri) { 40usize } else { 2000 };
         for round in 0..rounds {
-            q.push_ring(round).unwrap();
-            q.push_ring(round + 1_000_000).unwrap();
+            q.push_ring(round, || {}).unwrap();
+            q.push_ring(round + 1_000_000, || {}).unwrap();
             assert_eq!(q.pop(), Some(round));
             assert_eq!(q.pop(), Some(round + 1_000_000));
         }
@@ -895,7 +888,7 @@ mod tests {
                 let finished = Arc::clone(&finished);
                 s.spawn(move || {
                     for i in 0..per {
-                        q.push_ring((p, i)).unwrap();
+                        q.push_ring((p, i), || {}).unwrap();
                     }
                     finished.fetch_add(1, Ordering::SeqCst);
                 });
@@ -959,7 +952,7 @@ mod tests {
         {
             let q = BandQueue::<Arc<()>>::with_capacity(5);
             for _ in 0..5 {
-                q.push_ring(Arc::clone(&live)).unwrap();
+                q.push_ring(Arc::clone(&live), || {}).unwrap();
             }
             assert_eq!(Arc::strong_count(&live), 6);
             assert!(q.pop().is_some());
@@ -1044,48 +1037,29 @@ mod tests {
         );
     }
 
+    /// The push that begins a batch is the one that recruits a worker for it,
+    /// and only the linking CAS can say which push that was: the second of
+    /// two pushes joins a batch no worker has taken yet, and a push that
+    /// lands after a worker's take-all begins one of its own. Run-queue
+    /// entries share the inbox, so they share the rule.
     #[test]
-    fn a_push_owes_a_wake_only_with_every_worker_parked_or_a_batch_to_begin() {
-        let parking = Parking::new(3);
-        assert!(!parking.owes_wake(0, true), "no worker is parked");
-        assert!(!parking.owes_wake(0, false), "no worker is parked");
-        for sleepers in 1..3 {
-            assert!(
-                parking.owes_wake(sleepers, true),
-                "{sleepers} parked and no worker has been woken for this batch"
-            );
-            assert!(
-                !parking.owes_wake(sleepers, false),
-                "{sleepers} parked, but a worker holds this batch already"
-            );
-        }
-        assert!(parking.owes_wake(3, true), "every worker is parked");
-        assert!(
-            parking.owes_wake(3, false),
-            "every worker is parked, so no worker will read the entry"
-        );
-    }
-
-    /// The hint is the inbox's emptiness and not the queue's: the second of
-    /// two pushes finds the batch the first began, and a push that lands after
-    /// a worker's take-all finds an empty inbox again even though that worker
-    /// is still holding entries from the last batch.
-    #[test]
-    fn the_inbox_hint_tells_a_batch_being_built_from_one_already_taken() {
+    fn only_the_push_that_begins_a_batch_recruits_for_it() {
         let q = BandQueue::<u32>::with_capacity(4);
-        assert!(q.inbox_is_empty(), "a fresh band has no batch in progress");
-        q.push_ring(1).unwrap();
-        assert!(
-            !q.inbox_is_empty(),
-            "the batch this push began is still in the inbox"
-        );
-        q.push_ring(2).unwrap();
-        assert!(!q.inbox_is_empty(), "and so is the entry that joined it");
+        let mut recruited = 0usize;
+
+        q.push_ring(1, || recruited += 1).unwrap();
+        assert_eq!(recruited, 1, "a fresh band's push has nobody coming");
+        q.push_ring(2, || recruited += 1).unwrap();
+        assert_eq!(recruited, 1, "this one joined the batch the first began");
+
         assert_eq!(q.pop(), Some(1), "one pop takes the whole inbox");
-        assert!(
-            q.inbox_is_empty(),
-            "a worker holds that batch now, so the next push begins one of its own"
+        q.push_ring(3, || recruited += 1).unwrap();
+        assert_eq!(
+            recruited, 2,
+            "a worker holds the last batch, so this push begins one of its own"
         );
+        q.push_task(4, || recruited += 1).unwrap();
+        assert_eq!(recruited, 2, "a task entry joins the batch in the inbox");
     }
 
     /// `wake_one` with nobody parked is a load and nothing else — the
@@ -1111,7 +1085,7 @@ mod tests {
         let mut popped = 0usize;
         for round in 0..200usize {
             for _ in 0..=(round % 5) {
-                q.push_ring(pushed).unwrap();
+                q.push_ring(pushed, || {}).unwrap();
                 pushed += 1;
             }
             for _ in 0..=(round % 3) {
@@ -1138,16 +1112,16 @@ mod tests {
     fn the_ring_supply_is_the_bound_and_a_task_entry_sits_outside_it() {
         let q = BandQueue::<usize>::with_capacity(3);
         for v in 0..3 {
-            q.push_ring(v).unwrap();
+            q.push_ring(v, || {}).unwrap();
         }
         assert_eq!(
-            q.push_ring(99),
+            q.push_ring(99, || {}),
             Err(99),
             "a fourth entry fit a ring of three"
         );
-        q.push_task(7).unwrap();
+        q.push_task(7, || {}).unwrap();
         assert_eq!(q.pop(), Some(0));
-        q.push_ring(100).unwrap();
+        q.push_ring(100, || {}).unwrap();
         assert_eq!(q.pop(), Some(1));
         assert_eq!(q.pop(), Some(2));
         assert_eq!(q.pop(), Some(7));
@@ -1164,12 +1138,12 @@ mod tests {
     fn a_batch_published_onto_a_non_empty_ready_keeps_every_entry() {
         let q = BandQueue::<usize>::with_capacity(8);
         for v in 0..3 {
-            q.push_ring(v).unwrap();
+            q.push_ring(v, || {}).unwrap();
         }
         // Refills, hands back the oldest and leaves 1 and 2 in `ready`.
         assert_eq!(q.pop(), Some(0));
         for v in 3..6 {
-            q.push_ring(v).unwrap();
+            q.push_ring(v, || {}).unwrap();
         }
         assert_eq!(q.refill(), Some(3), "the second batch's oldest entry");
         assert_eq!(q.pop(), Some(4));

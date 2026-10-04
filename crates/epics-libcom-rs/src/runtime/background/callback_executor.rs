@@ -375,9 +375,12 @@ impl PriorityQueue {
             );
             return Ok(());
         }
-        // Read before the push, and a hint only — see `BandQueue::inbox_is_empty`.
-        let fresh = self.queue.inbox_is_empty();
-        let depth = match self.queue.push_ring(Queued::Ring(cb)) {
+        // callback.c:789-824 — the push that begins a batch recruits a worker
+        // for it, and only that push can know (`BandQueue::publish`).
+        let depth = match self
+            .queue
+            .push_ring(Queued::Ring(cb), || self.parking.wake_one())
+        {
             Ok(depth) => depth,
             // No ring slot was free: the band is full, the one place that
             // decides it. Dropping the entry deallocates the callback that
@@ -388,8 +391,6 @@ impl PriorityQueue {
             }
         };
         self.deepen_high_water(depth);
-        // callback.c:789-824 — wake a worker only where the band owes one.
-        self.parking.wake_for_push(fresh);
         Ok(())
     }
 
@@ -400,8 +401,10 @@ impl PriorityQueue {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let fresh = self.queue.inbox_is_empty();
-        if let Err(entry) = self.queue.push_task(Queued::Task(cb)) {
+        if let Err(entry) = self
+            .queue
+            .push_task(Queued::Task(cb), || self.parking.wake_one())
+        {
             // Only reachable with the whole 4 G index space queued; dropping
             // the entry finalizes its task rather than stranding it.
             drop(entry);
@@ -409,9 +412,7 @@ impl PriorityQueue {
                 target: "epics_base_rs::runtime::callback",
                 "callback band queue arena exhausted; task entry dropped"
             );
-            return;
         }
-        self.parking.wake_for_push(fresh);
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):

@@ -1389,6 +1389,7 @@ pub fn errlog_strip_ansi(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fresh_process::with_a_process_of_its_own;
     use serial_test::serial;
 
     #[test]
@@ -1397,46 +1398,6 @@ mod tests {
         rt_info!("info message");
         rt_warn!("warn: {}", "something");
         rt_error!("error: {} {}", "bad", "thing");
-    }
-
-    /// Run `body` in a process of its own, and report there what it did.
-    ///
-    /// `tracing`'s global max level is a one-way latch: the first subscriber
-    /// installed raises it — a scoped `with_default` counts — and nothing
-    /// lowers it again, so [`nothing_is_listening`] stays false for the rest
-    /// of that process. A test whose subject is a process that has never had
-    /// a subscriber therefore needs a process that has never had one. Under
-    /// `cargo nextest` every test has one; under `cargo test` a single
-    /// earlier test takes it away, and these assertions used to fail there
-    /// for that reason and no other.
-    ///
-    /// `test` is the full path of the calling test, because that is what the
-    /// child is given to run.
-    #[cfg(not(any(target_os = "rtems", target_os = "vxworks")))]
-    fn with_a_process_of_its_own(test: &str, body: impl FnOnce()) {
-        const ROLE: &str = "EPICS_RS_LOG_FRESH_PROCESS";
-        if std::env::var(ROLE).as_deref() == Ok(test) {
-            body();
-            return;
-        }
-        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", test, "--nocapture"])
-            .env(ROLE, test)
-            .output()
-            .expect("re-exec the test binary");
-        assert!(
-            out.status.success(),
-            "{test} failed in a process of its own: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// The embedded targets have no process to spawn, so there the assertion
-    /// is only as isolated as the runner makes it.
-    #[cfg(any(target_os = "rtems", target_os = "vxworks"))]
-    fn with_a_process_of_its_own(_test: &str, body: impl FnOnce()) {
-        body();
     }
 
     /// The condition the console fallback keys on. With no subscriber the

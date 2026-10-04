@@ -27,6 +27,8 @@ pub mod env;
 pub mod env_table;
 pub mod epics_string;
 pub mod exit;
+#[cfg(test)]
+mod fresh_process;
 pub mod fs;
 pub mod general_time;
 pub mod interrupt_accept;

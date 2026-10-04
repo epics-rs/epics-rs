@@ -74,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 
-use super::callback_queue::{BandQueue, Parking};
+use super::callback_queue::{BandQueue, Parking, Returns};
 use super::facility::{run_facility_loop, run_isolated};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
@@ -488,15 +488,42 @@ pub struct CallbackQueueStats {
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "callback band";
 
+/// Run one worker of one band, with the band's own answer to whether its
+/// workers chain the nodes they have run ([`BandQueue::returns`]) decided here
+/// and nowhere else: the chain handle and the loop that fills it are picked
+/// together, so a worker cannot run a loop that disagrees with its handle.
+fn worker_loop(pq: &PriorityQueue, slot: usize) {
+    // callback.c:563-570 — the nodes this worker has run and not yet given
+    // back. Holding the handle is what guarantees they are given back.
+    let returns = pq.queue.returns(pq.parking.workers());
+    if returns.is_batched() {
+        drain_band::<true>(pq, slot, returns);
+    } else {
+        drain_band::<false>(pq, slot, returns);
+    }
+}
+
 /// C `callbackTask` (`callback.c:210-235`) for one worker of one band.
 /// `slot` is the worker's ordinal within the band — its park slot.
-fn worker_loop(pq: &PriorityQueue, slot: usize) {
+///
+/// `BATCHED` is the band's chain decision made constant, so the band that does
+/// not chain pays nothing for the one that does: threading it through as a
+/// runtime field instead costs a single worker's drain 11% (62.5 → 67.7 ns per
+/// entry on this box), which is more than chaining ever saved it.
+fn drain_band<const BATCHED: bool>(
+    pq: &PriorityQueue,
+    slot: usize,
+    mut returns: Returns<'_, Queued>,
+) {
     let parked = pq.parking.waiter(slot);
     loop {
         // callback.c:223 — take the next entry.
-        let Some(entry) = pq.queue.pop() else {
+        let Some(entry) = pq.queue.pop_into::<BATCHED>(&mut returns) else {
             // callback.c:220-221 — nothing to run: exit if the band has
             // stopped and is drained, otherwise sleep until a push arrives.
+            // callback.c:574-581 — give the slots back before sleeping, so a
+            // band that has caught up is holding none of its ring.
+            returns.flush();
             if pq.shutdown.load(Ordering::SeqCst) {
                 return;
             }
@@ -823,7 +850,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const T: Duration = Duration::from_secs(5);
 
@@ -1378,7 +1405,17 @@ mod tests {
             rx.recv_timeout(T)
                 .unwrap_or_else(|e| panic!("only {i} of 1000 entries ran: {e}"));
         }
-        assert_eq!(pool.stats(CallbackPriority::Low, false).num_used, 0);
+        // Four workers chain their nodes (`return_batch`), so the last entry
+        // having run does not mean every node is back yet: each worker returns
+        // its chain when it next finds the queue empty, just before parking.
+        let gave_back = Instant::now();
+        while pool.stats(CallbackPriority::Low, false).num_used != 0 {
+            assert!(
+                gave_back.elapsed() < T,
+                "a parked worker is still holding nodes it ran"
+            );
+            std::thread::yield_now();
+        }
         pool.shutdown();
     }
 
@@ -1410,7 +1447,11 @@ mod tests {
             "a ring of two holds two"
         );
 
-        while pq.queue.pop().is_some() {}
+        while pq
+            .queue
+            .pop_into::<true>(&mut pq.queue.returns(1))
+            .is_some()
+        {}
         assert_eq!(pq.queue.ring_used(), 0, "the ring drained");
 
         for _ in 0..2 {
@@ -1471,7 +1512,7 @@ mod tests {
                     (Arc::clone(&pq), Arc::clone(&popped), Arc::clone(&broken));
                 s.spawn(move || {
                     loop {
-                        match pq.queue.pop() {
+                        match pq.queue.pop_into::<true>(&mut pq.queue.returns(1)) {
                             Some(entry) => {
                                 drop(entry);
                                 popped.fetch_add(1, Ordering::Relaxed);

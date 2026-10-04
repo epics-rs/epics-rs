@@ -373,6 +373,35 @@ impl<T> Pool<T> {
 
     /// Return `i` to the supply it came from — its index says which. The
     /// caller must own it: off both stacks and with its value taken.
+    /// Give a whole chain of ring nodes back in one CAS — the reverse of
+    /// `RETURN_EVERY` [`Pool::alloc_ring`] calls paid once. `head` through
+    /// `tail` must already be linked head-to-tail and owned by this thread,
+    /// and `n` must be their number.
+    ///
+    /// The count comes down with the slots and not before: it is lowered here,
+    /// so for as long as a worker holds a chain the band both reports those
+    /// entries queued and refuses requests for their slots. Lowering the count
+    /// where the callback returns instead would report slots free that no
+    /// requester can get.
+    fn dealloc_chain(&self, head: u32, tail: u32, n: usize) {
+        self.ring_used.fetch_sub(n, Ordering::AcqRel);
+        let tail_node = unsafe { self.get(tail) };
+        loop {
+            let old = self.free_ring.load(Ordering::Acquire);
+            let prev = tail_node.link.load(Ordering::Relaxed);
+            tail_node
+                .link
+                .store(bump(prev, idx_of(old)), Ordering::Release);
+            if self
+                .free_ring
+                .compare_exchange_weak(old, bump(old, head), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     fn dealloc(&self, i: u32) {
         let list = if (i as usize) < self.ring_slots {
             self.ring_used.fetch_sub(1, Ordering::AcqRel);
@@ -528,22 +557,43 @@ impl<T> BandQueue<T> {
         }
     }
 
-    /// Take the value out of a node this thread has just unlinked, and return
-    /// the node to the arena.
+    /// Take the value out of a node this thread has just unlinked, leaving the
+    /// node itself for the caller to return (see [`Returns`]).
     ///
     /// # Safety
     ///
     /// `i` must be a node whose unlink CAS this thread won, so no other thread
     /// can reach it.
     #[inline]
-    unsafe fn consume(&self, i: u32) -> Option<T> {
-        let v = unsafe { (*self.nodes.get(i).value.get()).take() };
-        self.nodes.dealloc(i);
-        v
+    unsafe fn take(&self, i: u32) -> Option<T> {
+        unsafe { (*self.nodes.get(i).value.get()).take() }
     }
 
-    /// Take the oldest submitted entry, or `None` when both stacks are empty.
-    pub(super) fn pop(&self) -> Option<T> {
+    /// Open a consumer's chain of nodes to give back — one per worker, since a
+    /// chain is single-threaded until it is published. `workers` is the band's
+    /// width, which with the ring size decides how many nodes the chain holds
+    /// (see [`return_batch`]).
+    pub(super) fn returns(&self, workers: usize) -> Returns<'_, T> {
+        Returns {
+            queue: self,
+            head: IDX_NONE,
+            tail: IDX_NONE,
+            n: 0,
+            batch: return_batch(workers, self.nodes.ring_slots),
+        }
+    }
+
+    /// Take the oldest submitted entry, or `None` when both stacks are empty,
+    /// and hand its node to `returns`.
+    ///
+    /// With `BATCHED` the node is chained instead of going straight back —
+    /// `callback.c:563-570` as of #996, where a worker returns `CB_FREE_EVERY`
+    /// of them in one CAS, so both the free-list CAS and the ring count are
+    /// paid once per chain rather than once per entry. That is worth a third
+    /// of four workers' drain and a sixth of eight workers'; it costs a lone
+    /// worker 5.6%, which is why the band decides ([`return_batch`]) and
+    /// decides it as a constant.
+    pub(super) fn pop_into<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<T> {
         loop {
             let head = self.ready.0.load(Ordering::Acquire);
             match idx_of(head) {
@@ -554,7 +604,7 @@ impl<T> BandQueue<T> {
                     if idx_of(self.inbox.0.load(Ordering::Acquire)) == IDX_NONE {
                         return None;
                     }
-                    if let Some(v) = self.refill() {
+                    if let Some(v) = self.refill::<BATCHED>(returns) {
                         return Some(v);
                     }
                 }
@@ -572,7 +622,9 @@ impl<T> BandQueue<T> {
                         )
                         .is_ok()
                     {
-                        return unsafe { self.consume(i) };
+                        let v = unsafe { self.take(i) };
+                        returns.stage::<BATCHED>(i);
+                        return v;
                     }
                 }
             }
@@ -584,7 +636,7 @@ impl<T> BandQueue<T> {
     ///
     /// `None` means another worker took the inbox first — the caller retries
     /// its pop rather than reporting the band empty.
-    fn refill(&self) -> Option<T> {
+    fn refill<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<T> {
         // Take the whole inbox in one CAS. Pushers and other workers can
         // contend; exactly one of them comes away with the chain.
         let newest = loop {
@@ -628,7 +680,9 @@ impl<T> BandQueue<T> {
             // `newest` is the chain's last node after the reversal.
             self.publish_ready(rest, newest);
         }
-        unsafe { self.consume(oldest) }
+        let v = unsafe { self.take(oldest) };
+        returns.stage::<BATCHED>(oldest);
+        v
     }
 
     /// Link a batch's tail onto `ready` and swing the root to its first entry.
@@ -671,6 +725,122 @@ impl<T> BandQueue<T> {
     pub(super) fn is_empty(&self) -> bool {
         idx_of(self.ready.0.load(Ordering::SeqCst)) == IDX_NONE
             && idx_of(self.inbox.0.load(Ordering::SeqCst)) == IDX_NONE
+    }
+}
+
+/// Nodes a consumer has run and not yet given back, chained and returned
+/// `RETURN_EVERY` at a time — C's `CB_FREE_EVERY` done-chain
+/// (`callback.c:563-570`, #996).
+///
+/// **Every node this stages is returned to the pool before the handle goes
+/// away**, and the handle is the only way to stage one, so no exit path —
+/// early return, a panicking callback, a worker shutting down — can strand a
+/// slot. The chain is single-threaded until the CAS that publishes it, which
+/// is why it is a handle per consumer and not shared state.
+///
+/// The price of holding nodes is paid in the band's own currency: for as long
+/// as a chain is unflushed those slots are neither free to a requester nor
+/// counted as drained, so a saturated band refuses that many requests per
+/// worker earlier than one that returns every node at once, and
+/// `callbackQueueStatus` reports them queued until the chain goes back. A
+/// worker flushes before it sleeps, so a band that has caught up holds none,
+/// and [`return_batch`] is 1 for a one-worker band, which is every band until
+/// `callbackParallelThreads` widens one — so the default band's count stays
+/// exactly the entries queued.
+pub(super) struct Returns<'a, T> {
+    queue: &'a BandQueue<T>,
+    /// Newest staged node, or `IDX_NONE`.
+    head: u32,
+    /// Oldest staged node — the end the free list is linked onto.
+    tail: u32,
+    n: usize,
+    /// Nodes to chain before giving them back — [`return_batch`].
+    batch: usize,
+}
+
+/// Most nodes a worker may chain before giving them back — C's
+/// `CB_FREE_EVERY`.
+const RETURN_EVERY: usize = 16;
+
+/// How many nodes a worker of this band chains before returning them.
+///
+/// Two inputs, each for its own reason.
+///
+/// **The worker count, because batching only pays where workers contend.** A
+/// chain trades one free-list CAS and one count update per entry for one per
+/// chain, and that trade is a loss when nobody is competing for either: on this
+/// box, measured against the same binary's unchained arm, a single worker's
+/// drain is 5.6% *slower* at a chain of 16 (62.5 → 65.9 ns per entry) while
+/// four workers are 32.6% faster (580.2 → 391.0) and eight 17.8% (567.5 →
+/// 466.4). A band with one worker — the `callbackParallelThreads` default —
+/// therefore returns every node as it dequeues it, which is also what keeps
+/// its ring count exactly the entries queued. #996 chains 16 whatever the
+/// band's width.
+///
+/// **The ring size, because a worker must not be able to starve a requester.**
+/// Staged slots are neither free nor drained, so a chain that could hold a
+/// band's whole ring would let a worker blocked inside one callback refuse
+/// every request until it returns. Half the ring, shared out over the workers,
+/// bounds that by construction instead of by a check at the boundary.
+fn return_batch(workers: usize, ring_slots: usize) -> usize {
+    if workers < 2 {
+        return 1;
+    }
+    (ring_slots / (2 * workers)).clamp(1, RETURN_EVERY)
+}
+
+impl<T> Returns<'_, T> {
+    /// Whether this band's workers chain at all — [`return_batch`] of 1 means
+    /// a node goes back as it is dequeued, which is both what a band with one
+    /// worker measures fastest and what keeps its ring count exactly the
+    /// entries queued.
+    pub(super) fn is_batched(&self) -> bool {
+        self.batch > 1
+    }
+
+    /// Chain node `i`, which this thread has just unlinked and emptied.
+    #[inline]
+    fn stage<const BATCHED: bool>(&mut self, i: u32) {
+        if !BATCHED || (i as usize) >= self.queue.nodes.ring_slots {
+            // A band that does not chain gives the node straight back, with
+            // the test folded out of its loop entirely.
+            //
+            // Run-queue nodes likewise are not ring slots: nothing waits on
+            // them, and the supply they come from grows, so there is nothing
+            // to batch.
+            self.queue.nodes.dealloc(i);
+            return;
+        }
+        let node = unsafe { self.queue.nodes.get(i) };
+        let prev = node.link.load(Ordering::Relaxed);
+        node.link.store(bump(prev, self.head), Ordering::Relaxed);
+        self.head = i;
+        if self.tail == IDX_NONE {
+            self.tail = i;
+        }
+        self.n += 1;
+        if self.n == self.batch {
+            self.flush();
+        }
+    }
+
+    /// Give back whatever is staged. Called at the batch size, before a worker
+    /// sleeps, and on drop.
+    #[inline]
+    pub(super) fn flush(&mut self) {
+        if self.head == IDX_NONE {
+            return;
+        }
+        self.queue.nodes.dealloc_chain(self.head, self.tail, self.n);
+        self.head = IDX_NONE;
+        self.tail = IDX_NONE;
+        self.n = 0;
+    }
+}
+
+impl<T> Drop for Returns<'_, T> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -752,6 +922,11 @@ impl Parking {
         }
     }
 
+    /// The band's width — how many workers share this queue.
+    pub(super) fn workers(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Claim worker `slot`'s park slot for as long as the worker runs. Holding
     /// the token is what publishes the worker's thread handle, so a signaller
     /// that finds a slot parked finds a handle in it without the worker having
@@ -813,6 +988,13 @@ impl ParkSlot<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pop one entry and give its slot straight back — what a worker does over
+    /// `RETURN_EVERY` entries, done one at a time so a test can speak about
+    /// the ring after every pop.
+    fn pop1<T>(q: &BandQueue<T>) -> Option<T> {
+        q.pop_into::<true>(&mut q.returns(1))
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -823,14 +1005,14 @@ mod tests {
     fn empty_and_non_empty_are_the_two_boundaries_of_is_empty() {
         let q = BandQueue::<u32>::with_capacity(4);
         assert!(q.is_empty());
-        assert_eq!(q.pop(), None);
+        assert_eq!(pop1(&q), None);
         assert!(q.is_empty());
         q.push_ring(7, || {}).unwrap();
         assert!(!q.is_empty());
-        assert_eq!(q.pop(), Some(7));
+        assert_eq!(pop1(&q), Some(7));
         assert!(q.is_empty());
         q.push_ring(8, || {}).unwrap();
-        assert_eq!(q.pop(), Some(8));
+        assert_eq!(pop1(&q), Some(8));
     }
 
     /// `CHUNK0` is the first chunk boundary and every later one doubles, so a
@@ -847,7 +1029,7 @@ mod tests {
             q.push_ring(i, || {}).unwrap();
         }
         for i in 0..n {
-            assert_eq!(q.pop(), Some(i), "entry {i} came back out of order");
+            assert_eq!(pop1(&q), Some(i), "entry {i} came back out of order");
         }
         assert!(q.is_empty());
     }
@@ -863,8 +1045,8 @@ mod tests {
         for round in 0..rounds {
             q.push_ring(round, || {}).unwrap();
             q.push_ring(round + 1_000_000, || {}).unwrap();
-            assert_eq!(q.pop(), Some(round));
-            assert_eq!(q.pop(), Some(round + 1_000_000));
+            assert_eq!(pop1(&q), Some(round));
+            assert_eq!(pop1(&q), Some(round + 1_000_000));
         }
         assert!(q.is_empty());
     }
@@ -900,7 +1082,7 @@ mod tests {
                 s.spawn(move || {
                     let mut mine = vec![Vec::new(); PRODUCERS];
                     loop {
-                        match q.pop() {
+                        match pop1(&q) {
                             Some((p, i)) => mine[p].push(i),
                             None => {
                                 if done.load(Ordering::SeqCst) {
@@ -955,7 +1137,7 @@ mod tests {
                 q.push_ring(Arc::clone(&live), || {}).unwrap();
             }
             assert_eq!(Arc::strong_count(&live), 6);
-            assert!(q.pop().is_some());
+            assert!(pop1(&q).is_some());
             assert_eq!(Arc::strong_count(&live), 5);
         }
         assert_eq!(
@@ -1012,6 +1194,30 @@ mod tests {
     /// on: nothing parked owes nothing, every worker parked owes a wake
     /// whatever the push found, and in between only a push that begins a batch
     /// owes one — spreading that batch is the workers' cascade.
+    /// Every boundary of the chain size the band derives: a single worker
+    /// returns each node as it dequeues it, and no wider band may chain more
+    /// than half its ring between them.
+    #[test]
+    fn a_worker_chains_nothing_alone_and_never_half_the_ring() {
+        assert_eq!(return_batch(1, 4096), 1, "nothing to amortize alone");
+        assert_eq!(return_batch(0, 4096), 1, "a band with no worker, likewise");
+        assert_eq!(return_batch(2, 4096), RETURN_EVERY, "C's cap, reached");
+        assert_eq!(return_batch(2, 64), 16, "half of 64, split two ways");
+        assert_eq!(return_batch(2, 63), 15, "just under it");
+        assert_eq!(return_batch(8, 64), 4, "half of 64, split eight ways");
+        assert_eq!(return_batch(8, 16), 1, "a ring too small to share out");
+        assert_eq!(return_batch(8, 1), 1, "and one that cannot be shared");
+        for workers in 2..=8usize {
+            for ring_slots in 1..=64usize {
+                let batch = return_batch(workers, ring_slots);
+                assert!(
+                    batch * workers * 2 <= ring_slots.max(2 * workers),
+                    "{workers} workers chaining {batch} of {ring_slots} slots                      can starve a requester"
+                );
+            }
+        }
+    }
+
     /// A wake must come out of a worker's sleep, not out of a claim another
     /// signaller already holds: the claimed worker's next read of the queue
     /// can be ordered before this entry was published, so crediting it leaves
@@ -1052,7 +1258,7 @@ mod tests {
         q.push_ring(2, || recruited += 1).unwrap();
         assert_eq!(recruited, 1, "this one joined the batch the first began");
 
-        assert_eq!(q.pop(), Some(1), "one pop takes the whole inbox");
+        assert_eq!(pop1(&q), Some(1), "one pop takes the whole inbox");
         q.push_ring(3, || recruited += 1).unwrap();
         assert_eq!(
             recruited, 2,
@@ -1092,12 +1298,12 @@ mod tests {
                 if popped == pushed {
                     break;
                 }
-                assert_eq!(q.pop(), Some(popped), "entry {popped} left out of turn");
+                assert_eq!(pop1(&q), Some(popped), "entry {popped} left out of turn");
                 popped += 1;
             }
         }
         while popped < pushed {
-            assert_eq!(q.pop(), Some(popped));
+            assert_eq!(pop1(&q), Some(popped));
             popped += 1;
         }
         assert!(q.is_empty());
@@ -1120,12 +1326,12 @@ mod tests {
             "a fourth entry fit a ring of three"
         );
         q.push_task(7, || {}).unwrap();
-        assert_eq!(q.pop(), Some(0));
+        assert_eq!(pop1(&q), Some(0));
         q.push_ring(100, || {}).unwrap();
-        assert_eq!(q.pop(), Some(1));
-        assert_eq!(q.pop(), Some(2));
-        assert_eq!(q.pop(), Some(7));
-        assert_eq!(q.pop(), Some(100));
+        assert_eq!(pop1(&q), Some(1));
+        assert_eq!(pop1(&q), Some(2));
+        assert_eq!(pop1(&q), Some(7));
+        assert_eq!(pop1(&q), Some(100));
         assert!(q.is_empty());
     }
 
@@ -1141,17 +1347,21 @@ mod tests {
             q.push_ring(v, || {}).unwrap();
         }
         // Refills, hands back the oldest and leaves 1 and 2 in `ready`.
-        assert_eq!(q.pop(), Some(0));
+        assert_eq!(pop1(&q), Some(0));
         for v in 3..6 {
             q.push_ring(v, || {}).unwrap();
         }
-        assert_eq!(q.refill(), Some(3), "the second batch's oldest entry");
-        assert_eq!(q.pop(), Some(4));
-        assert_eq!(q.pop(), Some(5));
-        assert_eq!(q.pop(), Some(1));
-        assert_eq!(q.pop(), Some(2));
+        assert_eq!(
+            q.refill::<true>(&mut q.returns(1)),
+            Some(3),
+            "the second batch's oldest entry"
+        );
+        assert_eq!(pop1(&q), Some(4));
+        assert_eq!(pop1(&q), Some(5));
+        assert_eq!(pop1(&q), Some(1));
+        assert_eq!(pop1(&q), Some(2));
         assert!(q.is_empty());
-        assert_eq!(q.pop(), None);
+        assert_eq!(pop1(&q), None);
     }
 
     /// The layout the 46%/33%/9% loss above was measured against. The

@@ -1392,6 +1392,17 @@ mod tests {
     use crate::runtime::fresh_process::with_a_process_of_its_own;
     use serial_test::serial;
 
+    // One `#[serial]` key for this whole module, because there is one piece of
+    // state behind it: the arena, the listener list, `eltc` and the console are
+    // all `pvt`, and a test that touches any of them can be the reason another
+    // one sees the wrong thing. These tests used to hold four independent keys
+    // over it — the default plus `errlog_listeners`, `errlog_console` and
+    // `errlog_sev` — so any two groups could run at once and clobber each
+    // other: a `eltc(false)` landing inside the test that asserts the setting,
+    // or a console line consuming the arena the boot-burst test measures. The
+    // keys bought parallelism only under `cargo test`; `cargo nextest` gives
+    // each test a process and does not need them at all.
+
     #[test]
     fn test_log_macros_compile() {
         rt_debug!("debug message {}", 42);
@@ -1407,7 +1418,7 @@ mod tests {
     /// entry points do not do it (`tracing-subscriber` sits behind an
     /// optional feature that also pulls a Prometheus exporter).
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn with_no_subscriber_nothing_is_listening() {
         with_a_process_of_its_own(
             "runtime::log::tests::with_no_subscriber_nothing_is_listening",
@@ -1425,7 +1436,7 @@ mod tests {
     /// IOC gets each errlog line twice: once through its own sink and once on
     /// stderr.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn with_a_subscriber_the_fallback_stands_down() {
         use tracing::subscriber::with_default;
         let captured = with_default(tracing_subscriber::registry(), nothing_is_listening);
@@ -1441,7 +1452,7 @@ mod tests {
     /// own fallback would then print every errlog line a second time on the
     /// very target the subscriber exists for.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declares_itself_to_the_dispatcher() {
         use tracing::level_filters::LevelFilter;
         use tracing::subscriber::with_default;
@@ -1490,7 +1501,7 @@ mod tests {
     /// rendering it through `Debug` is what keeps it readable; switching to a
     /// `record_str` arm would wrap every diagnostic in quotes.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_line_carries_message_and_fields() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
@@ -1510,7 +1521,7 @@ mod tests {
     /// `debug!` that produced no line, and here at the filter itself so the
     /// reason is not mistaken for a rendering accident.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declines_below_info() {
         use tracing::level_filters::LevelFilter;
         let taken = tracing::subscriber::with_default(ConsoleSubscriber, || {
@@ -1536,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_to_log_threshold_roundtrips() {
         errlog_set_sev_to_log(ErrlogSevEnum::Major);
         assert_eq!(errlog_get_sev_to_log(), ErrlogSevEnum::Major);
@@ -1549,7 +1560,7 @@ mod tests {
     /// `errlogInfo`. Every test in the `errlog_sev` group restores that
     /// value, so this holds whichever order they run in.
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_to_log_defaults_to_info_like_c_zero_init() {
         assert_eq!(
             errlog_get_sev_to_log(),
@@ -1563,7 +1574,7 @@ mod tests {
     /// C IOC prints `sevr=info` lines even after `errlogSetSevToLog(major)`
     /// — e.g. `devBiDbState`'s "Creating new db state" notice at iocInit.
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_printf_emits_every_severity_whatever_sev_to_log_says() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         errlog_set_sev_to_log(ErrlogSevEnum::Fatal);
@@ -1670,7 +1681,7 @@ mod tests {
     /// Installing twice must not chain the hook onto itself: that prints every
     /// panic once per install, and the second copy looks like a second panic.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_panic_hook_installs_once() {
         let _restore = PanicHookUnderTest;
         assert!(install_panic_hook(), "the first install takes effect");
@@ -1688,7 +1699,7 @@ mod tests {
     /// environment that does not exist. A sentinel hook proves the absence
     /// directly: if the previous hook still ran, it would flip the flag.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_panic_hook_does_not_run_the_hook_it_replaced() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -1803,7 +1814,7 @@ mod tests {
     /// Deterministic, not a race: the last message's flush cannot return until
     /// the worker has completed a pass with it in hand.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_boot_sized_burst_of_console_messages_loses_none() {
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink = std::sync::Arc::clone(&seen);
@@ -1833,7 +1844,7 @@ mod tests {
     /// is shut the drain cannot complete, so a producer that waits for it
     /// cannot return, and a producer that does not wait must already have.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn only_a_blocking_producer_waits_for_the_drain() {
         for prologue in [false, true] {
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1895,7 +1906,7 @@ mod tests {
     /// while the gate is shut not one of them may return, and once it opens
     /// all of them must.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn every_producer_in_the_flush_rendezvous_is_released() {
         const FLUSHERS: usize = 8;
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1960,7 +1971,7 @@ mod tests {
     /// hold that shows the previous test is measuring something, since without
     /// the flush that burst is this one.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn the_same_burst_with_the_console_off_overflows_and_is_counted() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -2004,7 +2015,7 @@ mod tests {
     /// test does not fail, it hangs, so the wait is bounded and the failure is
     /// a timeout rather than a wedged process.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_that_logs_does_not_wait_for_its_own_drain() {
         let logged = std::sync::atomic::AtomicBool::new(false);
         let id = errlog_add_listener(move |_| {
@@ -2157,7 +2168,7 @@ mod tests {
 
     /// A file console for one test, taken back however the test leaves.
     ///
-    /// The console and `eltc` are both process-global, and `#[serial]` only
+    /// The console and `eltc` are both process-global, and `#[serial(errlog)]` only
     /// keeps these tests from overlapping — it does not undo a redirect a
     /// failing one left behind, which would silence every later test's
     /// console. Restoring on drop does, panic or not.
@@ -2214,7 +2225,7 @@ mod tests {
     /// the caller's stream, and they are still only the caller's bytes — a set
     /// console gets the same framing as `stderr`.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn a_set_console_takes_the_message_bytes_and_nothing_else() {
         let console = ConsoleUnderTest::new("set");
         console.log("iocPause: IOC suspended\n");
@@ -2229,7 +2240,7 @@ mod tests {
     /// C original is an `errlogPrintf` in a server, and while that subscriber
     /// is installed the errlog console is ours.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn our_subscribers_own_lines_go_to_the_set_console() {
         let console = ConsoleUnderTest::new("subscriber");
         tracing::subscriber::with_default(ConsoleSubscriber, || {
@@ -2245,7 +2256,7 @@ mod tests {
     /// its worker out to get this (`errlog.c:486`), the port holds the console
     /// lock across the write instead.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn a_swap_stops_writing_the_stream_it_replaced() {
         let console = ConsoleUnderTest::new("first");
         console.log("to the first\n");
@@ -2260,7 +2271,7 @@ mod tests {
     /// terminal would have kept — and giving the console back restores the
     /// answer for `stderr`.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_paint_answer_follows_the_stream_that_was_installed() {
         let before = errlog_console_paints();
         {
@@ -2281,7 +2292,7 @@ mod tests {
     /// `eltc` still owns whether a line is echoed at all. A set console says
     /// where the bytes go; it is not a decision to send them.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn eltc_still_silences_a_set_console() {
         let console = ConsoleUnderTest::new("gated");
         let was = eltc(false);
@@ -2301,7 +2312,7 @@ mod tests {
     /// every `epicsThreadCreate` thread and what keeps this test off its own
     /// flush.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn the_lost_message_line_goes_to_the_set_console() {
         let console = ConsoleUnderTest::new("lost");
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -2341,7 +2352,7 @@ mod tests {
     /// The subscriber's skip is keyed on a target the `tracing` macros spell as
     /// a literal, so this is what stops the two spellings drifting apart.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_errlog_target_is_the_one_the_macros_publish_on() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
@@ -2360,7 +2371,7 @@ mod tests {
     /// would print C's bytes a second time behind a `LEVEL target:` prefix C
     /// never writes, so it declines them and takes every other target.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declines_errlog_events_and_takes_the_rest() {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2406,7 +2417,7 @@ mod tests {
     /// An application that installed its own subscriber asked for its own
     /// formatting, so `write_console` must stay silent under one.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_errlog_console_is_ours_only_with_nothing_listening_or_our_subscriber() {
         with_a_process_of_its_own(
             "runtime::log::tests::the_errlog_console_is_ours_only_with_nothing_listening_or_our_subscriber",
@@ -2460,7 +2471,7 @@ mod tests {
     /// of its writer is pinned by
     /// [`the_console_writes_the_callers_bytes_and_appends_nothing`].
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn the_callers_bytes_frame_every_errlog_sink() {
         let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&heard);
@@ -2503,7 +2514,7 @@ mod tests {
     /// message. Delivery is on the errlog worker thread, so the test flushes
     /// the way C's `errlogFlush` does before looking.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_registered_listener_receives_every_message_after_a_flush() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2523,7 +2534,7 @@ mod tests {
     /// matched; a token matches at most one, so a second removal answers
     /// false and nothing further is delivered.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_removed_listener_stops_receiving_and_cannot_be_removed_twice() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2546,7 +2557,7 @@ mod tests {
     /// Boundary: the listener sees the message with its ANSI stripped, which
     /// is what C does before the listener loop (`errlog.c:678-681`).
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_sees_the_message_with_its_escapes_removed() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2564,7 +2575,7 @@ mod tests {
     /// snapshot, so the call cannot deadlock and the removal takes effect on
     /// the next message.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_can_remove_itself_from_inside_its_own_callback() {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let slot: std::sync::Arc<std::sync::Mutex<Option<ErrlogListenerId>>> =
@@ -2595,7 +2606,7 @@ mod tests {
     /// setting so a caller can restore it, and the setting itself is what
     /// gates the console.
     #[test]
-    #[serial(errlog_console)]
+    #[serial(errlog)]
     fn eltc_reports_the_previous_setting_and_gates_the_console() {
         assert!(errlog_to_console(), "C initialises pvt.toConsole to TRUE");
         assert!(eltc(false), "the previous setting comes back");

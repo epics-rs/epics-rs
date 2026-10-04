@@ -301,9 +301,23 @@ impl tracing::Subscriber for ConsoleSubscriber {
         Some(tracing::level_filters::LevelFilter::INFO)
     }
 
+    /// Through [`Console`], not `eprintln!`, so this subscriber's console is
+    /// the one [`errlog_set_console`] names.
+    ///
+    /// These are the lines whose C originals are `errlogPrintf` calls in the
+    /// servers — `pvt.console`'s bytes there — and while this subscriber is
+    /// the installed one, the errlog console is ours by the same test
+    /// [`console_fallback`] applies ([`console_subscriber_is_current`]). An
+    /// application that redirects errlog to a file and then reads only errlog
+    /// lines in it would otherwise be missing half of what C puts there. The
+    /// subscriber frames the event, so the newline is added here: C's
+    /// `errlogPrintf` callers carry one in their own format string.
+    ///
+    /// `eltc` does not gate it, and that is C's line too: `pvt.toConsole`
+    /// gates messages that went through errlog's queue, and these did not.
     fn event(&self, event: &tracing::Event<'_>) {
         if let Some(line) = Self::line_for(event) {
-            eprintln!("{line}");
+            console().write(&format!("{line}\n"));
         }
     }
 
@@ -1291,11 +1305,12 @@ pub fn errlog_to_console() -> bool {
 /// demanding it: a line is flushed as it is written, so a buffered wrapper —
 /// which is what would not satisfy the bound — would have nothing to hold.
 ///
-/// Every byte errlog writes follows this: a message's console echo and the
-/// worker's `errlog: lost N messages` line alike. What does not is a
-/// `tracing` event that never entered errlog — the subscriber
-/// [`install_console_subscriber`] installs formats those, and C's
-/// `pvt.console` is written by errlog only.
+/// Every byte this port writes to a console follows it: a message's echo, the
+/// worker's `errlog: lost N messages` line, and — while the subscriber
+/// [`install_console_subscriber`] installs is the one in place — the events it
+/// renders, whose C originals are `errlogPrintf` calls. An application that
+/// installed a subscriber of its own keeps its own console, as it keeps its
+/// own formatting.
 ///
 /// C returns 0 unconditionally, so there is nothing to hand back.
 /// [`errlog_set_console_to_stderr`] is C's `NULL` argument.
@@ -2185,6 +2200,22 @@ mod tests {
         assert_eq!(
             console.text("set"),
             "iocPause: IOC suspended\ndbConvertJSON: "
+        );
+    }
+
+    /// A line this crate's own subscriber renders is `pvt.console`'s too: its
+    /// C original is an `errlogPrintf` in a server, and while that subscriber
+    /// is installed the errlog console is ours.
+    #[test]
+    #[serial]
+    fn our_subscribers_own_lines_go_to_the_set_console() {
+        let console = ConsoleUnderTest::new("subscriber");
+        tracing::subscriber::with_default(ConsoleSubscriber, || {
+            tracing::warn!(target: "epics_base_rs::runtime", "a runtime line");
+        });
+        assert_eq!(
+            console.text("subscriber"),
+            "WARN  epics_base_rs::runtime: a runtime line\n"
         );
     }
 

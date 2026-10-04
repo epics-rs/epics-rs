@@ -740,7 +740,9 @@ pub fn osd_show_all_line() -> &'static str {
 /// handle, so a signaller touches the waiter's parker and nothing any other
 /// requester shares. C's `epicsEvent` is itself a PI mutex and a condvar
 /// (`osdEvent.c:29-31`, `:54` through `globalAttrDefault`,
-/// `osdMutex.c:71-73`); this has no mutex of its own to invert.
+/// `osdMutex.c:71-73`); this has no mutex of its own to invert. PR #996 reaches
+/// the same conclusion for Linux and replaces that pair with a futex
+/// (`fe0e949b9`), leaving the mutex only on the platforms without one.
 ///
 /// # It is a condition wait, not a token
 ///
@@ -757,7 +759,9 @@ pub fn osd_show_all_line() -> &'static str {
 /// The announce/poll pair is sequentially consistent on both sides, which is
 /// what closes the window a plain flag would leave: a signaller publishes its
 /// work and then tests the latch, a waiter stores the latch and then polls for
-/// work, so at least one of the two sees the other.
+/// work, so at least one of the two sees the other. What it does not close on
+/// its own is a signaller stopped after taking the announcement and before the
+/// `unpark` it owes; [`signal`](Self::signal) is three-state for that.
 pub struct Event {
     /// `SLEEPING` only between the waiter announcing that it is about to park
     /// and the wake that releases it, so a signaller's compare-exchange is
@@ -775,6 +779,11 @@ pub struct Event {
 const EVENT_AWAKE: u32 = 0;
 /// The waiter has announced that its next step is to park.
 const EVENT_SLEEPING: u32 = 1;
+/// A signaller has taken the announcement and is on its way to the waiter's
+/// `unpark` — see [`Event::signal`]. Only a signaller writes this, and only
+/// the waiter clears it, so a signaller stopped in that window cannot clobber
+/// a later announcement with a stale store.
+const EVENT_CLAIMED: u32 = 2;
 
 impl Event {
     pub const fn new() -> Self {
@@ -806,19 +815,33 @@ impl Event {
     ///
     /// The work being signalled must already be published — see *It is a
     /// condition wait, not a token* above.
+    ///
+    /// Taking the announcement and reaching the waiter's `unpark` are two
+    /// steps, so a signaller can be stopped between them — and on an IOC it is
+    /// a low-priority requester that gets stopped, by the very load that filled
+    /// the queue. A second signaller must therefore not read "already taken" as
+    /// "nobody to wake" and decline: it unparks the waiter itself, which is why
+    /// the claim is its own state rather than an immediate return to the awake
+    /// one. That leaves the waiter dependent on no particular
+    /// thread resuming — the property epics-base PR #996 gives its Linux
+    /// `epicsEvent` by triggering the futex whenever a waiter is registered
+    /// (`osdEvent.c`, `fe0e949b9`). A redundant `unpark` costs the waiter one
+    /// extra poll of its condition and nothing else.
     pub fn signal(&self) -> bool {
         use std::sync::atomic::Ordering;
-        if self
-            .state
-            .compare_exchange(
-                EVENT_SLEEPING,
-                EVENT_AWAKE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
+        match self.state.compare_exchange(
+            EVENT_SLEEPING,
+            EVENT_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // Ours to release.
+            Ok(_) => {}
+            // Claimed, by a signaller that may not have reached its `unpark`.
+            Err(EVENT_CLAIMED) => {}
+            // Running: it polls its condition before it parks again, and the
+            // work this signal is for is already published.
+            Err(_) => return false,
         }
         if let Some(t) = self.thread.get() {
             t.unpark();
@@ -849,7 +872,7 @@ impl std::fmt::Debug for Event {
         f.debug_struct("Event")
             .field(
                 "sleeping",
-                &(self.state.load(std::sync::atomic::Ordering::Relaxed) == EVENT_SLEEPING),
+                &(self.state.load(std::sync::atomic::Ordering::Relaxed) != EVENT_AWAKE),
             )
             .field("claimed", &self.thread.get().is_some())
             .finish()
@@ -1286,6 +1309,44 @@ mod tests {
             "the deadline wait returned early: {:?}",
             started.elapsed()
         );
+    }
+
+    /// The three states a signal can find, and what each owes: nobody
+    /// announced is a no-op, an announcement is taken and released, and an
+    /// announcement some other signaller has already taken is released again —
+    /// that signaller may be stopped before the `unpark` it owes, and a waiter
+    /// must not be left waiting for one particular thread to run again.
+    #[test]
+    fn a_signal_releases_a_waiter_whose_claim_is_still_in_flight() {
+        use std::sync::atomic::Ordering;
+
+        let event = Event::new();
+        let waiter = event.waiter();
+        assert!(!event.signal(), "nobody has announced itself");
+
+        event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+        assert!(event.signal(), "an announced waiter has to be released");
+        assert_eq!(
+            event.state.load(Ordering::SeqCst),
+            EVENT_CLAIMED,
+            "the claim has to outlive the signaller that took it"
+        );
+        assert!(
+            event.signal(),
+            "a claim nobody may have acted on yet is not `nobody to wake`"
+        );
+
+        // Both signals unparked this thread, so the park below returns on a
+        // token instead of blocking: one extra poll of the condition is the
+        // whole cost of the redundant wake.
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            polls > 1
+        });
+        assert_eq!(polls, 2, "the park blocked instead of taking its token");
+        // Leave no token behind for whatever runs next on this thread.
+        std::thread::park_timeout(std::time::Duration::ZERO);
     }
 
     /// Shutdown: [`Event::wake`] has to release a waiter whichever side of its

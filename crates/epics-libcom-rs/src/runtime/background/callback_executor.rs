@@ -375,8 +375,8 @@ impl PriorityQueue {
             );
             return Ok(());
         }
-        let depth = match self.queue.push_ring(Queued::Ring(cb)) {
-            Ok(depth) => depth,
+        let (depth, fresh) = match self.queue.push_ring(Queued::Ring(cb)) {
+            Ok(pushed) => pushed,
             // No ring slot was free: the band is full, the one place that
             // decides it. Dropping the entry deallocates the callback that
             // was never queued.
@@ -386,8 +386,8 @@ impl PriorityQueue {
             }
         };
         self.deepen_high_water(depth);
-        // callback.c:375 — wake the band, but only if a worker is parked.
-        self.parking.wake_one();
+        // callback.c:789-824 — wake a worker only where the band owes one.
+        self.parking.wake_for_push(fresh);
         Ok(())
     }
 
@@ -398,17 +398,20 @@ impl PriorityQueue {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        if let Err(entry) = self.queue.push_task(Queued::Task(cb)) {
+        let fresh = match self.queue.push_task(Queued::Task(cb)) {
+            Ok(fresh) => fresh,
             // Only reachable with the whole 4 G index space queued; dropping
             // the entry finalizes its task rather than stranding it.
-            drop(entry);
-            tracing::error!(
-                target: "epics_base_rs::runtime::callback",
-                "callback band queue arena exhausted; task entry dropped"
-            );
-            return;
-        }
-        self.parking.wake_one();
+            Err(entry) => {
+                drop(entry);
+                tracing::error!(
+                    target: "epics_base_rs::runtime::callback",
+                    "callback band queue arena exhausted; task entry dropped"
+                );
+                return;
+            }
+        };
+        self.parking.wake_for_push(fresh);
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
@@ -499,10 +502,10 @@ fn worker_loop(pq: &PriorityQueue, slot: usize) {
             parked.park_until(|| !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst));
             continue;
         };
-        // callback.c:224 — a pop that leaves work behind re-triggers the
-        // band, so a second worker is not left asleep beside a queue that is
-        // not empty. C triggers unconditionally; this costs a load unless a
-        // worker really is parked.
+        // callback.c:558-560 — a pop that leaves work behind wakes a sleeper,
+        // so a second worker is not left asleep beside a queue that is not
+        // empty. Recruiting the band is the workers' job, not the requester's
+        // (see `Parking`), and this is where they do it.
         if !pq.queue.is_empty() {
             pq.parking.wake_one();
         }

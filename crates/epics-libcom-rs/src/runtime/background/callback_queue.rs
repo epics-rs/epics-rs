@@ -455,12 +455,9 @@ impl<T> BandQueue<T> {
     /// before the entry is published: the band's high-water mark is latched
     /// from it, and a load afterwards would read a depth a worker has already
     /// lowered.
-    pub(super) fn push_ring(&self, v: T) -> Result<usize, T> {
+    pub(super) fn push_ring(&self, v: T) -> Result<(usize, bool), T> {
         match self.nodes.alloc_ring() {
-            Some((i, depth)) => {
-                self.publish(i, v);
-                Ok(depth)
-            }
+            Some((i, depth)) => Ok((depth, self.publish(i, v))),
             None => Err(v),
         }
     }
@@ -473,17 +470,17 @@ impl<T> BandQueue<T> {
     /// Submit `v` without taking a ring slot — the run-queue entries that
     /// share the band's FIFO but not its bound. `Err(v)` only when the arena's
     /// index space is exhausted, which is 4 G entries on one band.
-    pub(super) fn push_task(&self, v: T) -> Result<(), T> {
+    pub(super) fn push_task(&self, v: T) -> Result<bool, T> {
         match self.nodes.alloc_task() {
-            Some(i) => {
-                self.publish(i, v);
-                Ok(())
-            }
+            Some(i) => Ok(self.publish(i, v)),
             None => Err(v),
         }
     }
 
-    /// Put `v` in node `i` and link it into the inbox.
+    /// Put `v` in node `i` and link it into the inbox. Returns whether the
+    /// inbox was empty before the push, which is the one thing about a push
+    /// that cannot be recovered afterwards and is what the band's wake
+    /// decision turns on (see [`Parking`]).
     ///
     /// The CAS that publishes the node is sequentially consistent, not merely
     /// release: the caller goes on to test whether a worker is parked, and a
@@ -492,7 +489,7 @@ impl<T> BandQueue<T> {
     /// then complete while the push sits in the store buffer, and the pusher
     /// decides not to wake the worker that is deciding not to see the entry.
     /// Lock `cmpxchg` already carries this on x86.
-    fn publish(&self, i: u32, v: T) {
+    fn publish(&self, i: u32, v: T) -> bool {
         let node = unsafe { self.nodes.get(i) };
         // Ours until the CAS below links it.
         unsafe { *node.value.get() = Some(v) };
@@ -506,7 +503,7 @@ impl<T> BandQueue<T> {
                 .compare_exchange_weak(head, bump(head, i), Ordering::SeqCst, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return idx_of(head) == IDX_NONE;
             }
         }
     }
@@ -669,6 +666,38 @@ impl<T> BandQueue<T> {
 /// that none of them is parked, and a band running flat out is exactly the
 /// case where none is.
 ///
+/// ## Who wakes a worker
+///
+/// **Every published entry has a committed observer** — a worker that reads the
+/// queue after the entry is visible and before it next sleeps. A worker that is
+/// not parked is one: the push is sequentially consistent and a worker polls its
+/// wake condition only after counting itself in `sleepers`, so either the poll
+/// sees the entry or the count the requester read came after the push. That pair
+/// is why [`BandQueue::publish`] and [`BandQueue::is_empty`] are both SeqCst, and
+/// it leaves the requester owing a wake for only one case: every worker parked.
+///
+/// Above that minimum the requester recruits once per batch. An entry that found
+/// the inbox empty begins work no worker has been woken for, so it wakes one
+/// sleeper; an entry that found the inbox occupied inherits that batch's
+/// observer, and spreading the batch over more workers belongs to the workers —
+/// each pop that leaves work behind wakes another ([`Parking::wake_one`] in the
+/// band's loop), so the cascade is paid for on the band's threads and not on the
+/// requester's. A scan thread pushing into a band that is keeping up issues no
+/// syscall at all.
+///
+/// #996 puts a third rule between those two: it also declines the recruiting
+/// wake while some awake worker sits between callbacks and so will read the
+/// inbox next (`anyReady`, `callback.c:519`). That worker is trusted without
+/// being verified, which is why #996 then needs `CB_STALE_US` — no worker
+/// finishing a batch for 20 µs is read as the trusted worker having been
+/// preempted, and the requester wakes a sleeper after all
+/// (`callback.c:808-822`). Neither is here. The window `anyReady` reports is the
+/// few instructions between a worker's `busy = 0` and its next queue read, so
+/// what the rule saves is a wake the band almost never needed to skip, and
+/// declining on it is precisely what made a timeout necessary to get liveness
+/// back. One wake per batch needs no clock on the request path, no progress
+/// counter and no per-worker `busy` flag.
+///
 /// Given its own cache-line block, for the same reason [`Root`] has one:
 /// `sleepers` is written by a worker on every park and unpark, while the band's
 /// ring counter is written by every requester. Measured in C with the two in one
@@ -703,6 +732,26 @@ impl Parking {
             sleepers: &self.sleepers,
             waiter: self.slots[slot].waiter(),
         }
+    }
+
+    /// The requester's wake decision — `callback.c:789-824` as of #996,
+    /// narrowed to the two rules under [`Parking`]. `fresh` is what
+    /// [`BandQueue::push_ring`] reports: this entry found the inbox empty.
+    pub(super) fn wake_for_push(&self, fresh: bool) {
+        if self.owes_wake(self.sleepers.load(Ordering::SeqCst), fresh) {
+            self.wake_one();
+        }
+    }
+
+    /// Whether a push owes the band a wake, as a rule over the count alone —
+    /// the two cases are stated once here and tested over every boundary of
+    /// `sleepers` rather than inferred from which worker happened to be
+    /// parked. The first is not an optimization: with every worker parked the
+    /// entry waits for the next push unless this push wakes someone. The
+    /// second recruits one worker for a batch that has none; a batch that
+    /// already has one is spread by the workers themselves.
+    fn owes_wake(&self, sleepers: usize, fresh: bool) -> bool {
+        sleepers != 0 && (sleepers == self.slots.len() || fresh)
     }
 
     /// Wake one parked worker, if any is parked. A push with every worker of
@@ -938,6 +987,53 @@ mod tests {
         assert!(
             woke.load(Ordering::SeqCst),
             "the worker never left its park"
+        );
+    }
+
+    /// The requester's two rules over every boundary of the count they turn
+    /// on: nothing parked owes nothing, every worker parked owes a wake
+    /// whatever the push found, and in between only a push that begins a batch
+    /// owes one — spreading that batch is the workers' cascade.
+    #[test]
+    fn a_push_owes_a_wake_only_with_every_worker_parked_or_a_batch_to_begin() {
+        let parking = Parking::new(3);
+        assert!(!parking.owes_wake(0, true), "no worker is parked");
+        assert!(!parking.owes_wake(0, false), "no worker is parked");
+        for sleepers in 1..3 {
+            assert!(
+                parking.owes_wake(sleepers, true),
+                "{sleepers} parked and no worker has been woken for this batch"
+            );
+            assert!(
+                !parking.owes_wake(sleepers, false),
+                "{sleepers} parked, but a worker holds this batch already"
+            );
+        }
+        assert!(parking.owes_wake(3, true), "every worker is parked");
+        assert!(
+            parking.owes_wake(3, false),
+            "every worker is parked, so no worker will read the entry"
+        );
+    }
+
+    /// `fresh` is the inbox's emptiness before the push and not the queue's:
+    /// the second of two pushes inherits the worker the first recruited, and a
+    /// push that lands after a worker's take-all begins a batch again even
+    /// though that worker is still holding entries from the last one.
+    #[test]
+    fn a_push_reports_whether_it_found_the_inbox_empty() {
+        let q = BandQueue::<u32>::with_capacity(4);
+        assert_eq!(
+            q.push_ring(1),
+            Ok((1, true)),
+            "the first push begins a batch"
+        );
+        assert_eq!(q.push_ring(2), Ok((2, false)), "the second joins it");
+        assert_eq!(q.pop(), Some(1), "one pop takes the whole inbox");
+        assert_eq!(
+            q.push_ring(3),
+            Ok((2, true)),
+            "the inbox is empty again, so this push begins a batch of its own"
         );
     }
 

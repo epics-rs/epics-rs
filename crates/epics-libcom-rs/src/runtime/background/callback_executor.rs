@@ -543,6 +543,14 @@ fn drain_band<const BATCHED: bool>(
         // (see `Parking`), and this is where they do it. The answer comes out
         // of the pop's own CAS (`Popped::more`): reading the roots again here
         // instead costs a drain 7% at four workers and 11% at two.
+        //
+        // rt43 asks a wider question here, `sleepers && (more || !readyEmpty()
+        // || inbox)`, because its requester declines the recruiting wake
+        // whenever a worker looks ready (`Parking`). `more` already answers
+        // its first two terms, from the CAS instead of a fresh load. Its third
+        // is an entry pushed after this worker took the inbox — and an inbox
+        // this worker emptied makes that push a batch starter, which recruits
+        // on the requester's side whatever this worker does.
         if popped.more {
             pq.parking.wake_one();
         }

@@ -1641,21 +1641,37 @@ mod tests {
         );
     }
 
+    /// `install_panic_hook`'s two halves, restored together.
+    ///
+    /// The refusal is a process one-shot — `PANIC_HOOK_INSTALLED`, so that a
+    /// second install cannot chain the hook onto itself — and a test that
+    /// takes the hook back without clearing the flag leaves the one state no
+    /// process can reach on its own: the flag set and the default hook in
+    /// place, where the next `install_panic_hook` refuses and installs
+    /// nothing. Under `cargo nextest` each test has a process of its own and
+    /// never sees it; under `cargo test`, which shares one, whichever of
+    /// these tests ran second used to fail. Both halves on drop is what makes
+    /// that state unreachable, panic or not.
+    struct PanicHookUnderTest;
+
+    impl Drop for PanicHookUnderTest {
+        fn drop(&mut self) {
+            let _ = std::panic::take_hook();
+            PANIC_HOOK_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Installing twice must not chain the hook onto itself: that prints every
     /// panic once per install, and the second copy looks like a second panic.
-    ///
-    /// Restores the default hook afterwards so a `cargo test` run — which,
-    /// unlike `cargo nextest`, shares one process across tests — is not left
-    /// with this one.
     #[test]
     #[serial]
     fn the_panic_hook_installs_once() {
+        let _restore = PanicHookUnderTest;
         assert!(install_panic_hook(), "the first install takes effect");
         assert!(
             !install_panic_hook(),
             "a second install must be refused, not chained onto the first"
         );
-        let _ = std::panic::take_hook();
     }
 
     /// The hook replaces the previous one; it does not run it afterwards.
@@ -1671,6 +1687,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+        let _restore = PanicHookUnderTest;
         let previous_ran = Arc::new(AtomicBool::new(false));
         let flag = previous_ran.clone();
         std::panic::set_hook(Box::new(move |_| {
@@ -1686,7 +1703,6 @@ mod tests {
             "the replaced hook must not run: chaining it doubles the console \
              output and appends a RUST_BACKTRACE note that cannot be acted on"
         );
-        let _ = std::panic::take_hook();
     }
 
     fn test_queue() -> ErrlogQueue {

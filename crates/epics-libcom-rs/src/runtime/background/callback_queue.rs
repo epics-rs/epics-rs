@@ -901,7 +901,9 @@ impl<T> Drop for Returns<'_, T> {
 /// `sleepers` is written by a worker on every park and unpark, while the band's
 /// ring counter is written by every requester. Measured in C with the two in one
 /// 64-byte line, a band loses 46% of its throughput at one worker, 33% at four
-/// and 9% at eight.
+/// and 9% at eight. The per-worker slots are blocked off the same way, for the
+/// same reason one worker's parking must not be another's write traffic — C
+/// aligns each `cbWorker` to `CB_WORKER_ALIGN` (`callback.c:144`, `:713-717`).
 #[repr(align(128))]
 pub(super) struct Parking {
     /// Workers inside [`ParkSlot::park_until`] — the pusher's test for whether
@@ -911,14 +913,22 @@ pub(super) struct Parking {
     /// band names its thread after. A worker therefore cannot end up sharing a
     /// slot with another, which would turn one worker's "I am awake" into the
     /// other's lost wake-up.
-    slots: Box<[Event]>,
+    slots: Box<[Slot]>,
 }
+
+/// One worker's event on its own cache-line block — C's 128-byte `cbWorker`
+/// (`callback.c:144`). The state word inside is written by that worker on
+/// every park and every wake, so slots packed 16 bytes apart put four workers'
+/// park traffic in one line: the band's own measurements for `sleepers` beside
+/// the ring counter are what this avoids per worker.
+#[repr(align(128))]
+struct Slot(Event);
 
 impl Parking {
     pub(super) fn new(workers: usize) -> Self {
         Parking {
             sleepers: AtomicUsize::new(0),
-            slots: (0..workers.max(1)).map(|_| Event::new()).collect(),
+            slots: (0..workers.max(1)).map(|_| Slot(Event::new())).collect(),
         }
     }
 
@@ -934,7 +944,7 @@ impl Parking {
     pub(super) fn waiter(&self, slot: usize) -> ParkSlot<'_> {
         ParkSlot {
             sleepers: &self.sleepers,
-            waiter: self.slots[slot].waiter(),
+            waiter: self.slots[slot].0.waiter(),
         }
     }
 
@@ -954,7 +964,7 @@ impl Parking {
             return;
         }
         for slot in &self.slots {
-            if slot.signal() == Signalled::Claimed {
+            if slot.0.signal() == Signalled::Claimed {
                 return;
             }
         }
@@ -964,7 +974,7 @@ impl Parking {
     /// its own exit condition.
     pub(super) fn wake_all(&self) {
         for slot in &self.slots {
-            slot.wake();
+            slot.0.wake();
         }
     }
 }
@@ -1218,6 +1228,26 @@ mod tests {
         }
     }
 
+    /// **Invariant:** no two workers' park slots share a cache line.
+    ///
+    /// Asserted on the addresses rather than on `size_of` because that is what
+    /// the hardware shares: a `Slot` whose alignment someone drops still has a
+    /// plausible size, and the cost shows up only as throughput at four
+    /// workers, where nothing fails and nobody looks.
+    #[test]
+    fn one_worker_s_park_traffic_cannot_reach_another_s_line() {
+        let parking = Parking::new(8);
+        let mut last = 0usize;
+        for (j, slot) in parking.slots.iter().enumerate() {
+            let at = slot as *const Slot as usize;
+            assert_eq!(at % 128, 0, "slot {j} is not on a line block");
+            if j > 0 {
+                assert!(at - last >= 128, "slots {} and {j} share a line", j - 1);
+            }
+            last = at;
+        }
+    }
+
     /// A wake must come out of a worker's sleep, not out of a claim another
     /// signaller already holds: the claimed worker's next read of the queue
     /// can be ordered before this entry was published, so crediting it leaves
@@ -1226,17 +1256,17 @@ mod tests {
     fn a_wake_passes_over_a_slot_another_signaller_has_already_claimed() {
         let parking = Parking::new(2);
         // Both workers parked — the count a requester reads.
-        parking.slots[0].announce_for_test();
-        parking.slots[1].announce_for_test();
+        parking.slots[0].0.announce_for_test();
+        parking.slots[1].0.announce_for_test();
         parking.sleepers.store(2, Ordering::SeqCst);
 
         // One signaller claims the first slot and is stopped before its
         // `unpark`.
-        assert_eq!(parking.slots[0].signal(), Signalled::Claimed);
+        assert_eq!(parking.slots[0].0.signal(), Signalled::Claimed);
 
         parking.wake_one();
         assert_eq!(
-            parking.slots[1].signal(),
+            parking.slots[1].0.signal(),
             Signalled::Pending,
             "the wake stopped at a claim it did not make and left the second \
              worker asleep"

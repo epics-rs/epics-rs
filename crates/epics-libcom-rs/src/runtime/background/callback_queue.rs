@@ -586,6 +586,10 @@ impl<T> BandQueue<T> {
     /// Take the oldest submitted entry, or `None` when both stacks are empty,
     /// and hand its node to `returns`.
     ///
+    /// Whether work was left behind comes out of the pop's own CAS, which is
+    /// what spares a worker a fresh read of either root per callback — C's
+    /// `*more` out-parameter (`callback.c:388-452`).
+    ///
     /// With `BATCHED` the node is chained instead of going straight back —
     /// `callback.c:563-570` as of #996, where a worker returns `CB_FREE_EVERY`
     /// of them in one CAS, so both the free-list CAS and the ring count are
@@ -593,7 +597,10 @@ impl<T> BandQueue<T> {
     /// of four workers' drain and a sixth of eight workers'; it costs a lone
     /// worker 5.6%, which is why the band decides ([`return_batch`]) and
     /// decides it as a constant.
-    pub(super) fn pop_into<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<T> {
+    pub(super) fn pop_into<const BATCHED: bool>(
+        &self,
+        returns: &mut Returns<'_, T>,
+    ) -> Option<Popped<T>> {
         loop {
             let head = self.ready.0.load(Ordering::Acquire);
             match idx_of(head) {
@@ -604,8 +611,8 @@ impl<T> BandQueue<T> {
                     if idx_of(self.inbox.0.load(Ordering::Acquire)) == IDX_NONE {
                         return None;
                     }
-                    if let Some(v) = self.refill::<BATCHED>(returns) {
-                        return Some(v);
+                    if let Some(popped) = self.refill::<BATCHED>(returns) {
+                        return Some(popped);
                     }
                 }
                 i => {
@@ -624,7 +631,10 @@ impl<T> BandQueue<T> {
                     {
                         let v = unsafe { self.take(i) };
                         returns.stage::<BATCHED>(i);
-                        return v;
+                        return v.map(|value| Popped {
+                            value,
+                            more: idx_of(next) != IDX_NONE,
+                        });
                     }
                 }
             }
@@ -636,7 +646,7 @@ impl<T> BandQueue<T> {
     ///
     /// `None` means another worker took the inbox first — the caller retries
     /// its pop rather than reporting the band empty.
-    fn refill<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<T> {
+    fn refill<const BATCHED: bool>(&self, returns: &mut Returns<'_, T>) -> Option<Popped<T>> {
         // Take the whole inbox in one CAS. Pushers and other workers can
         // contend; exactly one of them comes away with the chain.
         let newest = loop {
@@ -682,7 +692,10 @@ impl<T> BandQueue<T> {
         }
         let v = unsafe { self.take(oldest) };
         returns.stage::<BATCHED>(oldest);
-        v
+        v.map(|value| Popped {
+            value,
+            more: rest != IDX_NONE,
+        })
     }
 
     /// Link a batch's tail onto `ready` and swing the root to its first entry.
@@ -717,15 +730,31 @@ impl<T> BandQueue<T> {
     /// already taking, which costs one extra poll and never a lost entry.
     ///
     /// It also reads *empty* for a batch a worker holds mid-refill: the inbox
-    /// is already drained and `ready` not yet published. The entries are that
-    /// worker's to publish, and the band's worker loop re-tests this after
-    /// every pop (`callback.c:224`), so the publish is followed by a wake —
-    /// which is what keeps a worker that parks inside this window from
-    /// sleeping on a queue that has work in it.
+    /// is already drained and `ready` not yet published. What keeps a worker
+    /// that parks inside that window from sleeping on a queue with work in it
+    /// is the refilling worker's own [`Popped::more`], which is true exactly
+    /// when its refill published something — so the publish is followed by a
+    /// wake, and a batch of one publishes nothing and leaves the band as empty
+    /// as this said it was.
     pub(super) fn is_empty(&self) -> bool {
         idx_of(self.ready.0.load(Ordering::SeqCst)) == IDX_NONE
             && idx_of(self.inbox.0.load(Ordering::SeqCst)) == IDX_NONE
     }
+}
+
+/// One entry a worker took, and whether the pop that took it left another
+/// behind — C's `nextNode` and its `*more` (`callback.c:438-452`).
+///
+/// A worker recruits another on `more` and nothing else. It is the pop's own
+/// CAS speaking, so it can be behind the queue by the time it is read: a batch
+/// that arrived since is one whose own first push already answered for it (see
+/// [`Parking`]), and an entry this worker drained in the meantime needs no
+/// second worker. What the band must never do is let a published entry wait
+/// for a *later* push to be noticed, and that is the requester's rule, not
+/// this one.
+pub(super) struct Popped<T> {
+    pub(super) value: T,
+    pub(super) more: bool,
 }
 
 /// Nodes a consumer has run and not yet given back, chained and returned
@@ -1001,7 +1030,7 @@ mod tests {
     /// `RETURN_EVERY` entries, done one at a time so a test can speak about
     /// the ring after every pop.
     fn pop1<T>(q: &BandQueue<T>) -> Option<T> {
-        q.pop_into::<true>(&mut q.returns(1))
+        q.pop_into::<true>(&mut q.returns(1)).map(|p| p.value)
     }
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1360,7 +1389,7 @@ mod tests {
             q.push_ring(v, || {}).unwrap();
         }
         assert_eq!(
-            q.refill::<true>(&mut q.returns(1)),
+            q.refill::<true>(&mut q.returns(1)).map(|p| p.value),
             Some(3),
             "the second batch's oldest entry"
         );
@@ -1369,6 +1398,46 @@ mod tests {
         assert_eq!(pop1(&q), Some(1));
         assert_eq!(pop1(&q), Some(2));
         assert!(q.is_empty());
+        assert_eq!(pop1(&q), None);
+    }
+
+    /// **Invariant:** `Popped::more` is true exactly when the pop's own CAS
+    /// left an entry on `ready`.
+    ///
+    /// One case per boundary rather than one per story, and the fourth is the
+    /// one that matters: a pop that empties `ready` while the inbox holds a
+    /// batch reports no more work, which a fresh read of both roots would call
+    /// non-empty. That is deliberate — the batch in the inbox has a worker
+    /// owed to it by its own first push — and it is the whole difference
+    /// between this and the two root loads it replaced.
+    #[test]
+    fn more_is_the_entry_the_pop_left_on_ready_and_nothing_else() {
+        let q = BandQueue::<usize>::with_capacity(8);
+
+        // A one-entry batch: the refill publishes nothing.
+        q.push_ring(10, || {}).unwrap();
+        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        assert_eq!((p.value, p.more), (10, false));
+
+        // A three-entry batch: the refill publishes two.
+        for v in 20..23 {
+            q.push_ring(v, || {}).unwrap();
+        }
+        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        assert_eq!((p.value, p.more), (20, true), "two left on ready");
+        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        assert_eq!((p.value, p.more), (21, true), "one left on ready");
+
+        // The last of the batch, with a fresh batch sitting in the inbox.
+        q.push_ring(30, || {}).unwrap();
+        let p = q.pop_into::<true>(&mut q.returns(1)).unwrap();
+        assert_eq!(
+            (p.value, p.more),
+            (22, false),
+            "the inbox batch is its own first push's to answer for"
+        );
+        assert!(!q.is_empty(), "and it really is still queued");
+        assert_eq!(pop1(&q), Some(30));
         assert_eq!(pop1(&q), None);
     }
 

@@ -1,19 +1,21 @@
 # epics-libcom-rs
 
 EPICS `libCom` for Rust: the layer an IOC is built *on*, with no record system
-above it. Two modules, named for the two halves of C's libCom they port:
+above it.
 
 | module | C counterpart | what it is |
 |---|---|---|
-| `runtime` | `epicsThread`, `epicsTime`, `errlog`, `envDefs`, `epicsString` | the task spawn/sleep/interval seam and its two backends, EPICS priority bands, the general-time provider, the environment-parameter table, `errlog` |
-| `net` | `osiSock` | the EPICS protocols' shared socket layer — per-NIC async UDP with TX/RX accuracy, interface enumeration, loopback multicast |
+| `runtime` | `epicsThread`, `epicsTime`, `errlog`, `envDefs`, `epicsString`, `taskwd`, `macLib`, `epicsExit` | the task spawn/sleep/interval seam and its two backends, EPICS priority bands, the general-time provider, the environment-parameter table, `errlog` and its log client, the task watchdog, macro expansion, the exit and `cantProceed` paths |
+| `net` | `osiSock` | the EPICS protocols' shared socket layer — per-NIC async UDP with TX/RX accuracy, interface enumeration, loopback multicast, the SEARCH datagram socket |
+| `shared_array` | `shared_vector` (pvxs) | the array payload an `EpicsValue`, an asyn array read and a monitor queue all share without copying |
+| `walltime` | `epicsTimeStamp` | a wall-clock instant with EPICS nanosecond precision on every platform |
 
 It exists so a consumer that wants the concurrency and socket primitives — a
 protocol client, a gateway, `pvxs-rs` — does not have to take the database with
 them (issue #55).
 
 **You usually do not depend on this crate directly.** `epics-base-rs` re-exports
-both modules at their original paths, so `epics_base_rs::runtime::…` and
+`runtime` and `net` at their original paths, so `epics_base_rs::runtime::…` and
 `epics_base_rs::net::…` still resolve exactly as before; the split changed no
 call site anywhere in the workspace. Depend on `epics-libcom-rs` only when you
 want the layer *without* `epics-base-rs`.
@@ -58,8 +60,9 @@ it.
 
 ## RTEMS
 
-The `net` module's socket-bearing submodules (`async_udp_v4`, `iface_map`,
-`loopback_mcast`) are host-only — `socket2`/`if-addrs` do not build for
+The `net` module's socket-bearing submodules — `async_udp_v4` and
+`loopback_mcast` (`tokio_backend` only) and `iface_map` (off every embedded
+target) — are host-only — `socket2`/`if-addrs` do not build for
 `armv7-rtems-eabihf`, and the RTEMS CA server uses the separate raw-libc socket
 driver. The wire constants beside them stay on every target, because the PVA
 SEARCH decoder has to embed them on RTEMS too.

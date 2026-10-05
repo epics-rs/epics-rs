@@ -1,15 +1,15 @@
-// RTEMS-EXEC-MODEL-ALLOW(15): the teardown test drives the scheduler from a
+// RTEMS-EXEC-MODEL-ALLOW(16): the teardown test drives the scheduler from a
 // tokio task (spawn/abort are its cancellation instrument) and the seven
 // ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
 // tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
 // the tokio test runtime only as the start-context `ScanOwner::start`
 // requires; the scan/owner threads under test go through the exec seam
 // (`block_on_sync` → `park_on`) when the exec backend is on. The
-// seven parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
-// cap boundaries, the two dedicated-helper boundaries, and the config gate)
-// want a runtime only for the `.await` that loads their records — the leader
-// and its helpers are `MandatoryThread`s either way. All fifteen verified
-// passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+// eight parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
+// cap boundaries, the two dedicated-helper boundaries, the idle-band boundary,
+// and the config gate) want a runtime only for the `.await` that loads their
+// records — the leader and its helpers are `MandatoryThread`s either way. All
+// sixteen verified passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -974,15 +974,17 @@ impl HelperPool {
 /// is that construction
 /// — announce, poll, park — so the second look here is the condition itself.
 ///
-/// `band` is what the thread was spawned at, not a constant: C seeds its
-/// `prio` from `epicsThreadGetPrioritySelf` (`dbScan.c:1303`), which for a
-/// dedicated helper is already its rate's band, so it never rebands at all.
+/// `sleep_band` is the band this helper waits at, which is also the band it
+/// was spawned at: C seeds its `sleepPrio` from `epicsThreadGetPrioritySelf`
+/// (`dbScan.c:1303`). For a dedicated helper that is already its rate's band,
+/// so it never rebands at all; a pool helper lowers itself to each rate it
+/// serves and comes back up here before it parks.
 fn helper_loop(
     db: Arc<PvDatabase>,
     pool: Arc<HelperPool>,
     me: usize,
     driver: TickDriver,
-    mut band: ThreadPriority,
+    sleep_band: ThreadPriority,
 ) {
     // C `taskwdInsert(0, NULL, NULL)` (`dbScan.c:1306`): a helper is monitored
     // but promises nothing, because an idle pool is the normal state and a
@@ -991,6 +993,9 @@ fn helper_loop(
     let helper = &pool.helpers[me];
     let serves = helper.serves;
     let waiter = helper.wake.waiter();
+    // The band it is in now, which starts as the band it was born at. C's
+    // `prio`, against its `sleepPrio` (`dbScan.c:1311-1316`).
+    let mut band = sleep_band;
     while !pool.shutdown.load(Ordering::Acquire) {
         watched.check_in();
         match pool.take_work(serves) {
@@ -1026,8 +1031,20 @@ fn helper_loop(
                 // counts against the cap for as long as it is inside the rate.
                 drop(slow);
             }
-            None => waiter
-                .wait_until(|| pool.shutdown.load(Ordering::Acquire) || pool.offers_work(serves)),
+            None => {
+                // C `dbScan.c:1358-1361`, immediately before the wait: a
+                // helper sleeps at the band its wake-up needs, which for a
+                // pool helper is above every leader it may have to preempt.
+                // Leaving it at the band of the rate it last served would
+                // make the next wake-up wait for whatever is running.
+                if band != sleep_band {
+                    band = sleep_band;
+                    crate::runtime::task::reband_current_thread(band);
+                }
+                waiter.wait_until(|| {
+                    pool.shutdown.load(Ordering::Acquire) || pool.offers_work(serves)
+                })
+            }
         }
     }
 }
@@ -1048,6 +1065,14 @@ fn spawn_helpers(
     configured_reserve: usize,
     rate_helpers: &[usize],
 ) -> Option<Arc<HelperPool>> {
+    if passes.is_empty() {
+        // A site `menuScan` may carry only the three fixed choices, and then
+        // there is no periodic pass for a helper to join. C does not test for
+        // it and indexes `papPeriodic[nPeriodic - 1]` regardless
+        // (`dbScan.c:1436`); the bound below is what makes that index sound
+        // here rather than a fallback at the use site.
+        return None;
+    }
     let dedicated: Vec<usize> = (0..passes.len())
         .map(|ind| rate_helpers.get(ind).copied().unwrap_or(0))
         .collect();
@@ -1106,9 +1131,13 @@ fn spawn_helpers(
             // (`dbScan.c:1419-1421`): a dedicated helper is born at its rate's
             // band and never leaves it.
             Serves::Rate(ind) => passes[*ind].prio,
-            // C `opts.priority = epicsThreadPriorityScanLow` (`:1420`); the
-            // band a pool helper ends up at is the rate it is serving.
-            Serves::Pool => ThreadPriority::ScanLow,
+            // C `opts.priority = papPeriodic[nPeriodic - 1]->prio`
+            // (`dbScan.c:1436`): a pool helper SLEEPS at the fastest rate's
+            // band, not at `ScanLow`, so a wake-up preempts a slower leader
+            // the moment it arrives instead of waiting for every one of them
+            // to finish. It lowers itself to the rate it actually serves in
+            // `helper_loop`, and comes back up here before it parks again.
+            Serves::Pool => passes[passes.len() - 1].prio,
         })
         .collect();
     let pool = Arc::new(HelperPool {
@@ -2214,6 +2243,118 @@ mod tests {
                 1,
                 "a pass with no pool ran on more than the leader: {threads:?}"
             );
+        }
+
+        /// Wait until every named helper is sitting at the band it should be
+        /// idle at, or fail naming the one that is not.
+        ///
+        /// Polled rather than read once: a band is only observable after the
+        /// thread has reached the registry, and after it has parked.
+        async fn wait_for_idle_bands(want: &[(String, ThreadPriority)]) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let report = crate::runtime::task::thread_report();
+                let wrong: Vec<String> = want
+                    .iter()
+                    .map(
+                        |(name, band)| match report.iter().find(|t| t.name() == name) {
+                            None => format!("{name}: not running"),
+                            Some(t) if t.epics_priority() != band.value() => format!(
+                                "{name}: band {}, expected {}",
+                                t.epics_priority(),
+                                band.value()
+                            ),
+                            Some(_) => String::new(),
+                        },
+                    )
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if wrong.is_empty() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "still wrong after 30 s: {}",
+                    wrong.join("; ")
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// A parked pool helper must sit at the FASTEST rate's band, not at
+        /// the band of whatever it last served and not at `ScanLow`: its
+        /// wake-up has to preempt the slower leaders, which on a loaded box
+        /// are holding every CPU. C's own regression check for this is
+        /// `helpersAtWrongPriority` (`dbScanParallelTest.c`).
+        ///
+        /// BOUNDARY: the two ways a helper can be idle — the band it was born
+        /// at, and the band it returns to after serving a slower rate. The
+        /// second needs the premise that a pool helper really did enter the
+        /// slow list, which `slow_helpers_max` carries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_idle_helper_sleeps_at_the_band_its_wake_up_needs() {
+            let fast = ScanType::SEC01;
+            let slow = ScanType::SEC1;
+            let observed = Arc::new(Observed::default());
+            let db = Arc::new(PvDatabase::new());
+            load_fast(&db, &observed, fast).await;
+            load_slow(&db, &observed, slow).await;
+
+            let rates = periodic_scans();
+            let passes = passes_for(&rates);
+            let driver = TickDriver::capture();
+            let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
+            let mut rate_helpers = vec![0; rates.len()];
+            rate_helpers[rate(slow)] = 1;
+            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &rate_helpers)
+                .expect("a pool");
+            let guard = HelperStopGuard(Arc::clone(&pool));
+
+            // Dedicated first, so helper 0 is the slow rate's own and 1 and 2
+            // are the pool's.
+            let fastest = passes[passes.len() - 1].prio;
+            let want = vec![
+                ("scanHelper0".to_string(), passes[rate(slow)].prio),
+                ("scanHelper1".to_string(), fastest),
+                ("scanHelper2".to_string(), fastest),
+            ];
+            assert_ne!(
+                want[0].1, fastest,
+                "the dedicated helper's band must differ from the pool's,                  or this test cannot tell them apart"
+            );
+            wait_for_idle_bands(&want).await;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let threads: Vec<_> = [fast, slow]
+                .into_iter()
+                .map(|scan| {
+                    let ind = rate(scan);
+                    leader(
+                        Arc::clone(&db),
+                        PeriodicDuty {
+                            scan_type: scan,
+                            period: scan.interval().expect("a rate"),
+                            ind,
+                            pass: Arc::clone(&passes[ind]),
+                            pool: Some(Arc::clone(&pool)),
+                        },
+                        driver.clone(),
+                        Arc::clone(&stop),
+                    )
+                })
+                .collect();
+            wait_for_passes(&observed, 3).await;
+            stop.store(true, Ordering::Release);
+            for thread in threads {
+                thread.join().expect("a leader");
+            }
+
+            assert!(
+                observed.slow_helpers_max.load(Ordering::Acquire) >= 1,
+                "no pool helper entered the slow list, so nothing had to come                  back up to its sleep band"
+            );
+            wait_for_idle_bands(&want).await;
+            drop(guard);
         }
 
         /// Drive the fast and the slow rate together over a pool of `count`

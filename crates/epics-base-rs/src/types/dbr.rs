@@ -440,7 +440,27 @@ pub fn is_link_dbf_type(dbf_type: u8) -> bool {
 /// `dbCommon` answers. That is the same condition under which the record could
 /// be instantiated at all.
 pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
-    let desc = crate::server::record::declared_field(record_type, field.trim())?;
+    link_class_of(crate::server::record::declared_field(
+        record_type,
+        field.trim(),
+    )?)
+}
+
+/// The same rule, asked of a declaration the caller already holds.
+///
+/// [`dbf_link_class`] is the by-name entry, and the name is the expensive
+/// half: resolving it is a case-insensitive linear scan of the record type's
+/// table and then `dbCommon`'s, ~170 declarations for a `calc`. A caller
+/// walking [`declared_fields`](crate::server::record::declared_fields) has the
+/// descriptor in hand, so asking by name made every field of every record
+/// re-scan the tables to find the entry it was already holding — measured as
+/// the largest single cost of `iocInit` on a 32k-record database.
+///
+/// The two agree on which declaration answers because no record type
+/// redeclares a `dbCommon` field name; `declared_fields_name_the_same_entry`
+/// pins that, since it is what makes the by-name resolution and a walk's own
+/// descriptor the same `FieldDesc`.
+pub fn link_class_of(desc: &crate::server::record::FieldDesc) -> Option<DbfLinkClass> {
     match desc.declared_dbf {
         DbfCode::Inlink => Some(DbfLinkClass::InLink),
         DbfCode::Outlink => Some(DbfLinkClass::OutLink),
@@ -671,6 +691,37 @@ mod buffer_size_tests {
 #[cfg(test)]
 mod dbf_link_class_tests {
     use super::*;
+
+    /// The invariant that makes [`link_class_of`] and [`dbf_link_class`] two
+    /// entries to one answer rather than two answers.
+    ///
+    /// `declared_fields` yields `dbCommon` first and the type's own table
+    /// second; `declared_field` resolves a name against the type's table first
+    /// and `dbCommon` second. The two orders disagree only for a name declared
+    /// in BOTH — then a walk holds `dbCommon`'s descriptor while the by-name
+    /// lookup answers from the type's. No record type redeclares a `dbCommon`
+    /// field, so the question never arises; a type that started to would make
+    /// the two entries disagree silently, which is what this fails on.
+    #[test]
+    fn declared_fields_name_the_same_entry() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        use crate::server::record::declared_fields;
+
+        let mut redeclared = Vec::new();
+        for record_type in RECORD_TYPES {
+            let mut seen = std::collections::HashSet::new();
+            for desc in declared_fields(record_type) {
+                if !seen.insert(desc.name) {
+                    redeclared.push(format!("{record_type}.{}", desc.name));
+                }
+            }
+        }
+        assert!(
+            redeclared.is_empty(),
+            "these types redeclare a dbCommon field, so a walk's descriptor and \
+             the by-name lookup's are no longer the same entry: {redeclared:?}"
+        );
+    }
 
     #[test]
     fn dbcommon_links_classified_uniformly() {

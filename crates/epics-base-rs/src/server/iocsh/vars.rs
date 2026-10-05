@@ -12,7 +12,8 @@
 //! # What a softIoc has here that this table does not
 //!
 //! Measured on `softIoc` R7.0.10: a bare `var` lists 24 names, and the
-//! same command here lists 12. The 24 arrive by two routes —
+//! same command here lists 13, twelve of which are C's. The 24 arrive by
+//! two routes —
 //! `registerAllRecordDeviceDrivers.cpp` copies the 22 `variable()` lines
 //! of `softIoc.dbd` into the iocsh table, and `libComRegister.c:518-520`
 //! adds `asCheckClientIP` and `freeListBypass` directly. The gap is not a
@@ -53,6 +54,13 @@
 //! it gates the `mlockall` at `iocInit.c:225`, and nothing in this
 //! workspace calls `mlockall`. `freeListBypass` — it turns off the
 //! recycling pool in `freeListLib.c:61`, which Rust allocation replaces.
+//!
+//! # The thirteenth, which C's 24 do not include
+//!
+//! `scanParallelThreadsDefault`. `dbCore.dbd:33` declares it on the
+//! parallel-scan branch this port tracks (epics-base #998) and R7.0.10
+//! does not have it at all, so it sits outside the census above;
+//! `seeded_knobs` seeds it alongside the nine.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
@@ -98,7 +106,8 @@ static VARIABLES: LazyLock<Mutex<BTreeMap<&'static str, VarDef>>> = LazyLock::ne
 /// The knobs C registers from a `.dbd` `variable()` line rather than from
 /// a C file — seven out of the record `.dbd`s via the generated
 /// `<app>_registerRecordDeviceDriver` (`registerRecordDeviceDriver.pl:270`)
-/// and `callbackParallelThreadsDefault` out of `dbCore.dbd:32`.
+/// and `callbackParallelThreadsDefault` and `scanParallelThreadsDefault`
+/// out of `dbCore.dbd:32-33`.
 /// This port resolves its vendored `.dbd`s at build time and has no such
 /// runtime registrar to hang them off, so the table is born holding them;
 /// that is what keeps it and
@@ -130,6 +139,18 @@ fn seeded_knobs() -> Vec<VarDef> {
                         value as i32,
                     )
                 },
+            },
+        },
+        // C `scanParallelThreadsDefault` — `dbCore.dbd:33`, the same
+        // shape: an `int` global (`dbScan.c:158`) that
+        // `scanParallelThreads(0, ...)` reads at the point of use
+        // (`dbScan.c:296`), so `var scanParallelThreadsDefault 4` changes
+        // what the next `scanParallelThreads 0` resolves to.
+        VarDef {
+            name: "scanParallelThreadsDefault",
+            access: VarAccess::Int {
+                get: || crate::server::scan::parallel_threads_default() as i64,
+                set: |value| crate::server::scan::set_parallel_threads_default(value as i32),
             },
         },
         // C `dbTemplateMaxVars` — `dbCore.dbd:29`, like
@@ -528,6 +549,10 @@ mod tests {
     /// than a fixed list, so a knob added later is covered without
     /// touching the test.
     #[test]
+    // The walk writes every knob, `scanParallelThreadsDefault` included,
+    // and the `scanParallelThreads` tests read that one's declared
+    // default — so they take turns.
+    #[serial_test::serial(scan_parallel)]
     fn every_registered_variable_round_trips_a_write() {
         let ctx = make_ctx();
         let mut reg = CommandRegistry::new();
@@ -592,8 +617,9 @@ mod tests {
         }
     }
 
-    /// `callbackParallelThreadsDefault` is the one seeded knob that is not
-    /// a record `.dbd` variable, so the join above cannot cover it. Its
+    /// `callbackParallelThreadsDefault` is one of the two seeded knobs
+    /// that are not record `.dbd` variables, so the join above cannot
+    /// cover it. Its
     /// default is C's post-registration value — `epicsThreadGetCPUs()`
     /// (`dbIocRegister.c:639`), not the `2` `callback.c:69` declares — and
     /// a write must move it without moving the processor count the
@@ -628,6 +654,47 @@ mod tests {
         );
         assert_eq!(cb::parallel_threads_default(), -2);
         cb::set_parallel_threads_default(cpus);
+    }
+
+    /// The other seeded knob with no record `.dbd` behind it. Registering
+    /// it is worth something only if the command reads the same global —
+    /// C's header makes that one claim, not two: "Helper count used by
+    /// `scanParallelThreads(0)`; also an iocsh variable"
+    /// (`dbScan.h:149-150`).
+    #[test]
+    #[serial_test::serial(scan_parallel)]
+    fn var_scan_parallel_threads_default_is_what_the_command_resolves_zero_to() {
+        use crate::server::scan;
+        let ctx = make_ctx();
+        let restore = scan::parallel_threads_default();
+        assert_eq!(restore, 8, "C `int scanParallelThreadsDefault = 8`");
+        assert_eq!(
+            run_var(&ctx, &["scanParallelThreadsDefault"]).unwrap(),
+            "int scanParallelThreadsDefault = 8\n"
+        );
+
+        assert_eq!(
+            run_var(&ctx, &["scanParallelThreadsDefault", "5"]).unwrap(),
+            ""
+        );
+        // `0 -1`: the count comes from the knob, the reserve from the
+        // argument, so nothing else can be what moved the count.
+        let mut reg = CommandRegistry::new();
+        super::super::commands::register_builtins(&mut reg);
+        let cmd = reg
+            .get("scanParallelThreads")
+            .expect("`scanParallelThreads` must be registered")
+            .clone();
+        let tokens: Vec<String> = ["0", "-1"].iter().map(|t| (*t).to_string()).collect();
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+        assert_eq!(scan::parallel_threads(), (5, 0));
+
+        scan::set_parallel_threads_default(restore);
+        scan::set_parallel_threads(0, 0);
     }
 
     /// What registering them is for: `var` must move the value the

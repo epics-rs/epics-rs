@@ -83,15 +83,18 @@ iocInit()
 
 ### IOC Binary
 
+The iocsh commands and the device-support binding are behind the `ioc`
+feature, which is **not** on by default: `mqtt-rs = { version = "0.30",
+features = ["ioc"] }`.
+
 ```rust
 use mqtt_rs::ioc::register_mqtt_commands;
 
-let trace = Arc::new(TraceManager::new());
 let handle = epics_base_rs::runtime::task::runtime_handle();
 
 let mut app = IocApplication::new();
 app = asyn_rs::adapter::register_asyn_device_support(app);
-app = register_mqtt_commands(app, handle, trace);
+app = register_mqtt_commands(app, handle);
 
 // The `_app` entry point runs C's `rsrvRegistrar` before the script.
 epics_ca_rs::server::run_ca_ioc_app(app.startup_script("st.cmd")).await
@@ -139,7 +142,7 @@ use mqtt_rs::z2m::register_z2m_commands;
 
 let mut app = IocApplication::new();
 app = asyn_rs::adapter::register_asyn_device_support(app);
-app = register_mqtt_commands(app, handle, trace);
+app = register_mqtt_commands(app, handle);
 app = register_z2m_commands(app);  // adds mqttZ2m* commands
 ```
 
@@ -223,6 +226,7 @@ when diagnosing why the Connected PV moved).
 - [rumqttc](https://crates.io/crates/rumqttc) — async MQTT client
 - [serde_json](https://crates.io/crates/serde_json) — JSON parsing
 - [asyn-rs](../asyn-rs/) — PortDriver framework
+- epics-base-rs, epics-ca-rs — the record and iocsh side, `ioc` feature only
 
 ## Examples
 

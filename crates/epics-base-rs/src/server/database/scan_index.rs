@@ -422,7 +422,7 @@ impl PvDatabase {
     /// Snapshots the map under the records read lock and releases it before the
     /// caller takes any per-record lock. The sort key travels with the record,
     /// so the snapshot and the key come from that one read.
-    fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
+    pub(super) fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
         let mut keyed: Vec<_> = {
             let records = self.inner.records.read();
             records

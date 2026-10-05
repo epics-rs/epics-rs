@@ -613,12 +613,6 @@ struct PvDatabaseInner {
     /// phase — C's `dbLoadRecords` links a record into `pdbbase` at once but
     /// runs `init_record` only at `iocInit`. [`PvDatabase::add_loaded_record`]
     /// used to bind the dset and run the passes eagerly at load time, so a
-    /// record whose device-support PORT is configured by a later `st.cmd`
-    /// command (ADCore's `NDTimeSeriesConfigure` builds the `*_TS` port AFTER
-    /// `dbLoadRecords(NDStats.template)`) bound to a missing port and lost its
-    /// device support. Names are pushed in load order and drained once, in that
-    /// order, by `ioc_init`. Empty on every path but a LOAD.
-    deferred_record_inits: std::sync::Mutex<Vec<String>>,
     /// C `plink->text != NULL` for the one case the port's link storage cannot
     /// tell apart on its own: a link field the `.db` assigned the EMPTY string.
     ///
@@ -1282,7 +1276,6 @@ impl PvDatabase {
                 registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
-                deferred_record_inits: std::sync::Mutex::new(Vec::new()),
                 empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
@@ -2462,7 +2455,7 @@ impl PvDatabase {
         // this explicitly BEFORE `setup_io_intr` (C's `scanInit`), so a record's
         // dset is bound before I/O Intr wiring reads it; this call is the
         // catch-all for a path that reaches the barrier directly (a unit test, a
-        // bare shell). Idempotent — the list is empty once drained. Before
+        // bare shell). Idempotent — each record's debt is claimed once. Before
         // `ca_link_init` to keep the order the eager path had, where the init
         // passes ran at load, ahead of the link worker.
         self.drain_deferred_record_inits();
@@ -2532,7 +2525,8 @@ impl PvDatabase {
     /// C runs this pass BEFORE `init_record`; this port runs the init passes
     /// first — at load for a programmatic / `dbCreateRecord` record, and at the
     /// barrier just above (`init_deferred_record` draining
-    /// `deferred_record_inits`) for a record loaded during the LOAD phase — so
+    /// `drain_deferred_record_inits`, which runs `init_deferred_record` for
+    /// every record that owes one) for a record loaded during the LOAD phase — so
     /// the port's order is still init-then-link, and that ordering IS
     /// observable. Measured against softIoc R7.0.10 on
     /// `record(calcout,"X"){field(INPA,"@instio p") field(OUT,"@instio q")}`:
@@ -3087,7 +3081,7 @@ impl PvDatabase {
         // AFTER `dbLoadRecords(NDStats.template)`). The record is still
         // published below so a name check, an alias and `dbInitRecordLinks` all
         // see it; only its device-support binding and passes wait for the
-        // barrier's drain of `deferred_record_inits`. Outside the LOAD phase —
+        // barrier's drain of the records that owe an init. Outside the LOAD phase —
         // programmatic creation, `dbCreateRecord` after `iocInit` — there is no
         // barrier to defer to, so the record is initialised in place, as before.
         let defer = self.is_load_deferring();
@@ -3129,7 +3123,7 @@ impl PvDatabase {
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rec_arc = Arc::new(RecordCell::new(instance, seq));
+        let rec_arc = Arc::new(RecordCell::new(instance, seq, defer));
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
         // adopted before the record is reachable by anyone.
@@ -3145,13 +3139,10 @@ impl PvDatabase {
 
         if defer {
             // The dset binding, init passes, scan-index insert and the
-            // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`; the
-            // record is published (above) so the barrier finds it by name.
-            self.inner
-                .deferred_record_inits
-                .lock()
-                .unwrap()
-                .push(name.to_string());
+            // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`. The
+            // record carries that debt itself (`RecordCell::init_owed`, set
+            // from `defer` above), so the barrier finds it by walking the
+            // database it is already going to walk.
             return Ok(());
         }
 
@@ -3196,14 +3187,18 @@ impl PvDatabase {
     }
 
     /// Run every record's OWED init — C's `initDatabase` per-record pass — for
-    /// the records the LOAD phase deferred. The list is drained (`mem::take`),
-    /// so a second call is a no-op: the build lifecycle calls this BEFORE
-    /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
-    /// Load order is preserved because the list was pushed in load order.
+    /// the records the LOAD phase deferred, in database load order.
+    ///
+    /// The walk is C's `initDatabase` walk: every record, in load order, each
+    /// asked whether its init is still owed. [`RecordCell::claim_owed_init`]
+    /// hands that debt to exactly one caller, so a second call is a no-op —
+    /// the build lifecycle calls this BEFORE `setup_io_intr`, and
+    /// [`Self::ioc_init`] calls it again as a catch-all.
     pub(crate) fn drain_deferred_record_inits(&self) {
-        let owed = std::mem::take(&mut *self.inner.deferred_record_inits.lock().unwrap());
-        for name in owed {
-            self.init_deferred_record(&name);
+        for (name, rec_arc) in self.records_in_load_order() {
+            if rec_arc.claim_owed_init() {
+                self.init_deferred_record(&name, &rec_arc);
+            }
         }
     }
 
@@ -3213,12 +3208,7 @@ impl PvDatabase {
     /// place (created before the load, already live) from one the barrier will
     /// init against the final merged fields.
     pub(crate) fn record_init_deferred(&self, name: &str) -> bool {
-        self.inner
-            .deferred_record_inits
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|n| n == name)
+        self.get_record(name).is_some_and(|rec| rec.init_owed())
     }
 
     /// Run the OWED init half of [`Self::add_loaded_record`] for a record whose
@@ -3240,10 +3230,7 @@ impl PvDatabase {
     /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
-    fn init_deferred_record(&self, name: &str) {
-        let Some(rec_arc) = self.get_record(name) else {
-            return;
-        };
+    fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>) {
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
@@ -3262,7 +3249,7 @@ impl PvDatabase {
             )
         };
         self.add_to_scan_list(scan, phas, record_type, rec_arc.load_order(), name);
-        self.rec_gbl_init_simm(&rec_arc);
+        self.rec_gbl_init_simm(rec_arc);
         self.arm_watchdog(name);
         // The tail both loaders ran right after `add_loaded_record`: C's
         // `init_record` checkLinks (`init_links`), then the constant-INP seed /
@@ -3274,7 +3261,7 @@ impl PvDatabase {
             let inst = &mut *guard;
             inst.record.init_links(&inst.common);
         }
-        self.rec_gbl_init_constant_links(&rec_arc);
+        self.rec_gbl_init_constant_links(rec_arc);
     }
 
     /// Verify that `name` is not currently registered in any of the
@@ -4923,6 +4910,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["STAYS", "GONE", "GONE:ALT"]
         );
+    }
+
+    /// An owed `init_record` is the record's OWN debt, and it is claimed
+    /// exactly once.
+    ///
+    /// Boundaries: a record created outside the LOAD phase owes nothing (it
+    /// inited in place), one created inside it owes its init until the
+    /// barrier, and a second crossing of the barrier finds nothing left to
+    /// claim — the build lifecycle crosses it twice, before `setup_io_intr`
+    /// and again from `ioc_init`, and C's `initDatabase` pass runs once.
+    #[epics_macros_rs::epics_test]
+    async fn a_load_phase_record_owes_its_init_until_the_barrier_claims_it() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("EAGER", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        assert!(!db.record_init_deferred("EAGER"));
+
+        db.begin_load().unwrap();
+        db.add_record("OWED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        assert!(db.record_init_deferred("OWED"));
+        assert!(!db.record_init_deferred("EAGER"));
+
+        let owed = db.get_record("OWED").expect("the record is published");
+        db.drain_deferred_record_inits();
+        assert!(!db.record_init_deferred("OWED"));
+        assert!(
+            !owed.claim_owed_init(),
+            "the barrier's claim was not the only one"
+        );
+
+        db.drain_deferred_record_inits();
+        assert!(!db.record_init_deferred("OWED"));
     }
 
     /// `add_alias` must reject collisions with

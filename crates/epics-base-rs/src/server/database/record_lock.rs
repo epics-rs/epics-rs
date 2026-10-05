@@ -2095,6 +2095,7 @@ mod tests {
             let cell = Arc::new(RecordCell::new(
                 RecordInstance::new(name.into(), CalcRecord::default()),
                 0,
+                false,
             ));
             db.inner.record_locks.adopt(name, cell.lock_record());
             db.ensure_set_for(name, cell.lock_record());
@@ -2138,6 +2139,7 @@ mod tests {
         let cell = Arc::new(RecordCell::new(
             RecordInstance::new(name.into(), CalcRecord::default()),
             0,
+            false,
         ));
         db.inner.record_locks.adopt(name, cell.lock_record());
         cell

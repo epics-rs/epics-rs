@@ -387,6 +387,76 @@ impl PvDatabase {
         }
     }
 
+    /// How many records are on `scan`'s list — C `ellCount(&psl->list)`,
+    /// which `spawnHelpers` reads to pick the rate its reserve serves
+    /// (`dbScan.c:1304`).
+    pub(crate) fn scan_list_len(&self, scan: ScanType) -> usize {
+        scan.scan_list().map_or(0, |list| {
+            self.inner.scan_index.bucket(list).snapshot().1.len()
+        })
+    }
+
+    /// The snapshot one parallel periodic pass claims its slots out of — C
+    /// `snapshotList` (`dbScan.c:1158-1181`).
+    ///
+    /// A pass that may be worked by more than one thread cannot walk the live
+    /// list the way [`Self::scan_list_once`] does: a claim has to name a
+    /// *position*, and the bucket is an ordered set with no stable index. So
+    /// the pass takes the list once, as C's does, and pays for that where C
+    /// pays — at each record, by asking whether it is still on this list
+    /// before processing it ([`Self::process_scan_slot`]).
+    ///
+    /// Costs no copy: the bucket already materialises its order as a shared
+    /// `Arc<[ScanKey]>` for [`ScanCursor`], and this is that same value. C
+    /// `dbCalloc`s a `scan_slot` array per rate and refills it every pass.
+    pub(crate) fn scan_pass_snapshot(&self, list: ScanList) -> ScanPassSnapshot {
+        ScanPassSnapshot(self.inner.scan_index.bucket(list).snapshot().1)
+    }
+
+    /// Process one claimed slot of a pass — C `runSlots`' body
+    /// (`dbScan.c:1122-1132`).
+    ///
+    /// The SCAN re-check is C's, and it is what makes a snapshot sound: the
+    /// record may have left this list since the snapshot was taken — its own
+    /// processing can do that — and a pass must not process a record the list
+    /// no longer holds, which is the one thing a live walk gives for free.
+    ///
+    /// One divergence, stated rather than folded in: C holds `dbScanLock`
+    /// across the check and the `dbProcess`, so no SCAN write can land between
+    /// them. Here the check reads the record under its own read lock and the
+    /// process takes the record's gate for itself, because
+    /// [`Self::process_record_with_links_resolved`] is the single owner of that
+    /// gate and the gate is not reentrant. The window that leaves is the one
+    /// [`Self::scan_list_once`] already has — its cursor hands out a record
+    /// that is in the list as of that step and processes it without the gate —
+    /// so a parallel pass is no weaker here than the sequential one it
+    /// replaces.
+    pub(crate) fn process_scan_slot(
+        &self,
+        snapshot: &ScanPassSnapshot,
+        slot: usize,
+        scan: ScanType,
+        visited: &mut crate::server::database::ProcStack,
+    ) {
+        let Some(key) = snapshot.0.get(slot) else {
+            return;
+        };
+        // The key carries the instance the list was built with; a key whose
+        // record has since been replaced falls back to the name, which is what
+        // the sequential sweep's `process_record_with_links_sync` arm is for.
+        let Some(rec) = key
+            .handle
+            .upgrade()
+            .or_else(|| self.get_record_no_resolve(&key.name))
+        else {
+            return;
+        };
+        if rec.read().common.scan != scan {
+            return;
+        }
+        let _ = self.process_record_with_links_resolved(&key.name, rec, visited);
+    }
+
     /// Get all record names whose `PINI` is **exactly** `mode`.
     ///
     /// C matches the menu index with `!=` (`iocInit.c:598`
@@ -580,6 +650,41 @@ impl PvDatabase {
                 "a returned process frame left its cycle marker behind"
             );
         }
+    }
+}
+
+/// One periodic pass's view of its scan list — C `ppsl->snap`, the `scan_slot`
+/// array (`dbScan.c:103-106`, `:124`).
+///
+/// Opaque on purpose: a slot index means nothing except against the snapshot
+/// it was claimed from, so the only things a holder can do with one are ask
+/// its PHAS and hand it back to [`PvDatabase::process_scan_slot`].
+pub(crate) struct ScanPassSnapshot(Arc<[super::ScanKey]>);
+
+impl ScanPassSnapshot {
+    /// How many slots the pass has to hand out.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// A list with no records at all — C's `if (ppsl->snapLen == 0) return`
+    /// (`dbScan.c:1196-1197`).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The PHAS a pass groups slot `slot` by.
+    ///
+    /// The key's PHAS, not the record's live one. C copies `prec->phas` into
+    /// the slot at snapshot time (`dbScan.c:1177`) and groups by that, which
+    /// can disagree with the order the list is in: the list is ordered by the
+    /// PHAS each record was inserted under, so a PHAS written since then makes
+    /// C's groups non-contiguous and splits one PHAS across two groups — each
+    /// of which then gets its own barrier, which is a slower pass rather than
+    /// a wrong one. The key's PHAS is the value the order is built from, so a
+    /// group is contiguous by construction.
+    pub(crate) fn phas(&self, slot: usize) -> i16 {
+        self.0[slot].phas
     }
 }
 

@@ -839,15 +839,6 @@ struct Errlog {
     work: Event,
     listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
     next_id: std::sync::atomic::AtomicU64,
-    /// Set once, after the worker thread is known to exist.
-    ///
-    /// C has no equivalent because C has no such state: `errlogInit2` calls
-    /// `cantProceed` when the thread will not start (`errlog.c:604-606`), so
-    /// every later line runs in a process that has a drainer. This port keeps
-    /// the IOC alive instead, which makes "no drainer" reachable — and a
-    /// producer that waits for a drain that can never happen would hang the
-    /// IOC on its first log line, turning a degraded log sink into a dead IOC.
-    worker_running: std::sync::atomic::AtomicBool,
 }
 
 static ERRLOG: std::sync::OnceLock<&'static Errlog> = std::sync::OnceLock::new();
@@ -892,27 +883,27 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             work: Event::new(),
             listeners: std::sync::Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
-            worker_running: std::sync::atomic::AtomicBool::new(false),
         }));
         // C `epicsThreadCreateOpt("errlog", …)` at `epicsThreadPriorityLow`
         // with `epicsThreadStackSmall` (`errlog.c:568-574`).
-        let spawned = crate::runtime::task::spawn_dedicated_thread(
-            "errlog".to_string(),
+        //
+        // Mandatory, as C makes it: `errlogInitPvt` leaves
+        // `pvt.errlogInitFailed` set unless the thread started, and every
+        // `errlogInit`/`errlogInit2` entry then prints `ERROR: errlogInit
+        // failed` and `exit(1)`s (`errlog.c:667-670`) — not `cantProceed`,
+        // which would recurse through this very function. Carrying on instead
+        // is what needed a "no drainer" state for the flush at the end of
+        // [`errlog_emit`] to consult; `MandatoryThread` leaves no failure for
+        // a caller to resolve, so that state is gone with it. This is also the
+        // call site [`crate::runtime::task::MandatoryThread`]'s own docs name:
+        // the message reporting a failed thread creation cannot be routed
+        // through the worker whose creation just failed.
+        crate::runtime::task::MandatoryThread::new(
+            "errlog",
             crate::runtime::task::ThreadPriority::Low,
             crate::runtime::task::StackSizeClass::Small,
-            move || errlog_worker(errlog),
-        );
-        if spawned.is_ok() {
-            errlog
-                .worker_running
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            // C exits the process when the thread cannot be created
-            // (`errlog.c:604-606`). Here the queue still accepts and still
-            // accounts; only delivery stops, so say so rather than kill an
-            // IOC over a log sink.
-            eprintln!("errlogInit failed: no errlog thread, listeners will not be called");
-        }
+        )
+        .spawn(move || errlog_worker(errlog));
         errlog
     })
 }
@@ -1059,14 +1050,7 @@ fn errlog_post(message: &str, echo: ConsoleEcho) {
     // C `msgbufCommit`'s tail (`errlog.c:186-187`). `accepted` stands for C's
     // `msgbufAlloc` having returned a buffer at all: a refused message never
     // reaches `msgbufCommit` and so never flushes there either.
-    if accepted
-        && local_echo
-        && ok_to_block
-        && !at_exit
-        && errlog
-            .worker_running
-            .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if accepted && local_echo && ok_to_block && !at_exit {
         errlog_flush();
     }
 }

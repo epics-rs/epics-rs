@@ -1,4 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the exec-backend suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): a sync test that hand-builds its own tokio
+// runtime, and `scanParallelThreads`'s refusal test, which wants a runtime
+// only as the start-context `ScanOwner::start` requires; both run and pass in
+// the exec-backend suite.
 //! The callback- and scanOnce-queue iocsh commands from
 //! `dbIocRegister.c` (@R7.0.10): `scanOnceSetQueueSize`,
 //! `scanOnceQueueShow`, `callbackSetQueueSize`, `callbackQueueShow`

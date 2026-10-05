@@ -27,12 +27,45 @@ compiled" from a second copy of the BSP-prefix resolution, which is how the
 link contract stops having one source of truth. The boot glue itself stays
 RTEMS-only; nothing in `csrc/` is compiled for any other target.
 
+## The RTEMS operator commands
+
+`src/shell/` is the behaviour behind the iocsh commands base registers from its
+RTEMS boot path and from nowhere else — `netstat`, `heapSpace`, `nfsMount`,
+`zoneset`, `rt` and `setlogmask` (`libcom/RTEMS/posix/rtems_init.c:692-705`
+@R7.0.10). They are here for the reason the stats funnel is: an IOC has them
+because it booted on RTEMS, not because it loaded a database. The iocsh surface
+— argument descriptors, usage text, registry entries — is
+`epics_base_rs::server::iocsh::register_rtems_commands`, since `CommandDef` is
+that crate's type and this crate is one of its dependencies. It registers five
+of the six; `nfsMount` names an API this port's network stack does not have, and
+a name in `help` whose implementation cannot exist is worse than its absence.
+There is an `unsupported` backend so a host build still compiles, and nothing
+here is reachable from `softioc-rs`.
+
+## What `csrc/` holds
+
+| file | what it is |
+|---|---|
+| `rtems_init.c` | `POSIX_Init` — kernel bring-up, libbsd, the compiled-in command-line buffer, then `main` |
+| `rtems_config.c` | the `<rtems/confdefs.h>` configuration translation unit; base's minus NFS, TFTP, telnetd, ftpd, libblock, the RTC driver and the ~25-command shell |
+| `boot_args.c` | the boot line's tokeniser, its own TU rather than a static in `rtems_init.c`; `src/boot_args.rs` owns what the tokens mean |
+| `rtems_shell_cmds.c` | the half of the operator commands above that has to call an RTEMS or libbsd API; everything expressible in Rust stays in Rust, where it is host-testable |
+| `rtems_stats.c` | the C side of the stats funnel. Compiling it is what emits `rtems_boot_linked` |
+
+`csrc/tests/rtems-api/` records the RTEMS and libbsd declarations
+`rtems_init.c` names, so a runner with no cross toolchain can still compile
+that file with `-Werror`. `scripts/rtems-api-check.sh` is its integrity gate:
+pass 1 refuses an unmarked declaration anywhere in the record and needs no
+toolchain; pass 2 requires each `@rtems-api <header>` block to appear in that
+header as a contiguous run of byte-identical lines, so it runs wherever
+`RTEMS_BSP_PREFIX` is set and is skipped loudly where it is not.
+
 ## Prerequisites
 
 | what | needed for | notes |
 |---|---|---|
 | nightly toolchain + `rust-src` | everything below | `armv7-rtems-eabihf` is tier 3: no prebuilt `std`, so `-Zbuild-std` |
-| `jq` | the target-spec generation | see "The target spec" below |
+| `jq` | the target-spec generation, and `rtems-check.sh`'s binary census | see "The target spec" below |
 | BSP prefix from `scripts/rtems-bsp.sh` (tools + kernel + libbsd) | linking a bootable image | source its `epics-rs-env.sh`; this crate's `build.rs` derives the compiler and every link flag from `RTEMS_BSP_PREFIX` |
 
 Type-checking needs only the first two rows — no cross-toolchain, no BSP.
@@ -124,6 +157,14 @@ per-thread TLS leak on RTEMS from 136 B to 0. You do not pass anything: `.cargo/
 `build.rustc-wrapper = scripts/rtems-rustc-wrapper.sh`, which rewrites the
 triple to a spec generated from the exact rustc in use and leaves every other
 invocation (host builds included) untouched.
+
+`scripts/rtems-tls-spec.sh` generates it, and generates rather than commits it
+because the builtin spec is whatever the active nightly emits: a frozen JSON in
+the tree would drift from the toolchain in use and first show up as a
+mismatched data-layout at codegen, the very failure class the deviation exists
+to avoid. The script diffs the stock print against its own output and refuses
+to emit if more than that one key changed, so the deviation cannot silently
+widen.
 
 Two operational notes:
 

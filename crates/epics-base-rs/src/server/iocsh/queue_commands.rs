@@ -144,13 +144,17 @@ fn cmd_scan_once_set_queue_size() -> CommandDef {
 }
 
 /// `scanParallelThreads <count> <reserve>` — C `scanParallelThreads`
-/// (`dbScan.c:286-321`), registered with `iocshSetError`
-/// (`dbIocRegister.c:666`), so its refusal fails the line.
+/// (`dbScan.c:289-315`), registered with `iocshSetError`
+/// (`dbIocRegister.c:667`), so its refusal fails the line.
 ///
 /// The count arithmetic is C's, and it differs from
 /// `callbackParallelThreads`' in its floor: a resolved count of zero is a
 /// valid answer there — no helpers, which is what every IOC that never calls
 /// this runs — where a callback band floors at one worker.
+///
+/// The reserve is how many helpers the pool keeps off the slower rates, and
+/// its zero is not "none": zero selects the default of one, and only a
+/// negative argument asks for none.
 fn cmd_scan_parallel_threads() -> CommandDef {
     CommandDef::new(
         "scanParallelThreads",
@@ -160,14 +164,14 @@ fn cmd_scan_parallel_threads() -> CommandDef {
                 arg_type: ArgType::Int,
             },
             ArgDesc {
-                name: "reserved for fastest rate",
+                name: "kept off slower rates",
                 arg_type: ArgType::Int,
             },
         ],
-        "scanParallelThreads <no of threads> <reserved for fastest rate> — Configure helper \
+        "scanParallelThreads <no of threads> <kept off slower rates> — Configure helper \
          threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault, a \
-         negative count leaves that many CPUs without a helper. The second argument reserves \
-         that many helpers for the fastest rate.",
+         negative count leaves that many CPUs without a helper. The second argument keeps \
+         that many helpers off the slower rates (0: one, negative: none).",
         |args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::scan;
             if scan::periodic_lists_built() {
@@ -193,7 +197,14 @@ fn cmd_scan_parallel_threads() -> CommandDef {
                 ));
                 count = scan::MAX_PARALLEL_THREADS as i64;
             }
-            let mut reserve = ival(args, 1).max(0);
+            // C `dbScan.c:303-306`: zero is the default of one helper kept
+            // off the slower rates, negative is none.
+            let asked_reserve = ival(args, 1);
+            let mut reserve = match asked_reserve {
+                0 => 1,
+                r if r < 0 => 0,
+                r => r,
+            };
             if reserve > count {
                 ctx.eprintln(&format!(
                     "scanParallelThreads: clamping reserve {reserve} to {count}"
@@ -427,10 +438,12 @@ mod tests {
         );
     }
 
-    /// C `scanParallelThreads`' count arithmetic (`dbScan.c:293-310`), which
+    /// C `scanParallelThreads`' count arithmetic (`dbScan.c:293-311`), which
     /// differs from `callbackParallelThreads`' in both ends: it floors at 0
     /// rather than 1 — no helpers is the state every IOC that never calls it
-    /// runs in — and it has a ceiling, the width of the pool's masks.
+    /// runs in — and it has a ceiling, the width of the pool's masks. The
+    /// reserve's own arithmetic has the opposite shape: its zero is the
+    /// default of one, and only a negative argument means none.
     #[test]
     #[serial_test::serial(scan_parallel)]
     fn scan_parallel_threads_resolves_its_count_the_way_c_does() {
@@ -492,6 +505,29 @@ mod tests {
         assert_eq!(scan::parallel_threads(), (2, 2));
         assert!(
             err.contains("scanParallelThreads: clamping reserve 5 to 2"),
+            "{err:?}"
+        );
+
+        // BOUNDARY: the reserve's zero and its negative arm
+        // (`dbScan.c:303-306`). Zero is one helper kept off the slower rates,
+        // not none; none takes a negative argument.
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["4", "0"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::parallel_threads(), (4, 1));
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["4", "-1"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::parallel_threads(), (4, 0));
+        // BOUNDARY: and that default is clamped like any other reserve, so a
+        // resolved count of none reports the one helper it cannot keep.
+        let (_, err, failed) = run(
+            &ctx,
+            "scanParallelThreads",
+            &[&format!("-{}", cpus + 7), "0"],
+        );
+        assert!(!failed);
+        assert_eq!(scan::parallel_threads(), (0, 0));
+        assert!(
+            err.contains("scanParallelThreads: clamping reserve 1 to 0"),
             "{err:?}"
         );
 

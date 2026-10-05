@@ -1117,6 +1117,30 @@ pub struct RecordCell {
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
     /// of the record.
     plan: ProcessPlan,
+    /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
+    /// the database load sequence: the scan index's secondary sort key, and
+    /// the order every whole-database walk visits.
+    ///
+    /// Here by the rule above: every reader of it — the scan-index insert,
+    /// `all_record_names`, the PINI sweep — needs it *before* it takes the
+    /// record's lock set, and what it used to reach for instead was a
+    /// name-keyed copy-on-write map beside the records. That map was cloned
+    /// once per record added, which made `dbLoadRecords` quadratic. On the
+    /// cell the sequence is born with the node, cannot go missing from it, and
+    /// dies with it.
+    load_order: u64,
+    /// This record's `init_record` is still OWED to `iocInit` — it was created
+    /// during the LOAD phase, which defers the whole init half (C runs
+    /// `dbLoadRecords` and `initDatabase` as two passes).
+    ///
+    /// Here for the same reason [`Self::load_order`] is: the db loader asks it
+    /// per record, before it takes the record's lock, and what it used to ask
+    /// instead was a `Vec<String>` of owed names beside the records —
+    /// scanned linearly, so one `.db` cost a scan per record and
+    /// `dbLoadRecords` was quadratic a second time over. On the node the
+    /// answer is the record's own, and the owed-ness cannot name a record
+    /// that does not exist.
+    init_owed: std::sync::atomic::AtomicBool,
     data: LockSetGuarded<RecordInstance>,
 }
 
@@ -1201,7 +1225,7 @@ struct LockSetGuarded<T: Send + Sync>(std::cell::UnsafeCell<T>);
 unsafe impl<T: Send + Sync> Sync for LockSetGuarded<T> {}
 
 impl RecordCell {
-    pub(crate) fn new(instance: RecordInstance) -> Self {
+    pub(crate) fn new(instance: RecordInstance, load_order: u64, init_owed: bool) -> Self {
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -1222,8 +1246,29 @@ impl RecordCell {
                 .map(|(_, vf)| instance.record.field_slot(vf))
                 .collect(),
             plan: ProcessPlan::of(&*instance.record),
+            load_order,
+            init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
+    }
+
+    /// This record's database load sequence, without taking its lock set.
+    pub(crate) fn load_order(&self) -> u64 {
+        self.load_order
+    }
+
+    /// Is this record's `init_record` still owed to `iocInit`?
+    pub(crate) fn init_owed(&self) -> bool {
+        self.init_owed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Claim the owed init: `true` to exactly one caller, which then owns
+    /// running it. The single transition out of [`Self::init_owed`], so the
+    /// init pass cannot run twice for one record however many times the
+    /// barrier is crossed.
+    pub(crate) fn claim_owed_init(&self) -> bool {
+        self.init_owed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// The type-static answers this cycle may test instead of re-asking the

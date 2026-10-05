@@ -272,12 +272,11 @@ impl PvDatabase {
                 inst.record.record_type(),
             )
         };
-        // Re-use the record's existing load-order sequence so the scan-index
+        // Re-use the record's own load-order sequence so the scan-index
         // secondary key stays stable across SCAN/PHAS edits. A record loaded
         // before should always scan before a later-loaded record at the same
         // PHAS.
-        let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
-        self.add_to_scan_list(cur_scan, cur_phas, cur_type, seq, name);
+        self.add_to_scan_list(cur_scan, cur_phas, cur_type, rec_arc.load_order(), name);
     }
 
     /// Count one over-run for `scan`'s list — C `ppsl->overruns++`
@@ -342,11 +341,10 @@ impl PvDatabase {
             let inst = rec.read();
             (inst.common.phas, inst.record.record_type())
         };
-        let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
         Some(super::ScanKey::new(
             phas,
             record_type,
-            seq,
+            rec.load_order(),
             name,
             std::sync::Arc::downgrade(&rec),
         ))
@@ -405,7 +403,7 @@ impl PvDatabase {
     /// record was inspected serially.
     pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
         let mut result = Vec::new();
-        for (name, rec) in self.records_in_load_order().await {
+        for (name, rec) in self.records_in_load_order() {
             if rec.read().common.pini == mode.to_u16() as i16 {
                 result.push(name);
             }
@@ -422,26 +420,14 @@ impl PvDatabase {
     /// this PINI sweep does not, and that is a separate gap).
     ///
     /// Snapshots the map under the records read lock and releases it before the
-    /// caller takes any per-record lock.
-    async fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
-        let snapshot: Vec<_> = {
+    /// caller takes any per-record lock. The sort key travels with the record,
+    /// so the snapshot and the key come from that one read.
+    pub(super) fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
+        let mut keyed: Vec<_> = {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(n, r)| (n.to_string(), r.clone()))
-                .collect()
-        };
-        let mut keyed: Vec<_> = {
-            let load_order = self.inner.load_order.load();
-            snapshot
-                .into_iter()
-                .map(|(name, rec)| {
-                    (
-                        load_order.get(name.as_str()).copied().unwrap_or(0),
-                        name,
-                        rec,
-                    )
-                })
+                .map(|(n, r)| (r.load_order(), n.to_string(), r.clone()))
                 .collect()
         };
         keyed.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -487,7 +473,7 @@ impl PvDatabase {
             // See `scan_list_once`: one set per sweep, emptied by each frame's
             // own unwind.
             let mut visited = crate::server::database::ProcStack::new();
-            for (name, rec) in self.records_in_load_order().await {
+            for (name, rec) in self.records_in_load_order() {
                 let (pini, phas) = {
                     let instance = rec.read();
                     (instance.common.pini, i32::from(instance.common.phas))

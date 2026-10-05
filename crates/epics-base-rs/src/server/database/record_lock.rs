@@ -2092,10 +2092,11 @@ mod tests {
         use crate::server::records::calc::CalcRecord;
         let db = PvDatabase::new();
         let cell = |name: &str| {
-            let cell = Arc::new(RecordCell::new(RecordInstance::new(
-                name.into(),
-                CalcRecord::default(),
-            )));
+            let cell = Arc::new(RecordCell::new(
+                RecordInstance::new(name.into(), CalcRecord::default()),
+                0,
+                false,
+            ));
             db.inner.record_locks.adopt(name, cell.lock_record());
             db.ensure_set_for(name, cell.lock_record());
             cell
@@ -2135,10 +2136,11 @@ mod tests {
     fn adopted_cell(db: &PvDatabase, name: &str) -> Arc<crate::server::record::RecordCell> {
         use crate::server::record::{RecordCell, RecordInstance};
         use crate::server::records::calc::CalcRecord;
-        let cell = Arc::new(RecordCell::new(RecordInstance::new(
-            name.into(),
-            CalcRecord::default(),
-        )));
+        let cell = Arc::new(RecordCell::new(
+            RecordInstance::new(name.into(), CalcRecord::default()),
+            0,
+            false,
+        ));
         db.inner.record_locks.adopt(name, cell.lock_record());
         cell
     }

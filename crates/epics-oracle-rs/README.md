@@ -109,10 +109,15 @@ missing build into 835 ERRORs and a 75.3 % coverage number that reads like a
 port defect. Nothing is ever skipped when a prerequisite is absent — a silently
 skipped oracle is the false-clean we are escaping.
 
-`cargo nextest run -p epics-oracle-rs` runs 219 tests. They test the harness
-itself — dbd parsing, case generation, adjudication, allowlist staleness — and
-need neither C tree; the two C-tree-dependent integration files (`tests/`) are
-the oracle runs themselves.
+`cargo nextest run -p epics-oracle-rs` runs 219 tests, and every one of them
+tests the **harness**, never the port — nothing in them asserts a value the
+port reports, so they keep passing while its field tables are regenerated
+underneath them. The unit half (dbd parsing, case generation, adjudication,
+allowlist staleness) needs no C tree. `tests/oracle.rs` and
+`tests/pva_oracle.rs` boot the real pair, so they need the trees above and fail
+loudly rather than skipping when one is absent; four of `oracle.rs`'s are gated
+off `exec_backend`, where `oracle-ioc` refuses to start and they would have no
+subject.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
 be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`

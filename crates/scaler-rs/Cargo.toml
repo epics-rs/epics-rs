@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
-asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing = "0.1"
 

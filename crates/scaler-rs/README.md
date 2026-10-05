@@ -13,7 +13,8 @@ The scaler record represents a multi-channel counter (typically a VME or PCI sca
 - **OneShot** — count for a configurable time then stop
 - **AutoCount** — periodically count with display refresh, often used while idle
 
-scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full state machine, preset/gate/direction/name per-channel configuration, periodic display update during counting, and asyn-based device support.
+scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full state machine, preset/gate/direction/name per-channel configuration, periodic display update during counting, and device support over a
+`ScalerDriver` trait.
 
 ## Features
 
@@ -28,7 +29,7 @@ scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full st
 - **Status fields** — CNT (count enable), CONT (continuous counting), TCNT (counts when finished), VAL (elapsed time)
 
 ### Device Support
-- **Asyn device support** (`scaler_asyn.rs`) — bridges scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm`, `done` operations
+- **Device support** (`scaler_asyn.rs`) — bridges the scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm`, `done` operations, and exports the seven asyn `drvInfo` strings (`SCALER_RESET`, `SCALER_READ`, …) a port driver would match on. It implements `epics_base_rs`'s `DeviceSupport` directly; the crate does not depend on `asyn-rs`
 - **Software scaler** (`scaler_soft.rs`) — pure Rust simulation driver for testing (configurable count rates per channel)
 - **DeviceCommand actions** — record expresses commands as data (Reset, Arm, WritePreset) which the framework dispatches to the driver
 
@@ -56,7 +57,7 @@ scaler-rs/
 │   ├── records/dbd_generated.rs # the field table generated from scalerRecord.dbd
 │   └── device_support/
 │       ├── mod.rs              # ScalerDriver trait
-│       ├── scaler_asyn.rs      # asyn-based device support
+│       ├── scaler_asyn.rs      # DeviceSupport impl + asyn drvInfo strings
 │       └── scaler_soft.rs      # software simulation driver
 ├── db/                         # database templates + autosave .req files
 └── ui/                         # PyDM .ui screens (16/32/64 channel)
@@ -120,14 +121,13 @@ camonitor SCALER:S1 SCALER:S2 SCALER:S3
 cargo nextest run -p scaler-rs
 ```
 
-Test coverage: state machine transitions (OneShot → arm → counting → done), AutoCount periodic refresh, preset writing, gate/direction handling, COUT/COUTP link firing, soft driver count generation, asyn device support bridge.
+Test coverage: state machine transitions (OneShot → arm → counting → done), AutoCount periodic refresh, preset writing, gate/direction handling, COUT/COUTP link firing, soft driver count generation, the device-support bridge.
 
 ## Dependencies
 
 - epics-base-rs — Record trait, DeviceSupport, ProcessAction (the record's
   `Record` impl is hand-written, not derived)
 - epics-ca-rs — the `run_ca_ioc_app` entry point the example uses
-- asyn-rs — port driver framework
 - tokio, tracing
 
 ## Requirements

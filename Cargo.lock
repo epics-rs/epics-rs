@@ -3530,7 +3530,6 @@ dependencies = [
 name = "scaler-rs"
 version = "0.30.2"
 dependencies = [
- "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
  "tokio",

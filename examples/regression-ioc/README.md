@@ -50,7 +50,7 @@ because the `EPICS_CA_*` client env is process-global under `cargo test`.
 ## Run the IOC by hand
 
 ```sh
-cargo run -p regression-ioc --bin regression_ioc
+cargo run -p regression-ioc --bin regression-ioc
 # prints the CA + PVA ports; then, against those ports:
 #   caget REG:E:MBBO   pvget REG:D:MTR   caput REG:D:MTR 5.0   ...
 ```

@@ -153,7 +153,7 @@ The acquisition loop runs inside a `current_thread` tokio runtime created by the
 
 ```bash
 cargo build -p xrt-beamline --features ioc --release
-./target/release/xrt_ioc examples/xrt-beamline/ioc/st.cmd
+./target/release/xrt-ioc examples/xrt-beamline/ioc/st.cmd
 ```
 
 ```bash

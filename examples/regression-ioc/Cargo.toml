@@ -19,5 +19,5 @@ tokio = { version = "1", features = ["full"] }
 serial_test = "3"
 
 [[bin]]
-name = "regression_ioc"
+name = "regression-ioc"
 path = "src/bin/regression_ioc.rs"

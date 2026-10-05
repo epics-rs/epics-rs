@@ -59,7 +59,7 @@ table and the notes on rayon parallelism and the shared thread pool.
 ### Run SimDetector IOC
 
 ```bash
-cargo run -p sim-detector --features ioc --bin sim_ioc -- \
+cargo run -p sim-detector --features ioc --bin sim-ioc -- \
     examples/sim-detector/ioc/st.cmd
 ```
 
@@ -118,7 +118,7 @@ crates/ad-core-rs/
   opi/pydm/             # PyDM .ui screens
   doc/                  # the parity notes against C ADCore
 
-examples/sim-detector/  # the simulated driver and its sim_ioc binary
+examples/sim-detector/  # the simulated driver and its sim-ioc binary
 crates/ad-plugins-rs/   # the 26 plugins
 ```
 

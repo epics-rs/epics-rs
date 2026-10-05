@@ -4,7 +4,7 @@
 # Port of EPICS testAsynPortDriver IOC.
 #
 # Usage:
-#   cargo run --release -p scope-ioc --features ioc --bin scope_ioc -- ioc/st.cmd
+#   cargo run --release -p scope-ioc --features ioc --bin scope-ioc -- ioc/st.cmd
 #============================================================
 
 # Environment

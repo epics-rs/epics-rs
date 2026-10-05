@@ -65,7 +65,7 @@ pub fn publish_pvxs_report(handle: ServerReportHandle) {
 /// pvxs registers it out of the `.dbd` expansion and not out of a running
 /// server.
 ///
-/// Measured on `scope_ioc` before this existed: `pvxsr` on the first
+/// Measured on `scope-ioc` before this existed: `pvxsr` on the first
 /// `st.cmd` line was `ERROR st.cmd line 1: Command 'pvxsr' not registered.`,
 /// which aborts the script.
 ///
@@ -194,7 +194,7 @@ mod tests {
     }
 
     /// pvxs registers `pvxsr` from `pvxsBaseRegistrar`, so it is on the
-    /// shell that runs `st.cmd`. Measured on `scope_ioc` before this fix:
+    /// shell that runs `st.cmd`. Measured on `scope-ioc` before this fix:
     /// `ERROR st.cmd line 1: Command 'pvxsr' not registered.`
     #[test]
     fn pvxsr_is_registered_before_the_startup_script_runs() {

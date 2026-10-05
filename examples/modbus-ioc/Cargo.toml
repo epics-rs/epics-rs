@@ -17,6 +17,6 @@ modbus-rs = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
-name = "modbus_ioc"
+name = "modbus-ioc"
 path = "src/bin/modbus_ioc.rs"
 required-features = ["ioc"]

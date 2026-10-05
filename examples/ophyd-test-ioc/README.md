@@ -49,7 +49,7 @@ The acquisition loop runs inside a `current_thread` tokio runtime created by the
 
 ```bash
 cargo build --release -p ophyd-test-ioc --features ioc
-./target/release/ophyd_test_ioc examples/ophyd-test-ioc/ioc/st.cmd
+./target/release/ophyd-test-ioc examples/ophyd-test-ioc/ioc/st.cmd
 ```
 
 ## Architecture

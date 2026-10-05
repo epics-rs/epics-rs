@@ -1,4 +1,4 @@
-#!../../target/debug/sim_ioc
+#!../../target/debug/sim-ioc
 #============================================================
 # st.cmd — SimDetector IOC startup script
 #
@@ -6,7 +6,7 @@
 # commonPlugins.cmd include for plugin configuration.
 #
 # Usage:
-#   cargo run --bin sim_ioc --features ioc -- ioc/st.cmd
+#   cargo run --bin sim-ioc --features ioc -- ioc/st.cmd
 #============================================================
 
 # Environment

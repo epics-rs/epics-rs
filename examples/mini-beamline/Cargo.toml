@@ -23,6 +23,6 @@ epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
 
 [[bin]]
-name = "mini_ioc"
+name = "mini-ioc"
 path = "src/bin/mini_ioc.rs"
 required-features = ["ioc"]

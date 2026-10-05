@@ -17,6 +17,6 @@ mqtt-rs = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
-name = "mqtt_ioc"
+name = "mqtt-ioc"
 path = "src/bin/mqtt_ioc.rs"
 required-features = ["ioc"]

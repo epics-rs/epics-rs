@@ -19,7 +19,7 @@ pymodbus.simulator                 # listens on 127.0.0.1:502
 Then run the IOC:
 
 ```sh
-cargo run --release -p modbus-ioc --bin modbus_ioc --features ioc -- ioc/st.cmd
+cargo run --release -p modbus-ioc --bin modbus-ioc --features ioc -- ioc/st.cmd
 ```
 
 ## What it does

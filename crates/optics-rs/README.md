@@ -209,7 +209,7 @@ Build and run the mini-beamline IOC with a simulated Kohzu double-crystal monoch
 
 ```bash
 cargo build --release -p mini-beamline --features ioc
-./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
+./target/release/mini-ioc examples/mini-beamline/ioc/st.cmd
 ```
 
 In another terminal, set the DCM to Auto mode and change energy:

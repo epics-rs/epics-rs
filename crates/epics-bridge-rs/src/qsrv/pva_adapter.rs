@@ -1660,7 +1660,7 @@ pub async fn pvalink_link_set_install(
 /// names, so `casr` and `pvxsr` answer on the first `st.cmd` line. Rust has
 /// no link-time registrar, so this port must call them, and a call that every
 /// application head has to remember is a rule that holds until one forgets —
-/// measured on `scope_ioc`, whose script got `Command 'pvxsr' not registered`
+/// measured on `scope-ioc`, whose script got `Command 'pvxsr' not registered`
 /// and `Command 'casr' not registered` from a head that had nothing wrong
 /// with it. Pairing the two registrars with the runner is what removes the
 /// choice.

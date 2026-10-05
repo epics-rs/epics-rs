@@ -26,7 +26,7 @@ sudo apt install mosquitto && mosquitto -v
 ```bash
 cargo build --release -p mqtt-ioc --features ioc
 
-./target/release/mqtt_ioc examples/mqtt-ioc/ioc/st.cmd
+./target/release/mqtt-ioc examples/mqtt-ioc/ioc/st.cmd
 ```
 
 ### Logging
@@ -36,10 +36,10 @@ The binary installs a `tracing_subscriber` controlled by `RUST_LOG`
 
 ```bash
 # Default — reconnects (info) and errors (error) only
-./target/release/mqtt_ioc examples/mqtt-ioc/ioc/st.cmd
+./target/release/mqtt-ioc examples/mqtt-ioc/ioc/st.cmd
 
 # Also show Connected PV recovery path (Publish/PingResp restoring Connected=1)
-RUST_LOG=info,mqtt_rs=debug ./target/release/mqtt_ioc examples/mqtt-ioc/ioc/st.cmd
+RUST_LOG=info,mqtt_rs=debug ./target/release/mqtt-ioc examples/mqtt-ioc/ioc/st.cmd
 ```
 
 Useful lines to watch for:

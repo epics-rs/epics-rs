@@ -71,7 +71,7 @@ Default prefix: `SCOPE:scopeSim:`
 # Release build
 cargo build --release -p scope-ioc --features ioc
 # Run
-./target/release/scope_ioc examples/scope-ioc/ioc/st.cmd
+./target/release/scope-ioc examples/scope-ioc/ioc/st.cmd
 ```
 
 ### Standalone Demo (no EPICS)

@@ -1541,6 +1541,34 @@ pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     set_thread_ok_to_block(priority == ThreadPriority::Iocsh);
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
+    band_and_register(priority)
+}
+
+/// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that
+/// is already running — the band changing while the thread keeps the name and
+/// the role it took at its entry.
+///
+/// [`enter_ioc_thread`] is for a thread taking on its role; this is for one
+/// whose role changes band under it. The port's caller is the periodic scan
+/// helper, which carries the band of whichever rate it is serving
+/// (`dbScan.c:1269-1272`) — the whole point of the pool being shared, since a
+/// fast rate's records must not be processed at a slow rate's priority.
+///
+/// Deliberately not [`apply_to_current_thread`]: that one changes the OS and
+/// nothing else, so a thread that used it would keep the band its row claims
+/// it is at, and `epicsThreadShowAll` would be wrong for exactly the threads
+/// that move.
+pub fn reband_current_thread(priority: ThreadPriority) -> PriorityApplied {
+    band_and_register(priority)
+}
+
+/// Take the band and write the row that reports it — the one caller of
+/// [`apply_to_current_thread`] in this crate.
+///
+/// The two halves are one function because they are one fact: a row that
+/// disagrees with the thread's scheduling is worse than no row, and splitting
+/// them left two entry points that each had to remember the second half.
+fn band_and_register(priority: ThreadPriority) -> PriorityApplied {
     let applied = apply_to_current_thread(priority);
     thread_registry::register_current(priority, applied);
     applied
@@ -4236,7 +4264,8 @@ mod tests {
 
     /// The banding half of the prologue is not reachable without the naming
     /// half: nothing in this crate's production scope calls
-    /// [`apply_to_current_thread`] except [`enter_ioc_thread`] itself.
+    /// [`apply_to_current_thread`] except [`band_and_register`], which is what
+    /// [`enter_ioc_thread`] and [`reband_current_thread`] both go through.
     ///
     /// Separate from the sweep above because it catches the other direction —
     /// a thread that is named by `Builder` but takes its band directly, which
@@ -4244,8 +4273,9 @@ mod tests {
     /// somewhere else in the file.
     #[test]
     fn only_the_prologue_reaches_the_banding_call() {
-        // Only the definition and the prologue's own delegation, both in
-        // task.rs. Anywhere else is a thread banded without being named.
+        // Only the definition and the single delegation, both in task.rs.
+        // Anywhere else is a thread banded without being named — or banded
+        // without the row that says so.
         let allowed = [
             "pub fn apply_to_current_thread(priority: ThreadPriority) -> PriorityApplied {",
             "let applied = apply_to_current_thread(priority);",
@@ -4288,29 +4318,42 @@ mod tests {
     /// passing it.
     #[test]
     fn the_prologue_registers_the_thread_for_the_vxworks_census() {
-        let body = production_scope(include_str!("task.rs"))
-            .split_once("pub fn enter_ioc_thread(")
-            .expect("the prologue is still in this file")
-            .1
-            .split_once("\n}\n")
-            .expect("the prologue's body is terminated")
-            .0;
+        let src = production_scope(include_str!("task.rs"));
+        let body_of = |signature: &str| -> &str {
+            src.split_once(signature)
+                .expect("the function is still in this file")
+                .1
+                .split_once("\n}\n")
+                .expect("the function's body is terminated")
+                .0
+        };
+        let prologue = body_of("pub fn enter_ioc_thread(");
         assert!(
-            body.contains("#[cfg(target_os = \"vxworks\")]"),
+            prologue.contains("#[cfg(target_os = \"vxworks\")]"),
             "the census registration must stay gated to the one OS whose \
              backend needs it; `epics-rtems-boot` is a dependency of this \
              package on that target only"
         );
         assert!(
-            body.contains("epics_rtems_boot::stats::register_task();"),
+            prologue.contains("epics_rtems_boot::stats::register_task();"),
             "VxWorks gives an RTP no task enumerator, so `dump_tasks` and \
              `stack_report` list exactly what announced itself here"
         );
+        // The row half sits behind `band_and_register`, which is also what
+        // `reband_current_thread` goes through, so the chain is checked in
+        // two steps rather than one: the prologue reaches it, and it is what
+        // writes the row.
         assert!(
-            body.contains("thread_registry::register_current(priority, applied);"),
-            "`epicsThreadShowAll` prints exactly what the prologue registered; \
-             a registration outside the prologue is a thread that can start \
-             without one"
+            prologue.contains("band_and_register(priority)"),
+            "the prologue must take its band through the one place that also \
+             writes the row, or a thread can start banded and unlisted"
+        );
+        assert!(
+            body_of("fn band_and_register(")
+                .contains("thread_registry::register_current(priority, applied);"),
+            "`epicsThreadShowAll` prints exactly what the band call \
+             registered; a band without a registration is a thread whose row \
+             reports a priority it is not at"
         );
     }
 

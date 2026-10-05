@@ -1,8 +1,12 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the exec-backend suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): a sync test that hand-builds its own tokio
+// runtime, and `scanParallelThreads`'s refusal test, which wants a runtime
+// only as the start-context `ScanOwner::start` requires; both run and pass in
+// the exec-backend suite.
 //! The callback- and scanOnce-queue iocsh commands from
 //! `dbIocRegister.c` (@R7.0.10): `scanOnceSetQueueSize`,
 //! `scanOnceQueueShow`, `callbackSetQueueSize`, `callbackQueueShow`
-//! and `callbackParallelThreads`.
+//! and `callbackParallelThreads`, plus `scanParallelThreads` from
+//! epics-base #998.
 //!
 //! All five reach the same two facilities the port already runs — the
 //! priority-banded callback pool and the `scanOnce` ring in
@@ -25,6 +29,7 @@ use crate::runtime::background::{CallbackPriority, CallbackQueueStats};
 /// Register the queue-facility command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_scan_once_set_queue_size());
+    registry.register(cmd_scan_parallel_threads());
     registry.register(cmd_scan_once_queue_show());
     registry.register(cmd_callback_set_queue_size());
     registry.register(cmd_callback_queue_show());
@@ -40,6 +45,10 @@ const CALLBACK_NOT_INIT: &str =
 /// verbatim.
 const SCAN_ONCE_NOT_INIT: &str =
     "scanOnce system not initialized, yet. Please run iocInit before using this command.";
+
+/// C `scanParallelThreads`'s refusal and its two clamp reports
+/// (`dbScan.c:289`, `:298-299`, `:304-305`).
+const SCAN_PARALLEL_ALREADY_INIT: &str = "scanParallelThreads: scan system already initialized";
 
 /// C `callbackSetQueueSize`'s two diagnostics (`callback.c:103`, `:107`).
 const QUEUE_SIZE_MUST_BE_POSITIVE: &str = "Queue size must be positive";
@@ -129,6 +138,69 @@ fn cmd_scan_once_set_queue_size() -> CommandDef {
         |args: &[ArgValue], _ctx: &CommandContext| {
             let size = ival(args, 0);
             crate::runtime::background::scan_once::set_queue_size(size.max(1) as usize);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `scanParallelThreads <count> <reserve>` — C `scanParallelThreads`
+/// (`dbScan.c:286-321`), registered with `iocshSetError`
+/// (`dbIocRegister.c:666`), so its refusal fails the line.
+///
+/// The count arithmetic is C's, and it differs from
+/// `callbackParallelThreads`' in its floor: a resolved count of zero is a
+/// valid answer there — no helpers, which is what every IOC that never calls
+/// this runs — where a callback band floors at one worker.
+fn cmd_scan_parallel_threads() -> CommandDef {
+    CommandDef::new(
+        "scanParallelThreads",
+        vec![
+            ArgDesc {
+                name: "no of threads",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "reserved for fastest rate",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "scanParallelThreads <no of threads> <reserved for fastest rate> — Configure helper \
+         threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault, a \
+         negative count leaves that many CPUs without a helper. The second argument reserves \
+         that many helpers for the fastest rate.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            use crate::server::scan;
+            if scan::periodic_lists_built() {
+                ctx.eprintln(SCAN_PARALLEL_ALREADY_INIT);
+                return Ok(CommandOutcome::Failed);
+            }
+            // The same two different globals as `callbackParallelThreads`:
+            // the processor count for the negative arm,
+            // `scanParallelThreadsDefault` for the zero arm.
+            let asked = ival(args, 0);
+            let mut count = if asked < 0 {
+                crate::runtime::background::callback_executor::cpu_count() as i64 + asked
+            } else if asked == 0 {
+                scan::parallel_threads_default() as i64
+            } else {
+                asked
+            }
+            .max(0);
+            if count > scan::MAX_PARALLEL_THREADS as i64 {
+                ctx.eprintln(&format!(
+                    "scanParallelThreads: clamping {count} to {}",
+                    scan::MAX_PARALLEL_THREADS
+                ));
+                count = scan::MAX_PARALLEL_THREADS as i64;
+            }
+            let mut reserve = ival(args, 1).max(0);
+            if reserve > count {
+                ctx.eprintln(&format!(
+                    "scanParallelThreads: clamping reserve {reserve} to {count}"
+                ));
+                reserve = count;
+            }
+            scan::set_parallel_threads(count as i32, reserve as i32);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -339,12 +411,134 @@ mod tests {
             ("callbackSetQueueSize", 1),
             ("callbackQueueShow", 1),
             ("callbackParallelThreads", 2),
+            // `dbIocRegister.c:487-493` in the #998 prototype.
+            ("scanParallelThreads", 2),
         ] {
             assert_eq!(reg.get(name).unwrap().args.len(), arity, "{name}");
         }
         let cpt = reg.get("callbackParallelThreads").unwrap();
         assert!(matches!(cpt.args[0].arg_type, ArgType::Int));
         assert!(matches!(cpt.args[1].arg_type, ArgType::String));
+        let spt = reg.get("scanParallelThreads").unwrap();
+        assert!(matches!(spt.args[0].arg_type, ArgType::Int));
+        assert!(
+            matches!(spt.args[1].arg_type, ArgType::Int),
+            "the reserve is `iocshArgInt`, not a priority name"
+        );
+    }
+
+    /// C `scanParallelThreads`' count arithmetic (`dbScan.c:293-310`), which
+    /// differs from `callbackParallelThreads`' in both ends: it floors at 0
+    /// rather than 1 — no helpers is the state every IOC that never calls it
+    /// runs in — and it has a ceiling, the width of the pool's masks.
+    #[test]
+    #[serial_test::serial(scan_parallel)]
+    fn scan_parallel_threads_resolves_its_count_the_way_c_does() {
+        use crate::server::scan;
+        let ctx = make_ctx();
+        let cpus = crate::runtime::background::callback_executor::cpu_count();
+
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["3", "1"]);
+        assert!(!failed && err.is_empty(), "a plain count: {err:?}");
+        assert_eq!(scan::parallel_threads(), (3, 1));
+
+        // Zero is the knob, which C declares 2 and leaves there.
+        let (_, _, failed) = run(&ctx, "scanParallelThreads", &["0", "0"]);
+        assert!(!failed);
+        assert_eq!(scan::parallel_threads().0, scan::parallel_threads_default());
+        assert_eq!(scan::parallel_threads_default(), 2);
+
+        // Negative leaves that many CPUs without a helper, and never goes
+        // below none at all. C applies the ceiling after this arithmetic, not
+        // before, so on a box with more CPUs than the mask is wide the count
+        // lands on the ceiling and says so.
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["-1", "0"]);
+        assert!(!failed);
+        let max = scan::MAX_PARALLEL_THREADS as i32;
+        assert_eq!(scan::parallel_threads().0, (cpus - 1).min(max));
+        if cpus - 1 > max {
+            assert!(
+                err.contains(&format!(
+                    "scanParallelThreads: clamping {} to {max}",
+                    cpus - 1
+                )),
+                "{err:?}"
+            );
+        } else {
+            assert!(err.is_empty(), "{err:?}");
+        }
+        let (_, _, failed) = run(
+            &ctx,
+            "scanParallelThreads",
+            &[&format!("-{}", cpus + 7), "0"],
+        );
+        assert!(!failed);
+        assert_eq!(
+            scan::parallel_threads().0,
+            0,
+            "C's `if (count < 0) count = 0`"
+        );
+
+        // Both clamps report on stderr, as C's `fprintf(stderr, ...)` does.
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["9999", "0"]);
+        assert!(!failed);
+        assert_eq!(scan::parallel_threads().0, max);
+        assert!(
+            err.contains(&format!("scanParallelThreads: clamping 9999 to {max}")),
+            "{err:?}"
+        );
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["2", "5"]);
+        assert!(!failed);
+        assert_eq!(scan::parallel_threads(), (2, 2));
+        assert!(
+            err.contains("scanParallelThreads: clamping reserve 5 to 2"),
+            "{err:?}"
+        );
+
+        scan::set_parallel_threads(0, 0);
+    }
+
+    /// C's `if (papPeriodic)` (`dbScan.c:288-292`): the helper count is a
+    /// pre-`iocInit` knob, because `spawnHelpers` reads it once. Driven
+    /// through a real scan facility rather than a flag, since the gate's whole
+    /// content is "the lists exist".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(scan_parallel)]
+    async fn scan_parallel_threads_is_refused_once_the_scan_system_is_up() {
+        use crate::server::scan;
+        let db = Arc::new(PvDatabase::new());
+        let ctx = CommandContext::new(
+            Arc::clone(&db),
+            crate::runtime::task::BlockingBridge::capture(),
+        );
+
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["2", "1"]);
+        assert!(!failed && err.is_empty(), "before iocInit: {err:?}");
+
+        let owner = scan::ScanOwner::start(Arc::clone(&db));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !scan::periodic_lists_built() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scan owner never built its periodic lists"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["4", "0"]);
+        assert!(
+            failed,
+            "C returns -1, and the command is registered with iocshSetError"
+        );
+        assert!(err.contains(SCAN_PARALLEL_ALREADY_INIT), "{err:?}");
+        assert_eq!(
+            scan::parallel_threads(),
+            (2, 1),
+            "a refused line must not have stored its count"
+        );
+
+        drop(owner);
+        scan::set_parallel_threads(0, 0);
     }
 
     /// C's `%8s  %15d  %10d  %6d  %6.1f  %11d` with a percentage the

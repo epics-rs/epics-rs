@@ -304,6 +304,11 @@ struct OverrunTracker {
     over_max: f64,
     report_delay: f64,
     reported: Instant,
+    /// Whether this IOC has helper threads at all, which decides which remedy
+    /// the report names. C reads the global `nHelpers` where it builds the
+    /// message (`dbScan.c:979`); it is fixed once `spawnHelpers` has run, so
+    /// the fact belongs to the tracker from the moment it is built.
+    helpers: bool,
 }
 
 impl OverrunTracker {
@@ -316,7 +321,7 @@ impl OverrunTracker {
         }
     }
 
-    fn new(scan: ScanType, period: Duration, start: Instant) -> Self {
+    fn new(scan: ScanType, period: Duration, start: Instant, helpers: bool) -> Self {
         Self {
             scan,
             period,
@@ -327,6 +332,7 @@ impl OverrunTracker {
             over_max: 0.0,
             report_delay: OVERRUN_REPORT_DELAY,
             reported: start,
+            helpers,
         }
     }
 
@@ -365,11 +371,20 @@ impl OverrunTracker {
             if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
                 let period = self.period.as_secs_f64();
                 let scan = self.scan;
+                // C `dbScan.c:981-985`: the remedy names `scanRateThreads()`
+                // only where there is already a helper to add one to.
+                let remedy = if self.helpers {
+                    ",\n\tor add helper threads with scanParallelThreads() or \
+                     scanRateThreads() before iocInit."
+                } else {
+                    ",\n\tor add helper threads with scanParallelThreads() before \
+                     iocInit."
+                };
                 let msg = format!(
                     "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
                  averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
                  happened {} times in a row.\n\tTo fix this, move some records \
-                 to a slower scan rate.\n",
+                 to a slower scan rate{remedy}\n",
                     crate::runtime::log::erl_warning(),
                     period + self.overtime / f64::from(self.consecutive),
                     period + self.over_min,
@@ -1235,7 +1250,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         None,
     );
     let mut next = Instant::now() + period;
-    let mut overrun = OverrunTracker::new(scan_type, period, Instant::now());
+    let mut overrun = OverrunTracker::new(scan_type, period, Instant::now(), duty.pool.is_some());
     loop {
         watched.check_in();
         // Sleep until the deadline or the stop signal, whichever first.
@@ -1558,10 +1573,17 @@ mod overrun_tests {
     use super::*;
 
     /// Drive `ticks` sweeps that each take `sweep` against a `period` list,
-    /// starting from `base`. Returns every warning the tracker emitted.
-    fn run(period: Duration, sweep: Duration, ticks: u32, base: Instant) -> Vec<String> {
+    /// starting from `base`, on an IOC that has `helpers` helper threads or
+    /// none. Returns every warning the tracker emitted.
+    fn run(
+        period: Duration,
+        sweep: Duration,
+        ticks: u32,
+        base: Instant,
+        helpers: bool,
+    ) -> Vec<String> {
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, helpers);
         let mut warnings = Vec::new();
         for i in 1..=ticks {
             let now = base + sweep * i;
@@ -1602,7 +1624,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, false);
 
         let outcome = tracker.after_scan(&mut next, base + Duration::from_secs(3));
 
@@ -1621,7 +1643,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, false);
 
         let now = base + Duration::from_secs(21);
         let outcome = tracker.after_scan(&mut next, now);
@@ -1641,7 +1663,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, false);
 
         let now = base + Duration::from_secs(2);
         assert!(tracker.after_scan(&mut next, now).overran);
@@ -1659,16 +1681,49 @@ mod overrun_tests {
         let sweep = Duration::from_secs(2);
 
         assert!(
-            run(period, sweep, 9, base).is_empty(),
+            run(period, sweep, 9, base, false).is_empty(),
             "the ninth consecutive over-run is still silent"
         );
 
-        let warnings = run(period, sweep, 10, base);
+        let warnings = run(period, sweep, 10, base, false);
         assert_eq!(warnings.len(), 1, "the tenth reports");
         let w = &warnings[0];
         assert!(w.contains("from '1 second' scan thread"), "{w}");
         assert!(w.contains("10 times in a row"), "{w}");
         assert!(w.contains("move some records to a slower scan rate"), "{w}");
+    }
+
+    /// BOUNDARY: the remedy the report names depends on whether any helper
+    /// thread exists — C `dbScan.c:981-985` tests `nHelpers == 0`. An IOC with
+    /// no helpers cannot be told to give a rate its own one, because
+    /// `scanRateThreads` without a pool is not what adds the first helper.
+    #[test]
+    fn the_remedy_names_scan_rate_threads_only_once_helpers_exist() {
+        let base = Instant::now();
+        let period = Duration::from_secs(1);
+        let sweep = Duration::from_secs(2);
+
+        let without = run(period, sweep, 10, base, false);
+        assert_eq!(without.len(), 1);
+        assert!(
+            without[0].ends_with(
+                "move some records to a slower scan rate,\n\tor add helper threads \
+                 with scanParallelThreads() before iocInit.\n"
+            ),
+            "{}",
+            without[0]
+        );
+
+        let with = run(period, sweep, 10, base, true);
+        assert_eq!(with.len(), 1);
+        assert!(
+            with[0].ends_with(
+                "move some records to a slower scan rate,\n\tor add helper threads \
+                 with scanParallelThreads() or scanRateThreads() before iocInit.\n"
+            ),
+            "{}",
+            with[0]
+        );
     }
 
     /// BOUNDARY: the report interval doubles after each report
@@ -1678,7 +1733,13 @@ mod overrun_tests {
     #[test]
     fn the_report_interval_doubles_after_each_report() {
         let base = Instant::now();
-        let warnings = run(Duration::from_secs(1), Duration::from_secs(2), 21, base);
+        let warnings = run(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            21,
+            base,
+            false,
+        );
 
         assert_eq!(warnings.len(), 2, "reports at tick 10 and tick 21");
         assert!(warnings[1].contains("21 times in a row"), "{}", warnings[1]);
@@ -1692,7 +1753,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, false);
 
         // Nine over-runs, then one sweep that beats its deadline.
         for i in 1..=9u32 {

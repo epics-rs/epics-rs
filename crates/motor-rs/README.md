@@ -53,6 +53,8 @@ motor-rs/
     poll_loop.rs        # Async per-axis polling task for motor status
     builder.rs          # MotorBuilder — fluent API for motor assembly
     sim_motor.rs        # SimMotor — simulated motor for testing
+    ioc.rs              # `simMotorCreate` and the dynamic device support
+    record/dbd_generated.rs  # the field table generated from motorRecord.dbd
   benches/
     motor.rs            # Criterion benchmarks
   opi/
@@ -63,11 +65,15 @@ motor-rs/
 ## Quick Start
 
 ```rust
+use std::sync::{Arc, Mutex};
+
 use motor_rs::{MotorBuilder, SimMotor};
 
-let sim = SimMotor::new();
-let setup = MotorBuilder::new("MOTOR1", sim)
+let sim = Arc::new(Mutex::new(SimMotor::new()));
+let setup = MotorBuilder::new(sim)
     .addr(0)
+    // one call sets both the moving and the idle interval; set them apart with
+    // `moving_poll_interval` / `idle_poll_interval`
     .poll_interval(Duration::from_millis(100))
     .build();
 ```
@@ -75,21 +81,25 @@ let setup = MotorBuilder::new("MOTOR1", sim)
 ## Testing
 
 ```bash
-cargo nextest run   # 233 tests
-cargo bench         # Criterion benchmarks
+cargo nextest run -p motor-rs
+cargo bench -p motor-rs
 ```
 
-233 tests covering record processing, motion phases, coordinate conversion, device support, axis runtime, C parity (backlash, SET mode, retry, readback, NTM), and simulated motor behavior.
+The suite covers record processing, motion phases, coordinate conversion,
+device support, axis runtime, C parity (backlash, SET mode, retry, readback,
+NTM), and simulated motor behaviour.
 
 ## Dependencies
 
 - epics-base-rs — Record trait, DeviceSupport trait
+- epics-ca-rs — the iocsh side of `simMotorCreate`
 - asyn-rs — AsynMotor interface, async runtime facade
 - bitflags — MipFlags, MstaFlags
+- tokio, tracing
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

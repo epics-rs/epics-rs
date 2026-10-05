@@ -1117,6 +1117,18 @@ pub struct RecordCell {
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
     /// of the record.
     plan: ProcessPlan,
+    /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
+    /// the database load sequence: the scan index's secondary sort key, and
+    /// the order every whole-database walk visits.
+    ///
+    /// Here by the rule above: every reader of it — the scan-index insert,
+    /// `all_record_names`, the PINI sweep — needs it *before* it takes the
+    /// record's lock set, and what it used to reach for instead was a
+    /// name-keyed copy-on-write map beside the records. That map was cloned
+    /// once per record added, which made `dbLoadRecords` quadratic. On the
+    /// cell the sequence is born with the node, cannot go missing from it, and
+    /// dies with it.
+    load_order: u64,
     data: LockSetGuarded<RecordInstance>,
 }
 
@@ -1201,7 +1213,7 @@ struct LockSetGuarded<T: Send + Sync>(std::cell::UnsafeCell<T>);
 unsafe impl<T: Send + Sync> Sync for LockSetGuarded<T> {}
 
 impl RecordCell {
-    pub(crate) fn new(instance: RecordInstance) -> Self {
+    pub(crate) fn new(instance: RecordInstance, load_order: u64) -> Self {
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -1222,8 +1234,14 @@ impl RecordCell {
                 .map(|(_, vf)| instance.record.field_slot(vf))
                 .collect(),
             plan: ProcessPlan::of(&*instance.record),
+            load_order,
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
+    }
+
+    /// This record's database load sequence, without taking its lock set.
+    pub(crate) fn load_order(&self) -> u64 {
+        self.load_order
     }
 
     /// The type-static answers this cycle may test instead of re-asking the

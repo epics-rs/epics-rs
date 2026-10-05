@@ -443,6 +443,21 @@ impl ScanKey {
 /// it by walking `all_record_names` alone answered it wrong for aliases with
 /// no way to notice. [`PvDatabase::all_db_nodes`] reassembles C's one list;
 /// `alias_of` is `dbIsAlias`.
+/// The database's alias table entry — C's alias `dbRecordNode`.
+///
+/// C allocates an alias node into the target's own record list and numbers it
+/// from the counter a record draws from (`pnewnode->order =
+/// pdbentry->pdbbase->no_records++`, `dbStaticLib.c:1703-1704`), which is why
+/// an alias appears at its declaration point in a `dbl` walk and not after
+/// every record. This port keeps aliases in a map of their own, so the node's
+/// two facts — what it points at, where it was declared — are this struct.
+struct AliasNode {
+    /// The canonical record name the alias resolves to.
+    target: String,
+    /// Load sequence, from the same counter as [`RecordCell::load_order`].
+    order: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbNode {
     /// The name this node is reached by — an alias node carries the ALIAS
@@ -507,19 +522,19 @@ struct PvDatabaseInner {
     /// 60–66) that C runs independently, on the one path where both ends of
     /// the contention pair are banded. See [`scan_index::ScanIndex`].
     scan_index: scan_index::ScanIndex,
-    /// Per-record load-order sequence number, assigned monotonically
-    /// at `add_record`. Used as the secondary scan-index sort key so
-    /// same-PHAS records preserve database load order. Survives a
-    /// `remove_record` + re-`add_record` (the re-add gets a fresh,
-    /// higher sequence — matching a fresh `.db` reload).
+    /// C `pdbbase->no_records` (`dbStaticLib.c:1704`) — the one counter every
+    /// node of the database draws its load sequence from as it is created:
+    /// records ([`RecordCell::load_order`]) and alias nodes
+    /// ([`AliasNode::order`]) alike, which is what interleaves the two in the
+    /// list `dbl` walks.
     ///
-    /// Read-modify-write cell (`add_loaded_record` inserts, `remove_record`
-    /// removes), so it is a [`SnapshotCell`], not a bare `ArcSwap`: the
-    /// writer gate is what makes insert-then-publish atomic. Both writers
-    /// also hold [`Self::registration_mutex`] today, but the gate keeps the
-    /// RMW correct without depending on that — L46's type changes in step 4.
-    load_order: SnapshotCell<HashMap<String, u64>>,
-    /// Monotonic counter feeding `load_order`.
+    /// The sequences live ON the nodes. They used to live in a copy-on-write
+    /// `SnapshotCell<HashMap<String, u64>>` beside them, which cloned the
+    /// whole map once per record added — `dbLoadRecords` was quadratic in
+    /// record count — and let a sequence outlive its node or go missing from
+    /// it, which every reader answered for with an `unwrap_or` fallback.
+    /// A sequence is now a field of the node it belongs to, so neither is
+    /// representable.
     load_order_counter: std::sync::atomic::AtomicU64,
     /// CP/CPP link index: maps source_record → target edges to process when
     /// the source changes. Each edge carries the CP-vs-CPP distinction (see
@@ -544,11 +559,11 @@ struct PvDatabaseInner {
     /// (`links.rs:2968`) merges into an existing edge list, so concurrent
     /// registrations need the [`SnapshotCell`] writer gate.
     external_cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
-    /// Alias map: alternate-name → real-record-name. Mirrors epics-base
-    /// PR #336 (alias name validation + parsing). `find_entry` and
+    /// Alias map: alternate-name → the [`AliasNode`] it names. Mirrors
+    /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: RecursiveReadLock<HashMap<String, String>>,
+    aliases: RecursiveReadLock<HashMap<String, AliasNode>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -1260,7 +1275,6 @@ impl PvDatabase {
                 link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
                 records: RecursiveReadLock::new(HashMap::new()),
                 scan_index: scan_index::ScanIndex::new(),
-                load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(HashMap::new()),
                 external_cp_links: SnapshotCell::new(HashMap::new()),
@@ -3107,7 +3121,15 @@ impl PvDatabase {
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         let record_type = instance.record.record_type();
-        let rec_arc = Arc::new(RecordCell::new(instance));
+        // The record's load sequence — C `pnewnode->order =
+        // pdbentry->pdbbase->no_records++` (`dbStaticLib.c:1704`) — drawn here,
+        // where the node is built, so it is born with the record. Drawn before
+        // the deferral test so the deferred drain preserves load order.
+        let seq = self
+            .inner
+            .load_order_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rec_arc = Arc::new(RecordCell::new(instance, seq));
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
         // adopted before the record is reachable by anyone.
@@ -3120,17 +3142,6 @@ impl PvDatabase {
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
         self.release_record_inits(name);
-
-        // Assign a monotonic load-order sequence — the scan-index
-        // secondary sort key, so same-PHAS records keep load order. Assigned in
-        // both arms at load time so the deferred drain preserves load order.
-        let seq = self
-            .inner
-            .load_order_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.load_order.update(|m| {
-            m.insert(name.to_string(), seq);
-        });
 
         if defer {
             // The dset binding, init passes, scan-index insert and the
@@ -3250,14 +3261,7 @@ impl PvDatabase {
                 instance.record.record_type(),
             )
         };
-        let seq = self
-            .inner
-            .load_order
-            .load()
-            .get(name)
-            .copied()
-            .unwrap_or(u64::MAX);
-        self.add_to_scan_list(scan, phas, record_type, seq, name);
+        self.add_to_scan_list(scan, phas, record_type, rec_arc.load_order(), name);
         self.rec_gbl_init_simm(&rec_arc);
         self.arm_watchdog(name);
         // The tail both loaders ran right after `add_loaded_record`: C's
@@ -3367,11 +3371,6 @@ impl PvDatabase {
         // 2) Drop from scan index if it was scheduled.
         self.delete_from_scan_list(scan, name);
 
-        // 2b) Drop the load-order entry.
-        self.inner.load_order.update(|m| {
-            m.remove(name);
-        });
-
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
         // CP lists may still reference this name).
@@ -3386,24 +3385,13 @@ impl PvDatabase {
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
-        let mut aliases = self.inner.aliases.write();
-        let orphaned: Vec<String> = aliases
-            .iter()
-            .filter(|(_, target)| *target == name)
-            .map(|(alias, _)| alias.clone())
-            .collect();
-        aliases.retain(|_alias, target| target != name);
-        drop(aliases);
-        // The alias nodes go with the record, and so do their load-order
-        // sequences: a name with a sequence and no node would keep a
-        // node-list walk sorting against a node that no longer exists.
-        if !orphaned.is_empty() {
-            self.inner.load_order.update(|m| {
-                for alias in &orphaned {
-                    m.remove(alias);
-                }
-            });
-        }
+        // The alias nodes go with the record, and their load sequences with
+        // them: the sequence is a field of the node, so a sequence outliving
+        // the node it describes is unrepresentable.
+        self.inner
+            .aliases
+            .write()
+            .retain(|_alias, node| node.target != name);
 
         // Same rule as `remove_simple_pv`: removal IS destruction. The
         // record's own `Arc` outlives the map entry for as long as a CA
@@ -3444,7 +3432,7 @@ impl PvDatabase {
         // Alias resolve (epics-base PR #336): the alternate name maps
         // to a canonical record name. Look up the real record after
         // translating the base.
-        if let Some(target) = self.inner.aliases.read().get(base).cloned() {
+        if let Some(target) = self.alias_target(base) {
             if let Some(rec) = self.inner.records.read().get(target.as_str()) {
                 return Some(PvEntry::Record(rec.clone()));
             }
@@ -3477,22 +3465,22 @@ impl PvDatabase {
             )));
         }
         self.check_name_free(alias)?;
-        self.inner
-            .aliases
-            .write()
-            .insert(alias.to_string(), target.to_string());
         // An alias is a node of the database, so it takes a sequence from the
         // same counter the records draw from — C numbers it identically,
         // `pnewnode->order = pdbentry->pdbbase->no_records++`
         // (`dbStaticLib.c:1704`), which is what puts an alias at its own load
         // position in the list `dbl` and `dbglob` walk.
-        let seq = self
+        let order = self
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.load_order.update(|m| {
-            m.insert(alias.to_string(), seq);
-        });
+        self.inner.aliases.write().insert(
+            alias.to_string(),
+            AliasNode {
+                target: target.to_string(),
+                order,
+            },
+        );
         Ok(())
     }
 
@@ -3510,7 +3498,17 @@ impl PvDatabase {
     /// Resolve an alias to its target record name, or `None` when the
     /// name is not an alias.
     pub fn resolve_alias(&self, name: &str) -> Option<String> {
-        self.inner.aliases.read().get(name).cloned()
+        self.alias_target(name)
+    }
+
+    /// The record name the alias node `name` points at, or `None` when the
+    /// name is not an alias. The one reader of an alias node's target.
+    fn alias_target(&self, name: &str) -> Option<String> {
+        self.inner
+            .aliases
+            .read()
+            .get(name)
+            .map(|node| node.target.clone())
     }
 
     /// Queue an iocsh command line for post-PINI execution.
@@ -3563,7 +3561,7 @@ impl PvDatabase {
         let rec = self.inner.records.read().get(base).cloned().or_else(|| {
             // Alias entry exists and points to a live record
             // (epics-base PR #336).
-            let target = self.inner.aliases.read().get(base).cloned();
+            let target = self.alias_target(base);
             target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
         });
         let Some(rec) = rec else {
@@ -3703,7 +3701,7 @@ impl PvDatabase {
         if let Some(rec) = self.inner.records.read().get(name).cloned() {
             return Some(rec);
         }
-        let target = self.inner.aliases.read().get(name).cloned()?;
+        let target = self.alias_target(name)?;
         self.inner.records.read().get(target.as_str()).cloned()
     }
 
@@ -3731,7 +3729,7 @@ impl PvDatabase {
                 return Some((canonical.clone(), rec.clone()));
             }
         }
-        let target = self.inner.aliases.read().get(name).cloned()?;
+        let target = self.alias_target(name)?;
         let records = self.inner.records.read();
         let (canonical, rec) = records.get_key_value(target.as_str())?;
         Some((canonical.clone(), rec.clone()))
@@ -3765,33 +3763,23 @@ impl PvDatabase {
     /// whole-database walk already goes through, makes every such pass
     /// deterministic and load-ordered at once.
     ///
-    /// The order key is the existing per-record `load_order` sequence (the
+    /// The order key is the record's own `load_order` sequence (the
     /// scan-index's secondary sort key), so this ordering and the scan lists'
-    /// ordering are the same fact, not two. A record with no sequence — none
-    /// exists; `add_record` is the only insertion path — would sort last by
-    /// name rather than nondeterministically.
+    /// ordering are the same fact, not two. A record cannot be missing one: it
+    /// is a field of its cell, set where the cell is built.
     pub async fn all_record_names(&self) -> Vec<String> {
-        // Lock order records → load_order (matching `add_record`/`remove_record`):
-        // the `records` map is a sync `parking_lot::RwLock` now, so its guard is
-        // `!Send` and MUST NOT be held across the async `load_order` read. Snapshot
-        // the keys under the records guard, release it (block close), then await
-        // load_order — neither lock is ever held while waiting on the other, so the
-        // records→load_order order is honoured without an AB-BA against add_record.
-        // The two reads are no longer one atomic snapshot: a record inserted between
-        // them is absent from `load_order` and sorts last by name via the
-        // `unwrap_or(u64::MAX)` fallback — the same degradation already defined for a
-        // sequence-less record, and every whole-database walk is racy against a
-        // concurrent add/remove regardless.
-        let mut names: Vec<String> = {
+        // One map, one guard: the sequence travels with the record, so the
+        // snapshot and the sort key come from the same read and there is no
+        // second structure to order a lock against.
+        let mut names: Vec<(u64, String)> = {
             let records = self.inner.records.read();
-            records.keys().map(|n| n.to_string()).collect()
+            records
+                .iter()
+                .map(|(name, rec)| (rec.load_order(), name.to_string()))
+                .collect()
         };
-        let load_order = self.inner.load_order.load();
-        names.sort_by(|a, b| {
-            let seq = |n: &String| load_order.get(n.as_str()).copied().unwrap_or(u64::MAX);
-            seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))
-        });
-        names
+        names.sort_unstable();
+        names.into_iter().map(|(_order, name)| name).collect()
     }
 
     /// Every node C's `dbFirstRecord` / `dbNextRecord` walk visits — the
@@ -3806,16 +3794,21 @@ impl PvDatabase {
     /// The caller groups by record type; an alias groups with its target,
     /// because C's alias node lives in the target's own type list.
     pub async fn all_db_nodes(&self) -> Vec<DbNode> {
-        // Same lock discipline as `all_record_names`: snapshot each map under
-        // its own guard and let the guard die with the statement, so no two
-        // are ever held at once and none is live across an await.
-        let mut nodes: Vec<DbNode> = {
+        // Each map is read under its own guard, which dies with the statement,
+        // so no two are ever held at once. Each node carries its own sequence,
+        // so the two reads need not be one snapshot to be ordered together.
+        let mut nodes: Vec<(u64, DbNode)> = {
             let records = self.inner.records.read();
             records
-                .keys()
-                .map(|name| DbNode {
-                    name: name.to_string(),
-                    alias_of: None,
+                .iter()
+                .map(|(name, rec)| {
+                    (
+                        rec.load_order(),
+                        DbNode {
+                            name: name.to_string(),
+                            alias_of: None,
+                        },
+                    )
                 })
                 .collect()
         };
@@ -3823,18 +3816,19 @@ impl PvDatabase {
             let aliases = self.inner.aliases.read();
             aliases
                 .iter()
-                .map(|(alias, target)| DbNode {
-                    name: alias.clone(),
-                    alias_of: Some(target.clone()),
+                .map(|(alias, node)| {
+                    (
+                        node.order,
+                        DbNode {
+                            name: alias.clone(),
+                            alias_of: Some(node.target.clone()),
+                        },
+                    )
                 })
                 .collect::<Vec<_>>()
         });
-        let load_order = self.inner.load_order.load();
-        nodes.sort_by(|a, b| {
-            let seq = |n: &DbNode| load_order.get(&n.name).copied().unwrap_or(u64::MAX);
-            seq(a).cmp(&seq(b)).then_with(|| a.name.cmp(&b.name))
-        });
-        nodes
+        nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        nodes.into_iter().map(|(_order, node)| node).collect()
     }
 
     /// Get all alias names registered against existing records.
@@ -3853,8 +3847,8 @@ impl PvDatabase {
         let aliases = self.inner.aliases.read();
         let mut hits: Vec<String> = aliases
             .iter()
-            .filter_map(|(alias, target)| {
-                if target == canonical {
+            .filter_map(|(alias, node)| {
+                if node.target == canonical {
                     Some(alias.clone())
                 } else {
                     None

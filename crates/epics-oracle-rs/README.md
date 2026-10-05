@@ -72,12 +72,20 @@ makes the harness and the catalogue check each other.
 
 ```sh
 cargo build -p epics-oracle-rs
-ORACLE_IOC_BIN=target/debug/oracle-ioc \
-  cargo run -p epics-oracle-rs --bin oracle -- --phase all --json out.json
+cargo run -p epics-oracle-rs --bin oracle -- --phase all --json out.json
 
 # one record type, one phase
 cargo run -p epics-oracle-rs --bin oracle -- --phase monitor --record-types calc
 ```
+
+Six phases: `read`, `put`, `monitor` and `array` — which is what `all` means —
+plus `pva-read` and `pva-monitor`, which it deliberately does not (see below).
+`--max-put-cases <n>` caps the put cases per record type for a fast pass, and
+the report still states the true denominator, so a capped run reads as LOW
+coverage rather than as a full sweep. `--allowlist <file>` replaces the shipped
+allowlist, `--dbd` the denominator (also `EPICS_ORACLE_DBD`), and
+`ORACLE_PUT_LANES` the put concurrency, which otherwise follows
+`available_parallelism`.
 
 Needs **two** C trees, and `CTools::discover` fails loudly if either is missing:
 
@@ -85,12 +93,26 @@ Needs **two** C trees, and `CTools::discover` fails loudly if either is missing:
   `/home/stevek/work/epics-base/bin/linux-x86_64`, override `EPICS_BASE_BIN`.
 - the fat ground-truth IOC — default
   `/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc`, override
-  `EPICS_ORACLE_IOC_BIN`. `--dbd` defaults to that same tree's expanded dbd.
+  `EPICS_ORACLE_IOC_BIN`. `--dbd` defaults to that same tree's
+  `dbd/softIoc.dbd`.
+
+The Rust side needs no variable: `RustIoc::binary` finds `oracle-ioc` beside
+the `oracle` binary (and under `cargo test`, through `CARGO_BIN_EXE_*`).
+`ORACLE_IOC_BIN` overrides that, and is **not** `EPICS_ORACLE_IOC_BIN` — the
+two names differ by one prefix and name opposite sides of the experiment.
 
 The PVA phases additionally need the pvxs tree (`PVXS_BIN`) and the fat
-`softIocPVX` beside the fat `softIoc`. Nothing is ever skipped when a
-prerequisite is absent — a silently skipped oracle is the false-clean we are
-escaping.
+`softIocPVX` beside the fat `softIoc` (`EPICS_ORACLE_PVX_IOC_BIN`). Neither
+falls back to a stock binary when the fat one is absent: the stock `softIocPVX`
+cannot load six of the denominator's record types, so a fallback would turn a
+missing build into 835 ERRORs and a 75.3 % coverage number that reads like a
+port defect. Nothing is ever skipped when a prerequisite is absent — a silently
+skipped oracle is the false-clean we are escaping.
+
+`cargo nextest run -p epics-oracle-rs` runs 219 tests. They test the harness
+itself — dbd parsing, case generation, adjudication, allowlist staleness — and
+need neither C tree; the two C-tree-dependent integration files (`tests/`) are
+the oracle runs themselves.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
 be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`

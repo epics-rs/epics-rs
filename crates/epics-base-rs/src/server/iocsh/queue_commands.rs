@@ -455,11 +455,11 @@ mod tests {
         assert!(!failed && err.is_empty(), "a plain count: {err:?}");
         assert_eq!(scan::parallel_threads(), (3, 1));
 
-        // Zero is the knob, which C declares 2 and leaves there.
+        // Zero is the knob, which C declares 8 and leaves there.
         let (_, _, failed) = run(&ctx, "scanParallelThreads", &["0", "0"]);
         assert!(!failed);
         assert_eq!(scan::parallel_threads().0, scan::parallel_threads_default());
-        assert_eq!(scan::parallel_threads_default(), 2);
+        assert_eq!(scan::parallel_threads_default(), 8);
 
         // Negative leaves that many CPUs without a helper, and never goes
         // below none at all. C applies the ceiling after this arithmetic, not

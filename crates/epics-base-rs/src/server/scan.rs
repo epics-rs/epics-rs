@@ -1008,9 +1008,11 @@ impl Drop for HelperStopGuard {
 /// C `scanParallelThreadsDefault` (`dbScan.c:158`) — what
 /// `scanParallelThreads(0, ...)` resolves to.
 ///
-/// C declares it `2` and, unlike `callbackParallelThreadsDefault`, leaves it
-/// there: no registration phase overwrites it with the processor count.
-static PARALLEL_THREADS_DEFAULT: AtomicI32 = AtomicI32::new(2);
+/// C declares it `8` and, unlike `callbackParallelThreadsDefault`, leaves it
+/// there: no registration phase overwrites it with the processor count. It is
+/// what the count resolves to, not a pool that exists — helpers are spawned
+/// only once `scanParallelThreads` has been called at all.
+static PARALLEL_THREADS_DEFAULT: AtomicI32 = AtomicI32::new(8);
 /// C `nHelpersConfigured` (`dbScan.c:160`) — already resolved and clamped by
 /// the `scanParallelThreads` command, as C resolves it inside the function.
 static CONFIGURED_HELPERS: AtomicI32 = AtomicI32::new(0);

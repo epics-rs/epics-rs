@@ -304,11 +304,57 @@ struct OverrunTracker {
     over_max: f64,
     report_delay: f64,
     reported: Instant,
-    /// Whether this IOC has helper threads at all, which decides which remedy
-    /// the report names. C reads the global `nHelpers` where it builds the
-    /// message (`dbScan.c:979`); it is fixed once `spawnHelpers` has run, so
-    /// the fact belongs to the tracker from the moment it is built.
-    helpers: bool,
+    /// Which remedy the report names. Resolved once, when the tracker is
+    /// built: both facts C reads at print time are already settled by then.
+    remedy: Remedy,
+}
+
+/// What the over-run report tells the operator to do about it — C builds the
+/// tail of the message from `nHelpers` and `epicsThreadGetCPUs()` at the point
+/// it prints (`dbScan.c:988-993`).
+///
+/// One state rather than the two booleans C tests in sequence: the three tails
+/// are mutually exclusive, both inputs are fixed once `spawnHelpers` has run,
+/// and a tracker that stored them separately would invite a site to test the
+/// CPU count on an IOC that already has helpers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Remedy {
+    /// Helpers exist, so one more — or one dedicated to this rate — is the
+    /// thing to add.
+    MoreHelpers,
+    /// No helper yet, and a CPU free to run one.
+    FirstHelper,
+    /// A single CPU: a helper there could only take turns with this thread,
+    /// so the report names no helper at all.
+    NoHelperWouldHelp,
+}
+
+impl Remedy {
+    /// The state of an IOC whose helper pool `helpers` says exists.
+    fn for_ioc(helpers: bool) -> Self {
+        if helpers {
+            Self::MoreHelpers
+        } else if crate::runtime::background::callback_executor::cpu_count() > 1 {
+            Self::FirstHelper
+        } else {
+            Self::NoHelperWouldHelp
+        }
+    }
+
+    /// The tail C appends to "move some records to a slower scan rate".
+    fn tail(self) -> &'static str {
+        match self {
+            Self::MoreHelpers => {
+                ",\n\tor add helper threads with scanParallelThreads() or \
+                 scanRateThreads() before iocInit."
+            }
+            Self::FirstHelper => {
+                ",\n\tor add helper threads with scanParallelThreads() before \
+                 iocInit."
+            }
+            Self::NoHelperWouldHelp => ".",
+        }
+    }
 }
 
 impl OverrunTracker {
@@ -321,7 +367,7 @@ impl OverrunTracker {
         }
     }
 
-    fn new(scan: ScanType, period: Duration, start: Instant, helpers: bool) -> Self {
+    fn new(scan: ScanType, period: Duration, start: Instant, remedy: Remedy) -> Self {
         Self {
             scan,
             period,
@@ -332,7 +378,7 @@ impl OverrunTracker {
             over_max: 0.0,
             report_delay: OVERRUN_REPORT_DELAY,
             reported: start,
-            helpers,
+            remedy,
         }
     }
 
@@ -371,15 +417,7 @@ impl OverrunTracker {
             if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
                 let period = self.period.as_secs_f64();
                 let scan = self.scan;
-                // C `dbScan.c:981-985`: the remedy names `scanRateThreads()`
-                // only where there is already a helper to add one to.
-                let remedy = if self.helpers {
-                    ",\n\tor add helper threads with scanParallelThreads() or \
-                     scanRateThreads() before iocInit."
-                } else {
-                    ",\n\tor add helper threads with scanParallelThreads() before \
-                     iocInit."
-                };
+                let remedy = self.remedy.tail();
                 let msg = format!(
                     "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
                  averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
@@ -1250,7 +1288,12 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         None,
     );
     let mut next = Instant::now() + period;
-    let mut overrun = OverrunTracker::new(scan_type, period, Instant::now(), duty.pool.is_some());
+    let mut overrun = OverrunTracker::new(
+        scan_type,
+        period,
+        Instant::now(),
+        Remedy::for_ioc(duty.pool.is_some()),
+    );
     loop {
         watched.check_in();
         // Sleep until the deadline or the stop signal, whichever first.
@@ -1573,17 +1616,17 @@ mod overrun_tests {
     use super::*;
 
     /// Drive `ticks` sweeps that each take `sweep` against a `period` list,
-    /// starting from `base`, on an IOC that has `helpers` helper threads or
-    /// none. Returns every warning the tracker emitted.
+    /// starting from `base`, on an IOC in the state `remedy` describes.
+    /// Returns every warning the tracker emitted.
     fn run(
         period: Duration,
         sweep: Duration,
         ticks: u32,
         base: Instant,
-        helpers: bool,
+        remedy: Remedy,
     ) -> Vec<String> {
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, helpers);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, remedy);
         let mut warnings = Vec::new();
         for i in 1..=ticks {
             let now = base + sweep * i;
@@ -1624,7 +1667,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, false);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
         let outcome = tracker.after_scan(&mut next, base + Duration::from_secs(3));
 
@@ -1643,7 +1686,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, false);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
         let now = base + Duration::from_secs(21);
         let outcome = tracker.after_scan(&mut next, now);
@@ -1663,7 +1706,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, false);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
         let now = base + Duration::from_secs(2);
         assert!(tracker.after_scan(&mut next, now).overran);
@@ -1681,11 +1724,11 @@ mod overrun_tests {
         let sweep = Duration::from_secs(2);
 
         assert!(
-            run(period, sweep, 9, base, false).is_empty(),
+            run(period, sweep, 9, base, Remedy::FirstHelper).is_empty(),
             "the ninth consecutive over-run is still silent"
         );
 
-        let warnings = run(period, sweep, 10, base, false);
+        let warnings = run(period, sweep, 10, base, Remedy::FirstHelper);
         assert_eq!(warnings.len(), 1, "the tenth reports");
         let w = &warnings[0];
         assert!(w.contains("from '1 second' scan thread"), "{w}");
@@ -1693,36 +1736,52 @@ mod overrun_tests {
         assert!(w.contains("move some records to a slower scan rate"), "{w}");
     }
 
-    /// BOUNDARY: the remedy the report names depends on whether any helper
-    /// thread exists — C `dbScan.c:981-985` tests `nHelpers == 0`. An IOC with
-    /// no helpers cannot be told to give a rate its own one, because
-    /// `scanRateThreads` without a pool is not what adds the first helper.
+    /// BOUNDARY: each of the three remedies C can name (`dbScan.c:988-993`).
+    /// An IOC with no helpers cannot be told to give a rate its own one,
+    /// because `scanRateThreads` without a pool is not what adds the first
+    /// helper; and an IOC with one CPU is told about no helper at all, because
+    /// one there could only take turns with the thread that is over-running.
     #[test]
-    fn the_remedy_names_scan_rate_threads_only_once_helpers_exist() {
+    fn each_remedy_names_only_what_would_help_this_ioc() {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let sweep = Duration::from_secs(2);
+        let tail = |remedy| {
+            let warnings = run(period, sweep, 10, base, remedy);
+            assert_eq!(warnings.len(), 1, "{remedy:?} reported once");
+            let head = "move some records to a slower scan rate";
+            let at = warnings[0]
+                .find(head)
+                .unwrap_or_else(|| panic!("{remedy:?}: {}", warnings[0]));
+            warnings[0][at + head.len()..].to_string()
+        };
 
-        let without = run(period, sweep, 10, base, false);
-        assert_eq!(without.len(), 1);
-        assert!(
-            without[0].ends_with(
-                "move some records to a slower scan rate,\n\tor add helper threads \
-                 with scanParallelThreads() before iocInit.\n"
-            ),
-            "{}",
-            without[0]
+        assert_eq!(
+            tail(Remedy::MoreHelpers),
+            ",\n\tor add helper threads with scanParallelThreads() or \
+             scanRateThreads() before iocInit.\n"
         );
+        assert_eq!(
+            tail(Remedy::FirstHelper),
+            ",\n\tor add helper threads with scanParallelThreads() before iocInit.\n"
+        );
+        assert_eq!(tail(Remedy::NoHelperWouldHelp), ".\n");
+    }
 
-        let with = run(period, sweep, 10, base, true);
-        assert_eq!(with.len(), 1);
-        assert!(
-            with[0].ends_with(
-                "move some records to a slower scan rate,\n\tor add helper threads \
-                 with scanParallelThreads() or scanRateThreads() before iocInit.\n"
-            ),
-            "{}",
-            with[0]
+    /// BOUNDARY: which remedy an IOC is in. A helper pool wins over the CPU
+    /// count — C tests `nHelpers` first — and the single-CPU state is reachable
+    /// only with no pool.
+    #[test]
+    fn a_helper_pool_decides_the_remedy_before_the_cpu_count_does() {
+        assert_eq!(Remedy::for_ioc(true), Remedy::MoreHelpers);
+        let alone = crate::runtime::background::callback_executor::cpu_count() <= 1;
+        assert_eq!(
+            Remedy::for_ioc(false),
+            if alone {
+                Remedy::NoHelperWouldHelp
+            } else {
+                Remedy::FirstHelper
+            }
         );
     }
 
@@ -1738,7 +1797,7 @@ mod overrun_tests {
             Duration::from_secs(2),
             21,
             base,
-            false,
+            Remedy::FirstHelper,
         );
 
         assert_eq!(warnings.len(), 2, "reports at tick 10 and tick 21");
@@ -1753,7 +1812,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, false);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
         // Nine over-runs, then one sweep that beats its deadline.
         for i in 1..=9u32 {

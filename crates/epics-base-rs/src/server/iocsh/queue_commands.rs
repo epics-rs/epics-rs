@@ -182,9 +182,10 @@ fn cmd_scan_parallel_threads() -> CommandDef {
             },
         ],
         "scanParallelThreads <no of threads> <kept off slower rates> — Configure helper \
-         threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault, a \
-         negative count leaves that many CPUs without a helper. The second argument keeps \
-         that many helpers off the slower rates (0: one, negative: none).",
+         threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault (at \
+         most CPUs - 1), a negative count leaves that many CPUs without a helper. The \
+         second argument keeps that many helpers off the slower rates (0: one, negative: \
+         none).",
         |args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::scan;
             if scan::periodic_lists_built() {
@@ -198,7 +199,13 @@ fn cmd_scan_parallel_threads() -> CommandDef {
             let mut count = if asked < 0 {
                 crate::runtime::background::callback_executor::cpu_count() as i64 + asked
             } else if asked == 0 {
-                scan::parallel_threads_default() as i64
+                // C `dbScan.c:307-314`: the default leaves one CPU to the
+                // leaders, so on a single CPU it asks for no helper at all —
+                // one there could only take turns with the thread it is
+                // helping. The `.max(0)` below is C's own `count < 0` clamp.
+                let leaders_cpu =
+                    crate::runtime::background::callback_executor::cpu_count() as i64 - 1;
+                (scan::parallel_threads_default() as i64).min(leaders_cpu)
             } else {
                 asked
             }
@@ -524,11 +531,18 @@ mod tests {
         assert!(!failed && err.is_empty(), "a plain count: {err:?}");
         assert_eq!(scan::parallel_threads(), (3, 1));
 
-        // Zero is the knob, which C declares 8 and leaves there.
+        // Zero is the knob, which C declares 8 and leaves there — but capped
+        // at one less than the CPU count (`dbScan.c:307-314`), so the knob's
+        // value is what a box with enough CPUs gets and no box gets a helper
+        // per CPU. A single-CPU box resolves zero to no helper at all.
         let (_, _, failed) = run(&ctx, "scanParallelThreads", &["0", "0"]);
         assert!(!failed);
-        assert_eq!(scan::parallel_threads().0, scan::parallel_threads_default());
         assert_eq!(scan::parallel_threads_default(), 8);
+        assert_eq!(
+            scan::parallel_threads().0,
+            scan::parallel_threads_default().min(cpus - 1).max(0),
+            "the default is capped at CPUs - 1 ({cpus} CPUs here)"
+        );
 
         // Negative leaves that many CPUs without a helper, and never goes
         // below none at all. C applies the ceiling after this arithmetic, not

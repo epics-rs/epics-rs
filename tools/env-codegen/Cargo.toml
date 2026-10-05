@@ -4,6 +4,6 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "EPICS"
-description = "Offline generator: EPICS CONFIG_ENV/CONFIG_SITE_ENV -> the Rust ENV_PARAM table for epics-base-rs"
+description = "Offline generator: EPICS CONFIG_ENV/CONFIG_SITE_ENV -> the Rust ENV_PARAM table and Base version for epics-libcom-rs"
 
 [dependencies]

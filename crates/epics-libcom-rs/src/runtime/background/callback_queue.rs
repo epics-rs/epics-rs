@@ -308,7 +308,7 @@ impl<T> Pool<T> {
     /// # Safety
     ///
     /// `g` must be an index this arena has published — every index reachable
-    /// from a link or from [`Pool::alloc`] is.
+    /// from a link or from [`Pool::alloc_ring`] / [`Pool::alloc_task`] is.
     #[inline]
     unsafe fn get(&self, g: u32) -> &Node<T> {
         let (c, off) = locate(g);
@@ -711,7 +711,7 @@ impl<T> BandQueue<T> {
 
     /// Link a batch's tail onto `ready` and swing the root to its first entry.
     ///
-    /// Sequentially consistent for the same reason as [`BandQueue::push`]: the
+    /// Sequentially consistent for the same reason as [`BandQueue::publish`]: the
     /// publisher's own next step is to check whether a worker is parked next to
     /// the batch it just published.
     fn publish_ready(&self, first: u32, tail: u32, at: &mut ReadyCursor) {

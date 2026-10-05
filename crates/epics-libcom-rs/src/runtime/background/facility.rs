@@ -5,14 +5,21 @@
 //! ([`super::delayed_timer`]) behind `sleep`, `interval`, scan periods and
 //! `callbackRequestDelayed`; the scanOnce worker ([`super::scan_once`]) behind
 //! FLNK and `scanOnce`; and the callback bands
-//! ([`super::callback_executor`]). Each owns a `Mutex` + `Condvar` queue and
-//! runs callbacks its callers supplied. Two defects follow from that shape,
-//! and they were the same defect in all three files:
+//! ([`super::callback_executor`]). Each owns a queue and runs callbacks its
+//! callers supplied. Two defects follow from that shape, and they were the
+//! same defect in all three files:
 //!
 //! * `.lock().unwrap()` propagates a poisoned mutex. Poison means "a thread
 //!   panicked while holding this", not "the data is broken" — these queues are
 //!   plain collections whose invariants survive a panic — so propagating turns
-//!   one caller's panic into the loss of the whole facility.
+//!   one caller's panic into the loss of the whole facility. The three
+//!   facilities no longer have a poisonable lock at all: their queues are a
+//!   [`PriorityInheritanceMutex`](crate::runtime::sync::PriorityInheritanceMutex)
+//!   and an [`Event`](crate::runtime::sync::Event) apiece, taken for C's
+//!   priority-inheritance parity, and neither poisons.
+//!   `no_facility_propagates_a_poisoned_lock` is what keeps a
+//!   `std::sync::Mutex` from coming back into one of them; [`recover`] stays
+//!   for the `std` locks elsewhere in the IOC that do poison.
 //! * A caller-supplied callback runs **on the facility thread**. An unwinding
 //!   callback therefore unwinds the loop and the thread ends. Nothing
 //!   announces it: submitters keep enqueueing, the IOC keeps answering CA and
@@ -249,7 +256,10 @@ mod tests {
 
     /// The treatment is uniform across the three facilities, or it is not a
     /// treatment. A `.lock().unwrap()` reintroduced in any of them is one
-    /// caller's panic away from taking that facility down.
+    /// caller's panic away from taking that facility down — and a
+    /// `std::sync::Mutex` or `Condvar` is what would bring the `.unwrap()`
+    /// back, as well as putting a non-PI lock between a requester and this
+    /// facility's own lower-priority worker.
     #[test]
     fn no_facility_propagates_a_poisoned_lock() {
         let files = [
@@ -273,12 +283,16 @@ mod tests {
         // Split so this file's own needles do not match when it is read.
         let poison = concat!(".lock()", ".unwrap()");
         let wait_poison = concat!(".wait(", "st).unwrap()");
+        let poisonable = [concat!("std::sync::", "Mutex"), concat!("Cond", "var")];
 
         let mut offences = Vec::new();
         for (label, src, facility) in files {
             let prod = production(src, Comments::Strip);
             for (n, line) in prod.lines().enumerate() {
-                if line.contains(poison) || line.contains(wait_poison) {
+                if line.contains(poison)
+                    || line.contains(wait_poison)
+                    || poisonable.iter().any(|n| line.contains(n))
+                {
                     offences.push(format!("{label}:{}", n + 1));
                 }
             }

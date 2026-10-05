@@ -375,10 +375,10 @@ struct LockSet {
     id: u64,
     /// C's `lockSet::lock` (`:32`) — the mutex `dbScanLock` takes.
     lock: PriorityInheritanceMutex<()>,
-    /// Position of this set's mutex among this file's entries in the process
-    /// mutex list, so [`lock_set_mutex_rows`] can hand back the row
-    /// `epicsMutexShow` prints for it. See [`SET_MUTEX_SEQ`].
-    mutex_seq: u64,
+    /// The address the process mutex list lists `lock` under, so
+    /// [`mutex_rows_by_addr`] can hand back the row `epicsMutexShow` prints
+    /// for this set and no other.
+    mutex_addr: usize,
     /// The thread currently inside `lock`, or 0. Written only by that thread.
     owner: AtomicU64,
     /// How deep that thread's recursion is. C's `epicsMutex` is recursive by
@@ -522,36 +522,21 @@ impl LockRecord {
 /// costs nothing and makes an A/B against a C IOC read straight across.
 const FIRST_SET_ID: u64 = 2;
 
-/// Serialises lock-set mutex creation with its sequence counter.
-///
-/// The process mutex list ([`mutex_report`]) has no per-mutex accessor, so a
-/// set finds its own row positionally. That is exact only if the order sets
-/// are appended to the list is the order they take sequence numbers, which
-/// this lock is what guarantees — several `PvDatabase`s in one process each
-/// run their own registry mutex and would otherwise interleave. Nothing is
-/// acquired while it is held.
-static SET_MUTEX_SEQ: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-
 /// Mint one set. Every `LockSet` in the process comes from here.
 fn new_set(id: u64) -> Set {
-    let mut seq = SET_MUTEX_SEQ.lock().unwrap_or_else(|e| e.into_inner());
-    let mutex_seq = *seq;
-    *seq += 1;
-    // The mutex is created UNDER `SET_MUTEX_SEQ` so its position in the
-    // process mutex list matches `mutex_seq`. This is the only
-    // `PriorityInheritanceMutex::new` in this file, which is what makes
-    // filtering that list by creating file select exactly these mutexes.
-    let set: Set = Box::leak(Box::new(LockSet {
+    let lock = PriorityInheritanceMutex::new(());
+    // The mutex names its own row, so no two sets can be confused for each
+    // other and nothing has to be serialised against the process mutex list.
+    let mutex_addr = lock.registered_addr();
+    Box::leak(Box::new(LockSet {
         id,
-        lock: PriorityInheritanceMutex::new(()),
-        mutex_seq,
+        lock,
+        mutex_addr,
         owner: AtomicU64::new(0),
         depth: AtomicUsize::new(0),
         many_holds: AtomicUsize::new(0),
         held: std::cell::UnsafeCell::new(None),
-    }));
-    drop(seq);
-    set
+    }))
 }
 
 /// The set every record locks through until a registry gives it one — C's
@@ -559,9 +544,9 @@ fn new_set(id: u64) -> Set {
 /// set from its first access rather than only from `iocInit` on.
 ///
 /// One per process, never in any registry's `active` or `free` list, and
-/// its id `0` is never a set id (`FIRST_SET_ID` is 2). It is created in this
-/// file under [`SET_MUTEX_SEQ`] like every other set, so it holds a row in
-/// the process mutex list and shifts nothing — see [`lock_set_mutex_rows`].
+/// its id `0` is never a set id (`FIRST_SET_ID` is 2). It comes from
+/// [`new_set`] like every other set, so it holds a row in the process mutex
+/// list of its own — see [`mutex_rows_by_addr`].
 fn bootstrap_set() -> Set {
     static BOOTSTRAP: std::sync::OnceLock<Set> = std::sync::OnceLock::new();
     BOOTSTRAP.get_or_init(|| new_set(0))
@@ -1196,34 +1181,25 @@ impl Registry {
         self.active.values().map(|state| state.set).collect()
     }
 
-    fn info(&self, id: u64, rows: &HashMap<u64, MutexInfo>) -> LockSetInfo {
+    fn info(&self, id: u64, rows: &HashMap<usize, MutexInfo>) -> LockSetInfo {
         let state = &self.active[&id];
         LockSetInfo {
             id,
             members: state.members.iter().cloned().collect(),
             refs: state.members.len() + state.set.many_holds.load(Ordering::Relaxed),
             locked: state.set.is_locked(),
-            mutex: rows.get(&state.set.mutex_seq).cloned(),
+            mutex: rows.get(&state.set.mutex_addr).cloned(),
         }
     }
 }
 
-/// The row `epicsMutexShow` prints for each lock-set mutex, keyed by
-/// [`LockSet::mutex_seq`].
-///
-/// Positional because the process mutex list exposes no per-mutex accessor.
-/// It is exact: [`Registry::make_set`] is the only `PriorityInheritanceMutex`
-/// created in this file, so filtering by creating file selects exactly the
-/// lock-set mutexes; creation is serialised by [`SET_MUTEX_SEQ`]; and a set's
-/// cell is never dropped, so no entry ever leaves the list and shifts the
-/// ones behind it.
-fn lock_set_mutex_rows() -> HashMap<u64, MutexInfo> {
+/// Every row of the process mutex list, keyed by the address it reports —
+/// which is [`LockSet::mutex_addr`] for a lock set's own mutex.
+fn mutex_rows_by_addr() -> HashMap<usize, MutexInfo> {
     mutex_report(false)
         .shown
         .into_iter()
-        .filter(|info| info.file() == file!())
-        .enumerate()
-        .map(|(seq, info)| (seq as u64, info))
+        .map(|info| (info.addr(), info))
         .collect()
 }
 
@@ -1440,7 +1416,7 @@ impl PvDatabase {
     /// C's `lockSetsActive` and `lockSetsFree` as `dblsr("*", n)` and
     /// `dbLockShowLocked(n)` read them.
     pub fn lock_set_report(&self) -> LockSetReport {
-        let rows = lock_set_mutex_rows();
+        let rows = mutex_rows_by_addr();
         let registry = self.inner.record_locks.lock();
         LockSetReport {
             active: registry
@@ -1462,7 +1438,7 @@ impl PvDatabase {
         let canonical = self
             .resolve_alias(record)
             .unwrap_or_else(|| record.to_string());
-        let rows = lock_set_mutex_rows();
+        let rows = mutex_rows_by_addr();
         let registry = self.inner.record_locks.lock();
         let id = registry.real_set_of(&canonical)?.id;
         Some(registry.info(id, &rows))
@@ -2061,25 +2037,32 @@ mod tests {
         assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
 
-    /// The positional association between a set and its `epicsMutexShow` row
-    /// is only exact while `make_set` is the ONLY `PriorityInheritanceMutex`
-    /// created in this file. This is that check: one row for every set ever
-    /// made in this process, and not one more.
+    /// A set finds its `epicsMutexShow` row by its own mutex's address, so
+    /// every set gets a row of its own and a mutex created anywhere else —
+    /// including in this file — is never mistaken for a set's.
     #[test]
-    fn this_file_creates_no_mutex_but_lock_sets() {
+    fn every_set_reports_the_row_of_its_own_mutex() {
         let db = PvDatabase::new();
         for name in ["MS:1", "MS:2", "MS:3"] {
             drop(db.lock_record(name));
         }
-        let made = *SET_MUTEX_SEQ.lock().unwrap();
-        assert_eq!(
-            lock_set_mutex_rows().len() as u64,
-            made,
-            "a second mutex created in this file would shift every set's row"
-        );
+        let decoy: PriorityInheritanceMutex<()> = PriorityInheritanceMutex::new(());
+
+        let mut claimed = std::collections::HashSet::new();
         for set in db.lock_set_report().active {
-            assert!(set.mutex.is_some(), "set {} has no row", set.id);
+            let row = set
+                .mutex
+                .unwrap_or_else(|| panic!("set {} has no row", set.id));
+            assert_eq!(row.file(), file!(), "a set's mutex is created here");
+            assert_ne!(
+                row.addr(),
+                decoy.registered_addr(),
+                "set {} claimed a mutex that is not a lock set's",
+                set.id
+            );
+            assert!(claimed.insert(row.addr()), "two sets claim one row");
         }
+        drop(decoy);
     }
 
     /// `RecordCell::read_in` rides the set its caller holds when the target

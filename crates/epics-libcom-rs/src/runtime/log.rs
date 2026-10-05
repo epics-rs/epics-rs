@@ -17,6 +17,8 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::runtime::sync::{Event, EventWaiter, PriorityInheritanceMutex};
+
 /// True when no `tracing` subscriber would take an event — i.e. when
 /// everything this module emits is being discarded.
 ///
@@ -694,14 +696,36 @@ struct ErrlogQueue {
     at_exit: bool,
     to_console: bool,
     flush_seq: u64,
+    /// Producers blocked in [`errlog_flush`], C's `pvt.nFlushers`
+    /// (`errlog.c:103`, also under `msgQueueLock`). C counts them and chains
+    /// one binary event from each released flusher to the next
+    /// (`:191-217`); one event per flusher is the same rendezvous without the
+    /// chain, and it is what lets this lock be the PI one.
+    flushers: Vec<Flusher>,
+}
+
+/// One producer waiting for the worker to finish a pass.
+struct Flusher {
+    /// The `flush_seq` the flusher saw when it registered. The worker has
+    /// given it the pass it came for once `flush_seq` is past this, which is
+    /// also the worker's test for whether it may go back to sleep.
+    start: u64,
+    event: std::sync::Arc<Event>,
 }
 
 struct Errlog {
-    queue: std::sync::Mutex<ErrlogQueue>,
-    /// C `pvt.waitForWork`.
-    work: std::sync::Condvar,
-    /// C `pvt.waitForSeq`.
-    seq: std::sync::Condvar,
+    /// C's `pvt.msgQueueLock`, and an `epicsMutex` there (`errlog.c:95`) — so
+    /// a [`PriorityInheritanceMutex`] here.
+    ///
+    /// Every line any thread logs passes through this lock, and the thread
+    /// that holds it longest is the `errlog` worker at
+    /// [`ThreadPriority::Low`](crate::runtime::task::ThreadPriority::Low).
+    /// Fused to a `Condvar` the lock could not be the PI one, so a record at
+    /// High logging an alarm waited behind a Low worker for as long as
+    /// anything in between cared to run.
+    queue: PriorityInheritanceMutex<ErrlogQueue>,
+    /// C `pvt.waitForWork` (`errlog.c:93`) — one waiter, the worker.
+    work: Event,
     listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
     next_id: std::sync::atomic::AtomicU64,
     /// Set once, after the worker thread is known to exist.
@@ -742,7 +766,7 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
     ERRLOG.get_or_init(|| {
         let (buf_size, max_msg_size) = errlog_clamp_sizes(bufsize, max_msg_size);
         let errlog: &'static Errlog = Box::leak(Box::new(Errlog {
-            queue: std::sync::Mutex::new(ErrlogQueue {
+            queue: PriorityInheritanceMutex::new(ErrlogQueue {
                 buf_size,
                 max_msg_size,
                 log: ErrlogBuf::new(),
@@ -752,9 +776,9 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
                 // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
                 to_console: true,
                 flush_seq: 0,
+                flushers: Vec::new(),
             }),
-            work: std::sync::Condvar::new(),
-            seq: std::sync::Condvar::new(),
+            work: Event::new(),
             listeners: std::sync::Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             worker_running: std::sync::atomic::AtomicBool::new(false),
@@ -785,16 +809,37 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
 /// C `errlogThread` (`errlog.c:624-720`): swap the buffers, drain the snapshot
 /// with the queue UNLOCKED, then report anything the arena refused.
 fn errlog_worker(errlog: &'static Errlog) {
-    let mut q = errlog.queue.lock().expect("errlog queue");
+    let parked = errlog.work.waiter();
+    let mut q = errlog.queue.lock();
     loop {
         q.flush_seq += 1;
-        errlog.seq.notify_all();
+        // C triggers `waitForSeq` once and lets the released flusher chain to
+        // the next (`errlog.c:204-215`); each flusher owning an event means
+        // the pass is announced to all of them here instead.
+        for f in &q.flushers {
+            if f.start < q.flush_seq {
+                f.event.signal();
+            }
+        }
 
         if q.log.entries.is_empty() {
             if q.at_exit {
                 break;
             }
-            q = errlog.work.wait(q).expect("errlog queue");
+            drop(q);
+            // A flusher that registered while this thread was asleep is the
+            // second reason to get up, and the reason it is a *condition* and
+            // not a token: C's `waitForWork` latches a trigger, so its worker
+            // can be woken by a flusher it has already served and simply make
+            // one more empty pass. Asking whether any flusher is still short
+            // of its pass answers the same question without the extra pass.
+            parked.wait_until(|| {
+                let q = errlog.queue.lock();
+                !q.log.entries.is_empty()
+                    || q.at_exit
+                    || q.flushers.iter().any(|f| f.start >= q.flush_seq)
+            });
+            q = errlog.queue.lock();
             continue;
         }
 
@@ -834,7 +879,7 @@ fn errlog_worker(errlog: &'static Errlog) {
             eprintln!("errlog: lost {n_lost} messages");
         }
 
-        q = errlog.queue.lock().expect("errlog queue");
+        q = errlog.queue.lock();
         q.print = print;
     }
 }
@@ -884,7 +929,7 @@ fn errlog_post(message: &str, echo: ConsoleEcho) {
     // C reads it before the lock (`errlog.c:147`); it is this thread's own.
     let ok_to_block = crate::runtime::task::thread_is_ok_to_block();
 
-    let mut q = errlog.queue.lock().expect("errlog queue");
+    let mut q = errlog.queue.lock();
     let was_empty = q.log.pos == 0;
     let at_exit = q.at_exit;
     // One read of `eltc` per message, under the same lock that admits it.
@@ -893,7 +938,7 @@ fn errlog_post(message: &str, echo: ConsoleEcho) {
     drop(q);
 
     if accepted && was_empty {
-        errlog.work.notify_all();
+        errlog.work.signal();
     }
     console_fallback(message, local_echo);
 
@@ -964,24 +1009,42 @@ fn errlog_clamp_sizes(bufsize: usize, max_msg_size: usize) -> (usize, usize) {
 
 /// C `errlogSequence` (`errlog.c:189-217`): block until the worker completes
 /// one pass of its loop.
-fn errlog_sequence() {
-    let errlog = errlog_pvt();
-    let mut q = errlog.queue.lock().expect("errlog queue");
-    if q.at_exit {
-        return;
-    }
-    let seq = q.flush_seq;
-    while q.flush_seq == seq && !q.at_exit {
-        errlog.work.notify_all();
-        q = errlog.seq.wait(q).expect("errlog queue");
-    }
+///
+/// The event is the caller's, not the facility's, so the two sequences
+/// [`errlog_flush`] needs cost one allocation between them and the worker
+/// needs no chain to pass a wake from one waiting producer to the next.
+fn errlog_sequence(errlog: &'static Errlog, mine: &std::sync::Arc<Event>, waiter: &EventWaiter) {
+    let start = {
+        let mut q = errlog.queue.lock();
+        if q.at_exit {
+            return;
+        }
+        let start = q.flush_seq;
+        q.flushers.push(Flusher {
+            start,
+            event: std::sync::Arc::clone(mine),
+        });
+        start
+    };
+    // C `errlog.c:209` — force the worker to wake and increment the sequence.
+    errlog.work.signal();
+    waiter.wait_until(|| {
+        let q = errlog.queue.lock();
+        q.flush_seq != start || q.at_exit
+    });
+    let mut q = errlog.queue.lock();
+    q.flushers
+        .retain(|f| !std::sync::Arc::ptr_eq(&f.event, mine));
 }
 
 /// C `errlogFlush` (`errlog.c:614-622`): TWO sequences, because it takes both
 /// buffers being handled to know every message logged so far has been seen.
 pub fn errlog_flush() {
-    errlog_sequence();
-    errlog_sequence();
+    let errlog = errlog_pvt();
+    let mine = std::sync::Arc::new(Event::new());
+    let waiter = mine.waiter();
+    errlog_sequence(errlog, &mine, &waiter);
+    errlog_sequence(errlog, &mine, &waiter);
 }
 
 /// C `errlogAddListener` (`errlog.c:417-431`).
@@ -1056,7 +1119,7 @@ pub fn errlog_show(level: u32) -> Vec<String> {
     // Snapshot under the queue lock, format outside it: the queue is the one
     // lock a formatting path must not be holding if it ever logs.
     let (buf_size, max_msg_size, log, print) = {
-        let q = errlog.queue.lock().expect("errlog queue");
+        let q = errlog.queue.lock();
         (
             q.buf_size,
             q.max_msg_size,
@@ -1104,7 +1167,7 @@ pub fn errlog_show(level: u32) -> Vec<String> {
 pub fn eltc(yesno: bool) -> bool {
     let errlog = errlog_pvt();
     let previous = {
-        let mut q = errlog.queue.lock().expect("errlog queue");
+        let mut q = errlog.queue.lock();
         std::mem::replace(&mut q.to_console, yesno)
     };
     errlog_flush();
@@ -1114,13 +1177,13 @@ pub fn eltc(yesno: bool) -> bool {
 /// Whether errlog messages currently reach the console — the `eltc` setting.
 #[must_use]
 pub fn errlog_to_console() -> bool {
-    errlog_pvt().queue.lock().expect("errlog queue").to_console
+    errlog_pvt().queue.lock().to_console
 }
 
 /// How many messages the buffer has refused since the last drain reported.
 #[must_use]
 pub fn errlog_messages_lost() -> usize {
-    errlog_pvt().queue.lock().expect("errlog queue").n_lost
+    errlog_pvt().queue.lock().n_lost
 }
 
 /// C `errlogStripANSI` (`errlog.c:269-313`) — remove CSI escape sequences.
@@ -1469,6 +1532,7 @@ mod tests {
             at_exit: false,
             to_console: true,
             flush_seq: 0,
+            flushers: Vec::new(),
         }
     }
 
@@ -1628,6 +1692,72 @@ mod tests {
                 "prologue={prologue}: C waits exactly when `epicsThreadIsOkToBlock`"
             );
         }
+    }
+
+    /// Boundary: more than one producer inside the flush rendezvous at once.
+    ///
+    /// C triggers `waitForSeq` once and has the released flusher re-trigger it
+    /// for the next (`errlog.c:214-217`), because its event is binary — one
+    /// trigger releases one waiter. Each flusher owning its own event is what
+    /// replaces that chain; a rendezvous that kept the single event and
+    /// dropped the chain would leave every flusher but one blocked for the
+    /// life of the IOC. Holding the worker in a listener makes it decidable:
+    /// while the gate is shut not one of them may return, and once it opens
+    /// all of them must.
+    #[test]
+    #[serial(errlog_listeners)]
+    fn every_producer_in_the_flush_rendezvous_is_released() {
+        const FLUSHERS: usize = 8;
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let holding = std::sync::atomic::AtomicBool::new(false);
+        let id = errlog_add_listener(move |_| {
+            if !holding.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().expect("gate").recv();
+            }
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
+        let waiting: Vec<_> = (0..FLUSHERS)
+            .map(|i| {
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    // A plain thread is `epicsThreadIsOkToBlock`, which is the
+                    // only kind that waits — see
+                    // `only_a_blocking_producer_waits_for_the_drain`.
+                    errlog_printf(&format!("rendezvous {i}\n"));
+                    let _ = done_tx.send(i);
+                })
+            })
+            .collect();
+        drop(done_tx);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reaches the listener");
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a producer returned while the drain it waits for was still gated"
+        );
+
+        let _ = release_tx.send(());
+        let mut released = Vec::new();
+        for _ in 0..FLUSHERS {
+            released.push(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("every producer in the rendezvous is released"),
+            );
+        }
+        for t in waiting {
+            t.join().expect("a producer thread");
+        }
+        released.sort_unstable();
+        assert_eq!(released, (0..FLUSHERS).collect::<Vec<_>>());
+        errlog_flush();
+        assert!(errlog_remove_listener(id));
     }
 
     /// The same burst with the console off, which is C's other answer and the

@@ -12,28 +12,70 @@
 //! signals the band's event; `callbackTask` (`callback.c:210`) waits on the
 //! event, drains the ring, and invokes each callback.
 //!
-//! This module keeps that structure but with **plain `std` threads +
-//! `Mutex`/`Condvar`** and boxed closures instead of C function pointers, so
-//! it carries **no tokio-runtime dependency** and runs on RTEMS
+//! This module keeps that structure but with **plain `std` threads and a
+//! lock-free band queue** and boxed closures instead of C function pointers,
+//! so it carries **no tokio-runtime dependency** and runs on RTEMS
 //! (armv7-rtems-eabihf). The OS thread priority per band is applied
 //! best-effort via the existing [`apply_to_current_thread`](crate::runtime::task::apply_to_current_thread) abstraction in
 //! [`crate::runtime::task`] — this module does **not** duplicate that logic.
 //!
-//! ## Overflow hysteresis (`callback.c:365-374`, `:227`)
+//! ## No lock on the band (epics-base PR #996)
 //!
-//! C sets a per-band `queueOverflow` flag when a push finds the ring full; a
-//! subsequent `callbackRequest` returns `S_db_bufFull` *immediately*
-//! (`callback.c:365`) without even attempting a push, until a worker pops an
-//! entry and clears the flag (`callback.c:227`). We reproduce that exact
-//! latch: once `overflow` is set, `request` rejects until a worker drains one
-//! entry.
+//! A band is crossed by every priority in the IOC, so whatever guards it is a
+//! priority-inversion site. C guards its ring with `epicsSpin`, which on Linux
+//! is a priority-inheriting `pthread_mutex` whenever POSIX thread priority
+//! scheduling is available (`osdSpin.c:126`); inheritance bounds the inversion
+//! by boosting the holder. This port has nothing to boost on that path: a
+//! `callbackRequest` is one CAS onto `callback_queue::BandQueue`'s inbox and
+//! owns nothing, so a requester descheduled anywhere in it delays no one,
+//! whatever its priority. Inside the band, one worker does briefly own the
+//! root it is refilling — see that module for why that window is not an
+//! inversion site, and for why the queue is addressed by arena index rather
+//! than by pointer.
+//!
+//! C also signals the band's event on every push (`callback.c:375`) and
+//! re-triggers it on every pop that leaves work behind (`callback.c:224`), so
+//! a band pays a wake-up per entry whether or not a worker is actually asleep.
+//! That is the other half of what epics-base PR #996 attacks, with a wake-up
+//! token per worker. Here a push wakes a worker only while one is parked, and
+//! the announce/poll pair that makes that safe is in
+//! `callback_queue::Parking`.
+//!
+//! What PR #996 shows is worth taking is the take-all inbox; what it keeps
+//! that this does not is the *private* batch. A batch that becomes the
+//! property of the worker that took it strands its tail behind one callback
+//! that blocks, even while other workers of the band sit idle — two callbacks
+//! that have to meet then deadlock, which C's shared ring does not
+//! (`a_blocked_callback_does_not_strand_its_neighbours`). The private batch
+//! was implemented here, measured against that invariant, and withdrawn; the
+//! band now takes the inbox all at once and publishes it to a stack every
+//! worker pops from, so an entry becomes a worker's property only as that
+//! worker takes it.
+//!
+//! ## A full band (`callback.c:874-877` as of epics-base PR #996)
+//!
+//! Whether a band is full is the slot supply's answer and nothing else's
+//! (`callback_queue::Pool`): a request that gets no slot is refused, counted
+//! against `queueOverflows` and named on the log, and the next request is
+//! accepted the moment a slot comes back. There is no second cell recording
+//! that the band *was* full.
+//!
+//! Older base keeps one, `cbQueueSet.queueOverflow`, and turns the next
+//! `callbackRequest` away on it without attempting a push (`callback.c:365`
+//! pre-#996), until a worker pops an entry and clears it (`:227`). That flag
+//! is raised *after* the push it failed, so a worker draining the ring in
+//! between clears it first and the raise lands on an empty ring — from then
+//! on every `callbackRequest` is refused with every slot free, the only
+//! writer of the clear is a pop, and a pop needs a push. The band never
+//! recovers, and it goes quiet while dead, because the message sits past the
+//! gate too. PR #996 drops the flag along with the ring; so does this.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 
-use super::facility::{recover, run_facility_loop, run_isolated};
+use super::callback_queue::{BandQueue, Parking, ReadyCursor, Returns};
+use super::facility::{run_facility_loop, run_isolated};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
@@ -238,9 +280,8 @@ impl CallbackPriority {
 /// surfacing an error to the caller (`callback.c:237-284`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
-    /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`). Either
-    /// the push found the ring at capacity, or the overflow latch is still set
-    /// from a prior full push (`callback.c:365`).
+    /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`): the
+    /// push found every slot of the ring taken.
     QueueFull,
 }
 
@@ -255,62 +296,78 @@ enum Queued {
     Task(Callback),
 }
 
-/// Mutable, lock-guarded state of one priority band's ring.
-struct QueueState {
-    queue: VecDeque<Queued>,
-    /// Ring slots in use — the `Queued::Ring` entries in `queue`. This, not
-    /// `queue.len()`, is what C's bounded ring measures: a task's run-queue
-    /// entry shares the FIFO but holds no ring slot.
-    ring_used: usize,
-    /// C `epicsRingPointerGetHighWaterMark` on the band's ring — the
-    /// deepest the queue has ever been. `callbackQueueShow` reports it
-    /// and `callbackQueueStatus(reset=1)` clears it
-    /// (`callback.c:115-139`), so it is not derivable from `queue.len()`
-    /// after the fact and has to be latched on every push.
-    high_water: usize,
-    /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
-    overflow: bool,
-    /// C `cbQueueSet.queueOverflows` — lifetime overflow count
-    /// (`callback.c:57`).
-    overflows: u64,
-    shutdown: bool,
-}
-
-/// One priority band: a bounded ring plus its wake-up condvar. Mirrors C
-/// `cbQueueSet` (`callback.c:53-62`).
+/// One priority band: a bounded lock-free FIFO plus the park slots its workers
+/// sleep in. Mirrors C `cbQueueSet` (`callback.c:53-62`).
 struct PriorityQueue {
     capacity: usize,
-    state: Mutex<QueueState>,
-    /// C `cbQueueSet.semWakeUp` (`callback.c:54`).
-    wake: Condvar,
+    queue: BandQueue<Queued>,
+    /// The deepest the ring has been since the last reset — C
+    /// `epicsRingPointerGetHighWaterMark`, which `callbackQueueShow` reports
+    /// and `callbackQueueStatus(reset=1)` clears (`callback.c:115-139`). Not
+    /// derivable after the fact, so it is latched on the pushes that deepen
+    /// the ring; a push that does not deepen it only reads.
+    high_water: AtomicUsize,
+    /// C `cbQueueSet.queueOverflows` — lifetime overflow count
+    /// (`callback.c:57`).
+    overflows: AtomicU64,
+    shutdown: AtomicBool,
+    /// C `cbQueueSet.semWakeUp` (`callback.c:54`), as one park slot per
+    /// worker. Cache-line aligned, and kept out of `used`'s line — see
+    /// `callback_queue::Parking`.
+    parking: Parking,
 }
 
 impl PriorityQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, workers: usize) -> Self {
         PriorityQueue {
             capacity,
-            state: Mutex::new(QueueState {
-                queue: VecDeque::with_capacity(capacity.min(1024)),
-                ring_used: 0,
-                high_water: 0,
-                overflow: false,
-                overflows: 0,
-                shutdown: false,
-            }),
-            wake: Condvar::new(),
+            queue: BandQueue::with_capacity(capacity),
+            high_water: AtomicUsize::new(0),
+            overflows: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            parking: Parking::new(workers),
         }
+    }
+
+    /// Deepen the high-water mark if `depth` — the ring's depth as the push
+    /// that just succeeded saw it — is the deepest yet.
+    ///
+    /// In the steady state one relaxed load: the mark only moves while the
+    /// ring is reaching depths it has not reached since the last reset. The
+    /// depth is the pusher's own, not a load, because by now the entry may
+    /// already have run.
+    fn deepen_high_water(&self, depth: usize) {
+        if depth > self.high_water.load(Ordering::Relaxed) {
+            self.high_water.fetch_max(depth, Ordering::AcqRel);
+        }
+    }
+
+    /// Count the refused request and name it — C `callback.c:874-877` as of
+    /// PR #996, which counts and prints once per refusal rather than once per
+    /// episode. A band saturated for a second by a 1 kHz producer therefore
+    /// reports a thousand, and says so a thousand times: the count is the
+    /// requests that were lost, and no cell is kept to suppress the rest.
+    fn report_full(&self, name: &str) -> CallbackError {
+        self.overflows.fetch_add(1, Ordering::Relaxed);
+        // `fullMessage[priority]`.
+        tracing::error!(
+            target: "epics_base_rs::runtime::callback",
+            band = name,
+            "callbackRequest: ERROR {} ring buffer full",
+            name
+        );
+        CallbackError::QueueFull
     }
 
     /// Port of `callbackRequest` for a single band (`callback.c:341-377`).
     fn request(&self, name: &str, cb: Callback) -> Result<(), CallbackError> {
-        let mut st = recover(FACILITY, self.state.lock());
-        if st.shutdown {
+        if self.shutdown.load(Ordering::Acquire) {
             // Pool stopped: C drops late callbackRequests after callbackStop
             // without surfacing an error (`callback.c:237-284`). Drop `cb`
             // (deallocated here, never invoked) and report success. This also
             // absorbs the teardown race where the delayed timer fires into a
             // pool that has just been dropped.
-            drop(st);
+            drop(cb);
             tracing::trace!(
                 target: "epics_base_rs::runtime::callback",
                 band = name,
@@ -318,32 +375,22 @@ impl PriorityQueue {
             );
             return Ok(());
         }
-        // callback.c:365 — reject immediately while the overflow latch is set.
-        if st.overflow {
-            return Err(CallbackError::QueueFull);
-        }
-        // callback.c:367-374 — push; on a full ring, latch overflow and count.
-        if st.ring_used >= self.capacity {
-            st.overflow = true;
-            st.overflows += 1;
-            // callback.c:370 — `fullMessage[priority]`, printed once per
-            // overflow episode (the latch above suppresses repeats).
-            tracing::error!(
-                target: "epics_base_rs::runtime::callback",
-                band = name,
-                "callbackRequest: ERROR {} ring buffer full",
-                name
-            );
-            return Err(CallbackError::QueueFull);
-        }
-        st.queue.push_back(Queued::Ring(cb));
-        st.ring_used += 1;
-        // The ring's high-water mark moves on the push that made it
-        // deepest, exactly where `epicsRingPointer` moves its own.
-        st.high_water = st.high_water.max(st.ring_used);
-        drop(st);
-        // callback.c:375 — signal the band's wake-up event.
-        self.wake.notify_one();
+        // callback.c:789-824 — the push that begins a batch recruits a worker
+        // for it, and only that push can know (`BandQueue::publish`).
+        let depth = match self
+            .queue
+            .push_ring(Queued::Ring(cb), || self.parking.wake_one())
+        {
+            Ok(depth) => depth,
+            // No ring slot was free: the band is full, the one place that
+            // decides it. Dropping the entry deallocates the callback that
+            // was never queued.
+            Err(entry) => {
+                drop(entry);
+                return Err(self.report_full(name));
+            }
+        };
+        self.deepen_high_water(depth);
         Ok(())
     }
 
@@ -351,30 +398,76 @@ impl PriorityQueue {
     /// see [`Queued::Task`]. After shutdown `cb` is dropped un-run, which is
     /// how the task learns it was cancelled.
     fn schedule_task(&self, cb: Callback) {
-        let mut st = recover(FACILITY, self.state.lock());
-        if st.shutdown {
+        if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        st.queue.push_back(Queued::Task(cb));
-        drop(st);
-        self.wake.notify_one();
+        if let Err(entry) = self
+            .queue
+            .push_task(Queued::Task(cb), || self.parking.wake_one())
+        {
+            // Only reachable with the whole 4 G index space queued; dropping
+            // the entry finalizes its task rather than stranding it.
+            drop(entry);
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                "callback band queue arena exhausted; task entry dropped"
+            );
+        }
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
-    /// sample size/used/high-water/overflows, and clear the high-water
-    /// mark when `reset` is set.
+    /// sample size/used/high-water/overflows, then reset the high-water mark
+    /// when asked — in that order, as C does, so the row reports the mark the
+    /// reset is about to drop.
+    ///
+    /// A reset leaves the mark at the entries still queued, not at zero:
+    /// `epicsRingPointerResetHighWaterMark` is
+    /// `highWaterMark = getUsedNoLock()` (`epicsRingPointer.h:339-343`). The
+    /// mark is the deepest the ring has been *since the reset*, and the ring
+    /// is already that deep at the moment the reset happens.
     fn stats(&self, reset: bool) -> CallbackQueueStats {
-        let mut st = recover(FACILITY, self.state.lock());
-        let out = CallbackQueueStats {
-            size: self.capacity,
-            num_used: st.ring_used,
-            max_used: st.high_water,
-            num_overflow: st.overflows,
+        // `used` and the mark are two words, so a row is sampled until they
+        // agree — a push raises `used` before the mark and would otherwise be
+        // caught between the two, reporting a mark below the depth. The retry
+        // is on this side because it is `callbackQueueStatus`, run from iocsh,
+        // and the alternative is a CAS loop on every request.
+        let (used, mark) = loop {
+            let used = self.queue.ring_used();
+            let mark = self.high_water.load(Ordering::Acquire);
+            if mark >= used {
+                if !reset {
+                    break (used, mark);
+                }
+                // The mark the reset drops is the one reported, and the one it
+                // installs is the depth the ring is at right now
+                // (`epicsRingPointer.h:339-343`).
+                if self
+                    .high_water
+                    .compare_exchange_weak(mark, used, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break (used, mark);
+                }
+            }
         };
-        if reset {
-            st.high_water = 0;
+        CallbackQueueStats {
+            size: self.capacity,
+            num_used: used,
+            max_used: mark,
+            num_overflow: self.overflows.load(Ordering::Relaxed),
         }
-        out
+    }
+
+    /// Lifetime overflow count — C `queueOverflows` (`callback.c:57`).
+    fn overflow_count(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
+    }
+
+    /// Stop the band and wake every worker so each re-tests its exit
+    /// condition. Idempotent.
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.parking.wake_all();
     }
 }
 
@@ -395,30 +488,77 @@ pub struct CallbackQueueStats {
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "callback band";
 
-/// Port of `callbackTask` for one band (`callback.c:210-235`).
-fn worker_loop(pq: &PriorityQueue) {
+/// Run one worker of one band, with the band's own answer to whether its
+/// workers chain the nodes they have run ([`BandQueue::returns`]) decided here
+/// and nowhere else: the chain handle and the loop that fills it are picked
+/// together, so a worker cannot run a loop that disagrees with its handle.
+fn worker_loop(pq: &PriorityQueue, slot: usize) {
+    // callback.c:563-570 — the nodes this worker has run and not yet given
+    // back. Holding the handle is what guarantees they are given back.
+    let returns = pq.queue.returns(pq.parking.workers());
+    if returns.is_batched() {
+        drain_band::<true>(pq, slot, returns);
+    } else {
+        drain_band::<false>(pq, slot, returns);
+    }
+}
+
+/// C `callbackTask` (`callback.c:210-235`) for one worker of one band.
+/// `slot` is the worker's ordinal within the band — its park slot.
+///
+/// `BATCHED` is the band's chain decision made constant, so the band that does
+/// not chain pays nothing for the one that does: threading it through as a
+/// runtime field instead costs a single worker's drain 11% (62.5 → 67.7 ns per
+/// entry on this box), which is more than chaining ever saved it.
+fn drain_band<const BATCHED: bool>(
+    pq: &PriorityQueue,
+    slot: usize,
+    mut returns: Returns<'_, Queued>,
+) {
+    let parked = pq.parking.waiter(slot);
+    // callback.c:537 — the root as this worker last left it.
+    let mut at = ReadyCursor::new();
     loop {
-        let mut st = recover(FACILITY, pq.state.lock());
-        // callback.c:220-221 — sleep on the wake event while the ring is empty.
-        while st.queue.is_empty() && !st.shutdown {
-            st = recover(FACILITY, pq.wake.wait(st));
-        }
-        if st.queue.is_empty() {
-            // Empty *and* shutdown — drain complete, exit.
-            return;
-        }
-        // callback.c:223 — pop next entry.
-        let cb = match st.queue.pop_front().unwrap() {
-            Queued::Ring(cb) => {
-                st.ring_used -= 1;
-                // callback.c:227 — clear the overflow latch on every pop.
-                st.overflow = false;
-                cb
+        // callback.c:223 — take the next entry.
+        let Some(popped) = pq.queue.pop_into::<BATCHED>(&mut returns, &mut at) else {
+            // callback.c:220-221 — nothing to run: exit if the band has
+            // stopped and is drained, otherwise sleep until a push arrives.
+            // callback.c:574-581 — give the slots back before sleeping, so a
+            // band that has caught up is holding none of its ring.
+            returns.flush();
+            if pq.shutdown.load(Ordering::SeqCst) {
+                return;
             }
+            parked.park_until(|| !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst));
+            // callback.c:607 — a sleep makes the carried root worthless: every
+            // entry this worker could have taken from it was taken by whoever
+            // emptied the band, so the next pop starts from a fresh read
+            // rather than from a word whose compare-exchange can only fail.
+            at = ReadyCursor::new();
+            continue;
+        };
+        // callback.c:558-560 — a pop that leaves work behind wakes a sleeper,
+        // so a second worker is not left asleep beside a queue that is not
+        // empty. Recruiting the band is the workers' job, not the requester's
+        // (see `Parking`), and this is where they do it. The answer comes out
+        // of the pop's own CAS (`Popped::more`): reading the roots again here
+        // instead costs a drain 7% at four workers and 11% at two.
+        //
+        // rt43 asks a wider question here, `sleepers && (more || !readyEmpty()
+        // || inbox)`, because its requester declines the recruiting wake
+        // whenever a worker looks ready (`Parking`). `more` already answers
+        // its first two terms, from the CAS instead of a fresh load. Its third
+        // is an entry pushed after this worker took the inbox — and an inbox
+        // this worker emptied makes that push a batch starter, which recruits
+        // on the requester's side whatever this worker does.
+        if popped.more {
+            pq.parking.wake_one();
+        }
+        let cb = match popped.value {
+            Queued::Ring(cb) => cb,
             Queued::Task(cb) => cb,
         };
-        drop(st);
-        // callback.c:228 — run the callback with the ring lock released.
+        // callback.c:228 — run the callback owning no band state.
         run_isolated(FACILITY, cb);
     }
 }
@@ -451,7 +591,7 @@ impl CallbackHandle {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
+        self.queues[priority.index()].overflow_count()
     }
 
     /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
@@ -500,11 +640,13 @@ impl CallbackPool {
     ) -> Self {
         let capacity = queue_size.max(1);
         let threads_per_priority = threads_per_priority.map(|n| n.max(1));
-        let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] = [
-            Arc::new(PriorityQueue::new(capacity)),
-            Arc::new(PriorityQueue::new(capacity)),
-            Arc::new(PriorityQueue::new(capacity)),
-        ];
+        let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] =
+            CallbackPriority::ALL.map(|p| {
+                Arc::new(PriorityQueue::new(
+                    capacity,
+                    threads_per_priority[p.index()],
+                ))
+            });
 
         let mut workers = Vec::with_capacity(threads_per_priority.iter().sum::<usize>());
         for prio in CallbackPriority::ALL {
@@ -544,11 +686,7 @@ impl CallbackPool {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
-                    run_facility_loop(
-                        FACILITY,
-                        || worker_loop(&pq),
-                        || recover(FACILITY, pq.state.lock()).shutdown = true,
-                    );
+                    run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 });
                 workers.push(handle);
             }
@@ -573,7 +711,7 @@ impl CallbackPool {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
+        self.queues[priority.index()].overflow_count()
     }
 
     /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
@@ -586,8 +724,7 @@ impl CallbackPool {
     /// `callbackStop`/`callbackCleanup` (`callback.c:237-284`). Idempotent.
     pub fn shutdown(&mut self) {
         for pq in &self.queues {
-            recover(FACILITY, pq.state.lock()).shutdown = true;
-            pq.wake.notify_all();
+            pq.request_shutdown();
         }
         for w in self.workers.drain(..) {
             let _ = w.join();
@@ -645,6 +782,7 @@ impl DedicatedExecutor {
         let threads = threads.max(1);
         let queue = Arc::new(PriorityQueue::new(
             CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed).max(1),
+            threads,
         ));
         let mut workers = Vec::with_capacity(threads);
         for j in 0..threads {
@@ -667,11 +805,7 @@ impl DedicatedExecutor {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
-                    run_facility_loop(
-                        FACILITY,
-                        || worker_loop(&pq),
-                        || recover(FACILITY, pq.state.lock()).shutdown = true,
-                    );
+                    run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 },
             );
             match spawned {
@@ -701,8 +835,7 @@ impl DedicatedExecutor {
 
     /// Stop the workers and join them. Idempotent; [`Drop`] calls it.
     pub fn shutdown(&mut self) {
-        recover(FACILITY, self.queue.state.lock()).shutdown = true;
-        self.queue.wake.notify_all();
+        self.queue.request_shutdown();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -734,7 +867,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const T: Duration = Duration::from_secs(5);
 
@@ -898,9 +1031,9 @@ mod tests {
     }
 
     #[test]
-    fn full_ring_latches_overflow_then_recovers() {
+    fn a_full_ring_refuses_and_counts_every_request() {
         // Boundary: capacity-1 ring, worker pinned busy → the second live
-        // entry fills the ring, the third latches overflow (callback.c:365).
+        // entry fills the ring and every request after it is refused.
         let mut pool = CallbackPool::with_config(1, 1);
         let (started_tx, started_rx) = mpsc::channel();
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
@@ -919,19 +1052,16 @@ mod tests {
         // Fill the single ring slot (worker is busy, cannot drain).
         pool.request(CallbackPriority::Low, Box::new(|| {}))
             .unwrap();
-        // Next push finds the ring full → QueueFull + overflow latched.
-        assert_eq!(
-            pool.request(CallbackPriority::Low, Box::new(|| {})),
-            Err(CallbackError::QueueFull)
-        );
-        // While latched, even a would-fit push is rejected (callback.c:365).
-        assert_eq!(
-            pool.request(CallbackPriority::Low, Box::new(|| {})),
-            Err(CallbackError::QueueFull)
-        );
-        assert_eq!(pool.overflow_count(CallbackPriority::Low), 1);
+        // Every push now finds the ring full, and each one is its own loss.
+        for _ in 0..2 {
+            assert_eq!(
+                pool.request(CallbackPriority::Low, Box::new(|| {})),
+                Err(CallbackError::QueueFull)
+            );
+        }
+        assert_eq!(pool.overflow_count(CallbackPriority::Low), 2);
 
-        gate_tx.send(()).unwrap(); // release the worker so it drains + clears.
+        gate_tx.send(()).unwrap(); // release the worker so it drains.
         pool.shutdown();
     }
 
@@ -1006,6 +1136,650 @@ mod tests {
             pinned, 1,
             "cpu_count() reported {host} for a thread pinned to one \
              processor — that is the pre-556de06ff sysconf behaviour"
+        );
+    }
+
+    /// Waiter boundary: a worker is parked in `wait`, so the push has to
+    /// signal. Four rounds, each starting from a band that has gone quiet.
+    #[test]
+    fn a_push_into_a_parked_band_wakes_it() {
+        let pool = CallbackPool::with_config(16, 1);
+        for round in 0..4u32 {
+            let (tx, rx) = mpsc::channel();
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || tx.send(round).unwrap()),
+            )
+            .unwrap();
+            assert_eq!(
+                rx.recv_timeout(T).unwrap(),
+                round,
+                "round {round} never ran: the push did not wake the parked band"
+            );
+            // The worker is now draining nothing and on its way back to a
+            // park, so the next round starts from the parked state again.
+            assert_eq!(pool.stats(CallbackPriority::Low, false).num_used, 0);
+        }
+    }
+
+    /// Waiter boundary: no worker is in `wait` — the only one is busy inside
+    /// a callback — so the push signals nobody and the entry has to be picked
+    /// up by the worker's own next look at the queue.
+    #[test]
+    fn work_pushed_at_a_busy_band_runs_without_a_wake_up() {
+        let mut pool = CallbackPool::with_config(16, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || tx.send(7u32).unwrap()),
+        )
+        .unwrap();
+        gate_tx.send(()).unwrap();
+        assert_eq!(
+            rx.recv_timeout(T).unwrap(),
+            7,
+            "the entry pushed while the worker was busy was never taken"
+        );
+        pool.shutdown();
+    }
+
+    /// One entry out of the ring is one slot back, and the next request takes
+    /// it — the recovery half of
+    /// [`a_full_ring_refuses_and_counts_every_request`].
+    #[test]
+    fn one_drained_entry_frees_one_slot() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+
+        let (ran_tx, ran_rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || ran_tx.send(1u32).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            pool.request(CallbackPriority::Low, Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+
+        gate_tx.send(()).unwrap();
+        // The worker returns the slot when it takes the entry out of the
+        // ring, before it runs it, so this signal is proof the slot is back
+        // and the next push has to be accepted.
+        assert_eq!(ran_rx.recv_timeout(T).unwrap(), 1);
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || tx.send(2u32).unwrap())
+            ),
+            Ok(()),
+            "a slot came back and the band still refused the request"
+        );
+        assert_eq!(rx.recv_timeout(T).unwrap(), 2);
+        assert_eq!(pool.overflow_count(CallbackPriority::Low), 1);
+        pool.shutdown();
+    }
+
+    /// Every refused request is counted, however many threads are refused at
+    /// once — `queueOverflows` is the requests the band lost.
+    #[test]
+    fn every_refused_push_counts_its_own_overflow() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+        pool.request(CallbackPriority::Low, Box::new(|| {}))
+            .unwrap();
+
+        let h = pool.handle();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        let _ = h.request(CallbackPriority::Low, Box::new(|| {}));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            pool.overflow_count(CallbackPriority::Low),
+            512,
+            "every one of the 512 pushes was refused by a full ring"
+        );
+        gate_tx.send(()).unwrap();
+        pool.shutdown();
+    }
+
+    /// `numUsed` counts entries that have not run, not entries still in the
+    /// inbox: a batch a worker has taken is still in C's ring until each
+    /// entry runs.
+    #[test]
+    fn num_used_counts_the_entries_that_have_not_run_yet() {
+        let mut pool = CallbackPool::with_config(10, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+
+        for _ in 0..6 {
+            pool.request(CallbackPriority::Medium, Box::new(|| {}))
+                .unwrap();
+        }
+        let st = pool.stats(CallbackPriority::Medium, false);
+        assert_eq!(st.size, 10);
+        assert_eq!(
+            st.num_used, 6,
+            "queued-but-not-run entries are the ring's use"
+        );
+        assert_eq!(st.max_used, 6);
+
+        // The seventh has to be claimed while the band is still gated, or the
+        // worker may already have drained some of the six and the mark would
+        // never reach seven.
+        let (tx, rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || tx.send(()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(pool.stats(CallbackPriority::Medium, false).num_used, 7);
+
+        // One worker, so FIFO makes the seventh the last to run and its own
+        // slot the last to be released.
+        gate_tx.send(()).unwrap();
+        rx.recv_timeout(T).unwrap();
+        let st = pool.stats(CallbackPriority::Medium, true);
+        assert_eq!(st.num_used, 0, "every entry ran, so the ring is empty");
+        assert_eq!(
+            st.max_used, 7,
+            "the mark holds the deepest the ring ever was"
+        );
+        assert_eq!(
+            pool.stats(CallbackPriority::Medium, false).max_used,
+            0,
+            "callbackQueueStatus(reset=1) must put the mark back to the \
+             entries still queued, and the ring is drained here"
+        );
+        pool.shutdown();
+    }
+
+    /// FIFO across 300 entries, pushed both while the band's worker is held
+    /// and after it is released.
+    #[test]
+    fn a_single_worker_band_runs_entries_in_push_order() {
+        let mut pool = CallbackPool::with_config(2000, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::High,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        for i in 0..200u32 {
+            let tx = tx.clone();
+            pool.request(
+                CallbackPriority::High,
+                Box::new(move || tx.send(i).unwrap()),
+            )
+            .unwrap();
+        }
+        gate_tx.send(()).unwrap();
+        for i in 200..300u32 {
+            let tx = tx.clone();
+            pool.request(
+                CallbackPriority::High,
+                Box::new(move || tx.send(i).unwrap()),
+            )
+            .unwrap();
+        }
+        drop(tx);
+        let seen: Vec<u32> = rx.iter().take(300).collect();
+        assert_eq!(
+            seen,
+            (0..300).collect::<Vec<u32>>(),
+            "entries ran out of order"
+        );
+        pool.shutdown();
+    }
+
+    /// A band widened by `callbackParallelThreads`: with four workers and
+    /// four pushers, no entry may be left queued with nobody woken for it.
+    #[test]
+    fn a_parallel_band_loses_no_entry_however_its_workers_are_parked() {
+        let mut pool = CallbackPool::with_per_priority_config(4000, [4, 1, 1]);
+        let h = pool.handle();
+        let (tx, rx) = mpsc::channel();
+        let pushers: Vec<_> = (0..4)
+            .map(|_| {
+                let h = h.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..250 {
+                        let tx = tx.clone();
+                        h.request(
+                            CallbackPriority::Low,
+                            Box::new(move || tx.send(()).unwrap()),
+                        )
+                        .expect("a 4000-slot ring takes 1000 entries");
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for t in pushers {
+            t.join().unwrap();
+        }
+        drop(tx);
+        for i in 0..1000 {
+            rx.recv_timeout(T)
+                .unwrap_or_else(|e| panic!("only {i} of 1000 entries ran: {e}"));
+        }
+        // Four workers chain their nodes (`return_batch`), so the last entry
+        // having run does not mean every node is back yet: each worker returns
+        // its chain when it next finds the queue empty, just before parking.
+        let gave_back = Instant::now();
+        while pool.stats(CallbackPriority::Low, false).num_used != 0 {
+            assert!(
+                gave_back.elapsed() < T,
+                "a parked worker is still holding nodes it ran"
+            );
+            std::thread::yield_now();
+        }
+        pool.shutdown();
+    }
+
+    /// The boundary the ring's accounting has to hold at: zero, with a worker
+    /// consuming one entry while a requester takes the slot for the next.
+    ///
+    /// Counted from outside the band — raised after the push, lowered after
+    /// the pop — the two are not ordered against each other, because the entry
+    /// is a worker's to run from the moment it is linked: the decrement lands
+    /// before its own increment and the count reads `usize::MAX`. That showed
+    /// up as 5 failures in 25 runs of
+    /// `a_parallel_band_loses_no_entry_however_its_workers_are_parked`, and
+    /// `stats` would have spun forever on it rather than reported it. The
+    /// count is the slot supply's own, so this holds by construction.
+    /// Refusal follows the slots and nothing else: a band that has just
+    /// refused a request takes the next one as soon as the ring drains, with
+    /// no state left over from the refusal. Pre-#996 base keeps that state
+    /// (`callback.c:365`) and a requester can raise it after the pop that
+    /// would have cleared it, which shuts the band for the life of the IOC.
+    #[test]
+    fn a_drained_ring_takes_requests_again() {
+        let pq = PriorityQueue::new(2, 1);
+        for _ in 0..2 {
+            assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        }
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull),
+            "a ring of two holds two"
+        );
+
+        while pq
+            .queue
+            .pop_into::<true>(&mut pq.queue.returns(1), &mut ReadyCursor::new())
+            .is_some()
+        {}
+        assert_eq!(pq.queue.ring_used(), 0, "the ring drained");
+
+        for _ in 0..2 {
+            assert!(
+                pq.request("cbLow", Box::new(|| {})).is_ok(),
+                "every slot is free, so the band is not full"
+            );
+        }
+        assert_eq!(pq.overflow_count(), 1, "one request was lost, and one only");
+    }
+
+    #[test]
+    fn the_ring_count_never_reads_below_the_entries_queued() {
+        const CAPACITY: usize = 4;
+        const TOTAL: usize = 20_000;
+        let pq = Arc::new(PriorityQueue::new(CAPACITY, 1));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let popped = Arc::new(AtomicUsize::new(0));
+        // A broken count panics the thread that reads it, and the remaining
+        // threads would then wait out the harness timeout for entries nobody
+        // is pushing any more. Every loop watches for that, so a regression
+        // reports in milliseconds.
+        let broken = Arc::new(AtomicBool::new(false));
+        let deep = |pq: &PriorityQueue, broken: &AtomicBool| {
+            let used = pq.queue.ring_used();
+            if used > CAPACITY {
+                broken.store(true, Ordering::SeqCst);
+                panic!("the ring of {CAPACITY} reported {used} entries queued");
+            }
+        };
+
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let (pq, claimed, broken) =
+                    (Arc::clone(&pq), Arc::clone(&claimed), Arc::clone(&broken));
+                s.spawn(move || {
+                    // An entry is claimed before it is pushed, so exactly
+                    // `TOTAL` reach the ring however the two pushers
+                    // interleave. Counting pushes afterwards instead lets both
+                    // read one short of `TOTAL`, push, and leave an entry
+                    // behind that the poppers have already stopped counting.
+                    while claimed.fetch_add(1, Ordering::Relaxed) < TOTAL {
+                        while pq.request("cbLow", Box::new(|| {})).is_err() {
+                            deep(&pq, &broken);
+                            // A full ring is the poppers' turn: spinning on it
+                            // instead starves them on an oversubscribed box.
+                            std::thread::yield_now();
+                        }
+                        deep(&pq, &broken);
+                        if broken.load(Ordering::SeqCst) {
+                            return;
+                        }
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let (pq, popped, broken) =
+                    (Arc::clone(&pq), Arc::clone(&popped), Arc::clone(&broken));
+                s.spawn(move || {
+                    loop {
+                        match pq
+                            .queue
+                            .pop_into::<true>(&mut pq.queue.returns(1), &mut ReadyCursor::new())
+                        {
+                            Some(took) => {
+                                drop(took.value);
+                                popped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // `TOTAL` pops can only have happened after
+                            // `TOTAL` pushes, so nothing can still arrive.
+                            None if popped.load(Ordering::Relaxed) >= TOTAL => return,
+                            None if broken.load(Ordering::SeqCst) => return,
+                            None => std::thread::yield_now(),
+                        }
+                        deep(&pq, &broken);
+                    }
+                });
+            }
+        });
+
+        assert!(!broken.load(Ordering::SeqCst), "see the panic above");
+        assert_eq!(
+            pq.queue.ring_used(),
+            0,
+            "every entry ran and the ring still holds slots"
+        );
+    }
+
+    /// Work queued behind a callback that blocks must run on another worker
+    /// as soon as one is free — epics-base `callbackBlockedTest.c` (PR #996,
+    /// `21a7f980e`). A worker that took a whole batch instead of one entry
+    /// would hold the short callbacks behind the blocking one, and freeing a
+    /// different worker would not release them.
+    #[test]
+    fn work_behind_a_blocked_callback_runs_on_a_freed_worker() {
+        const NWORKERS: usize = 3;
+        const NSHORT: usize = 20;
+        let mut pool = CallbackPool::with_per_priority_config(64, [NWORKERS, 1, 1]);
+
+        // C's `gate`: a callback that reports it started, then waits.
+        let gate = |pool: &CallbackPool| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }),
+            )
+            .unwrap();
+            (started_rx, release_tx)
+        };
+
+        // Hold every worker inside a callback.
+        let held: Vec<_> = (0..NWORKERS - 1)
+            .map(|_| {
+                let g = gate(&pool);
+                g.0.recv_timeout(T).unwrap();
+                g
+            })
+            .collect();
+        let hold = gate(&pool);
+        hold.0.recv_timeout(T).unwrap();
+
+        // Nobody is free: a blocking callback and the short ones queue up, so
+        // they land in one batch.
+        let blocked = gate(&pool);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        for _ in 0..NSHORT {
+            let (ran, done_tx) = (Arc::clone(&ran), done_tx.clone());
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || {
+                    if ran.fetch_add(1, Ordering::SeqCst) + 1 == NSHORT {
+                        done_tx.send(()).unwrap();
+                    }
+                }),
+            )
+            .unwrap();
+        }
+
+        // The released worker takes the blocking callback — it is the oldest
+        // of the batch — and blocks in it.
+        hold.1.send(()).unwrap();
+        blocked.0.recv_timeout(T).unwrap();
+
+        // Free one worker: it has to run the short ones while the worker that
+        // took them out of the inbox stays blocked.
+        held[0].1.send(()).unwrap();
+        done_rx
+            .recv_timeout(T)
+            .expect("the short callbacks behind the blocked one never ran");
+        assert_eq!(ran.load(Ordering::SeqCst), NSHORT);
+
+        for h in &held[1..] {
+            h.1.send(()).unwrap();
+        }
+        blocked.1.send(()).unwrap();
+        pool.shutdown();
+    }
+
+    /// A task entry takes no ring slot, so a full ring must not refuse it:
+    /// a refused wake would strand the task forever.
+    #[test]
+    fn a_full_ring_still_takes_a_task_entry() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+        pool.request(CallbackPriority::Low, Box::new(|| {}))
+            .unwrap();
+        assert_eq!(
+            pool.request(CallbackPriority::Low, Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+
+        let (tx, rx) = mpsc::channel();
+        pool.handle().schedule_task(
+            CallbackPriority::Low,
+            Box::new(move || tx.send(99u32).unwrap()),
+        );
+        gate_tx.send(()).unwrap();
+        assert_eq!(
+            rx.recv_timeout(T).unwrap(),
+            99,
+            "a task entry was lost on a band whose ring was full"
+        );
+        pool.shutdown();
+    }
+
+    /// A band with two workers must let the second entry through while the
+    /// first callback is still blocked inside its own. C keeps queued entries
+    /// where every worker of the band can see them; a worker that claimed a
+    /// whole batch for itself would strand the rest behind its own callback,
+    /// and two callbacks that have to meet would deadlock.
+    #[test]
+    fn a_blocked_callback_does_not_strand_its_neighbours() {
+        let mut pool = CallbackPool::with_per_priority_config(16, [2, 1, 1]);
+        let (a_started_tx, a_started_rx) = mpsc::channel();
+        let (a_release_tx, a_release_rx) = mpsc::channel::<()>();
+        let (b_started_tx, b_started_rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                a_started_tx.send(()).unwrap();
+                // Bounded, so even a failing run joins its workers.
+                let _ = a_release_rx.recv_timeout(T * 2);
+            }),
+        )
+        .unwrap();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || b_started_tx.send(()).unwrap()),
+        )
+        .unwrap();
+
+        a_started_rx
+            .recv_timeout(T)
+            .expect("the first callback never ran");
+        let second = b_started_rx.recv_timeout(T);
+        let _ = a_release_tx.send(());
+        pool.shutdown();
+        second.expect(
+            "the second entry never ran while the first callback was blocked \
+             and a worker of the band was idle",
+        );
+    }
+
+    /// `used` and the high-water mark share one word, so the two boundaries of
+    /// that word are worth separating: a reset must not disturb the count, and
+    /// it must leave the mark at that count rather than at zero —
+    /// `epicsRingPointerResetHighWaterMark` is `highWaterMark = used`
+    /// (`epicsRingPointer.h:339-343`), and `callbackQueueStatus` is called on
+    /// a live band, not a drained one.
+    ///
+    /// Tested on the band directly: a band with a worker has no state a test
+    /// can hold still.
+    #[test]
+    fn a_high_water_reset_leaves_the_queued_entries_counted() {
+        let pq = PriorityQueue::new(4, 1);
+        for _ in 0..3 {
+            pq.request("cbLow", Box::new(|| {})).unwrap();
+        }
+        let st = pq.stats(false);
+        assert_eq!((st.num_used, st.max_used), (3, 3));
+
+        let st = pq.stats(true);
+        assert_eq!(
+            (st.num_used, st.max_used),
+            (3, 3),
+            "the reset sampled first"
+        );
+        let st = pq.stats(false);
+        assert_eq!(st.num_used, 3, "the reset dropped the entries' count");
+        assert_eq!(
+            st.max_used, 3,
+            "the reset put the mark below the entries already queued"
+        );
+
+        pq.request("cbLow", Box::new(|| {})).unwrap();
+        let st = pq.stats(false);
+        assert_eq!((st.num_used, st.max_used), (4, 4));
+    }
+
+    /// The ring's capacity boundary, on the band itself: `capacity` pushes go
+    /// in and every one after that is refused by the slot supply and counted
+    /// on its own.
+    #[test]
+    fn the_capacity_boundary_refuses_every_push_past_it() {
+        let pq = PriorityQueue::new(2, 1);
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        assert_eq!(pq.overflow_count(), 2);
+        assert_eq!(pq.stats(false).num_used, 2, "a refused push took no slot");
+    }
+
+    /// A task entry takes no ring slot, so a full band still accepts one —
+    /// the property `Queued::Task` exists for. The band-level twin of
+    /// `a_full_ring_still_takes_a_task_entry`, at the boundary where the ring
+    /// is exactly full.
+    #[test]
+    fn a_full_band_still_takes_a_task_entry() {
+        let pq = PriorityQueue::new(1, 1);
+        pq.request("cbLow", Box::new(|| {})).unwrap();
+        assert_eq!(
+            pq.request("cbLow", Box::new(|| {})),
+            Err(CallbackError::QueueFull)
+        );
+        pq.schedule_task(Box::new(|| {}));
+        assert_eq!(
+            pq.stats(false).num_used,
+            1,
+            "the task entry was charged to the ring"
         );
     }
 }

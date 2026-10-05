@@ -469,27 +469,46 @@ mod pi_mutex {
 ///
 /// The whole module exists so `epicsMutexShowAll` can answer the question it
 /// is run to answer — *which lock is held right now* — rather than only how
-/// many exist. That answer needs a try-lock through a stable address, which is
-/// what pins the `Box` and the `Drop`.
+/// many exist. That answer needs a try-lock on a backend that is still there,
+/// which is what the shared `Arc` and the `Drop` give it.
 mod epics_mutex {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::MutexBackend;
 
+    /// C's `onlyLocked` try-lock, type-erased. C needs no equivalent because
+    /// its node's payload is opaque bytes; here the backend is generic and the
+    /// list must be one list.
+    trait LockProbe: Send + Sync {
+        fn is_locked(&self) -> bool;
+    }
+
+    impl<T: Send> LockProbe for MutexBackend<T> {
+        fn is_locked(&self) -> bool {
+            match self.try_lock() {
+                Some(guard) => {
+                    drop(guard);
+                    false
+                }
+                None => true,
+            }
+        }
+    }
+
     /// One entry of C's `mutexList` (`epicsMutex.cpp:39`).
     ///
-    /// `probe` is the entry's own `try_lock`, monomorphised for the `T` that
-    /// registered it and then type-erased to a plain function pointer. C needs
-    /// no equivalent because its node's payload is opaque bytes; here the
-    /// backend is generic, and the list must be one list.
+    /// The entry holds the backend by `Arc` rather than by address, so the
+    /// thing [`report`] try-locks is alive because the entry exists, not
+    /// because deregistration happens to run first. `addr` and `osd_addr` are
+    /// the numbers C prints and are never turned back into a pointer.
     struct Entry {
         id: u64,
         file: &'static str,
         line: u32,
         addr: usize,
         osd_addr: usize,
-        probe: unsafe fn(usize) -> bool,
+        backend: Arc<dyn LockProbe>,
     }
 
     /// Creation order, as C's `ellAdd` appends.
@@ -507,29 +526,37 @@ mod epics_mutex {
     /// [`PriorityInheritanceMutex`](super::PriorityInheritanceMutex) for why
     /// this is a newtype and not an alias.
     pub struct EpicsMutex<T> {
-        /// Allocated before registration and freed after deregistration, so
-        /// the address in the list is valid for exactly as long as the list
-        /// holds it.
-        inner: Box<MutexBackend<T>>,
+        /// Heap-allocated so the address the list reports is stable for the
+        /// mutex's whole life, and shared with the list entry so that address
+        /// cannot name freed memory.
+        inner: Arc<MutexBackend<T>>,
         id: u64,
     }
 
-    impl<T> EpicsMutex<T> {
+    impl<T: Send + 'static> EpicsMutex<T> {
         /// C `epicsMutexCreate()` — `epicsMutexOsiCreate(__FILE__, __LINE__)`.
         #[track_caller]
         pub fn new(value: T) -> Self {
-            let inner = Box::new(MutexBackend::new(value));
+            let inner = Arc::new(MutexBackend::new(value));
             let caller = std::panic::Location::caller();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             lock().push(Entry {
                 id,
                 file: caller.file(),
                 line: caller.line(),
-                addr: &*inner as *const MutexBackend<T> as usize,
+                addr: Arc::as_ptr(&inner) as usize,
                 osd_addr: osd_addr(&inner),
-                probe: probe_locked::<T>,
+                backend: Arc::clone(&inner) as Arc<dyn LockProbe>,
             });
             Self { inner, id }
+        }
+    }
+
+    impl<T> EpicsMutex<T> {
+        /// The address this mutex is listed under — C's `epicsMutexId`, the
+        /// same number [`MutexInfo::addr`] reports.
+        pub fn registered_addr(&self) -> usize {
+            Arc::as_ptr(&self.inner) as usize
         }
 
         pub fn lock(&self) -> super::PriorityInheritanceMutexGuard<'_, T> {
@@ -551,8 +578,9 @@ mod epics_mutex {
     }
 
     /// C `epicsMutexDestroy` (`epicsMutex.cpp:105-113`): off the list first,
-    /// under the list lock, and only then freed. A walk holding that lock can
-    /// therefore dereference every address it is looking at.
+    /// under the list lock. Dropping the entry drops the list's reference to
+    /// the backend, and the last reference to go frees it — so a walk holding
+    /// that lock is looking at live mutexes by construction.
     impl<T> Drop for EpicsMutex<T> {
         fn drop(&mut self) {
             let id = self.id;
@@ -579,23 +607,6 @@ mod epics_mutex {
     #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
     fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
         inner as *const MutexBackend<T> as usize
-    }
-
-    /// # Safety
-    ///
-    /// `addr` must be the address a live `Box<MutexBackend<T>>` was registered
-    /// with, for the same `T`. [`report`] calls this only while holding the
-    /// list lock, and [`EpicsMutex::drop`] removes the entry under that same
-    /// lock before the box is freed, so an address reachable here is live.
-    unsafe fn probe_locked<T>(addr: usize) -> bool {
-        let backend = unsafe { &*(addr as *const MutexBackend<T>) };
-        match backend.try_lock() {
-            Some(guard) => {
-                drop(guard);
-                false
-            }
-            None => true,
-        }
     }
 
     /// One row of C's `epicsMutexShow` (`epicsMutex.cpp:118-127`).
@@ -665,12 +676,8 @@ mod epics_mutex {
         let entries = lock();
         let mut shown = Vec::new();
         for entry in entries.iter() {
-            if only_locked {
-                // SAFETY: see `probe_locked`. The list lock is held here, and
-                // deregistration takes it before freeing.
-                if !unsafe { (entry.probe)(entry.addr) } {
-                    continue;
-                }
+            if only_locked && !entry.backend.is_locked() {
+                continue;
             }
             shown.push(MutexInfo {
                 addr: entry.addr,
@@ -717,6 +724,271 @@ pub fn osd_show_all_line() -> &'static str {
         "PI is enabled"
     } else {
         "PI is not enabled"
+    }
+}
+
+/// C `epicsEventId` with one waiting thread — the wake-up half of a facility
+/// whose state is guarded by a [`PriorityInheritanceMutex`].
+///
+/// Every background facility C has is built from two primitives, not one: a
+/// mutex over the state, and a **separate** event the worker sleeps on —
+/// `msgQueueLock` beside `waitForWork` (`errlog.c:93-95`), the `onceQ` ring's
+/// spinlock beside `onceSem` (`dbScan.c:65-68`), the timer queue's mutex
+/// beside its event (`timerPrivate.h:115,188`). A Rust port reaches for
+/// `Mutex` + `Condvar` instead, which fuses them, and the fusion is what
+/// costs the priority-inheritance property: a `Condvar` can only wait on the
+/// `std::sync::Mutex` it is paired with, so every requester of the facility —
+/// a scan thread at ScanHigh, a device callback at High — ends up blocking on
+/// a non-PI lock that the facility's own Low-priority worker holds, for as
+/// long as anything in between cares to run.
+///
+/// Keeping the two apart is what lets the state lock be the PI one. The wake
+/// then needs no lock at all: this is one latch plus the waiter's thread
+/// handle, so a signaller touches the waiter's parker and nothing any other
+/// requester shares. C's `epicsEvent` is itself a PI mutex and a condvar
+/// (`osdEvent.c:29-31`, `:54` through `globalAttrDefault`,
+/// `osdMutex.c:71-73`); this has no mutex of its own to invert. PR #996 reaches
+/// the same conclusion for Linux and replaces that pair with a futex
+/// (`fe0e949b9`), leaving the mutex only on the platforms without one.
+///
+/// # It is a condition wait, not a token
+///
+/// [`signal`](Self::signal) releases a waiter that has announced itself and
+/// does nothing at all otherwise — unlike C's `epicsEventSignal`, which
+/// latches `isFull` for a wait that has not happened yet (`osdEvent.c:87-90`).
+/// What makes that safe is that the waiter never sleeps on the event alone:
+/// it sleeps on a *condition over the shared state*, re-polled on every
+/// announcement. So a caller MUST publish its work before signalling, and the
+/// waiter's `ready` MUST read that work. A signal whose work is not yet
+/// visible is not a lost wake-up — it is a wake-up the waiter's own poll will
+/// make for itself.
+///
+/// The announce/poll pair is sequentially consistent on both sides, which is
+/// what closes the window a plain flag would leave: a signaller publishes its
+/// work and then tests the latch, a waiter stores the latch and then polls for
+/// work, so at least one of the two sees the other. What it does not close on
+/// its own is a signaller stopped after taking the announcement and before the
+/// `unpark` it owes; [`signal`](Self::signal) is three-state for that.
+pub struct Event {
+    /// `SLEEPING` only between the waiter announcing that it is about to park
+    /// and the wake that releases it, so a signaller's compare-exchange is
+    /// itself the test for whether anyone is there to wake.
+    state: std::sync::atomic::AtomicU32,
+    /// The waiting thread, published by [`Event::waiter`] before the state can
+    /// ever read `SLEEPING` — a signaller that finds the event sleeping finds
+    /// a handle in it.
+    thread: std::sync::OnceLock<std::thread::Thread>,
+}
+
+/// Nobody is parked: either the waiter is running, or it has not claimed the
+/// event yet. The two are told apart by [`Event::thread`], which is the only
+/// thing a wake needs from either.
+const EVENT_AWAKE: u32 = 0;
+/// The waiter has announced that its next step is to park.
+const EVENT_SLEEPING: u32 = 1;
+/// A signaller has taken the announcement and is on its way to the waiter's
+/// `unpark` — see [`Event::signal`]. Only a signaller writes this, and only
+/// the waiter clears it, so a signaller stopped in that window cannot clobber
+/// a later announcement with a stale store.
+const EVENT_CLAIMED: u32 = 2;
+
+/// What one [`Event::signal`] did — see that method.
+///
+/// `Claimed` and `Pending` both leave the waiter bound to wake; they differ in
+/// whether *this* caller is the one that took it out of its sleep, which is
+/// the only question a caller waking one waiter out of several can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signalled {
+    /// This call moved a parked waiter out of its sleep.
+    Claimed,
+    /// Another signaller holds the claim and is on its way to the waiter's
+    /// `unpark`; this call unparked it too, and took nothing of its own.
+    Pending,
+    /// The waiter was not parked. It polls its condition before it parks
+    /// again, so the work this signal is for is already its to find.
+    Running,
+}
+
+impl Event {
+    pub const fn new() -> Self {
+        Event {
+            state: std::sync::atomic::AtomicU32::new(EVENT_AWAKE),
+            thread: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Claim the waiting side of this event.
+    ///
+    /// The returned token is the only thing that can wait, which is how
+    /// "the thread handle is published before the first park" holds by
+    /// construction instead of by a call-order rule the next caller has to
+    /// know about.
+    ///
+    /// One event has one waiter: a second token for the same event would park
+    /// a second thread behind one latch, and a signal meant for either would
+    /// release only one. A facility that needs N waiters owns N events — that
+    /// is what the callback band's `Parking` is.
+    pub fn waiter(&self) -> EventWaiter<'_> {
+        let _ = self.thread.set(std::thread::current());
+        EventWaiter { event: self }
+    }
+
+    /// Put this event in the state a parked waiter leaves behind, with no
+    /// thread actually parked on it — the only way a test can hold the window
+    /// between a signaller's claim and the waiter's next poll still, since a
+    /// real waiter leaves it the moment it is unparked.
+    #[cfg(test)]
+    pub(crate) fn announce_for_test(&self) {
+        self.state
+            .store(EVENT_SLEEPING, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Release the waiter if it is parked, and cost one atomic if it is not.
+    /// The answer says *who* took the announcement, which is what lets a pool
+    /// of events (the callback band's `Parking`) stop at the waiter it took
+    /// off the pool and keep looking past one another signaller already holds:
+    /// [`Signalled::Claimed`] is a waiter this call moved out of its sleep,
+    /// [`Signalled::Pending`] one that is already somebody else's to release,
+    /// and [`Signalled::Running`] one that was not asleep at all.
+    ///
+    /// The work being signalled must already be published — see *It is a
+    /// condition wait, not a token* above.
+    ///
+    /// Taking the announcement and reaching the waiter's `unpark` are two
+    /// steps, so a signaller can be stopped between them — and on an IOC it is
+    /// a low-priority requester that gets stopped, by the very load that filled
+    /// the queue. A second signaller must therefore not read "already taken" as
+    /// "nobody to wake" and decline: it unparks the waiter itself, which is why
+    /// the claim is its own state rather than an immediate return to the awake
+    /// one. That leaves the waiter dependent on no particular
+    /// thread resuming — the property epics-base PR #996 gives its Linux
+    /// `epicsEvent` by triggering the futex whenever a waiter is registered
+    /// (`osdEvent.c`, `fe0e949b9`). A redundant `unpark` costs the waiter one
+    /// extra poll of its condition and nothing else.
+    /// [`signal`](Self::signal) for a caller scanning a pool of events for one
+    /// to claim: it reads the state first and compare-exchanges only a slot
+    /// that is actually parked, so passing over a running waiter leaves that
+    /// waiter's line shared instead of taking it exclusive. The answers are
+    /// the same, and so is the race the scan is built on — a slot that parks
+    /// between the load and the next slot's read is a slot the push's own
+    /// SeqCst pairing has already handed its entry to.
+    ///
+    /// The read is SeqCst, and that is load-bearing rather than cautious: the
+    /// announcement it is testing is a SeqCst store, and an announcement is
+    /// only worth testing against the publication that preceded this call.
+    /// With an `Acquire` load the two sit in no common order, so the scan may
+    /// read `AWAKE` from a waiter that has already announced itself and whose
+    /// own poll ran before the work was published — and then nobody wakes it.
+    /// The compare-exchange this replaces could not read that stale value, so
+    /// the ordering is what the cheaper read has to pay back.
+    ///
+    /// The single-waiter callers keep [`signal`](Self::signal): there the
+    /// waiter is usually parked, and the extra load would buy nothing.
+    pub fn signal_if_parked(&self) -> Signalled {
+        use std::sync::atomic::Ordering;
+        if self.state.load(Ordering::SeqCst) == EVENT_AWAKE {
+            return Signalled::Running;
+        }
+        self.signal()
+    }
+
+    pub fn signal(&self) -> Signalled {
+        use std::sync::atomic::Ordering;
+        let answer = match self.state.compare_exchange(
+            EVENT_SLEEPING,
+            EVENT_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // Ours to release.
+            Ok(_) => Signalled::Claimed,
+            // Claimed, by a signaller that may not have reached its `unpark`.
+            Err(EVENT_CLAIMED) => Signalled::Pending,
+            // Running: it polls its condition before it parks again, and the
+            // work this signal is for is already published.
+            Err(_) => return Signalled::Running,
+        };
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+        answer
+    }
+
+    /// Release the waiter whether or not it has announced itself — the
+    /// shutdown path, where the condition the waiter re-tests is its own exit
+    /// and a signal dropped inside the announce window would hang a join.
+    pub fn wake(&self) {
+        use std::sync::atomic::Ordering;
+        self.state.store(EVENT_AWAKE, Ordering::SeqCst);
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field(
+                "sleeping",
+                &(self.state.load(std::sync::atomic::Ordering::Relaxed) != EVENT_AWAKE),
+            )
+            .field("claimed", &self.thread.get().is_some())
+            .finish()
+    }
+}
+
+/// The waiting side of one [`Event`] — see [`Event::waiter`].
+pub struct EventWaiter<'a> {
+    event: &'a Event,
+}
+
+impl EventWaiter<'_> {
+    /// Park until `ready` holds.
+    ///
+    /// The announcement is re-made before every poll, so a signaller that
+    /// misses it is a signaller whose work the poll that follows sees.
+    pub fn wait_until(&self, mut ready: impl FnMut() -> bool) {
+        use std::sync::atomic::Ordering;
+        loop {
+            self.event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+            if ready() {
+                break;
+            }
+            std::thread::park();
+        }
+        self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
+    }
+
+    /// [`wait_until`](Self::wait_until) with a deadline. `true` when `ready`
+    /// held, `false` when the deadline arrived first — C
+    /// `epicsEventWaitWithTimeout`'s two answers (`osdEvent.c:119-144`).
+    pub fn wait_until_deadline(
+        &self,
+        deadline: std::time::Instant,
+        mut ready: impl FnMut() -> bool,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let answered = loop {
+            self.event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+            if ready() {
+                break true;
+            }
+            // `park_timeout` may return early for any reason, which is why the
+            // deadline is re-derived from the clock rather than counted down.
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break false;
+            };
+            std::thread::park_timeout(left);
+        };
+        self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
+        answered
     }
 }
 
@@ -801,30 +1073,47 @@ mod tests {
     /// Locate `m`'s own row, which is the only way to test a process-global
     /// list that other code also registers into.
     fn find_entry<T>(m: &PriorityInheritanceMutex<T>) -> Option<MutexInfo> {
-        let want = mutex_addr(m);
+        let want = m.registered_addr();
         mutex_report(false)
             .shown
             .into_iter()
             .find(|e| e.addr() == want)
     }
 
-    /// The address the list holds, reached the same way `new` computed it.
-    fn mutex_addr<T>(m: &PriorityInheritanceMutex<T>) -> usize {
-        // One row per mutex, so the row that reports this file and this
-        // mutex's line is this mutex — except that two mutexes can share a
-        // line, which is why the tests that need identity capture the addr
-        // once and compare against it afterwards.
-        let guard = m.try_lock();
-        let held = guard.is_none();
-        drop(guard);
-        assert!(!held, "helper must not be called on a held mutex");
-        // The registered address is the boxed backend's, and `try_lock`
-        // proved this mutex is the free one; find it by elimination on the
-        // locked probe.
-        let before: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
-        let _g = m.lock();
-        let after: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
-        after.into_iter().find(|a| !before.contains(a)).unwrap()
+    /// The row is found by the mutex's own registered address, so a mutex
+    /// another thread creates and holds cannot be mistaken for this one. The
+    /// helper this replaced identified a row by elimination against the
+    /// process-global list and failed exactly here.
+    #[test]
+    fn an_entry_is_identified_while_other_threads_register_and_hold() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let addr = m.registered_addr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let noise = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+                    let _held = other.lock();
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            let held = m.lock();
+            assert_eq!(find_entry(&m).unwrap().addr(), addr);
+            assert!(
+                mutex_report(true).shown.iter().any(|e| e.addr() == addr),
+                "this mutex is held, so onlyLocked must list it"
+            );
+            drop(held);
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        noise.join().unwrap();
     }
 
     /// C's `onlyLocked` boundary, both sides of it: the filter try-locks every
@@ -832,11 +1121,11 @@ mod tests {
     #[test]
     fn only_locked_keeps_exactly_the_held_mutexes() {
         let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
-        let addr = mutex_addr(&m);
+        let addr = m.registered_addr();
         // A second, never-held mutex, so "the filter excludes something" is a
         // property of this test and not of whatever else the process created.
         let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
-        let other_addr = mutex_addr(&other);
+        let other_addr = other.registered_addr();
 
         let free = mutex_report(true);
         assert!(
@@ -850,18 +1139,19 @@ mod tests {
             held.shown.iter().any(|e| e.addr() == addr),
             "a held mutex must be listed under onlyLocked"
         );
-        assert_eq!(
-            held.total, free.total,
-            "the count is the whole list, not the filtered rows — C prints \
-             `ellCount(&mutexList)` before it filters"
-        );
+        // One report, so no mutex created or dropped elsewhere in the process
+        // can make the two halves disagree: unfiltered, `total` must equal the
+        // rows themselves, which is what makes it C's `ellCount(&mutexList)`
+        // and not the filtered count.
+        let all = mutex_report(false);
+        assert_eq!(all.total, all.shown.len());
         assert!(
             !held.shown.iter().any(|e| e.addr() == other_addr),
             "the filter must exclude the mutex nobody holds"
         );
         assert!(
             held.shown.len() < held.total,
-            "{} of {}",
+            "filtering must not change the count: {} of {}",
             held.shown.len(),
             held.total
         );
@@ -870,15 +1160,15 @@ mod tests {
         assert!(!mutex_report(true).shown.iter().any(|e| e.addr() == addr));
     }
 
-    /// The address in the list is the boxed backend's, so it survives moving
+    /// The address in the list is the shared backend's, so it survives moving
     /// the mutex — the property that makes the `onlyLocked` probe sound. A
     /// registry of addresses of the values themselves would dangle here.
     #[test]
     fn the_registered_address_survives_moving_the_mutex() {
         let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(1);
-        let addr = mutex_addr(&m);
+        let addr = m.registered_addr();
         let moved = Box::new(m);
-        assert_eq!(mutex_addr(&moved), addr);
+        assert_eq!(moved.registered_addr(), addr);
         assert!(mutex_report(false).shown.iter().any(|e| e.addr() == addr));
         drop(moved);
         assert!(!mutex_report(false).shown.iter().any(|e| e.addr() == addr));
@@ -1019,5 +1309,175 @@ mod tests {
             w.join().expect("worker panicked");
         }
         assert_eq!(*m.lock(), THREADS * PER_THREAD);
+    }
+
+    /// The first boundary of [`EventWaiter::wait_until`]: a condition that
+    /// already holds must not reach `park` at all, because the signal that
+    /// would have released it may already have been spent.
+    #[test]
+    fn an_event_does_not_park_on_a_condition_that_already_holds() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            true
+        });
+        assert_eq!(polls, 1, "a condition already true was polled twice");
+    }
+
+    /// The other boundary: a waiter that *has* announced itself is released by
+    /// a signal, and a signal with nobody announced is the one-atomic no-op
+    /// the band's per-push wake-up depends on for its cost.
+    #[test]
+    fn a_signal_releases_an_announced_waiter_and_costs_nothing_otherwise() {
+        let event = std::sync::Arc::new(Event::new());
+        assert_eq!(
+            event.signal(),
+            Signalled::Running,
+            "an event with no waiter at all reported a wake"
+        );
+
+        let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (e, g, p) = (
+            std::sync::Arc::clone(&event),
+            std::sync::Arc::clone(&go),
+            std::sync::Arc::clone(&parked),
+        );
+        let worker = std::thread::spawn(move || {
+            let waiter = e.waiter();
+            waiter.wait_until(|| {
+                p.store(true, std::sync::atomic::Ordering::SeqCst);
+                g.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        });
+        while !parked.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        go.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The waiter may be anywhere between its announcement and `park`, so
+        // the wake has to be retried — which is the contract: a signal is not
+        // a latch, it releases a waiter that is there to be released.
+        while event.signal() != Signalled::Claimed {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        worker.join().expect("waiter panicked");
+    }
+
+    /// [`EventWaiter::wait_until_deadline`]'s two answers, at the boundary
+    /// between them: a condition that holds answers `true` without waiting,
+    /// and a condition that never holds answers `false` no earlier than the
+    /// deadline.
+    #[test]
+    fn a_deadline_wait_answers_which_of_the_two_happened() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            waiter.wait_until_deadline(far, || true),
+            "a condition that holds was reported as a timeout"
+        );
+
+        let wait = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        assert!(
+            !waiter.wait_until_deadline(started + wait, || false),
+            "a condition that never holds was reported as met"
+        );
+        assert!(
+            started.elapsed() >= wait,
+            "the deadline wait returned early: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The three states a signal can find, and what each owes: nobody
+    /// announced is a no-op, an announcement is taken and released, and an
+    /// announcement some other signaller has already taken is released again —
+    /// that signaller may be stopped before the `unpark` it owes, and a waiter
+    /// must not be left waiting for one particular thread to run again.
+    #[test]
+    fn a_signal_releases_a_waiter_whose_claim_is_still_in_flight() {
+        use std::sync::atomic::Ordering;
+
+        let event = Event::new();
+        let waiter = event.waiter();
+        assert_eq!(
+            event.signal(),
+            Signalled::Running,
+            "nobody has announced itself"
+        );
+
+        event.state.store(EVENT_SLEEPING, Ordering::SeqCst);
+        assert_eq!(
+            event.signal(),
+            Signalled::Claimed,
+            "an announced waiter has to be released"
+        );
+        assert_eq!(
+            event.state.load(Ordering::SeqCst),
+            EVENT_CLAIMED,
+            "the claim has to outlive the signaller that took it"
+        );
+        assert_eq!(
+            event.signal(),
+            Signalled::Pending,
+            "a claim nobody may have acted on yet is released, by a signaller \
+             that takes no credit for a sleep it did not end"
+        );
+
+        // Both signals unparked this thread, so the park below returns on a
+        // token instead of blocking: one extra poll of the condition is the
+        // whole cost of the redundant wake.
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            polls > 1
+        });
+        assert_eq!(polls, 2, "the park blocked instead of taking its token");
+        // Leave no token behind for whatever runs next on this thread.
+        std::thread::park_timeout(std::time::Duration::ZERO);
+    }
+
+    /// [`Event::signal_if_parked`] must answer exactly what
+    /// [`Event::signal`] answers on each of the three states, since a scan
+    /// that reads one of them differently either claims a worker twice or
+    /// walks past the only one it could have woken.
+    #[test]
+    fn reading_before_the_claim_answers_the_same_on_all_three_states() {
+        let awake = Event::new();
+        assert_eq!(awake.signal_if_parked(), Signalled::Running);
+        assert_eq!(awake.signal(), Signalled::Running);
+
+        let sleeping = Event::new();
+        sleeping.announce_for_test();
+        assert_eq!(sleeping.signal_if_parked(), Signalled::Claimed);
+
+        // Claimed by that call; a second signaller gets `Pending` either way.
+        assert_eq!(sleeping.signal_if_parked(), Signalled::Pending);
+        assert_eq!(sleeping.signal(), Signalled::Pending);
+    }
+
+    /// Shutdown: [`Event::wake`] has to release a waiter whichever side of its
+    /// announcement it is on, so a facility's join cannot hang on a wake that
+    /// landed in the window [`Event::signal`] deliberately ignores.
+    #[test]
+    fn a_forced_wake_releases_a_waiter_that_has_not_announced_itself() {
+        let event = Event::new();
+        let waiter = event.waiter();
+        // Nobody is announced — `signal` is a no-op here by design, `wake`
+        // still leaves a token, so the park below returns.
+        assert_eq!(event.signal(), Signalled::Running);
+        event.wake();
+        let mut polls = 0usize;
+        waiter.wait_until(|| {
+            polls += 1;
+            polls > 1
+        });
+        assert_eq!(polls, 2, "the forced wake did not release the park");
     }
 }

@@ -29,6 +29,7 @@
 //! over to it (that is a later increment).
 
 pub mod callback_executor;
+mod callback_queue;
 pub mod delayed_timer;
 // `pub`, not `pub(crate)`: the record system's periodic-scan threads
 // (`epics_base_rs::server::scan`) and the database write gate run under the

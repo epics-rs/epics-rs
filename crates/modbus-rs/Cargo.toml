@@ -6,7 +6,6 @@ description = "Rust port of EPICS modbus — Modbus TCP/RTU/ASCII driver for epi
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
-readme = "README.md"
 
 # Library import name kept as `modbus_rs` so consumers continue to write
 # `use modbus_rs::...` even though the crates.io package is

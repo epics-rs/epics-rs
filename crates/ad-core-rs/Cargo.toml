@@ -6,7 +6,6 @@ description = "Core types and base classes for areaDetector-rs"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
-readme = "README.md"
 
 [dependencies]
 asyn-rs = { workspace = true }

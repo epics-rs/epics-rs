@@ -6,7 +6,6 @@ description = "Rust port of EPICS motor record"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
-readme = "README.md"
 
 [dependencies]
 epics-base-rs = { workspace = true }

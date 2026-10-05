@@ -758,6 +758,51 @@ mod ioc {
         //      threads exists no matter how many entry points start one.
         //      Held to the end of `main`: this IOC scans for as long as it
         //      serves.
+        // (2b-rig) PARALLEL SCAN HELPERS, under `bringup-probes` only
+        //      (measurement rig, not IOC content — same rule as the probe
+        //      databases above). `scanParallelThreads` and `scanRateThreads`
+        //      are iocsh commands and this target has no iocsh, so the boot
+        //      command line is the only configuration surface an image has:
+        //
+        //        BENCH_SCAN_HELPERS=2 BENCH_SCAN_RESERVE=1
+        //        BENCH_SCAN_RATE_HELPERS=6:1,3:2
+        //
+        //      The dedicated form takes the period's INDEX rather than its
+        //      `menuScan` choice, because `rtems_init.c` splits the command
+        //      line on whitespace and every periodic choice string has a
+        //      space in it. Indices run slowest-first, as `papPeriodic` does:
+        //      on the stock menu 0 is `10 second` and 6 is `.1 second`.
+        #[cfg(feature = "bringup-probes")]
+        {
+            let count = std::env::var("BENCH_SCAN_HELPERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok());
+            if let Some(count) = count {
+                let reserve = std::env::var("BENCH_SCAN_RESERVE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .unwrap_or(0);
+                epics_base_rs::server::scan::set_parallel_threads(count, reserve);
+                println!("SCANRIG pool count={count} reserve={reserve}");
+            }
+            if let Ok(spec) = std::env::var("BENCH_SCAN_RATE_HELPERS") {
+                for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+                    match item.trim().split_once(':') {
+                        Some((ind, n)) => {
+                            match (ind.trim().parse::<usize>(), n.trim().parse::<i32>()) {
+                                (Ok(ind), Ok(n)) => {
+                                    epics_base_rs::server::scan::set_rate_threads(ind, n);
+                                    println!("SCANRIG rate ind={ind} count={n}");
+                                }
+                                _ => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
+                            }
+                        }
+                        None => println!("SCANRIG rate spec '{item}' is not <ind>:<count>"),
+                    }
+                }
+            }
+        }
+
         let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports

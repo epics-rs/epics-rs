@@ -2,7 +2,9 @@
 
 Rust port of [EPICS asyn](https://epics-modules.github.io/master/asyn/R4-44/asynDriver.html) — an async device I/O framework for hardware drivers.
 
-No C dependencies. Pure Rust. Integrates with [epics-ca](https://github.com/physwkim/epics-base-rs) via the optional `epics` feature.
+No C dependencies. Pure Rust. The record/device-support side is the `epics`
+feature, **on by default**; `--no-default-features` leaves the driver
+framework on its own, with no dependency on `epics-base-rs`.
 
 **Repository:** <https://github.com/epics-rs/epics-rs>
 
@@ -14,66 +16,66 @@ asyn-rs provides the same driver model as C asyn, but uses Rust's type system an
 - **ParamList** — named parameter cache with change tracking, timestamps, and alarm status
 - **InterruptManager** — dual async (broadcast) + sync (mpsc) callback delivery
 - **PortManager** — registry of named port drivers
-- **AsynDeviceSupport** — universal asyn device support factory bridging any asyn-rs driver to epics-ca records
+- **AsynDeviceSupport** — the universal asyn device support, bridging any
+  asyn-rs driver to `epics-base-rs` records (`epics` feature)
 
-## What's New in v0.2
+## Execution model
 
-### v0.2.0 — Actor Model + Typed Capabilities
+A driver is **not** shared behind a lock. Each one is owned exclusively by an
+actor, and callers hold handles:
 
-**Actor-based port driver execution** — drivers are no longer accessed through `Arc<Mutex<dyn PortDriver>>`. Instead, each driver runs in its own actor thread with exclusive ownership:
+- **PortActor / PortRuntime** — owns the driver, dispatches requests from a
+  channel, broadcasts `RuntimeEvent` (Started/Stopped/Connected/Disconnected/
+  Error) and shuts down gracefully
+- **PortHandle** — a cloneable async handle with typed methods
+  (`read_int32()`, `write_float64()`, …)
+- **AsyncCompletionHandle** — `Future`, plus `wait_blocking()` for sync callers
+- **AxisRuntime** — the per-axis motor actor: poll loop, event emission, I/O
+  Intr notification
+- **Supervision** — a restart loop with a configurable policy
+  (`max_restarts`, `restart_window`)
 
-- **PortActor** — owns the driver exclusively, dispatches requests via channel
-- **PortHandle** — cloneable async handle with typed convenience methods (`read_int32()`, `write_float64()`, etc.)
-- **AsyncCompletionHandle** — `Future` impl + `wait_blocking()` for sync callers
+`PortManager::register_port` registers a driver and hands back a
+`PortRuntimeHandle`.
 
-**Adapter migration** — `AsynDeviceSupport` now supports both legacy (`Arc<Mutex>`) and actor (`PortHandle`) backends via `PortBackend` enum. New drivers should use `from_handle()`.
+### Protocol and transport
 
-**Typed capability system**:
-- `InterfaceType` enum with bidirectional string conversion (e.g. `"asynInt32"` ↔ `InterfaceType::Int32`)
-- `Capability` enum for declaring driver capabilities at type level
-- `PortDriver::capabilities()` / `supports()` default trait methods
-
-**Extended request types** — `RequestOp` extended with `DrvUserCreate`, `Enum`, `Int32Array`, `Float64Array`. `RequestResult` gains alarm/timestamp metadata.
-
-### v0.2.1 — Protocol, Transport, Runtime
-
-**Pure-data protocol** (`src/protocol/`) — serializable message types at all boundaries, no trait objects or closures:
+Every boundary carries pure data — no trait objects, no closures — so a
+request can one day cross a process:
 
 | Type | Description |
 |------|-------------|
-| `PortCommand` | One variant per `RequestOp`; payloads that cannot serialize (`CallParamCallbacks` updates, the `WithDriver` closure) are dropped |
-| `PortReply` | Response envelope with typed `ReplyPayload` |
-| `ParamValue` | Serializable value union (no `GenericPointer`) |
-| `PortRequest` | Request envelope with `RequestMeta` |
-| `PortEvent` | Event with `EventPayload` (value change / exception) |
+| `PortCommand` | one variant per `RequestOp` |
+| `PortReply` | response envelope with a typed `ReplyPayload` |
+| `ParamValue` | the serializable value union |
+| `PortRequest` | request envelope with `RequestMeta` |
+| `PortEvent` | value change / exception, with `EventPayload` |
 
-All types derive `serde::Serialize`/`Deserialize` for future wire transport.
+All of them derive `serde::Serialize`/`Deserialize`. `RuntimeClient` is the
+transport seam over them; `InProcessClient` is the zero-cost path that passes
+the enums straight through, and a socket client is where a multi-process
+deployment would plug in.
 
-**Pluggable transport** (`src/transport/`) — `RuntimeClient` trait decouples callers from transport:
+### Typed capabilities
 
-```rust
-pub trait RuntimeClient: Send + Sync + Clone + 'static {
-    fn request(&self, req: PortRequest) -> Pin<Box<dyn Future<Output = Result<PortReply, TransportError>> + Send + '_>>;
-    fn request_blocking(&self, req: PortRequest) -> Result<PortReply, TransportError>;
-    fn subscribe(&self, filter: EventFilter) -> ...;
-}
-```
+`InterfaceType` converts both ways against the C interface names
+(`"asynInt32"` ↔ `InterfaceType::Int32`), `Capability` declares what a driver
+can do, and `PortDriver::capabilities()`/`supports()` answer from it.
 
-- **InProcessClient** — zero-cost fast path, direct enum pass-through (no serialization)
-- Future: `UnixSocketClient` for multi-process deployments
+## Ported drivers
 
-**Runtime module** (`src/runtime/`) — promoted actors with lifecycle management:
+`drivers/` carries the C asyn port drivers:
 
-- **PortRuntime** — promoted `PortActor` with `RuntimeEvent` broadcast (Started/Stopped/Connected/Disconnected/Error) and graceful shutdown
-- **AxisRuntime** — per-axis motor actor with event emission, poll loop, and I/O Intr notification
-- **Supervision** — generic restart loop with configurable policy (`max_restarts`, `restart_window`)
-- **PortManager integration** — `register_port_runtime()` auto-registers both runtime handle and legacy port handle for backwards compatibility
+| driver | state |
+|---|---|
+| `ip_port`, `ip_server_port` | TCP/UDP client and server ports |
+| `serial_port` | POSIX termios, with a Win32 DCB backend behind the same module path — C asyn's `drvAsynSerialPort.c` / `…Win32.c` split |
+| `prologix` | the Prologix GPIB-Ethernet controller |
+| `null_port` | the discard port |
+| `ftdi` (`ftdi-mpsse`), `usbtmc` (`usbtmc`), `vxi11` (`vxi11`) | scaffolds: they compile with the feature off and `connect()` fails fast with "feature not enabled" rather than silently doing nothing |
 
-**Criterion benchmarks** (`benches/throughput.rs`):
-- `local_int32_read` / `local_float64_write` / `local_octet_roundtrip` — legacy mutex path
-- `actor_int32_read` — PortHandle via actor
-- `concurrent_32_producers` — 32 threads on same port
-- `interrupt_event_throughput` — 1k events broadcast delivery
+`interpose/` is the octet-level middleware chain — `eos`, `echo`, `delay`,
+`flush`, `com` — layered under a port the way C's `asynInterposeXxx` is.
 
 ## Architecture
 
@@ -127,9 +129,9 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-asyn-rs = { path = "../asyn-rs" }
-# With EPICS integration:
-# asyn-rs = { path = "../asyn-rs", features = ["epics"] }
+asyn-rs = "0.30"
+# Driver framework only, no record system:
+# asyn-rs = { version = "0.30", default-features = false }
 ```
 
 ### Implementing a Driver
@@ -171,23 +173,25 @@ impl PortDriver for TemperatureDriver {
 use asyn_rs::manager::PortManager;
 
 let manager = PortManager::new();
-let port = manager.register_port(TemperatureDriver::new());
+// The driver moves into its actor; what comes back is a handle to it.
+let runtime = manager.register_port(TemperatureDriver::new())?;
 
-// Access from anywhere via Arc<RwLock<dyn PortDriver>>
-let p = manager.find_port("tempPort").unwrap();
+// Anywhere else, by name:
+let port = manager.find_port_handle("tempPort")?;
 ```
 
 ### EPICS Integration
 
-With the `epics` feature, use `AsynDeviceSupport` to bridge drivers to epics-ca records:
+With the `epics` feature, use `AsynDeviceSupport` to bridge drivers to
+`epics-base-rs` records:
 
 ```rust
 use asyn_rs::adapter::{AsynDeviceSupport, parse_asyn_link};
 
 // In a DeviceSupport factory:
 let link = parse_asyn_link("@asyn(tempPort, 0, 1.0) TEMPERATURE").unwrap();
-let port = manager.find_port(&link.port_name).unwrap();
-let adapter = AsynDeviceSupport::new(port, link, "asynFloat64");
+let handle = manager.find_port_handle(&link.port_name)?;
+let adapter = AsynDeviceSupport::from_handle(handle, link, "asynFloat64");
 ```
 
 The adapter handles:
@@ -208,13 +212,23 @@ The adapter handles:
 | `manager` | `PortManager` — named port driver registry + runtime registration |
 | `user` | `AsynUser` — per-request context (reason, addr) |
 | `trace` | `asyn_trace!` macro for debug logging |
-| `interfaces` | `InterfaceType`, `Capability` — typed interface/capability system |
+| `interfaces` | `InterfaceType`, `Capability`, and one module per asyn interface — int32/int64/uint32Digital/uint64/float64/octet/enum/arrays/average/gpib/motor/genericPointer |
+| `drivers` | the ported port drivers (see above) |
+| `interpose` | the octet interpose chain — eos, echo, delay, flush, com |
+| `sync_io` | the synchronous convenience API over a port's I/O |
+| `services` | the services every port is born with — C's `pasynBase` |
+| `registry` | the process-wide port registry: the single claim on a port name |
+| `iocsh` | the asyn iocsh commands |
+| `asyn_record` | the `asyn` record and its I/O Intr support *(requires `epics`)* |
+| `timestamp` | named time-stamp sources — C's `registryFunctionFind` |
+| `escape` | the one C escape table (libCom `epicsString.c`) |
+| `exception` | port exception callbacks |
 | `port_actor` | `PortActor` — actor with exclusive driver ownership |
 | `port_handle` | `PortHandle` — cloneable async handle with typed convenience methods |
 | `protocol` | Pure-data message types: `PortCommand`, `PortReply`, `ParamValue`, `PortEvent` |
 | `transport` | `RuntimeClient` trait, `InProcessClient` (zero-cost fast path) |
 | `runtime` | `PortRuntime`, `AxisRuntime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
-| `adapter` | `AsynDeviceSupport` — epics-ca bridge *(requires `epics` feature)* |
+| `adapter` | `AsynDeviceSupport` — the record bridge *(requires `epics`)* |
 
 ## Runtime Facade
 
@@ -242,9 +256,9 @@ This means `can_block` is preserved for compatibility but has no runtime effect.
 ## Testing
 
 ```bash
-cargo test                    # Core tests (316)
-cargo test --features epics   # With EPICS integration (326)
-cargo bench                   # Criterion throughput benchmarks
+cargo nextest run -p asyn-rs                          # with `epics`, the default
+cargo nextest run -p asyn-rs --no-default-features    # framework only
+cargo bench -p asyn-rs                                # criterion throughput
 ```
 
 ## License

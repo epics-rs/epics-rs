@@ -86,10 +86,12 @@ use epics_ca_rs::server::run_ca_ioc_app;
 #[epics_base_rs::epics_main]
 async fn main() -> epics_base_rs::error::CaResult<()> {
     let (name, factory) = mca_rs::mca_record_factory();
+    // The database loads through the shell, as in C: `db_file` is
+    // `IocBuilder`'s, and an `IocApplication` has no second loader.
     run_ca_ioc_app(
         IocApplication::new()
             .register_record_type(name, factory)
-            .db_file("my-mca.db", &Default::default())?,
+            .startup_line(r#"dbLoadRecords("my-mca.db")"#),
     )
     .await
 }

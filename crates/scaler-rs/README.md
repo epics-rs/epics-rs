@@ -82,10 +82,12 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 
     // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
     // `dbsr` server layer exist before `iocInit` rather than after it.
+    // The database loads through the shell, as in C: `db_file` is
+    // `IocBuilder`'s, and an `IocApplication` has no second loader.
     run_ca_ioc_app(
         IocApplication::new()
             .register_record_type(name, factory)
-            .db_file("db/scaler16.db", &macros)?,
+            .startup_line(r#"dbLoadRecords("db/scaler16.db")"#),
     )
     .await
 }

@@ -123,7 +123,9 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 
     // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
     // `dbsr` server layer exist before `iocInit` rather than after it.
-    run_ca_ioc_app(app.db_file("db/sync_pid_control.db", &macros)?).await
+    // The database loads through the shell, as in C: `db_file` is
+    // `IocBuilder`'s, and an `IocApplication` has no second loader.
+    run_ca_ioc_app(app.startup_line(r#"dbLoadRecords("db/sync_pid_control.db")"#)).await
 }
 ```
 

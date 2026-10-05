@@ -16,9 +16,12 @@ name = "modbus_rs"
 path = "src/lib.rs"
 
 [dependencies]
-asyn-rs = { workspace = true }
-tokio = { version = "1", features = ["sync", "time", "rt"] }
-tracing = "0.1"
+# Named only by `src/ioc.rs` (gated on `feature = "ioc"`); see `epics-ca-rs`
+# below, which was already optional for the same reason.
+asyn-rs = { workspace = true, optional = true }
+# Named only by `src/ioc.rs`, like `asyn-rs` above. The `#[tokio::test]`s in
+# that module take the unconditional dev-dependency below instead.
+tokio = { version = "1", features = ["sync", "time", "rt"], optional = true }
 thiserror = "2"
 
 epics-base-rs = { workspace = true, optional = true }
@@ -29,7 +32,7 @@ default = []
 # Opt-in IOC integration: record / device-support binding through asyn-rs.
 # Without this flag modbus-rs builds the protocol + driver layers only,
 # with no EPICS database dependency.
-ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "asyn-rs/epics"]
+ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "dep:asyn-rs", "dep:tokio", "asyn-rs/epics"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

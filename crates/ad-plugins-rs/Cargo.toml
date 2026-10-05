@@ -11,7 +11,10 @@ repository.workspace = true
 ad-core-rs = { workspace = true }
 asyn-rs = { workspace = true }
 epics-base-rs = { workspace = true }
-epics-ca-rs = { workspace = true }
+# Named only by `mod ioc` (gated on `feature = "ioc"`), so it is optional and
+# the feature pulls it: a non-optional dependency used by one feature is
+# compiled for every default build that cannot reach it.
+epics-ca-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 parking_lot = "0.12"
@@ -44,7 +47,7 @@ tiff = "0.9"
 
 [features]
 default = ["parallel", "simd"]
-ioc = ["ad-core-rs/ioc"]
+ioc = ["dep:epics-ca-rs", "ad-core-rs/ioc"]
 pva = ["dep:epics-pva-rs", "dep:epics-bridge-rs"]
 parallel = ["rayon"]
 simd = ["dep:fearless_simd", "dep:fearless_simd_macros", "ad-core-rs/simd"]

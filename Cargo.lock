@@ -1156,7 +1156,6 @@ dependencies = [
  "epics-ca-rs",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]

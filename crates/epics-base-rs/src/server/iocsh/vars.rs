@@ -673,8 +673,18 @@ mod tests {
             "int scanParallelThreadsDefault = 8\n"
         );
 
+        // The zero arm caps the knob at CPUs - 1 (`dbScan.c:307-314`), so a
+        // knob at or above the cap resolves to the cap and the command would
+        // pass this test while ignoring the global entirely. Seed it one
+        // below the cap instead: then the resolved count can only have come
+        // from the knob. Two CPUs or fewer leave no room for that, and there
+        // the claim is only the cap — C's own test computes the same min
+        // (`dbScanParallelTest.c::runWith`).
+        let cap = crate::runtime::background::callback_executor::cpu_count() as i32 - 1;
+        let seed = if cap >= 2 { (cap - 1).min(5) } else { 5 };
+        let want = seed.min(cap).max(0);
         assert_eq!(
-            run_var(&ctx, &["scanParallelThreadsDefault", "5"]).unwrap(),
+            run_var(&ctx, &["scanParallelThreadsDefault", &seed.to_string()]).unwrap(),
             ""
         );
         // `0 -1`: the count comes from the knob, the reserve from the
@@ -691,7 +701,11 @@ mod tests {
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
         ));
-        assert_eq!(scan::parallel_threads(), (5, 0));
+        assert_eq!(
+            scan::parallel_threads(),
+            (want, 0),
+            "knob {seed} capped at CPUs - 1 = {cap}"
+        );
 
         scan::set_parallel_threads_default(restore);
         scan::set_parallel_threads(0, 0);

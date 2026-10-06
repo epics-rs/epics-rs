@@ -1878,7 +1878,7 @@ impl PvDatabase {
         // order; a record type that redeclares a `dbCommon` field keeps the
         // first entry, since that is the one `declared_field` resolves.
         for desc in crate::server::record::declared_fields(record_type) {
-            let ftype = match crate::types::dbf_link_class(record_type, desc.name) {
+            let ftype = match crate::types::link_class_of(desc) {
                 Some(DbfLinkClass::InLink) => LinkFieldType::In,
                 Some(DbfLinkClass::OutLink) => LinkFieldType::Out,
                 Some(DbfLinkClass::FwdLink) => LinkFieldType::Fwd,

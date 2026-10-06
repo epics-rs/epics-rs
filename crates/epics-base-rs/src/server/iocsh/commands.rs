@@ -2133,14 +2133,13 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                     return dbpr_no_access(&inst, d).map(|t| (d.name.to_string(), t, None));
                 }
                 let value = inst.resolve_field(d.name)?;
-                let link =
-                    crate::types::dbf_link_class(inst.record.record_type(), d.name).map(|class| {
-                        let raw = match inst.resolve_field_stored(d.name) {
-                            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                            _ => String::new(),
-                        };
-                        (class, raw)
-                    });
+                let link = crate::types::link_class_of(d).map(|class| {
+                    let raw = match inst.resolve_field_stored(d.name) {
+                        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                        _ => String::new(),
+                    };
+                    (class, raw)
+                });
                 Some((d.name.to_string(), db_get_string(&inst, d, &value), link))
             })
             .collect();

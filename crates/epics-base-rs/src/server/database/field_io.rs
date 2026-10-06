@@ -4518,7 +4518,7 @@ mod tests {
         let mut accepted = Vec::new();
         for record_type in RECORD_TYPES {
             for desc in declared_fields(record_type) {
-                if crate::types::dbf_link_class(record_type, desc.name).is_none() {
+                if crate::types::link_class_of(desc).is_none() {
                     continue;
                 }
                 if declared_link_type(record_type, None, desc.name).is_none() {
@@ -4643,7 +4643,7 @@ mod tests {
         let mut offenders = Vec::new();
         for record_type in RECORD_TYPES {
             for desc in declared_fields(record_type) {
-                if crate::types::dbf_link_class(record_type, desc.name).is_none() {
+                if crate::types::link_class_of(desc).is_none() {
                     continue;
                 }
                 if desc.read_only

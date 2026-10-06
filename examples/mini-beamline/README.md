@@ -151,7 +151,7 @@ with plugins under the same prefix (`mini:dot:image1:`, `mini:dot:Stats1:`, etc.
 | `mini:dot:cam1:AcquirePeriod` | ao | Acquisition period (s) |
 | `mini:dot:cam1:AcquirePeriod_RBV` | ai | Acquisition period readback |
 | `mini:dot:cam1:DetectorState_RBV` | mbbi | Detector state (Idle/Acquire/...) |
-| `mini:dot:cam1:AcquireBusy_RBV` | bi | Whether acquisition is in progress |
+| `mini:dot:cam1:AcquireBusy` | busy | Whether acquisition is in progress |
 | `mini:dot:cam1:ArrayCounter` | longout | Frame counter (resettable) |
 | `mini:dot:cam1:ArrayCounter_RBV` | longin | Frame counter readback |
 | `mini:dot:cam1:ArrayCallbacks` | bo | Enable/disable NDArray callbacks |
@@ -187,13 +187,19 @@ cargo build --release -p mini-beamline --features ioc
 ### Acquire an image and display with Python
 
 ```bash
-# 1. Enable callbacks and acquire a single image
+# 1. Enable callbacks on the driver AND on the plugin that serves ArrayData.
+#    NDPluginBase.template defaults EnableCallbacks to Disable, and
+#    commonPlugins.cmd does not override it, so without this ArrayData
+#    stays at its .db value however many frames the driver produces.
 caput mini:dot:cam1:ArrayCallbacks 1
+caput mini:dot:image1:EnableCallbacks 1
+
+# 2. Acquire a single image
 caput mini:dot:cam1:ImageMode 0          # Single
 caput mini:dot:cam1:AcquireTime 0.1
 caput mini:dot:cam1:Acquire 1
 
-# 2. Read the image data
+# 3. Read the image data
 caget mini:dot:image1:ArrayData
 ```
 

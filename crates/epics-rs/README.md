@@ -31,7 +31,7 @@ you through `epics-base-rs`, so the features select nothing.
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.30", features = ["motor", "ad"] }
+epics-rs = { version = "0.31", features = ["motor", "ad"] }
 ```
 
 ```rust

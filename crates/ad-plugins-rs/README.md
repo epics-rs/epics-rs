@@ -122,7 +122,7 @@ A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead fro
 To disable parallelism entirely:
 
 ```toml
-ad-plugins-rs = { version = "0.30", default-features = false }
+ad-plugins-rs = { version = "0.31", default-features = false }
 ```
 
 ## Usage

@@ -84,7 +84,7 @@ iocInit()
 ### IOC Binary
 
 The iocsh commands and the device-support binding are behind the `ioc`
-feature, which is **not** on by default: `mqtt-rs = { version = "0.30",
+feature, which is **not** on by default: `mqtt-rs = { version = "0.31",
 features = ["ioc"] }`.
 
 ```rust

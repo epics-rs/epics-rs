@@ -273,12 +273,8 @@ impl NDArrayPool {
         let data_type = source.data.data_type();
         let mut copy = self.alloc(dims, data_type)?;
         copy.data.copy_from(&source.data);
-        // C++ NDArrayPool::copy carries BOTH stamps across (NDArrayPool.cpp:284-285).
-        // Copying only `time_stamp` left `timestamp` (epicsTS) at whatever the
-        // recycled buffer happened to hold.
         copy.unique_id = source.unique_id;
-        copy.time_stamp = source.time_stamp;
-        copy.timestamp = source.timestamp;
+        copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
         copy.codec = source.codec.clone();
         Ok(copy)
@@ -378,8 +374,7 @@ impl NDArrayPool {
         };
 
         out.unique_id = src.unique_id;
-        out.time_stamp = src.time_stamp;
-        out.timestamp = src.timestamp;
+        out.copy_time_stamps_from(src);
         if copy_dimensions {
             out.dims = src.dims.clone();
         }
@@ -436,8 +431,7 @@ impl NDArrayPool {
         let mut out = self.alloc(src.dims.clone(), target_type)?;
         crate::color::convert_data_type_into(src, &mut out.data)?;
         out.unique_id = src.unique_id;
-        out.time_stamp = src.time_stamp;
-        out.timestamp = src.timestamp;
+        out.copy_time_stamps_from(src);
         out.attributes.copy_from(&src.attributes);
         Ok(out)
     }
@@ -460,8 +454,7 @@ impl NDArrayPool {
         let mut arr = self.alloc(out_dims, target_type)?;
         crate::convert::convert_dims_into(src, dims_out, &mut arr.data)?;
         arr.unique_id = src.unique_id;
-        arr.timestamp = src.timestamp;
-        arr.time_stamp = src.time_stamp;
+        arr.copy_time_stamps_from(src);
         arr.attributes.copy_from(&src.attributes);
 
         Ok(arr)

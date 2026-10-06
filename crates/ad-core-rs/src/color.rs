@@ -71,8 +71,7 @@ fn output(
 ) -> ADResult<NDArray> {
     let mut arr = pool.alloc(dims, data_type)?;
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     arr.codec = src.codec.clone();
     Ok(arr)

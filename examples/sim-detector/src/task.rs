@@ -275,7 +275,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             array_counter += 1;
 
             frame.unique_id = array_counter;
-            frame.timestamp = ad_core_rs::timestamp::EpicsTimestamp::now();
+            frame.update_time_stamps_now();
 
             // C `simDetector::computeImage` publishes the converted array's
             // size beside the frame it belongs to (simDetector.cpp:709-712):

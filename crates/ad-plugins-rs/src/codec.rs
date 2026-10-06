@@ -199,8 +199,7 @@ fn codec_output_with(
     fill(arr.data.as_u8_slice_mut())?;
     // `pool->copy(input, output, false, true, false)`: the metadata, not the data.
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }

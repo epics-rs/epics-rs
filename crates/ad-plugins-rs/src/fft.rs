@@ -60,7 +60,7 @@ pub fn next_pow2(n: usize) -> usize {
 fn float64_output(pool: &NDArrayPool, src: &NDArray, dims: Vec<NDDimension>) -> ADResult<NDArray> {
     let mut arr = pool.alloc(dims, NDDataType::Float64)?;
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }
@@ -875,6 +875,30 @@ impl NDPluginProcess for FFTProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `float64_output` carries both halves of its source's timestamp pair.
+    ///
+    /// The two are independent in C — a hardware clock feeds `timeStamp` while
+    /// the registered time source feeds `epicsTS` — so the source is stamped
+    /// with values that cannot be derived from each other.
+    #[test]
+    fn the_float64_output_carries_the_whole_timestamp_pair() {
+        let mut src = NDArray::with_data(
+            vec![NDDimension::new(4), NDDimension::new(2)],
+            NDDataBuffer::F64(vec![0.0; 8]),
+        );
+        src.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 7, nsec: 11 };
+        src.time_stamp = 123.5;
+
+        let pool = NDArrayPool::new(0);
+        let out = float64_output(&pool, &src, src.dims.clone()).unwrap();
+
+        assert_eq!(out.timestamp, src.timestamp, "epicsTS was dropped");
+        assert_eq!(
+            out.time_stamp, src.time_stamp,
+            "the derived double was dropped"
+        );
+    }
 
     /// The paired-row and half-column transforms against one complex
     /// transform per row and per column, on frames with an odd row count

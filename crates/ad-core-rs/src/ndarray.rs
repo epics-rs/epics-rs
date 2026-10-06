@@ -649,6 +649,22 @@ impl NDArray {
         self.update_time_stamps(EpicsTimestamp::now());
     }
 
+    /// Carry `src`'s timestamp pair onto this array.
+    ///
+    /// The single owner of timestamp *propagation*, as
+    /// [`NDArray::update_time_stamps`] is the single owner of stamping. The two
+    /// fields are independent in C (a hardware clock feeds `timeStamp` while
+    /// the registered time source feeds `epicsTS`), so a derived frame must
+    /// carry both or it carries neither correctly — C copies the pair together
+    /// in `NDArrayPool::copy`/`convert` (NDArrayPool.cpp:284-285, 658-659).
+    /// Every plugin that builds an output from an input goes through here, so
+    /// no site can copy one half and leave the other at the recycled buffer's
+    /// value.
+    pub fn copy_time_stamps_from(&mut self, src: &NDArray) {
+        self.timestamp = src.timestamp;
+        self.time_stamp = src.time_stamp;
+    }
+
     /// Compute layout info for this array (matching C++ NDArray::getInfo).
     ///
     /// For 3D arrays, reads the `ColorMode` attribute to determine which

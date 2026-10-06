@@ -251,7 +251,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             array_counter += 1;
 
             frame.unique_id = array_counter;
-            frame.timestamp = ad_core_rs::timestamp::EpicsTimestamp::now();
+            frame.update_time_stamps_now();
 
             // Update parameters and fire callbacks in one atomic operation.
             // Using set_params_and_notify instead of write_int32_no_wait avoids

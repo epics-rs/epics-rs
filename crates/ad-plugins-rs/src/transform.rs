@@ -180,8 +180,7 @@ pub fn apply_transform(
     same_type!(U8, U16, I8, I16, I32, U32, I64, U64, F32, F64);
 
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }

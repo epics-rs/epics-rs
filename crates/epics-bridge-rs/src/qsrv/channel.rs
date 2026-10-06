@@ -1323,7 +1323,7 @@ mod tests {
             .await
             .unwrap();
 
-        let m = member(r#"GRP:AI{"arr":{"s":0}}"#);
+        let m = member(r#"GRP:AI.{"arr":{"s":0}}"#);
         assert_eq!(m.names(), ("GRP:AI", "VAL"), "the suffix is peeled first");
         assert_eq!(m.value_filters.len(), 1);
         assert_eq!(m.property_filters.len(), 1);
@@ -1348,7 +1348,7 @@ mod tests {
             .await
             .unwrap();
 
-        let m = member(r#"GRP:AI{"nosuchfilter":{}}"#);
+        let m = member(r#"GRP:AI.{"nosuchfilter":{}}"#);
         assert!(m.filter_error.is_some(), "the bad suffix is recorded");
         assert!(m.value_filters.is_empty(), "and no chain is served");
         let err = resolve_db_channel(&db, &m)

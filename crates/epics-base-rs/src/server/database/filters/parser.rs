@@ -6,7 +6,7 @@
 //! * `TEMP` — no filter; equivalent to `(base, "VAL", None)`.
 //! * `TEMP.VAL` — base record + explicit field.
 //! * `TEMP.{"dbnd":{"d":0.5}}` — filter chain on `VAL` of `TEMP`.
-//! * `TEMP.VAL.{"arr":{"s":0,"i":2,"e":-1}}` — explicit field +
+//! * `TEMP.VAL{"arr":{"s":0,"i":2,"e":-1}}` — explicit field +
 //!   filter chain.
 //! * Chained filters live in one JSON object — `TEMP.{"dec":{"n":3},
 //!   "dbnd":{"d":1.0}}` decimates first, then deadbands the
@@ -39,9 +39,16 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedChannelName {
     /// Record + optional `.FIELD` portion (everything before the
-    /// JSON suffix). Caller routes this through the existing
-    /// `parse_pv_name` to get the (base, field) split.
+    /// JSON suffix), with the `$` modifier still attached when
+    /// [`Self::string_view`] is set. Caller routes this through the
+    /// existing `parse_pv_name` to get the (base, field) split.
     pub record_path: String,
+    /// The `$` long-string modifier was present *where C accepts one* —
+    /// directly after the field part. Read this instead of looking for a
+    /// trailing `$` on [`Self::record_path`]: a record whose own name ends
+    /// in `$` has no modifier, and only the splitter can tell the two
+    /// apart.
+    pub string_view: bool,
     /// Raw JSON suffix from the channel name, or `None` if there
     /// wasn't one. Returned separately so callers can record /
     /// audit the original suffix even when the filter parse fails.
@@ -50,20 +57,37 @@ pub struct ParsedChannelName {
 
 /// Split a raw channel name into the `record_path` + JSON suffix.
 ///
-/// pvxs `test:ai.VAL{"dbnd":{"d":0.0}}`: the suffix
-/// begins at the first `{` regardless of whether a separating `.`
-/// precedes it. EPICS PV names never contain `{`, so the first
-/// `{` is unambiguous. Accepts every pvxs-compatible form:
+/// **The record name ends at the first `.`, and nothing before that dot is
+/// ever a modifier.** That is C's rule, not a simplification of it:
+/// `dbFindRecordPart` takes the span up to `strchr(pname, '.')` and looks
+/// it up whole in the PVD hash (`dbStaticLib.c:1548-1573`), so `{`, `[`
+/// and `$` inside a record name are just characters. Braced record names
+/// are ordinary EPICS names — NSLS-II writes `XF:31IDA-OP{Tbl-Ax:X1}Mtr`,
+/// and a C IOC serves it, `.DESC` and filter suffix and all. Cutting at
+/// the first `{` instead gave `{` two meanings and tore every such name in
+/// half.
 ///
-/// - `RECORD`            → no suffix.
-/// - `RECORD.FIELD`      → no suffix.
-/// - `RECORD{...}`       → suffix without field separator.
-/// - `RECORD.{...}`      → suffix after bare separator (legacy CA).
-/// - `RECORD.FIELD{...}` → suffix directly after field (pvxs).
-/// - `RECORD.FIELD.{...}` → suffix after explicit separator.
+/// So the accepted forms are exactly C's, each verified against a live
+/// `softIoc`:
 ///
-/// A trailing legacy array-range modifier (`RECORD.VAL[start:incr:end]`)
-/// is normalised into a canonical `arr` channel filter, matching EPICS
+/// - `RECORD`              → no suffix.
+/// - `RECORD.FIELD`        → no suffix.
+/// - `RECORD.{...}`        → absent field name binds `VAL`.
+/// - `RECORD.FIELD{...}`   → suffix directly after the field.
+/// - `RECORD.FIELD$`       → long-string modifier.
+/// - `RECORD$`             → the same on the default field (port-only).
+/// - `RECORD.FIELD$[r]{j}` → `$`, then range, then JSON, in C's order.
+///
+/// and the forms C refuses are refused here, by having no `.` to parse
+/// after: `RECORD{...}`, `RECORD[r]` (the whole string is a record name,
+/// which is why a record actually *called* `XF:...{Tbl}` resolves), and
+/// `RECORD.FIELD.{...}` (C's `dbChannelCreate` reaches its "nothing else
+/// may follow" check with a `.` in hand and fails, `dbChannel.c:522-525`).
+/// The deliberate exception is an undotted `RECORD$`, which the CA server
+/// serves as a record-level long string — see the body.
+///
+/// A legacy array-range modifier (`RECORD.VAL[start:incr:end]`) is
+/// normalised into a canonical `arr` channel filter, matching EPICS
 /// `dbChannel.c` `parseArrayRange` (dbChannel.c:351-446, 507-510): base
 /// translates `[N]`, `[s:e]`, `[s:i:e]` into an `arr` filter inserted
 /// *before* any JSON filters, so the slice applies first. Because every
@@ -71,58 +95,113 @@ pub struct ParsedChannelName {
 /// emitting the range as `arr` here gives the legacy syntax full support
 /// with no consumer changes — `split_channel_name` is the single owner of
 /// "channel name → record_path + filters".
-///
-/// Returns the empty suffix when no `{` and no `[range]` appear.
 pub fn split_channel_name(raw: &str) -> ParsedChannelName {
-    // 1. Peel the JSON filter suffix at the first `{`. EPICS PV names
-    //    never contain `{`, so the first `{` is unambiguous.
-    let (name_part, json_suffix) = match raw.find('{') {
-        Some(brace_pos) => {
-            // Strip an optional `.` separator immediately before the
-            // brace so `RECORD.{...}` and `RECORD.FIELD.{...}` produce a
-            // clean record path without the dangling dot.
-            let path_end = if brace_pos > 0 && raw.as_bytes()[brace_pos - 1] == b'.' {
-                brace_pos - 1
-            } else {
-                brace_pos
-            };
-            (&raw[..path_end], Some(raw[brace_pos..].to_string()))
-        }
-        None => (raw, None),
+    // Anything the grammar does not accept stays whole on the record path,
+    // so the record/field lookup downstream fails the channel exactly as C
+    // reaches `finish:` with a status and returns no `dbChannel`.
+    let whole = || ParsedChannelName {
+        record_path: raw.to_string(),
+        string_view: false,
+        json_suffix: None,
     };
 
-    // 2. Peel a trailing `[range]` array-range modifier off the name and
-    //    fold it into the filter chain as a leading `arr` entry. Array
-    //    range is channel syntax (base parses it after field modifiers,
-    //    before JSON filters), not part of the field name.
-    //
-    //    The separating `.` of `RECORD.[range]` goes with it, exactly as
-    //    step 1 drops the one in `RECORD.{json}`: C consumes that dot in
-    //    `pvNameLookup` before the field lookup (`if (**ppname == '.')
-    //    ++*ppname`, `dbChannel.c:321-322`), so `dbFindFieldPart` sees
-    //    `[2]`, takes the absent-field-name branch and binds `VAL`. Left
-    //    on the record path it makes the field the EMPTY string, which
-    //    resolves nowhere — `src.[2]` then fails every existence and
-    //    locality test in the port while C answers all of them.
-    if let Some((record_path, arr_inner)) = peel_array_range(name_part) {
-        let record_path = record_path
-            .strip_suffix('.')
-            .map(str::to_string)
-            .unwrap_or(record_path);
-        let json_suffix = Some(match json_suffix {
-            Some(existing) => merge_arr_into_json(&arr_inner, &existing),
-            None => format!("{{{arr_inner}}}"),
-        });
-        return ParsedChannelName {
-            record_path,
-            json_suffix,
+    let Some(dot) = raw.find('.') else {
+        // No field part, so no `[range]` and no `{json}` either. The one
+        // modifier the port still reads off an undotted name is a trailing
+        // `$`: C refuses `REC$` (`caget 'LS:REC$'` reports not found on a
+        // live `softIoc`, because `dbFindRecordPart` hashes the `$` with the
+        // rest), but the CA server has advertised a record-level long string
+        // for `REC$` since it gained `$` support, and unlike `{` a `$` cannot
+        // occur in a real record name — `.db` files spell macros `$(P)`, so a
+        // loaded name never carries one.
+        return match raw.strip_suffix('$') {
+            Some(core) if !core.is_empty() => ParsedChannelName {
+                record_path: raw.to_string(),
+                string_view: true,
+                json_suffix: None,
+            },
+            _ => whole(),
         };
+    };
+    let tail = &raw[dot + 1..];
+
+    // Field name: a C identifier, empty for `RECORD.{json}`. C's
+    // `dbFindFieldPart` measures it with this same charset and takes the
+    // absent-field-name branch — binding `VAL` — when the length is zero
+    // (`dbStaticLib.c:1565-1584`), which is why `$`, `[` and `{` need no
+    // special casing to terminate it.
+    let field_len = field_name_len(tail);
+    let mut rest = &tail[field_len..];
+
+    // `$` long-string modifier, innermost of the three. Left ON the record
+    // path because `parse_channel_name` and the CA server both expect to
+    // find it there; `string_view` is what says it is a modifier.
+    let string_view = rest.starts_with('$');
+    if string_view {
+        rest = &rest[1..];
     }
 
+    // `[range]` folded into a leading `arr` entry.
+    let mut arr_inner = None;
+    if let Some(body) = rest.strip_prefix('[') {
+        let Some((inner, after)) = body.find(']').and_then(|close| {
+            let (start, incr, end) = parse_array_range(&body[..close])?;
+            Some((build_arr_inner(start, incr, end), &body[close + 1..]))
+        }) else {
+            return whole();
+        };
+        arr_inner = Some(inner);
+        rest = after;
+    }
+
+    let json_suffix = if rest.is_empty() {
+        None
+    } else if rest.starts_with('{') {
+        Some(rest.to_string())
+    } else {
+        return whole();
+    };
+
+    // The separating `.` of `RECORD.{json}` / `RECORD.[range]` goes with the
+    // suffix: C consumes it in `pvNameLookup` before the field lookup (`if
+    // (**ppname == '.') ++*ppname`, `dbChannel.c:321-322`). Left on the
+    // record path it makes the field the EMPTY string, which resolves
+    // nowhere — `src.[2]` then fails every existence and locality test in
+    // the port while C answers all of them.
+    let mut record_path = if field_len == 0 {
+        raw[..dot].to_string()
+    } else {
+        raw[..dot + 1 + field_len].to_string()
+    };
+    if string_view {
+        record_path.push('$');
+    }
+
+    let json_suffix = match (arr_inner, json_suffix) {
+        (Some(arr), Some(json)) => Some(merge_arr_into_json(&arr, &json)),
+        (Some(arr), None) => Some(format!("{{{arr}}}")),
+        (None, json) => json,
+    };
+
     ParsedChannelName {
-        record_path: name_part.to_string(),
+        record_path,
+        string_view,
         json_suffix,
     }
+}
+
+/// Length of the field-name token at the head of `s` — a C identifier, or
+/// zero when none is present, as C `dbFindFieldPart` measures it
+/// (`dbStaticLib.c:1565-1571`).
+fn field_name_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    match b.first() {
+        Some(&c) if c == b'_' || c.is_ascii_alphabetic() => {}
+        _ => return 0,
+    }
+    b.iter()
+        .position(|&c| !(c == b'_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(b.len())
 }
 
 /// A client-supplied channel name resolved into everything C
@@ -171,35 +250,25 @@ pub struct ChannelName {
 /// it could not build.
 pub fn parse_channel_name(raw: &str) -> ChannelName {
     let parsed = split_channel_name(raw);
-    let (core, string_view) = match parsed.record_path.strip_suffix('$') {
-        Some(core) => (core, true),
-        None => (parsed.record_path.as_str(), false),
+    // `split_channel_name` decided whether the trailing `$` is a modifier;
+    // re-deriving it here with `strip_suffix` would strip the last character
+    // off a record actually named `REC$`.
+    let core = if parsed.string_view {
+        parsed
+            .record_path
+            .strip_suffix('$')
+            .unwrap_or(&parsed.record_path)
+    } else {
+        parsed.record_path.as_str()
     };
     let (record, field) = crate::server::database::parse_pv_name(core);
     ChannelName {
         record: record.to_string(),
         field: field.to_ascii_uppercase(),
         record_path: core.to_string(),
-        string_view,
+        string_view: parsed.string_view,
         json_suffix: parsed.json_suffix,
     }
-}
-
-/// Peel a trailing legacy array-range modifier (`[...]`) off a channel
-/// name part, returning the stripped record path and the synthesised
-/// inner `"arr":{...}` filter fragment. Returns `None` when there is no
-/// trailing `[...]` or it does not parse as a valid range — the name is
-/// then left untouched so the unresolved field still fails downstream
-/// exactly as before, matching base rejecting `dbChannelCreate`.
-fn peel_array_range(name_part: &str) -> Option<(String, String)> {
-    let without_close = name_part.strip_suffix(']')?;
-    let open = without_close.rfind('[')?;
-    let inner = &without_close[open + 1..];
-    let (start, incr, end) = parse_array_range(inner)?;
-    Some((
-        name_part[..open].to_string(),
-        build_arr_inner(start, incr, end),
-    ))
 }
 
 /// Parse the interior of a `[...]` array-range modifier into
@@ -988,17 +1057,20 @@ mod tests {
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.5}}"#));
     }
 
+    /// A second `.` after the field is where C's "nothing else may follow"
+    /// check fails (`dbChannel.c:522-525`): `caget 'A:REC.VAL.{"dbnd":...}'`
+    /// against a live `softIoc` reports not found, while `A:REC.{...}` and
+    /// `A:REC.VAL{...}` both answer. Nothing is peeled, so the name fails
+    /// the field lookup downstream.
     #[test]
-    fn split_field_then_filter() {
-        let p = split_channel_name(r#"TEMP.VAL.{"dbnd":{"d":0.5}}"#);
-        assert_eq!(p.record_path, "TEMP.VAL");
-        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.5}}"#));
+    fn split_refuses_a_separator_after_the_field() {
+        let raw = r#"TEMP.VAL.{"dbnd":{"d":0.5}}"#;
+        let p = split_channel_name(raw);
+        assert_eq!(p.record_path, raw);
+        assert!(p.json_suffix.is_none());
     }
 
-    /// pvxs `test:ai.VAL{...}` (no separating `.`): the
-    /// first `{` always begins the suffix, the optional `.`
-    /// immediately before it is consumed so the record_path is
-    /// clean.
+    /// pvxs `test:ai.VAL{...}`: the suffix may follow the field directly.
     #[test]
     fn split_pvxs_field_directly_followed_by_filter() {
         let p = split_channel_name(r#"test:ai.VAL{"dbnd":{"d":0.0}}"#);
@@ -1006,15 +1078,43 @@ mod tests {
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.0}}"#));
     }
 
-    /// `RECORD{...}` without any field component.
+    /// `RECORD{...}` with no `.` is a record *name*, not a filtered
+    /// channel: C's `dbFindRecordPart` hashes the whole brace-bearing span
+    /// (`dbStaticLib.c:1558-1566`), and `caget 'A:REC{"dbnd":{"d":0.1}}'`
+    /// against a live `softIoc` reports not found. Peeling it here was what
+    /// gave `{` two meanings.
     #[test]
-    fn split_record_directly_followed_by_filter() {
-        let p = split_channel_name(r#"TEMP{"arr":{"s":0,"i":1,"e":4}}"#);
-        assert_eq!(p.record_path, "TEMP");
-        assert_eq!(
-            p.json_suffix.as_deref(),
-            Some(r#"{"arr":{"s":0,"i":1,"e":4}}"#)
-        );
+    fn split_refuses_a_filter_with_no_field_separator() {
+        let raw = r#"TEMP{"arr":{"s":0,"i":1,"e":4}}"#;
+        let p = split_channel_name(raw);
+        assert_eq!(p.record_path, raw);
+        assert!(p.json_suffix.is_none());
+    }
+
+    /// The name the old first-`{` cut tore in half. NSLS-II record names
+    /// brace a device path, so `{` is an ordinary record-name character —
+    /// a live `softIoc` serves `XF:31IDA-OP{Tbl-Ax:X1}Mtr`, its `.DESC`,
+    /// and `.VAL{"dbnd":...}` on it.
+    #[test]
+    fn split_keeps_braces_that_belong_to_the_record_name() {
+        let bare = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
+        let p = split_channel_name(bare);
+        assert_eq!(p.record_path, bare);
+        assert!(p.json_suffix.is_none());
+
+        let p = split_channel_name("XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
+        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
+        assert!(p.json_suffix.is_none());
+
+        let p = split_channel_name(r#"XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL{"dbnd":{"d":0.1}}"#);
+        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL");
+        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.1}}"#));
+
+        // A record name may even END in `}` — the closing brace carries no
+        // more meaning than the opening one.
+        let p = split_channel_name("XF:31IDA-OP{Tbl}.VAL");
+        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl}.VAL");
+        assert!(p.json_suffix.is_none());
     }
 
     /// Legacy `[N]` single-element range → `arr` with start==end==N
@@ -1042,13 +1142,19 @@ mod tests {
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"i":2,"e":10}}"#));
     }
 
-    /// Range with no field component defaults the field to `VAL`
-    /// downstream; only the record path is stripped here.
+    /// A range needs the separating `.` as much as a JSON suffix does:
+    /// `caget 'W:REC.[0:2]'` answers on a live `softIoc` and
+    /// `caget 'W:REC[0:2]'` reports not found, because the second form is a
+    /// record name with brackets in it.
     #[test]
-    fn split_array_range_no_field() {
-        let p = split_channel_name("WF[1:4]");
+    fn split_array_range_needs_the_separator() {
+        let p = split_channel_name("WF.[1:4]");
         assert_eq!(p.record_path, "WF");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":1,"e":4}}"#));
+
+        let p = split_channel_name("WF[1:4]");
+        assert_eq!(p.record_path, "WF[1:4]");
+        assert!(p.json_suffix.is_none());
     }
 
     /// Default positions are omitted; a full-array `[:]` is the identity
@@ -1550,12 +1656,23 @@ mod tests {
     }
 
     /// The `$` is innermost, so it comes off after the suffix and before the
-    /// `record.FIELD` split — on a bare `REC$` too, which binds `VAL`.
+    /// `record.FIELD` split — including on a bare `REC$`, which binds `VAL`.
+    /// That undotted form is the port's one documented addition to C's
+    /// grammar (`caget 'LS:REC$'` reports not found on a live `softIoc`);
+    /// it stays because a loaded record name cannot contain a `$`.
     #[test]
     fn channel_name_peels_the_dollar_modifier() {
         assert_eq!(
             cn("REC.DESC$"),
             ("REC.DESC".into(), "REC".into(), "DESC".into(), true, None)
+        );
+        assert_eq!(
+            cn("REC.VAL$"),
+            ("REC.VAL".into(), "REC".into(), "VAL".into(), true, None)
+        );
+        assert_eq!(
+            cn("REC.$"),
+            ("REC".into(), "REC".into(), "VAL".into(), true, None)
         );
         assert_eq!(
             cn("REC$"),
@@ -1564,13 +1681,12 @@ mod tests {
     }
 
     /// The case that made the old callers' last-dot split a coin flip: a
-    /// suffix with no `.` left the field looking like a clean `VAL`, while
-    /// one containing `0.5` tore the JSON apart. Both resolve identically
-    /// here, and the suffix comes back whole.
+    /// suffix whose JSON contains a `.` (`0.5`) got torn apart at the
+    /// number. Both suffixes resolve identically here and come back whole.
     #[test]
     fn channel_name_peels_the_json_suffix_dotted_or_not() {
         assert_eq!(
-            cn(r#"REC{"arr":{"s":0}}"#),
+            cn(r#"REC.{"arr":{"s":0}}"#),
             (
                 "REC".into(),
                 "REC".into(),
@@ -1580,9 +1696,9 @@ mod tests {
             )
         );
         assert_eq!(
-            cn(r#"REC{"dbnd":{"d":0.5}}"#),
+            cn(r#"REC.VAL{"dbnd":{"d":0.5}}"#),
             (
-                "REC".into(),
+                "REC.VAL".into(),
                 "REC".into(),
                 "VAL".into(),
                 false,

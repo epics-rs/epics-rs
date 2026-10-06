@@ -1427,16 +1427,21 @@ impl ChannelProvider for BridgeProvider {
             return true;
         }
         // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
-        // before the existence check so a record-level `REC$` (default
-        // `VAL`) answers the search; `split_channel_name` leaves the `$`
-        // on the record path (the CA server detects it there too).
-        // `has_name` strips any remaining `{json}` / `[range]` suffix
-        // itself, so this only removes the trailing modifier.
+        // before the existence check so `REC.VAL$` answers the search on the
+        // record's `VAL`; `split_channel_name` leaves the `$` on the record
+        // path (the CA server detects it there too) and its `string_view`
+        // flag is what says the `$` is a modifier rather than the last
+        // character of the record's own name. `has_name` strips any
+        // remaining `{json}` / `[range]` suffix itself.
         let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
-        let core = parsed
-            .record_path
-            .strip_suffix('$')
-            .unwrap_or(&parsed.record_path);
+        let core = if parsed.string_view {
+            parsed
+                .record_path
+                .strip_suffix('$')
+                .unwrap_or(&parsed.record_path)
+        } else {
+            parsed.record_path.as_str()
+        };
         self.db.has_name(core).await
     }
 

@@ -13,7 +13,6 @@ use crate::types::{SimMode, SineOperation};
 /// SimDetector-specific parameter indices.
 #[derive(Clone, Copy)]
 pub struct SimDetectorParams {
-    pub gain: usize,
     pub gain_x: usize,
     pub gain_y: usize,
     pub gain_red: usize,
@@ -51,7 +50,6 @@ pub struct SimDetectorParams {
 impl SimDetectorParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
-            gain: base.create_param("AD_GAIN", ParamType::Float64)?,
             gain_x: base.create_param("SIM_GAIN_X", ParamType::Float64)?,
             gain_y: base.create_param("SIM_GAIN_Y", ParamType::Float64)?,
             gain_red: base.create_param("SIM_GAIN_RED", ParamType::Float64)?,
@@ -133,7 +131,7 @@ impl SimConfigSnapshot {
         Ok(Self {
             sim_mode: SimMode::from_i32(handle.read_int32(sim.sim_mode, 0).await?),
             gains: Gains {
-                gain: handle.read_float64(sim.gain, 0).await?,
+                gain: handle.read_float64(ad.gain, 0).await?,
                 gain_x: handle.read_float64(sim.gain_x, 0).await?,
                 gain_y: handle.read_float64(sim.gain_y, 0).await?,
                 gain_red: handle.read_float64(sim.gain_red, 0).await?,
@@ -215,7 +213,7 @@ impl SimConfigSnapshot {
         Ok(Self {
             sim_mode: SimMode::from_i32(base.get_int32_param(sim.sim_mode, 0)?),
             gains: Gains {
-                gain: base.get_float64_param(sim.gain, 0)?,
+                gain: base.get_float64_param(ad.gain, 0)?,
                 gain_x: base.get_float64_param(sim.gain_x, 0)?,
                 gain_y: base.get_float64_param(sim.gain_y, 0)?,
                 gain_red: base.get_float64_param(sim.gain_red, 0)?,

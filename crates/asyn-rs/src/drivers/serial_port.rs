@@ -3659,22 +3659,24 @@ mod tests {
     /// `poll(fd, 1, 0)`, so a `TMOT` of 500 us produced "serial read timeout"
     /// with zero bytes without waiting at all — a device answering in 300 us
     /// alarmed on every scan. It must now be given a whole tick.
+    ///
+    /// Asserted on the conversion rather than through `read_until`, because a
+    /// `deadline` of `now + 500 us` makes the assertion a race: the budget
+    /// `wait_until` derives is whatever is left when it reads the clock, and a
+    /// 500 us descheduling between the two leaves zero — the right answer for
+    /// an expired deadline and a failure of this test. The end-to-end wiring
+    /// (deadline → derived interval → `poll`) is asserted race-free by
+    /// `an_expired_deadline_stays_a_non_blocking_probe` below, so what is left
+    /// here is the arithmetic, and that needs no clock.
     #[test]
     fn a_sub_millisecond_budget_waits_a_whole_tick() {
-        let fd = FakeFd::new(libc::POLLIN, u32::MAX);
-        let mut buf = [0u8; 8];
-        let err = read_until(
-            &fd,
-            &mut buf,
-            Some(Instant::now() + Duration::from_micros(500)),
-        )
-        .expect_err("the fake never delivers, so the read must time out");
-        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
-        assert_eq!(
-            fd.first_ms.get(),
-            1,
-            "a 500 us timeout must reach poll as one whole millisecond"
-        );
+        assert_eq!(duration_to_poll_ms(Duration::ZERO), 0);
+        assert_eq!(duration_to_poll_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_to_poll_ms(Duration::from_micros(500)), 1);
+        assert_eq!(duration_to_poll_ms(Duration::from_millis(250)), 250);
+        // `poll` takes a `c_int`, and a deadline far enough out to overflow it
+        // must saturate rather than wrap into the non-blocking probe.
+        assert_eq!(duration_to_poll_ms(Duration::MAX), i32::MAX);
     }
 
     /// D5's other zero. An already-expired deadline must stay a non-blocking

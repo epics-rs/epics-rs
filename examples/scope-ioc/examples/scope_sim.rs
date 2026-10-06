@@ -31,14 +31,25 @@ async fn main() {
     // 3. Subscribe for interrupt notifications
     let mut rx = port_handle.interrupts().subscribe_async();
 
-    // 4. Spawn background simulation task
+    // 4. Open `interruptAccept`. `call_param_callbacks` returns without
+    // notifying while the gate is closed, and the gate's single owner is the
+    // IOC scan facility, which this demo does not run — so without this the
+    // simulation task's callbacks are no-ops forever and step 6 waits for an
+    // update that can never arrive. C compiles the non-IOC translation unit
+    // with `interruptAccept = 1` for the same reason
+    // (asynPortDriver.cpp:23-25); here the non-IOC program opens it itself.
+    // Subscribed first, above, so the one-shot flush of the driver's
+    // construction seeds is delivered rather than missed.
+    epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+
+    // 5. Spawn background simulation task
     let sim_handle = port_handle.clone();
     let sim_notify = notify.clone();
     asyn_rs::runtime::task::spawn(async move {
         sim_task_handle(sim_handle, sim_notify, indices).await;
     });
 
-    // 5. Set update time to 0.2s and start running
+    // 6. Set update time to 0.2s and start running
     port_handle
         .write_float64(indices.p_update_time, 0, 0.2)
         .await
@@ -52,7 +63,7 @@ async fn main() {
     println!("Simulation running (1kHz sine, noise=0.1V, update=0.2s)");
     println!("Waiting for 5 waveform updates...\n");
 
-    // 6. Receive updates
+    // 7. Receive updates
     let mut update_count = 0;
     while update_count < 5 {
         match rx.recv().await {
@@ -89,7 +100,7 @@ async fn main() {
         }
     }
 
-    // 7. Change vertical gain to x10
+    // 8. Change vertical gain to x10
     println!("\nSwitching vertical gain to x10...");
     let vgs_idx = port_handle
         .drv_user_create(&DrvUserRequest::new("P_VertGainSelect", 0))
@@ -128,11 +139,11 @@ async fn main() {
         }
     }
 
-    // 8. Stop
+    // 9. Stop
     println!("\nStopping simulation...");
     port_handle.write_int32(indices.p_run, 0, 0).await.unwrap();
 
-    // 9. Shutdown runtime
+    // 10. Shutdown runtime
     runtime_handle.shutdown_and_wait();
 
     println!("\nDone.");

@@ -2,7 +2,7 @@
 # st.cmd — Modbus IOC startup script
 #
 # Usage:
-#   cargo run --release -p modbus-ioc --bin modbus_ioc --features ioc -- ioc/st.cmd
+#   cargo run --release -p modbus-ioc --bin modbus-ioc --features ioc -- ioc/st.cmd
 #
 # Requires a reachable Modbus/TCP server. To run a local simulator:
 #   pip install pymodbus && pymodbus.simulator   # or: diagslave -m tcp

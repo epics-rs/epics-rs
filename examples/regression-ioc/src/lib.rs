@@ -40,7 +40,7 @@ use motor_rs::sim_motor::SimMotor;
 use tokio::sync::mpsc;
 
 /// The regression record database, embedded so the harness and the runnable
-/// `regression_ioc` binary serve byte-identical records.
+/// `regression-ioc` binary serve byte-identical records.
 pub const REGRESSION_DB: &str = include_str!("../db/regression.db");
 
 /// DTYP that the standard motor record (`REG:D:MTR`) carries; the harness

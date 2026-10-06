@@ -17,7 +17,7 @@ parking_lot = "0.12"
 epics-base-rs = { workspace = true, optional = true }
 
 [[bin]]
-name = "sim_ioc"
+name = "sim-ioc"
 path = "src/bin/sim_ioc.rs"
 required-features = ["ioc"]
 

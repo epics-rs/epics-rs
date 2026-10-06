@@ -30,13 +30,13 @@ cd "$REPO_ROOT"
 # examples/<package>/ioc/st.cmd, and every example exposes the "ioc" feature.
 ioc_bin() {
     case "$1" in
-        mini-beamline)  echo "mini_ioc" ;;
-        scope-ioc)      echo "scope_ioc" ;;
-        sim-detector)   echo "sim_ioc" ;;
-        xrt-beamline)   echo "xrt_ioc" ;;
-        mqtt-ioc)       echo "mqtt_ioc" ;;
-        modbus-ioc)     echo "modbus_ioc" ;;
-        ophyd-test-ioc) echo "ophyd_test_ioc" ;;
+        mini-beamline)  echo "mini-ioc" ;;
+        scope-ioc)      echo "scope-ioc" ;;
+        sim-detector)   echo "sim-ioc" ;;
+        xrt-beamline)   echo "xrt-ioc" ;;
+        mqtt-ioc)       echo "mqtt-ioc" ;;
+        modbus-ioc)     echo "modbus-ioc" ;;
+        ophyd-test-ioc) echo "ophyd-test-ioc" ;;
         *)              echo "" ;;
     esac
 }

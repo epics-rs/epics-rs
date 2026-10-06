@@ -378,7 +378,7 @@ impl CaServerBuilder {
         // started. Here for the same reason: the dual-protocol runner stands
         // its CA server up with a bare `run()` and puts the iocsh on the PVA
         // side, so a publication inside `run_with_shell` left `casr` and the
-        // `dbsr` layer report empty on every `scope_ioc`-shaped IOC.
+        // `dbsr` layer report empty on every `scope-ioc`-shaped IOC.
         crate::server::iocsh::publish_casr_source(
             server.stats(),
             crate::server::casr_addrs(&server).unwrap_or_default(),

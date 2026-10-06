@@ -93,7 +93,7 @@ measurement). Each has its own README; build everything with
 `cargo build --release --workspace` and run e.g.
 
 ```bash
-cargo run --release -p scope-ioc --features ioc --bin scope_ioc -- examples/scope-ioc/ioc/st.cmd
+cargo run --release -p scope-ioc --features ioc --bin scope-ioc -- examples/scope-ioc/ioc/st.cmd
 ```
 
 PyDM screens ship under `opi/`, `crates/*/opi`, and `examples/*/opi` — the CA

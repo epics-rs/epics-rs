@@ -25,6 +25,6 @@ xrt-materials = { git = "https://github.com/physwkim/xrt-rs.git" }
 xrt-oes = { git = "https://github.com/physwkim/xrt-rs.git" }
 
 [[bin]]
-name = "xrt_ioc"
+name = "xrt-ioc"
 path = "src/bin/xrt_ioc.rs"
 required-features = ["ioc"]

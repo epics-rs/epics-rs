@@ -2,7 +2,7 @@
 # st.cmd — MQTT IOC startup script (Z2M builder version)
 #
 # Usage:
-#   cargo run --release -p mqtt-ioc --bin mqtt_ioc -- ioc/st.cmd
+#   cargo run --release -p mqtt-ioc --bin mqtt-ioc -- ioc/st.cmd
 #
 # Each mqttZ2m* command registers topics AND creates records.
 # No .db file needed for Z2M devices.

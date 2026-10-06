@@ -6,7 +6,6 @@ description = "Rust port of EPICS asyn - async device I/O framework"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
-readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }

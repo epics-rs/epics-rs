@@ -181,7 +181,7 @@ with plugins under the same prefix (`mini:dot:image1:`, `mini:dot:Stats1:`, etc.
 cargo build --release -p mini-beamline --features ioc
 
 # Run
-./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
+./target/release/mini-ioc examples/mini-beamline/ioc/st.cmd
 ```
 
 ### Acquire an image and display with Python
@@ -420,7 +420,7 @@ Motors use the `simMotorCreate` + `dbLoadRecords("motor.template", ...)` pattern
 cargo build --release -p mini-beamline --features ioc
 
 # Run
-./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
+./target/release/mini-ioc examples/mini-beamline/ioc/st.cmd
 ```
 
 The CA server port can be changed with the `EPICS_CA_SERVER_PORT` environment variable (default: 5064).

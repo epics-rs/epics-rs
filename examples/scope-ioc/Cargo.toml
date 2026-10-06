@@ -16,7 +16,7 @@ epics-ca-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
 
 [[bin]]
-name = "scope_ioc"
+name = "scope-ioc"
 path = "src/bin/scope_ioc.rs"
 required-features = ["ioc"]
 

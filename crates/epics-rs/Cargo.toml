@@ -19,6 +19,7 @@ ad-plugins-rs = { workspace = true, optional = true }
 std-rs = { workspace = true, optional = true }
 scaler-rs = { workspace = true, optional = true }
 optics-rs = { workspace = true, optional = true }
+mca-rs = { workspace = true, optional = true }
 
 [features]
 default = ["ca"]
@@ -36,4 +37,5 @@ busy = []
 std = ["dep:std-rs"]
 scaler = ["dep:scaler-rs"]
 optics = ["dep:optics-rs"]
-full = ["ca", "pva", "bridge", "asyn", "motor", "ad", "ioc", "calc", "autosave", "busy", "std", "scaler", "optics"]
+mca = ["dep:mca-rs"]
+full = ["ca", "pva", "bridge", "asyn", "motor", "ad", "ioc", "calc", "autosave", "busy", "std", "scaler", "optics", "mca"]

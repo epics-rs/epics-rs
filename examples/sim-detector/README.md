@@ -103,10 +103,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 cargo build -p sim-detector --features ioc
 
 # Full IOC with plugins
-cargo build --release -p sim-detector --features ioc --bin sim_ioc
+cargo build --release -p sim-detector --features ioc --bin sim-ioc
 
 # Run IOC
-./target/release/sim_ioc examples/sim-detector/ioc/st.cmd
+./target/release/sim-ioc examples/sim-detector/ioc/st.cmd
 
 # Standalone demo (no EPICS IOC, just PortHandle API)
 cargo run -p sim-detector --example demo

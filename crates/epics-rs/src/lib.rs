@@ -25,6 +25,7 @@
 //! | `std` | Standard records (epid, throttle, timestamp) | no |
 //! | `scaler` | Scaler record (64-channel counter) | no |
 //! | `optics` | Beamline optics (table, monochromator, filters) | no |
+//! | `mca` | mca record (multichannel analyzer) | no |
 //! | `full` | Everything | no |
 //!
 //! `calc`, `autosave` and `busy` are always available through `epics-base-rs`;
@@ -87,3 +88,7 @@ pub use scaler_rs as scaler;
 /// Optics record types and device support (table, monochromator, filters, etc.).
 #[cfg(feature = "optics")]
 pub use optics_rs as optics;
+
+/// mca record — multichannel analyzer, with the soft (simulated) driver.
+#[cfg(feature = "mca")]
+pub use mca_rs as mca;

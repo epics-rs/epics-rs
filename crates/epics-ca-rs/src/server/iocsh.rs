@@ -293,7 +293,7 @@ pub fn ca_server_commands() -> Vec<CommandDef> {
 /// it alike. `CaServer::run_with_shell` also registers this list, but only
 /// the paths that reach it — the dual-protocol runner stands its CA server
 /// up with a bare `run()` and puts the iocsh on the PVA side, so `casr` was
-/// missing from `scope_ioc`'s prompt as well as its script. The two copies
+/// missing from `scope-ioc`'s prompt as well as its script. The two copies
 /// cannot disagree: neither captures anything, both read
 /// [`publish_casr_source`].
 pub fn register_rsrv_commands(mut app: IocApplication) -> IocApplication {
@@ -593,7 +593,7 @@ mod tests {
     /// binds its sockets (`caservertask.c:1519-1560`) and has nothing to do
     /// with a shell. The port published from `CaServer::run_with_shell`
     /// instead, so a runner that stands its CA server up with a bare `run()`
-    /// — the dual-protocol one every `scope_ioc`-shaped IOC uses — left
+    /// — the dual-protocol one every `scope-ioc`-shaped IOC uses — left
     /// `casr` and the `dbsr` layer report empty on a fully running IOC.
     /// Measured there before this: `casr` at the prompt printed nothing.
     #[cfg(tokio_backend)]

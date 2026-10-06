@@ -21,6 +21,6 @@ epics-base-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
 
 [[bin]]
-name = "ophyd_test_ioc"
+name = "ophyd-test-ioc"
 path = "src/bin/ophyd_test_ioc.rs"
 required-features = ["ioc"]

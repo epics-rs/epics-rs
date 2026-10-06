@@ -366,6 +366,17 @@ impl PvDatabase {
     /// the event lists, whose `eventCallback` (`dbScan.c:459-465`) is a bare
     /// `scanList` call.
     pub(crate) async fn scan_list_once(&self, list: ScanList) {
+        self.scan_list_sweep(list, "event scan");
+    }
+
+    /// The sweep itself, for a caller that already owns a thread — the
+    /// periodic leaders. `facility` names that thread in the message a
+    /// panicking record produces.
+    ///
+    /// Synchronous because nothing in it awaits: the cursor step and
+    /// `dbProcess` are both sync, and the periodic leaders are plain threads
+    /// with no executor to drive a future on.
+    pub(crate) fn scan_list_sweep(&self, list: ScanList, facility: &str) {
         let mut cursor = self.scan_cursor(list);
         // One set for the whole sweep. `run_process_frame` owns the unwind and
         // takes its own marker back out on every exit, so the set is empty
@@ -374,10 +385,19 @@ impl PvDatabase {
         // record was paying for its first insert.
         let mut visited = crate::server::database::ProcStack::new();
         while let Some((name, rec)) = cursor.next(self) {
-            let _ = match rec {
-                Some(rec) => self.process_record_with_links_resolved(name, rec, &mut visited),
-                None => self.process_record_with_links_sync(name, &mut visited),
-            };
+            // A panicking record costs that record, not the rest of the
+            // sweep — and a frame that unwound left its marker behind, so the
+            // set it poisoned is replaced rather than carried on.
+            let ok = crate::runtime::background::facility::run_isolated(facility, || {
+                let _ = match rec {
+                    Some(rec) => self.process_record_with_links_resolved(name, rec, &mut visited),
+                    None => self.process_record_with_links_sync(name, &mut visited),
+                };
+            });
+            if !ok {
+                visited = crate::server::database::ProcStack::new();
+                continue;
+            }
             debug_assert!(
                 visited.is_empty(),
                 "a returned process frame left its cycle marker behind"
@@ -406,7 +426,13 @@ impl PvDatabase {
     ///
     /// Costs no copy: the bucket already materialises its order as a shared
     /// `Arc<[ScanKey]>` for [`ScanCursor`], and this is that same value. C
-    /// `dbCalloc`s a `scan_slot` array per rate and refills it every pass.
+    /// `dbCalloc`s a `scan_slot` array per rate and refills it every pass —
+    /// still on the leader, even after it moved the *allocation* to
+    /// `addToList` and `spawnHelpers` (`snapNext`, `dbScan.c:129-130`). The
+    /// port does not copy that double-buffer: the one build it leaves on a
+    /// leader happens once per list change, where C's refill happens every
+    /// pass, and moving the build to the mutator would make a bulk SCAN
+    /// rewrite quadratic on the thread doing it.
     pub(crate) fn scan_pass_snapshot(&self, list: ScanList) -> ScanPassSnapshot {
         ScanPassSnapshot(self.inner.scan_index.bucket(list).snapshot().1)
     }

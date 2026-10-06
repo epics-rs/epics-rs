@@ -17,8 +17,9 @@ PLC register/coil space through the standard asyn interfaces.
 - `protocol` — Modbus function codes, MBAP header, request/response PDUs.
 - `interpose` — link-layer framing: Modbus/TCP (MBAP), RTU (CRC-16),
   ASCII (LRC), built on the `asyn-rs` octet interpose framework.
-- `datatype` — the 28 `modbusDataType_t` encodings (INT16, sign-magnitude,
-  BCD, 32/64-bit LE/BE with byte-swap variants, FLOAT32/64, strings).
+- `datatype` — all 37 `modbusDataType_t` encodings (INT16, sign-magnitude,
+  BCD, 32/64-bit LE/BE with byte-swap variants, FLOAT32/64, the four string
+  and four zero-terminated-string orders).
 - `driver` — `DrvModbusAsyn`: the read poller, `do_modbus_io`, absolute
   addressing, and I/O statistics / time histogram.
 - `ioc` (feature `ioc`) — record and device-support binding.

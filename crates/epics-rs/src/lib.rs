@@ -1,11 +1,11 @@
 //! Pure Rust EPICS control system framework.
 //!
-//! This is the umbrella crate that re-exports all epics-rs sub-crates.
+//! This is the umbrella crate that re-exports the epics-rs sub-crates.
 //! Use feature flags to select which modules you need:
 //!
 //! ```toml
 //! [dependencies]
-//! epics-rs = { version = "0.6", features = ["motor", "ad"] }
+//! epics-rs = { version = "0.30", features = ["motor", "ad"] }
 //! ```
 //!
 //! ## Features
@@ -13,17 +13,22 @@
 //! | Feature | Description | Default |
 //! |---------|-------------|---------|
 //! | `ca` | Channel Access client & server | yes |
-//! | `pva` | pvAccess client (experimental) | no |
-//! | `bridge` | Record ↔ PVA bridge (QSRV equivalent) | no |
+//! | `pva` | pvAccess client & server | no |
+//! | `bridge` | Record ↔ PVA bridge (QSRV equivalent); implies `pva` | no |
 //! | `asyn` | Async port driver framework | no |
-//! | `motor` | Motor record + SimMotor | no |
-//! | `ad` | areaDetector (core + plugins) | no |
+//! | `motor` | Motor record + SimMotor; implies `asyn` | no |
+//! | `ad` | areaDetector (core + plugins); implies `asyn` | no |
+//! | `ioc` | the areaDetector iocsh commands; implies `ad` | no |
 //! | `calc` | Calc expression engine | always |
 //! | `autosave` | PV save/restore | always |
 //! | `busy` | Busy record | always |
 //! | `std` | Standard records (epid, throttle, timestamp) | no |
-//! | `scaler` | Scaler record (multi-channel counter) | no |
+//! | `scaler` | Scaler record (64-channel counter) | no |
+//! | `optics` | Beamline optics (table, monochromator, filters) | no |
 //! | `full` | Everything | no |
+//!
+//! `calc`, `autosave` and `busy` are always available through `epics-base-rs`;
+//! their feature flags exist so a dependant can name them and are empty.
 
 /// Core IOC infrastructure — record system, database, iocsh, types.
 pub use epics_base_rs as base;
@@ -32,7 +37,7 @@ pub use epics_base_rs as base;
 #[cfg(feature = "ca")]
 pub use epics_ca_rs as ca;
 
-/// pvAccess protocol — client (experimental).
+/// pvAccess protocol — client and server.
 #[cfg(feature = "pva")]
 pub use epics_pva_rs as pva;
 

@@ -1,6 +1,7 @@
-# ad-plugins
+# ad-plugins-rs
 
-NDPlugin implementations for [areaDetector-rs](../ad-core/). 23 image processing and data handling plugins for real-time detector data pipelines.
+NDPlugin implementations for [ad-core-rs](../ad-core-rs/). 26 image processing
+and data handling plugins for real-time detector data pipelines.
 
 No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT).
 
@@ -45,9 +46,12 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 
 | Plugin | Description |
 |--------|-------------|
-| **NDFileHDF5** | HDF5 file writer (feature-gated `hdf5` crate, with binary fallback) |
+| **NDFileHDF5** | HDF5 file writer via `rust-hdf5`, with the custom-layout XML engine of C's `NDFileHDF5` |
 | **NDFileJPEG** | JPEG encoding/decoding via jpeg-encoder/jpeg-decoder |
-| **NDFileTIFF** | TIFF encoding/decoding via tiff crate |
+| **NDFileTIFF** | TIFF encoding/decoding via the `image` crate |
+| **NDFileNetCDF** | netCDF-3 classic writer |
+| **NDFileNexus** | NeXus file writer |
+| **NDFileMagick** | the ImageMagick-style format set, via the `image` crate |
 
 ### Codec
 
@@ -70,15 +74,25 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 | **NDScatter** | Round-robin splitter (one → many) |
 | **Passthrough** | No-op stub for unimplemented plugin types |
 
+### Serving
+
+| Plugin | Description |
+|--------|-------------|
+| **NDPluginPva** | serves the latest NDArray as an NTNDArray over pvAccess (`pva` feature) |
+
 ## Features
 
 ```toml
 [features]
-default = ["parallel"]
-parallel = ["rayon"]    # Rayon data-parallelism for CPU-heavy plugins
-hdf5 = ["dep:hdf5-metno"]  # HDF5 file format (built from bundled source, requires cmake)
-ioc  = ["ad-core/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
+default   = ["parallel", "simd"]
+parallel  = ["rayon"]       # rayon data-parallelism for CPU-heavy plugins
+simd      = ["fearless_simd", "ad-core-rs/simd"]  # the SIMD kernels
+ioc       = ["ad-core-rs/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
+pva       = ["epics-pva-rs", "epics-bridge-rs"]   # NDPluginPva
 ```
+
+HDF5 is not feature-gated: `rust-hdf5` is an unconditional dependency, built
+with `threadsafe`, `all_filters` and `parallel`.
 
 ### Parallel Processing
 
@@ -100,7 +114,7 @@ All plugins share a single rayon `ThreadPool` to avoid over-subscription when mu
 To override the thread count, call `set_num_threads()` before the first array is processed:
 
 ```rust
-ad_plugins::par_util::set_num_threads(4);
+ad_plugins_rs::par_util::set_num_threads(4);
 ```
 
 A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead from dominating on small arrays. Below this threshold, the sequential path is used automatically.
@@ -108,7 +122,7 @@ A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead fro
 To disable parallelism entirely:
 
 ```toml
-ad-plugins = { version = "0.2", default-features = false }
+ad-plugins-rs = { version = "0.30", default-features = false }
 ```
 
 ## Usage
@@ -116,12 +130,15 @@ ad-plugins = { version = "0.2", default-features = false }
 Each plugin implements `NDPluginProcess`:
 
 ```rust
-use ad_plugins::stats::NDStatsPlugin;
-use ad_core::plugin::NDPluginProcess;
+use ad_core_rs::plugin::NDPluginProcess;
+use ad_plugins_rs::stats::StatsProcessor;
 
-let mut stats = NDStatsPlugin::new();
+let stats = StatsProcessor::new();
+// `&self`, not `&mut self`: the runtime runs one processor on NumThreads
+// callback threads at once, so a stateful plugin owns its own locking.
 let result = stats.process_array(&array, &pool);
-// result.arrays contains processed output
+// result.output_arrays carries the processed frames, result.param_updates
+// the parameter writes the runtime posts.
 ```
 
 With the `ioc` feature, plugins register as st.cmd startup commands:
@@ -136,9 +153,9 @@ NDStdArraysConfigure("IMAGE1", 5, "SIM1")
 ## Build
 
 ```bash
-cargo build -p ad-plugins                    # plugins only
-cargo build -p ad-plugins     # with IOC commands
-cargo test -p ad-plugins                     # 205 tests
+cargo build -p ad-plugins-rs                        # plugins only
+cargo build -p ad-plugins-rs --features ioc,pva     # with IOC commands and NDPluginPva
+cargo nextest run -p ad-plugins-rs
 ```
 
 ## License

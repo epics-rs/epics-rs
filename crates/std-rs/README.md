@@ -10,7 +10,7 @@ No C dependencies. Just `cargo build`.
 
 The `std` module is a foundational synApps package providing PID feedback control, rate-limited outputs, formatted timestamps, sequence programs, and dozens of beamline utility databases. It's used as a base layer by virtually every synApps IOC.
 
-std-rs ports the C synApps `std` module to native Rust, including the three core records (`epid`, `throttle`, `timestamp`), four device support implementations, native Rust async replacements for two SNL state machines (`delayDo`, `femto`), and 85 database templates ready to load with `dbLoadRecords`.
+std-rs ports the C synApps `std` module to native Rust, including the three core records (`epid`, `throttle`, `timestamp`), four device support implementations, native Rust async replacements for two SNL state machines (`delayDo`, `femto`), and 51 database templates ready to load with `dbLoadRecords`, plus 31 autosave `.req` files.
 
 ## Features
 
@@ -52,8 +52,8 @@ Wall-clock timestamp string with 11 format options:
 | **Epid Soft** | epid | Synchronous PID computation each scan cycle |
 | **Async Soft Channel** | epid | Trigger-driven async PID with callback completion |
 | **Fast Epid** | epid | Interrupt-driven 1 kHz+ PID loop with high-rate readback |
-| **Time of Day** | timestamp | Periodic wall-clock update via interval timer |
-| **Sec Past Epoch** | longin | Unix epoch seconds counter |
+| **Time of Day** | stringin | the wall-clock string of `devTimeOfDay.c`'s `devSiTodString` |
+| **Sec Past Epoch** | ai | Unix epoch seconds, `devTimeOfDay.c`'s `devAiTodSeconds` |
 
 ### SNL Programs (Native Rust async)
 The synApps `std` module ships with two SNL (State Notation Language) state machines that std-rs reimplements as native Rust async tasks:
@@ -63,7 +63,7 @@ The synApps `std` module ships with two SNL (State Notation Language) state mach
 
 Both run as `tokio::spawn`'d tasks with `select!` for event/timeout multiplexing — no SNL compiler needed.
 
-### Database Templates (85+ bundled in `db/`)
+### Database Templates (51 `.db` and 3 `.vdb` in `db/`, with 31 `.req` files)
 - **PID** — sync_pid_control, async_pid_control, fast_pid_control with autosave .req files
 - **Femto** — DLPCA-200, DHPCA-100, DDPCA-300 amplifier presets
 - **Generic state** — countDownTimer, alarmClock, autoShutter, genTweak, genericState (numeric/string/aux variants)
@@ -89,10 +89,12 @@ std-rs/
 │   │   ├── epid_soft_callback.rs    # async trigger-based variant
 │   │   ├── epid_fast.rs             # 1 kHz+ interrupt-driven PID
 │   │   └── time_of_day.rs           # periodic timestamp update
+│   ├── records/dbd_generated.rs     # the field tables generated from the .dbd set
+│   ├── seq_runner.rs                # the SNL program launcher, C's `seq()` stand-in
 │   └── snl/
 │       ├── delay_do.rs              # delayDo state machine
 │       └── femto.rs                 # Femto amplifier control
-├── db/                              # 85 database templates + .req files
+├── db/                              # 51 database templates + their .req files
 └── ui/                              # PyDM screens
 ```
 
@@ -100,7 +102,7 @@ std-rs/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.8", features = ["std"] }
+epics-rs = { version = "0.30", features = ["std"] }
 ```
 
 ### Register All Record Types
@@ -121,7 +123,9 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 
     // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
     // `dbsr` server layer exist before `iocInit` rather than after it.
-    run_ca_ioc_app(app.db_file("db/sync_pid_control.db", &macros)?).await
+    // The database loads through the shell, as in C: `db_file` is
+    // `IocBuilder`'s, and an `IocApplication` has no second loader.
+    run_ca_ioc_app(app.startup_line(r#"dbLoadRecords("db/sync_pid_control.db")"#)).await
 }
 ```
 
@@ -142,21 +146,23 @@ camonitor PID:CVAL PID:OVAL
 ## Testing
 
 ```bash
-cargo test -p std-rs
+cargo nextest run -p std-rs
 ```
 
 Test coverage: PID computation correctness, anti-windup, output deadband, MaxMin tracking, throttle rate limiting, sync input behavior, timestamp format generation, delayDo state transitions, femto auto-ranging.
 
 ## Dependencies
 
-- epics-base-rs — Record trait, DeviceSupport, ProcessAction
+- epics-base-rs — Record trait, DeviceSupport, ProcessAction (the three
+  records' `Record` impls are hand-written, not derived)
+- epics-ca-rs — the `run_ca_ioc_app` entry point the example uses
 - asyn-rs — port driver (used by Femto cascaded amplifier)
 - chrono — timestamp formatting
-- epics-macros-rs — `#[derive(EpicsRecord)]`
+- tokio, tracing
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

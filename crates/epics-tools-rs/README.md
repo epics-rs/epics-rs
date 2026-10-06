@@ -9,9 +9,43 @@ PTY-based process supervisor with a multi-client telnet console. Drop-in
 flag compatibility with C `procServ`, so existing wrapper scripts and
 systemd units do not need to be rewritten.
 
-Unix-only (depends on `forkpty(3)` and POSIX signals). On non-Unix
-targets the crate compiles to an empty library so workspace builds keep
-succeeding; the `procserv-rs` binary is unavailable there.
+Host platforms only, and `build.rs` owns that decision as an allowlist
+(`PROCSERV_HOST_TARGETS`: linux, macos, the four BSDs, solaris, illumos,
+cygwin) emitting one `cfg(procserv_host_platform)` — `cfg(unix)` cannot
+tell "`libc` and `nix` are linked" from "there is a second process to
+supervise behind `forkpty(3)`, with a controlling terminal on fd 0".
+The two failures therefore differ:
+
+- A unix target off the list (RTEMS, VxWorks — `fork(2)` is an `ENOSYS`
+  stub there) is **refused at build time** with a `cargo::error` naming
+  the reason. An image where the IOC *is* the system has no second
+  process to supervise, so compiling the module away would hand an
+  embedded consumer an empty API and imply the port is merely missing.
+- On non-unix the module does compile away, so workspace builds keep
+  succeeding, and `procserv-rs` exits 2 saying no Windows (ConPTY)
+  backend exists yet — there the port is unwritten, not impossible.
+
+C states the same restriction outside its code, as
+`PROD_HOST = procServ` in its makefile.
+
+## Modules
+
+| module | C counterpart | what it is |
+|---|---|---|
+| `supervisor` | `procServ.cc` main loop + `SendToAll` | the client roster, the child handle and the restart tracker; every byte crosses it |
+| `child` | `processFactory.cc` | the `forkpty(3)` child — `RLIMIT_CORE`, the `argv[0]`-vs-`--exec` split, the PTY master |
+| `listener` | `acceptFactory.cc` | one accept task per bound listener, TCP and UNIX |
+| `endpoint` | `acceptFactory.cc` spec parsing | one `-P`/`-l` spec string → one `Endpoint` |
+| `client` | `clientFactory.cc` | a connected peer, its `readonly` flag and its mpsc |
+| `console` | `procServ.cc:566-569` | the launching terminal joined to the party line in foreground mode |
+| `telnet` | libtelnet | `IAC WILL ECHO` / `IAC DO LINEMODE`, and nothing else |
+| `menu` | `clientItem::processInput` | the stateless command-key cascade |
+| `messages` | procServ's `@@@` console text | every string ported byte-for-byte, so `manage-procs` and telnet front-ends still recognise the output |
+| `restart` | `processFactoryNeedsRestart` | the 3-state restart mode; the sliding-window limiter itself is `epics_base_rs::runtime::supervise`, shared with `ca-gateway-rs` |
+| `daemon` | `forkAndGo` | daemonize, and the signal handlers |
+| `sidecar` | `openLogFile`, `writeInfoFile`, `writePidFile`, `setEnvVar` | the log, pid and info files, and the `PROCSERV_INFO` env contract |
+| `config` | the flag set | `ProcServConfig` and its construction-time validation |
+| `error` | — | `ProcServError` |
 
 ## Build
 
@@ -60,18 +94,18 @@ Everything after `--` is the child program and its argv.
 
 | Flag | Description | Default |
 |---|---|---|
-| `-P, --port <PORT>` | TCP control port (note: uppercase `-P`) | — |
+| `-P, --port <ENDPOINT>` | Control listener, **repeatable** (C `ctlSpecs`). A bare port (`4051`), an interface bind (`192.168.1.5:4051`, honored only with `--allow`), or a socket — `unix:/run/ioc.sock`, `unix:user:grp:0660:/run/ioc.sock`, abstract `unix:@name` (note: uppercase `-P`) | — |
 | `--allow` | Bind the control port to 0.0.0.0 instead of 127.0.0.1 | off |
-| `-l, --logport <PORT>` | Read-only viewer/log TCP port | — |
+| `-l, --logport <ENDPOINT>` | Read-only viewer/log listener, same spec grammar. Binds **all interfaces** by default — the inverse of the control port | — |
 | `--restrict` | Restrict the log port to localhost | off |
-| `--unixpath <PATH>` | UNIX-domain socket path | — |
+| `--unixpath <PATH>` | UNIX-domain socket path (`-P unix:<path>` reaches the same listener) | — |
 | `-f, --foreground` | Do not daemonize | off |
 | `-d, --debug` | Keep child in foreground + debug-level logging (also `PROCSERV_DEBUG` env) | off |
 | `-q, --quiet` | Suppress the no-log-file warning when daemonizing | off |
 | `-L, --logfile <PATH>` | Log file (`-` logs to stdout) | — |
 | `-S, --logstamp[=FMT]` | Timestamp each log line (FMT attached with `=`) | off |
 | `-F, --timefmt <FMT>` | strftime for banner / start-time lines | `%c` |
-| `-p, --pidfile <PATH>` | PID file (note: lowercase `-p`) | — |
+| `-p, --pidfile <PATH>` | PID file (note: lowercase `-p`); falls back to `PROCSERV_PID` | — |
 | `-I, --info-file <PATH>` | `PROCSERV_INFO` info file | — |
 | `--holdoff <SEC>` | Hold-off between restarts | 15 |
 | `-w, --wait` | Do not start child until first console request | off |
@@ -98,12 +132,19 @@ nc -U /tmp/ioc.sock
 ```
 
 Multiple clients may connect simultaneously and share the child's stdout
-in a party-line fashion. Built-in keys:
+in a party-line fashion. The command keys:
 
-- `Ctrl-X` — force-kill the child (sends `SIGKILL` by default).
-- `Ctrl-T` — toggle restart mode (`OnExit` ↔ off).
+- `Ctrl-X` — force-kill the child (`SIGKILL` unless `-K` says otherwise).
+  Rebind with `-k`, disable with an empty value.
+- `Ctrl-T` — toggle restart mode (`OnExit` ↔ off); `-T` rebinds it.
 - `Ctrl-R` — manually restart the child when it is dead.
-- `Ctrl-]` — log this client out (child stays running).
+- `Ctrl-Q` — shut the supervisor down. Always enabled and never exposed
+  on the CLI (C `quitChar`, `procServ.cc:69`); it fires only while the
+  child is already down.
+- Per-client logout is **disabled** until `-x/--logoutcmd` gives it a
+  key. `Ctrl-]` is what the C docs suggest for it, and caret notation
+  cannot express it — the escape covers `^A`..`^Z` alone, so `^]` parses
+  to a literal `^`. Pass the raw byte: `--logoutcmd=$'\x1d'`.
 
 ### Logging
 
@@ -127,7 +168,13 @@ server.run().await?;
 
 The end-to-end test at `tests/procserv_e2e.rs` shows a complete config
 literal with TCP listener, key bindings, restart policy and a
-`/bin/cat` child — useful as a copy-paste starting point.
+`/bin/cat` child — useful as a copy-paste starting point. It binds the
+listeners itself and hands them over with `ProcServ::with_prebound`,
+which is what the binary does so a bind failure fail-fasts before
+`fork_and_go`; library use as above lets `run` bind them.
+
+`cargo nextest run -p epics-tools-rs` runs 173 tests, the e2e ones over
+a real socket against a real `/bin/cat`.
 
 ## Architecture
 

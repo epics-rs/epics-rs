@@ -51,6 +51,32 @@ epics-ca-rs implements the full Channel Access protocol used by C EPICS for over
 - **Subscription** — async stream of monitor events with deadband filtering
 - **Reconnect** — automatic recovery on server restart (beacon-driven)
 
+### Beyond the C protocol
+
+Subsystems with no C counterpart, each behind its own feature so a build that
+does not want one does not compile it:
+
+- **Service discovery** (`discovery`) — mDNS + DNS-SD announcement and
+  lookup, and RFC 2136 dynamic DNS registration with TSIG signing
+  (`discovery-dns-update`). An IOC can register itself in site DNS instead of
+  relying on broadcast search. See `doc/12-discovery.md`.
+- **CA over TLS** (`experimental-rust-tls`) — NOT part of the EPICS spec:
+  rustls on the virtual circuit, with client certificates, an SNI map and a
+  handshake timeout. See `doc/11-tls-design.md`.
+- **Capability tokens** (`cap-tokens`) — Ed25519-signed client identity for
+  clients behind NAT or in containers, where host/user matching cannot
+  identify them.
+- **Observability** (`observability`, `otlp`) — a Prometheus exporter and an
+  OTLP trace exporter over the bare `metrics`/`tracing` facades the crate
+  always emits on, plus an on-disk event recorder and replay
+  (`doc/10-observability.md`).
+- **Server hardening** — a structured audit log, per-client rate limiting with
+  strikes, signed beacons, an introspection HTTP endpoint, and a drain grace
+  period for shutdown.
+- **`calink`** — the `ca://` record-link resolver, which is what the
+  `client-core` feature exists for: an RTEMS build takes the client a record
+  link needs without the UDP discovery stack.
+
 ### CLI Tools
 - **caget-rs** — read PV value (single shot)
 - **caput-rs** — write PV value
@@ -58,6 +84,26 @@ epics-ca-rs implements the full Channel Access protocol used by C EPICS for over
 - **cainfo-rs** — display PV metadata (host, access, type, count, etc.)
 - **ca-repeater-rs** — CA repeater daemon (UDP search forwarding)
 - **softioc-rs** — soft IOC server (driven by CLI args, .db files, or st.cmd)
+- **ca-lint-rs** — static linter for a CA deployment's configuration
+- **ca-admin-rs** — query a running server's introspection endpoint
+- **ca-replay-rs** — replay a recorded CA event log
+- **ca-soak**, **ca-soak-observed** — long-running client soak, the second
+  wired to the observability stack
+- **realtime-ca-ioc** — the RTEMS CA IOC entry point
+
+## Feature levers
+
+| feature | what it adds |
+|---|---|
+| `client` (default) | the full client: `client-core` plus the host-only UDP discovery stack — beacon monitor, repeater registration, `discovery`, reverse-DNS peer names |
+| `client-core` | the client a record link needs and nothing else — search, virtual circuit, subscriptions, the `ca://` resolver. The configuration an RTEMS target builds |
+| `discovery` | mDNS + DNS-SD announcement and lookup |
+| `discovery-dns-update` | RFC 2136 dynamic DNS registration, TSIG-signed |
+| `experimental-rust-tls` | CA over TLS (not an EPICS protocol feature) |
+| `cap-tokens` | Ed25519 capability-token identity |
+| `observability` | bundled Prometheus exporter + `tracing-subscriber` init |
+| `otlp` | OpenTelemetry OTLP trace export |
+| `bringup-probes` | the RTEMS bring-up measurement rig in `realtime-ca-ioc` |
 
 ## Architecture
 
@@ -66,24 +112,48 @@ epics-ca-rs/src/
 ├── lib.rs
 ├── protocol.rs             # CA header (standard + extended), command codes
 ├── channel.rs              # CA channel state model
+├── iocinf.rs               # the address-list env-var helpers (libca iocinf.cpp)
+├── estdlib.rs              # C parsing semantics for the numeric knobs
+├── copt.rs                 # C option-argument semantics for the CLI tools
+├── hostname.rs             # peer address → the text libca shows for it
 ├── client/
 │   ├── mod.rs              # CaClient
 │   ├── transport.rs        # TCP virtual circuit
 │   ├── search.rs           # UDP search broadcaster
 │   ├── beacon_monitor.rs   # passive beacon listener
 │   ├── subscription.rs     # async monitor stream
+│   ├── sync_group.rs       # SyncGroup — batched ops + collective wait
+│   ├── circuit_breaker.rs  # per-server backoff
 │   ├── state.rs            # connection state machine
 │   └── types.rs            # CaError, CaValue
 ├── server/
 │   ├── mod.rs              # re-exports
 │   ├── ca_server.rs        # CaServer (top-level)
 │   ├── ioc_app.rs          # adapter for IocApplication::run
-│   ├── tcp.rs              # TCP listener + per-client task
+│   ├── iocsh.rs            # the server's iocsh command (`casr`)
+│   ├── tcp.rs, recv.rs, send.rs, frame.rs, outbox.rs
+│   │                       # the virtual circuit, split by direction
 │   ├── udp.rs              # UDP search responder
+│   ├── addr_list.rs        # EPICS_CAS_* interface/beacon address lists
 │   ├── beacon.rs           # RSRV_IS_UP emitter
-│   └── monitor.rs          # subscription handling
+│   ├── signed_beacon.rs    # optional beacon signing
+│   ├── monitor.rs          # subscription handling
+│   ├── access_token.rs     # the type-state ACF gate on every channel
+│   ├── rate_limit.rs       # per-client message and search rate limits
+│   ├── blocking.rs         # the blocking-front-end server path
+│   ├── introspection.rs    # the admin HTTP endpoint
+│   └── stats.rs            # the counters casr and Prometheus both read
+├── calink/                 # `ca://` record links (resolver + iocsh)
+├── discovery/              # mDNS, DNS-SD, DNS UPDATE, TSIG, zone files
+├── tls/                    # CA over TLS (experimental)
+├── cap_token.rs            # Ed25519 capability tokens
+├── audit.rs                # structured audit log
+├── observability.rs        # metrics/tracing wiring
+├── replay.rs               # event-log record and replay
+├── chaos.rs                # fault injection for tests
 ├── repeater.rs             # CA repeater daemon
-└── bin/                    # caget-rs, caput-rs, camonitor-rs, cainfo-rs, softioc-rs, ca-repeater-rs
+├── repeater_clients.rs     # the repeater's client registry
+└── bin/                    # the twelve CLI tools listed above
 ```
 
 ## Quick Start
@@ -144,6 +214,11 @@ while let Some(event) = sub.recv().await {
 | `EPICS_CA_REPEATER_PORT` | `5065` | Repeater UDP port |
 | `EPICS_CA_MAX_ARRAY_BYTES` | `16384` | Maximum array transfer size |
 | `EPICS_CA_BEACON_PERIOD` | `15` | Server beacon interval (seconds) |
+| `EPICS_CA_NAME_SERVERS` | (empty) | Unicast search targets — the only search a target with no UDP broadcast has |
+
+The server-side `EPICS_CAS_*` set (interface and beacon address lists,
+channel and subscription limits, timeouts, rate limits, TLS, audit) and the
+rest of the client set are tabulated in `doc/08-environment.md`.
 
 ## Testing
 
@@ -155,15 +230,19 @@ Test coverage: header encode/decode (golden packets vs `caget`), DBR encoding fo
 
 ## Dependencies
 
-- epics-base-rs — PvDatabase, records, EpicsValue, DBR codec
-- tokio — async runtime
-- bytes — buffer management
-- chrono — timestamp formatting
-- thiserror — error types
+- epics-base-rs — PvDatabase, records, EpicsValue, DBR codec, and the
+  `runtime`/`net` layer (this crate does not depend on tokio directly)
+- chrono, thiserror, parking_lot, arc-swap, dashmap — the always-on set
+- clap — the CLI tools
+- metrics, tracing — the facades the crate emits on with no exporter attached
+
+Everything else is feature-gated: mdns-sd and hickory-* for `discovery`,
+tokio-rustls and x509-parser for `experimental-rust-tls`, ed25519-dalek for
+`cap-tokens`, the opentelemetry tree for `otlp`.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

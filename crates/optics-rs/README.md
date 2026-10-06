@@ -24,8 +24,13 @@ monitors, and other optical components.
 | XIA PF4 dual filter | `snl::pf4` | pf4.st |
 | Ion chamber I0 | `snl::io` | Io.st |
 | Coarse+fine flexure | `snl::flex_combined_motion` | flexCombinedMotion.st |
-| HSC-1 slit controller | `drivers::hsc` | xiahsc.st / xia_slit.st |
-| Quad X-ray BPM | `drivers::qxbpm` | sncqxbpm.st |
+| HSC-1 slit controller | `drivers::hsc` (port driver) and `snl::xiahsc` (serial actor) | xiahsc.st |
+| XIA slit with sscan | `snl::xia_slit` | xia_slit.st |
+| Quad X-ray BPM | `drivers::qxbpm` (port driver) and `snl::qxbpm` (serial actor) | sncqxbpm.st |
+
+The three serial actors in `snl/` are async entry points taking the read and
+write halves of the connection (`run(config, reader, writer, cmd_rx,
+status_tx)`); they are not `seqStart` programs.
 
 ## Architecture
 
@@ -39,7 +44,8 @@ math/        Physics calculations (matrix3, orient)
 data/        Reference data tables (chantler X-ray absorption)
 snl/         Control logic as async state machines (epics-ca-rs)
 drivers/     Device I/O as asyn port drivers (SimHsc, SimQxbpm)
-db/          36 database templates from the original module
+seq_runner/  The `seqStart` command — the Rust stand-in for C's `seq`
+db/          32 database templates and 4 .vdb from the original module
 ```
 
 State machines (`snl/`) monitor PVs and drive motors. They contain no I/O
@@ -157,7 +163,7 @@ simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
 
 ## Database templates
 
-36 templates are bundled in the `db/` directory. Key templates:
+32 `.db` templates and 4 `.vdb` files are bundled in `db/`. Key templates:
 
 | Template | Description |
 |---|---|
@@ -179,22 +185,22 @@ simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
 
 ## Testing
 
-362 tests covering:
+What the suite covers:
 
-- **Golden tests** (46): Rust output compared against values from the original
+- **Golden tests**: Rust output compared against values from the original
   C `tableRecord.c`, compiled and executed independently. Tolerance: 1e-10.
-- **Matrix/orient** (10): Round-trip verification against published
+- **Matrix/orient**: Round-trip verification against published
   crystallographic data (Si, Be, VO2) from the original optics test suite.
-- **Chantler** (8): X-ray absorption coefficients for 22 elements.
-- **State machines** (127): Physics calculations for each controller.
-- **Serial protocol** (111): Command formatting, response parsing, coordinate
+- **Chantler**: X-ray absorption coefficients for 22 elements.
+- **State machines**: Physics calculations for each controller.
+- **Serial protocol**: Command formatting, response parsing, coordinate
   math for HSC-1 and QXBPM.
-- **Port drivers** (23): SimHsc and SimQxbpm parameter updates and poll loops.
-- **Table record** (32): Field access, geometry modes, process logic.
-- **seq_runner** (3): Macro parsing, program dispatch.
+- **Port drivers**: SimHsc and SimQxbpm parameter updates and poll loops.
+- **Table record**: Field access, geometry modes, process logic.
+- **seq_runner**: Macro parsing, program dispatch.
 
 ```sh
-cargo test -p optics-rs
+cargo nextest run -p optics-rs
 ```
 
 ## Quick Start: Kohzu DCM Simulation

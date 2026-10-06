@@ -6,8 +6,27 @@ Hosts multiple bridge implementations as feature-gated sub-modules:
 
 - **`qsrv`** (default) — Record ↔ pvAccess channels (C++ QSRV equivalent)
 - **`ca_gateway`** (default) — CA fan-out gateway (C++ ca-gateway equivalent)
-- **`pvalink`** (planned) — PVA links for record INP/OUT
-- **`pva_gateway`** (planned) — PVA-to-PVA proxy
+- **`pvalink`** — `pva://` links for record INP/OUT, pulled in by `qsrv`
+- **`pva_gateway`** — PVA-to-PVA proxy, with tower-style middleware and a
+  multi-tenant variant
+
+## Feature levers
+
+Every bridge is its own feature, and each has a `-bin` companion that adds
+only the CLI (`clap`, `tracing-subscriber`) for its binary:
+
+| feature | what it selects |
+|---|---|
+| `qsrv-core` | the QSRV bridge without the client stack — the configuration an RTEMS IOC builds, and the twin of `epics-ca-rs/client-core` |
+| `qsrv` (default) | `qsrv-core` plus `pvalink` and the PVA client/TLS stack |
+| `ca-gateway` (default) | the CA fan-out gateway |
+| `ca-gateway-tls` | the gateway over `epics-ca-rs/experimental-rust-tls` |
+| `pvalink` | `pva://` record links on their own |
+| `pva-gateway` | the PVA-to-PVA proxy |
+| `dual-ioc` | one IOC serving CA and PVA together |
+| `dual-gateway` | the CA and PVA gateways in one process, TOML-configured |
+| `all-bridges` | every bridge and every binary |
+| `bringup-probes` | forwards `epics-pva-rs/bringup-probes` to the RTEMS measurement image |
 
 No C dependencies. Just `cargo build`.
 
@@ -57,6 +76,9 @@ Upstream IOCs                Gateway                 Downstream Clients
 - `command` — runtime command interface (R1/R2/R3/AS/PVL/V)
 - `master` — auto-restart supervisor (NRESTARTS=10, RESTART_INTERVAL=10min)
 - `server` — `GatewayServer` top-level + main event loop
+- `routing` — split downstream/upstream network routing
+- `report` — C-compatible R1/R2/R3 report rendering and file append
+- `control` — the gateway's own command/control PVs
 
 ### Binary
 
@@ -148,15 +170,27 @@ The `--preload` file is still supported as an optional warm-cache mechanism but 
 
 ```
 epics-bridge-rs/src/
-  lib.rs            # Module re-exports + public API
-  error.rs          # BridgeError, BridgeResult
-  convert.rs        # EpicsValue <-> ScalarValue conversion (Enum=UShort, DBF-aware)
-  pvif.rs           # Snapshot -> NTScalar/NTEnum/NTScalarArray + FieldDesc + pvRequest filter
-  provider.rs       # ChannelProvider/Channel/PvaMonitor traits + BridgeProvider + AnyChannel
-  channel.rs        # BridgeChannel (single record) + PutOptions (process/block)
-  monitor.rs        # BridgeMonitor (DbSubscription -> PVA monitor)
-  group.rs          # GroupChannel + GroupMonitor + AnyMonitor + nested field paths
-  group_config.rs   # Group JSON parser (C++ QSRV format) + info(Q:group) + merge
+  lib.rs                  # module re-exports + public API
+  error.rs                # BridgeError, BridgeResult
+  convert.rs              # EpicsValue <-> ScalarValue (Enum=UShort, DBF-aware)
+  qsrv/
+    pvif.rs               # Snapshot -> NTScalar/NTEnum/NTScalarArray + pvRequest filter
+    provider.rs           # ChannelProvider/Channel/PvaMonitor traits + BridgeProvider
+    channel.rs            # BridgeChannel (single record) + PutOptions (process/block)
+    monitor.rs            # BridgeMonitor (DbSubscription -> PVA monitor)
+    group.rs              # GroupChannel + GroupMonitor + nested field paths
+    group_config.rs       # group JSON parser (C++ QSRV format) + info(Q:group)
+    group_pump.rs         # the server-wide group drain (pvxs's single pump)
+    put_status.rs         # the one owner of a PUT rejection's Status.message
+    trap_write.rs         # asTrapWrite emission on PUT
+    pva_adapter.rs        # BridgeProvider -> the native PVA ChannelSource
+    iocsh.rs              # dbpr-style QSRV commands
+  ca_gateway/             # see the module list above, plus routing/report/control
+  pvalink/                # link.rs, registry.rs, config.rs, iocsh.rs, integration.rs
+  pva_gateway/            # gateway.rs, channel_cache.rs, source.rs, middleware.rs,
+                          #   multi_gateway.rs, control.rs
+  bin/                    # ca-gateway-rs, qsrv-rs, pva-gateway-rs, dual-ioc-rs,
+                          #   dual-gateway-rs, realtime-pva-ioc
 ```
 
 ### Type Mapping
@@ -186,14 +220,14 @@ epics-bridge-rs/src/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.8", features = ["bridge"] }
+epics-rs = { version = "0.30", features = ["bridge"] }
 ```
 
 Or directly:
 
 ```toml
 [dependencies]
-epics-bridge-rs = "0.8"
+epics-bridge-rs = "0.30"
 ```
 
 ### Example
@@ -224,22 +258,25 @@ if bridge.channel_find("TEMP:ai").await {
 ## Testing
 
 ```bash
-cargo test -p epics-bridge-rs    # 39 tests
+cargo nextest run -p epics-bridge-rs
 ```
 
 Tests cover: type conversion roundtrips, NormativeType structure building, pvRequest field filtering, group JSON parsing, info(Q:group) parsing with prefix, group merging, PutOptions parsing (process/block), nested field path operations, NTEnum UShort index.
 
 ## Dependencies
 
-- epics-base-rs — Record trait, PvDatabase, Snapshot, DbSubscription
-- epics-pva-rs — PvStructure, ScalarValue, FieldDesc
-- tokio — async runtime (fan-in channels, spawned tasks)
-- serde / serde_json — group config JSON parsing
-- thiserror — error types
+- epics-base-rs — Record trait, PvDatabase, Snapshot, DbSubscription, and the
+  `runtime` layer (the tokio dependency is that crate's, not this one's)
+- epics-pva-rs — PvStructure, ScalarValue, FieldDesc (`qsrv-core`, `pvalink`,
+  `pva-gateway`)
+- epics-ca-rs — the gateway's two CA sides (`ca-gateway`, `qsrv`)
+- serde / serde_json — group config JSON parsing; toml — `dual-gateway`
+- regex — `.pvlist` rules and the PVA gateway's name matching
+- thiserror, parking_lot, arc-swap, bytes, chrono, async-trait, tracing
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

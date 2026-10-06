@@ -32,31 +32,44 @@ epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/ep
 ## Features
 
 ### Record System
-- **Record trait** — `process()`, `get_field()`, `put_field()`, `field_list()`, `validate_put()`, `init_record()`, `special()`
+- **Record trait** — three required methods (`record_type()`, `get_field()`, `put_field()`); everything else is a defaulted hook a type overrides only where C's record support differs from the common path (`process()`, `declared_fields()`, `validate_put()`, `on_put()`, `init_record()`, `special()`, `check_alarms()`, the monitor-posting and link-fetch policy hooks)
 - **#[derive(EpicsRecord)]** proc macro for boilerplate generation
 - **CommonFields** — shared fields (NAME, RTYP, SCAN, PHAS, SEVR, STAT, TIME, DESC, etc.)
 - **RecordInstance** — runtime wrapper with subscriber list, link state, processing flag, alarm evaluation
 - **ProcessOutcome / ProcessAction** — pure state-machine records express side effects (link writes, delayed reprocess, device commands) as data
 - **Snapshot** — bundled value + alarm + timestamp + display/control/enum metadata, assembled on demand
 
-### Record Types (23+)
+### Record Types
+
+The 34 EPICS Base types `db_loader::create_record` builds by name:
+
 | Category | Types |
 |----------|-------|
 | Analog | ai, ao |
 | Binary | bi, bo |
-| Multi-bit binary | mbbi, mbbo |
-| Long integer | longin, longout |
-| String | stringin, stringout |
-| Array | waveform, compress, histogram |
-| Calculation | calc, calcout, scalcout, sub, asub |
-| Selection | sel, seq, sseq, transform |
-| Fanout | fanout, dfanout |
-| Misc | busy, asyn |
+| Multi-bit binary | mbbi, mbbo, mbbiDirect, mbboDirect |
+| Integer | longin, longout, int64in, int64out |
+| String | stringin, stringout, lsi, lso |
+| Array | waveform, aai, aao, subArray, compress, histogram |
+| Calculation | calc, calcout, sel, sub, aSub |
+| Fanout | fanout, dfanout, seq |
+| Misc | event, printf, permissive, state |
+
+The synApps types ship in this crate too (`acalcout`, `busy`, `scalcout`,
+`sseq`, `swait`, `transform`) but are not in that table: a consumer registers
+the ones it wants with `register_record_type`, the way `epics-oracle-rs` does,
+so an IOC that does not load synApps databases does not answer for their
+names.
 
 ### Database & Processing
 - **PvDatabase** — Arc-shared record map with `add_record`, `get_record`, `process_record`, `process_record_with_links`, `put_record_field_from_ca`
 - **Link parsing** — DB/CA/PVA/Constant links, INP/OUT/FLNK/SDIS/TSEL
 - **Scan engine** — Passive, I/O Intr, Event, periodic (10/5/2/1/0.5/0.2/0.1 Hz), with PHAS ordering
+- **Parallel scanning** — `scanParallelThreads`/`scanRateThreads` add helper
+  threads that claim slots of the PHAS group a rate's own thread has published,
+  so one rate's pass uses more than one CPU while keeping PHAS order; helpers
+  carry the band of the rate they are serving and sleep at the fastest rate's
+  (epics-base #998)
 - **Alarm propagation** — MS/NMS link maximize-severity, deadband filtering (MDEL/ADEL), state alarms (HIHI/HIGH/LOW/LOLO)
 - **DBE event mask** — VALUE/LOG/ALARM/PROPERTY for fine-grained subscription
 - **Origin tracking** — self-write filter for sequencer write-back loops
@@ -97,9 +110,15 @@ epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/ep
 - C autosave-compatible `.sav` file format
 
 ### Runtime Facade
-- `epics_base_rs::runtime::sync` — `mpsc`, `Notify`, `RwLock`, `Mutex`, `Arc`
-- `epics_base_rs::runtime::task` — `spawn`, `sleep`, `interval`, `timeout`
+- `epics_base_rs::runtime::sync` — `mpsc`, `oneshot`, `broadcast`, `Notify`,
+  `RwLock`, `Mutex`, `Arc`, and the EPICS mutex registry
+- `epics_base_rs::runtime::task` — `spawn`, `sleep`, `sleep_until`, `interval`,
+  `timeout`, `MandatoryThread`, the EPICS priority bands
 - `epics_base_rs::runtime::select` — async multiplexing
+
+`runtime` and `net` are re-exports of `epics-libcom-rs` (issue #55): the paths
+are unchanged, and a consumer that wants those primitives without the record
+system can depend on that crate instead.
 - `#[epics_base_rs::epics_main]` — IOC entry point (replaces `#[tokio::main]`)
 - `#[epics_base_rs::epics_test]` — async test (replaces `#[tokio::test]`)
 
@@ -135,9 +154,10 @@ banding is, at 84.7× on the same guest.
 
 ```
 epics-base-rs/src/
-├── lib.rs
+├── lib.rs                  # re-exports `runtime` and `net` from epics-libcom-rs
 ├── error.rs                # CaError, CaResult
-├── runtime/                # async runtime facade (mpsc, Notify, spawn, select)
+├── json5.rs                # the JSON5 subset `.db` link/info values use
+├── reference.rs            # the C-source citations the parity tests read
 ├── types/
 │   ├── value.rs            # EpicsValue (12 variants: scalar + array)
 │   ├── dbr.rs              # DbFieldType, DBR type ranges
@@ -152,7 +172,7 @@ epics-base-rs/src/
     │   ├── field_io.rs     # get_pv, put_pv, put_record_field_from_ca
     │   ├── processing.rs   # process_record_with_links (full link chain)
     │   ├── links.rs        # DB/CA/PVA/Constant link resolution
-    │   ├── scan_index.rs   # SCAN scheduling (Passive/Periodic/IOIntr/Event)
+    │   ├── scan_index.rs   # SCAN scheduling + `post_event` (Passive/Periodic/IOIntr/Event)
     │   └── db_access.rs    # DbChannel, DbSubscription, DbMultiMonitor
     ├── db_loader/          # .db parser, macro expansion, info()
     ├── record/
@@ -161,11 +181,18 @@ epics-base-rs/src/
     ├── records/            # 23 record type implementations
     ├── snapshot.rs         # Snapshot, AlarmInfo, DisplayInfo, ControlInfo, EnumInfo
     ├── pv.rs               # ProcessVariable, MonitorEvent, Subscriber
-    ├── recgbl.rs           # EventMask (VALUE/LOG/ALARM/PROPERTY)
-    ├── scan.rs             # ScanType
-    ├── scan_event.rs       # event-driven scanning
+    ├── recgbl/, recgbl.rs  # EventMask (VALUE/LOG/ALARM/PROPERTY), recGblXxx
+    ├── scan.rs             # the scan engine: rates, PHAS passes, helper pool
+    ├── event_queue.rs      # the CA monitor event queue (C `dbEvent.c`)
     ├── access_security.rs  # ACF parser + UAG/HAG/ASG
     ├── device_support.rs   # DeviceSupport trait, DeviceSupportFactory
+    ├── driver_support.rs   # DriverSupport (drvet) registration
+    ├── builtin_devices/    # the Soft Channel family of dsets
+    ├── cvt_bpt.rs          # breakpoint tables (cvtTable)
+    ├── db_convert_json.rs  # .db ⇄ JSON conversion
+    ├── db_server.rs        # the dbServer seam a protocol server registers on
+    ├── snl.rs              # the sequencer (SNL) state-program seam
+    ├── status_pv.rs        # the IOC's own status/statistics PVs
     └── autosave/           # save/restore (Pass0/Pass1, request files)
 ```
 
@@ -238,14 +265,20 @@ Test coverage: record processing, alarm evaluation, deadband filtering, link cha
 
 ## Dependencies
 
+- epics-libcom-rs — the `runtime`/`net` layer this crate re-exports (tokio or
+  the thread backend lives there, not here)
+- epics-macros-rs — `#[derive(EpicsRecord)]`, `#[epics_main]`, `#[epics_test]`
+- epics-rtems-boot — the RTEMS entry point, on that target
 - chrono — timestamp formatting
 - bytes — buffer management
 - thiserror — error types
-- tokio — async runtime (re-exported via `runtime::` facade)
+- parking_lot, arc-swap — record and registry locking
+- serde_json — `.db`/JSON conversion and the status PVs
+- clap, hostname, async-trait, tracing
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

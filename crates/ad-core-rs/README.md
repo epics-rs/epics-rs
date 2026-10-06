@@ -1,57 +1,50 @@
-# areadetector-rs
+# ad-core-rs
 
-Pure Rust implementation of [EPICS areaDetector](https://github.com/areaDetector/areaDetector) — N-dimensional array handling, plugin framework, and simulated detector driver.
+Pure Rust implementation of [EPICS areaDetector](https://github.com/areaDetector/areaDetector)
+core — N-dimensional array handling and the plugin framework.
 
 No C dependencies. Just `cargo build`.
 
 **Repository:** <https://github.com/epics-rs/epics-rs>
 
-## Workspace
+## Where the rest of areaDetector lives
 
 | Crate | Description |
 |-------|-------------|
-| **ad-core** | Core types: NDArray, NDArrayPool, attributes, driver/plugin base classes |
-| **plugins** | 16 NDPlugin implementations: stats, ROI, process, transform, FFT, file I/O, etc. |
-| **sim-detector** | Simulated areaDetector driver (4 SimModes, Mono/RGB1, ROI crop) |
+| **ad-core-rs** (this crate) | Core types: NDArray, NDArrayPool, attributes, driver/plugin base classes |
+| **ad-plugins-rs** | 26 NDPlugin implementations: stats, ROI, process, transform, FFT, file I/O, etc. |
+| **examples/sim-detector** | Simulated areaDetector driver (4 SimModes, Mono/RGB1, ROI crop) |
 
 ## Features
 
-### ad-core
-
-- `NDArray` — N-dimensional typed array container (10 data types)
+- `NDArray` — N-dimensional typed array container (the 10 C `NDDataType`s,
+  Int8 through Float64)
 - `NDArrayPool` — Free-list buffer reuse with memory tracking
 - `NDAttributeList` — Metadata attributes through processing chain
 - `NDColorMode` — Mono, Bayer, RGB1/2/3, YUV444/422
 - `ADDriverBase` — Base detector driver with channel-based plugin chain
-- `NDPluginProcess` trait — Pure plugin processing interface
-- `PluginRuntime` — Per-plugin data processing thread
+- `NDPluginProcess` trait — Pure plugin processing interface, `&self` so one
+  processor can run on `NumThreads` callback threads at once
+- `PluginRuntime` — Per-plugin data processing thread, with the frame
+  throttler and the plugin-chain wiring
+- `FileBase` / `FileController` — the capture/stream/single file lifecycle every
+  file writer plugin is built on
+- `simd` — the SIMD kernels the plugins' hot loops call (`simd` feature, on by
+  default)
 
-### plugins
+### Feature levers
 
-| Plugin | Description |
-|--------|-------------|
-| stats | Min/max/mean/sigma, centroid |
-| roi | Region of interest with binning |
-| process | Arithmetic, morphology, filters |
-| transform | Flip, rotate, transpose |
-| color_convert | Bayer/RGB/YUV conversions |
-| overlay | Draw shapes on images |
-| fft | Fast Fourier Transform |
-| time_series | Temporal data ringbuffer |
-| circular_buff | Array history buffer |
-| codec | JPEG/PNG/Zlib compression |
-| gather | Combine arrays |
-| scatter | Distribute arrays |
-| std_arrays | Standard array generation |
-| file_tiff | TIFF file writing |
-| file_jpeg | JPEG file writing |
-| file_hdf5 | HDF5 file writing |
+| feature | what it does |
+|---|---|
+| `simd` (default) | the SIMD kernels, shared with `ad-plugins-rs/simd` |
+| `ioc` | the iocsh/record side — `epics-base-rs`, `epics-ca-rs` and `asyn-rs/epics`, the plugin manager and the driver context |
 
-### Parallel Processing
+### Plugins
 
-The `parallel` feature (enabled by default in ad-plugins) uses rayon to parallelize CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). A shared thread pool sized to `available_cores - 2` prevents over-subscription with port driver threads. See the [ad-plugins README](../ad-plugins/README.md#parallel-processing) for details.
+The 26 plugin implementations live in `ad-plugins-rs`; its README has the
+table and the notes on rayon parallelism and the shared thread pool.
 
-### sim-detector
+### examples/sim-detector
 
 - 4 simulation modes: LinearRamp, Peaks, Sine, OffsetNoise
 - Color modes: Mono, RGB1
@@ -66,7 +59,8 @@ The `parallel` feature (enabled by default in ad-plugins) uses rayon to parallel
 ### Run SimDetector IOC
 
 ```bash
-cargo run -p sim-detector --features ioc --bin sim_ioc -- ioc/st.cmd
+cargo run -p sim-detector --features ioc --bin sim_ioc -- \
+    examples/sim-detector/ioc/st.cmd
 ```
 
 ### st.cmd
@@ -83,8 +77,8 @@ iocInit()
 ### Library Usage
 
 ```rust
-use ad_core::ndarray::{NDArray, NDDataType};
-use ad_core::driver::ad_driver::ADDriverBase;
+use ad_core_rs::driver::ad_driver::ADDriverBase;
+use ad_core_rs::ndarray::{NDArray, NDDataType};
 
 let mut driver = ADDriverBase::new("SIM1", 256, 256, 50_000_000).unwrap();
 driver.connect_downstream(stats_handle.array_sender().clone());
@@ -94,49 +88,43 @@ driver.publish_array(Arc::new(array)).unwrap();
 ## Testing
 
 ```bash
-cargo test --workspace
+cargo nextest run -p ad-core-rs
 ```
-
-90 tests (38 ad-core + 8 plugins + 41 sim-detector unit + 3 integration).
 
 ## Architecture
 
 ```
-areadetector-rs/
-  ad-core/
-    src/
-      ndarray.rs          # NDArray, NDDataBuffer, NDDataType
-      ndarray_pool.rs     # Buffer pool
-      attributes.rs       # NDAttributeList
-      color.rs            # NDColorMode
-      params/             # Parameter definitions
-      driver/             # ADDriverBase, ADStatus, ImageMode
-      plugin/             # NDPluginProcess, PluginRuntime, channels
-    opi/
-      medm/               # ADCore MEDM .adl screens (66)
-      pydm/               # PyDM .ui screens
-  plugins/
-    src/
-      stats.rs .. file_hdf5.rs  # 16 plugin implementations
-  sim-detector/
-    src/
-      types.rs            # SimMode, DirtyFlags
-      pixel_cast.rs       # PixelCast trait
-      color_layout.rs     # Color mode indexing
-      compute.rs          # Image generation (4 modes)
-      roi.rs              # ROI cropping
-      driver.rs           # SimDetector + PortDriver impl
-      task.rs             # Acquisition thread
-    Db/                   # Database templates
-    ioc/                  # st.cmd startup scripts
-    opi/
-      medm/               # SimDetector MEDM .adl screens
-      pydm/               # PyDM .ui screens
+crates/ad-core-rs/
+  src/
+    ndarray.rs          # NDArray, NDDataBuffer, NDDataType
+    ndarray_pool.rs     # buffer pool with memory tracking
+    attributes.rs       # NDAttributeList
+    color.rs            # NDColorMode
+    color_layout.rs     # color-mode indexing
+    pixel_cast.rs       # the PixelCast trait
+    roi.rs              # ROI cropping
+    codec.rs            # the codec descriptor a compressed NDArray carries
+    convert.rs          # data-type conversion
+    simd.rs             # the SIMD kernels (`simd` feature)
+    timestamp.rs        # the NDArray timestamp pair
+    finalize.rs         # end-of-acquisition finalisation
+    params/             # parameter definitions
+    driver/             # ADDriverBase, NDArrayDriver, ADStatus, ImageMode
+    plugin/             # NDPluginProcess, PluginRuntime, channels, throttler,
+                        #   wiring, FileBase/FileController
+    ioc/                # iocsh side: plugin manager, driver context (`ioc`)
+  db/                   # ADCore database templates
+  opi/medm/             # ADCore MEDM .adl screens (66) and their .ui twins
+  opi/pydm/             # PyDM .ui screens
+  doc/                  # the parity notes against C ADCore
+
+examples/sim-detector/  # the simulated driver and its sim_ioc binary
+crates/ad-plugins-rs/   # the 26 plugins
 ```
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

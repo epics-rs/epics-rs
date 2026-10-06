@@ -36,7 +36,8 @@ scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full st
 - `scaler.db` — base scaler record (64-channel)
 - `scaler16.db` / `scaler32.db` / `scaler16m.db` — sized variants
 - `scalerSoftCtrl.db` — software-only test scaler
-- `scaler*_settings.req` — autosave request files for all sized variants
+- `scaler*_settings.req` — autosave request files for the 8/16/32/64-channel
+  variants, plus the per-channel `scaler_channelN_settings.req`
 
 ### PyDM Screens (bundled in `ui/`)
 - 16-channel: full, more, calc variants
@@ -52,6 +53,7 @@ scaler-rs/
 │   ├── records/
 │   │   ├── mod.rs              # re-exports
 │   │   └── scaler.rs           # ScalerRecord (Record trait + state machine)
+│   ├── records/dbd_generated.rs # the field table generated from scalerRecord.dbd
 │   └── device_support/
 │       ├── mod.rs              # ScalerDriver trait
 │       ├── scaler_asyn.rs      # asyn-based device support
@@ -64,7 +66,7 @@ scaler-rs/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.8", features = ["scaler"] }
+epics-rs = { version = "0.30", features = ["scaler"] }
 ```
 
 ### Register the Record Type
@@ -80,10 +82,12 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 
     // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
     // `dbsr` server layer exist before `iocInit` rather than after it.
+    // The database loads through the shell, as in C: `db_file` is
+    // `IocBuilder`'s, and an `IocApplication` has no second loader.
     run_ca_ioc_app(
         IocApplication::new()
             .register_record_type(name, factory)
-            .db_file("db/scaler16.db", &macros)?,
+            .startup_line(r#"dbLoadRecords("db/scaler16.db")"#),
     )
     .await
 }
@@ -94,12 +98,8 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 ```rust
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
 
-let driver = SoftScalerDriver::new(16, vec![
-    1_000_000.0,  // channel 1: 1 MHz time base
-    100_000.0,    // channel 2: 100 kHz signal
-    50_000.0,     // channel 3: 50 kHz signal
-    // ... up to 16 channels
-]);
+// The channel count alone; it is clamped to MAX_SCALER_CHANNELS (64).
+let driver = SoftScalerDriver::new(16);
 ```
 
 ### Operating the Scaler (CA)
@@ -117,21 +117,22 @@ camonitor SCALER:S1 SCALER:S2 SCALER:S3
 ## Testing
 
 ```bash
-cargo test -p scaler-rs
+cargo nextest run -p scaler-rs
 ```
 
 Test coverage: state machine transitions (OneShot → arm → counting → done), AutoCount periodic refresh, preset writing, gate/direction handling, COUT/COUTP link firing, soft driver count generation, asyn device support bridge.
 
 ## Dependencies
 
-- epics-base-rs — Record trait, DeviceSupport, ProcessAction
+- epics-base-rs — Record trait, DeviceSupport, ProcessAction (the record's
+  `Record` impl is hand-written, not derived)
+- epics-ca-rs — the `run_ca_ioc_app` entry point the example uses
 - asyn-rs — port driver framework
-- epics-macros-rs — `#[derive(EpicsRecord)]`
-- chrono — timestamps
+- tokio, tracing
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

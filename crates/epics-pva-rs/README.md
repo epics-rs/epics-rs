@@ -86,8 +86,14 @@ epics-pva-rs/src/
 │   ├── env.rs
 │   └── mod.rs
 ├── service/            # axum-style PVA RPC service framework
+├── decode.rs           # the server→client response decoder (always compiled,
+│                       #   not part of the `client` feature)
+├── leaf_convert.rs     # the one owner of EpicsValue <-> PVA leaf types
+├── channel_shape.rs    # the one owner of pvxs's scalar-vs-array decision
+├── peer_buf.rs         # fallible growth for buffers a peer sizes
+├── util.rs             # the Rust analogues of pvxs `util.h`
 ├── cli.rs / format.rs / log.rs   # CLI helpers, output formatting, logging
-└── bin/                # 8 command-line binaries (see below)
+└── bin/                # the 8 command-line binaries (see below)
 ```
 
 ## Modules
@@ -158,8 +164,8 @@ decoding and response encoding so service authors write plain typed
 
 ## CLI Tools
 
-The crate builds 8 binaries (the 4 explicitly declared in `Cargo.toml` plus
-4 auto-discovered from `src/bin/`). They mirror the pvxs `tools/` set:
+The crate builds 8 binaries, declared in `Cargo.toml` and gated on the
+`client` feature. They mirror the pvxs `tools/` set:
 
 - **pvget-rs** — read PVA channel values (single shot)
 - **pvput-rs** — write a PVA channel value
@@ -173,6 +179,18 @@ The crate builds 8 binaries (the 4 explicitly declared in `Cargo.toml` plus
   frames for network diagnostics (mirrors pvxs `pvxvct`)
 - **mshim-rs** — beacon multicast shim; forwards UDP datagrams between
   endpoints to bridge IPv4 multicast (mirrors pvxs `mshim`)
+
+## Feature levers
+
+| feature | what it does |
+|---|---|
+| `client` (default) | the native client — `client_native`, the `client` re-export, `PvaServer::client_config()`, and the `pv*` binaries. Off leaves a server-only build; the wire decoder the server needs is `crate::decode`, which is always compiled |
+| `tls` (default) | `pvas://` over rustls. Off drops rustls and with it `ring`/`getrandom 0.2`, which do not build for RTEMS — and `auth::TlsServerConfig`/`TlsClientConfig` become uninhabited, so the `tls` config fields still compile and are provably `None` |
+| `pkcs12` (default) | PKCS#12 keychains in `auth::tls` (implies `tls`). Off is PEM-only. Closes the second `getrandom 0.2` path |
+| `bringup-probes` | the client-side dial-attempt counter and `client_native::dial_pool_probe()` the RTEMS bring-up measurements read |
+
+An RTEMS target build is `--no-default-features`, which is why each of the
+three defaults states what it costs that target.
 
 ## Quick Start
 
@@ -254,19 +272,19 @@ cargo test -p epics-pva-rs
 
 ## Dependencies
 
-- tokio — async runtime
+- epics-base-rs — `EpicsValue`, `PvDatabase`, and the `runtime`/`net` layer
+  (the tokio dependency is that crate's, not this one's)
+- epics-macros-rs — `#[pva_service]`, `#[derive(NTScalar)]`, `#[derive(NTTable)]`
 - bytes — refcounted byte buffers for zero-copy monitor fan-out
-- rustls / tokio-rustls — opt-in TLS transport
-- chrono — timestamps
+- chrono, thiserror, parking_lot, dashmap, futures-util, tokio-util
 - clap — CLI argument parsing
-- thiserror — error types
+- rustls / tokio-rustls / x509-parser — `tls`
+- p12 / pkcs5 / der / spki / sha1 — `pkcs12`
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
 
 ## License
 
 [EPICS Open License](../../LICENSE)
-</content>
-</invoke>

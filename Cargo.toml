@@ -73,7 +73,6 @@ optics-rs = { path = "crates/optics-rs", version = "0.30.2" }
 mca-rs = { path = "crates/mca-rs", version = "0.30.2" }
 mqtt-rs = { path = "crates/mqtt-rs", version = "0.30.2" }
 modbus-rs = { path = "crates/modbus-rs", version = "0.30.2", package = "epics-modbus-rs" }
-epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.30.2" }
 
 # Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
 # image size is a real resource: `cargo build --profile release-embedded ...`

@@ -1141,10 +1141,10 @@ fn stats_of<T: StatsElem + Send + Sync>(
         total,
         net,
         num_elements: v.len(),
-        min_x: if x_size > 0 { min_idx % x_size } else { 0 },
-        min_y: if x_size > 0 { min_idx / x_size } else { 0 },
-        max_x: if x_size > 0 { max_idx % x_size } else { 0 },
-        max_y: if x_size > 0 { max_idx / x_size } else { 0 },
+        min_x: min_idx.checked_rem(x_size).unwrap_or(0),
+        min_y: min_idx.checked_div(x_size).unwrap_or(0),
+        max_x: max_idx.checked_rem(x_size).unwrap_or(0),
+        max_y: max_idx.checked_div(x_size).unwrap_or(0),
         ..StatsResult::default()
     }
 }

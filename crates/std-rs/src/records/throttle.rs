@@ -591,10 +591,8 @@ impl Record for ThrottleRecord {
             // unconnected external SINP (`EXT_NC`) is NOT synced (its
             // `checkLink` can never connect here — no CA client), so SYNC
             // is left in `Process`, matching C leaving it pending.
-            "SYNC" => {
-                if self.sync == THROTTLE_SYNC_PROCESS && self.siv != LINK_EXT_NC {
-                    self.value_sync();
-                }
+            "SYNC" if self.sync == THROTTLE_SYNC_PROCESS && self.siv != LINK_EXT_NC => {
+                self.value_sync()
             }
             _ => {}
         }

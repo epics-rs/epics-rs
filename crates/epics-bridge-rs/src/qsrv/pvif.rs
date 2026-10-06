@@ -154,10 +154,8 @@ pub fn change_leaves(
         // Value-only mappings: the mapped node IS the value (pvxs `value =
         // node`), marked whole; no metadata sub-tree exists, so there is
         // nothing to over-mark.
-        FieldMapping::Plain | FieldMapping::Any => {
-            if change.intersects(EventMask::VALUE) {
-                leaves.push("");
-            }
+        FieldMapping::Plain | FieldMapping::Any if change.intersects(EventMask::VALUE) => {
+            leaves.push("");
         }
         // Const/Structure/Proc carry no runtime event leaf.
         _ => {}

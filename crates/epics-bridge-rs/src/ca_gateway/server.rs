@@ -1183,34 +1183,32 @@ impl GatewayServer {
                             peer,
                             pv_name,
                             sub_id,
-                        } => {
-                            if cache_mode.is_no_cache() {
-                                let msid = synthetic_sid(peer, &pv_name, sub_id);
-                                // Close carries no mask, so withdraw both
-                                // interests by sid — `remove_property_interest`
-                                // is a no-op for a value-only subscription
-                                // whose sid was never added to `prop_interest`.
-                                let (became_empty, prop_became_empty) =
-                                    match cache_for_conn.read().await.get(&pv_name) {
-                                        Some(entry) => {
-                                            let mut e = entry.write().await;
-                                            let v = e.remove_monitor_interest(msid);
-                                            let p = e.remove_property_interest(msid);
-                                            (v, p)
-                                        }
-                                        None => (false, false),
-                                    };
-                                if became_empty {
-                                    upstream_for_conn.release_monitor(&pv_name);
-                                }
-                                if prop_became_empty {
-                                    upstream_for_conn.release_prop_monitor(&pv_name);
-                                }
-                                if let Some(monitors) = peer_monitors.get_mut(&peer) {
-                                    monitors.retain(|(p, s)| !(p == &pv_name && *s == msid));
-                                    if monitors.is_empty() {
-                                        peer_monitors.remove(&peer);
+                        } if cache_mode.is_no_cache() => {
+                            let msid = synthetic_sid(peer, &pv_name, sub_id);
+                            // Close carries no mask, so withdraw both
+                            // interests by sid — `remove_property_interest`
+                            // is a no-op for a value-only subscription
+                            // whose sid was never added to `prop_interest`.
+                            let (became_empty, prop_became_empty) =
+                                match cache_for_conn.read().await.get(&pv_name) {
+                                    Some(entry) => {
+                                        let mut e = entry.write().await;
+                                        let v = e.remove_monitor_interest(msid);
+                                        let p = e.remove_property_interest(msid);
+                                        (v, p)
                                     }
+                                    None => (false, false),
+                                };
+                            if became_empty {
+                                upstream_for_conn.release_monitor(&pv_name);
+                            }
+                            if prop_became_empty {
+                                upstream_for_conn.release_prop_monitor(&pv_name);
+                            }
+                            if let Some(monitors) = peer_monitors.get_mut(&peer) {
+                                monitors.retain(|(p, s)| !(p == &pv_name && *s == msid));
+                                if monitors.is_empty() {
+                                    peer_monitors.remove(&peer);
                                 }
                             }
                         }

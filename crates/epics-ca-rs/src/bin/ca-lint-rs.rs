@@ -126,10 +126,8 @@ fn lint_env(issues: &mut Vec<Issue>) {
             "EPICS_CA_AUTO_ADDR_LIST" => {
                 seen_auto_addr_list = matches!(v.trim(), "NO" | "no" | "0" | "off");
             }
-            "EPICS_CA_CONN_TMO" | "EPICS_CA_PUT_TIMEOUT" => {
-                if v.parse::<f64>().is_err() {
-                    issues.push(Issue::Error(format!("{k}={v:?} is not a number")));
-                }
+            "EPICS_CA_CONN_TMO" | "EPICS_CA_PUT_TIMEOUT" if v.parse::<f64>().is_err() => {
+                issues.push(Issue::Error(format!("{k}={v:?} is not a number")));
             }
             _ => {}
         }

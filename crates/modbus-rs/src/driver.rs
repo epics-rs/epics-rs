@@ -123,6 +123,36 @@ impl ModbusFunctionCode {
         })
     }
 
+    /// Bytes the reply PDU — function code first, as
+    /// [`crate::interpose::ModbusFramer::unwrap_response`] delivers it — should
+    /// occupy. C `doModbusIO`'s `replySize` (drvModbusAsyn.cpp:2096-2206).
+    ///
+    /// This count is what a read asks the octet port for, and it is a frame
+    /// delimiter, not a buffer capacity: Modbus carries no terminator, so an
+    /// octet read returns early only once the requested count is met and
+    /// otherwise waits out the whole timeout before reporting one. Asking for
+    /// a capacity therefore turns every well-formed reply into a timeout.
+    pub fn expected_reply_pdu_len(self, len: usize) -> usize {
+        match self {
+            // fcode + byteCount + the bits packed eight to a byte.
+            Self::ReadCoils | Self::ReadDiscreteInputs => 2 + len.div_ceil(8),
+            // fcode + byteCount + two bytes per register.
+            Self::ReadHoldingRegisters | Self::ReadInputRegisters | Self::ReadInputRegistersF23 => {
+                2 + 2 * len
+            }
+            // fcode + byteCount + one byte per word.
+            Self::ReportSlaveId => 2 + len,
+            // fcode + the address and the value/count echoed back.
+            Self::WriteSingleCoil
+            | Self::WriteSingleRegister
+            | Self::WriteMultipleCoils
+            | Self::WriteMultipleRegisters => 5,
+            // FC 0x17 cannot be asked for zero registers, so C's write arm
+            // reads one back (`nread = 1`, drvModbusAsyn.cpp:2188).
+            Self::WriteMultipleRegistersF23 => 2 + 2,
+        }
+    }
+
     /// Whether this is a read operation (drives a poller thread).
     pub fn is_read(self) -> bool {
         matches!(
@@ -343,7 +373,14 @@ pub trait OctetTransport: Send + Sync {
         self.write_frame(data)
     }
     /// Receive one framed response, waiting up to `timeout`.
-    fn read_frame(&mut self, timeout: Duration) -> ModbusResult<Vec<u8>>;
+    ///
+    /// `expected` is the reply's on-wire length as the request implies it
+    /// ([`crate::interpose::ModbusFramer::expected_reply_frame_len`]), and is
+    /// the count the read asks the link for. It must never be a buffer
+    /// capacity: a Modbus link carries no terminator, so the requested count
+    /// is what delimits the frame, and asking for more than the reply holds
+    /// spends the whole timeout before reporting one.
+    fn read_frame(&mut self, expected: usize, timeout: Duration) -> ModbusResult<Vec<u8>>;
 
     /// Send a framed request and receive its response as ONE locked,
     /// flush-first exchange — C `asynOctetSyncIO.c:231-276`, which every
@@ -359,9 +396,14 @@ pub trait OctetTransport: Send + Sync {
     /// The default is the unlocked, unflushed pair, which is correct only for
     /// a transport that owns its link outright — in-crate test doubles. Any
     /// transport over a shared asyn port MUST override it.
-    fn write_read(&mut self, data: &[u8], timeout: Duration) -> ModbusResult<Vec<u8>> {
+    fn write_read(
+        &mut self,
+        data: &[u8],
+        expected: usize,
+        timeout: Duration,
+    ) -> ModbusResult<Vec<u8>> {
         self.write_frame(data)?;
-        self.read_frame(timeout)
+        self.read_frame(expected, timeout)
     }
     /// Discard any partially received frame.
     ///
@@ -625,6 +667,12 @@ impl ModbusEngine {
         let expected_txid = framed.transaction_id;
         let is_udp = self.framer.link_type() == LinkType::Udp;
         let framed = framed.bytes;
+        // C computes the same count as `replySize` and hands it to
+        // `pasynOctetSyncIO->writeRead` as the read length
+        // (drvModbusAsyn.cpp:2096-2206, 2177-2182).
+        let expected_reply = self
+            .framer
+            .expected_reply_frame_len(function.expected_reply_pdu_len(len));
 
         let started = Instant::now();
         // The transport write/read cycle. C `doModbusIO` increments
@@ -632,14 +680,15 @@ impl ModbusEngine {
         // transport status (drvModbusAsyn.cpp:2204-2208) — it is the single
         // I/O-error site. A Modbus exception response or a malformed frame is
         // not a transport failure and must never reach it.
-        let response_pdu = match self.transact(transport, &framed, expected_txid, is_udp) {
-            Ok(pdu) => pdu,
-            Err(e) => {
-                self.stats.io_errors += 1;
-                self.stats.current_io_errors += 1;
-                return Err(e);
-            }
-        };
+        let response_pdu =
+            match self.transact(transport, &framed, expected_txid, is_udp, expected_reply) {
+                Ok(pdu) => pdu,
+                Err(e) => {
+                    self.stats.io_errors += 1;
+                    self.stats.current_io_errors += 1;
+                    return Err(e);
+                }
+            };
         // Transport succeeded: record the cycle time (C updates LastIOTime /
         // MaxIOTime / the histogram on every successful writeRead, before the
         // exception check, drvModbusAsyn.cpp:2211-2225) and clear the
@@ -697,8 +746,9 @@ impl ModbusEngine {
         framed: &[u8],
         expected_txid: Option<u16>,
         is_udp: bool,
+        expected_reply: usize,
     ) -> ModbusResult<Vec<u8>> {
-        let result = self.transact_frame(transport, framed, expected_txid, is_udp);
+        let result = self.transact_frame(transport, framed, expected_txid, is_udp, expected_reply);
         if result.is_err() {
             transport.reset_stream();
         }
@@ -713,6 +763,7 @@ impl ModbusEngine {
         framed: &[u8],
         expected_txid: Option<u16>,
         is_udp: bool,
+        expected_reply: usize,
     ) -> ModbusResult<Vec<u8>> {
         // The request and its reply are ONE locked, flush-first exchange (C
         // `asynOctetSyncIO.c:231-276`). Only the re-reads below — a stale TCP
@@ -720,13 +771,13 @@ impl ModbusEngine {
         // port separately, and each of those is entered only after this port's
         // own reply failed to arrive, so there is nothing of ours left to
         // steal.
-        let mut pending = Some(transport.write_read(framed, READ_TIMEOUT));
+        let mut pending = Some(transport.write_read(framed, expected_reply, READ_TIMEOUT));
         let mut udp_retries = 0u32;
         let mut stale_frames = 0u32;
         loop {
             let attempt = match pending.take() {
                 Some(first) => first,
-                None => transport.read_frame(READ_TIMEOUT),
+                None => transport.read_frame(expected_reply, READ_TIMEOUT),
             };
             match attempt {
                 Ok(raw) => {
@@ -964,7 +1015,7 @@ mod tests {
             self.resent.push(data.to_vec());
             Ok(())
         }
-        fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+        fn read_frame(&mut self, _expected: usize, _timeout: Duration) -> ModbusResult<Vec<u8>> {
             self.responses
                 .pop_front()
                 .unwrap_or(Err(ModbusError::Timeout))
@@ -1739,7 +1790,7 @@ mod tests {
         fn write_frame(&mut self, _data: &[u8]) -> ModbusResult<()> {
             Ok(())
         }
-        fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+        fn read_frame(&mut self, _expected: usize, _timeout: Duration) -> ModbusResult<Vec<u8>> {
             Ok(self.frame.clone())
         }
     }
@@ -1765,7 +1816,11 @@ mod tests {
             fn write_frame(&mut self, _data: &[u8]) -> ModbusResult<()> {
                 Ok(())
             }
-            fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+            fn read_frame(
+                &mut self,
+                _expected: usize,
+                _timeout: Duration,
+            ) -> ModbusResult<Vec<u8>> {
                 // Always a stale transaction ID (0); the request's ID is 1.
                 let mut frame = crate::protocol::MbapHeader::new(0, self.pdu.len() as u16)
                     .to_bytes()

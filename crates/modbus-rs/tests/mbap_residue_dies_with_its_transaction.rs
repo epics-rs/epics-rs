@@ -58,9 +58,9 @@ impl OctetTransport for ChunkedTcpTransport {
         self.mbap.reset();
     }
 
-    fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+    fn read_frame(&mut self, expected: usize, _timeout: Duration) -> ModbusResult<Vec<u8>> {
         let Self { chunks, mbap } = self;
-        mbap.read_frame(|| Ok(chunks.pop_front().unwrap_or_default()))
+        mbap.read_frame(expected, |_need| Ok(chunks.pop_front().unwrap_or_default()))
     }
 }
 

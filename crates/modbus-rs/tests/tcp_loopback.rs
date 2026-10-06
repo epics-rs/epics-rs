@@ -26,7 +26,7 @@ impl OctetTransport for TcpTransport {
             .map_err(|e| ModbusError::Io(e.to_string()))
     }
 
-    fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+    fn read_frame(&mut self, _expected: usize, _timeout: Duration) -> ModbusResult<Vec<u8>> {
         // Read the 6-byte MBAP header, then the PDU it sizes.
         let mut header = [0u8; 6];
         self.stream

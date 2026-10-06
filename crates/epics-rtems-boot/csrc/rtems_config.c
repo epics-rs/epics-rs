@@ -53,6 +53,23 @@ extern void *POSIX_Init(void *argument);
 #endif
 
 /*
+ * D-SMP. Processor count, on an SMP kernel only. `RTEMS_SMP` comes from the
+ * BSP's own `cpuopts.h`, so a stock uniprocessor BSP never sees this and
+ * confdefs keeps its single-processor configuration; on an SMP BSP confdefs
+ * otherwise also defaults to ONE, which boots but leaves the second core
+ * idle — and a parallel scan pass with one core is a leader that drains
+ * every PHAS group alone, because an RTEMS POSIX thread is SCHED_FIFO by
+ * default (`cpukit/posix/src/pthreadattrdefault.c:55`) and a helper at or
+ * below the leader's band cannot preempt it. Overridable from the build for
+ * the same reason the tick is.
+ */
+#ifdef RTEMS_SMP
+#ifndef CONFIGURE_MAXIMUM_PROCESSORS
+#define CONFIGURE_MAXIMUM_PROCESSORS 2
+#endif
+#endif
+
+/*
  * E. Task stack pool (base :39). Every Rust thread's stack comes out of this,
  * and this port is thread-per-connection: CA runs one thread per client, PVA
  * three (the 3N+2 budget in `server_native/blocking.rs`). Base's generous value

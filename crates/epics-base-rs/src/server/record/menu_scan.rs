@@ -149,6 +149,29 @@ pub fn menu_scan() -> &'static MenuScan {
     menu
 }
 
+/// The menu index a choice string names in the table that *will* be in
+/// force, answered without freezing it — [`MenuScan::index_of`] is the
+/// same question asked of the frozen table.
+///
+/// For the one caller that has to name a rate while the door is still
+/// open: `scanRateThreads` runs between `dbLoadDatabase` and `iocInit`,
+/// where C's `dbFindMenu` reads the loaded menu without committing the IOC
+/// to it. Calling [`menu_scan`] there would freeze whatever is pending, and
+/// a second `.dbd` declaring `menu(menuScan)` — which the two-cell design
+/// above exists to allow — would then fail with
+/// [`InstallError::AlreadyInUse`].
+pub fn pending_index_of(label: &str) -> Option<u16> {
+    if let Some(frozen) = MENU_SCAN.get() {
+        return frozen.index_of(label);
+    }
+    let pending = PENDING.lock().expect("menuScan peek");
+    match pending.as_deref() {
+        Some(choices) => choices.iter().position(|c| c == label),
+        None => stock_choices().iter().position(|c| *c == label),
+    }
+    .map(|i| i as u16)
+}
+
 impl MenuScan {
     fn from_choices(choices: &'static [&'static str]) -> Self {
         let periods: Vec<Option<Duration>> = choices[SCAN_1ST_PERIODIC as usize..]

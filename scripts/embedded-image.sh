@@ -81,6 +81,16 @@ case "$KIND" in
     *) usage ;;
 esac
 
+# EMBEDDED_EXTRA_FEATURES appends to the shipped set — the measurement rig,
+# whose features are deliberately not in it:
+#
+#   EMBEDDED_EXTRA_FEATURES=bringup-probes scripts/embedded-image.sh rtems pva
+#
+# A separate variable rather than letting the caller replace FEATURES: an
+# image built without `qsrv-core`/`pvalink` is not the thing a bring-up run
+# is measuring, and that mistake is silent.
+[[ -n "${EMBEDDED_EXTRA_FEATURES:-}" ]] && FEATURES="$FEATURES,$EMBEDDED_EXTRA_FEATURES"
+
 # The comma in `std,panic_abort` is cargo's separator, not bash's — quoted
 # for the same SC2054 reason the gates give.
 ARGS=(build --profile "$PROFILE" --no-default-features

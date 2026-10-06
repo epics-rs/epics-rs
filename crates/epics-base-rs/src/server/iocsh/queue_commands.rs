@@ -30,6 +30,7 @@ use crate::runtime::background::{CallbackPriority, CallbackQueueStats};
 pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_scan_once_set_queue_size());
     registry.register(cmd_scan_parallel_threads());
+    registry.register(cmd_scan_rate_threads());
     registry.register(cmd_scan_once_queue_show());
     registry.register(cmd_callback_set_queue_size());
     registry.register(cmd_callback_queue_show());
@@ -47,8 +48,11 @@ const SCAN_ONCE_NOT_INIT: &str =
     "scanOnce system not initialized, yet. Please run iocInit before using this command.";
 
 /// C `scanParallelThreads`'s refusal and its two clamp reports
-/// (`dbScan.c:289`, `:298-299`, `:304-305`).
+/// (`dbScan.c:302`, `:311-312`, `:320-321`).
 const SCAN_PARALLEL_ALREADY_INIT: &str = "scanParallelThreads: scan system already initialized";
+
+/// C `scanRateThreads`'s refusal (`dbScan.c:335`).
+const SCAN_RATE_ALREADY_INIT: &str = "scanRateThreads: scan system already initialized";
 
 /// C `callbackSetQueueSize`'s two diagnostics (`callback.c:103`, `:107`).
 const QUEUE_SIZE_MUST_BE_POSITIVE: &str = "Queue size must be positive";
@@ -83,6 +87,15 @@ fn ival(args: &[ArgValue], index: usize) -> i64 {
     match args.get(index) {
         Some(ArgValue::Int(n)) => *n,
         _ => 0,
+    }
+}
+
+/// The same for an `iocshArgString`: C's `args[n].sval` is NULL when the
+/// argument was omitted, and `scanRateThreads` prints `''` for it.
+fn sval(args: &[ArgValue], index: usize) -> &str {
+    match args.get(index) {
+        Some(ArgValue::String(s)) => s.as_str(),
+        _ => "",
     }
 }
 
@@ -144,13 +157,17 @@ fn cmd_scan_once_set_queue_size() -> CommandDef {
 }
 
 /// `scanParallelThreads <count> <reserve>` — C `scanParallelThreads`
-/// (`dbScan.c:286-321`), registered with `iocshSetError`
-/// (`dbIocRegister.c:666`), so its refusal fails the line.
+/// (`dbScan.c:289-315`), registered with `iocshSetError`
+/// (`dbIocRegister.c:667`), so its refusal fails the line.
 ///
 /// The count arithmetic is C's, and it differs from
 /// `callbackParallelThreads`' in its floor: a resolved count of zero is a
 /// valid answer there — no helpers, which is what every IOC that never calls
 /// this runs — where a callback band floors at one worker.
+///
+/// The reserve is how many helpers the pool keeps off the slower rates, and
+/// its zero is not "none": zero selects the default of one, and only a
+/// negative argument asks for none.
 fn cmd_scan_parallel_threads() -> CommandDef {
     CommandDef::new(
         "scanParallelThreads",
@@ -160,14 +177,15 @@ fn cmd_scan_parallel_threads() -> CommandDef {
                 arg_type: ArgType::Int,
             },
             ArgDesc {
-                name: "reserved for fastest rate",
+                name: "kept off slower rates",
                 arg_type: ArgType::Int,
             },
         ],
-        "scanParallelThreads <no of threads> <reserved for fastest rate> — Configure helper \
-         threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault, a \
-         negative count leaves that many CPUs without a helper. The second argument reserves \
-         that many helpers for the fastest rate.",
+        "scanParallelThreads <no of threads> <kept off slower rates> — Configure helper \
+         threads shared by all periodic scan rates. 0 uses scanParallelThreadsDefault (at \
+         most CPUs - 1), a negative count leaves that many CPUs without a helper. The \
+         second argument keeps that many helpers off the slower rates (0: one, negative: \
+         none).",
         |args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::scan;
             if scan::periodic_lists_built() {
@@ -181,7 +199,13 @@ fn cmd_scan_parallel_threads() -> CommandDef {
             let mut count = if asked < 0 {
                 crate::runtime::background::callback_executor::cpu_count() as i64 + asked
             } else if asked == 0 {
-                scan::parallel_threads_default() as i64
+                // C `dbScan.c:307-314`: the default leaves one CPU to the
+                // leaders, so on a single CPU it asks for no helper at all —
+                // one there could only take turns with the thread it is
+                // helping. The `.max(0)` below is C's own `count < 0` clamp.
+                let leaders_cpu =
+                    crate::runtime::background::callback_executor::cpu_count() as i64 - 1;
+                (scan::parallel_threads_default() as i64).min(leaders_cpu)
             } else {
                 asked
             }
@@ -193,7 +217,14 @@ fn cmd_scan_parallel_threads() -> CommandDef {
                 ));
                 count = scan::MAX_PARALLEL_THREADS as i64;
             }
-            let mut reserve = ival(args, 1).max(0);
+            // C `dbScan.c:303-306`: zero is the default of one helper kept
+            // off the slower rates, negative is none.
+            let asked_reserve = ival(args, 1);
+            let mut reserve = match asked_reserve {
+                0 => 1,
+                r if r < 0 => 0,
+                r => r,
+            };
             if reserve > count {
                 ctx.eprintln(&format!(
                     "scanParallelThreads: clamping reserve {reserve} to {count}"
@@ -201,6 +232,62 @@ fn cmd_scan_parallel_threads() -> CommandDef {
                 reserve = count;
             }
             scan::set_parallel_threads(count as i32, reserve as i32);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `scanRateThreads <rate> <count>` — C `scanRateThreads`
+/// (`dbScan.c:329-355`), registered with `iocshSetError`
+/// (`dbIocRegister.c:668`).
+///
+/// Helpers that serve one periodic rate and no other, at that rate's band, so
+/// every pass of it is shared by the same workers whatever the other rates are
+/// doing. They are not under the `scanParallelThreads` reserve, and may be
+/// combined with a pool.
+///
+/// C refuses an unknown rate by walking `menuScan`'s choices from
+/// `SCAN_1ST_PERIODIC` up, so a non-periodic choice (`Passive`, `Event`,
+/// `I/O Intr`) is as unknown as a misspelling. C also refuses when no `.dbd`
+/// has been loaded; here the stock `menuScan` is always resolvable, which
+/// leaves the unknown-rate refusal as the only one, and the lookup is the
+/// non-freezing [`crate::server::record::menu_scan::pending_index_of`] so that
+/// naming a rate does not close the door on a later `menu(menuScan)`.
+fn cmd_scan_rate_threads() -> CommandDef {
+    CommandDef::new(
+        "scanRateThreads",
+        vec![
+            ArgDesc {
+                name: "SCAN rate",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "no of threads",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "scanRateThreads <SCAN rate> <no of threads> — Add helper threads that process \
+         records of one periodic SCAN rate only, at that rate's priority.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            use crate::server::record::menu_scan::{SCAN_1ST_PERIODIC, pending_index_of};
+            if crate::server::scan::periodic_lists_built() {
+                ctx.eprintln(SCAN_RATE_ALREADY_INIT);
+                return Ok(CommandOutcome::Failed);
+            }
+            let rate = sval(args, 0);
+            let Some(ind) = pending_index_of(rate)
+                .filter(|index| *index >= SCAN_1ST_PERIODIC)
+                .map(|index| (index - SCAN_1ST_PERIODIC) as usize)
+                .filter(|ind| *ind < crate::server::scan::MAX_PARALLEL_THREADS)
+            else {
+                ctx.eprintln(&format!(
+                    "scanRateThreads: '{rate}' is not a periodic SCAN rate"
+                ));
+                return Ok(CommandOutcome::Failed);
+            };
+            // C `if (count < 0) count = 0` (`dbScan.c:352`); the store floors
+            // it, so there is one place that decides what a negative means.
+            crate::server::scan::set_rate_threads(ind, ival(args, 1) as i32);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -427,10 +514,12 @@ mod tests {
         );
     }
 
-    /// C `scanParallelThreads`' count arithmetic (`dbScan.c:293-310`), which
+    /// C `scanParallelThreads`' count arithmetic (`dbScan.c:293-311`), which
     /// differs from `callbackParallelThreads`' in both ends: it floors at 0
     /// rather than 1 — no helpers is the state every IOC that never calls it
-    /// runs in — and it has a ceiling, the width of the pool's masks.
+    /// runs in — and it has a ceiling, the width of the pool's masks. The
+    /// reserve's own arithmetic has the opposite shape: its zero is the
+    /// default of one, and only a negative argument means none.
     #[test]
     #[serial_test::serial(scan_parallel)]
     fn scan_parallel_threads_resolves_its_count_the_way_c_does() {
@@ -442,11 +531,18 @@ mod tests {
         assert!(!failed && err.is_empty(), "a plain count: {err:?}");
         assert_eq!(scan::parallel_threads(), (3, 1));
 
-        // Zero is the knob, which C declares 2 and leaves there.
+        // Zero is the knob, which C declares 8 and leaves there — but capped
+        // at one less than the CPU count (`dbScan.c:307-314`), so the knob's
+        // value is what a box with enough CPUs gets and no box gets a helper
+        // per CPU. A single-CPU box resolves zero to no helper at all.
         let (_, _, failed) = run(&ctx, "scanParallelThreads", &["0", "0"]);
         assert!(!failed);
-        assert_eq!(scan::parallel_threads().0, scan::parallel_threads_default());
-        assert_eq!(scan::parallel_threads_default(), 2);
+        assert_eq!(scan::parallel_threads_default(), 8);
+        assert_eq!(
+            scan::parallel_threads().0,
+            scan::parallel_threads_default().min(cpus - 1).max(0),
+            "the default is capped at CPUs - 1 ({cpus} CPUs here)"
+        );
 
         // Negative leaves that many CPUs without a helper, and never goes
         // below none at all. C applies the ceiling after this arithmetic, not
@@ -495,13 +591,36 @@ mod tests {
             "{err:?}"
         );
 
+        // BOUNDARY: the reserve's zero and its negative arm
+        // (`dbScan.c:303-306`). Zero is one helper kept off the slower rates,
+        // not none; none takes a negative argument.
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["4", "0"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::parallel_threads(), (4, 1));
+        let (_, err, failed) = run(&ctx, "scanParallelThreads", &["4", "-1"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::parallel_threads(), (4, 0));
+        // BOUNDARY: and that default is clamped like any other reserve, so a
+        // resolved count of none reports the one helper it cannot keep.
+        let (_, err, failed) = run(
+            &ctx,
+            "scanParallelThreads",
+            &[&format!("-{}", cpus + 7), "0"],
+        );
+        assert!(!failed);
+        assert_eq!(scan::parallel_threads(), (0, 0));
+        assert!(
+            err.contains("scanParallelThreads: clamping reserve 1 to 0"),
+            "{err:?}"
+        );
+
         scan::set_parallel_threads(0, 0);
     }
 
-    /// C's `if (papPeriodic)` (`dbScan.c:288-292`): the helper count is a
-    /// pre-`iocInit` knob, because `spawnHelpers` reads it once. Driven
-    /// through a real scan facility rather than a flag, since the gate's whole
-    /// content is "the lists exist".
+    /// C's `if (papPeriodic)` (`dbScan.c:301-304`, `:334-337`): a helper
+    /// count is a pre-`iocInit` knob, because `spawnHelpers` reads both of
+    /// them once. Driven through a real scan facility rather than a flag,
+    /// since the gate's whole content is "the lists exist".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(scan_parallel)]
     async fn scan_parallel_threads_is_refused_once_the_scan_system_is_up() {
@@ -513,6 +632,8 @@ mod tests {
         );
 
         let (_, err, failed) = run(&ctx, "scanParallelThreads", &["2", "1"]);
+        assert!(!failed && err.is_empty(), "before iocInit: {err:?}");
+        let (_, err, failed) = run(&ctx, "scanRateThreads", &["1 second", "1"]);
         assert!(!failed && err.is_empty(), "before iocInit: {err:?}");
 
         let owner = scan::ScanOwner::start(Arc::clone(&db));
@@ -537,8 +658,66 @@ mod tests {
             "a refused line must not have stored its count"
         );
 
+        let (_, err, failed) = run(&ctx, "scanRateThreads", &["1 second", "4"]);
+        assert!(failed, "the same gate guards the per-rate count");
+        assert!(err.contains(SCAN_RATE_ALREADY_INIT), "{err:?}");
+        let rate = periodic_offset("1 second");
+        assert_eq!(
+            scan::rate_threads().get(rate).copied(),
+            Some(1),
+            "a refused line must not have stored its count"
+        );
+
         drop(owner);
         scan::set_parallel_threads(0, 0);
+        scan::set_rate_threads(rate, 0);
+    }
+
+    /// The rate offset a choice string names — what `scanRateThreads` keys
+    /// its count by, and what the pool indexes its passes by.
+    fn periodic_offset(rate: &str) -> usize {
+        use crate::server::record::menu_scan::{SCAN_1ST_PERIODIC, pending_index_of};
+        (pending_index_of(rate).expect("a menuScan choice") - SCAN_1ST_PERIODIC) as usize
+    }
+
+    /// C `scanRateThreads` (`dbScan.c:329-355`): the rate has to be a
+    /// *periodic* `menuScan` choice, and a negative count is none.
+    #[test]
+    #[serial_test::serial(scan_parallel)]
+    fn scan_rate_threads_takes_a_periodic_choice_and_nothing_else() {
+        use crate::server::scan;
+        let ctx = make_ctx();
+        let fast = periodic_offset(".1 second");
+        let slow = periodic_offset("1 second");
+
+        let (_, err, failed) = run(&ctx, "scanRateThreads", &[".1 second", "2"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::rate_threads().get(fast).copied(), Some(2));
+
+        // BOUNDARY: the three choices below `SCAN_1ST_PERIODIC` are as
+        // unknown as a misspelling — C walks the choices from there up, so a
+        // real menu entry that is not a rate gets the same refusal. An
+        // omitted argument reaches the handler as the empty string, which C
+        // prints as `''` for the same reason.
+        for rate in ["Passive", "Event", "I/O Intr", "sometimes", ""] {
+            let (_, err, failed) = run(&ctx, "scanRateThreads", &[rate, "1"]);
+            assert!(failed, "`{rate}` was accepted as a rate");
+            assert!(
+                err.contains(&format!(
+                    "scanRateThreads: '{rate}' is not a periodic SCAN rate"
+                )),
+                "{err:?}"
+            );
+        }
+
+        // BOUNDARY: negative is none. Unlike `scanParallelThreads`' count
+        // there is no CPU-relative arm, so `-3` is not `cpus - 3`.
+        let (_, err, failed) = run(&ctx, "scanRateThreads", &["1 second", "-3"]);
+        assert!(!failed && err.is_empty(), "{err:?}");
+        assert_eq!(scan::rate_threads().get(slow).copied(), Some(0));
+
+        scan::set_rate_threads(fast, 0);
+        scan::set_rate_threads(slow, 0);
     }
 
     /// C's `%8s  %15d  %10d  %6d  %6.1f  %11d` with a percentage the

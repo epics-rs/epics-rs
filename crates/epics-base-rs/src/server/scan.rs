@@ -1,14 +1,16 @@
-// RTEMS-EXEC-MODEL-ALLOW(12): the teardown test drives the scheduler from a
+// RTEMS-EXEC-MODEL-ALLOW(16): the teardown test drives the scheduler from a
 // tokio task (spawn/abort are its cancellation instrument) and the seven
 // ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
 // tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
 // the tokio test runtime only as the start-context `ScanOwner::start`
 // requires; the scan/owner threads under test go through the exec seam
-// (`block_on_sync` → `park_on`) when the exec backend is on. The four
-// parallel-pass tests (PHAS order, no-helper walk, reserved helper, and the
-// config gate) want a runtime only for the `.await` that loads their records —
-// the leader and its helpers are `MandatoryThread`s either way. All twelve
-// verified passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+// (`block_on_sync` → `park_on`) when the exec backend is on. The
+// eight parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
+// cap boundaries, the two dedicated-helper boundaries, the idle-band boundary,
+// and the config gate) want a runtime only for the `.await` that loads their
+// records — the leader and its helpers are `MandatoryThread`s either way. All
+// sixteen verified passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -302,6 +304,57 @@ struct OverrunTracker {
     over_max: f64,
     report_delay: f64,
     reported: Instant,
+    /// Which remedy the report names. Resolved once, when the tracker is
+    /// built: both facts C reads at print time are already settled by then.
+    remedy: Remedy,
+}
+
+/// What the over-run report tells the operator to do about it — C builds the
+/// tail of the message from `nHelpers` and `epicsThreadGetCPUs()` at the point
+/// it prints (`dbScan.c:988-993`).
+///
+/// One state rather than the two booleans C tests in sequence: the three tails
+/// are mutually exclusive, both inputs are fixed once `spawnHelpers` has run,
+/// and a tracker that stored them separately would invite a site to test the
+/// CPU count on an IOC that already has helpers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Remedy {
+    /// Helpers exist, so one more — or one dedicated to this rate — is the
+    /// thing to add.
+    MoreHelpers,
+    /// No helper yet, and a CPU free to run one.
+    FirstHelper,
+    /// A single CPU: a helper there could only take turns with this thread,
+    /// so the report names no helper at all.
+    NoHelperWouldHelp,
+}
+
+impl Remedy {
+    /// The state of an IOC whose helper pool `helpers` says exists.
+    fn for_ioc(helpers: bool) -> Self {
+        if helpers {
+            Self::MoreHelpers
+        } else if crate::runtime::background::callback_executor::cpu_count() > 1 {
+            Self::FirstHelper
+        } else {
+            Self::NoHelperWouldHelp
+        }
+    }
+
+    /// The tail C appends to "move some records to a slower scan rate".
+    fn tail(self) -> &'static str {
+        match self {
+            Self::MoreHelpers => {
+                ",\n\tor add helper threads with scanParallelThreads() or \
+                 scanRateThreads() before iocInit."
+            }
+            Self::FirstHelper => {
+                ",\n\tor add helper threads with scanParallelThreads() before \
+                 iocInit."
+            }
+            Self::NoHelperWouldHelp => ".",
+        }
+    }
 }
 
 impl OverrunTracker {
@@ -314,7 +367,7 @@ impl OverrunTracker {
         }
     }
 
-    fn new(scan: ScanType, period: Duration, start: Instant) -> Self {
+    fn new(scan: ScanType, period: Duration, start: Instant, remedy: Remedy) -> Self {
         Self {
             scan,
             period,
@@ -325,6 +378,7 @@ impl OverrunTracker {
             over_max: 0.0,
             report_delay: OVERRUN_REPORT_DELAY,
             reported: start,
+            remedy,
         }
     }
 
@@ -363,11 +417,12 @@ impl OverrunTracker {
             if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
                 let period = self.period.as_secs_f64();
                 let scan = self.scan;
+                let remedy = self.remedy.tail();
                 let msg = format!(
                     "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
                  averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
                  happened {} times in a row.\n\tTo fix this, move some records \
-                 to a slower scan rate.\n",
+                 to a slower scan rate{remedy}\n",
                     crate::runtime::log::erl_warning(),
                     period + self.overtime / f64::from(self.consecutive),
                     period + self.over_min,
@@ -434,8 +489,10 @@ const fn sp_gen(word: usize) -> usize {
     word >> SP_IDX_BITS
 }
 
-/// How many helpers one pool can hold — C `MAX_PARALLEL_THREADS` (`dbScan.c:157`):
-/// the pool's masks carry one bit per helper, and one bit per rate, in a word.
+/// How many helpers one pool can hold — C `SP_MAX_HELPERS` (`dbScan.c:164`): a
+/// word's worth, which is also the width of the one-bit-per-rate `wanted`
+/// mask. C spells the second use `SP_MAX_PERIODS` (`:165`) and defines it as
+/// the first, so there is one number and two diagnostics that print it.
 ///
 /// `pub(crate)` because the clamp C prints from inside
 /// `scanParallelThreads` is printed by the iocsh command here, which has to
@@ -671,10 +728,19 @@ fn periodic_pass(db: &PvDatabase, duty: &PeriodicDuty) {
         }
         if let Some(pool) = &duty.pool {
             // One slot of the group is the leader's own, so the group wants
-            // help for the rest of them and for no more than that.
+            // help for the rest of them and for no more than that — and, for
+            // any rate but the one the pool keeps helpers free for, no more
+            // than its own dedicated helpers plus the room the cap still has
+            // (`dbScan.c:1271-1286`). The want bit goes up regardless, so a
+            // helper already awake and walking the rates still finds this
+            // group.
             if end - start > 1 {
+                let mut want = end - start - 1;
+                if duty.ind != pool.fast_rate {
+                    want = want.min(pool.slow_room() + pool.dedicated[duty.ind]);
+                }
                 pool.want(duty.ind);
-                pool.wake(end - start - 1, duty.ind);
+                pool.wake(want, duty.ind);
             }
         }
 
@@ -689,17 +755,48 @@ fn periodic_pass(db: &PvDatabase, duty: &PeriodicDuty) {
     }
 }
 
-/// One pooled helper — C `scan_helper` (`dbScan.c:150-156`).
+/// Which rates one helper may take work from — C `scan_helper::serves`
+/// (`dbScan.c:161`), a mask whose all-ones value `SP_ALL` (`:166`) is what C
+/// tests to tell the two kinds of helper apart.
+///
+/// Named variants rather than that sentinel: "serves every rate" and "is a
+/// pool helper, and so subject to the slow-rate cap" are one fact, and a mask
+/// that carries both invites a site to test the wrong one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serves {
+    /// Every rate, under [`HelperPool::slow_cap`] — a `scanParallelThreads`
+    /// helper.
+    Pool,
+    /// This rate and no other, at its band — a `scanRateThreads` helper.
+    Rate(usize),
+}
+
+impl Serves {
+    /// C's bitmask form, which `helpWanted` is masked with and which
+    /// `run_slots` narrows its faster-rate break to.
+    fn mask(self) -> usize {
+        match self {
+            Self::Pool => usize::MAX,
+            Self::Rate(ind) => 1usize << ind,
+        }
+    }
+
+    /// C `me->serves == SP_ALL` (`dbScan.c:1302`).
+    fn is_pool(self) -> bool {
+        self == Self::Pool
+    }
+}
+
+/// One helper — C `scan_helper` (`dbScan.c:157-162`).
 struct Helper {
-    /// C `scan_helper::wake` (`dbScan.c:151`).
+    /// C `scan_helper::wake` (`dbScan.c:158`).
     wake: Event,
-    /// The rates this helper may take work from — C `scan_helper::serves`
-    /// (`dbScan.c:154`). A reserved helper serves one rate and no other.
-    serves: usize,
+    /// C `scan_helper::serves` (`dbScan.c:161`).
+    serves: Serves,
 }
 
 /// The pool of helper threads, shared by every rate — C's `helpers[]`,
-/// `helpWanted` and `helperShutdown` file statics (`dbScan.c:150-168`).
+/// `helpWanted` and `helperShutdown` file statics (`dbScan.c:151-169`).
 ///
 /// A leader that opens a group sets its bit in [`Self::wanted`] and wakes as
 /// many sleeping helpers as the group has slots beyond its own. A helper
@@ -707,48 +804,95 @@ struct Helper {
 /// record at a time, and looks for a faster rate after each. Leaders never
 /// depend on a helper for progress: a leader runs the whole group itself if no
 /// helper ever arrives.
+///
+/// # What the reserve keeps free
+///
+/// Every pool helper may enter every rate. What the reserve buys is a ceiling:
+/// at most [`Self::slow_cap`] of them are inside a rate other than
+/// [`Self::fast_rate`] at the same time, so a pass of that rate always finds
+/// the rest of the pool idle — whichever helpers those turn out to be.
+///
+/// # The other kind
+///
+/// A `scanRateThreads` helper serves one rate and no other, at that rate's
+/// band, so every pass of that rate gets the same workers however busy the
+/// other rates are — the deterministic choice for an RT IOC, and the reason
+/// the cap above does not apply to it. Both kinds may exist at once
+/// (`dbScan.c:146-155`).
 struct HelperPool {
-    /// C `helpWanted` (`dbScan.c:166`): one bit per rate with a group open
+    /// C `helpWanted` (`dbScan.c:179`): one bit per rate with a group open
     /// that a helper may still claim from.
     wanted: AtomicUsize,
-    /// C `helperShutdown` (`dbScan.c:168`), owned by [`HelperStopGuard`].
+    /// C `helperShutdown` (`dbScan.c:181`), owned by [`HelperStopGuard`].
     shutdown: AtomicBool,
-    /// One per helper, in the order they were spawned — C `helpers[]`
-    /// (`dbScan.c:163`).
+    /// The rate helpers are kept free for: the fastest one with records when
+    /// the pool was built, else the fastest there is — C `fastPeriod`
+    /// (`dbScan.c:176`).
+    fast_rate: usize,
+    /// How many pool helpers may be inside a rate other than
+    /// [`Self::fast_rate`] at one time — C `slowCap` (`dbScan.c:177`).
+    slow_cap: usize,
+    /// How many are, right now — C `slowBusy` (`dbScan.c:178`). [`SlowSlot`]
+    /// is the only writer.
+    slow_busy: AtomicUsize,
+    /// Helpers serving only this rate, per rate — C `nDedicated`
+    /// (`dbScan.c:175`). A leader adds its own to what the cap allows, since
+    /// they are not under the cap.
+    dedicated: Box<[usize]>,
+    /// One per helper, dedicated ones first — C `helpers[]` (`dbScan.c:173`).
+    ///
+    /// That order is load-bearing: [`Self::wake`] walks it from the front, so
+    /// a rate with its own helpers reaches them before it reaches the pool.
     helpers: Box<[Helper]>,
     /// Every rate's pass, indexed by the rate's offset — C `papPeriodic`
     /// (`dbScan.c:102`), which `helperTask` indexes the same way.
     passes: Box<[Arc<PeriodicPass>]>,
 }
 
+/// One pool helper's admission to a rate other than
+/// [`HelperPool::fast_rate`] — C's `slowBusy` increment and the decrement
+/// that matches it (`dbScan.c:1323-1337`).
+///
+/// A guard, and the only writer of either half, because the two have to stay
+/// paired on every way out of the record: an increment left behind would take
+/// a helper off the fast rate's ceiling for the life of the IOC.
+struct SlowSlot<'a>(&'a HelperPool);
+
+impl Drop for SlowSlot<'_> {
+    fn drop(&mut self) {
+        self.0.slow_busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl HelperPool {
-    /// C `maskSet(&helpWanted, mybit)` (`dbScan.c:1226`).
+    /// C `maskSet(&helpWanted, mybit)` (`dbScan.c:1285`).
     fn want(&self, ind: usize) {
         self.wanted.fetch_or(1usize << ind, Ordering::AcqRel);
     }
 
-    /// C `maskClear(&helpWanted, mybit)` (`dbScan.c:1236`).
+    /// C `maskClear(&helpWanted, mybit)` (`dbScan.c:1293`).
     fn unwant(&self, ind: usize) {
         self.wanted.fetch_and(!(1usize << ind), Ordering::AcqRel);
     }
 
-    /// Wake up to `want` helpers that may serve rate `ind` — C `wakeHelpers`
-    /// (`dbScan.c:1138-1152`).
+    /// Wake up to `want` sleeping helpers that serve rate `ind` — C
+    /// `wakeHelpers` (`dbScan.c:1191-1205`), whose `eligible` argument is
+    /// `periodHelpers[ind]` (`:1286`).
     ///
     /// C picks sleeping helpers out of a `helperSleepers` bitmask and claims
     /// each with a compare-and-swap, so two leaders cannot count the same
     /// helper twice and a helper that is already working is not woken for
     /// nothing. [`Event::signal_if_parked`] *is* that claim — it answers
     /// whether this call took the helper out of its sleep — so the port needs
-    /// neither the mask nor its CAS loop, and the one place a helper's
-    /// eligibility is written is its own [`Helper::serves`].
+    /// neither the mask nor its CAS loop, and `periodHelpers` is read off
+    /// each helper's own [`Helper::serves`] instead of cached per rate.
     fn wake(&self, mut want: usize, ind: usize) {
         let bit = 1usize << ind;
         for helper in &self.helpers {
             if want == 0 {
                 return;
             }
-            if helper.serves & bit == 0 {
+            if helper.serves.mask() & bit == 0 {
                 continue;
             }
             if helper.wake.signal_if_parked() == Signalled::Claimed {
@@ -757,19 +901,71 @@ impl HelperPool {
         }
     }
 
-    /// The fastest rate `serves` may take work from that has a slot to claim —
-    /// C `helperTask`'s inner loop (`dbScan.c:1257-1275`).
-    fn pick(&self, serves: usize) -> Option<usize> {
-        let wanted = self.wanted.load(Ordering::Acquire) & serves;
-        // Fastest rate first, which is the last one: `periodic_scans()` is
-        // slowest-first.
+    /// How many more pool helpers may enter a rate other than
+    /// [`Self::fast_rate`] — half of what a leader of such a rate caps its
+    /// wake-up count by (`dbScan.c:1277-1283`), the other half being that
+    /// rate's own [`Self::dedicated`] helpers.
+    fn slow_room(&self) -> usize {
+        self.slow_cap
+            .saturating_sub(self.slow_busy.load(Ordering::Acquire))
+    }
+
+    /// The rates `serves` may take work from that still have a slot to claim,
+    /// fastest first — C `helperTask`'s inner loop (`dbScan.c:1314-1322`).
+    ///
+    /// Fastest is last: `periodic_scans()` is slowest-first.
+    fn offered(&self, serves: Serves) -> impl Iterator<Item = usize> + '_ {
+        let wanted = self.wanted.load(Ordering::Acquire) & serves.mask();
         (0..self.passes.len())
             .rev()
-            .find(|ind| wanted & (1usize << ind) != 0 && self.passes[*ind].has_work())
+            .filter(move |ind| wanted & (1usize << ind) != 0)
+            .filter(|ind| self.passes[*ind].has_work())
+    }
+
+    /// The fastest offered rate this helper may enter, with the [`SlowSlot`]
+    /// that let it in — C `helperTask`'s admission (`dbScan.c:1323-1328`).
+    ///
+    /// A dedicated helper needs no admission: it is not under the cap, and the
+    /// only rate it is offered is its own. For a pool helper the answer is
+    /// `None` when nothing is offered, and when every offer is a slower rate
+    /// whose cap is taken. A refused admission moves on to the next rate
+    /// rather than giving up, because an offer from a rate *faster* than
+    /// [`Self::fast_rate`] — one that had no records when the pool was built —
+    /// comes first in this walk.
+    fn take_work(&self, serves: Serves) -> Option<(usize, Option<SlowSlot<'_>>)> {
+        for ind in self.offered(serves) {
+            if ind == self.fast_rate || !serves.is_pool() {
+                return Some((ind, None));
+            }
+            if let Some(slot) = self.enter_slow() {
+                return Some((ind, Some(slot)));
+            }
+        }
+        None
+    }
+
+    /// Take one of the [`Self::slow_cap`] places, or give it straight back —
+    /// C's increment and its back-out (`dbScan.c:1323-1327`).
+    fn enter_slow(&self) -> Option<SlowSlot<'_>> {
+        // Built before the test, so the back-out is the same `Drop` as an
+        // ordinary exit rather than a second decrement site.
+        let slot = SlowSlot(self);
+        if self.slow_busy.fetch_add(1, Ordering::AcqRel) < self.slow_cap {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// What [`Self::take_work`] would answer, without taking an admission —
+    /// the condition a parked helper re-tests.
+    fn offers_work(&self, serves: Serves) -> bool {
+        self.offered(serves)
+            .any(|ind| ind == self.fast_rate || !serves.is_pool() || self.slow_room() > 0)
     }
 }
 
-/// One helper thread's body — C `helperTask` (`dbScan.c:1242-1283`).
+/// One helper thread's body — C `helperTask` (`dbScan.c:1298-1348`).
 ///
 /// C announces its sleep in `helperSleepers`, looks for work a second time,
 /// and only then waits on its event, so a leader that publishes between the
@@ -777,22 +973,37 @@ impl HelperPool {
 /// [`EventWaiter::wait_until`](crate::runtime::sync::EventWaiter::wait_until)
 /// is that construction
 /// — announce, poll, park — so the second look here is the condition itself.
-fn helper_loop(db: Arc<PvDatabase>, pool: Arc<HelperPool>, me: usize, driver: TickDriver) {
-    // C `taskwdInsert(0, NULL, NULL)` (`dbScan.c:1247`): a helper is monitored
+///
+/// `sleep_band` is the band this helper waits at, which is also the band it
+/// was spawned at: C seeds its `sleepPrio` from `epicsThreadGetPrioritySelf`
+/// (`dbScan.c:1303`). For a dedicated helper that is already its rate's band,
+/// so it never rebands at all; a pool helper lowers itself to each rate it
+/// serves and comes back up here before it parks.
+fn helper_loop(
+    db: Arc<PvDatabase>,
+    pool: Arc<HelperPool>,
+    me: usize,
+    driver: TickDriver,
+    sleep_band: ThreadPriority,
+) {
+    // C `taskwdInsert(0, NULL, NULL)` (`dbScan.c:1306`): a helper is monitored
     // but promises nothing, because an idle pool is the normal state and a
     // helper inside a long record owes no check-in either.
     let watched = taskwd_insert(format!("scanHelper{me}"), CheckIn::Unbounded, None);
     let helper = &pool.helpers[me];
+    let serves = helper.serves;
     let waiter = helper.wake.waiter();
-    let mut band = ThreadPriority::ScanLow;
+    // The band it is in now, which starts as the band it was born at. C's
+    // `prio`, against its `sleepPrio` (`dbScan.c:1311-1316`).
+    let mut band = sleep_band;
     while !pool.shutdown.load(Ordering::Acquire) {
         watched.check_in();
-        match pool.pick(helper.serves) {
-            Some(ind) => {
+        match pool.take_work(serves) {
+            Some((ind, slow)) => {
                 let pass = &pool.passes[ind];
                 if band != pass.prio {
                     band = pass.prio;
-                    // C `epicsThreadSetPriority` (`dbScan.c:1269-1272`): a
+                    // C `epicsThreadSetPriority` (`dbScan.c:1331-1334`): a
                     // helper carries the band of the rate it serves, or a
                     // fast rate's records would be processed at a slow rate's
                     // priority. `reband_current_thread` is that call, and it
@@ -807,24 +1018,44 @@ fn helper_loop(db: Arc<PvDatabase>, pool: Arc<HelperPool>, me: usize, driver: Ti
                         pass,
                         &SlotRunner::Helper {
                             wanted: &pool.wanted,
-                            faster: faster_than(ind),
+                            // C `runSlots(ppsl, me->serves)`, where the break
+                            // mask is `serves & faster` (`dbScan.c:1171`): a
+                            // dedicated helper has no faster rate to leave
+                            // for, so it finishes the group it is in.
+                            faster: serves.mask() & faster_than(ind),
                         },
                     );
                 });
+                // Given back here and not before — C decrements `slowBusy`
+                // after `runSlots` returns (`dbScan.c:1336-1337`), so a helper
+                // counts against the cap for as long as it is inside the rate.
+                drop(slow);
             }
-            None => waiter.wait_until(|| {
-                pool.shutdown.load(Ordering::Acquire) || pool.pick(helper.serves).is_some()
-            }),
+            None => {
+                // C `dbScan.c:1358-1361`, immediately before the wait: a
+                // helper sleeps at the band its wake-up needs, which for a
+                // pool helper is above every leader it may have to preempt.
+                // Leaving it at the band of the rate it last served would
+                // make the next wake-up wait for whatever is running.
+                if band != sleep_band {
+                    band = sleep_band;
+                    crate::runtime::task::reband_current_thread(band);
+                }
+                waiter.wait_until(|| {
+                    pool.shutdown.load(Ordering::Acquire) || pool.offers_work(serves)
+                })
+            }
         }
     }
 }
 
-/// Build the pool and spawn it — C `spawnHelpers` (`dbScan.c:1285-1325`),
+/// Build the pool and spawn it — C `spawnHelpers` (`dbScan.c:1352-1432`),
 /// which `scanInit` calls before the first `spawnPeriodic` so a leader cannot
 /// open a group before there is a pool to wake.
 ///
-/// `None` when no helpers were configured, and when there are more rates than
-/// a mask has bits for.
+/// `rate_helpers` is `scanRateThreads`' per-rate count, indexed like `passes`;
+/// `configured` is the shared pool's. `None` when neither asked for a helper,
+/// and when there are more rates than a mask has bits for.
 fn spawn_helpers(
     db: &Arc<PvDatabase>,
     passes: Box<[Arc<PeriodicPass>]>,
@@ -832,13 +1063,26 @@ fn spawn_helpers(
     driver: &TickDriver,
     configured: usize,
     configured_reserve: usize,
+    rate_helpers: &[usize],
 ) -> Option<Arc<HelperPool>> {
-    if configured == 0 {
+    if passes.is_empty() {
+        // A site `menuScan` may carry only the three fixed choices, and then
+        // there is no periodic pass for a helper to join. C does not test for
+        // it and indexes `papPeriodic[nPeriodic - 1]` regardless
+        // (`dbScan.c:1436`); the bound below is what makes that index sound
+        // here rather than a fallback at the use site.
         return None;
     }
+    let dedicated: Vec<usize> = (0..passes.len())
+        .map(|ind| rate_helpers.get(ind).copied().unwrap_or(0))
+        .collect();
+    let n_rate: usize = dedicated.iter().sum();
     // The mask width is this module's invariant, not the caller's: one bit per
-    // helper, one bit per rate, in one word.
-    let count = configured.min(MAX_PARALLEL_THREADS);
+    // rate, in one word.
+    let mut n_pool = configured.min(MAX_PARALLEL_THREADS);
+    if n_pool + n_rate == 0 {
+        return None;
+    }
     if passes.len() > MAX_PARALLEL_THREADS {
         crate::runtime::log::errlog_printf(&format!(
             "scanParallelThreads: {} scan rates exceed the {} the helper pool can serve, \
@@ -848,34 +1092,72 @@ fn spawn_helpers(
         ));
         return None;
     }
+    if n_pool + n_rate > MAX_PARALLEL_THREADS {
+        // C drops pool helpers rather than dedicated ones (`dbScan.c:1366-1375`):
+        // a rate asked for its own by name, the pool is whatever is left over.
+        crate::runtime::log::errlog_printf(&format!(
+            "scanParallelThreads: {} helpers exceed {}, dropping pool helpers\n",
+            n_pool + n_rate,
+            MAX_PARALLEL_THREADS
+        ));
+        n_pool = MAX_PARALLEL_THREADS.saturating_sub(n_rate);
+        if n_pool + n_rate > MAX_PARALLEL_THREADS {
+            return None;
+        }
+    }
 
-    // The reserve serves the fastest rate that has records; with no records
-    // anywhere there is nothing to reserve for. C `dbScan.c:1300-1307`.
-    let reserved_rate = (0..passes.len())
+    // Helpers are kept free for the fastest rate that has records, or for the
+    // fastest rate there is when no list has any yet — C `dbScan.c:1377-1384`.
+    let fast_rate = (0..passes.len())
         .rev()
-        .find(|ind| lengths.get(*ind).copied().unwrap_or(0) > 0);
-    let reserve = match reserved_rate {
-        Some(_) => configured_reserve.min(count),
-        None => 0,
-    };
+        .find(|ind| lengths.get(*ind).copied().unwrap_or(0) > 0)
+        .unwrap_or(passes.len().saturating_sub(1));
+    // C `slowCap = nPool - nReserveConfigured` (`dbScan.c:1386-1387`), where
+    // `scanParallelThreads` has already clamped the reserve to the count.
+    let slow_cap = n_pool.saturating_sub(configured_reserve);
 
-    let helpers = (0..count)
-        .map(|i| Helper {
-            wake: Event::new(),
-            serves: match reserved_rate {
-                Some(rate) if i < reserve => 1usize << rate,
-                _ => usize::MAX,
-            },
+    // Dedicated first, so a leader waking by lowest index reaches its own
+    // before the pool — C `dbScan.c:1398-1412`.
+    let kinds: Vec<Serves> = dedicated
+        .iter()
+        .enumerate()
+        .flat_map(|(ind, n)| std::iter::repeat_n(Serves::Rate(ind), *n))
+        .chain(std::iter::repeat_n(Serves::Pool, n_pool))
+        .collect();
+    let bands: Vec<ThreadPriority> = kinds
+        .iter()
+        .map(|serves| match serves {
+            // C `opts.priority = papPeriodic[lowBit(serves)]->prio`
+            // (`dbScan.c:1419-1421`): a dedicated helper is born at its rate's
+            // band and never leaves it.
+            Serves::Rate(ind) => passes[*ind].prio,
+            // C `opts.priority = papPeriodic[nPeriodic - 1]->prio`
+            // (`dbScan.c:1436`): a pool helper SLEEPS at the fastest rate's
+            // band, not at `ScanLow`, so a wake-up preempts a slower leader
+            // the moment it arrives instead of waiting for every one of them
+            // to finish. It lowers itself to the rate it actually serves in
+            // `helper_loop`, and comes back up here before it parks again.
+            Serves::Pool => passes[passes.len() - 1].prio,
         })
         .collect();
     let pool = Arc::new(HelperPool {
         wanted: AtomicUsize::new(0),
         shutdown: AtomicBool::new(false),
-        helpers,
+        fast_rate,
+        slow_cap,
+        slow_busy: AtomicUsize::new(0),
+        dedicated: dedicated.into_boxed_slice(),
+        helpers: kinds
+            .into_iter()
+            .map(|serves| Helper {
+                wake: Event::new(),
+                serves,
+            })
+            .collect(),
         passes,
     });
 
-    for me in 0..count {
+    for (me, band) in bands.into_iter().enumerate() {
         let db = Arc::clone(db);
         let pool_for_thread = Arc::clone(&pool);
         let driver = driver.clone();
@@ -885,14 +1167,12 @@ fn spawn_helpers(
         // this process dying here.
         MandatoryThread::new(
             format!("scanHelper{me}"),
-            // C `opts.priority = epicsThreadPriorityScanLow`
-            // (`dbScan.c:1317`); the band it ends up at is the rate it serves.
-            ThreadPriority::ScanLow,
-            // C `opts.stackSize = epicsThreadStackBig` (`dbScan.c:1318`).
+            band,
+            // C `opts.stackSize = epicsThreadStackBig` (`dbScan.c:1423`).
             StackSizeClass::Big,
         )
         .spawn(move || {
-            helper_loop(db, pool_for_thread, me, driver);
+            helper_loop(db, pool_for_thread, me, driver, band);
         });
     }
     Some(pool)
@@ -922,17 +1202,27 @@ impl Drop for HelperStopGuard {
     }
 }
 
-/// C `scanParallelThreadsDefault` (`dbScan.c:158`) — what
+/// C `scanParallelThreadsDefault` (`dbScan.c:167`) — what
 /// `scanParallelThreads(0, ...)` resolves to.
 ///
-/// C declares it `2` and, unlike `callbackParallelThreadsDefault`, leaves it
-/// there: no registration phase overwrites it with the processor count.
-static PARALLEL_THREADS_DEFAULT: AtomicI32 = AtomicI32::new(2);
-/// C `nHelpersConfigured` (`dbScan.c:160`) — already resolved and clamped by
+/// C declares it `8` and, unlike `callbackParallelThreadsDefault`, leaves it
+/// there: no registration phase overwrites it with the processor count. It is
+/// what the count resolves to, not a pool that exists — helpers are spawned
+/// only once `scanParallelThreads` has been called at all.
+static PARALLEL_THREADS_DEFAULT: AtomicI32 = AtomicI32::new(8);
+/// C `nHelpersConfigured` (`dbScan.c:169`) — already resolved and clamped by
 /// the `scanParallelThreads` command, as C resolves it inside the function.
 static CONFIGURED_HELPERS: AtomicI32 = AtomicI32::new(0);
-/// C `nReserveConfigured` (`dbScan.c:161`).
+/// C `nReserveConfigured` (`dbScan.c:170`).
 static CONFIGURED_RESERVE: AtomicI32 = AtomicI32::new(0);
+/// C `nRateConfigured` (`dbScan.c:171`) — `scanRateThreads`' per-rate count,
+/// keyed by the rate's offset below `SCAN_1ST_PERIODIC`.
+///
+/// A map where C has an array sized by the mask width: only the rates a
+/// startup script named have an entry, and `scanRateThreads` runs before
+/// `menuScan` freezes, so the ladder's length is not yet a number this can be
+/// sized by.
+static CONFIGURED_RATE_HELPERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 /// C's `papPeriodic` read as the already-initialised gate (`dbScan.c:288`):
 /// non-NULL from `initPeriodic` until `deletePeriodic` frees it. The port has
 /// no array to test for it, so the gate is its own cell, set where the passes
@@ -958,14 +1248,40 @@ pub fn periodic_lists_built() -> bool {
     PERIODIC_LISTS_BUILT.load(Ordering::Acquire)
 }
 
-/// C `scanParallelThreads`'s two stores (`dbScan.c:318-319`), minus the
+/// C `scanParallelThreads`'s two stores (`dbScan.c:324-325`), minus the
 /// arithmetic and the diagnostics around them: the caller owns those, because
 /// C prints them from the same function only because C has nowhere else to put
-/// them. `reserve` is clamped to `count` there, and to the pool's own width
-/// here.
+/// them. `reserve` arrives resolved — zero already turned into the default of
+/// one and negative into none — and clamped to `count`.
 pub fn set_parallel_threads(count: i32, reserve: i32) {
     CONFIGURED_HELPERS.store(count, Ordering::Relaxed);
     CONFIGURED_RESERVE.store(reserve, Ordering::Relaxed);
+}
+
+/// C `scanRateThreads`' one store (`dbScan.c:352-353`), minus the rate-name
+/// lookup and the diagnostics around it — the command owns those, as it owns
+/// `scanParallelThreads`' count arithmetic. `rate` is the offset below
+/// `SCAN_1ST_PERIODIC`, which is how `passes` and `wanted` are indexed too.
+pub fn set_rate_threads(rate: usize, count: i32) {
+    CONFIGURED_RATE_HELPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(rate, count.max(0) as usize);
+}
+
+/// What [`set_rate_threads`] has stored, dense and indexed by rate offset —
+/// what the pool builder reads. Outlives one IOC's lifetime, as C's array
+/// does: the C test configures three IOCs in one process and has to set every
+/// rate on each pass because of it.
+pub fn rate_threads() -> Vec<usize> {
+    let map = CONFIGURED_RATE_HELPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut out = vec![0; map.keys().next_back().map_or(0, |last| last + 1)];
+    for (rate, count) in map.iter() {
+        out[*rate] = *count;
+    }
+    out
 }
 
 /// What [`set_parallel_threads`] last stored.
@@ -1001,7 +1317,12 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         None,
     );
     let mut next = Instant::now() + period;
-    let mut overrun = OverrunTracker::new(scan_type, period, Instant::now());
+    let mut overrun = OverrunTracker::new(
+        scan_type,
+        period,
+        Instant::now(),
+        Remedy::for_ioc(duty.pool.is_some()),
+    );
     loop {
         watched.check_in();
         // Sleep until the deadline or the stop signal, whichever first.
@@ -1134,9 +1455,9 @@ impl ScanScheduler {
             .map(|(ind, scan_type)| Arc::new(PeriodicPass::new(*scan_type, periodic_priority(ind))))
             .collect();
         PERIODIC_LISTS_BUILT.store(true, Ordering::Release);
-        // C `spawnHelpers()` sizes its reserve from `ellCount` of each list
-        // (`dbScan.c:1300-1306`), which at this point is what `buildScanLists`
-        // just put there.
+        // C `spawnHelpers()` picks the rate it keeps helpers free for from
+        // `ellCount` of each list (`dbScan.c:1315-1323`), which at this point
+        // is what `buildScanLists` just put there.
         let lengths: Vec<usize> = scans
             .iter()
             .map(|scan_type| self.db.scan_list_len(*scan_type))
@@ -1151,6 +1472,7 @@ impl ScanScheduler {
             driver,
             CONFIGURED_HELPERS.load(Ordering::Relaxed).max(0) as usize,
             CONFIGURED_RESERVE.load(Ordering::Relaxed).max(0) as usize,
+            &rate_threads(),
         );
         let helper_guard = pool.as_ref().map(|p| HelperStopGuard(Arc::clone(p)));
         for (ind, scan_type) in scans.into_iter().enumerate() {
@@ -1323,10 +1645,17 @@ mod overrun_tests {
     use super::*;
 
     /// Drive `ticks` sweeps that each take `sweep` against a `period` list,
-    /// starting from `base`. Returns every warning the tracker emitted.
-    fn run(period: Duration, sweep: Duration, ticks: u32, base: Instant) -> Vec<String> {
+    /// starting from `base`, on an IOC in the state `remedy` describes.
+    /// Returns every warning the tracker emitted.
+    fn run(
+        period: Duration,
+        sweep: Duration,
+        ticks: u32,
+        base: Instant,
+        remedy: Remedy,
+    ) -> Vec<String> {
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, remedy);
         let mut warnings = Vec::new();
         for i in 1..=ticks {
             let now = base + sweep * i;
@@ -1367,7 +1696,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
         let outcome = tracker.after_scan(&mut next, base + Duration::from_secs(3));
 
@@ -1386,7 +1715,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(10);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
         let now = base + Duration::from_secs(21);
         let outcome = tracker.after_scan(&mut next, now);
@@ -1406,7 +1735,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
         let now = base + Duration::from_secs(2);
         assert!(tracker.after_scan(&mut next, now).overran);
@@ -1424,16 +1753,65 @@ mod overrun_tests {
         let sweep = Duration::from_secs(2);
 
         assert!(
-            run(period, sweep, 9, base).is_empty(),
+            run(period, sweep, 9, base, Remedy::FirstHelper).is_empty(),
             "the ninth consecutive over-run is still silent"
         );
 
-        let warnings = run(period, sweep, 10, base);
+        let warnings = run(period, sweep, 10, base, Remedy::FirstHelper);
         assert_eq!(warnings.len(), 1, "the tenth reports");
         let w = &warnings[0];
         assert!(w.contains("from '1 second' scan thread"), "{w}");
         assert!(w.contains("10 times in a row"), "{w}");
         assert!(w.contains("move some records to a slower scan rate"), "{w}");
+    }
+
+    /// BOUNDARY: each of the three remedies C can name (`dbScan.c:988-993`).
+    /// An IOC with no helpers cannot be told to give a rate its own one,
+    /// because `scanRateThreads` without a pool is not what adds the first
+    /// helper; and an IOC with one CPU is told about no helper at all, because
+    /// one there could only take turns with the thread that is over-running.
+    #[test]
+    fn each_remedy_names_only_what_would_help_this_ioc() {
+        let base = Instant::now();
+        let period = Duration::from_secs(1);
+        let sweep = Duration::from_secs(2);
+        let tail = |remedy| {
+            let warnings = run(period, sweep, 10, base, remedy);
+            assert_eq!(warnings.len(), 1, "{remedy:?} reported once");
+            let head = "move some records to a slower scan rate";
+            let at = warnings[0]
+                .find(head)
+                .unwrap_or_else(|| panic!("{remedy:?}: {}", warnings[0]));
+            warnings[0][at + head.len()..].to_string()
+        };
+
+        assert_eq!(
+            tail(Remedy::MoreHelpers),
+            ",\n\tor add helper threads with scanParallelThreads() or \
+             scanRateThreads() before iocInit.\n"
+        );
+        assert_eq!(
+            tail(Remedy::FirstHelper),
+            ",\n\tor add helper threads with scanParallelThreads() before iocInit.\n"
+        );
+        assert_eq!(tail(Remedy::NoHelperWouldHelp), ".\n");
+    }
+
+    /// BOUNDARY: which remedy an IOC is in. A helper pool wins over the CPU
+    /// count — C tests `nHelpers` first — and the single-CPU state is reachable
+    /// only with no pool.
+    #[test]
+    fn a_helper_pool_decides_the_remedy_before_the_cpu_count_does() {
+        assert_eq!(Remedy::for_ioc(true), Remedy::MoreHelpers);
+        let alone = crate::runtime::background::callback_executor::cpu_count() <= 1;
+        assert_eq!(
+            Remedy::for_ioc(false),
+            if alone {
+                Remedy::NoHelperWouldHelp
+            } else {
+                Remedy::FirstHelper
+            }
+        );
     }
 
     /// BOUNDARY: the report interval doubles after each report
@@ -1443,7 +1821,13 @@ mod overrun_tests {
     #[test]
     fn the_report_interval_doubles_after_each_report() {
         let base = Instant::now();
-        let warnings = run(Duration::from_secs(1), Duration::from_secs(2), 21, base);
+        let warnings = run(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            21,
+            base,
+            Remedy::FirstHelper,
+        );
 
         assert_eq!(warnings.len(), 2, "reports at tick 10 and tick 21");
         assert!(warnings[1].contains("21 times in a row"), "{}", warnings[1]);
@@ -1457,7 +1841,7 @@ mod overrun_tests {
         let base = Instant::now();
         let period = Duration::from_secs(1);
         let mut next = base + period;
-        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base);
+        let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
         // Nine over-runs, then one sweep that beats its deadline.
         for i in 1..=9u32 {
@@ -1510,12 +1894,11 @@ mod tests {
             done: [AtomicI32; 3],
             violations: AtomicI32,
             slow_started: AtomicI32,
-            /// Slow records processed by a helper reserved for the fast rate —
-            /// the C test's `reservedOnSlow`.
-            reserved_on_slow: AtomicI32,
-            /// How many helpers the pool reserved, so a slow record can tell
-            /// whether the one running it was one of them.
-            reserve: AtomicI32,
+            /// Helpers inside a slow record right now, and the most there
+            /// ever were at once — the C test's `slowHelpersNow` and
+            /// `slowHelpersMax`. The second is what the reserve caps.
+            slow_helpers_now: AtomicI32,
+            slow_helpers_max: AtomicI32,
             /// Distinct threads that processed a PHAS-0 fast record — the C
             /// test's `tids[]`.
             threads: Mutex<Vec<String>>,
@@ -1611,17 +1994,22 @@ mod tests {
             fn process(&mut self) -> CaResult<ProcessOutcome> {
                 let o = &self.observed;
                 o.slow_started.fetch_add(1, Ordering::AcqRel);
-                if let Some(idx) = std::thread::current()
+                // Only a helper counts against the cap — the rate's own
+                // thread is never kept out of its own list, which is why C's
+                // `slowProc` tests the thread name too.
+                let helper = std::thread::current()
                     .name()
-                    .and_then(|n| n.strip_prefix("scanHelper"))
-                    .and_then(|n| n.parse::<i32>().ok())
-                {
-                    if idx < o.reserve.load(Ordering::Acquire) {
-                        o.reserved_on_slow.fetch_add(1, Ordering::AcqRel);
-                        eprintln!("slow record processed by reserved helper {idx}");
-                    }
+                    .is_some_and(|name| name.starts_with("scanHelper"));
+                if helper {
+                    let now = o.slow_helpers_now.fetch_add(1, Ordering::AcqRel) + 1;
+                    // C walks a compare-and-swap up to the new maximum
+                    // (`dbScanParallelTest.c:97-105`); `fetch_max` is that loop.
+                    o.slow_helpers_max.fetch_max(now, Ordering::AcqRel);
                 }
                 std::thread::sleep(SLOW_WORK);
+                if helper {
+                    o.slow_helpers_now.fetch_sub(1, Ordering::AcqRel);
+                }
                 Ok(ProcessOutcome::complete())
             }
             fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1635,7 +2023,7 @@ mod tests {
             }
         }
 
-        /// The fast rate, and the slow one the reserve test runs beside it.
+        /// The fast rate, and the slow one the cap tests run beside it.
         /// Real ladder entries, so `faster_than` and `HelperPool::pick` see
         /// the indices a running IOC gives them.
         fn rate(scan: ScanType) -> usize {
@@ -1762,8 +2150,8 @@ mod tests {
             let passes = passes_for(&rates);
             let driver = TickDriver::capture();
             let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
-            let pool =
-                spawn_helpers(&db, passes.clone(), &lengths, &driver, 8, 0).expect("eight helpers");
+            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 8, 0, &[])
+                .expect("eight helpers");
             let guard = HelperStopGuard(Arc::clone(&pool));
 
             let stop = Arc::new(AtomicBool::new(false));
@@ -1857,19 +2245,57 @@ mod tests {
             );
         }
 
-        /// `reserve` is what the prototype's p99 row buys: with every helper
-        /// free to enter a slow record, the fast rate's next pass can find the
-        /// pool busy and fall back to its leader alone. A reserved helper must
-        /// therefore never be seen inside the slow list — the C test's
-        /// `reservedOnSlow` check — while the unreserved ones must still be,
-        /// or the reserve has simply stopped the pool from helping.
+        /// Wait until every named helper is sitting at the band it should be
+        /// idle at, or fail naming the one that is not.
+        ///
+        /// Polled rather than read once: a band is only observable after the
+        /// thread has reached the registry, and after it has parked.
+        async fn wait_for_idle_bands(want: &[(String, ThreadPriority)]) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let report = crate::runtime::task::thread_report();
+                let wrong: Vec<String> = want
+                    .iter()
+                    .map(
+                        |(name, band)| match report.iter().find(|t| t.name() == name) {
+                            None => format!("{name}: not running"),
+                            Some(t) if t.epics_priority() != band.value() => format!(
+                                "{name}: band {}, expected {}",
+                                t.epics_priority(),
+                                band.value()
+                            ),
+                            Some(_) => String::new(),
+                        },
+                    )
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if wrong.is_empty() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "still wrong after 30 s: {}",
+                    wrong.join("; ")
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// A parked pool helper must sit at the FASTEST rate's band, not at
+        /// the band of whatever it last served and not at `ScanLow`: its
+        /// wake-up has to preempt the slower leaders, which on a loaded box
+        /// are holding every CPU. C's own regression check for this is
+        /// `helpersAtWrongPriority` (`dbScanParallelTest.c`).
+        ///
+        /// BOUNDARY: the two ways a helper can be idle — the band it was born
+        /// at, and the band it returns to after serving a slower rate. The
+        /// second needs the premise that a pool helper really did enter the
+        /// slow list, which `slow_helpers_max` carries.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn a_reserved_helper_serves_only_the_fastest_rate() {
-            const RESERVE: usize = 2;
+        async fn an_idle_helper_sleeps_at_the_band_its_wake_up_needs() {
             let fast = ScanType::SEC01;
             let slow = ScanType::SEC1;
             let observed = Arc::new(Observed::default());
-            observed.reserve.store(RESERVE as i32, Ordering::Release);
             let db = Arc::new(PvDatabase::new());
             load_fast(&db, &observed, fast).await;
             load_slow(&db, &observed, slow).await;
@@ -1878,8 +2304,96 @@ mod tests {
             let passes = passes_for(&rates);
             let driver = TickDriver::capture();
             let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
-            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 4, RESERVE)
-                .expect("four helpers");
+            let mut rate_helpers = vec![0; rates.len()];
+            rate_helpers[rate(slow)] = 1;
+            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &rate_helpers)
+                .expect("a pool");
+            let guard = HelperStopGuard(Arc::clone(&pool));
+
+            // Dedicated first, so helper 0 is the slow rate's own and 1 and 2
+            // are the pool's.
+            let fastest = passes[passes.len() - 1].prio;
+            let want = vec![
+                ("scanHelper0".to_string(), passes[rate(slow)].prio),
+                ("scanHelper1".to_string(), fastest),
+                ("scanHelper2".to_string(), fastest),
+            ];
+            assert_ne!(
+                want[0].1, fastest,
+                "the dedicated helper's band must differ from the pool's,                  or this test cannot tell them apart"
+            );
+            wait_for_idle_bands(&want).await;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let threads: Vec<_> = [fast, slow]
+                .into_iter()
+                .map(|scan| {
+                    let ind = rate(scan);
+                    leader(
+                        Arc::clone(&db),
+                        PeriodicDuty {
+                            scan_type: scan,
+                            period: scan.interval().expect("a rate"),
+                            ind,
+                            pass: Arc::clone(&passes[ind]),
+                            pool: Some(Arc::clone(&pool)),
+                        },
+                        driver.clone(),
+                        Arc::clone(&stop),
+                    )
+                })
+                .collect();
+            wait_for_passes(&observed, 3).await;
+            stop.store(true, Ordering::Release);
+            for thread in threads {
+                thread.join().expect("a leader");
+            }
+
+            assert!(
+                observed.slow_helpers_max.load(Ordering::Acquire) >= 1,
+                "no pool helper entered the slow list, so nothing had to come                  back up to its sleep band"
+            );
+            wait_for_idle_bands(&want).await;
+            drop(guard);
+        }
+
+        /// Drive the fast and the slow rate together over a pool of `count`
+        /// helpers, `reserve` of which the pool keeps off the slower rates,
+        /// plus `fast_threads` and `slow_threads` helpers dedicated to the two
+        /// rates, and hand back what was observed — the C test's `runWith`.
+        ///
+        /// The two assertions every case shares: the slow list completed a
+        /// pass, and the fast list kept its PHAS order while that happened.
+        async fn run_with(
+            count: usize,
+            reserve: usize,
+            fast_threads: usize,
+            slow_threads: usize,
+        ) -> Arc<Observed> {
+            let fast = ScanType::SEC01;
+            let slow = ScanType::SEC1;
+            let observed = Arc::new(Observed::default());
+            let db = Arc::new(PvDatabase::new());
+            load_fast(&db, &observed, fast).await;
+            load_slow(&db, &observed, slow).await;
+
+            let rates = periodic_scans();
+            let passes = passes_for(&rates);
+            let driver = TickDriver::capture();
+            let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
+            let mut rate_helpers = vec![0; rates.len()];
+            rate_helpers[rate(fast)] = fast_threads;
+            rate_helpers[rate(slow)] = slow_threads;
+            let pool = spawn_helpers(
+                &db,
+                passes.clone(),
+                &lengths,
+                &driver,
+                count,
+                reserve,
+                &rate_helpers,
+            )
+            .expect("a pool");
             let guard = HelperStopGuard(Arc::clone(&pool));
 
             let stop = Arc::new(AtomicBool::new(false));
@@ -1909,11 +2423,6 @@ mod tests {
             }
             drop(guard);
 
-            assert_eq!(
-                observed.reserved_on_slow.load(Ordering::Acquire),
-                0,
-                "a helper reserved for the fastest rate processed a slow record"
-            );
             assert!(
                 observed.slow_started.load(Ordering::Acquire) >= NSLOW,
                 "the slow list never completed a pass: {} records",
@@ -1923,6 +2432,79 @@ mod tests {
                 observed.violations.load(Ordering::Acquire),
                 0,
                 "the fast list broke its PHAS order while a slow list ran"
+            );
+            observed
+        }
+
+        /// What the reserve buys is the prototype's p99 row: with every helper
+        /// free to enter a slow record, the fast rate's next pass can find the
+        /// whole pool busy and fall back to its leader alone. The reserve is
+        /// the ceiling that stops that — at most `count - reserve` helpers are
+        /// inside a slower rate at once, which is the C test's
+        /// `slowHelpersMax <= cap` check.
+        ///
+        /// BOUNDARY: `0 < slow_cap < count`. Both halves matter — the ceiling
+        /// must hold, and helpers must still reach the slow list, or the
+        /// reserve has simply stopped the pool from helping.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn the_reserve_caps_what_a_slower_rate_may_hold() {
+            let observed = run_with(4, 2, 0, 0).await;
+            let peak = observed.slow_helpers_max.load(Ordering::Acquire);
+            assert!(
+                peak <= 2,
+                "{peak} helpers were inside the slow list at once"
+            );
+            assert!(peak > 0, "no helper ever reached the slow list");
+        }
+
+        /// BOUNDARY: `slow_cap == 0`, which `scanParallelThreads(n, n)` asks
+        /// for. No helper may enter a slower rate at all, so that rate is its
+        /// own leader's walk while the pool stays available to the fast one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_full_reserve_keeps_every_helper_out_of_the_slower_rates() {
+            let observed = run_with(4, 4, 0, 0).await;
+            assert_eq!(
+                observed.slow_helpers_max.load(Ordering::Acquire),
+                0,
+                "a helper entered a slower rate with every helper reserved"
+            );
+        }
+
+        /// `scanRateThreads` with no pool at all: a rate's passes are shared
+        /// by its own helpers and nothing else, which is the determinism an RT
+        /// IOC buys with it. The C test's `nthreads == fastT + 1`.
+        ///
+        /// BOUNDARY: `n_pool == 0` with `n_rate > 0` — the pool exists only
+        /// because a rate asked for helpers by name.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dedicated_helpers_serve_their_own_rate_and_no_other() {
+            const FAST_THREADS: usize = 2;
+            let observed = run_with(0, 0, FAST_THREADS, 1).await;
+            let threads = observed.threads.lock().expect("thread list").clone();
+            assert_eq!(
+                threads.len(),
+                FAST_THREADS + 1,
+                "the fast list ran on something other than its leader and its \
+                 own {FAST_THREADS} helpers: {threads:?}"
+            );
+            assert_eq!(
+                observed.slow_helpers_max.load(Ordering::Acquire),
+                1,
+                "the slow rate's one dedicated helper did not serve it alone"
+            );
+        }
+
+        /// BOUNDARY: a dedicated helper is not under the reserve. With
+        /// `reserve == count` no *pool* helper may enter the slow list, yet
+        /// the rate's own helper must, or `scanRateThreads` would be undone by
+        /// a `scanParallelThreads` on the same IOC.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_dedicated_helper_is_outside_the_reserve() {
+            let observed = run_with(2, 2, 0, 1).await;
+            assert_eq!(
+                observed.slow_helpers_max.load(Ordering::Acquire),
+                1,
+                "the slow list held something other than its own one helper"
             );
         }
     }

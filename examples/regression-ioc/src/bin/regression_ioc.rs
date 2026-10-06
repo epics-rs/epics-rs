@@ -14,8 +14,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ioc = RegressionIoc::boot().await?;
     println!("regression IOC up:");
     println!("  CA  : 127.0.0.1:{}", ioc.ca_port);
-    println!("  PVA : {}", ioc.pva_addr);
+    println!(
+        "  PVA : {} (search on 127.0.0.1:{})",
+        ioc.pva_addr, ioc.pva_search_port
+    );
     println!("records: see db/regression.db (REG:A:* .. REG:H:*)");
+    println!();
+    println!("point clients at it with:");
+    println!(
+        "  export EPICS_CA_ADDR_LIST=127.0.0.1:{} EPICS_CA_AUTO_ADDR_LIST=NO",
+        ioc.ca_port
+    );
+    println!(
+        "  export EPICS_PVA_ADDR_LIST=127.0.0.1:{} EPICS_PVA_AUTO_ADDR_LIST=NO",
+        ioc.pva_search_port
+    );
     println!("Ctrl-C to stop.");
     tokio::signal::ctrl_c().await?;
     println!("shutting down.");

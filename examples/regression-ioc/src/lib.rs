@@ -58,6 +58,12 @@ pub struct RegressionIoc {
     pub ca_port: u16,
     /// The PVA TCP endpoint (an OS-assigned ephemeral loopback addr).
     pub pva_addr: SocketAddr,
+    /// The PVA UDP **search** port. Distinct from `pva_addr`'s TCP port, and
+    /// the only one an out-of-process client can use: a `pvget` discovers the
+    /// TCP endpoint from the search reply, so pointing it at the TCP port
+    /// finds nothing. The in-process tests pin `pva_addr` directly and never
+    /// need this; the runnable binary prints it.
+    pub pva_search_port: u16,
     _ca_task: tokio::task::JoinHandle<epics_base_rs::error::CaResult<()>>,
     _pva_server: PvaServer,
     /// Core-owned scan start (PINI pass + periodic scan-%g threads) —
@@ -146,6 +152,9 @@ impl RegressionIoc {
         let source = Arc::new(PvDatabaseSource::new(db.clone()));
         let pva_server = PvaServer::start(source, PvaServerConfig::isolated())?;
         let pva_addr = pva_server.tcp_addr();
+        // Stamped by `PvaServer::start` with the port the kernel actually
+        // handed out, because `isolated()` asks for `udp_port = 0`.
+        let pva_search_port = pva_server.config().udp_port;
 
         // Let the CA listener finish binding before clients connect.
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -154,6 +163,7 @@ impl RegressionIoc {
             db,
             ca_port,
             pva_addr,
+            pva_search_port,
             _ca_task,
             _pva_server: pva_server,
             _scan_owner: scan_owner,

@@ -277,6 +277,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             frame.unique_id = array_counter;
             frame.timestamp = ad_core_rs::timestamp::EpicsTimestamp::now();
 
+            // C `simDetector::computeImage` publishes the converted array's
+            // size beside the frame it belongs to (simDetector.cpp:709-712):
+            // `NDArraySize` from `arrayInfo.totalBytes`, `NDArraySizeX/Y` from
+            // the converted dims. Without them the detector port reports a
+            // 0x0 frame of 0 bytes for the whole run.
+            let info = frame.info();
+
             // Counter updates + callParamCallbacks always run (like C EPICS).
             // Only doCallbacksGenericPointer (publish) is gated by array_callbacks.
             if let Err(e) = ctx
@@ -293,6 +300,21 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                             ctx.ad.num_images_counter,
                             0,
                             ParamValue::Int32(num_counter),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_x,
+                            0,
+                            ParamValue::Int32(info.x_size as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_y,
+                            0,
+                            ParamValue::Int32(info.y_size as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size,
+                            0,
+                            ParamValue::Int32(info.total_bytes as i32),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.timestamp_rbv,

@@ -435,14 +435,14 @@ fn range_pass<T: StatsElem>(v: &[T]) -> Range<T> {
     let mut mins = [v[0]; LANES];
     let mut maxs = [v[0]; LANES];
     let mut sums = [T::Acc::default(); LANES];
-    let mut chunks = v.chunks_exact(LANES);
+    // A fixed-size view: with the length known, no bounds check sits in the
+    // loop, which is what keeps it vectorizable.
+    let (blocks, tail) = v.as_chunks::<LANES>();
+    let mut chunks = blocks.iter();
     loop {
         let mut lanes = [T::Lane::default(); LANES];
         let mut seen = 0;
         for c in chunks.by_ref().take(FLUSH) {
-            // A fixed-size view: with the length known, no bounds check sits
-            // in the loop, which is what keeps it vectorizable.
-            let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES elements");
             for l in 0..LANES {
                 let e = c[l];
                 mins[l] = T::lower(mins[l], e);
@@ -466,7 +466,7 @@ fn range_pass<T: StatsElem>(v: &[T]) -> Range<T> {
         max = T::upper(max, maxs[l]);
         total = total + sums[l];
     }
-    for &e in chunks.remainder() {
+    for &e in tail {
         min = T::lower(min, e);
         max = T::upper(max, e);
         total = total + e.to_acc();
@@ -481,16 +481,15 @@ fn range_pass<T: StatsElem>(v: &[T]) -> Range<T> {
 /// Sum of squared deviations from `mean`.
 fn variance_pass<T: StatsElem>(v: &[T], mean: f64) -> f64 {
     let mut lanes = [0.0f64; LANES];
-    let mut chunks = v.chunks_exact(LANES);
-    for c in &mut chunks {
-        let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES elements");
+    let (blocks, tail) = v.as_chunks::<LANES>();
+    for c in blocks {
         for l in 0..LANES {
             let d = c[l].to_f64() - mean;
             lanes[l] += d * d;
         }
     }
     let mut acc: f64 = lanes.iter().sum();
-    for &e in chunks.remainder() {
+    for &e in tail {
         let d = e.to_f64() - mean;
         acc += d * d;
     }
@@ -503,19 +502,15 @@ fn variance_pass<T: StatsElem>(v: &[T], mean: f64) -> f64 {
 /// vectorizes; only the block that hits is walked element by element.
 fn first_index<T: PartialEq + Copy>(v: &[T], x: T) -> usize {
     const BLOCK: usize = 64;
-    let mut chunks = v.chunks_exact(BLOCK);
+    let (blocks, tail) = v.as_chunks::<BLOCK>();
     let mut base = 0;
-    for c in &mut chunks {
+    for c in blocks {
         if c.iter().fold(false, |hit, &e| hit | (e == x)) {
             return base + c.iter().position(|&e| e == x).unwrap_or(0);
         }
         base += BLOCK;
     }
-    chunks
-        .remainder()
-        .iter()
-        .position(|&e| e == x)
-        .map_or(0, |i| base + i)
+    tail.iter().position(|&e| e == x).map_or(0, |i| base + i)
 }
 
 /// [`range_pass`], [`variance_pass`] and [`project_row_pass`] on explicit
@@ -1227,7 +1222,7 @@ fn project_row_pass<T: StatsElem>(
     let mut sum = [0.0f64; LANES];
     let mut thr = [0.0f64; LANES];
     let mut m10 = [0.0f64; LANES];
-    let mut cols = row.chunks_exact(LANES);
+    let (col_blocks, col_tail) = row.as_chunks::<LANES>();
     let mut base = 0;
     // The column index as a vector of f64, stepped by LANES per chunk:
     // converting `base + l` in the loop would need a packed usize->f64,
@@ -1236,8 +1231,7 @@ fn project_row_pass<T: StatsElem>(
     for (l, x) in idx.iter_mut().enumerate() {
         *x = l as f64;
     }
-    for c in cols.by_ref() {
-        let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES elements");
+    for c in col_blocks {
         let cs: &mut [f64; LANES] = (&mut col_sum[base..base + LANES])
             .try_into()
             .expect("LANES columns");
@@ -1259,14 +1253,7 @@ fn project_row_pass<T: StatsElem>(
         base += LANES;
     }
     let mut out = [sum.iter().sum(), thr.iter().sum(), m10.iter().sum()];
-    project_tail(
-        cols.remainder(),
-        base,
-        threshold,
-        col_sum,
-        col_thr,
-        &mut out,
-    );
+    project_tail(col_tail, base, threshold, col_sum, col_thr, &mut out);
     out
 }
 

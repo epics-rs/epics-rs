@@ -406,7 +406,7 @@ impl ModbusFramer {
                     });
                 }
                 let mut bytes = Vec::with_capacity(hex.len() / 2);
-                for pair in hex.chunks_exact(2) {
+                for pair in hex.as_chunks::<2>().0.iter() {
                     let hi = hex_digit(pair[0])?;
                     let lo = hex_digit(pair[1])?;
                     bytes.push((hi << 4) | lo);

@@ -192,8 +192,8 @@ impl fmt::Display for EpicsValue {
 fn write_be<T: Copy, const N: usize>(dst: &mut Vec<u8>, arr: &[T], wire: impl Fn(T) -> [u8; N]) {
     let start = dst.len();
     dst.resize(start + arr.len() * N, 0);
-    for (out, &v) in dst[start..].chunks_exact_mut(N).zip(arr) {
-        out.copy_from_slice(&wire(v));
+    for (out, &v) in dst[start..].as_chunks_mut::<N>().0.iter_mut().zip(arr) {
+        *out = wire(v);
     }
 }
 
@@ -204,9 +204,11 @@ fn read_be<T, const N: usize>(
     count: usize,
     elem: impl Fn([u8; N]) -> T,
 ) -> SharedArray<T> {
-    data.chunks_exact(N)
+    data.as_chunks::<N>()
+        .0
+        .iter()
         .take(count)
-        .map(|c| elem(c.try_into().expect("chunks_exact yields N bytes")))
+        .map(|c| elem(*c))
         .collect()
 }
 

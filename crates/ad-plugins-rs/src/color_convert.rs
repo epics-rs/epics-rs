@@ -299,7 +299,7 @@ fn demosaic_row<T: BayerPixel>(
     let even_row = (y % 2 == 0) == phase.r_row_even;
     let interior_y = y > 0 && y + 1 < h;
     if !interior_y || w < 3 {
-        for (x, px) in out_row.chunks_exact_mut(3).enumerate() {
+        for (x, px) in out_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let even_col = (x % 2 == 0) == phase.r_col_even;
             demosaic_pixel(row[x], even_row, even_col, px);
         }
@@ -324,7 +324,7 @@ fn demosaic_row<T: BayerPixel>(
     #[cfg(not(feature = "simd"))]
     let done = 0;
     let out = &mut out[done * 3..];
-    for (i, px) in out.chunks_exact_mut(3).enumerate() {
+    for (i, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         let i = i + done;
         let even_col = (i % 2 == 0) == first_even;
         let val = c[i].to_u32();

@@ -296,7 +296,7 @@ where
         // Mismatched endian: per-element swap. Still no enum match,
         // tight inlinable loop; LLVM auto-vectorizes the byte-reverse.
         let mut buf = [0u8; N];
-        for (slot, chunk) in slots.iter_mut().zip(bytes.chunks_exact(N)) {
+        for (slot, chunk) in slots.iter_mut().zip(bytes.as_chunks::<N>().0.iter()) {
             buf.copy_from_slice(chunk);
             slot.write(swap(buf));
         }

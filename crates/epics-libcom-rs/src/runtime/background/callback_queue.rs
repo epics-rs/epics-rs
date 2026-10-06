@@ -1024,6 +1024,14 @@ impl Parking {
         self.slots.len()
     }
 
+    /// How many workers are inside [`ParkSlot::park_until`] right now. Half of
+    /// the band's idle test — C reads `nAwake` and the `sleepers` bitmask for
+    /// the same answer (`testCallbackIdle`, `callback.c:999-1017`).
+    #[cfg(test)]
+    pub(super) fn sleepers(&self) -> usize {
+        self.sleepers.load(Ordering::SeqCst)
+    }
+
     /// Claim worker `slot`'s park slot for as long as the worker runs. Holding
     /// the token is what publishes the worker's thread handle, so a signaller
     /// that finds a slot parked finds a handle in it without the worker having

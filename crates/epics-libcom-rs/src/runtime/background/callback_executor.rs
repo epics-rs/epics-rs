@@ -463,6 +463,21 @@ impl PriorityQueue {
         self.overflows.load(Ordering::Relaxed)
     }
 
+    /// Every worker of this band is parked and the band holds nothing —
+    /// queued, running, or run and not yet given back. C `testCallbackIdle`
+    /// (`callback.c:996-1020`) asks the same of the worker states, `nAwake`,
+    /// the sleeper bits and the in-use count; here a parked worker IS a
+    /// sleeper and a running one is not, so the two loads answer all of it.
+    ///
+    /// Read in this order: the sleeper count last, so a worker that has just
+    /// taken an entry out of the ring cannot be counted asleep against a ring
+    /// reading that already excludes its entry.
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        let empty = self.queue.is_empty() && self.queue.ring_used() == 0;
+        empty && self.parking.sleepers() == self.parking.workers()
+    }
+
     /// Stop the band and wake every worker so each re-tests its exit
     /// condition. Idempotent.
     fn request_shutdown(&self) {
@@ -616,6 +631,14 @@ impl CallbackHandle {
 pub struct CallbackPool {
     queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES],
     workers: Vec<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl CallbackPool {
+    /// Every band of the pool is idle — see [`PriorityQueue::is_idle`].
+    fn is_idle(&self) -> bool {
+        self.queues.iter().all(|pq| pq.is_idle())
+    }
 }
 
 impl CallbackPool {
@@ -871,7 +894,7 @@ impl Drop for CallbackPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1787,5 +1810,151 @@ mod tests {
             1,
             "the task entry was charged to the ring"
         );
+    }
+
+    /// One slot of the stress test below: a callback identity the band is
+    /// asked to run thousands of times from several threads at once.
+    struct StressSlot {
+        priority: CallbackPriority,
+        /// Pushes the band ACCEPTED. Raised by whoever pushed, never by a
+        /// worker, so a run can never inflate it.
+        accepted: AtomicUsize,
+        ran: AtomicUsize,
+        /// Requeue myself from inside the callback while this is positive.
+        chain: AtomicI64,
+    }
+
+    /// One push, counted only if the band took it; `Err` is a full ring, which
+    /// the caller decides what to do about. The callback it queues is the
+    /// stress load: it holds its worker now and then, and while `chain` lasts
+    /// it queues itself again — so a worker is a requester too.
+    fn stress_request(
+        h: CallbackHandle,
+        slots: Arc<Vec<StressSlot>>,
+        j: usize,
+    ) -> Result<(), CallbackError> {
+        let inner = h.clone();
+        let mine = Arc::clone(&slots);
+        let priority = slots[j].priority;
+        let cb = Box::new(move || {
+            let again = {
+                let s = &mine[j];
+                // Hold this worker, so the rest of the batch has to find the
+                // others — C's `slotCallback` sleeps on the same cadence.
+                if s.ran.fetch_add(1, Ordering::AcqRel).is_multiple_of(128) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                s.chain.fetch_sub(1, Ordering::AcqRel) > 0
+            };
+            if again {
+                // A refusal here loses a chain link, not an entry: nothing was
+                // accepted, so nothing is owed a run.
+                let _ = stress_request(inner, mine, j);
+            }
+        });
+        h.request(priority, cb)?;
+        slots[j].accepted.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// The whole band under the load it was built for, as C's
+    /// `callbackStressTest` runs it (PR #996): four requester threads each
+    /// pushing to six slots spread over the three priorities, four workers per
+    /// band, callbacks that sleep inside so their worker is held, and
+    /// callbacks that queue themselves again.
+    ///
+    /// Two properties, and they are the two a lost wake-up or a leaked slot
+    /// breaks: **every accepted request runs exactly once**, and once the
+    /// requesters are done **every band returns to idle and stays there**.
+    /// Counted per slot, because a lost entry and a double run cancel in a
+    /// sum.
+    ///
+    /// Three rounds, each starting from that idle state, so a round also
+    /// covers the first request into a fully-asleep band — the one case where
+    /// the requester's own wake is all that can start the work.
+    ///
+    /// A full ring is not what this measures: a refused push backs off and
+    /// retries, and only an accepted one is owed a run.
+    #[test]
+    fn the_band_runs_every_accepted_request_once_and_returns_to_idle() {
+        const WORKERS: usize = 4;
+        const REQUESTERS: usize = 4;
+        const SLOTS: usize = 6;
+        const REQUESTS: usize = 4000;
+        const CHAIN: i64 = 50;
+        const ROUNDS: usize = 3;
+
+        let pool = CallbackPool::with_per_priority_config(2048, [WORKERS; NUM_CALLBACK_PRIORITIES]);
+        let h = pool.handle();
+        let slots: Arc<Vec<StressSlot>> = Arc::new(
+            (0..SLOTS)
+                .map(|j| StressSlot {
+                    priority: CallbackPriority::ALL[j % NUM_CALLBACK_PRIORITIES],
+                    accepted: AtomicUsize::new(0),
+                    ran: AtomicUsize::new(0),
+                    chain: AtomicI64::new(0),
+                })
+                .collect(),
+        );
+
+        for round in 1..=ROUNDS {
+            for s in slots.iter() {
+                s.accepted.store(0, Ordering::Release);
+                s.ran.store(0, Ordering::Release);
+                s.chain.store(CHAIN, Ordering::Release);
+            }
+
+            let threads: Vec<_> = (0..REQUESTERS)
+                .map(|t| {
+                    let h = h.clone();
+                    let slots = Arc::clone(&slots);
+                    std::thread::spawn(move || {
+                        let mut seed = t as u32 + 1;
+                        for _ in 0..REQUESTS {
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            let j = (seed >> 16) as usize % SLOTS;
+                            while stress_request(h.clone(), Arc::clone(&slots), j).is_err() {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("a requester thread");
+            }
+
+            let deadline = Instant::now() + T;
+            while !pool.is_idle() {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: the band never returned to idle"
+                );
+                std::thread::yield_now();
+            }
+            // Idle once is not idle: a worker could be between its park and
+            // its next look at the queue. Nothing is pushing any more, so
+            // this has to still hold.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                pool.is_idle(),
+                "round {round}: the band left idle with nothing to run"
+            );
+
+            for (j, s) in slots.iter().enumerate() {
+                assert_eq!(
+                    s.ran.load(Ordering::Acquire),
+                    s.accepted.load(Ordering::Acquire),
+                    "round {round} slot {j}: an accepted request did not run exactly once"
+                );
+            }
+            for p in CallbackPriority::ALL {
+                assert_eq!(
+                    pool.stats(p, false).num_used,
+                    0,
+                    "round {round}: {p:?} still holds entries"
+                );
+            }
+        }
     }
 }

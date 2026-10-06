@@ -677,7 +677,7 @@ pub(crate) async fn parse_search_datagram(
             // peer name is treated as a `postsize - 1` byte
             // name (matching rsrv) rather than the full
             // payload (Rust pre-fix).
-            let scan_end = payload.len().saturating_sub(1).max(0);
+            let scan_end = payload.len().saturating_sub(1);
             let pv_name_end = payload[..scan_end]
                 .iter()
                 .position(|&b| b == 0)

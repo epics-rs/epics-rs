@@ -2919,7 +2919,7 @@ pub(crate) async fn dispatch_message(
             // `payload.len()` bytes on the unterminated path, so a
             // malformed peer could resolve a different name than
             // rsrv would.
-            let scan_end = payload.len().saturating_sub(1).max(0);
+            let scan_end = payload.len().saturating_sub(1);
             let end = payload[..scan_end]
                 .iter()
                 .position(|&b| b == 0)
@@ -3872,7 +3872,7 @@ pub(crate) async fn dispatch_message(
                 return Ok(());
             }
             // C `search_reply_tcp` forces NUL at postsize-1.
-            let scan_end = payload.len().saturating_sub(1).max(0);
+            let scan_end = payload.len().saturating_sub(1);
             let end = payload[..scan_end]
                 .iter()
                 .position(|&b| b == 0)

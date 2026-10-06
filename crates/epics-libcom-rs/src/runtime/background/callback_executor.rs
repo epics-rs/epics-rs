@@ -477,7 +477,13 @@ impl PriorityQueue {
 pub struct CallbackQueueStats {
     /// Ring capacity — C `stats.size`.
     pub size: usize,
-    /// Entries queued right now — C `stats.numUsed`.
+    /// Entries **in use** right now — C `stats.numUsed`
+    /// (`callback.h:78-81`): queued, running, or already run and not yet
+    /// given back, because a worker of a multi-worker band returns its
+    /// nodes in batches ([`super::callback_queue`]'s `return_batch`). The
+    /// band is full when all `size` of them are in use. A one-worker band
+    /// — the `callbackParallelThreads` default — returns each node as it
+    /// dequeues it, so there the count is exactly the entries queued.
     pub num_used: usize,
     /// Deepest the ring has been since the last reset — C `stats.maxUsed`.
     pub max_used: usize,

@@ -497,7 +497,9 @@ impl<T> BandQueue<T> {
         }
     }
 
-    /// Ring entries queued right now — C `epicsRingPointerGetUsed`.
+    /// Ring entries in use right now — C `epicsRingPointerGetUsed`. Entries a
+    /// worker has run but not yet given back are still out, so this reads
+    /// above the number queued by up to [`return_batch`] per worker.
     pub(super) fn ring_used(&self) -> usize {
         self.nodes.ring_used()
     }

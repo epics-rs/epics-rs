@@ -21,6 +21,7 @@ Umbrella crate that re-exports all epics-rs sub-crates. Use feature flags to sel
 | `std` | Standard records (epid, throttle, timestamp) | no |
 | `scaler` | Scaler record (64-channel counter) | no |
 | `optics` | Beamline optics (table, monochromator, filters) | no |
+| `mca` | mca record (multichannel analyzer) | no |
 | `full` | Everything | no |
 
 `calc`, `autosave` and `busy` are rows for discoverability only — they reach
@@ -45,6 +46,7 @@ use epics_rs::ad_plugins;  // areaDetector plugins (feature = "ad")
 use epics_rs::std_mod;     // std records — not `std` (feature = "std")
 use epics_rs::scaler;      // scaler record (feature = "scaler")
 use epics_rs::optics;      // beamline optics (feature = "optics")
+use epics_rs::mca;         // mca record (feature = "mca")
 ```
 
 ## License

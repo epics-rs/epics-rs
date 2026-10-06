@@ -1226,6 +1226,7 @@ dependencies = [
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+ "mca-rs",
  "motor-rs",
  "optics-rs",
  "scaler-rs",

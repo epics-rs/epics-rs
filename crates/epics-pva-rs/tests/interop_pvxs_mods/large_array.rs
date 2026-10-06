@@ -106,7 +106,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
         out.status.success(),
         "pvxget exit={:?} for large array\nstderr: {stderr}\nstdout (first 200B): {}",
         out.status,
-        &stdout.chars().take(200).collect::<String>(),
+        stdout.chars().take(200).collect::<String>(),
     );
     // pvxget prints `value double[] = {N}[...]` — the count
     // marker tells us how many elements were decoded. Must match
@@ -116,7 +116,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
         stdout.contains(&marker),
         "expected `{marker}` in pvxget output (segment reassembly truncated?). \
          first 400B of stdout:\n{}",
-        &stdout.chars().take(400).collect::<String>(),
+        stdout.chars().take(400).collect::<String>(),
     );
     // Spot-check a couple of values that fall in the middle and
     // end of the array so a partial-buffer failure can't hide.

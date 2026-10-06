@@ -84,7 +84,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.94.0
+          toolchain: 1.99.0
 
       - uses: taiki-e/install-action@nextest
 

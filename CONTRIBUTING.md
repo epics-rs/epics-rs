@@ -13,7 +13,7 @@ cargo build --workspace        # rustup picks the pinned toolchain
 cargo nextest run --workspace  # or: cargo test --workspace
 ```
 
-The toolchain is pinned by `rust-toolchain.toml` (currently 1.94.0,
+The toolchain is pinned by `rust-toolchain.toml` (currently 1.99.0,
 edition 2024) — rustup installs it automatically. No EPICS C installation
 is needed for the default build and test run.
 

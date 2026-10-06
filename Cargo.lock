@@ -10,7 +10,7 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
- "fearless_simd",
+ "fearless_simd 1.0.0",
  "fearless_simd_macros",
  "futures-util",
  "parking_lot",
@@ -30,7 +30,7 @@ dependencies = [
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-pva-rs",
- "fearless_simd",
+ "fearless_simd 1.0.0",
  "fearless_simd_macros",
  "flate2",
  "image",
@@ -266,13 +266,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1314,6 +1314,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "fearless_simd"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fb2907d1f08b2b316b9223ced5b0e89d87028ba8deae9764741dba8ff7f3903"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]
@@ -3321,12 +3330,12 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.6.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd233628a89f05b562ee72d38cf60442bcee654fc0c106edea16d83dd5eaee7"
+checksum = "6b048b9e8dce79f1259084fead30e6ba572f127e0188ab1bf6e8b9a2a333decf"
 dependencies = [
  "bzip2",
- "fearless_simd",
+ "fearless_simd 1.0.0",
  "fearless_simd_macros",
  "flate2",
  "lz4_flex",
@@ -3338,9 +3347,13 @@ dependencies = [
 
 [[package]]
 name = "rust-zstd"
-version = "0.1.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d556913dfad2fe0a10328b1a99c3bb834acbe26fd267bd3b3b3f3032d7533804"
+checksum = "12ce4d622d648638e5d3d66f7d5657c51ce76b4be9ff94f2f061e55c259748e7"
+dependencies = [
+ "bytemuck",
+ "fearless_simd 0.3.0",
+]
 
 [[package]]
 name = "rustc_version"

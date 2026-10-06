@@ -210,9 +210,7 @@ impl CompressRecord {
         self.cvb = 0.0;
         self.res = 0;
         self.accum.clear();
-        for v in &mut self.val {
-            *v = 0.0;
-        }
+        self.val.fill(0.0);
     }
 
     /// C `compressRecord.c::monitor` (:101-111) — **the single owner of the

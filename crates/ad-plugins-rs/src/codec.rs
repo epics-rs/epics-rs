@@ -1165,11 +1165,7 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     let raw = src.data.as_u8_slice();
     let data_type = src.data.data_type();
     let elem_size = data_type.element_size();
-    let total_elems = if elem_size > 0 {
-        raw.len() / elem_size
-    } else {
-        0
-    };
+    let total_elems = raw.len().checked_div(elem_size).unwrap_or(0);
     let block_size = bshuf_default_block_size(elem_size);
 
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() / 2 + 16);

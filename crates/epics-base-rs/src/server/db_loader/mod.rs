@@ -1723,7 +1723,12 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     message: format!("breaktable {bt_name}: Raw value missing"),
                 });
             }
-            let pairs: Vec<(f64, f64)> = nums.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+            let pairs: Vec<(f64, f64)> = nums
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| (c[0], c[1]))
+                .collect();
             let table = crate::server::cvt_bpt::BrkTable::build(bt_name, &pairs).map_err(|e| {
                 CaError::DbParseError {
                     line,

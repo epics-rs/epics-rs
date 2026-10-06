@@ -4785,7 +4785,9 @@ mod tests {
         let read_i32_arr = |n: &str| -> Vec<i32> {
             let raw = ds.attr(n).unwrap().read_raw().unwrap();
             assert_eq!(raw.len(), 2 * 4, "{n} must be a 2-element int32 array");
-            raw.chunks_exact(4)
+            raw.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect()
         };
@@ -4887,7 +4889,9 @@ mod tests {
         let read_i32_arr = |n: &str| -> Vec<i32> {
             let raw = ds.attr(n).unwrap().read_raw().unwrap();
             assert_eq!(raw.len(), 2 * 4, "{n} must be a 2-element int32 array");
-            raw.chunks_exact(4)
+            raw.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect()
         };

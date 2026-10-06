@@ -2574,23 +2574,15 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         }
         // Whole batch is on the wire — decrement the backpressure counter.
         // `pending_frames` decides when `send_frame` should treat a stalled
-        // circuit as disconnected. `fetch_sub` via a saturating CAS loop
-        // never loses a concurrent `send_frame::fetch_add` (a plain
-        // `load`+`store` would) and never wraps on the occasional
-        // `read_loop` echo frame that bypassed `send_frame`'s increment.
-        let mut current = pending_frames.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(drained);
-            match pending_frames.compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        // circuit as disconnected. A saturating `update` never loses a
+        // concurrent `send_frame::fetch_add` (a plain `load`+`store` would)
+        // and never wraps on the occasional `read_loop` echo frame that
+        // bypassed `send_frame`'s increment.
+        pending_frames.update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.saturating_sub(drained),
+        );
     }
 }
 

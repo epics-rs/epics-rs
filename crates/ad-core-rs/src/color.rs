@@ -142,7 +142,7 @@ fn broadcast3<T: LaneElem>(v: &[T], out: &mut [T]) {
 }
 
 fn broadcast3_scalar<T: Copy>(v: &[T], out: &mut [T]) {
-    for (&p, px) in v.iter().zip(out.chunks_exact_mut(3)) {
+    for (&p, px) in v.iter().zip(out.as_chunks_mut::<3>().0.iter_mut()) {
         px.fill(p);
     }
 }
@@ -186,7 +186,7 @@ fn rgb1_mean<T: LaneElem>(v: &[T], out: &mut [T]) {
 }
 
 fn rgb1_mean_scalar<T: LaneElem>(v: &[T], out: &mut [T]) {
-    for (px, o) in v.chunks_exact(3).zip(out) {
+    for (px, o) in v.as_chunks::<3>().0.iter().zip(out) {
         // C: value = (R+G+B)/3. then (epicsType)value — truncate.
         *o = T::from_f64(((px[0].to_f64() + px[1].to_f64()) + px[2].to_f64()) / 3.0);
     }
@@ -514,7 +514,12 @@ fn yuv444_forward<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
 }
 
 fn yuv444_forward_scalar<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
-    for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
+    for (px, o) in v
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<3>().0.iter_mut())
+    {
         let (y, cb, cr) = rgb_to_yuv(px[0].to_f64(), px[1].to_f64(), px[2].to_f64(), half);
         o[0] = T::from_f64(round_clamp(y, max));
         o[1] = T::from_f64(round_clamp(cb, max));
@@ -534,7 +539,12 @@ fn yuv444_inverse<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
 }
 
 fn yuv444_inverse_scalar<T: LaneElem>(v: &[T], out: &mut [T], half: f64, max: f64) {
-    for (px, o) in v.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
+    for (px, o) in v
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<3>().0.iter_mut())
+    {
         let (r, g, b) = yuv_to_rgb(px[0].to_f64(), px[1].to_f64() - half, px[2].to_f64() - half);
         o[0] = T::from_f64(round_clamp(r, max));
         o[1] = T::from_f64(round_clamp(g, max));
@@ -555,7 +565,12 @@ fn yuv422_forward(v: &[u8], out: &mut [u8]) {
 }
 
 fn yuv422_forward_scalar(v: &[u8], out: &mut [u8]) {
-    for (px, o) in v.chunks_exact(6).zip(out.chunks_exact_mut(4)) {
+    for (px, o) in v
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
         let (y0, cb0, cr0) = rgb_to_yuv(px[0] as f64, px[1] as f64, px[2] as f64, U8_HALF);
         let (y1, cb1, cr1) = rgb_to_yuv(px[3] as f64, px[4] as f64, px[5] as f64, U8_HALF);
         o[0] = round_clamp((cb0 + cb1) / 2.0, U8_MAX) as u8;
@@ -578,7 +593,12 @@ fn yuv422_inverse(v: &[u8], out: &mut [u8]) {
 }
 
 fn yuv422_inverse_scalar(v: &[u8], out: &mut [u8]) {
-    for (px, o) in v.chunks_exact(4).zip(out.chunks_exact_mut(6)) {
+    for (px, o) in v
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<6>().0.iter_mut())
+    {
         let u = px[0] as f64 - U8_HALF;
         let vc = px[2] as f64 - U8_HALF;
         for (k, &y) in [px[1], px[3]].iter().enumerate() {
@@ -603,11 +623,16 @@ fn yuv411_forward(v: &[u8], out: &mut [u8]) {
 }
 
 fn yuv411_forward_scalar(v: &[u8], out: &mut [u8]) {
-    for (px, o) in v.chunks_exact(12).zip(out.chunks_exact_mut(6)) {
+    for (px, o) in v
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<6>().0.iter_mut())
+    {
         let mut ys = [0u8; 4];
         let mut cbs = [0.0f64; 4];
         let mut crs = [0.0f64; 4];
-        for (p, q) in px.chunks_exact(3).enumerate() {
+        for (p, q) in px.as_chunks::<3>().0.iter().enumerate() {
             let (y, cb, cr) = rgb_to_yuv(q[0] as f64, q[1] as f64, q[2] as f64, U8_HALF);
             ys[p] = round_clamp(y, U8_MAX) as u8;
             cbs[p] = cb;
@@ -635,7 +660,12 @@ fn yuv411_inverse(v: &[u8], out: &mut [u8]) {
 }
 
 fn yuv411_inverse_scalar(v: &[u8], out: &mut [u8]) {
-    for (px, o) in v.chunks_exact(6).zip(out.chunks_exact_mut(12)) {
+    for (px, o) in v
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<12>().0.iter_mut())
+    {
         let u = px[0] as f64 - U8_HALF;
         let vc = px[3] as f64 - U8_HALF;
         for (k, &y) in [px[1], px[2], px[4], px[5]].iter().enumerate() {

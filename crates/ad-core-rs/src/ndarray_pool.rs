@@ -218,7 +218,7 @@ impl NDArrayPool {
                     let mut freed_enough = false;
                     {
                         let mut free = self.free_list.lock();
-                        free.sort_by(|a, b| b.data.capacity_bytes().cmp(&a.data.capacity_bytes()));
+                        free.sort_by_key(|e| std::cmp::Reverse(e.data.capacity_bytes()));
                         let mut reclaimed = 0u64;
                         let over =
                             (current + needed_bytes as u64).saturating_sub(self.max_memory as u64);
@@ -308,7 +308,7 @@ impl NDArrayPool {
         // `usize` `excess` can never underflow (max_memory == 0 means unlimited).
         let total = self.allocated_bytes.load(Ordering::Relaxed) as usize;
         if self.max_memory > 0 && total > self.max_memory && !free.is_empty() {
-            free.sort_by(|a, b| b.data_size.cmp(&a.data_size));
+            free.sort_by_key(|e| std::cmp::Reverse(e.data_size));
             let mut excess = total - self.max_memory;
             while excess > 0 && !free.is_empty() {
                 let dropped = free.remove(0);

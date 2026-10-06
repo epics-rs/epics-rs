@@ -913,8 +913,11 @@ Additive API only; no breaking changes. Workspace version 0.25.0 -> 0.25.1.
 Minor release. RTEMS 6 goes from "type-checks" to a verified embedded target —
 a reactor-free execution model, blocking CA/PVA drivers, worker-pool thread
 accounting, and `pva://`/`ca://` links, all measured on QEMU/BSP hardware — and
-Linux PREEMPT_RT becomes a first-class real-time deployment with
-priority-inheritance locking proven on a real RT kernel. The runtime/socket
+Linux PREEMPT_RT gains two opt-in levers: `PTHREAD_PRIO_INHERIT` mutexes for
+the record-gate and scan-side lock family behind `--features linux-rt`, and
+SCHED_FIFO thread banding behind `EPICS_RS_ALLOW_RT_PRIORITY=YES`. With PI on,
+the record-gate inversion collapses to its critical-section bound on the
+measured RT guest; no other lock family was converted. The runtime/socket
 layer is extracted into the new `epics-libcom-rs` crate, and the async test
 suites move onto `#[epics_test]`, whose driver is selected by the build's
 backend. Four breaking API changes (epics-ca-rs, epics-pva-rs) plus one on the

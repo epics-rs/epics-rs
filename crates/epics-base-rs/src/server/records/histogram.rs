@@ -195,9 +195,7 @@ impl HistogramRecord {
     /// port was missing: `caput HG.CMD 1` on a never-processed histogram left
     /// `UDF=1` and its UDF_ALARM standing where C reports the record defined.
     fn clear_histogram(&mut self) {
-        for v in &mut self.val {
-            *v = 0;
-        }
+        self.val.fill(0);
         self.mcnt = self.mdel + 1;
         // `prec->udf = FALSE` (`:361`). UDF is common, so this is a latch the
         // after-put owner drains — see `take_udf_clear`.

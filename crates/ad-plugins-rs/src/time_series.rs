@@ -251,9 +251,7 @@ impl SharedTsState {
     /// Reset the running average accumulator (C++ resets `numAveraged_` and
     /// `averageStore_` on start/erase, resize, mode change).
     fn reset_average(&mut self) {
-        for v in &mut self.average_store {
-            *v = 0.0;
-        }
+        self.average_store.fill(0.0);
         self.num_averaged = 0;
     }
 

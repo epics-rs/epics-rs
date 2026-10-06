@@ -1,15 +1,16 @@
-// RTEMS-EXEC-MODEL-ALLOW(16): the teardown test drives the scheduler from a
+// RTEMS-EXEC-MODEL-ALLOW(17): the teardown test drives the scheduler from a
 // tokio task (spawn/abort are its cancellation instrument) and the seven
 // ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
 // tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
 // the tokio test runtime only as the start-context `ScanOwner::start`
 // requires; the scan/owner threads under test go through the exec seam
 // (`block_on_sync` → `park_on`) when the exec backend is on. The
-// eight parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
+// nine parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
 // cap boundaries, the two dedicated-helper boundaries, the idle-band boundary,
-// and the config gate) want a runtime only for the `.await` that loads their
-// records — the leader and its helpers are `MandatoryThread`s either way. All
-// sixteen verified passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+// the mid-pass list-growth boundary, and the config gate) want a runtime only
+// for the `.await` that loads their records — the leader and its helpers are
+// `MandatoryThread`s either way. All seventeen verified passing under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

@@ -2779,7 +2779,7 @@ mod tests {
         assert!(matches!(outcome, CommandOutcome::Continue));
         assert_eq!(
             rec.input.lock().unwrap().as_deref(),
-            Some(&[b'\r', b'\n'][..]),
+            Some(b"\r\n".as_slice()),
             "input EOS must reach the driver as decoded CR LF"
         );
 
@@ -2801,7 +2801,7 @@ mod tests {
             .expect("handler returns Ok");
         assert_eq!(
             rec.output.lock().unwrap().as_deref(),
-            Some(&[b'\n'][..]),
+            Some(b"\n".as_slice()),
             "output EOS must reach the driver as decoded LF"
         );
     }

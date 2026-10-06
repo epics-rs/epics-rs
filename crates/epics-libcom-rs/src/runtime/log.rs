@@ -85,7 +85,7 @@ fn console_subscriber_is_current() -> bool {
 /// print without back-pressure, or take back-pressure without printing.
 fn console_fallback(line: &str, local_echo: bool) {
     if local_echo && (nothing_is_listening() || console_subscriber_is_current()) {
-        write_console(&mut std::io::stderr().lock(), line);
+        console().write(line);
     }
 }
 
@@ -101,13 +101,112 @@ fn console_fallback(line: &str, local_echo: bool) {
 /// print a blank line C does not print, and the ones that carry none are
 /// silently rescued.
 ///
-/// The sink is a parameter so the framing can be asserted on a buffer; the
-/// process console is `stderr`, which is unbuffered, so C's `fflush` after a
-/// drain pass has no analogue to skip.
+/// Framing only: which stream the bytes land on, and whether that stream has
+/// to be flushed afterwards, belong to [`Console`] — this is the step both of
+/// its arms share.
 fn write_console(out: &mut impl std::io::Write, line: &str) {
     // C ignores `fprintf`'s return here too: a console that cannot be written
     // is not something an errlog line can report.
     let _ = out.write_all(line.as_bytes());
+}
+
+/// C's `pvt.console` and `pvt.ttyConsole` (`errlog.c:100-101`): the stream
+/// errlog's own bytes go to, and whether that stream understands ANSI escapes.
+///
+/// The two are one cell because [`errlog_set_console`] decides them together,
+/// as C does: the `isATTY` answer belongs to the stream it was taken from, and
+/// pairing them is what makes "escapes stripped against the stream they were
+/// not measured on" unrepresentable.
+struct Console {
+    sink: ConsoleSink,
+}
+
+/// Which stream, and — for a caller's — the `isATTY` answer taken when it was
+/// installed.
+enum ConsoleSink {
+    /// C `errlogInitPvt`'s `pvt.console = stderr` (`errlog.c:584-585`).
+    Stderr,
+    /// C `errlogSetConsole`'s argument (`errlog.c:478-487`).
+    Set {
+        stream: Box<dyn std::io::Write + Send>,
+        paints: bool,
+    },
+}
+
+/// The errlog console, and the lock that makes replacing it safe.
+///
+/// C calls `errlogSequence()` after the swap because its console writer is the
+/// errlog worker, which copies `pvt.console` under `msgQueueLock` and prints
+/// with the lock dropped (`errlog.c:761`, `:795`): a swap has to wait a whole
+/// worker pass out to know the previous stream is idle. Here the writer holds
+/// this lock for the write itself, so when [`errlog_set_console`] returns no
+/// thread can still be writing the stream it replaced — the guarantee C
+/// sequences for holds by construction.
+///
+/// A lock of its own, and not a field of [`ErrlogQueue`] where C keeps it,
+/// because admission must not wait behind console I/O. C does not pay that
+/// either: its print is outside `msgQueueLock`.
+///
+/// A caller's stream must not log. This lock is held across its `write`, so an
+/// `errlogPrintf` from inside one deadlocks; C's stream carries the same rule
+/// for the same reason, its `FILE` lock being held by `fprintf`.
+static CONSOLE: std::sync::Mutex<Console> = std::sync::Mutex::new(Console {
+    sink: ConsoleSink::Stderr,
+});
+
+/// The console, through a poisoning that must not be allowed to silence it.
+///
+/// A panic inside a caller's `write` poisons this lock. Refusing every later
+/// line over it would turn one bad stream into a mute IOC — the state
+/// [`install_console_subscriber`] exists to prevent — so the guard is taken
+/// either way and the next writer gets the same stream.
+fn console() -> std::sync::MutexGuard<'static, Console> {
+    CONSOLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Console {
+    /// One already-formatted errlog line to whichever stream is installed.
+    fn write(&mut self, line: &str) {
+        match &mut self.sink {
+            // stderr is unbuffered, so C's `fflush(console)` (`errlog.c:830`)
+            // has nothing to do here.
+            ConsoleSink::Stderr => write_console(&mut std::io::stderr().lock(), line),
+            ConsoleSink::Set { stream, .. } => {
+                write_console(stream, line);
+                // A caller's stream may buffer, and a line sitting in a buffer
+                // has not reached the console. C flushes once per drain pass;
+                // this writer runs per line, so this is where it belongs.
+                let _ = stream.flush();
+            }
+        }
+    }
+
+    /// Whether an errlog line's ANSI escapes survive to this console — C's
+    /// `pvt.ttyConsole`.
+    fn paints(&self) -> bool {
+        match &self.sink {
+            // Asked each time rather than latched as C latches it in
+            // `errlogInitPvt` (`pvt.ttyConsole = isATTY(stderr)`,
+            // `errlog.c:585`): this port answers at the call site, which can
+            // run before any errlog entry point has, so there is no init pass
+            // to latch it in.
+            ConsoleSink::Stderr => is_a_tty(&std::io::stderr()),
+            ConsoleSink::Set { paints, .. } => *paints,
+        }
+    }
+}
+
+/// C `isATTY` (`errlog.c:218-237`), for any stream: a terminal, and one that
+/// names itself in `$TERM`.
+///
+/// Both halves are C's. The second is there because C will not assume escape
+/// support from a terminal that declines to say what it is, and it is the half
+/// that makes a captured Rust IOC's bytes match a captured C IOC's.
+fn is_a_tty(stream: &impl std::io::IsTerminal) -> bool {
+    let term_names_itself = std::env::var_os("TERM").is_some_and(|t| !t.is_empty());
+    stream.is_terminal() && term_names_itself
 }
 
 /// The same bytes as a `tracing` record, which is one event and not a byte
@@ -202,9 +301,23 @@ impl tracing::Subscriber for ConsoleSubscriber {
         Some(tracing::level_filters::LevelFilter::INFO)
     }
 
+    /// Through [`Console`], not `eprintln!`, so this subscriber's console is
+    /// the one [`errlog_set_console`] names.
+    ///
+    /// These are the lines whose C originals are `errlogPrintf` calls in the
+    /// servers — `pvt.console`'s bytes there — and while this subscriber is
+    /// the installed one, the errlog console is ours by the same test
+    /// [`console_fallback`] applies ([`console_subscriber_is_current`]). An
+    /// application that redirects errlog to a file and then reads only errlog
+    /// lines in it would otherwise be missing half of what C puts there. The
+    /// subscriber frames the event, so the newline is added here: C's
+    /// `errlogPrintf` callers carry one in their own format string.
+    ///
+    /// `eltc` does not gate it, and that is C's line too: `pvt.toConsole`
+    /// gates messages that went through errlog's queue, and these did not.
     fn event(&self, event: &tracing::Event<'_>) {
         if let Some(line) = Self::line_for(event) {
-            eprintln!("{line}");
+            console().write(&format!("{line}\n"));
         }
     }
 
@@ -549,9 +662,7 @@ pub fn erl_warning() -> &'static str {
 /// it directly, so the predicate stays owned here rather than being
 /// re-derived per site.
 pub fn errlog_console_paints() -> bool {
-    use std::io::IsTerminal;
-    let term_names_itself = std::env::var_os("TERM").is_some_and(|t| !t.is_empty());
-    std::io::stderr().is_terminal() && term_names_itself
+    console().paints()
 }
 
 /// Emit a pre-formatted error message at the given severity.
@@ -728,15 +839,6 @@ struct Errlog {
     work: Event,
     listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
     next_id: std::sync::atomic::AtomicU64,
-    /// Set once, after the worker thread is known to exist.
-    ///
-    /// C has no equivalent because C has no such state: `errlogInit2` calls
-    /// `cantProceed` when the thread will not start (`errlog.c:604-606`), so
-    /// every later line runs in a process that has a drainer. This port keeps
-    /// the IOC alive instead, which makes "no drainer" reachable — and a
-    /// producer that waits for a drain that can never happen would hang the
-    /// IOC on its first log line, turning a degraded log sink into a dead IOC.
-    worker_running: std::sync::atomic::AtomicBool,
 }
 
 static ERRLOG: std::sync::OnceLock<&'static Errlog> = std::sync::OnceLock::new();
@@ -781,27 +883,27 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             work: Event::new(),
             listeners: std::sync::Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
-            worker_running: std::sync::atomic::AtomicBool::new(false),
         }));
         // C `epicsThreadCreateOpt("errlog", …)` at `epicsThreadPriorityLow`
         // with `epicsThreadStackSmall` (`errlog.c:568-574`).
-        let spawned = crate::runtime::task::spawn_dedicated_thread(
-            "errlog".to_string(),
+        //
+        // Mandatory, as C makes it: `errlogInitPvt` leaves
+        // `pvt.errlogInitFailed` set unless the thread started, and every
+        // `errlogInit`/`errlogInit2` entry then prints `ERROR: errlogInit
+        // failed` and `exit(1)`s (`errlog.c:667-670`) — not `cantProceed`,
+        // which would recurse through this very function. Carrying on instead
+        // is what needed a "no drainer" state for the flush at the end of
+        // [`errlog_emit`] to consult; `MandatoryThread` leaves no failure for
+        // a caller to resolve, so that state is gone with it. This is also the
+        // call site [`crate::runtime::task::MandatoryThread`]'s own docs name:
+        // the message reporting a failed thread creation cannot be routed
+        // through the worker whose creation just failed.
+        crate::runtime::task::MandatoryThread::new(
+            "errlog",
             crate::runtime::task::ThreadPriority::Low,
             crate::runtime::task::StackSizeClass::Small,
-            move || errlog_worker(errlog),
-        );
-        if spawned.is_ok() {
-            errlog
-                .worker_running
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            // C exits the process when the thread cannot be created
-            // (`errlog.c:604-606`). Here the queue still accepts and still
-            // accounts; only delivery stops, so say so rather than kill an
-            // IOC over a log sink.
-            eprintln!("errlogInit failed: no errlog thread, listeners will not be called");
-        }
+        )
+        .spawn(move || errlog_worker(errlog));
         errlog
     })
 }
@@ -876,7 +978,10 @@ fn errlog_worker(errlog: &'static Errlog) {
         print.pos = 0;
 
         if n_lost > 0 && to_console {
-            eprintln!("errlog: lost {n_lost} messages");
+            // C `fprintf(console, "errlog: lost %zu messages\n", nLost)`
+            // (`errlog.c:826-827`). The stream is `pvt.console`, so this line
+            // follows [`errlog_set_console`] exactly as a message does.
+            console().write(&format!("errlog: lost {n_lost} messages\n"));
         }
 
         q = errlog.queue.lock();
@@ -945,14 +1050,7 @@ fn errlog_post(message: &str, echo: ConsoleEcho) {
     // C `msgbufCommit`'s tail (`errlog.c:186-187`). `accepted` stands for C's
     // `msgbufAlloc` having returned a buffer at all: a refused message never
     // reaches `msgbufCommit` and so never flushes there either.
-    if accepted
-        && local_echo
-        && ok_to_block
-        && !at_exit
-        && errlog
-            .worker_running
-            .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if accepted && local_echo && ok_to_block && !at_exit {
         errlog_flush();
     }
 }
@@ -1180,6 +1278,60 @@ pub fn errlog_to_console() -> bool {
     errlog_pvt().queue.lock().to_console
 }
 
+/// C `errlogSetConsole(stream)` (`errlog.c:478-487`) — send errlog's console
+/// bytes to a stream of the caller's instead of `stderr`.
+///
+/// The bound is `IsTerminal` and not plain `Write` because C takes the
+/// `isATTY` answer from the stream it is given (`errlog.c:483`), and that
+/// answer decides whether an [`ERL_WARNING`]'s escapes reach the stream or are
+/// stripped first (`errlog.c:789-793`). A sink that cannot be asked would
+/// leave the port guessing at the one thing C measures. Nothing is lost by
+/// demanding it: a line is flushed as it is written, so a buffered wrapper —
+/// which is what would not satisfy the bound — would have nothing to hold.
+///
+/// Every byte this port writes to a console follows it: a message's echo, the
+/// worker's `errlog: lost N messages` line, and — while the subscriber
+/// [`install_console_subscriber`] installs is the one in place — the events it
+/// renders, whose C originals are `errlogPrintf` calls. An application that
+/// installed a subscriber of its own keeps its own console, as it keeps its
+/// own formatting.
+///
+/// C returns 0 unconditionally, so there is nothing to hand back.
+/// [`errlog_set_console_to_stderr`] is C's `NULL` argument.
+pub fn errlog_set_console<S>(stream: S)
+where
+    S: std::io::Write + std::io::IsTerminal + Send + 'static,
+{
+    // C `errlogInit(0)` first (`errlog.c:480`), so a process that sets its
+    // console before logging anything has the drainer its first line needs.
+    errlog_pvt();
+    let paints = is_a_tty(&stream);
+    install_console(ConsoleSink::Set {
+        stream: Box::new(stream),
+        paints,
+    });
+}
+
+/// C `errlogSetConsole(NULL)` — back to `stderr`, the stream `errlogInitPvt`
+/// starts with (`errlog.c:482`, `:584`).
+pub fn errlog_set_console_to_stderr() {
+    errlog_pvt();
+    install_console(ConsoleSink::Stderr);
+}
+
+/// Install a console and leave the previous stream flushed.
+///
+/// The swap is under the console lock, which is what gives C's
+/// post-`errlogSetConsole` guarantee (see [`CONSOLE`]); the flush is outside
+/// it, because by then the stream is this thread's alone and holding the lock
+/// across it would stall writers on a stream nobody can reach any more.
+fn install_console(sink: ConsoleSink) {
+    let previous = std::mem::replace(&mut console().sink, sink);
+    if let ConsoleSink::Set { mut stream, .. } = previous {
+        let _ = stream.flush();
+    }
+}
+
 /// How many messages the buffer has refused since the last drain reported.
 #[must_use]
 pub fn errlog_messages_lost() -> usize {
@@ -1221,7 +1373,19 @@ pub fn errlog_strip_ansi(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fresh_process::with_a_process_of_its_own;
     use serial_test::serial;
+
+    // One `#[serial]` key for this whole module, because there is one piece of
+    // state behind it: the arena, the listener list, `eltc` and the console are
+    // all `pvt`, and a test that touches any of them can be the reason another
+    // one sees the wrong thing. These tests used to hold four independent keys
+    // over it — the default plus `errlog_listeners`, `errlog_console` and
+    // `errlog_sev` — so any two groups could run at once and clobber each
+    // other: a `eltc(false)` landing inside the test that asserts the setting,
+    // or a console line consuming the arena the boot-burst test measures. The
+    // keys bought parallelism only under `cargo test`; `cargo nextest` gives
+    // each test a process and does not need them at all.
 
     #[test]
     fn test_log_macros_compile() {
@@ -1238,12 +1402,17 @@ mod tests {
     /// entry points do not do it (`tracing-subscriber` sits behind an
     /// optional feature that also pulls a Prometheus exporter).
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn with_no_subscriber_nothing_is_listening() {
-        assert!(
-            nothing_is_listening(),
-            "the test process has no global subscriber, so errlog output is \
-             being discarded and the console fallback must engage"
+        with_a_process_of_its_own(
+            "runtime::log::tests::with_no_subscriber_nothing_is_listening",
+            || {
+                assert!(
+                    nothing_is_listening(),
+                    "a process with no global subscriber discards every errlog \
+                     line, so the console fallback must engage"
+                );
+            },
         );
     }
 
@@ -1251,7 +1420,7 @@ mod tests {
     /// IOC gets each errlog line twice: once through its own sink and once on
     /// stderr.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn with_a_subscriber_the_fallback_stands_down() {
         use tracing::subscriber::with_default;
         let captured = with_default(tracing_subscriber::registry(), nothing_is_listening);
@@ -1267,7 +1436,7 @@ mod tests {
     /// own fallback would then print every errlog line a second time on the
     /// very target the subscriber exists for.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declares_itself_to_the_dispatcher() {
         use tracing::level_filters::LevelFilter;
         use tracing::subscriber::with_default;
@@ -1316,7 +1485,7 @@ mod tests {
     /// rendering it through `Debug` is what keeps it readable; switching to a
     /// `record_str` arm would wrap every diagnostic in quotes.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_line_carries_message_and_fields() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
@@ -1336,7 +1505,7 @@ mod tests {
     /// `debug!` that produced no line, and here at the filter itself so the
     /// reason is not mistaken for a rendering accident.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declines_below_info() {
         use tracing::level_filters::LevelFilter;
         let taken = tracing::subscriber::with_default(ConsoleSubscriber, || {
@@ -1362,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_to_log_threshold_roundtrips() {
         errlog_set_sev_to_log(ErrlogSevEnum::Major);
         assert_eq!(errlog_get_sev_to_log(), ErrlogSevEnum::Major);
@@ -1375,7 +1544,7 @@ mod tests {
     /// `errlogInfo`. Every test in the `errlog_sev` group restores that
     /// value, so this holds whichever order they run in.
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_to_log_defaults_to_info_like_c_zero_init() {
         assert_eq!(
             errlog_get_sev_to_log(),
@@ -1389,7 +1558,7 @@ mod tests {
     /// C IOC prints `sevr=info` lines even after `errlogSetSevToLog(major)`
     /// — e.g. `devBiDbState`'s "Creating new db state" notice at iocInit.
     #[test]
-    #[serial(errlog_sev)]
+    #[serial(errlog)]
     fn sev_printf_emits_every_severity_whatever_sev_to_log_says() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         errlog_set_sev_to_log(ErrlogSevEnum::Fatal);
@@ -1473,21 +1642,37 @@ mod tests {
         );
     }
 
+    /// `install_panic_hook`'s two halves, restored together.
+    ///
+    /// The refusal is a process one-shot — `PANIC_HOOK_INSTALLED`, so that a
+    /// second install cannot chain the hook onto itself — and a test that
+    /// takes the hook back without clearing the flag leaves the one state no
+    /// process can reach on its own: the flag set and the default hook in
+    /// place, where the next `install_panic_hook` refuses and installs
+    /// nothing. Under `cargo nextest` each test has a process of its own and
+    /// never sees it; under `cargo test`, which shares one, whichever of
+    /// these tests ran second used to fail. Both halves on drop is what makes
+    /// that state unreachable, panic or not.
+    struct PanicHookUnderTest;
+
+    impl Drop for PanicHookUnderTest {
+        fn drop(&mut self) {
+            let _ = std::panic::take_hook();
+            PANIC_HOOK_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Installing twice must not chain the hook onto itself: that prints every
     /// panic once per install, and the second copy looks like a second panic.
-    ///
-    /// Restores the default hook afterwards so a `cargo test` run — which,
-    /// unlike `cargo nextest`, shares one process across tests — is not left
-    /// with this one.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_panic_hook_installs_once() {
+        let _restore = PanicHookUnderTest;
         assert!(install_panic_hook(), "the first install takes effect");
         assert!(
             !install_panic_hook(),
             "a second install must be refused, not chained onto the first"
         );
-        let _ = std::panic::take_hook();
     }
 
     /// The hook replaces the previous one; it does not run it afterwards.
@@ -1498,11 +1683,12 @@ mod tests {
     /// environment that does not exist. A sentinel hook proves the absence
     /// directly: if the previous hook still ran, it would flip the flag.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_panic_hook_does_not_run_the_hook_it_replaced() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+        let _restore = PanicHookUnderTest;
         let previous_ran = Arc::new(AtomicBool::new(false));
         let flag = previous_ran.clone();
         std::panic::set_hook(Box::new(move |_| {
@@ -1518,7 +1704,6 @@ mod tests {
             "the replaced hook must not run: chaining it doubles the console \
              output and appends a RUST_BACKTRACE note that cannot be acted on"
         );
-        let _ = std::panic::take_hook();
     }
 
     fn test_queue() -> ErrlogQueue {
@@ -1613,7 +1798,7 @@ mod tests {
     /// Deterministic, not a race: the last message's flush cannot return until
     /// the worker has completed a pass with it in hand.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_boot_sized_burst_of_console_messages_loses_none() {
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink = std::sync::Arc::clone(&seen);
@@ -1643,7 +1828,7 @@ mod tests {
     /// is shut the drain cannot complete, so a producer that waits for it
     /// cannot return, and a producer that does not wait must already have.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn only_a_blocking_producer_waits_for_the_drain() {
         for prologue in [false, true] {
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1705,7 +1890,7 @@ mod tests {
     /// while the gate is shut not one of them may return, and once it opens
     /// all of them must.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn every_producer_in_the_flush_rendezvous_is_released() {
         const FLUSHERS: usize = 8;
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1770,7 +1955,7 @@ mod tests {
     /// hold that shows the previous test is measuring something, since without
     /// the flush that burst is this one.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn the_same_burst_with_the_console_off_overflows_and_is_counted() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -1814,7 +1999,7 @@ mod tests {
     /// test does not fail, it hangs, so the wait is bounded and the failure is
     /// a timeout rather than a wedged process.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_that_logs_does_not_wait_for_its_own_drain() {
         let logged = std::sync::atomic::AtomicBool::new(false);
         let id = errlog_add_listener(move |_| {
@@ -1965,10 +2150,193 @@ mod tests {
         assert_eq!(bare, b"dbConvertJSON: ");
     }
 
+    /// A file console for one test, taken back however the test leaves.
+    ///
+    /// The console and `eltc` are both process-global, and `#[serial(errlog)]` only
+    /// keeps these tests from overlapping — it does not undo a redirect a
+    /// failing one left behind, which would silence every later test's
+    /// console. Restoring on drop does, panic or not.
+    struct ConsoleUnderTest {
+        dir: tempfile::TempDir,
+        eltc_was: bool,
+    }
+
+    impl ConsoleUnderTest {
+        /// A console at `<tmp>/name`, with `eltc` on so a message is echoed at
+        /// all.
+        fn new(name: &str) -> Self {
+            let dir = tempfile::tempdir().expect("console dir");
+            let under_test = ConsoleUnderTest {
+                dir,
+                eltc_was: eltc(true),
+            };
+            under_test.redirect(name);
+            under_test
+        }
+
+        fn redirect(&self, name: &str) {
+            let file = std::fs::File::create(self.path(name)).expect("console file");
+            errlog_set_console(file);
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.path().join(name)
+        }
+
+        /// What reached that console. Every write flushes, so this needs no
+        /// sequencing with the writer.
+        fn text(&self, name: &str) -> String {
+            std::fs::read_to_string(self.path(name)).unwrap_or_default()
+        }
+
+        /// Log through our own subscriber rather than whatever the process
+        /// has: `console_fallback`'s gate is the ambient dispatcher, and a
+        /// test that scoped a subscriber earlier in this process has already
+        /// latched `nothing_is_listening` false for good.
+        fn log(&self, message: &str) {
+            tracing::subscriber::with_default(ConsoleSubscriber, || errlog_printf(message));
+        }
+    }
+
+    impl Drop for ConsoleUnderTest {
+        fn drop(&mut self) {
+            errlog_set_console_to_stderr();
+            eltc(self.eltc_was);
+        }
+    }
+
+    /// C `errlogSetConsole` (`errlog.c:478-487`): errlog's console bytes go to
+    /// the caller's stream, and they are still only the caller's bytes — a set
+    /// console gets the same framing as `stderr`.
+    #[test]
+    #[serial(errlog)]
+    fn a_set_console_takes_the_message_bytes_and_nothing_else() {
+        let console = ConsoleUnderTest::new("set");
+        console.log("iocPause: IOC suspended\n");
+        console.log("dbConvertJSON: ");
+        assert_eq!(
+            console.text("set"),
+            "iocPause: IOC suspended\ndbConvertJSON: "
+        );
+    }
+
+    /// A line this crate's own subscriber renders is `pvt.console`'s too: its
+    /// C original is an `errlogPrintf` in a server, and while that subscriber
+    /// is installed the errlog console is ours.
+    #[test]
+    #[serial(errlog)]
+    fn our_subscribers_own_lines_go_to_the_set_console() {
+        let console = ConsoleUnderTest::new("subscriber");
+        tracing::subscriber::with_default(ConsoleSubscriber, || {
+            tracing::warn!(target: "epics_base_rs::runtime", "a runtime line");
+        });
+        assert_eq!(
+            console.text("subscriber"),
+            "WARN  epics_base_rs::runtime: a runtime line\n"
+        );
+    }
+
+    /// The stream a swap replaces stops receiving at the swap — C sequences
+    /// its worker out to get this (`errlog.c:486`), the port holds the console
+    /// lock across the write instead.
+    #[test]
+    #[serial(errlog)]
+    fn a_swap_stops_writing_the_stream_it_replaced() {
+        let console = ConsoleUnderTest::new("first");
+        console.log("to the first\n");
+        console.redirect("second");
+        console.log("to the second\n");
+        assert_eq!(console.text("first"), "to the first\n");
+        assert_eq!(console.text("second"), "to the second\n");
+    }
+
+    /// C takes `pvt.ttyConsole` from the stream it is handed
+    /// (`errlog.c:483`), so a console that is a file strips the escapes a
+    /// terminal would have kept — and giving the console back restores the
+    /// answer for `stderr`.
+    #[test]
+    #[serial(errlog)]
+    fn the_paint_answer_follows_the_stream_that_was_installed() {
+        let before = errlog_console_paints();
+        {
+            let _console = ConsoleUnderTest::new("paints");
+            assert!(
+                !errlog_console_paints(),
+                "a file is not a terminal, so an errlog line reaches it stripped"
+            );
+            assert_eq!(erl_warning(), "WARNING");
+        }
+        assert_eq!(
+            errlog_console_paints(),
+            before,
+            "giving the console back restores the answer for stderr"
+        );
+    }
+
+    /// `eltc` still owns whether a line is echoed at all. A set console says
+    /// where the bytes go; it is not a decision to send them.
+    #[test]
+    #[serial(errlog)]
+    fn eltc_still_silences_a_set_console() {
+        let console = ConsoleUnderTest::new("gated");
+        let was = eltc(false);
+        console.log("suppressed\n");
+        assert_eq!(console.text("gated"), "", "eltc(0) reaches no stream");
+        eltc(was);
+        console.log("echoed\n");
+        assert_eq!(console.text("gated"), "echoed\n");
+    }
+
+    /// The worker's own line is `pvt.console`'s too: C writes
+    /// `errlog: lost %zu messages` to the console it was given
+    /// (`errlog.c:826-827`), not to `stderr`.
+    ///
+    /// Overflowing the arena needs the drain stalled, and the producer must
+    /// not wait for it — `set_thread_ok_to_block(false)` is C's state for
+    /// every `epicsThreadCreate` thread and what keeps this test off its own
+    /// flush.
+    #[test]
+    #[serial(errlog)]
+    fn the_lost_message_line_goes_to_the_set_console() {
+        let console = ConsoleUnderTest::new("lost");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let holding = std::sync::atomic::AtomicBool::new(false);
+        let id = errlog_add_listener(move |_| {
+            if !holding.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().expect("gate").recv();
+            }
+        });
+
+        let blocking_was = crate::runtime::task::thread_is_ok_to_block();
+        crate::runtime::task::set_thread_ok_to_block(false);
+        console.log("prime\n");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reaches the listener");
+        for i in 0..200 {
+            console.log(&format!("burst line {i}\n"));
+        }
+        let lost = errlog_messages_lost();
+        crate::runtime::task::set_thread_ok_to_block(blocking_was);
+
+        let _ = release_tx.send(());
+        errlog_flush();
+        assert!(errlog_remove_listener(id));
+        assert!(lost > 0, "a stalled drain plus 200 messages must overflow");
+        let text = console.text("lost");
+        assert!(
+            text.contains(&format!("errlog: lost {lost} messages\n")),
+            "the worker's lost-message line must reach the set console: {text:?}"
+        );
+    }
+
     /// The subscriber's skip is keyed on a target the `tracing` macros spell as
     /// a literal, so this is what stops the two spellings drifting apart.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_errlog_target_is_the_one_the_macros_publish_on() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
@@ -1987,7 +2355,7 @@ mod tests {
     /// would print C's bytes a second time behind a `LEVEL target:` prefix C
     /// never writes, so it declines them and takes every other target.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_console_subscriber_declines_errlog_events_and_takes_the_rest() {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2033,27 +2401,35 @@ mod tests {
     /// An application that installed its own subscriber asked for its own
     /// formatting, so `write_console` must stay silent under one.
     #[test]
-    #[serial]
+    #[serial(errlog)]
     fn the_errlog_console_is_ours_only_with_nothing_listening_or_our_subscriber() {
-        assert!(nothing_is_listening(), "no subscriber in a unit test");
-        assert!(!console_subscriber_is_current());
+        with_a_process_of_its_own(
+            "runtime::log::tests::the_errlog_console_is_ours_only_with_nothing_listening_or_our_subscriber",
+            || {
+                // The first row is the one that needs the fresh process: the
+                // two below raise the global max level themselves, which is
+                // what makes this row unobservable afterwards.
+                assert!(nothing_is_listening(), "no subscriber yet in this process");
+                assert!(!console_subscriber_is_current());
 
-        tracing::subscriber::with_default(ConsoleSubscriber, || {
-            assert!(!nothing_is_listening());
-            assert!(
-                console_subscriber_is_current(),
-                "our own subscriber leaves the console to write_console"
-            );
-        });
+                tracing::subscriber::with_default(ConsoleSubscriber, || {
+                    assert!(!nothing_is_listening());
+                    assert!(
+                        console_subscriber_is_current(),
+                        "our own subscriber leaves the console to write_console"
+                    );
+                });
 
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(CapturingSubscriber(seen), || {
-            assert!(!nothing_is_listening());
-            assert!(
-                !console_subscriber_is_current(),
-                "a foreign subscriber owns its own console"
-            );
-        });
+                let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                tracing::subscriber::with_default(CapturingSubscriber(seen), || {
+                    assert!(!nothing_is_listening());
+                    assert!(
+                        !console_subscriber_is_current(),
+                        "a foreign subscriber owns its own console"
+                    );
+                });
+            },
+        );
     }
 
     /// The `tracing` half of the same bytes. An event is a record and its
@@ -2079,7 +2455,7 @@ mod tests {
     /// of its writer is pinned by
     /// [`the_console_writes_the_callers_bytes_and_appends_nothing`].
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn the_callers_bytes_frame_every_errlog_sink() {
         let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&heard);
@@ -2122,7 +2498,7 @@ mod tests {
     /// message. Delivery is on the errlog worker thread, so the test flushes
     /// the way C's `errlogFlush` does before looking.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_registered_listener_receives_every_message_after_a_flush() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2142,7 +2518,7 @@ mod tests {
     /// matched; a token matches at most one, so a second removal answers
     /// false and nothing further is delivered.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_removed_listener_stops_receiving_and_cannot_be_removed_twice() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2165,7 +2541,7 @@ mod tests {
     /// Boundary: the listener sees the message with its ANSI stripped, which
     /// is what C does before the listener loop (`errlog.c:678-681`).
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_sees_the_message_with_its_escapes_removed() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -2183,7 +2559,7 @@ mod tests {
     /// snapshot, so the call cannot deadlock and the removal takes effect on
     /// the next message.
     #[test]
-    #[serial(errlog_listeners)]
+    #[serial(errlog)]
     fn a_listener_can_remove_itself_from_inside_its_own_callback() {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let slot: std::sync::Arc<std::sync::Mutex<Option<ErrlogListenerId>>> =
@@ -2214,7 +2590,7 @@ mod tests {
     /// setting so a caller can restore it, and the setting itself is what
     /// gates the console.
     #[test]
-    #[serial(errlog_console)]
+    #[serial(errlog)]
     fn eltc_reports_the_previous_setting_and_gates_the_console() {
         assert!(errlog_to_console(), "C initialises pvt.toConsole to TRUE");
         assert!(eltc(false), "the previous setting comes back");

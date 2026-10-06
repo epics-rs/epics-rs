@@ -370,6 +370,7 @@ pub fn ioc_log_show(level: u32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fresh_process::with_a_process_of_its_own;
     use serial_test::serial;
     use std::io::Read;
     use std::net::TcpListener;
@@ -430,54 +431,84 @@ mod tests {
         *PREFIX.lock().expect("prefix") = None;
     }
 
+    /// `accept` with a deadline. `TcpListener::accept` has none of its own, so
+    /// a client that never connects is a hang and not a failure — and the
+    /// reason it would not connect is exactly what the fresh process below
+    /// fixes, which is a thing a test should be able to report.
+    fn accept_within(server: &TcpListener, within: Duration) -> std::net::TcpStream {
+        server.set_nonblocking(true).expect("non-blocking listener");
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match server.accept() {
+                Ok((peer, _)) => {
+                    peer.set_nonblocking(false).expect("blocking peer");
+                    return peer;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client must connect within {within:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
     /// The row's own observable: a log server receives the IOC's messages.
     /// A real `TcpListener` stands in for `iocLogServer`, and the bytes it
     /// reads must be the prefix followed by the errlog text.
     #[test]
     #[serial(ioc_log)]
     fn a_log_server_receives_the_ioc_messages_with_the_prefix_prepended() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("log server");
-        let port = server.local_addr().expect("addr").port();
-        unsafe {
-            std::env::set_var("EPICS_IOC_LOG_INET", "127.0.0.1");
-            std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
-        }
-        *PREFIX.lock().expect("prefix") = None;
-        ioc_log_prefix("ioc=TEST ");
-        set_ioc_log_disable(false);
-        ioc_log_init().expect("the client must start");
-
-        let (mut peer, _) = server.accept().expect("the client must connect");
-        peer.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-
-        crate::runtime::log::errlog_printf("bind failed\n");
-        crate::runtime::log::errlog_flush();
-
-        // The restart thread flushes every 5 s; push now so the test does not
-        // have to wait for it.
-        let mut buf = [0u8; 256];
-        let mut got = String::new();
-        for _ in 0..50 {
-            ioc_log_flush();
-            match peer.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    break;
+        with_a_process_of_its_own(
+            "runtime::log_client::tests::a_log_server_receives_the_ioc_messages_with_the_prefix_prepended",
+            || {
+                let server = TcpListener::bind("127.0.0.1:0").expect("log server");
+                let port = server.local_addr().expect("addr").port();
+                unsafe {
+                    std::env::set_var("EPICS_IOC_LOG_INET", "127.0.0.1");
+                    std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
-        }
-        assert_eq!(
-            got, "ioc=TEST bind failed\n",
-            "the server must see the prefix then the message"
-        );
+                *PREFIX.lock().expect("prefix") = None;
+                ioc_log_prefix("ioc=TEST ");
+                set_ioc_log_disable(false);
+                ioc_log_init().expect("the client must start");
 
-        unsafe {
-            std::env::remove_var("EPICS_IOC_LOG_INET");
-            std::env::remove_var("EPICS_IOC_LOG_PORT");
-        }
+                let mut peer = accept_within(&server, Duration::from_secs(10));
+                peer.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+
+                crate::runtime::log::errlog_printf("bind failed\n");
+                crate::runtime::log::errlog_flush();
+
+                // The restart thread flushes every 5 s; push now so the test does not
+                // have to wait for it.
+                let mut buf = [0u8; 256];
+                let mut got = String::new();
+                for _ in 0..50 {
+                    ioc_log_flush();
+                    match peer.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+                assert_eq!(
+                    got, "ioc=TEST bind failed\n",
+                    "the server must see the prefix then the message"
+                );
+
+                unsafe {
+                    std::env::remove_var("EPICS_IOC_LOG_INET");
+                    std::env::remove_var("EPICS_IOC_LOG_PORT");
+                }
+            },
+        );
     }
 
     /// Boundary: `setIocLogDisable 1` on a client that is ALREADY running.
@@ -487,36 +518,41 @@ mod tests {
     #[test]
     #[serial(ioc_log)]
     fn disabling_forwarding_silences_a_client_that_is_already_connected() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("log server");
-        let port = server.local_addr().expect("addr").port();
-        unsafe {
-            std::env::set_var("EPICS_IOC_LOG_INET", "127.0.0.1");
-            std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
-        }
-        *PREFIX.lock().expect("prefix") = None;
-        set_ioc_log_disable(false);
-        ioc_log_init().expect("the client must start");
-        let (mut peer, _) = server.accept().expect("the client must connect");
-        peer.set_read_timeout(Some(Duration::from_millis(300)))
-            .expect("read timeout");
+        with_a_process_of_its_own(
+            "runtime::log_client::tests::disabling_forwarding_silences_a_client_that_is_already_connected",
+            || {
+                let server = TcpListener::bind("127.0.0.1:0").expect("log server");
+                let port = server.local_addr().expect("addr").port();
+                unsafe {
+                    std::env::set_var("EPICS_IOC_LOG_INET", "127.0.0.1");
+                    std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
+                }
+                *PREFIX.lock().expect("prefix") = None;
+                set_ioc_log_disable(false);
+                ioc_log_init().expect("the client must start");
+                let mut peer = accept_within(&server, Duration::from_secs(10));
+                peer.set_read_timeout(Some(Duration::from_millis(300)))
+                    .expect("read timeout");
 
-        set_ioc_log_disable(true);
-        crate::runtime::log::errlog_printf("suppressed\n");
-        crate::runtime::log::errlog_flush();
-        ioc_log_flush();
+                set_ioc_log_disable(true);
+                crate::runtime::log::errlog_printf("suppressed\n");
+                crate::runtime::log::errlog_flush();
+                ioc_log_flush();
 
-        let mut buf = [0u8; 64];
-        let n = peer.read(&mut buf).unwrap_or(0);
-        assert_eq!(
-            n,
-            0,
-            "nothing may reach the server while iocLogDisable is set: {:?}",
-            String::from_utf8_lossy(&buf[..n])
+                let mut buf = [0u8; 64];
+                let n = peer.read(&mut buf).unwrap_or(0);
+                assert_eq!(
+                    n,
+                    0,
+                    "nothing may reach the server while iocLogDisable is set: {:?}",
+                    String::from_utf8_lossy(&buf[..n])
+                );
+                set_ioc_log_disable(false);
+                unsafe {
+                    std::env::remove_var("EPICS_IOC_LOG_INET");
+                    std::env::remove_var("EPICS_IOC_LOG_PORT");
+                }
+            },
         );
-        set_ioc_log_disable(false);
-        unsafe {
-            std::env::remove_var("EPICS_IOC_LOG_INET");
-            std::env::remove_var("EPICS_IOC_LOG_PORT");
-        }
     }
 }

@@ -2,42 +2,16 @@
 
 ## v0.31.0 — 2026-10-06
 
-Minor release. Workspace 0.30.2 -> 0.31.0; the 18
-`[workspace.dependencies]` pins and the hand-written `epics-pva-rs` pin
-in `epics-bridge-rs` move in lockstep. **The pinned toolchain moves
-1.94.0 -> 1.99.0**, which every consumer inherits: `rust-hdf5` 0.7.2's
-zstd backend calls `std::hint::cold_path`, stable since 1.98, and
-0.6.1's `rust-zstd ^0.1` resolves only to a yanked release. The breaking
-changes: `EpicsValue`'s twelve array variants carry `SharedArray<T>`
-(new, `epics-libcom-rs`) instead of `Vec<T>`; `TypedScalarArray`'s carry
-`pvdata::PvArray<T>` instead of `Arc<[T]>`;
+Minor release. **The pinned toolchain moves 1.94.0 -> 1.99.0**, which
+every consumer inherits: `rust-hdf5` 0.7.2's zstd backend calls
+`std::hint::cold_path`, stable since 1.98. The breaking changes:
+`EpicsValue`'s twelve array variants carry `SharedArray<T>` (new,
+`epics-libcom-rs`) and `TypedScalarArray`'s carry `pvdata::PvArray<T>`;
 `NDPluginProcess::process_array` takes `&Arc<NDArray>`;
 `NDGatherConfigure` takes `maxPorts`; and the eight example IOC binaries
-are kebab-case. `epics-rs` gains an `mca` feature, and the
-`epics-tools-rs` entry leaves `[workspace.dependencies]`, where no
-member named it.
+are kebab-case. `epics-rs` gains an `mca` feature.
 
-### A periodic pass processed by a shared helper pool
-
-C's `scanParallelThreads` arrives: one leader per SCAN rate hands its
-record list to a pool of helpers, so a rate whose pass does not fit in
-one thread no longer over-runs. The count is an iocsh var, defaulting to
-eight and capped at CPUs - 1 the way C's zero arm caps it; slower rates
-take a cap rather than a pinned reserve, and a helper sleeps at the
-fastest rate's band. `scanRateThreads` helpers address one rate, and the
-over-run remedy names them.
-
-### Callback bands
-
-The band's submission path comes off a mutex: its queue is taken whole,
-its slot supply is its bound, the ring decides a full band instead of an
-overflow latch, and the push that begins a batch owns its recruitment. A
-worker is woken out of its own sleep rather than out of another
-signaller's claim, and only where the push owes one. `errlog`'s message
-queue and the three convergence locks gain priority inheritance, and
-`epicsEvent` gains the PI-guarded half `epicsMutex` already had.
-
-### areaDetector: one buffer, SIMD kernels
+### areaDetector: one shared buffer, SIMD kernels
 
 An array payload is shared rather than copied end to end — `EpicsValue`
 and `TypedScalarArray` over one buffer, CA and PVA serving it at a fixed
@@ -46,30 +20,40 @@ allocated from the pool it returns to on drop. The kernels run on
 `fearless_simd` lanes behind a `simd` feature (on by default, forwarded
 from `ad-plugins-rs` to `ad-core-rs`): colour conversion and demosaic,
 the rotating transforms, binning, `apply_element_ops`/`run_filter`,
-bitshuffle, the FFT row packing, and stats — variance, range, the
-histograms through slot tables, and row projection for every widening
-type.
+bitshuffle, the FFT row packing, and stats.
+
+### A periodic pass processed by a shared helper pool
+
+C's `scanParallelThreads` arrives: one leader per SCAN rate hands its
+record list to a pool of helpers, so a rate whose pass does not fit in
+one thread no longer over-runs. The count is an iocsh var, defaulting to
+eight and capped at CPUs - 1 the way C's zero arm caps it; slower rates
+take a cap rather than a pinned reserve.
+
+### Callback bands
+
+The band's submission path comes off a mutex: its queue is taken whole,
+its slot supply is its bound, and the ring decides a full band instead
+of an overflow latch. A worker is woken out of its own sleep rather than
+out of another signaller's claim. `errlog`'s message queue and the three
+convergence locks gain priority inheritance, and `epicsEvent` gains the
+PI-guarded half `epicsMutex` already had.
 
 ### netCDF-4 through rust-hdf5
 
 `NDFileNetCDF` wrote netCDF-3 one `write(2)` per element, 45x slower
 than `file_hdf5`; it now writes the netCDF-4 HDF5 container, whose full
 type set also keeps UInt8 and the 64-bit integers intact. Dimensions are
-named with `attach_scale`, `CLASS` and `NAME` are fixed-length strings,
-and `_NCProperties` derives both library versions rather than carrying a
-literal. The `netcdf3` dependency is gone.
+named with `attach_scale`, and the `netcdf3` dependency is gone.
 
 ### errlog
 
 `errlogSetConsole` is ported: `pvt.console` and `pvt.ttyConsole` have
 one owner behind a lock the writer holds across the write, which is the
-guarantee C spends an `errlogSequence()` to get, and `isATTY` comes from
-the stream handed in. `ConsoleSubscriber`'s own lines go to that
-console, so an application that redirects errlog to a file no longer
-gets the CA and PVA diagnostics on stderr. The worker is a
-`MandatoryThread`: C prints and `exit(1)`s when its thread does not
-start, so "no drainer" is no longer a state the closing flush has to
-carry.
+guarantee C spends an `errlogSequence()` to get. `ConsoleSubscriber`'s
+own lines go to that console, so an application that redirects errlog to
+a file no longer gets the CA and PVA diagnostics on stderr. The worker
+is a `MandatoryThread`.
 
 ## v0.30.2 — 2026-09-23
 

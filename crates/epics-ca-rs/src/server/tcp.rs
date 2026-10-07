@@ -435,27 +435,54 @@ const PUT_NOTIFY_BLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 struct PutNotifyCompletion {
     replied: AtomicBool,
     trap_guard: std::sync::Mutex<Option<epics_base_rs::server::access_security::TrapWriteGuard>>,
+    /// Sender of the "this put-callback is answered" signal the channel's next
+    /// WRITE_NOTIFY waits on. [`claim`](Self::claim) moves it into the
+    /// [`PutNotifyReply`] it hands out, so the successor is released when that
+    /// token dies — which is AFTER the reply it owns has been written. C
+    /// signals `client->blockSem` from the tail of `write_notify_reply`
+    /// (`camessage.c:1460`), once every queued reply is committed, for exactly
+    /// that reason: a successor woken at claim time can put its own reply on
+    /// the socket ahead of the predecessor's.
+    settled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Proof that its holder owns a put-callback's one client reply, carrying the
-/// put-log bracket that has to be closed with it. Dropping it without
-/// completing the guard fires the guard's cancel AfterWrite, the balance C
-/// gets from `asTrapWriteAfter` on a cancelled put.
-struct PutNotifyReply(Option<epics_base_rs::server::access_security::TrapWriteGuard>);
+/// two things that must be released with it: the put-log bracket C closes with
+/// `asTrapWriteAfter`, and the signal that frees the channel's waiting
+/// successor. Dropping it without completing the guard fires the guard's
+/// cancel AfterWrite, the balance C gets from `asTrapWriteAfter` on a
+/// cancelled put.
+///
+/// Both ride in the token rather than being released by whoever remembers to,
+/// so every path that can own a reply — the completion tail, the
+/// overdue-predecessor supersede, an unwind between the claim and the frame —
+/// releases them exactly once.
+struct PutNotifyReply {
+    trap_guard: Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+    /// Dropped, never sent: the waiter asks only whether this token died.
+    /// Carrying no value is what lets a sender dropped un-sent — a cancelled
+    /// notify, an unwind, a registration torn down with its channel — end the
+    /// wait exactly as a reply does.
+    _settled: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 impl PutNotifyCompletion {
+    /// The completion and the handle a successor on the same channel waits on.
+    /// One call because the two ends of that signal are only ever created
+    /// together, and the receiver has exactly one owner — the registration
+    /// this completion is installed with ([`InFlightPutNotify::settled`]).
     fn new(
         trap_guard: Option<epics_base_rs::server::access_security::TrapWriteGuard>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            replied: AtomicBool::new(false),
-            trap_guard: std::sync::Mutex::new(trap_guard),
-        })
-    }
-
-    /// C `pciu->pPutNotify->busy`.
-    fn is_busy(&self) -> bool {
-        !self.replied.load(Ordering::Acquire)
+    ) -> (Arc<Self>, tokio::sync::oneshot::Receiver<()>) {
+        let (settled, wait) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                replied: AtomicBool::new(false),
+                trap_guard: std::sync::Mutex::new(trap_guard),
+                settled: std::sync::Mutex::new(Some(settled)),
+            }),
+            wait,
+        )
     }
 
     /// Take this put-callback's reply. `None` for every caller after the
@@ -464,12 +491,18 @@ impl PutNotifyCompletion {
         if self.replied.swap(true, Ordering::AcqRel) {
             return None;
         }
-        Some(PutNotifyReply(
-            self.trap_guard
+        Some(PutNotifyReply {
+            trap_guard: self
+                .trap_guard
                 .lock()
                 .expect("put-notify trap guard poisoned")
                 .take(),
-        ))
+            _settled: self
+                .settled
+                .lock()
+                .expect("put-notify settle signal poisoned")
+                .take(),
+        })
     }
 }
 
@@ -485,6 +518,11 @@ struct InFlightPutNotify {
     /// When it was registered — `camessage.c:1668` measures its 60 s
     /// `blockSem` wait from here.
     busy_since: std::time::Instant,
+    /// Resolves once this put-callback's reply has been written, or once its
+    /// completion is destroyed without one. The channel's next WRITE_NOTIFY
+    /// waits on it; a circuit has a single receive loop, so there is never a
+    /// second waiter and the handle needs no sharing.
+    settled: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Single owner of a channel's in-flight put-callback registration, and of the
@@ -492,18 +530,23 @@ struct InFlightPutNotify {
 ///
 /// C `write_notify_action` (`camessage.c:1660-1706`) does not refuse a
 /// WRITE_NOTIFY that arrives while the channel's previous put-callback is
-/// still busy: it waits on `client->blockSem`, and only when that wait runs
-/// out does it `dbNotifyCancel` the predecessor and send ECA_PUTCBINPROG,
-/// addressed to the PREDECESSOR's saved `msg` (`camessage.c:1701` — the sole
-/// site that status has in all of rsrv). The arriving request is never the one
-/// refused.
+/// still busy, and it does not run it either: the client's receive thread
+/// WAITS on `client->blockSem` until the predecessor has been answered. Only
+/// when that wait runs out does it `dbNotifyCancel` the predecessor and send
+/// ECA_PUTCBINPROG, addressed to the PREDECESSOR's saved `msg`
+/// (`camessage.c:1701` — the sole site that status has in all of rsrv). The
+/// arriving request is never the one refused.
 ///
-/// So the rule here is "emit only on C's timeout path": a predecessor that has
-/// settled, or that is still inside [`PUT_NOTIFY_BLOCK_TIMEOUT`], draws no
-/// frame at all. Serialising concurrent put-callbacks belongs to the database
-/// below, and it queues the second one on the record's restart list rather than
-/// refusing it, so there is no database-level refusal for this layer to relay
-/// and this slot is the server's only source of the status.
+/// That wait is the whole of the ordering guarantee for two put-callbacks on
+/// ONE channel: the second is not submitted until the first's reply is out, so
+/// there is no race for the outbox for anything downstream to decide. Two on
+/// one *record* are a different pair, ordered by the database's restart list.
+///
+/// So the rule here is "emit only on C's timeout path": a predecessor that
+/// settles within [`PUT_NOTIFY_BLOCK_TIMEOUT`] draws no frame at all.
+/// A second put-callback is not a database-level refusal either — the database
+/// queues it on the record's restart list — so this slot is the server's only
+/// source of the status.
 ///
 /// Both receive loops reach this through [`serve_write_head`], which also
 /// performs the registration, so neither can serialise on its own terms.
@@ -521,27 +564,42 @@ impl PutNotifySlot {
     }
 
     /// C `write_notify_action`'s serialisation block (`camessage.c:1660-1706`),
-    /// run before this WRITE_NOTIFY's first side effect. The arriving request
-    /// proceeds on every arm; only a predecessor that has outstayed
-    /// [`PUT_NOTIFY_BLOCK_TIMEOUT`] draws ECA_PUTCBINPROG, and it draws it for
-    /// its own ioid.
-    fn serialize(&self, writer: &Outbox) -> CaResult<()> {
-        // Deregister once the predecessor can no longer be waited on: either it
-        // settled (C's `blockSem` returns at once) or it outstayed the wait. One
-        // still inside the wait stays registered and draws nothing.
-        let expired = {
-            let mut slot = self.inner.lock().expect("put-notify slot poisoned");
-            let done = slot.as_ref().is_some_and(|reg| {
-                !reg.completion.is_busy() || reg.busy_since.elapsed() >= PUT_NOTIFY_BLOCK_TIMEOUT
-            });
-            if done { slot.take() } else { None }
+    /// awaited before this WRITE_NOTIFY's first side effect. The arriving
+    /// request proceeds on every arm, but not until the predecessor is
+    /// answered: only one that has outstayed [`PUT_NOTIFY_BLOCK_TIMEOUT`]
+    /// draws ECA_PUTCBINPROG, and it draws it for its own ioid.
+    ///
+    /// Awaiting here parks this channel's receive loop, which is what C's
+    /// `epicsEventWaitWithTimeout` does to the client's receive thread — so a
+    /// `CA_PROTO_ECHO` queued behind a second put-callback is answered late on
+    /// both. The database below is reached only after this returns.
+    async fn serialize(&self, writer: &Outbox) -> CaResult<()> {
+        // Taken out for the duration of the wait, not consulted in place: this
+        // channel's one receive loop is both the only reader of the slot and
+        // the thread that waits, so holding the registration here removes the
+        // "registered but no longer waitable" state the decision below would
+        // otherwise have to tell apart from a fresh one.
+        let Some(reg) = self.inner.lock().expect("put-notify slot poisoned").take() else {
+            // Nothing registered — C's `else` arm, which allocates a fresh
+            // `pPutNotify` and sends nothing.
+            return Ok(());
         };
-        let Some(reg) = expired else { return Ok(()) };
-        // A settled predecessor has already spent its reply, so `claim` says no
-        // and nothing goes out; only the overdue one reaches the frame. Losing
-        // the claim here is C's second `busy` re-test under `putNotifyLock`
-        // (`camessage.c:1684-1686`): a put that finished mid-decision keeps its real
-        // reply.
+        // `Err` is the signal's sender dropped rather than sent — a cancelled
+        // notify, or a registration destroyed with its channel — which ends
+        // the wait exactly as a reply does. The budget is what is LEFT of C's
+        // 60 s, measured from when the predecessor registered rather than from
+        // this arrival, so a channel cannot extend it by writing again.
+        let _ = epics_base_rs::runtime::task::timeout(
+            PUT_NOTIFY_BLOCK_TIMEOUT.saturating_sub(reg.busy_since.elapsed()),
+            reg.settled,
+        )
+        .await;
+        // Both arms leave nothing further to wait for, and `claim` is what
+        // tells them apart: a predecessor that answered itself has spent its
+        // reply and draws nothing — C's second `busy` re-test under
+        // `putNotifyLock` (`camessage.c:1684-1686`) — while the timed-out one
+        // is still claimable, which is this layer's sole source of
+        // ECA_PUTCBINPROG.
         let Some(reply_token) = reg.completion.claim() else {
             return Ok(());
         };
@@ -4132,7 +4190,11 @@ enum PutPlan {
 ///   [`PendingWriteNotify::rx`] and sends the deferred reply via
 ///   [`finish_write_notify`] — [`run_write_notify_queue`] on the async server,
 ///   [`run_event_task`] on the blocking RTEMS driver. The message thread MUST
-///   NOT block on `rx` (C `camsgtask` never blocks on the put-callback).
+///   NOT block on `rx` — C `camsgtask` never waits for the put-callback it
+///   just forked. It does wait for a PREDECESSOR's on the same channel
+///   ([`PutNotifySlot::serialize`], C's `blockSem`), which is a different
+///   completion and the reason that wait cannot deadlock: the one it waits on
+///   is already with its owner.
 ///
 /// `state` is borrowed shared: the per-channel `put_notify_slot` is `Arc`-
 /// backed, so the supersede/install of an in-flight put-callback needs no
@@ -4308,7 +4370,7 @@ pub(crate) async fn serve_write_head(
         // The deprecated fire-and-forget CA_PROTO_WRITE path is not
         // serialised in C.
         if is_notify {
-            entry.put_notify_slot.serialize(writer)?;
+            entry.put_notify_slot.serialize(writer).await?;
         }
         let result = match &entry.target {
             ChannelTarget::RecordField { record, field } => {
@@ -4600,12 +4662,13 @@ pub(crate) async fn serve_write_head(
     // or the async device kickoff). C `write_notify_action` reaches the
     // same boundary, after `rsrvCheckPut` and before `caNetConvert` /
     // `asTrapWriteWithData` / `dbProcessNotify`. This request proceeds on
-    // every arm; only a predecessor past C's `blockSem` deadline is
-    // cancelled and answered ECA_PUTCBINPROG, for its own ioid. The
-    // deprecated fire-and-forget CA_PROTO_WRITE path is not serialised in
-    // C, so it is left untouched.
+    // every arm, but it WAITS here while the channel's previous put-callback
+    // is still busy — C blocks the client's receive thread on `blockSem` —
+    // and only a predecessor past that deadline is cancelled and answered
+    // ECA_PUTCBINPROG, for its own ioid. The deprecated fire-and-forget
+    // CA_PROTO_WRITE path is not serialised in C, so it is left untouched.
     if is_notify {
-        put_notify_slot.serialize(writer)?;
+        put_notify_slot.serialize(writer).await?;
     }
 
     // The CLAMPED full 32-bit count flows to the decode, the put and the
@@ -4889,7 +4952,7 @@ pub(crate) async fn serve_write_head(
             // than travelling with the receiver, so that whichever path
             // answers this ioid closes it — C keeps `asWritePvt` on
             // `pciu->pPutNotify` for the same reason.
-            let completion = PutNotifyCompletion::new(trap_guard.take());
+            let (completion, settled) = PutNotifyCompletion::new(trap_guard.take());
             // Register HERE, in the head both receive loops run, not in the
             // caller: an unregistered channel silently opts out of the
             // serialisation above, which is exactly how the two loops came to
@@ -4898,6 +4961,7 @@ pub(crate) async fn serve_write_head(
                 completion: completion.clone(),
                 reply,
                 busy_since: std::time::Instant::now(),
+                settled,
             });
             return Ok(WriteHeadOutcome::AsyncPending(PendingWriteNotify {
                 rx,
@@ -5043,22 +5107,38 @@ impl PendingWriteNotify {
     /// `chain` is what the completion receiver yielded: `Err` means the sender
     /// was dropped without firing (processing aborted), which surfaces as
     /// ECA_PUTFAIL so the client never sees a false success — C rsrv.
+    ///
+    /// `commit` is how THIS driver gets the queued reply into the circuit's
+    /// wire order, and it is a parameter rather than something the caller runs
+    /// afterwards because the channel's next put-callback is released by the
+    /// reply token dying — which happens here, after `commit` has returned. C
+    /// signals `blockSem` only after `cas_commit_msg`
+    /// (`camessage.c:1452-1460`), and for the same reason: a successor
+    /// released before the commit can reach the socket first. On the async
+    /// server the shared outbox this pushed to IS the single writer's queue,
+    /// so its `commit` has nothing to do; the blocking driver stages into a
+    /// private outbox and has to drain it under the send lock. `false` reports
+    /// the peer gone.
     pub(crate) fn settle(
         &mut self,
         chain: Result<(), tokio::sync::oneshot::error::RecvError>,
         writer: &Outbox,
-    ) -> CaResult<()> {
+        commit: impl FnOnce() -> bool,
+    ) -> CaResult<bool> {
         // Losing the claim means a predecessor-timeout supersede already
         // answered this ioid with ECA_PUTCBINPROG and closed its put-log
         // bracket with it. One ioid, one reply.
         let Some(mut owned) = self.completion.claim() else {
-            return Ok(());
+            return Ok(commit());
         };
         let final_status = match chain {
             Ok(()) => self.eca_status,
             Err(_) => ECA_PUTFAIL,
         };
-        finish_write_notify(&mut owned.0, final_status, &self.reply, writer)
+        finish_write_notify(&mut owned.trap_guard, final_status, &self.reply, writer)?;
+        // `owned` — and with it the successor's release — dies at the end of
+        // this scope, after the commit.
+        Ok(commit())
     }
 }
 
@@ -6545,20 +6625,26 @@ pub(crate) async fn run_event_task<W>(
                 // the decision about whether a reply is still owed are one copy,
                 // not two.
                 let mut p = pending_writes.remove(idx);
-                if p.settle(res, &ev_outbox).is_err() {
+                // Draining INSIDE `settle` is what keeps this driver's two
+                // socket writers in order. Each stages into its own outbox and
+                // they race for the send lock, so a push is not a commit here:
+                // the dispatch thread, released by this reply, would otherwise
+                // be free to take the lock and put its own put-callback's reply
+                // on the wire first.
+                let committed = p.settle(res, &ev_outbox, || {
+                    while let Some(frame) = ev_drain.try_next() {
+                        if write_frame(&frame).is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                match committed {
                     // Encoding the reply failed (16k-array boundary): the reply
                     // is unshippable, drop this completion and keep serving.
-                    continue;
-                }
-                let mut peer_gone = false;
-                while let Some(frame) = ev_drain.try_next() {
-                    if write_frame(&frame).is_err() {
-                        peer_gone = true;
-                        break;
-                    }
-                }
-                if peer_gone {
-                    break;
+                    Err(_) => continue,
+                    Ok(false) => break,
+                    Ok(true) => {}
                 }
             }
         }
@@ -7409,7 +7495,9 @@ async fn run_write_notify_queue(
                 let mut p = pending.remove(idx);
                 // An unshippable reply (16k-array boundary) is dropped, as it
                 // is on the blocking driver's owner; the circuit keeps serving.
-                let _ = p.settle(res, &outbox);
+                // The commit is a no-op: `outbox` is the one writer task's
+                // queue, so the push `settle` made is already the wire order.
+                let _ = p.settle(res, &outbox, || true);
             }
         }
     }
@@ -7578,12 +7666,59 @@ mod write_notify_queue_tests {
                 req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
-            completion: PutNotifyCompletion::new(None),
+            completion: PutNotifyCompletion::new(None).0,
             sid,
             // A simple-PV put: nothing parks a notify, so nothing to cancel.
             cancel: None,
         };
         (p, tx)
+    }
+
+    /// A channel's next put-callback is released by [`PendingWriteNotify::settle`]
+    /// only AFTER the driver's commit has run, because on the blocking driver
+    /// the commit — not the outbox push — is what fixes the wire order.
+    // RTEMS-EXEC-MODEL-ALLOW(1): measured — passes under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`; it awaits nothing and needs no
+    // reactor.
+    #[tokio::test]
+    async fn the_commit_runs_before_the_successor_is_released() {
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let (completion, mut settled) = PutNotifyCompletion::new(None);
+        let mut p = PendingWriteNotify {
+            rx: tokio::sync::oneshot::channel().1,
+            eca_status: crate::protocol::ECA_NORMAL,
+            reply: WriteNotifyReply {
+                write_type: 6,
+                write_count: 1,
+                ioid: 0x1111,
+                req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+            completion,
+            sid: 1,
+            cancel: None,
+        };
+        let committed = p.settle(Ok(()), &outbox, || {
+            assert!(
+                matches!(
+                    settled.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the successor must still be waiting while the reply is being committed"
+            );
+            true
+        });
+        assert!(
+            committed.expect("encode"),
+            "the commit reported the peer live"
+        );
+        assert!(
+            matches!(
+                settled.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "and released once it is committed"
+        );
     }
 
     /// The ioid of every WRITE_NOTIFY frame the outbox holds, in wire order.
@@ -7721,11 +7856,21 @@ mod put_notify_serialize_tests {
     //! `camessage.c:1701`). One case per boundary — registered vs not,
     //! inside the wait vs past it, still busy vs already answered.
     use super::{
-        ECA_PUTCBINPROG, InFlightPutNotify, PUT_NOTIFY_BLOCK_TIMEOUT, PutNotifyCompletion,
-        PutNotifySlot, WriteNotifyReply,
+        ECA_NORMAL, ECA_PUTCBINPROG, InFlightPutNotify, PUT_NOTIFY_BLOCK_TIMEOUT,
+        PutNotifyCompletion, PutNotifySlot, ReplyContext, WriteNotifyReply,
+        send_put_notify_response,
     };
     use crate::server::outbox::{Outbox, OutboxDrain};
-    use std::time::Instant;
+    use epics_base_rs::runtime::task::{block_on_sync, timeout};
+    use std::time::{Duration, Instant};
+
+    /// Drive the gate to completion on this test thread. `park_on`, since no
+    /// runtime is entered here — the same way the blocking driver runs it.
+    fn serialize(slot: &PutNotifySlot, outbox: &Outbox) {
+        block_on_sync(slot.serialize(outbox))
+            .expect("no async runtime on this thread")
+            .expect("serialize");
+    }
 
     fn live_outbox() -> (Outbox, OutboxDrain) {
         crate::server::outbox::channel()
@@ -7751,13 +7896,16 @@ mod put_notify_serialize_tests {
         }
     }
 
-    /// A slot holding one registered put-callback, registered `age` ago.
-    fn slot_registered_for(ioid: u32, age: std::time::Duration) -> PutNotifySlot {
+    /// A slot holding one registered put-callback, registered `age` ago and
+    /// never answered.
+    fn slot_registered_for(ioid: u32, age: Duration) -> PutNotifySlot {
+        let (completion, settled) = PutNotifyCompletion::new(None);
         let slot = PutNotifySlot::default();
         slot.install(InFlightPutNotify {
-            completion: PutNotifyCompletion::new(None),
+            completion,
             reply: reply_shape(ioid),
             busy_since: Instant::now() - age,
+            settled,
         });
         slot
     }
@@ -7776,36 +7924,95 @@ mod put_notify_serialize_tests {
     #[test]
     fn an_unregistered_channel_draws_no_frame() {
         let (outbox, mut drain) = live_outbox();
-        PutNotifySlot::default().serialize(&outbox).unwrap();
+        serialize(&PutNotifySlot::default(), &outbox);
         assert!(drain_frames(&mut drain).is_empty());
     }
 
-    /// Boundary: registered, still busy, still inside the wait. This is the
-    /// arm the port used to answer with ECA_PUTCBINPROG on every arrival; C
-    /// sends nothing until `epicsEventWaitWithTimeout` actually times out.
+    /// Boundary: registered, still busy, still inside the wait. C's
+    /// `epicsEventWaitWithTimeout` has not returned, so the arriving request
+    /// has not reached its first side effect — the gate must not return.
     #[test]
-    fn a_predecessor_inside_the_wait_draws_no_frame() {
+    fn a_predecessor_inside_the_wait_holds_the_arrival() {
         let (outbox, mut drain) = live_outbox();
         let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
-        slot.serialize(&outbox).unwrap();
+        let proceeded = block_on_sync(timeout(Duration::from_millis(200), slot.serialize(&outbox)))
+            .expect("no async runtime on this thread");
+        assert!(
+            proceeded.is_err(),
+            "the arrival must not proceed while the channel's put-callback is busy"
+        );
         assert!(
             drain_frames(&mut drain).is_empty(),
             "C sends nothing while the blockSem wait is still running"
         );
     }
 
-    /// ...and it stays registered, so it is still the predecessor a later
-    /// request measures against rather than being silently forgotten.
+    /// The wait ends when the predecessor's reply does — and the reply is on
+    /// the outbox first, which is the ordering the gate exists for. Answering
+    /// from another thread is the real shape: the completion tail runs on the
+    /// write-notify queue task (async server) or the event thread (blocking
+    /// driver), never on the receive loop that waits here.
     #[test]
-    fn a_predecessor_inside_the_wait_stays_registered() {
+    fn the_predecessors_reply_precedes_the_arrivals() {
         let (outbox, mut drain) = live_outbox();
-        let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
-        slot.serialize(&outbox).unwrap();
-        slot.serialize(&outbox).unwrap();
-        assert!(drain_frames(&mut drain).is_empty());
-        assert!(
-            slot.inner.lock().unwrap().is_some(),
-            "a predecessor still inside the wait is not deregistered"
+        let (completion, settled) = PutNotifyCompletion::new(None);
+        let slot = PutNotifySlot::default();
+        slot.install(InFlightPutNotify {
+            completion: completion.clone(),
+            reply: reply_shape(0x1111),
+            busy_since: Instant::now(),
+            settled,
+        });
+
+        let answerer = {
+            let outbox = outbox.clone();
+            std::thread::spawn(move || {
+                // Long enough that the gate below is parked, not merely
+                // entered; the assertion holds either way, this is what makes
+                // the parked path the one measured.
+                std::thread::sleep(Duration::from_millis(50));
+                let _owned = completion.claim().expect("the completion path replies");
+                send_put_notify_response(
+                    &outbox,
+                    epics_base_rs::types::DBR_LONG,
+                    1,
+                    ECA_NORMAL,
+                    0x1111,
+                    ReplyContext {
+                        req_hdr: crate::protocol::CaHeader::new(
+                            crate::protocol::CA_PROTO_WRITE_NOTIFY,
+                        ),
+                        client_minor: crate::protocol::CA_MINOR_VERSION,
+                    },
+                )
+                .expect("push the predecessor reply");
+                // `_owned` dies here, AFTER the push — that drop is the wake.
+            })
+        };
+        serialize(&slot, &outbox);
+        // What the released request does next, standing in for its own put.
+        send_put_notify_response(
+            &outbox,
+            epics_base_rs::types::DBR_LONG,
+            1,
+            ECA_NORMAL,
+            0x2222,
+            ReplyContext {
+                req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .expect("push the arrival's reply");
+        answerer.join().expect("answerer");
+
+        let ioids: Vec<u32> = drain_frames(&mut drain)
+            .iter()
+            .map(|f| status_and_ioid(f).1)
+            .collect();
+        assert_eq!(
+            ioids,
+            vec![0x1111, 0x2222],
+            "the predecessor's reply must already be queued when the arrival proceeds"
         );
     }
 
@@ -7815,7 +8022,7 @@ mod put_notify_serialize_tests {
     fn an_overdue_predecessor_draws_putcbinprog_for_its_own_ioid() {
         let (outbox, mut drain) = live_outbox();
         let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT);
-        slot.serialize(&outbox).unwrap();
+        serialize(&slot, &outbox);
 
         let frames = drain_frames(&mut drain);
         assert_eq!(frames.len(), 1, "exactly one reply");
@@ -7836,16 +8043,17 @@ mod put_notify_serialize_tests {
     #[test]
     fn an_already_answered_predecessor_draws_no_second_frame() {
         let (outbox, mut drain) = live_outbox();
-        let completion = PutNotifyCompletion::new(None);
+        let (completion, settled) = PutNotifyCompletion::new(None);
         assert!(completion.claim().is_some(), "the completion path replies");
         let slot = PutNotifySlot::default();
         slot.install(InFlightPutNotify {
             completion,
             reply: reply_shape(0x55),
             busy_since: Instant::now() - PUT_NOTIFY_BLOCK_TIMEOUT,
+            settled,
         });
 
-        slot.serialize(&outbox).unwrap();
+        serialize(&slot, &outbox);
         assert!(
             drain_frames(&mut drain).is_empty(),
             "no second reply for an already-answered ioid"
@@ -7853,19 +8061,21 @@ mod put_notify_serialize_tests {
     }
 
     /// A settled predecessor is deregistered on the way past, so the slot
-    /// tracks "may still be busy" and nothing else.
+    /// tracks "may still be busy" and nothing else. Its reply is already
+    /// spent, so the wait returns at once rather than running out C's 60 s.
     #[test]
     fn a_settled_predecessor_is_deregistered() {
         let (outbox, _drain) = live_outbox();
-        let completion = PutNotifyCompletion::new(None);
+        let (completion, settled) = PutNotifyCompletion::new(None);
         completion.claim();
         let slot = PutNotifySlot::default();
         slot.install(InFlightPutNotify {
             completion,
             reply: reply_shape(0x55),
             busy_since: Instant::now(),
+            settled,
         });
-        slot.serialize(&outbox).unwrap();
+        serialize(&slot, &outbox);
         assert!(slot.inner.lock().unwrap().is_none());
     }
 
@@ -7874,11 +8084,17 @@ mod put_notify_serialize_tests {
     /// closed by different paths.
     #[test]
     fn claim_grants_a_single_reply_owner() {
-        let completion = PutNotifyCompletion::new(None);
-        assert!(completion.is_busy(), "a fresh put-callback is busy");
+        let (completion, settled) = PutNotifyCompletion::new(None);
         assert!(completion.claim().is_some(), "the first caller owns it");
         assert!(completion.claim().is_none(), "every later caller does not");
-        assert!(!completion.is_busy(), "and it is no longer busy");
+        // The token the first caller took has been dropped, which is what the
+        // channel's successor waits for — C `epicsEventSignal(blockSem)`.
+        assert!(
+            block_on_sync(timeout(Duration::from_millis(200), settled))
+                .expect("no async runtime on this thread")
+                .is_ok(),
+            "answering a put-callback releases the channel's next one"
+        );
     }
 
     /// Cancelling an overdue predecessor fires its cancel AfterWrite, so the
@@ -7916,14 +8132,16 @@ mod put_notify_serialize_tests {
             rule_was_trap: true,
             cancel_status: "cancel".to_string(),
         });
+        let (completion, settled) = PutNotifyCompletion::new(Some(guard));
         let slot = PutNotifySlot::default();
         slot.install(InFlightPutNotify {
-            completion: PutNotifyCompletion::new(Some(guard)),
+            completion,
             reply: reply_shape(0x77),
             busy_since: Instant::now() - PUT_NOTIFY_BLOCK_TIMEOUT,
+            settled,
         });
 
-        slot.serialize(&live_outbox().0).unwrap();
+        serialize(&slot, &live_outbox().0);
 
         assert_eq!(
             events.lock().unwrap().clone(),

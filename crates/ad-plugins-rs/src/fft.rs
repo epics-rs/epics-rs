@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -55,12 +56,18 @@ pub fn next_pow2(n: usize) -> usize {
 }
 
 /// Allocate the Float64 output for `src` from `pool`, as C's
-/// `pNDArrayPool->alloc(rank, dims, NDFloat64, 0, 0)` (NDPluginFFT.cpp:212),
-/// and copy the frame identity over. The caller writes every element.
+/// `pNDArrayPool->alloc(rank, dims, NDFloat64, 0, 0)` (NDPluginFFT.cpp:212).
+/// The caller writes every element.
+///
+/// A spectrum is not the input frame, so it does not inherit the input's
+/// identity: C stamps the output from the time source and the wall clock
+/// (`getTimeStamp(&epicsTS)`, `timeStamp = now`, NDPluginFFT.cpp:216-218), and
+/// numbers it from the plugin's own counter. `unique_id` stays at the pool
+/// default here because [`FFTProcessor`] owns that counter and mints the number
+/// at the one point an output leaves the plugin.
 fn float64_output(pool: &NDArrayPool, src: &NDArray, dims: Vec<NDDimension>) -> ADResult<NDArray> {
     let mut arr = pool.alloc(dims, NDDataType::Float64)?;
-    arr.unique_id = src.unique_id;
-    arr.copy_time_stamps_from(src);
+    arr.update_time_stamps_now();
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }
@@ -391,6 +398,10 @@ struct FFTState {
 
 pub struct FFTProcessor {
     state: Mutex<FFTState>,
+    /// C `uniqueId_` (NDPluginFFT.h:83, zeroed at NDPluginFFT.cpp:54): the
+    /// plugin's own output numbering, post-incremented once per emitted array
+    /// (`:219`), so the first output is 0 regardless of the input's id.
+    unique_id: AtomicI32,
     /// Plan cache, shared across frames and across pool workers. Locked only
     /// for the plan lookup itself (one or two per frame), never across a
     /// transform.
@@ -412,6 +423,7 @@ impl FFTProcessor {
                 cached_dims: Vec::new(),
                 time_per_point: 1.0,
             }),
+            unique_id: AtomicI32::new(0),
             planner: Mutex::new(FftPlanner::new()),
             params: FFTParamIndices::default(),
         }
@@ -795,6 +807,10 @@ impl NDPluginProcess for FFTProcessor {
                         updates.push(ParamUpdate::float64_array(idx, mags.clone()));
                     }
                 }
+                // C `pArrayOut->uniqueId = uniqueId_++` (NDPluginFFT.cpp:219),
+                // after the averaging pass and immediately before the array
+                // leaves the plugin. This is the only site that writes it.
+                out.unique_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
                 let mut r = ProcessResult::arrays(vec![Arc::new(out)]);
                 r.param_updates = updates;
                 r
@@ -882,7 +898,7 @@ mod tests {
     /// the registered time source feeds `epicsTS` — so the source is stamped
     /// with values that cannot be derived from each other.
     #[test]
-    fn the_float64_output_carries_the_whole_timestamp_pair() {
+    fn the_float64_output_is_stamped_fresh_not_from_the_input() {
         let mut src = NDArray::with_data(
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataBuffer::F64(vec![0.0; 8]),
@@ -893,11 +909,15 @@ mod tests {
         let pool = NDArrayPool::new(0);
         let out = float64_output(&pool, &src, src.dims.clone()).unwrap();
 
-        assert_eq!(out.timestamp, src.timestamp, "epicsTS was dropped");
-        assert_eq!(
+        // C stamps the spectrum from the time source and the wall clock
+        // (NDPluginFFT.cpp:216-218); it never carries the input frame's.
+        assert_ne!(out.timestamp, src.timestamp, "epicsTS came from the input");
+        assert_ne!(
             out.time_stamp, src.time_stamp,
-            "the derived double was dropped"
+            "the derived double came from the input"
         );
+        // The pair still derives from one source, so it cannot disagree.
+        assert_eq!(out.time_stamp, out.timestamp.as_f64());
     }
 
     /// The paired-row and half-column transforms against one complex
@@ -1304,17 +1324,58 @@ mod tests {
         }
     }
 
+    /// C `NDPluginFFT::doArrayCallbacks` (NDPluginFFT.cpp:212-220) allocates a
+    /// bare array, copies the attribute list, stamps it fresh and numbers it
+    /// `uniqueId_++` — so a spectrum carries the input's attributes but neither
+    /// its id nor its timestamps.
     #[test]
-    fn test_fft_preserves_metadata() {
+    fn test_fft_output_identity_is_the_plugins_not_the_inputs() {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
         arr.unique_id = 42;
+        arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 7, nsec: 11 };
+        arr.time_stamp = 123.5;
+        arr.attributes
+            .add(ad_core_rs::attributes::NDAttribute::new_static(
+                "ColorMode",
+                "Color mode",
+                ad_core_rs::attributes::NDAttrSource::Driver,
+                ad_core_rs::attributes::NDAttrValue::Int32(0),
+            ));
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v[0] = 1.0;
         }
 
         let result = fft_1d_rows(&pool(), &arr, false).unwrap().unwrap();
-        assert_eq!(result.unique_id, 42);
-        assert_eq!(result.timestamp, arr.timestamp);
+        assert_ne!(result.unique_id, 42, "the input's id was inherited");
+        assert_ne!(result.timestamp, arr.timestamp);
+        assert_ne!(result.time_stamp, arr.time_stamp);
+        assert!(result.attributes.get("ColorMode").is_some());
+    }
+
+    /// The id comes off the plugin's own counter and runs 0, 1, 2 — C's
+    /// `uniqueId_` is zeroed in the constructor (NDPluginFFT.cpp:54) and
+    /// post-incremented per emitted array (`:219`), so it is independent of
+    /// whatever the inputs were numbered.
+    #[test]
+    fn the_processor_numbers_its_outputs_from_its_own_counter() {
+        let proc = FFTProcessor::new();
+        let pool = NDArrayPool::new(0);
+
+        let ids: Vec<i32> = [100, 7, 3]
+            .into_iter()
+            .map(|input_id| {
+                let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+                arr.unique_id = input_id;
+                if let NDDataBuffer::F64(ref mut v) = arr.data {
+                    v.iter_mut().for_each(|s| *s = 2.0);
+                }
+                let r = proc.process_array(&Arc::new(arr), &pool);
+                assert_eq!(r.output_arrays.len(), 1);
+                r.output_arrays[0].unique_id
+            })
+            .collect();
+
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[test]

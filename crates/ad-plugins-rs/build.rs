@@ -57,10 +57,20 @@ fn main() {
 fn emit_rust_hdf5_pin() {
     println!("cargo::rerun-if-changed=Cargo.toml");
     let manifest = std::fs::read_to_string("Cargo.toml").expect("cannot read Cargo.toml");
+    // Parsed, not line-matched: `cargo package` rewrites the inline table this
+    // crate declares into a `[dependencies.rust-hdf5]` section whose `version`
+    // sits on its own line, so a scan for a line starting `rust-hdf5` finds
+    // nothing in the packaged manifest and every `cargo publish` of this crate
+    // failed to verify. The dependency table is the pin's one source of truth
+    // in either shape.
     let pin = manifest
-        .lines()
-        .find(|l| l.trim_start().starts_with("rust-hdf5"))
-        .and_then(|l| l.split_once("version")?.1.split('"').nth(1))
-        .expect("Cargo.toml declares no `rust-hdf5 = { version = \"..\" }` to derive from");
+        .parse::<toml::Table>()
+        .expect("Cargo.toml is not valid TOML")
+        .get("dependencies")
+        .and_then(|d| d.get("rust-hdf5"))
+        .and_then(|d| d.get("version"))
+        .and_then(|v| v.as_str())
+        .expect("Cargo.toml declares no `rust-hdf5` dependency version to derive from")
+        .to_string();
     println!("cargo::rustc-env=RUST_HDF5_PIN={pin}");
 }

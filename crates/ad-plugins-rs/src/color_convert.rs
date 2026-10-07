@@ -72,7 +72,7 @@ pub fn bayer_to_rgb1(
         _ => unreachable!("the output was allocated in the source type"),
     }
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     Ok(Some(arr))
 }
@@ -974,7 +974,7 @@ fn false_color_mono_to_rgb1(
         _ => unreachable!("the output was allocated in the source type"),
     }
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     Ok(Some(arr))
 }
@@ -1166,6 +1166,36 @@ mod tests {
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
+    }
+
+    /// Both halves of the timestamp pair travel to the output.
+    ///
+    /// The two are independent in C — a hardware clock feeds `timeStamp` while
+    /// the registered time source feeds `epicsTS` — so the source is stamped
+    /// with values that cannot be derived from each other, and the output must
+    /// carry each. C copies the pair through `NDArrayPool::copy`
+    /// (NDArrayPool.cpp:284-285); both of this module's builders are that copy.
+    #[test]
+    fn both_builders_carry_the_whole_timestamp_pair() {
+        let mut src = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        src.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 7, nsec: 11 };
+        src.time_stamp = 123.5;
+
+        for out in [
+            bayer_to_rgb1(&pool(), &src, NDBayerPattern::RGGB)
+                .unwrap()
+                .unwrap(),
+            false_color_mono_to_rgb1(&pool(), &src, 1).unwrap().unwrap(),
+        ] {
+            assert_eq!(out.timestamp, src.timestamp, "epicsTS was dropped");
+            assert_eq!(
+                out.time_stamp, src.time_stamp,
+                "the derived double was dropped"
+            );
+        }
     }
 
     #[test]

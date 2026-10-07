@@ -1,15 +1,16 @@
-// RTEMS-EXEC-MODEL-ALLOW(16): the teardown test drives the scheduler from a
+// RTEMS-EXEC-MODEL-ALLOW(17): the teardown test drives the scheduler from a
 // tokio task (spawn/abort are its cancellation instrument) and the seven
 // ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
 // tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
 // the tokio test runtime only as the start-context `ScanOwner::start`
 // requires; the scan/owner threads under test go through the exec seam
 // (`block_on_sync` → `park_on`) when the exec backend is on. The
-// eight parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
+// nine parallel-pass tests (PHAS order, no-helper walk, the two slow-rate
 // cap boundaries, the two dedicated-helper boundaries, the idle-band boundary,
-// and the config gate) want a runtime only for the `.await` that loads their
-// records — the leader and its helpers are `MandatoryThread`s either way. All
-// sixteen verified passing under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+// the mid-pass list-growth boundary, and the config gate) want a runtime only
+// for the `.await` that loads their records — the leader and its helpers are
+// `MandatoryThread`s either way. All seventeen verified passing under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -668,22 +669,45 @@ struct PeriodicDuty {
     ind: usize,
     pass: Arc<PeriodicPass>,
     /// `None` when no helpers were configured, which is every IOC that has
-    /// not called `scanParallelThreads` — then [`periodic_pass`] is the old
-    /// sequential walk, over a snapshot.
+    /// not called `scanParallelThreads`.
     pool: Option<Arc<HelperPool>>,
 }
 
-/// One pass over a rate's records, PHAS group by PHAS group — C
-/// `periodicPass` (`dbScan.c:1189-1240`).
+impl PeriodicDuty {
+    /// Whether any helper can claim from this rate's groups — C
+    /// `nHelpers && periodHelpers[ind]` (`dbScan.c:1249`). False means the
+    /// leader is the only thread that will ever run this rate, and
+    /// [`periodic_pass`] walks the live list instead of a snapshot.
+    fn helpers_serve_this_rate(&self) -> bool {
+        self.pool
+            .as_ref()
+            .is_some_and(|pool| pool.serves_rate(self.ind))
+    }
+}
+
+/// One pass over a rate's records — C `periodicPass` (`dbScan.c:1249-1281`).
 ///
-/// The leader takes slots itself, so with no helpers this is a sequential walk
-/// and the pass costs one group barrier per PHAS that nobody waits at. A
-/// record added to the list during the pass waits for the next one, as it does
+/// A rate no helper serves walks its live list, which is what every IOC that
+/// has not called `scanParallelThreads` does and what the event lists do: the
+/// snapshot exists only because a *claim* has to name a position, and with one
+/// thread there are no claims. It is not an optimisation — the live walk is
+/// the stronger semantics. Its cursor re-finds its place whenever the list
+/// changes under it, so a record that an earlier record's processing adds to
+/// this list is reached in THIS pass, where a snapshot pass makes it wait for
+/// the next one.
+///
+/// With helpers the pass works on a snapshot, PHAS group by PHAS group. The
+/// leader publishes one group at a time and takes slots from it like any
+/// helper; a record added during the pass waits for the next one, as it does
 /// in C.
 fn periodic_pass(db: &PvDatabase, duty: &PeriodicDuty) {
     let Some(list) = duty.scan_type.scan_list() else {
         return;
     };
+    if !duty.helpers_serve_this_rate() {
+        db.scan_list_sweep(list, FACILITY);
+        return;
+    }
     let pass = &duty.pass;
     let snapshot = db.scan_pass_snapshot(list);
     if snapshot.is_empty() {
@@ -691,17 +715,11 @@ fn periodic_pass(db: &PvDatabase, duty: &PeriodicDuty) {
     }
     if snapshot.len() > SP_IDX_MASK {
         // More records than a slot index holds — 32-bit targets only, where
-        // the index is 20 bits. The leader walks the snapshot alone, so
-        // nothing has to be published and no claim can be made.
-        // C `dbScan.c:1198-1205`.
-        let mut visited = crate::server::database::ProcStack::new();
-        for slot in 0..snapshot.len() {
-            if !run_isolated(FACILITY, || {
-                db.process_scan_slot(&snapshot, slot, pass.scan, &mut visited)
-            }) {
-                visited = crate::server::database::ProcStack::new();
-            }
-        }
+        // the index is 20 bits. No claim can be made against a limit that
+        // cannot hold the end of the group, so the leader runs the rate alone
+        // for this pass, through the same live walk the unserved rates use.
+        // C `dbScan.c:1249-1252` falls back to `scanList()` here too.
+        db.scan_list_sweep(list, FACILITY);
         return;
     }
 
@@ -726,14 +744,14 @@ fn periodic_pass(db: &PvDatabase, duty: &PeriodicDuty) {
         if start == 0 {
             pass.cursor.store(sp_pack(generation, 0), Ordering::Release);
         }
+        // `helpers_serve_this_rate` is what got us here, so the pool is
+        // present; one slot of the group is the leader's own, so the group
+        // wants help for the rest of them and for no more than that — and,
+        // for any rate but the one the pool keeps helpers free for, no more
+        // than its own dedicated helpers plus the room the cap still has
+        // (`dbScan.c:1271-1286`). The want bit goes up regardless, so a
+        // helper already awake and walking the rates still finds this group.
         if let Some(pool) = &duty.pool {
-            // One slot of the group is the leader's own, so the group wants
-            // help for the rest of them and for no more than that — and, for
-            // any rate but the one the pool keeps helpers free for, no more
-            // than its own dedicated helpers plus the room the cap still has
-            // (`dbScan.c:1271-1286`). The want bit goes up regardless, so a
-            // helper already awake and walking the rates still finds this
-            // group.
             if end - start > 1 {
                 let mut want = end - start - 1;
                 if duty.ind != pool.fast_rate {
@@ -839,6 +857,12 @@ struct HelperPool {
     /// (`dbScan.c:175`). A leader adds its own to what the cap allows, since
     /// they are not under the cap.
     dedicated: Box<[usize]>,
+    /// Whether ANY helper serves each rate — C `periodHelpers[]`
+    /// (`dbScan.c:174`), built in `spawnHelpers` and read for its truthiness
+    /// alone (`dbScan.c:1249`, `:1443`). A pool helper serves every rate, so
+    /// this is false only for a rate that asked for no helpers of its own in
+    /// an IOC that configured no pool.
+    served: Box<[bool]>,
     /// One per helper, dedicated ones first — C `helpers[]` (`dbScan.c:173`).
     ///
     /// That order is load-bearing: [`Self::wake`] walks it from the front, so
@@ -905,6 +929,11 @@ impl HelperPool {
     /// [`Self::fast_rate`] — half of what a leader of such a rate caps its
     /// wake-up count by (`dbScan.c:1277-1283`), the other half being that
     /// rate's own [`Self::dedicated`] helpers.
+    /// C `periodHelpers[ind] != 0` (`dbScan.c:1249`).
+    fn serves_rate(&self, ind: usize) -> bool {
+        self.served.get(ind).copied().unwrap_or(false)
+    }
+
     fn slow_room(&self) -> usize {
         self.slow_cap
             .saturating_sub(self.slow_busy.load(Ordering::Acquire))
@@ -1140,6 +1169,12 @@ fn spawn_helpers(
             Serves::Pool => passes[passes.len() - 1].prio,
         })
         .collect();
+    // C `spawnHelpers` builds `periodHelpers[]` from the same `serves` masks
+    // it just handed the helpers (`dbScan.c:1424-1431`).
+    let served: Vec<bool> = (0..passes.len())
+        .map(|ind| kinds.iter().any(|k| k.mask() & (1usize << ind) != 0))
+        .collect();
+
     let pool = Arc::new(HelperPool {
         wanted: AtomicUsize::new(0),
         shutdown: AtomicBool::new(false),
@@ -1147,6 +1182,7 @@ fn spawn_helpers(
         slow_cap,
         slow_busy: AtomicUsize::new(0),
         dedicated: dedicated.into_boxed_slice(),
+        served: served.into_boxed_slice(),
         helpers: kinds
             .into_iter()
             .map(|serves| Helper {
@@ -2242,6 +2278,172 @@ mod tests {
                 threads.len(),
                 1,
                 "a pass with no pool ran on more than the leader: {threads:?}"
+            );
+        }
+
+        /// Blocks inside `process` until the test lets go, so a list change
+        /// can be made with the pass provably in flight.
+        struct GateRecord {
+            entered: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl Record for GateRecord {
+            fn record_type(&self) -> &'static str {
+                "scan_live_gate"
+            }
+            fn process(&mut self) -> CaResult<ProcessOutcome> {
+                self.entered.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(ProcessOutcome::complete())
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                (name == "VAL").then_some(EpicsValue::Double(0.0))
+            }
+            fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &[]
+            }
+        }
+
+        /// The record the list gains mid-pass; it counts its own runs and
+        /// nothing else.
+        struct CountRecord {
+            runs: Arc<AtomicI32>,
+        }
+
+        impl Record for CountRecord {
+            fn record_type(&self) -> &'static str {
+                "scan_live_count"
+            }
+            fn process(&mut self) -> CaResult<ProcessOutcome> {
+                self.runs.fetch_add(1, Ordering::AcqRel);
+                Ok(ProcessOutcome::complete())
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                (name == "VAL").then_some(EpicsValue::Double(0.0))
+            }
+            fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &[]
+            }
+        }
+
+        /// Put `name` on `scan`'s list at PHAS 0, the way `dbPutField` on a
+        /// SCAN field does.
+        fn join_list(db: &Arc<PvDatabase>, name: &str, scan: ScanType) {
+            db.get_record(name)
+                .expect("the record just loaded")
+                .write()
+                .common
+                .scan = scan;
+            db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
+        }
+
+        /// Run exactly ONE pass of `fast` over a list holding a blocking
+        /// record, add a second record to that list while the first is still
+        /// inside `process`, and report how many times the second ran.
+        async fn late_record_runs_in_the_same_pass(with_helpers: bool) -> i32 {
+            let fast = ScanType::SEC01;
+            let db = Arc::new(PvDatabase::new());
+            let entered = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let runs = Arc::new(AtomicI32::new(0));
+
+            // `a_gate` sorts ahead of `z_late` at the same PHAS, so the walk
+            // reaches the gate first and the late record is still ahead of it.
+            db.add_record(
+                "a_gate",
+                Box::new(GateRecord {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .await
+            .expect("load the gate record");
+            join_list(&db, "a_gate", fast);
+
+            let rates = periodic_scans();
+            let passes = passes_for(&rates);
+            let driver = TickDriver::capture();
+            let ind = rate(fast);
+            let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
+            let pool = with_helpers.then(|| {
+                spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &[])
+                    .expect("two pool helpers")
+            });
+            let guard = pool.clone().map(HelperStopGuard);
+
+            let duty = PeriodicDuty {
+                scan_type: fast,
+                period: fast.interval().expect("a rate"),
+                ind,
+                pass: Arc::clone(&passes[ind]),
+                pool: pool.clone(),
+            };
+            assert_eq!(
+                duty.helpers_serve_this_rate(),
+                with_helpers,
+                "the test cannot tell the two paths apart"
+            );
+            let leader_db = Arc::clone(&db);
+            let leader_driver = driver.clone();
+            let thread = std::thread::Builder::new()
+                .name(periodic_thread_name(duty.period))
+                .spawn(move || {
+                    leader_driver.drive(async {
+                        periodic_pass(&leader_db, &duty);
+                    });
+                })
+                .expect("spawn the leader");
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !entered.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "the pass never reached the gate");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            db.add_record(
+                "z_late",
+                Box::new(CountRecord {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("load the late record");
+            join_list(&db, "z_late", fast);
+
+            release.store(true, Ordering::Release);
+            thread.join().expect("the leader");
+            drop(guard);
+            runs.load(Ordering::Acquire)
+        }
+
+        /// BOUNDARY: the two pass shapes, on the one input that tells them
+        /// apart. A rate no helper serves walks its live list, so a record the
+        /// list gains while the pass is in flight is reached in THAT pass; a
+        /// rate with helpers works a snapshot whose slots were fixed before
+        /// the first record ran, so the newcomer waits for the next pass. C
+        /// routes unserved rates back through `scanList()` for exactly this
+        /// (`dbScan.c:1249-1252`) — without it every IOC that never calls
+        /// `scanParallelThreads` lost the 7.0 semantics.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_unserved_rate_reaches_a_record_the_list_gains_mid_pass() {
+            assert_eq!(
+                late_record_runs_in_the_same_pass(false).await,
+                1,
+                "the live walk must reach a record added ahead of its cursor"
+            );
+            assert_eq!(
+                late_record_runs_in_the_same_pass(true).await,
+                0,
+                "a snapshot pass must not grow the slots it already published"
             );
         }
 

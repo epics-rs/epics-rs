@@ -704,15 +704,11 @@ pub struct BridgeProvider {
     /// only at config-load time and once per channel-find / list, so
     /// the contention cost is negligible.
     groups: parking_lot::RwLock<HashMap<String, GroupPvDef>>,
-    /// Cumulative channel-creation counter. Tagged onto the provider
-    /// so `qsrvStats` can report total throughput. Mirrors pvxs
-    /// `qStats` (singlesourcehooks.cpp:88) total-channels metric.
-    /// Counters never decrement; restart the IOC for a clean slate.
+    /// Cumulative count of channels this provider has handed out, which
+    /// `qsrvStats` prints beside the server's live counts. Not a pvxs
+    /// metric — `qStats` (singlesourcehooks.cpp:88) reports only what is
+    /// live — and it never decrements; restart the IOC for a clean slate.
     channels_created: std::sync::atomic::AtomicU64,
-    /// Cumulative GET / PUT / SUBSCRIBE counters. Same caveats.
-    ops_get: std::sync::atomic::AtomicU64,
-    ops_put: std::sync::atomic::AtomicU64,
-    ops_subscribe: std::sync::atomic::AtomicU64,
     /// Metadata cache for single-record channels: (NtType, DbFieldType).
     /// Avoids repeated record introspection on every create_channel() call.
     /// Corresponds to C++ PDBProvider's transient_pv_map.
@@ -840,9 +836,6 @@ impl BridgeProvider {
             record_cache: parking_lot::RwLock::new(HashMap::new()),
             access_cell: Arc::new(parking_lot::RwLock::new(Arc::new(AllowAllAccess))),
             channels_created: std::sync::atomic::AtomicU64::new(0),
-            ops_get: std::sync::atomic::AtomicU64::new(0),
-            ops_put: std::sync::atomic::AtomicU64::new(0),
-            ops_subscribe: std::sync::atomic::AtomicU64::new(0),
             base_group_defs: parking_lot::RwLock::new(Vec::new()),
             group_files: parking_lot::RwLock::new(Vec::new()),
             group_generation: std::sync::atomic::AtomicU64::new(0),
@@ -893,19 +886,11 @@ impl BridgeProvider {
         channel_property_support(&self.db, name).await
     }
 
-    /// Snapshot of cumulative QSRV throughput counters (channels
-    /// created, GET / PUT / SUBSCRIBE issued). Mirrors pvxs's
-    /// `qStats` aggregate output. Per-channel breakdown is not
-    /// currently tracked — pvxs's per-channel counters require a
-    /// channel-registry that we can add in a follow-up; for now
-    /// callers get the IOC-wide totals.
+    /// Snapshot of the provider's cumulative channel-creation count.
     pub fn op_stats(&self) -> ProviderOpStats {
         use std::sync::atomic::Ordering::Relaxed;
         ProviderOpStats {
             channels_created: self.channels_created.load(Relaxed),
-            gets: self.ops_get.load(Relaxed),
-            puts: self.ops_put.load(Relaxed),
-            subscribes: self.ops_subscribe.load(Relaxed),
         }
     }
 
@@ -914,36 +899,12 @@ impl BridgeProvider {
         self.channels_created
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-
-    /// Increment the cumulative GET counter. Channel implementations
-    /// call this once per successful get. Held public so external
-    /// `Channel` impls (outside this crate) can participate in
-    /// `qsrvStats` totals.
-    pub fn note_get(&self) {
-        self.ops_get
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Increment the cumulative PUT counter.
-    pub fn note_put(&self) {
-        self.ops_put
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Increment the cumulative SUBSCRIBE counter.
-    pub fn note_subscribe(&self) {
-        self.ops_subscribe
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 /// Snapshot returned by [`BridgeProvider::op_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct ProviderOpStats {
     pub channels_created: u64,
-    pub gets: u64,
-    pub puts: u64,
-    pub subscribes: u64,
 }
 
 impl BridgeProvider {
@@ -1427,16 +1388,21 @@ impl ChannelProvider for BridgeProvider {
             return true;
         }
         // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
-        // before the existence check so a record-level `REC$` (default
-        // `VAL`) answers the search; `split_channel_name` leaves the `$`
-        // on the record path (the CA server detects it there too).
-        // `has_name` strips any remaining `{json}` / `[range]` suffix
-        // itself, so this only removes the trailing modifier.
+        // before the existence check so `REC.VAL$` answers the search on the
+        // record's `VAL`; `split_channel_name` leaves the `$` on the record
+        // path (the CA server detects it there too) and its `string_view`
+        // flag is what says the `$` is a modifier rather than the last
+        // character of the record's own name. `has_name` strips any
+        // remaining `{json}` / `[range]` suffix itself.
         let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
-        let core = parsed
-            .record_path
-            .strip_suffix('$')
-            .unwrap_or(&parsed.record_path);
+        let core = if parsed.string_view {
+            parsed
+                .record_path
+                .strip_suffix('$')
+                .unwrap_or(&parsed.record_path)
+        } else {
+            parsed.record_path.as_str()
+        };
         self.db.has_name(core).await
     }
 

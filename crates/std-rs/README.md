@@ -102,7 +102,7 @@ std-rs/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.30", features = ["std"] }
+epics-rs = { version = "0.31", features = ["std"] }
 ```
 
 ### Register All Record Types

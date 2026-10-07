@@ -58,7 +58,6 @@ use crate::driver::{
 };
 use crate::error::ModbusError;
 use crate::interpose::{LinkType, MbapAccumulator, TransactionIdCounter};
-use crate::protocol::MAX_MODBUS_FRAME_SIZE;
 
 /// `drvInfo` used by records that want the port's *default* data type — the C
 /// `MODBUS_DATA_STRING`. Records needing a different type pass the data-type
@@ -204,26 +203,53 @@ impl SyncIoTransport {
     /// `first` is the chunk a combined write-read op already has in hand; the
     /// accumulator asks the port for more only when that chunk is short of a
     /// whole MBAP frame.
-    fn frame_from(&mut self, first: Option<Vec<u8>>) -> crate::error::ModbusResult<Vec<u8>> {
+    ///
+    /// `expected` is the reply's on-wire length as the request implies it, and
+    /// it is the count every read here asks for. A capacity must not be used
+    /// in its place: with no terminator configured the octet layer returns
+    /// early only once the requested count is met, so a read for
+    /// `MAX_MODBUS_FRAME_SIZE` waits out the whole timeout on every
+    /// well-formed reply and reports it as an I/O error.
+    fn frame_from(
+        &mut self,
+        expected: usize,
+        first: Option<Vec<u8>>,
+    ) -> crate::error::ModbusResult<Vec<u8>> {
         let handle = &self.handle;
         let mut first = first;
-        let mut read_chunk = move || match first.take() {
+        let mut read_chunk = move |need: usize| match first.take() {
             Some(buf) => Ok(buf),
-            None => handle
-                .read_octet(0, MAX_MODBUS_FRAME_SIZE)
-                .map_err(from_asyn),
+            None => handle.read_octet(0, need).or_else(partial_bytes),
         };
         match self.mbap.as_mut() {
             // Modbus/TCP: one read is a slice of the stream, not a frame.
-            Some(acc) => acc.read_frame(read_chunk),
+            Some(acc) => acc.read_frame(expected, read_chunk),
             None => {
-                let buf = read_chunk()?;
+                let buf = read_chunk(expected)?;
                 if buf.is_empty() {
                     return Err(ModbusError::Timeout);
                 }
                 Ok(buf)
             }
         }
+    }
+}
+
+/// The bytes a failing octet read still delivered, or the failure itself when
+/// it delivered none.
+///
+/// C `asynOctetSyncIO`'s `writeRead` publishes `*nbytesIn` beside a failing
+/// status (asynOctetSyncIO.c:262-269), and `modbusInterpose::readIt` reads them
+/// back: a reply shorter than the `replySize` the read asked for leaves the EOS
+/// layer waiting out the timeout, so C rescues the transfer for the Modbus
+/// exception that case really is (modbusInterpose.c:350-354). `asyn-rs` carries
+/// the same transfer in [`AsynError::partial_read`], which lets the framing
+/// layer's own completeness test — the MBAP `cmd_length`, or the RTU CRC —
+/// decide, instead of C's hard-coded nine bytes.
+fn partial_bytes(e: AsynError) -> crate::error::ModbusResult<Vec<u8>> {
+    match e.partial_read().map(|p| p.data.clone()) {
+        Some(data) if !data.is_empty() => Ok(data),
+        _ => Err(from_asyn(e)),
     }
 }
 
@@ -258,8 +284,12 @@ impl OctetTransport for SyncIoTransport {
         }
     }
 
-    fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
-        self.frame_from(None)
+    fn read_frame(
+        &mut self,
+        expected: usize,
+        _timeout: Duration,
+    ) -> crate::error::ModbusResult<Vec<u8>> {
+        self.frame_from(expected, None)
     }
 
     /// C `asynOctetSyncIO.c:231-276` through `SyncIOHandle::write_read`: the
@@ -275,6 +305,7 @@ impl OctetTransport for SyncIoTransport {
     fn write_read(
         &mut self,
         data: &[u8],
+        expected: usize,
         _timeout: Duration,
     ) -> crate::error::ModbusResult<Vec<u8>> {
         if !self.write_delay.is_zero() {
@@ -282,12 +313,12 @@ impl OctetTransport for SyncIoTransport {
         }
         let first = self
             .handle
-            .write_read(0, data, MAX_MODBUS_FRAME_SIZE)
-            .map_err(from_asyn)?;
+            .write_read(0, data, expected)
+            .or_else(partial_bytes)?;
         if first.is_empty() {
             return Err(ModbusError::Timeout);
         }
-        self.frame_from(Some(first))
+        self.frame_from(expected, Some(first))
     }
 }
 
@@ -2203,7 +2234,11 @@ mod tests {
         fn write_frame(&mut self, _data: &[u8]) -> crate::error::ModbusResult<()> {
             Ok(())
         }
-        fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
+        fn read_frame(
+            &mut self,
+            _expected: usize,
+            _timeout: Duration,
+        ) -> crate::error::ModbusResult<Vec<u8>> {
             Err(ModbusError::Timeout)
         }
     }
@@ -2239,7 +2274,11 @@ mod tests {
             self.written.lock().unwrap().push(data.to_vec());
             Ok(())
         }
-        fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
+        fn read_frame(
+            &mut self,
+            _expected: usize,
+            _timeout: Duration,
+        ) -> crate::error::ModbusResult<Vec<u8>> {
             self.responses
                 .pop_front()
                 .unwrap_or(Err(ModbusError::Timeout))
@@ -2399,7 +2438,9 @@ mod tests {
                     for i in 0..EXCHANGES {
                         let req = [tag, i as u8];
                         let reply = transport
-                            .write_read(&req, crate::driver::READ_TIMEOUT)
+                            // The port hands back one byte per read, so one
+                            // byte is this reply's whole on-wire length.
+                            .write_read(&req, 1, crate::driver::READ_TIMEOUT)
                             .expect("the exchange must complete");
                         assert_eq!(
                             reply[0], tag,
@@ -2687,6 +2728,188 @@ mod tests {
             "a split reply must be reassembled and served"
         );
         assert_eq!(driver.engine.data()[124], 124);
+
+        runtime.shutdown();
+    }
+
+    /// An octet port that answers like a socket: each read takes the next
+    /// queued chunk and a read with nothing left waits out its timeout and
+    /// fails (C `drvAsynIPPort::readIt`'s EWOULDBLOCK arm,
+    /// drvAsynIPPort.c:852-866). Every read is counted, because the cost of
+    /// asking for bytes the reply does not hold is one extra read that can
+    /// only end in that timeout.
+    struct CountedReplyPort {
+        base: PortDriverBase,
+        chunks: Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+        reads: Arc<Mutex<usize>>,
+    }
+
+    impl PortDriver for CountedReplyPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            *self.reads.lock().unwrap() += 1;
+            let chunk = self.chunks.lock().unwrap().pop_front();
+            match chunk {
+                Some(c) => {
+                    let n = c.len().min(buf.len());
+                    buf[..n].copy_from_slice(&c[..n]);
+                    Ok(n)
+                }
+                None => Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "nothing left on the link".into(),
+                }),
+            }
+        }
+    }
+
+    /// A Modbus/TCP read port over a [`CountedReplyPort`] carrying the EOS
+    /// interpose `drvAsynIPPortConfigure` installs unless the startup line
+    /// passes `noProcessEos` (asyn drvAsynIPPort.c:1061-1064, mirrored by
+    /// `IpPortDriver::apply_ip_port_configure`) — the layer the `modbus-ioc`
+    /// example's port actually reads through.
+    fn eos_tcp_port(
+        name: &'static str,
+        length: usize,
+        chunks: Vec<Vec<u8>>,
+    ) -> (
+        ModbusPortDriver,
+        asyn_rs::runtime::PortRuntimeHandle,
+        Arc<Mutex<usize>>,
+    ) {
+        let reads = Arc::new(Mutex::new(0usize));
+        let (runtime, _jh) = create_port_runtime(
+            CountedReplyPort {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                chunks: Arc::new(Mutex::new(chunks.into())),
+                reads: Arc::clone(&reads),
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("port runtime must start");
+        // Exactly what the IP port's own configure does:
+        // `asynInterposeEosConfig(portName, -1, 1, 1)`.
+        runtime
+            .port_handle()
+            .push_eos_interpose_blocking(asyn_rs::interpose::PORT_CHAIN, true, true)
+            .expect("the default EOS layer must install");
+        let driver = ModbusPortDriver::new(
+            name,
+            test_config(0, length),
+            LinkType::Tcp,
+            Box::new(SyncIoTransport::new(
+                SyncIOHandle::from_handle(
+                    runtime.port_handle().clone(),
+                    0,
+                    crate::driver::READ_TIMEOUT,
+                ),
+                LinkType::Tcp,
+            )),
+        )
+        .expect("a TCP read config must build");
+        (driver, runtime, reads)
+    }
+
+    /// A function-3 reply carrying `len` registers from 1000 up.
+    fn holding_reply(transaction_id: u16, len: usize) -> Vec<u8> {
+        let mut pdu = vec![0x01u8, 0x03, (len * 2) as u8];
+        for i in 0..len as u16 {
+            pdu.extend_from_slice(&(1000 + i).to_be_bytes());
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&transaction_id.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&pdu);
+        frame
+    }
+
+    /// The EOS layer returns early only once the requested count is met
+    /// (asynInterposeEos.c:224-227), so the count a read asks for is what
+    /// delimits a Modbus frame. Asking for a buffer capacity asks for bytes no
+    /// reply contains: the read spends its whole timeout, and that is one
+    /// wasted timeout per transaction even where the frame is recovered from
+    /// the partial — the `modbus-ioc` example polled at 0.5 Hz against a
+    /// 100 ms poll delay. C asks for exactly `replySize` plus this link's
+    /// framing (drvModbusAsyn.cpp:2096-2206, modbusInterpose.c:345), so no
+    /// read of a well-formed reply ever reaches a timeout.
+    ///
+    /// `a_reply_split_across_two_reads_is_reassembled_by_write_read` is the
+    /// same shape with no EOS layer and cannot see any of this: without it a
+    /// short read is a plain success.
+    #[test]
+    fn a_tcp_reply_costs_no_timeout_through_the_default_eos_interpose() {
+        let frame = holding_reply(1, 10);
+        assert_eq!(frame.len(), 29, "ten registers answer in 29 bytes");
+        // Split, so the reply also has to survive reassembly through the layer.
+        let (a, b) = frame.split_at(20);
+        let (mut driver, runtime, reads) =
+            eos_tcp_port("MB_EOS_COUNT", 10, vec![a.to_vec(), b.to_vec()]);
+
+        driver.poll_cycle().expect("the cycle must complete");
+
+        assert_eq!(
+            driver.io_status,
+            AsynStatus::Success,
+            "a well-formed reply must not be reported as an I/O error"
+        );
+        assert_eq!(driver.engine.data()[0], 1000);
+        assert_eq!(driver.engine.data()[9], 1009);
+        assert_eq!(driver.engine.stats.read_ok, 1);
+        assert_eq!(driver.engine.stats.io_errors, 0);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            2,
+            "one read per delivered chunk and not one more: a third read has \
+             nothing to return and can only spend the whole timeout"
+        );
+
+        runtime.shutdown();
+    }
+
+    /// An exception reply is shorter than the `replySize` the request implies,
+    /// so the read it answers cannot meet its count and the EOS layer hands up
+    /// `asynTimeout` with the nine bytes attached. C rescues exactly that case
+    /// by byte count (`nbytesActual == 9` and the exception bit,
+    /// modbusInterpose.c:350-354); here the MBAP `cmd_length` says the frame is
+    /// whole, so the rescue needs no magic number — and the exception must
+    /// reach the caller as an exception, with no I/O error counted
+    /// (drvModbusAsyn.cpp:2229-2246).
+    #[test]
+    fn a_short_exception_reply_is_rescued_from_the_read_that_timed_out() {
+        // Unit 1, fcode 0x83 (3 | 0x80), exception 02 (illegal data address).
+        let pdu = vec![0x01u8, 0x83, 0x02];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&pdu);
+        assert_eq!(frame.len(), 9, "the exception reply C rescues is 9 bytes");
+        let (mut driver, runtime, _reads) = eos_tcp_port("MB_EOS_EXC", 10, vec![frame]);
+
+        driver.poll_cycle().expect("the cycle must complete");
+
+        assert_eq!(
+            driver.engine.stats.io_errors, 0,
+            "a Modbus exception is the slave answering, not a transport failure"
+        );
+        assert_eq!(
+            driver.engine.stats.read_ok, 0,
+            "and it is not a successful read either"
+        );
+        assert_eq!(
+            driver.io_status,
+            AsynStatus::Error,
+            "the exception must reach the records as an error"
+        );
 
         runtime.shutdown();
     }

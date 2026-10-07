@@ -236,31 +236,61 @@ impl MbapAccumulator {
     /// unknown, so the buffer is dropped along with the error rather than
     /// re-parsed at the same offset on the next call.
     pub fn next_frame(&mut self) -> ModbusResult<Option<Vec<u8>>> {
+        match self.head_frame_len()? {
+            Some(need) if self.buf.len() >= need => Ok(Some(self.buf.drain(..need).collect())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Total on-wire length of the frame at the head of the buffer, or `None`
+    /// while its header is not yet fully buffered.
+    fn head_frame_len(&mut self) -> ModbusResult<Option<usize>> {
         if self.buf.len() < MBAP_HEADER_SIZE {
             return Ok(None);
         }
         let header = MbapHeader::from_bytes(&self.buf[..MBAP_HEADER_SIZE])?;
-        let need = mbap_frame_len(&header).inspect_err(|_| self.buf.clear())?;
-        if self.buf.len() < need {
-            return Ok(None);
-        }
-        Ok(Some(self.buf.drain(..need).collect()))
+        mbap_frame_len(&header)
+            .inspect_err(|_| self.buf.clear())
+            .map(Some)
+    }
+
+    /// Bytes to ask the link for next, given `expected` — the whole reply's
+    /// on-wire length as the request implies it
+    /// ([`ModbusFramer::expected_reply_frame_len`]).
+    ///
+    /// Once the header is buffered its `cmd_length` is authoritative and
+    /// `expected` is ignored; until then `expected` is the only count there
+    /// is, and asking for it rather than for a buffer capacity is what keeps
+    /// the read from spending its whole timeout waiting for bytes the reply
+    /// does not contain.
+    ///
+    /// Never zero: `next_frame` returned `None`, so the buffer is short of
+    /// both the header size and any length a header declared.
+    fn next_read_len(&mut self, expected: usize) -> ModbusResult<usize> {
+        let total = match self.head_frame_len()? {
+            Some(need) => need,
+            None => expected.max(MBAP_HEADER_SIZE),
+        };
+        Ok(total - self.buf.len())
     }
 
     /// Return one whole frame, pulling more bytes through `read_chunk` until
     /// the length its header declares is satisfied.
     ///
-    /// `read_chunk` returns whatever a single read of the link produced; an
-    /// empty chunk is the underlying port's timeout.
+    /// `read_chunk` is given the byte count to ask the link for and returns
+    /// whatever that single read produced; an empty chunk is the underlying
+    /// port's timeout.
     pub fn read_frame(
         &mut self,
-        mut read_chunk: impl FnMut() -> ModbusResult<Vec<u8>>,
+        expected: usize,
+        mut read_chunk: impl FnMut(usize) -> ModbusResult<Vec<u8>>,
     ) -> ModbusResult<Vec<u8>> {
         loop {
             if let Some(frame) = self.next_frame()? {
                 return Ok(frame);
             }
-            let chunk = read_chunk()?;
+            let need = self.next_read_len(expected)?;
+            let chunk = read_chunk(need)?;
             if chunk.is_empty() {
                 return Err(ModbusError::Timeout);
             }
@@ -289,6 +319,24 @@ impl ModbusFramer {
     /// The configured link type.
     pub fn link_type(&self) -> LinkType {
         self.link_type
+    }
+
+    /// On-wire bytes a reply carrying a `pdu_len`-byte PDU occupies on this
+    /// link — the count a read must ask for.
+    ///
+    /// C adds exactly this per-link overhead to the `replySize` it was given
+    /// before reading: `maxchars + mbapSize + 1` for MBAP links
+    /// (modbusInterpose.c:345), `maxchars + 3` for RTU (:382) and
+    /// `maxchars*2 + 7` for ASCII (:412).
+    pub fn expected_reply_frame_len(&self, pdu_len: usize) -> usize {
+        match self.link_type {
+            // MBAP header plus the unit identifier ahead of the PDU.
+            LinkType::Tcp | LinkType::Udp => MBAP_HEADER_SIZE + 1 + pdu_len,
+            // Slave address ahead of the PDU, CRC after it.
+            LinkType::Rtu => pdu_len + 3,
+            // ':' + slave address + LRC + CR/LF, every byte hex-encoded.
+            LinkType::Ascii => pdu_len * 2 + 7,
+        }
     }
 
     /// Wrap a bare request PDU (`[slave, fcode, ...]`) into an on-wire frame.
@@ -653,12 +701,22 @@ mod tests {
         let mut chunks = vec![frame[..140].to_vec(), frame[140..].to_vec()].into_iter();
 
         let mut acc = MbapAccumulator::new();
+        let mut asked = Vec::new();
         let got = acc
-            .read_frame(|| Ok(chunks.next().unwrap_or_default()))
+            .read_frame(frame.len(), |need| {
+                asked.push(need);
+                Ok(chunks.next().unwrap_or_default())
+            })
             .unwrap();
 
         assert_eq!(got, frame, "both reads must land in one frame");
         assert_eq!(chunks.next(), None, "no bytes may be left unread");
+        assert_eq!(
+            asked,
+            vec![frame.len(), frame.len() - 140],
+            "each read asks for the bytes the frame still needs: the whole \
+             expected reply first, then the remainder the header pins down"
+        );
     }
 
     /// F3: the network is equally free to coalesce two replies into one read.
@@ -672,11 +730,11 @@ mod tests {
         let mut chunks = vec![both].into_iter();
 
         let mut acc = MbapAccumulator::new();
-        let mut read = || Ok(chunks.next().unwrap_or_default());
-        assert_eq!(acc.read_frame(&mut read).unwrap(), first);
+        let mut read = |_need: usize| Ok(chunks.next().unwrap_or_default());
+        assert_eq!(acc.read_frame(first.len(), &mut read).unwrap(), first);
         // The second frame comes out of the buffer: reading again would block
         // on a link that has already sent everything it is going to send.
-        assert_eq!(acc.read_frame(&mut read).unwrap(), second);
+        assert_eq!(acc.read_frame(second.len(), &mut read).unwrap(), second);
     }
 
     /// F3: `cmd_length` is the frame delimiter, so a reply cut short of it is a

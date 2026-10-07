@@ -971,7 +971,7 @@ impl ProcessFrame {
         let mut arr = pool.alloc(src.dims.clone(), out_type)?;
         arr.data.fill_from_f64(values);
         arr.unique_id = src.unique_id;
-        arr.timestamp = src.timestamp;
+        arr.copy_time_stamps_from(src);
         arr.attributes = src.attributes.clone();
 
         Ok(arr)
@@ -1395,6 +1395,34 @@ mod tests {
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
+    }
+
+    /// Both halves of the timestamp pair travel to `build_output`'s result.
+    ///
+    /// C reaches its output through `NDArrayPool::convert`, which copies the
+    /// pair together (NDArrayPool.cpp:658-659). The two are independent in C,
+    /// so the source carries values that cannot be derived from each other.
+    #[test]
+    fn the_output_carries_the_whole_timestamp_pair() {
+        let mut src = make_array(&[1, 2, 3, 4]);
+        src.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 7, nsec: 11 };
+        src.time_stamp = 123.5;
+
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            ..Default::default()
+        });
+        seed_background(&mut state, &make_array(&[1, 1, 1, 1]));
+        let out = state
+            .process(&pool(), &src)
+            .unwrap()
+            .expect("background subtraction is an element op, so it builds an output");
+
+        assert_eq!(out.timestamp, src.timestamp, "epicsTS was dropped");
+        assert_eq!(
+            out.time_stamp, src.time_stamp,
+            "the derived double was dropped"
+        );
     }
 
     fn make_array(vals: &[u8]) -> NDArray {

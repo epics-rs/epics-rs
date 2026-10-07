@@ -414,8 +414,7 @@ pub fn convert_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray>
     convert_type_into(src, &mut data)?;
     let mut arr = NDArray::with_data(src.dims.clone(), data);
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
     arr.codec = src.codec.clone();
     Ok(arr)
@@ -470,8 +469,7 @@ pub fn convert_dims(
     convert_dims_into(src, dims_out, &mut data)?;
     let mut arr = NDArray::with_data(out_dims, data);
     arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
+    arr.copy_time_stamps_from(src);
     arr.attributes.copy_from(&src.attributes);
     Ok(arr)
 }

@@ -5343,7 +5343,7 @@ ASG(PLAIN) {
     async fn a_filtered_channel_name_is_served_with_its_slice() {
         let db = wf_db("WF:FILT").await;
         let source = PvDatabaseSource::new(db);
-        let name = r#"WF:FILT{"arr":{"s":1,"e":2}}"#;
+        let name = r#"WF:FILT.{"arr":{"s":1,"e":2}}"#;
         assert!(source.has_pv(name).await, "a parseable filter must connect");
         let value = source
             .get_value(name)
@@ -5368,7 +5368,7 @@ ASG(PLAIN) {
     async fn a_dotted_filter_suffix_is_served_and_never_suppresses_the_read() {
         let db = ai_db("AI:FILT2").await;
         let source = PvDatabaseSource::new(db);
-        let name = r#"AI:FILT2{"dbnd":{"d":0.5}}"#;
+        let name = r#"AI:FILT2.{"dbnd":{"d":0.5}}"#;
         assert!(
             source.has_pv(name).await,
             "a dotted suffix parses like any other"
@@ -5408,7 +5408,7 @@ ASG(PLAIN) {
         let db = wf_db("WF:BADF").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            !source.has_pv(r#"WF:BADF{"nosuchfilter":{}}"#).await,
+            !source.has_pv(r#"WF:BADF.{"nosuchfilter":{}}"#).await,
             "an unknown filter name must refuse the channel, not connect it raw"
         );
     }
@@ -5427,7 +5427,7 @@ ASG(PLAIN) {
             "the mailbox itself is served"
         );
         assert!(
-            !source.has_pv(r#"MB:FILT{"arr":{"s":0,"e":1}}"#).await,
+            !source.has_pv(r#"MB:FILT.{"arr":{"s":0,"e":1}}"#).await,
             "a mailbox has no filter machinery, so a filtered name addresses nothing"
         );
     }
@@ -5441,7 +5441,7 @@ ASG(PLAIN) {
     async fn a_filtered_monitor_applies_the_chain_to_its_value_stream() {
         let db = wf_db("WF:MFILT").await;
         let source = PvDatabaseSource::new(db.clone());
-        let mut rx = dbe_monitor(&source, r#"WF:MFILT{"arr":{"s":1,"e":2}}"#, &[]).await;
+        let mut rx = dbe_monitor(&source, r#"WF:MFILT.{"arr":{"s":1,"e":2}}"#, &[]).await;
 
         db.put_record_field_from_ca_no_notify(
             "WF:MFILT",
@@ -5482,7 +5482,7 @@ ASG(PLAIN) {
         let db = ai_db("AI:SRCH").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            source.searchable(r#"AI:SRCH{"arr":{"s":0}}"#).await,
+            source.searchable(r#"AI:SRCH.{"arr":{"s":0}}"#).await,
             "search claims what dbChannelTest resolves; the refusal belongs at \
              create, where the client can be told"
         );

@@ -60,7 +60,7 @@ impl SimDetector {
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.num_images, 0, 100)?;
 
-        base.set_float64_param(sim_params.gain, 0, 1.0)?;
+        base.set_float64_param(ad.params.gain, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_x, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_y, 0, 1.0)?;
         base.set_float64_param(sim_params.gain_red, 0, 1.0)?;
@@ -136,7 +136,7 @@ impl SimDetector {
 
     fn set_dirty_for_float64(&self, reason: usize) {
         let mut dirty = self.dirty.lock();
-        if reason == self.sim_params.gain {
+        if reason == self.ad.params.gain {
             dirty.reset_ramp = true;
             dirty.reset_peak_cache = true;
         } else if reason == self.sim_params.gain_x || reason == self.sim_params.gain_y {
@@ -332,6 +332,8 @@ pub fn create_sim_detector(
 mod tests {
     use super::*;
     use ad_core_rs::plugin::channel::NDArrayOutput;
+    use asyn_rs::interfaces::InterfaceType;
+    use asyn_rs::port::DrvUserRequest;
 
     #[test]
     fn test_new_default_values() {
@@ -400,10 +402,42 @@ mod tests {
         let rt = create_sim_detector("SIM3", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
         handle
-            .write_float64_blocking(rt.sim_params.gain, 0, 2.0)
+            .write_float64_blocking(rt.ad_params.gain, 0, 2.0)
             .unwrap();
         // Verify write took effect
-        assert!((handle.read_float64_blocking(rt.sim_params.gain, 0).unwrap() - 2.0).abs() < 1e-10);
+        assert!((handle.read_float64_blocking(rt.ad_params.gain, 0).unwrap() - 2.0).abs() < 1e-10);
+    }
+
+    /// `ADBase.template`'s `Gain` record binds `@asyn(PORT,ADDR,TIMEOUT)GAIN`,
+    /// so the index that drvInfo resolves to is the only one the frame compute
+    /// may read. A second gain parameter under any other name silently splits
+    /// the record's writes from the compute's reads.
+    #[test]
+    fn gain_drv_info_resolves_to_the_only_gain_param() {
+        let rt = create_sim_detector("SIM_GAIN", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
+        let handle = rt.port_handle();
+
+        let bound = handle
+            .drv_user_create_blocking(
+                &DrvUserRequest::new("GAIN", 0).with_iface(InterfaceType::Float64),
+            )
+            .unwrap();
+        assert_eq!(bound.reason, rt.ad_params.gain);
+
+        // The value the record writes is the value the compute snapshot reads.
+        handle
+            .write_float64_blocking(rt.ad_params.gain, 0, 7.5)
+            .unwrap();
+        assert!((handle.read_float64_blocking(bound.reason, 0).unwrap() - 7.5).abs() < 1e-10);
+
+        // No second gain parameter exists to read a stale value from.
+        assert!(
+            handle
+                .drv_user_create_blocking(&DrvUserRequest::new("AD_GAIN", 0))
+                .is_err(),
+            "a second gain parameter would re-open the split between the Gain \
+             record's writes and the frame compute's reads"
+        );
     }
 
     #[test]

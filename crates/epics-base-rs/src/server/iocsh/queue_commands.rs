@@ -64,13 +64,23 @@ const CALLBACK_ALREADY_INIT: &str = "Callback system already initialized";
 /// the two spellings belong to different C tables.
 const BAND_NAMES: [&str; 3] = ["cbLow", "cbMedium", "cbHigh"];
 
+/// What the count column counts, and so what it is headed — the one thing
+/// `callbackQueueShow` and `scanOnceQueueShow` no longer agree on.
+/// `callbackQueueShow` says `IN USE` (`callback.c:298`) because a worker gives
+/// its run entries back in batches, so the count includes entries already run;
+/// `scanOnceQueueShow`'s ring is returned entry by entry and its column stays
+/// `ITEMS IN Q` (`dbScan.c:765`).
+const IN_USE_COLUMN: &str = "    IN USE";
+const ITEMS_IN_Q_COLUMN: &str = "ITEMS IN Q";
+
 /// The table both `callbackQueueShow` and `scanOnceQueueShow` print
-/// (`callback.c:149-158`, `dbScan.c:765-771`) — the same header and the
-/// same `%8s  %15d  %10d  %6d  %6.1f  %11d` row in both, which is why
-/// one formatter serves both.
-fn queue_stats_table(rows: &[(&str, CallbackQueueStats)]) -> Vec<String> {
-    let mut out =
-        vec!["PRIORITY  HIGH-WATER MARK  ITEMS IN Q  Q SIZE  % USED  Q OVERFLOWS".to_string()];
+/// (`callback.c:294-302`, `dbScan.c:765-771`) — the same
+/// `%8s  %15d  %10d  %6d  %6.1f  %11d` row in both and a header that differs
+/// only in `count_column`, which is why one formatter serves both.
+fn queue_stats_table(count_column: &str, rows: &[(&str, CallbackQueueStats)]) -> Vec<String> {
+    let mut out = vec![format!(
+        "PRIORITY  HIGH-WATER MARK  {count_column}  Q SIZE  % USED  Q OVERFLOWS"
+    )];
     for (name, st) in rows {
         let qusage = 100.0 * st.num_used as f64 / st.size as f64;
         out.push(format!(
@@ -316,7 +326,7 @@ fn cmd_scan_once_queue_show() -> CommandDef {
                         max_used: st.max_used,
                         num_overflow: st.num_overflow,
                     };
-                    for line in queue_stats_table(&[("scanOnce", row)]) {
+                    for line in queue_stats_table(ITEMS_IN_Q_COLUMN, &[("scanOnce", row)]) {
                         ctx.println(&line);
                     }
                 }
@@ -376,7 +386,7 @@ fn cmd_callback_queue_show() -> CommandDef {
                         .copied()
                         .zip(bands.iter().copied())
                         .collect();
-                    for line in queue_stats_table(&rows) {
+                    for line in queue_stats_table(IN_USE_COLUMN, &rows) {
                         ctx.println(&line);
                     }
                 }
@@ -730,10 +740,10 @@ mod tests {
             max_used: 5,
             num_overflow: 12,
         };
-        let out = queue_stats_table(&[("cbLow", st)]);
+        let out = queue_stats_table(IN_USE_COLUMN, &[("cbLow", st)]);
         assert_eq!(
             out[0],
-            "PRIORITY  HIGH-WATER MARK  ITEMS IN Q  Q SIZE  % USED  Q OVERFLOWS"
+            "PRIORITY  HIGH-WATER MARK      IN USE  Q SIZE  % USED  Q OVERFLOWS"
         );
         assert_eq!(
             out[1],

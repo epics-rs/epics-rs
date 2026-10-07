@@ -74,17 +74,38 @@ camonitor mini:dcm:theta.RBV
 
 Simulated XIA HSC-1 four-blade slit using `SimHsc` from `optics-rs`. Supports gap/center and individual blade control.
 
+Record names follow optics' `xiahsc.db`, so a display built for the real module
+finds them; only the parameters `HscDriver` implements appear.
+
 | PV | Description |
 |----|-------------|
-| HSC parameters | Exposed via asyn port driver (H_GAP, H_CENTER, TOP, BOTTOM, LEFT, RIGHT) |
+| `mini:hsc1:width` / `widthRB` | Horizontal gap setpoint / readback (mm) |
+| `mini:hsc1:h0` / `h0RB` | Horizontal center setpoint / readback (mm) |
+| `mini:hsc1:height` / `heightRB` | Vertical gap setpoint / readback (mm) |
+| `mini:hsc1:v0` / `v0RB` | Vertical center setpoint / readback (mm) |
+| `mini:hsc1:t` / `tRB` | Top blade setpoint / readback (mm) |
+| `mini:hsc1:b` / `bRB` | Bottom blade setpoint / readback (mm) |
+| `mini:hsc1:l` / `lRB` | Left blade setpoint / readback (mm) |
+| `mini:hsc1:r` / `rRB` | Right blade setpoint / readback (mm) |
+| `mini:hsc1:busy` | Done / Moving — any blade in motion |
+| `mini:hsc1:power` / `powerRB` | Drive power level 0-2 |
 
 ### Quad BPM
 
 Simulated Oxford quad X-ray beam position monitor using `SimQxbpm`. Reports X/Y beam position from four simulated diode currents.
 
+Record names follow optics' `qxbpm.db`. The beam position is read-only: the
+driver computes it from the diode currents, which the simulation generates from
+the position given to `simQxbpmCreate`.
+
 | PV | Description |
 |----|-------------|
-| QXBPM parameters | Exposed via asyn port driver (X_POS, Y_POS, CURRENT_A-D) |
+| `mini:bpm1:pos:x` / `pos:y` | Beam position (mm) |
+| `mini:bpm1:current:a` … `:d` | Diode currents (nA) |
+| `mini:bpm1:current:total` | Summed diode current (nA) |
+| `mini:bpm1:current:low` | Ok / Low — below the current limit |
+| `mini:bpm1:gain` / `gainRB` | Current range: 1 uA, 100 nA, 10 nA, 1 nA |
+| `mini:bpm1:mode` / `modeRB` | Signal mode: Single, Average, Window |
 
 ### Motors
 
@@ -151,7 +172,7 @@ with plugins under the same prefix (`mini:dot:image1:`, `mini:dot:Stats1:`, etc.
 | `mini:dot:cam1:AcquirePeriod` | ao | Acquisition period (s) |
 | `mini:dot:cam1:AcquirePeriod_RBV` | ai | Acquisition period readback |
 | `mini:dot:cam1:DetectorState_RBV` | mbbi | Detector state (Idle/Acquire/...) |
-| `mini:dot:cam1:AcquireBusy_RBV` | bi | Whether acquisition is in progress |
+| `mini:dot:cam1:AcquireBusy` | busy | Whether acquisition is in progress |
 | `mini:dot:cam1:ArrayCounter` | longout | Frame counter (resettable) |
 | `mini:dot:cam1:ArrayCounter_RBV` | longin | Frame counter readback |
 | `mini:dot:cam1:ArrayCallbacks` | bo | Enable/disable NDArray callbacks |
@@ -187,13 +208,19 @@ cargo build --release -p mini-beamline --features ioc
 ### Acquire an image and display with Python
 
 ```bash
-# 1. Enable callbacks and acquire a single image
+# 1. Enable callbacks on the driver AND on the plugin that serves ArrayData.
+#    NDPluginBase.template defaults EnableCallbacks to Disable, and
+#    commonPlugins.cmd does not override it, so without this ArrayData
+#    stays at its .db value however many frames the driver produces.
 caput mini:dot:cam1:ArrayCallbacks 1
+caput mini:dot:image1:EnableCallbacks 1
+
+# 2. Acquire a single image
 caput mini:dot:cam1:ImageMode 0          # Single
 caput mini:dot:cam1:AcquireTime 0.1
 caput mini:dot:cam1:Acquire 1
 
-# 2. Read the image data
+# 3. Read the image data
 caget mini:dot:image1:ArrayData
 ```
 

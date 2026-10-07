@@ -1,0 +1,155 @@
+# XIA HSC-1 slit controller — asyn port surface for simHscCreate().
+#
+# Record names follow optics' xiahsc.db so a display built for the real
+# module finds them; the SNL program there is replaced by the HscDriver
+# parameter list, so only the parameters the driver implements appear.
+#
+# Macros: P, HSC, PORT
+
+# --- Gap/center setpoints (writing either moves both blades of that axis) ---
+
+record(ao, "$(P)$(HSC)width") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))H_GAP")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)widthRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))H_GAP_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)h0") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))H_CENTER")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)h0RB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))H_CENTER_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)height") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))V_GAP")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)heightRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))V_GAP_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)v0") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))V_CENTER")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)v0RB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))V_CENTER_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+# --- Individual blade setpoints and readbacks ---
+
+record(ao, "$(P)$(HSC)t") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TOP")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)tRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TOP_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)b") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))BOTTOM")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)bRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))BOTTOM_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)l") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LEFT")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)lRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LEFT_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ao, "$(P)$(HSC)r") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RIGHT")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)$(HSC)rRB") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RIGHT_RBV")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+# --- Status ---
+
+# One BUSY parameter covers both axes; the driver reports any blade moving.
+record(bi, "$(P)$(HSC)busy") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))BUSY")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Done")
+    field(ONAM, "Moving")
+}
+
+record(longout, "$(P)$(HSC)power") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))POWER_LEVEL")
+    field(DRVL, "0")
+    field(DRVH, "2")
+}
+
+record(longin, "$(P)$(HSC)powerRB") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))POWER_LEVEL")
+    field(SCAN, "I/O Intr")
+}

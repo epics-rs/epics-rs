@@ -67,7 +67,7 @@ scaler-rs/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.30", features = ["scaler"] }
+epics-rs = { version = "0.31", features = ["scaler"] }
 ```
 
 ### Register the Record Type

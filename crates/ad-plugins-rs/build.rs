@@ -14,6 +14,8 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
+    emit_rust_hdf5_pin();
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
     if embedded_target {
@@ -42,4 +44,23 @@ fn main() {
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
+}
+
+/// The `rust-hdf5` pin, read out of this crate's own manifest and handed to
+/// `file_netcdf`'s `_NCProperties` attribute as `RUST_HDF5_PIN`.
+///
+/// That attribute is how a reader learns which library wrote the file, so the
+/// version in it has to be the one actually compiled. It was a literal beside
+/// the manifest pin, and the two drifted the moment the pin moved: files
+/// written against 0.7.2 claimed `rust-hdf5=0.6`. Deriving it leaves one
+/// source of truth, and a bump cannot carry a stale attribute with it.
+fn emit_rust_hdf5_pin() {
+    println!("cargo::rerun-if-changed=Cargo.toml");
+    let manifest = std::fs::read_to_string("Cargo.toml").expect("cannot read Cargo.toml");
+    let pin = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("rust-hdf5"))
+        .and_then(|l| l.split_once("version")?.1.split('"').nth(1))
+        .expect("Cargo.toml declares no `rust-hdf5 = { version = \"..\" }` to derive from");
+    println!("cargo::rustc-env=RUST_HDF5_PIN={pin}");
 }

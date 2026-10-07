@@ -28,10 +28,16 @@ const ND_NETCDF_FILE_VERSION: f64 = 3.1;
 /// Provenance, in the `version=2,<library>=<version>` form libnetcdf writes.
 /// netCDF-4 is an HDF5 container, and this attribute is how a reader learns
 /// which library produced the file.
+///
+/// Both versions are derived — ours from cargo, the HDF5 half from the
+/// manifest pin by `build.rs` — because a literal here drifts silently: it
+/// still said `0.6` once the pin moved to 0.7.2, so every file named a
+/// library that had not written it.
 const NC_PROPERTIES: &str = concat!(
     "version=2,ad-plugins-rs=",
     env!("CARGO_PKG_VERSION"),
-    ",rust-hdf5=0.6"
+    ",rust-hdf5=",
+    env!("RUST_HDF5_PIN")
 );
 /// The `NAME` a dimension scale carries when it is a dimension only and not a
 /// coordinate variable. netcdf-c writes this exact text, the length

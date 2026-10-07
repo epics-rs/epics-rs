@@ -51,8 +51,17 @@ because the `EPICS_CA_*` client env is process-global under `cargo test`.
 
 ```sh
 cargo run -p regression-ioc --bin regression-ioc
-# prints the CA + PVA ports; then, against those ports:
-#   caget REG:E:MBBO   pvget REG:D:MTR   caput REG:D:MTR 5.0   ...
+```
+
+Both servers take OS-assigned loopback ports, so the binary prints the two
+`export` lines that point a client at them. The PVA number to use is the UDP
+**search** port, not the TCP endpoint — a client discovers the TCP port from
+the search reply, so pointing `EPICS_PVA_ADDR_LIST` at it finds nothing.
+
+```sh
+export EPICS_CA_ADDR_LIST=127.0.0.1:<ca>   EPICS_CA_AUTO_ADDR_LIST=NO
+export EPICS_PVA_ADDR_LIST=127.0.0.1:<pva> EPICS_PVA_AUTO_ADDR_LIST=NO
+caget REG:E:MBBO   caput REG:D:MTR 5.0   pvget REG:Q:AI   ...
 ```
 
 ## CI

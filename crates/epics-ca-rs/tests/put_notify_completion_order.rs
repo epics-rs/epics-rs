@@ -14,16 +14,22 @@
 //! `precord->ppnr->restartList` (`dbNotify.c:217`) and `restartCheck` pops it
 //! with `ellFirst` (`dbNotify.c:156-164`).
 //!
-//! The async server used to spawn one task per put-callback, so both
-//! completions became runnable microseconds apart and then raced for the
-//! outbox. Nothing decided that race, but a runtime with spare workers wins it
-//! the right way almost every time — one circuit's pair reversed 0 times in
-//! 800 on an idle 96-CPU box — which is why the defect surfaced as one
-//! full-workspace nextest run in two rather than as a reproducible failure.
-//! So the starvation is built into the test rather than left to the machine:
-//! the server runtime gets two worker threads and eight circuits drive it at
-//! once. Against the one-task-per-put-callback shape that is 10 failures in 10
-//! runs; against the queue, 0 in 10.
+//! This port did not have that wait, so a channel's second put-callback was
+//! submitted while the first was still in flight and the two completions then
+//! raced for the outbox. Nothing decided that race, but a runtime with spare
+//! workers wins it the right way almost every time — one circuit's pair
+//! reversed 0 times in 800 on an idle 96-CPU box — which is why the defect
+//! surfaced as one full-workspace nextest run in two rather than as a
+//! reproducible failure.
+//!
+//! With the wait in place the second put-callback cannot start, so each trial
+//! checks the parked state directly instead of hoping to catch the race: an
+//! ECHO queued behind the second put-callback must NOT come back, on this
+//! server or on C, because the receive loop is inside the wait. A regression
+//! that drops the wait fails on the first trial rather than on one run in two.
+//! The two-worker runtime and the eight circuits are kept: they are the load
+//! the reversal was last seen under, and the ordering assertion still runs
+//! under them.
 //!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
@@ -79,6 +85,11 @@ const TRIALS: usize = 100;
 /// How long a read waits before the circuit is declared silent. Loopback
 /// replies land in microseconds; this only has to outrun scheduling noise.
 const READ_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long the circuit must stay quiet to count as parked in the channel's
+/// put-callback wait. A busy box can make the server slow to read the second
+/// request, which only weakens the proof — it cannot fail the check, because
+/// a server that has not read the request has not answered its ECHO either.
+const PARKED_WINDOW: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // The record: every other process goes async, so ONE server runs every trial
@@ -185,6 +196,12 @@ impl Raw {
         if let Some(f) = self.pending.pop_front() {
             return Read1::Frame(f);
         }
+        self.read_socket_frame()
+    }
+
+    /// One whole frame off the socket, ignoring anything already parked in
+    /// `pending`.
+    fn read_socket_frame(&mut self) -> Read1 {
         let mut hdr = [0u8; CaHeader::SIZE];
         if self.sock.read_exact(&mut hdr).is_err() {
             return Read1::Silent;
@@ -220,6 +237,28 @@ impl Raw {
         held.append(&mut self.pending);
         self.pending = held;
         found
+    }
+
+    /// Read with a short deadline, expecting nothing — the proof that the
+    /// receive loop is parked in this channel's put-callback wait and has
+    /// therefore not run the second request. Anything that does arrive is kept
+    /// for the reads below.
+    fn stays_silent(&mut self, window: Duration) -> bool {
+        self.sock.set_read_timeout(Some(window)).expect("timeout");
+        // The socket, not `pending`: frames received earlier — the handshake's
+        // VERSION and ACCESS_RIGHTS among them — say nothing about what the
+        // server is doing now. Anything new goes to the back, behind them.
+        let quiet = match self.read_socket_frame() {
+            Read1::Silent => true,
+            Read1::Frame(f) => {
+                self.pending.push_back(f);
+                false
+            }
+        };
+        self.sock
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("timeout");
+        quiet
     }
 
     /// The ioids of the next `want` WRITE_NOTIFY completions, in wire order.
@@ -281,17 +320,18 @@ fn write_notify_frame(sid: u32, ioid: u32, value: f64) -> Vec<u8> {
 // One trial
 // ---------------------------------------------------------------------------
 
-/// Open a channel, fire two WRITE_NOTIFYs back to back while the record is
-/// still mid-device-round-trip, end the round trip, and report the completion
-/// ioids in wire order.
+/// Open a channel, fire two WRITE_NOTIFYs while the record is still
+/// mid-device-round-trip, end the round trip, and report the completion ioids
+/// in wire order.
 ///
-/// The `CA_PROTO_ECHO` between the puts and the completion is the
-/// synchronisation point: its reply proves the receive loop has already run
-/// the write head for BOTH put-callbacks, so the second one really did arrive
-/// while the first was in flight. Ending the round trip then fires the first
-/// put-callback's completion and, through the database's restart list, the
-/// second's — back to back, from one thread, which is the case the order is
-/// about.
+/// Two `CA_PROTO_ECHO`s do the synchronising, and they say opposite things.
+/// The first rides behind FIRST alone: its reply proves the receive loop has
+/// run that write head and the record has forked async, so SECOND is sent into
+/// a channel whose put-callback is genuinely busy. The second rides behind
+/// SECOND and must NOT be answered — the loop is parked in the channel's
+/// serialisation wait, so SECOND has produced no side effect and cannot have
+/// reached the outbox. Ending the round trip then answers FIRST, which
+/// releases SECOND.
 fn one_trial(addr: SocketAddr, db: &PvDatabase, pv: &str) -> Vec<u32> {
     let mut c = Raw::connect(addr);
     c.send(&version_frame());
@@ -300,9 +340,16 @@ fn one_trial(addr: SocketAddr, db: &PvDatabase, pv: &str) -> Vec<u32> {
     let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
 
     c.send(&write_notify_frame(sid, FIRST, 7.0));
-    c.send(&write_notify_frame(sid, SECOND, 9.0));
     c.send(&echo_frame());
     c.wait_for(CA_PROTO_ECHO);
+
+    c.send(&write_notify_frame(sid, SECOND, 9.0));
+    c.send(&echo_frame());
+    assert!(
+        c.stays_silent(PARKED_WINDOW),
+        "a second put-callback on a busy channel must produce nothing until \
+         the first is answered"
+    );
 
     let _ = block_on_sync(db.complete_async_record(pv)).expect("blockable");
     c.completion_ioids(2)

@@ -97,18 +97,22 @@
 //! (`EventTaskControl::WriteComplete`); the event thread awaits it in its
 //! `select` and writes the deferred WRITE_NOTIFY reply under the SAME send lock,
 //! so the dispatch thread stays responsive and there is ONE owner of async
-//! socket writes. A plain fire-and-forget WRITE is always synchronous (no reply).
+//! socket writes. The one thing that does park the dispatch thread is the
+//! channel-level wait below, which is C parking the client's receive thread on
+//! `blockSem` — and it is the event thread's reply that releases it. A plain fire-and-forget WRITE is always synchronous (no reply).
 //! `command_drives_without_spawn` stays a *fail-closed* allowlist for
 //! everything not handled by a dedicated branch.
 //!
 //! The CHANNEL-level put-callback registration is not this driver's to keep:
 //! `serve_write_head` registers and consults it (`PutNotifySlot`), so both loops
-//! answer a concurrent WRITE_NOTIFY the same way — the arriving request is never
-//! refused here, and ECA_PUTCBINPROG goes to a predecessor only once it has
-//! outstayed C's 60 s `blockSem` wait (`camessage.c:1701`). Whether the database
-//! below queues a second put-callback on the record's restart list or refuses
-//! it is not an open question: it queues, so neither loop has a database-level
-//! refusal to relay.
+//! answer a concurrent WRITE_NOTIFY the same way — a second one on the same
+//! channel WAITS for its predecessor's reply rather than running beside it, the
+//! arriving request is never refused here, and ECA_PUTCBINPROG goes to a
+//! predecessor only once it has outstayed C's 60 s `blockSem` wait
+//! (`camessage.c:1701`). Whether the database below queues a second
+//! put-callback on the record's restart list or refuses it is not an open
+//! question: it queues, so neither loop has a database-level refusal to
+//! relay.
 //!
 //! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
 //! async branch a READ can reach; it is unreachable for a local record

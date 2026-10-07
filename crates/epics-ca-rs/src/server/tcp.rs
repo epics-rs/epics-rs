@@ -5107,22 +5107,38 @@ impl PendingWriteNotify {
     /// `chain` is what the completion receiver yielded: `Err` means the sender
     /// was dropped without firing (processing aborted), which surfaces as
     /// ECA_PUTFAIL so the client never sees a false success — C rsrv.
+    ///
+    /// `commit` is how THIS driver gets the queued reply into the circuit's
+    /// wire order, and it is a parameter rather than something the caller runs
+    /// afterwards because the channel's next put-callback is released by the
+    /// reply token dying — which happens here, after `commit` has returned. C
+    /// signals `blockSem` only after `cas_commit_msg`
+    /// (`camessage.c:1452-1460`), and for the same reason: a successor
+    /// released before the commit can reach the socket first. On the async
+    /// server the shared outbox this pushed to IS the single writer's queue,
+    /// so its `commit` has nothing to do; the blocking driver stages into a
+    /// private outbox and has to drain it under the send lock. `false` reports
+    /// the peer gone.
     pub(crate) fn settle(
         &mut self,
         chain: Result<(), tokio::sync::oneshot::error::RecvError>,
         writer: &Outbox,
-    ) -> CaResult<()> {
+        commit: impl FnOnce() -> bool,
+    ) -> CaResult<bool> {
         // Losing the claim means a predecessor-timeout supersede already
         // answered this ioid with ECA_PUTCBINPROG and closed its put-log
         // bracket with it. One ioid, one reply.
         let Some(mut owned) = self.completion.claim() else {
-            return Ok(());
+            return Ok(commit());
         };
         let final_status = match chain {
             Ok(()) => self.eca_status,
             Err(_) => ECA_PUTFAIL,
         };
-        finish_write_notify(&mut owned.trap_guard, final_status, &self.reply, writer)
+        finish_write_notify(&mut owned.trap_guard, final_status, &self.reply, writer)?;
+        // `owned` — and with it the successor's release — dies at the end of
+        // this scope, after the commit.
+        Ok(commit())
     }
 }
 
@@ -6609,20 +6625,26 @@ pub(crate) async fn run_event_task<W>(
                 // the decision about whether a reply is still owed are one copy,
                 // not two.
                 let mut p = pending_writes.remove(idx);
-                if p.settle(res, &ev_outbox).is_err() {
+                // Draining INSIDE `settle` is what keeps this driver's two
+                // socket writers in order. Each stages into its own outbox and
+                // they race for the send lock, so a push is not a commit here:
+                // the dispatch thread, released by this reply, would otherwise
+                // be free to take the lock and put its own put-callback's reply
+                // on the wire first.
+                let committed = p.settle(res, &ev_outbox, || {
+                    while let Some(frame) = ev_drain.try_next() {
+                        if write_frame(&frame).is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                match committed {
                     // Encoding the reply failed (16k-array boundary): the reply
                     // is unshippable, drop this completion and keep serving.
-                    continue;
-                }
-                let mut peer_gone = false;
-                while let Some(frame) = ev_drain.try_next() {
-                    if write_frame(&frame).is_err() {
-                        peer_gone = true;
-                        break;
-                    }
-                }
-                if peer_gone {
-                    break;
+                    Err(_) => continue,
+                    Ok(false) => break,
+                    Ok(true) => {}
                 }
             }
         }
@@ -7473,7 +7495,9 @@ async fn run_write_notify_queue(
                 let mut p = pending.remove(idx);
                 // An unshippable reply (16k-array boundary) is dropped, as it
                 // is on the blocking driver's owner; the circuit keeps serving.
-                let _ = p.settle(res, &outbox);
+                // The commit is a no-op: `outbox` is the one writer task's
+                // queue, so the push `settle` made is already the wire order.
+                let _ = p.settle(res, &outbox, || true);
             }
         }
     }
@@ -7648,6 +7672,53 @@ mod write_notify_queue_tests {
             cancel: None,
         };
         (p, tx)
+    }
+
+    /// A channel's next put-callback is released by [`PendingWriteNotify::settle`]
+    /// only AFTER the driver's commit has run, because on the blocking driver
+    /// the commit — not the outbox push — is what fixes the wire order.
+    // RTEMS-EXEC-MODEL-ALLOW(1): measured — passes under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`; it awaits nothing and needs no
+    // reactor.
+    #[tokio::test]
+    async fn the_commit_runs_before_the_successor_is_released() {
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let (completion, mut settled) = PutNotifyCompletion::new(None);
+        let mut p = PendingWriteNotify {
+            rx: tokio::sync::oneshot::channel().1,
+            eca_status: crate::protocol::ECA_NORMAL,
+            reply: WriteNotifyReply {
+                write_type: 6,
+                write_count: 1,
+                ioid: 0x1111,
+                req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+            completion,
+            sid: 1,
+            cancel: None,
+        };
+        let committed = p.settle(Ok(()), &outbox, || {
+            assert!(
+                matches!(
+                    settled.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the successor must still be waiting while the reply is being committed"
+            );
+            true
+        });
+        assert!(
+            committed.expect("encode"),
+            "the commit reported the peer live"
+        );
+        assert!(
+            matches!(
+                settled.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "and released once it is committed"
+        );
     }
 
     /// The ioid of every WRITE_NOTIFY frame the outbox holds, in wire order.

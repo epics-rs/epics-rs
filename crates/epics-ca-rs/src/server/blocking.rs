@@ -4776,7 +4776,9 @@ mod tests {
             .expect("blockable")
             .expect("completion");
         let chain = block_on_sync(&mut p.rx).expect("blockable");
-        p.settle(chain, &outbox).expect("encode completion");
+        // Nothing else writes this test's outbox, so the commit is a no-op.
+        p.settle(chain, &outbox, || true)
+            .expect("encode completion");
 
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {

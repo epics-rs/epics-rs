@@ -316,11 +316,30 @@ pub fn process_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
     )
 }
 
+/// The live channel and client counts pvxs `qStats` reports: it guards on its
+/// `server()` singleton and sums `conn.channels.size()` over
+/// `report.connections` (singlesourcehooks.cpp:88-99). `None` when there is no
+/// running server to ask — before the listeners bind, and on the thread-backend
+/// build, where the server's singleton does not exist at all.
+fn live_channels_and_clients() -> Option<(u64, usize)> {
+    #[cfg(tokio_backend)]
+    {
+        let report = epics_pva_rs::server::iocsh::pvxs_report()?.report();
+        let channels = report.peers.iter().map(|(_, p)| p.channels).sum();
+        Some((channels, report.peer_count))
+    }
+    #[cfg(not(tokio_backend))]
+    {
+        None
+    }
+}
+
 /// `qsrvStats [<recordOrGroupName>]` — print summary diagnostics for
-/// QSRV-bridged channels. With no argument, lists all groups + the
-/// total record count. With a name, prints the group's member roster
-/// (or "single record" for a non-group channel name). Mirrors pvxs
-/// `qStats` (singlesourcehooks.cpp:88) at the summary level.
+/// QSRV-bridged channels. With no argument, reports the two numbers pvxs
+/// `qStats` reports (singlesourcehooks.cpp:88-99 — live channels summed over
+/// the server's live connections, and the connection count itself) plus the
+/// group roster. With a name, prints that group's member roster (or "single
+/// record" for a non-group channel name).
 pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
     CommandDef::new(
         "qsrvStats",
@@ -360,15 +379,17 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                     }
                 }
                 _ => {
-                    let stats = provider.op_stats();
-                    ctx.println(&format!(
-                        "qsrvStats: {} group(s), {} channels created (cumulative), {} get / {} put / {} subscribe",
-                        groups.len(),
-                        stats.channels_created,
-                        stats.gets,
-                        stats.puts,
-                        stats.subscribes,
-                    ));
+                    let created = provider.op_stats().channels_created;
+                    match live_channels_and_clients() {
+                        Some((channels, clients)) => ctx.println(&format!(
+                            "qsrvStats: {} group(s), {channels} channel(s) on {clients} client(s), {created} created (cumulative)",
+                            groups.len(),
+                        )),
+                        None => ctx.println(&format!(
+                            "qsrvStats: {} group(s), {created} channel(s) created (cumulative); pvAccess server not yet started",
+                            groups.len(),
+                        )),
+                    }
                     let mut names: Vec<&String> = groups.keys().collect();
                     names.sort();
                     for n in names {

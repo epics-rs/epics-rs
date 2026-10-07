@@ -59,6 +59,16 @@ pub fn publish_pvxs_report(handle: ServerReportHandle) {
     *report_cell().write().unwrap() = Some(handle);
 }
 
+/// The singleton's only reader — pvxs's `if (auto srv = server())`, which
+/// guards every hook that needs the running server (`pvxsr`
+/// (`iochooks.cpp:188`), `qReport` and `qStats`
+/// (`singlesourcehooks.cpp:76`, `:88`)). `None` until the listeners bind.
+///
+/// Returns the handle by clone so no caller holds the lock across its report.
+pub fn pvxs_report() -> Option<ServerReportHandle> {
+    report_cell().read().unwrap().clone()
+}
+
 /// pvxs `pvxsBaseRegistrar`'s `pvxsr` registration
 /// (`ioc/iochooks.cpp:473-476`) applied to an [`IocApplication`]: the
 /// command exists before the startup script, as it does in pvxs, because
@@ -108,10 +118,7 @@ pub fn pvxsr_command() -> CommandDef {
                 _ => 0,
             };
 
-            // Snapshot through the shared handle. Borrow is released at the
-            // end of the match arm so the report is owned independently of
-            // the watch lock.
-            let report = match report_cell().read().unwrap().as_ref() {
+            let report = match pvxs_report() {
                 Some(handle) => handle.report(),
                 None => {
                     ctx.println("pvAccess server: not yet started");

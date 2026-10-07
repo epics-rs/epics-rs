@@ -37,6 +37,11 @@ pub struct QxbpmParams {
     pub gain: usize,
     pub mode: usize,
     pub low_current: usize,
+    /// Write-only trigger: a write runs one [`QxbpmDriver::poll`] inside the
+    /// port actor. The poll loop owns only a `PortHandle`, so this is how it
+    /// reaches the driver the actor owns — the same route C's `readPoller`
+    /// takes through `P_Read` (drvModbusAsyn.cpp:1631-1640).
+    pub poll: usize,
 }
 
 impl QxbpmParams {
@@ -53,6 +58,7 @@ impl QxbpmParams {
             gain: base.create_param("GAIN", ParamType::Int32)?,
             mode: base.create_param("MODE", ParamType::Int32)?,
             low_current: base.create_param("LOW_CURRENT", ParamType::Int32)?,
+            poll: base.create_param("POLL", ParamType::Int32)?,
         })
     }
 }
@@ -262,6 +268,10 @@ impl asyn_rs::port::PortDriver for QxbpmDriver {
         let reason = user.reason;
         self.base_mut().params.set_int32(reason, user.addr, value)?;
 
+        if reason == self.params.poll {
+            // `poll` publishes the readbacks and fires the callbacks itself.
+            return self.poll();
+        }
         if reason == self.params.gain {
             let mut sim = self.sim.lock().unwrap();
             sim.gain = value.max(0) as usize;
@@ -285,22 +295,29 @@ pub enum QxbpmPollCommand {
     Shutdown,
 }
 
-/// QXBPM poll loop: periodically reads the simulation and updates driver parameters.
+/// QXBPM poll loop: periodically triggers a driver poll through the port.
+///
+/// The driver itself belongs to the port actor once the port is registered, so
+/// the loop holds a `PortHandle` and writes [`QxbpmParams::poll`] rather than
+/// locking the driver behind the actor's back.
 pub struct QxbpmPollLoop {
     cmd_rx: tokio::sync::mpsc::Receiver<QxbpmPollCommand>,
-    driver: Arc<Mutex<QxbpmDriver>>,
+    port: asyn_rs::port_handle::PortHandle,
+    poll_reason: usize,
     poll_interval: Duration,
 }
 
 impl QxbpmPollLoop {
     pub fn new(
         cmd_rx: tokio::sync::mpsc::Receiver<QxbpmPollCommand>,
-        driver: Arc<Mutex<QxbpmDriver>>,
+        port: asyn_rs::port_handle::PortHandle,
+        poll_reason: usize,
         poll_interval: Duration,
     ) -> Self {
         Self {
             cmd_rx,
-            driver,
+            port,
+            poll_reason,
             poll_interval,
         }
     }
@@ -327,9 +344,10 @@ impl QxbpmPollLoop {
                     }
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {
-                    if let Ok(mut driver) = self.driver.lock() {
-                        let _ = driver.poll();
+                    if self.port.is_closed() {
+                        return;
                     }
+                    let _ = self.port.write_int32(self.poll_reason, 0, 1).await;
                 }
             }
         }
@@ -340,16 +358,16 @@ impl QxbpmPollLoop {
 // QxbpmHolder — IOC startup integration
 // ---------------------------------------------------------------------------
 
-/// Holds QXBPM driver instances created by startup commands.
+/// Holds the ports created by startup commands.
 pub struct QxbpmHolder {
-    drivers: Mutex<HashMap<String, Arc<Mutex<QxbpmDriver>>>>,
+    ports: Mutex<HashMap<String, asyn_rs::port_handle::PortHandle>>,
     poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<QxbpmPollCommand>>>,
 }
 
 impl QxbpmHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            drivers: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
         })
     }
@@ -418,34 +436,56 @@ impl QxbpmHolder {
 
                 let sim = Arc::new(Mutex::new(SimQxbpm::new(x_pos, y_pos)));
                 let driver = match QxbpmDriver::new(&port, sim) {
-                    Ok(d) => Arc::new(Mutex::new(d)),
+                    Ok(d) => d,
                     Err(e) => return Err(format!("failed to create QxbpmDriver: {e}")),
                 };
+                let poll_reason = driver.params.poll;
+
+                let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    driver,
+                    asyn_rs::runtime::config::RuntimeConfig::default(),
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => return Err(format!("failed to start QXBPM port: {e}")),
+                };
+                let port_handle = runtime.port_handle().clone();
+                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                    runtime.shutdown();
+                    return Err(format!("failed to register QXBPM port: {e}"));
+                }
 
                 let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-                let poll_loop =
-                    QxbpmPollLoop::new(cmd_rx, driver.clone(), Duration::from_millis(poll_ms));
+                let poll_loop = QxbpmPollLoop::new(
+                    cmd_rx,
+                    port_handle.clone(),
+                    poll_reason,
+                    Duration::from_millis(poll_ms),
+                );
 
                 ctx.bridge().spawn(poll_loop.run());
 
                 holder.poll_senders.lock().unwrap().push(cmd_tx);
-                holder.drivers.lock().unwrap().insert(port.clone(), driver);
+                holder
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .insert(port.clone(), port_handle);
                 println!("simQxbpmCreate: port={port} x={x_pos} y={y_pos} poll={poll_ms}ms");
                 Ok(CommandOutcome::Continue)
             },
         )
     }
 
-    /// Get a driver by port name.
-    pub fn get_driver(&self, port: &str) -> Option<Arc<Mutex<QxbpmDriver>>> {
-        self.drivers.lock().unwrap().get(port).cloned()
+    /// Get a port handle by port name.
+    pub fn get_port(&self, port: &str) -> Option<asyn_rs::port_handle::PortHandle> {
+        self.ports.lock().unwrap().get(port).cloned()
     }
 }
 
 impl Default for QxbpmHolder {
     fn default() -> Self {
         Self {
-            drivers: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
         }
     }
@@ -579,7 +619,7 @@ mod tests {
     #[test]
     fn test_qxbpm_holder_creation() {
         let holder = QxbpmHolder::new();
-        assert!(holder.get_driver("nonexistent").is_none());
+        assert!(holder.get_port("nonexistent").is_none());
     }
 
     #[test]

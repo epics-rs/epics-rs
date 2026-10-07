@@ -45,6 +45,11 @@ pub struct HscParams {
     pub v_center_rbv: usize,
     pub busy: usize,
     pub power_level: usize,
+    /// Write-only trigger: a write runs one [`HscDriver::poll`] inside the
+    /// port actor. The poll loop owns only a `PortHandle`, so this is how it
+    /// reaches the driver the actor owns — the same route C's `readPoller`
+    /// takes through `P_Read` (drvModbusAsyn.cpp:1631-1640).
+    pub poll: usize,
 }
 
 impl HscParams {
@@ -69,6 +74,7 @@ impl HscParams {
             v_center_rbv: base.create_param("V_CENTER_RBV", ParamType::Float64)?,
             busy: base.create_param("BUSY", ParamType::Int32)?,
             power_level: base.create_param("POWER_LEVEL", ParamType::Int32)?,
+            poll: base.create_param("POLL", ParamType::Int32)?,
         })
     }
 }
@@ -382,6 +388,10 @@ impl asyn_rs::port::PortDriver for HscDriver {
         let reason = user.reason;
         self.base_mut().params.set_int32(reason, user.addr, value)?;
 
+        if reason == self.params.poll {
+            // `poll` publishes the readbacks and fires the callbacks itself.
+            return self.poll();
+        }
         if reason == self.params.power_level {
             let mut sim = self.sim.lock().unwrap();
             sim.set_power_level(value);
@@ -402,22 +412,29 @@ pub enum HscPollCommand {
     Shutdown,
 }
 
-/// HSC poll loop: periodically reads the simulation and updates driver parameters.
+/// HSC poll loop: periodically triggers a driver poll through the port.
+///
+/// The driver itself belongs to the port actor once the port is registered, so
+/// the loop holds a `PortHandle` and writes [`HscParams::poll`] rather than
+/// locking the driver behind the actor's back.
 pub struct HscPollLoop {
     cmd_rx: tokio::sync::mpsc::Receiver<HscPollCommand>,
-    driver: Arc<Mutex<HscDriver>>,
+    port: asyn_rs::port_handle::PortHandle,
+    poll_reason: usize,
     poll_interval: Duration,
 }
 
 impl HscPollLoop {
     pub fn new(
         cmd_rx: tokio::sync::mpsc::Receiver<HscPollCommand>,
-        driver: Arc<Mutex<HscDriver>>,
+        port: asyn_rs::port_handle::PortHandle,
+        poll_reason: usize,
         poll_interval: Duration,
     ) -> Self {
         Self {
             cmd_rx,
-            driver,
+            port,
+            poll_reason,
             poll_interval,
         }
     }
@@ -444,9 +461,10 @@ impl HscPollLoop {
                     }
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {
-                    if let Ok(mut driver) = self.driver.lock() {
-                        let _ = driver.poll();
+                    if self.port.is_closed() {
+                        return;
                     }
+                    let _ = self.port.write_int32(self.poll_reason, 0, 1).await;
                 }
             }
         }
@@ -457,16 +475,16 @@ impl HscPollLoop {
 // HscHolder — IOC startup integration
 // ---------------------------------------------------------------------------
 
-/// Holds HSC driver instances created by startup commands.
+/// Holds the ports created by startup commands.
 pub struct HscHolder {
-    drivers: Mutex<HashMap<String, Arc<Mutex<HscDriver>>>>,
+    ports: Mutex<HashMap<String, asyn_rs::port_handle::PortHandle>>,
     poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<HscPollCommand>>>,
 }
 
 impl HscHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            drivers: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
         })
     }
@@ -517,34 +535,56 @@ impl HscHolder {
 
                 let sim = Arc::new(Mutex::new(SimHsc::new()));
                 let driver = match HscDriver::new(&port, sim) {
-                    Ok(d) => Arc::new(Mutex::new(d)),
+                    Ok(d) => d,
                     Err(e) => return Err(format!("failed to create HscDriver: {e}")),
                 };
+                let poll_reason = driver.params.poll;
+
+                let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    driver,
+                    asyn_rs::runtime::config::RuntimeConfig::default(),
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => return Err(format!("failed to start HSC port: {e}")),
+                };
+                let port_handle = runtime.port_handle().clone();
+                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                    runtime.shutdown();
+                    return Err(format!("failed to register HSC port: {e}"));
+                }
 
                 let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-                let poll_loop =
-                    HscPollLoop::new(cmd_rx, driver.clone(), Duration::from_millis(poll_ms));
+                let poll_loop = HscPollLoop::new(
+                    cmd_rx,
+                    port_handle.clone(),
+                    poll_reason,
+                    Duration::from_millis(poll_ms),
+                );
 
                 ctx.bridge().spawn(poll_loop.run());
 
                 holder.poll_senders.lock().unwrap().push(cmd_tx);
-                holder.drivers.lock().unwrap().insert(port.clone(), driver);
+                holder
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .insert(port.clone(), port_handle);
                 println!("simHscCreate: port={port} poll={poll_ms}ms");
                 Ok(CommandOutcome::Continue)
             },
         )
     }
 
-    /// Get a driver by port name.
-    pub fn get_driver(&self, port: &str) -> Option<Arc<Mutex<HscDriver>>> {
-        self.drivers.lock().unwrap().get(port).cloned()
+    /// Get a port handle by port name.
+    pub fn get_port(&self, port: &str) -> Option<asyn_rs::port_handle::PortHandle> {
+        self.ports.lock().unwrap().get(port).cloned()
     }
 }
 
 impl Default for HscHolder {
     fn default() -> Self {
         Self {
-            drivers: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
         }
     }
@@ -754,7 +794,7 @@ mod tests {
     #[test]
     fn test_hsc_holder_creation() {
         let holder = HscHolder::new();
-        assert!(holder.get_driver("nonexistent").is_none());
+        assert!(holder.get_port("nonexistent").is_none());
     }
 
     #[test]

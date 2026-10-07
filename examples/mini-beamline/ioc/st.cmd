@@ -88,6 +88,11 @@ dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=ph:,
 dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=edge:,MTR=edge:mtr,PORT=PD_EDGE")
 dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=slit:,MTR=slit:mtr,PORT=PD_SLIT")
 
+# Load the HSC-1 slit controller and the quad BPM (asyn surface over the
+# ports simHscCreate/simQxbpmCreate registered above).
+dbLoadRecords("$(MINI_BEAMLINE)/db/hsc.template", "P=$(PREFIX),HSC=hsc1:,PORT=HSC1")
+dbLoadRecords("$(MINI_BEAMLINE)/db/qxbpm.template", "P=$(PREFIX)bpm1:,PORT=QXBPM1")
+
 # ===== MovingDot area detector (AD convention: P=detector prefix, R=cam1:) =====
 epicsEnvSet("PREFIX", "mini:dot:")
 epicsEnvSet("PORT",       "DOT")

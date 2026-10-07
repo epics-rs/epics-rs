@@ -74,17 +74,38 @@ camonitor mini:dcm:theta.RBV
 
 Simulated XIA HSC-1 four-blade slit using `SimHsc` from `optics-rs`. Supports gap/center and individual blade control.
 
+Record names follow optics' `xiahsc.db`, so a display built for the real module
+finds them; only the parameters `HscDriver` implements appear.
+
 | PV | Description |
 |----|-------------|
-| HSC parameters | Exposed via asyn port driver (H_GAP, H_CENTER, TOP, BOTTOM, LEFT, RIGHT) |
+| `mini:hsc1:width` / `widthRB` | Horizontal gap setpoint / readback (mm) |
+| `mini:hsc1:h0` / `h0RB` | Horizontal center setpoint / readback (mm) |
+| `mini:hsc1:height` / `heightRB` | Vertical gap setpoint / readback (mm) |
+| `mini:hsc1:v0` / `v0RB` | Vertical center setpoint / readback (mm) |
+| `mini:hsc1:t` / `tRB` | Top blade setpoint / readback (mm) |
+| `mini:hsc1:b` / `bRB` | Bottom blade setpoint / readback (mm) |
+| `mini:hsc1:l` / `lRB` | Left blade setpoint / readback (mm) |
+| `mini:hsc1:r` / `rRB` | Right blade setpoint / readback (mm) |
+| `mini:hsc1:busy` | Done / Moving — any blade in motion |
+| `mini:hsc1:power` / `powerRB` | Drive power level 0-2 |
 
 ### Quad BPM
 
 Simulated Oxford quad X-ray beam position monitor using `SimQxbpm`. Reports X/Y beam position from four simulated diode currents.
 
+Record names follow optics' `qxbpm.db`. The beam position is read-only: the
+driver computes it from the diode currents, which the simulation generates from
+the position given to `simQxbpmCreate`.
+
 | PV | Description |
 |----|-------------|
-| QXBPM parameters | Exposed via asyn port driver (X_POS, Y_POS, CURRENT_A-D) |
+| `mini:bpm1:pos:x` / `pos:y` | Beam position (mm) |
+| `mini:bpm1:current:a` … `:d` | Diode currents (nA) |
+| `mini:bpm1:current:total` | Summed diode current (nA) |
+| `mini:bpm1:current:low` | Ok / Low — below the current limit |
+| `mini:bpm1:gain` / `gainRB` | Current range: 1 uA, 100 nA, 10 nA, 1 nA |
+| `mini:bpm1:mode` / `modeRB` | Signal mode: Single, Average, Window |
 
 ### Motors
 

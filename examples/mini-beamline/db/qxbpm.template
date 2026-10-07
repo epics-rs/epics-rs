@@ -1,0 +1,127 @@
+# Quad X-ray BPM — asyn port surface for simQxbpmCreate().
+#
+# Record names follow optics' qxbpm.db so a display built for the real
+# module finds them; the SNL program there is replaced by the QxbpmDriver
+# parameter list, so only the parameters the driver implements appear.
+#
+# Macros: P, PORT
+
+# --- Beam position (driver computes it from the four diode currents) ---
+
+record(ai, "$(P)pos:x") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))X_POS")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+record(ai, "$(P)pos:y") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))Y_POS")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "mm")
+}
+
+# --- Diode currents ---
+
+record(ai, "$(P)current:a") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CURRENT_A")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "nA")
+}
+
+record(ai, "$(P)current:b") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CURRENT_B")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "nA")
+}
+
+record(ai, "$(P)current:c") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CURRENT_C")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "nA")
+}
+
+record(ai, "$(P)current:d") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CURRENT_D")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "nA")
+}
+
+record(ai, "$(P)current:total") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TOTAL_CURRENT")
+    field(SCAN, "I/O Intr")
+    field(PREC, "4")
+    field(EGU,  "nA")
+}
+
+record(bi, "$(P)current:low") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LOW_CURRENT")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Ok")
+    field(ONAM, "Low")
+}
+
+# --- Configuration ---
+
+record(mbbo, "$(P)gain") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))GAIN")
+    field(ZRST, "1 uA")
+    field(ZRVL, "0")
+    field(ONST, "100 nA")
+    field(ONVL, "1")
+    field(TWST, "10 nA")
+    field(TWVL, "2")
+    field(THST, "1 nA")
+    field(THVL, "3")
+}
+
+record(mbbi, "$(P)gainRB") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))GAIN")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "1 uA")
+    field(ZRVL, "0")
+    field(ONST, "100 nA")
+    field(ONVL, "1")
+    field(TWST, "10 nA")
+    field(TWVL, "2")
+    field(THST, "1 nA")
+    field(THVL, "3")
+}
+
+record(mbbo, "$(P)mode") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MODE")
+    field(ZRST, "Single")
+    field(ZRVL, "0")
+    field(ONST, "Average")
+    field(ONVL, "1")
+    field(TWST, "Window")
+    field(TWVL, "2")
+}
+
+record(mbbi, "$(P)modeRB") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MODE")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Single")
+    field(ZRVL, "0")
+    field(ONST, "Average")
+    field(ONVL, "1")
+    field(TWST, "Window")
+    field(TWVL, "2")
+}

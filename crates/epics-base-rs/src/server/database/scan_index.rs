@@ -769,6 +769,8 @@ impl ScanCursor<'_> {
     /// processing having changed its PHAS, so its key is rebuilt from live
     /// state before the resume point is looked up. `live_scan_key` reads the
     /// records map and the record itself, so no bucket lock is held across it.
+    #[cold]
+    #[inline(never)]
     fn resync(&mut self, db: &PvDatabase) {
         let was = self.standing().cloned();
         let live = was.as_ref().and_then(|w| db.live_scan_key(&w.name));
@@ -796,6 +798,7 @@ impl ScanCursor<'_> {
     /// re-find alone when it is — never across processing, as C releases
     /// `psl->lock` around every `dbProcess`.
     #[allow(clippy::type_complexity)]
+    #[inline]
     pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<&Arc<RecordCell>>)> {
         if self.snapshot.is_none()
             || self

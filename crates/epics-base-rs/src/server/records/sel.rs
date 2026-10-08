@@ -84,6 +84,9 @@ pub struct SelRecord {
     /// treated every cycle as the first one.
     pub mlst: f64,
     pub alst: f64,
+    /// MDEL / ADEL, `DBF_DOUBLE`, the deadbands against MLST / ALST.
+    pub mdel: f64,
+    pub adel: f64,
     /// True when `do_sel` detected an out-of-range SELN in Specified
     /// mode — raises `SOFT_ALARM/INVALID` in `check_alarms`.
     soft_alarm: bool,
@@ -148,6 +151,8 @@ impl Default for SelRecord {
             lalm: 0.0,
             mlst: 0.0,
             alst: 0.0,
+            mdel: 0.0,
+            adel: 0.0,
             soft_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
@@ -176,7 +181,7 @@ impl Record for SelRecord {
     /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and
     /// returns; it never touches LALM, whose only writes are in
     /// `checkAlarms` (:270-302).
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     fn has_array_monitor_post(&self) -> bool {
         false
@@ -410,6 +415,8 @@ impl Record for SelRecord {
             CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
             CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
             CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
             CycleCell::Hyst => CycleRead::Value(CycleValue::Double(self.hyst)),
             CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
             _ => CycleRead::Absent,
@@ -470,6 +477,8 @@ impl Record for SelRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
+            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Double(self.adel)),
             _ => None,
         }
     }
@@ -563,7 +572,8 @@ impl Record for SelRecord {
                 }
                 Ok(())
             }
-            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MLST" | "ALST" => {
+            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MLST" | "ALST" | "MDEL"
+            | "ADEL" => {
                 let v = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
@@ -576,6 +586,8 @@ impl Record for SelRecord {
                     "LALM" => self.lalm = v,
                     "MLST" => self.mlst = v,
                     "ALST" => self.alst = v,
+                    "MDEL" => self.mdel = v,
+                    "ADEL" => self.adel = v,
                     _ => unreachable!(),
                 }
                 Ok(())

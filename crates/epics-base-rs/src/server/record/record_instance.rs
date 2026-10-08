@@ -2231,6 +2231,9 @@ pub struct RecordInstance {
     /// outside the passes, as both builders used to, put the lookup after the
     /// tail it is supposed to skip.
     init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
+    /// What this record's dset `init_record` did; written only by
+    /// [`crate::server::device_support::init_device_support`].
+    pub(crate) dset_init: crate::server::device_support::DsetInit,
     /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
     /// "busy" state for every put that lands on it.
     ///
@@ -3204,6 +3207,7 @@ impl RecordInstance {
             device: None,
             subroutine: None,
             init_subroutines: None,
+            dset_init: crate::server::device_support::DsetInit::Succeeded,
             pact: AtomicBool::new(false),
             notify: None,
             notify_restart_list: std::collections::VecDeque::new(),
@@ -3272,12 +3276,6 @@ impl RecordInstance {
         registry: Arc<HashMap<String, Arc<SubroutineFn>>>,
     ) {
         self.init_subroutines = Some(registry);
-    }
-
-    /// Whether this record's dset has a C `init_record`. Every soft-channel
-    /// dset does, and soft channel is the `device == None` case here.
-    pub(crate) fn dset_has_init_record(&self) -> bool {
-        self.device.as_ref().is_none_or(|d| d.has_init_record())
     }
 
     /// C's `if (!pdset) { recGblRecordError(S_dev_noDSET, prec, "init_record");
@@ -6494,17 +6492,22 @@ impl RecordInstance {
         // rather than a list, so the cycle allocates nothing for it.
         let forced_mask = (!secondary_guard.is_empty())
             .then_some(secondary_guard | EventMask::VALUE | EventMask::LOG);
-        let mut forced_fired: u64 = 0;
+        let mut secondary_fired: u64 = 0;
         if forced_mask.is_some() {
             debug_assert!(
                 value_masked.len() <= u64::BITS as usize,
                 "fields_posted_with_value_mask is wider than the fired bitmask"
             );
             for (index, (name, gate)) in value_masked.iter().enumerate() {
-                if *gate == ValuePostGate::OnChangeForced
-                    && self.record.take_secondary_value_change(name)
-                {
-                    forced_fired |= 1 << index;
+                // `OnChange` sits inside VAL's own guard, `OnChangeForced`
+                // inside the widened one.
+                let guard_open = match gate {
+                    ValuePostGate::OnChange => !deadband_mask.is_empty(),
+                    ValuePostGate::OnChangeForced => true,
+                    ValuePostGate::WithValue => false,
+                };
+                if guard_open && self.record.take_secondary_value_change(name) {
+                    secondary_fired |= 1 << index;
                 }
             }
         }
@@ -6518,7 +6521,7 @@ impl RecordInstance {
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
         // advance — has already run.
-        if self.subscribers.is_empty() && self.last_posted.is_empty() && forced_fired == 0 {
+        if self.subscribers.is_empty() && self.last_posted.is_empty() && secondary_fired == 0 {
             return;
         }
         let MonitorPlan {
@@ -6599,13 +6602,12 @@ impl RecordInstance {
                 // aiRecord.c:462) or posts it whenever the guard fires (timestamp
                 // RVAL, timestampRecord.c:160).
                 let post = match gate {
-                    ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
                     ValuePostGate::WithValue => include_val,
-                    // Decided once per cycle in `forced_fired` above, against
-                    // the record's own old copy — never here, where the answer
-                    // would depend on this loop's `last_posted` cache and on
-                    // the field having a subscriber.
-                    ValuePostGate::OnChangeForced => false,
+                    // Decided once per cycle in `secondary_fired` above,
+                    // against the record's own old copy — never here, where
+                    // the answer would depend on this loop's `last_posted`
+                    // cache and on the field having a subscriber.
+                    ValuePostGate::OnChange | ValuePostGate::OnChangeForced => false,
                 };
                 if post {
                     snapshot.push((field.clone().into(), val.clone(), deadband_mask));
@@ -6676,12 +6678,16 @@ impl RecordInstance {
         // the ones nobody watches are dropped below, after the published
         // values have advanced.
         if let Some(forced_mask) = forced_mask {
-            for (index, (name, _)) in value_masked.iter().enumerate() {
-                if forced_fired & (1 << index) == 0 {
+            for (index, (name, gate)) in value_masked.iter().enumerate() {
+                if secondary_fired & (1 << index) == 0 {
                     continue;
                 }
+                let mask = match gate {
+                    ValuePostGate::OnChangeForced => forced_mask,
+                    _ => deadband_mask,
+                };
                 if let Some(val) = self.resolve_field(name) {
-                    snapshot.push((Cow::Borrowed(name), val, forced_mask));
+                    snapshot.push((Cow::Borrowed(name), val, mask));
                 }
             }
         }
@@ -7186,27 +7192,26 @@ impl RecordInstance {
         // not its primary value (e.g. the motor record, VAL=setpoint /
         // RBV=readback — C `monitor()` deadbands RBV) overrides that
         // hook. Default is `val()`, so other records are unaffected.
-        let Some(val) = self.record.monitor_deadband_value() else {
+        // The operands in one ask — see `Record::monitor_deadband_cells`. A
+        // type that carries no MLST/ALST cell holds them in `CommonFields`.
+        let Some(cells) = self
+            .record
+            .monitor_deadband_cells([self.common.mlst, self.common.alst])
+        else {
             return (true, true);
         };
-
-        // The four cells in one ask — see `Record::monitor_deadband_cells`. A
-        // type that carries no MLST/ALST cell holds them in `CommonFields`.
-        let cells = self
-            .record
-            .monitor_deadband_cells([self.common.mlst, self.common.alst]);
-        let monitor_trigger = check_deadband(val, cells.mlst, cells.mdel);
-        let archive_trigger = check_deadband(val, cells.alst, cells.adel);
+        let (monitor_trigger, archive_trigger) = cells.crossed();
 
         if monitor_trigger || archive_trigger {
+            let val = cells.val();
             self.record
                 .store_monitor_last_posted(val, monitor_trigger, archive_trigger);
-        }
-        if archive_trigger {
-            self.common.alst = val;
-        }
-        if monitor_trigger {
-            self.common.mlst = val;
+            if archive_trigger {
+                self.common.alst = val.as_f64();
+            }
+            if monitor_trigger {
+                self.common.mlst = val.as_f64();
+            }
         }
 
         (monitor_trigger, archive_trigger)
@@ -9315,8 +9320,8 @@ mod metadata_cache_tests {
         fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             READBACK_DEADBAND_FIELDS
         }
-        fn monitor_deadband_value(&self) -> Option<f64> {
-            Some(self.rbv)
+        fn monitor_deadband_value(&self) -> Option<crate::server::record::AlarmLimit> {
+            Some(crate::server::record::AlarmLimit::Double(self.rbv))
         }
         fn monitor_deadband_field(&self) -> &'static str {
             "RBV"
@@ -11181,6 +11186,39 @@ mod forced_secondary_post_tests {
         let mut inst = ao_with_moved_rval(7);
         assert!(guarded_cycle(&mut inst).is_empty());
         assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+    }
+
+    /// ai RVAL rides VAL's own guard (aiRecord.c:459-465): a shut guard
+    /// leaves ORAW stale, an open one posts RVAL with VAL's mask and advances
+    /// ORAW, subscriber or not.
+    #[test]
+    fn ai_oraw_advances_only_inside_vals_guard() {
+        use crate::server::records::ai::AiRecord;
+        let mut rec = AiRecord::default();
+        rec.rval = 7;
+        let mut inst = RecordInstance::new("AI:RVAL".to_string(), rec);
+        let cycle = |inst: &mut RecordInstance, mask| {
+            let mut snapshot = ProcessSnapshot::new();
+            inst.collect_subscriber_posts(&mut snapshot, mask, EventMask::NONE, true);
+            snapshot
+                .iter()
+                .map(|(field, _, mask)| (field.to_string(), *mask))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(cycle(&mut inst, EventMask::NONE).is_empty());
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(0)));
+
+        assert!(cycle(&mut inst, EventMask::LOG).is_empty());
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+
+        inst.record.put_field("RVAL", EpicsValue::Long(9)).unwrap();
+        let _rx = inst
+            .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            .expect("RVAL subscriber");
+        let posted = cycle(&mut inst, EventMask::VALUE);
+        assert_eq!(posted, [("RVAL".to_string(), EventMask::VALUE)]);
+        assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(9)));
     }
 }
 

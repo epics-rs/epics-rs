@@ -299,6 +299,7 @@ pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
 ///
 /// Mirrors epics-base PR #566 — the alarm-message string (`amsg`) is
 /// transferred from `namsg` alongside the severity / status.
+#[inline]
 pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;

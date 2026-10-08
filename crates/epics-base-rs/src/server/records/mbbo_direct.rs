@@ -367,7 +367,7 @@ impl Record for MbboDirectRecord {
 
     /// C `mbboDirectRecord.c:160` — `mlst = val`, and that is the whole tracker
     /// half: mbboDirect has neither ADEL nor LALM.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
     }
 

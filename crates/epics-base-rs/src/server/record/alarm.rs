@@ -141,6 +141,11 @@ impl AnalogAlarmConfig {
         common_hyst: f64,
     ) -> u16 {
         let sevs = [self.hhsv, self.llsv, self.hsv, self.lsv];
+        // Every level is gated on its severity first, so with none enabled the
+        // operands need not be brought into a domain at all.
+        if sevs == [0; 4] {
+            return 3;
+        }
         match val {
             AlarmLimit::Double(v) => {
                 let limits = match self.limits {
@@ -319,5 +324,44 @@ where
         2
     } else {
         3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_is_normal_with_no_level_enabled_and_fires_with_any_one() {
+        for mut cfg in [
+            AnalogAlarmConfig::double(),
+            AnalogAlarmConfig::long(),
+            AnalogAlarmConfig::int64(),
+        ] {
+            cfg.set_limit(AlarmLimitField::Hihi, AlarmLimit::Long(10));
+            cfg.set_limit(AlarmLimitField::High, AlarmLimit::Long(5));
+            cfg.set_limit(AlarmLimitField::Low, AlarmLimit::Long(-5));
+            cfg.set_limit(AlarmLimitField::Lolo, AlarmLimit::Long(-10));
+            let at = |cfg: &AnalogAlarmConfig, v: i32| {
+                let val = match cfg.limit(AlarmLimitField::Hihi) {
+                    AlarmLimit::Double(_) => AlarmLimit::Double(v.into()),
+                    AlarmLimit::Long(_) => AlarmLimit::Long(v),
+                    AlarmLimit::Int64(_) => AlarmLimit::Int64(v.into()),
+                };
+                cfg.range(val, None, val, 0.0)
+            };
+            assert_eq!((at(&cfg, 20), at(&cfg, -20)), (3, 3), "{cfg:?}");
+            for sev in [1, 4, -1] {
+                let one = |f: fn(&mut AnalogAlarmConfig) -> &mut i16| {
+                    let mut c = cfg;
+                    *f(&mut c) = sev;
+                    c
+                };
+                assert_eq!(at(&one(|c| &mut c.hhsv), 20), 5, "{cfg:?} HHSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.hsv), 20), 4, "{cfg:?} HSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.lsv), -20), 2, "{cfg:?} LSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.llsv), -20), 1, "{cfg:?} LLSV {sev}");
+            }
+        }
     }
 }

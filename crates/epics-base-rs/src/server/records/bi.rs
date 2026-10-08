@@ -270,19 +270,20 @@ impl Record for BiRecord {
         InputLinkRequest::As(match soft {
             SoftDtyp::Plain => LinkReadAs::UShort,
             SoftDtyp::Raw => LinkReadAs::ULong,
-            SoftDtyp::Async => LinkReadAs::Enum {
-                buffer: self.async_buffer,
-            },
+            SoftDtyp::Async => LinkReadAs::Enum,
         })
     }
 
     /// The Async dset copies its buffer into VAL; the other soft dsets never
     /// read `async_buffer`, so taking every delivered value is exact for it.
     fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
-        let Some(value) = value else {
-            return Ok(());
-        };
-        self.set_val(value)?;
+        match value {
+            None => return Ok(()),
+            Some(EpicsValue::EnumArray(a)) if a.is_empty() => {
+                self.set_val(EpicsValue::Enum(self.async_buffer))?
+            }
+            Some(value) => self.set_val(value)?,
+        }
         self.async_buffer = self.val;
         Ok(())
     }

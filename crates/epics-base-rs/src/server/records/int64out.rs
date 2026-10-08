@@ -30,15 +30,15 @@ pub struct Int64outRecord {
     // LALM/ALST/MLST are DBF_INT64 too, but `special(SPC_NOMOD)`: read-only, so
     // no client put reaches the parse. LALM is the alarm ladder's own
     // `epicsInt64 lalm` (`int64outRecord.c:294`) — the threshold its hysteresis
-    // arm compares against — so it holds that exactly; ALST/MLST stay doubles,
-    // read by the monitor deadband engine.
+    // arm compares against — so it holds that exactly, as ALST/MLST hold the
+    // values `DELTA` compares (`int64outRecord.c:350`).
     pub lalm: i64,
     pub ivoa: i16,
     pub ivov: i64,
     pub adel: i64,
     pub mdel: i64,
-    pub alst: f64,
-    pub mlst: f64,
+    pub alst: i64,
+    pub mlst: i64,
     pub omsl: i16,
     pub dol: String,
     pub simm: i16,
@@ -70,8 +70,8 @@ impl Default for Int64outRecord {
             ivov: 0,
             adel: 0,
             mdel: 0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             omsl: 0,
             dol: String::new(),
             simm: 0,
@@ -200,8 +200,8 @@ impl Record for Int64outRecord {
             CycleCell::Val => CycleRead::Value(CycleValue::Int64(self.val)),
             CycleCell::Mdel => CycleRead::Value(CycleValue::Int64(self.mdel)),
             CycleCell::Adel => CycleRead::Value(CycleValue::Int64(self.adel)),
-            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
-            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Int64(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Int64(self.alst)),
             CycleCell::Hyst => CycleRead::Value(CycleValue::Int64(self.hyst)),
             CycleCell::Lalm => CycleRead::Value(CycleValue::Int64(self.lalm)),
             _ => CycleRead::Absent,
@@ -215,13 +215,13 @@ impl Record for Int64outRecord {
                 self.lalm = v;
                 self.on_put("LALM");
             }
-            (CycleCell::Alst, CycleValue::Double(v)) => {
-                self.validate_put("ALST", &CycleValue::Double(v).lend())?;
+            (CycleCell::Alst, CycleValue::Int64(v)) => {
+                self.validate_put("ALST", &CycleValue::Int64(v).lend())?;
                 self.alst = v;
                 self.on_put("ALST");
             }
-            (CycleCell::Mlst, CycleValue::Double(v)) => {
-                self.validate_put("MLST", &CycleValue::Double(v).lend())?;
+            (CycleCell::Mlst, CycleValue::Int64(v)) => {
+                self.validate_put("MLST", &CycleValue::Int64(v).lend())?;
                 self.mlst = v;
                 self.on_put("MLST");
             }
@@ -244,8 +244,8 @@ impl Record for Int64outRecord {
             "IVOV" => Some(EpicsValue::Int64(self.ivov)),
             "ADEL" => Some(EpicsValue::Int64(self.adel)),
             "MDEL" => Some(EpicsValue::Int64(self.mdel)),
-            "ALST" => Some(EpicsValue::Double(self.alst)),
-            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Int64(self.alst)),
+            "MLST" => Some(EpicsValue::Int64(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -345,14 +345,18 @@ impl Record for Int64outRecord {
                 }
             }
             "ALST" => {
-                self.alst = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("ALST".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.alst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("ALST".into()));
+                }
             }
             "MLST" => {
-                self.mlst = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("MLST".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.mlst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("MLST".into()));
+                }
             }
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {

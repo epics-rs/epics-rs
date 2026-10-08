@@ -583,6 +583,11 @@ impl Record for CalcoutRecord {
         false
     }
 
+    /// `calcoutRecord.c:124-126` discards the dset status and seeds.
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
+        crate::server::record::seed_trackers_from_val(self);
+    }
+
     fn record_type(&self) -> &'static str {
         "calcout"
     }

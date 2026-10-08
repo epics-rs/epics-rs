@@ -41,7 +41,8 @@ pub use menu_choices::{
     MENU_PINI, MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
     binary_enum_str_state, binary_enum_string_form, multibit_enum_states, multibit_enum_str_state,
     multibit_enum_string_form, multibit_state_string_index, resolve_enum_state_string,
-    resolve_menu_field_string, resolve_menu_field_string_db_load, shared_menu_choices,
+    resolve_menu_field_string, resolve_menu_field_string_db_load, resolve_put_string_enum,
+    shared_menu_choices,
 };
 pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;
@@ -51,17 +52,18 @@ pub use record_instance::{
     ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{SimLink, ambient_write_origin, value_as_dbr_string};
-pub(crate) use record_trait::value_gate;
 pub use record_trait::{
     AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink,
-    CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue, DelayedCallbackOutcome,
-    EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot,
-    InputFetchPolicy, InputLinkRequest, LinkReadAs, MonitorDeadbandCells, OutTarget, ProcessAction,
-    ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record,
-    RecordProcessResult, ResolvedInputLinks, SimmCells, Special, SubroutineFn, ValuePostGate,
-    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
-    dbput_coerce_value, input_link_slots_of, link_value_in_field_shape, put_field_internal_default,
+    CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue, DeadbandCells,
+    DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc,
+    FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkReadAs,
+    MonitorDeadbandCells, OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome,
+    ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, SimmCells,
+    Special, SubroutineFn, ValuePostGate, arg_letter_offset, arg_link_field,
+    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    input_link_slots_of, link_value_in_field_shape, put_field_internal_default,
     put_value_in_field_shape, seed_input_links,
 };
+pub(crate) use record_trait::{seed_trackers_from_val, value_gate};
 pub use scan::{ScanList, ScanType, SimModeScan};
 pub use sparse_text::SparseText;

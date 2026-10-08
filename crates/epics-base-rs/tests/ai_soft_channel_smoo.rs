@@ -102,6 +102,18 @@ fn smoo_zero_takes_every_reading_whole() {
     assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(0.0));
 }
 
+/// `devAiSoft.c:88` sets `dpvt` on every good read, `SMOO` or not, so a
+/// reading taken with the filter off is the history it blends into once on.
+#[test]
+fn a_reading_at_smoo_zero_is_history_for_the_filter() {
+    let mut ai = create_record("ai").unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
+    ai.put_field("SMOO", EpicsValue::Double(0.5)).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(0.0))).unwrap();
+
+    assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(50.0));
+}
+
 /// `SMOO = 1` is the other end: `new * 0 + old * 1` — the reading is weighed
 /// out entirely and `VAL` never moves again.
 #[test]

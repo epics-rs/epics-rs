@@ -1033,7 +1033,7 @@ impl PvDatabase {
             LinkReadAs::ULong => link_value_get_as(value, DbFieldType::ULong),
             LinkReadAs::UShort => link_value_get_as(value, DbFieldType::UShort),
             LinkReadAs::Int64 => link_value_get_as(value, DbFieldType::Int64),
-            LinkReadAs::Enum { buffer } => self.enum_read_of(link, value, buffer),
+            LinkReadAs::Enum => self.enum_read_of(link, value),
             LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
@@ -1041,22 +1041,22 @@ impl PvDatabase {
         }
     }
 
-    /// The `DBR_ENUM` form of a value just read from `link` into a buffer
-    /// holding `buffer`. A one-element string is C's `cvt_st_e`, which hands
-    /// it to the source's `put_enum_str` with the SOURCE's `dbAddr`: a state
-    /// name stores the source's VAL (no post) and the buffer is not written.
-    /// More elements take `dbGet`'s table, `getStringUshort` on element 0;
-    /// none (NORD=0) is `dbGet`'s `n <= 0` arm, which converts nothing and
-    /// succeeds, so the buffer is delivered as it was.
+    /// The `DBR_ENUM` form of a value just read from `link`, or an empty
+    /// `EnumArray` where C writes nothing into the reader's buffer. A
+    /// one-element string is C's `cvt_st_e`, which hands it to the source's
+    /// `put_enum_str` with the SOURCE's `dbAddr`: a state name stores the
+    /// source's VAL (no post) and the buffer is not written. More elements
+    /// take `dbGet`'s table, `getStringUshort` on element 0; none (NORD=0) is
+    /// `dbGet`'s `n <= 0` arm, which converts nothing and succeeds.
     fn enum_read_of(
         &self,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
-        buffer: u16,
     ) -> Option<EpicsValue> {
         use crate::server::record::EnumChoice;
+        let unwritten = || Some(EpicsValue::EnumArray(Vec::new().into()));
         if value.is_array() && value.count() == 0 {
-            return Some(EpicsValue::Enum(buffer));
+            return unwritten();
         }
         let one = value.count() == 1;
         let scalar = if value.is_array() {
@@ -1091,7 +1091,7 @@ impl PvDatabase {
                 if source.record.enum_str_clears_udf() {
                     source.common.udf = 0;
                 }
-                Some(EpicsValue::Enum(buffer))
+                unwritten()
             }
             EnumChoice::Index(i) => Some(EpicsValue::Enum(i)),
         }
@@ -5503,7 +5503,7 @@ mod db_link_addr_tests {
             LinkReadAs::ULong,
             LinkReadAs::UShort,
             LinkReadAs::Int64,
-            LinkReadAs::Enum { buffer: 7 },
+            LinkReadAs::Enum,
             LinkReadAs::String,
             LinkReadAs::CharArrayAsString { max_elements: 40 },
         ];
@@ -5577,23 +5577,15 @@ mod db_link_addr_tests {
             ),
             ("NEG", LinkReadAs::UShort, Some(EpicsValue::UShort(65535))),
             ("NEG", LinkReadAs::ULong, Some(EpicsValue::ULong(u32::MAX))),
-            (
-                "NEG",
-                LinkReadAs::Enum { buffer: 7 },
-                Some(EpicsValue::Enum(65535)),
-            ),
+            ("NEG", LinkReadAs::Enum, Some(EpicsValue::Enum(65535))),
             ("HEX", LinkReadAs::Long, Some(EpicsValue::Long(16))),
             ("HEX", LinkReadAs::Int64, Some(EpicsValue::Int64(16))),
             ("HEX", LinkReadAs::UShort, Some(EpicsValue::UShort(16))),
             ("EXP", LinkReadAs::ULong, Some(EpicsValue::ULong(1000))),
             ("WORD", LinkReadAs::Long, None),
-            ("WORD", LinkReadAs::Enum { buffer: 7 }, None),
-            ("HEX", LinkReadAs::Enum { buffer: 7 }, None),
-            (
-                "M",
-                LinkReadAs::Enum { buffer: 7 },
-                Some(EpicsValue::Enum(2)),
-            ),
+            ("WORD", LinkReadAs::Enum, None),
+            ("HEX", LinkReadAs::Enum, None),
+            ("M", LinkReadAs::Enum, Some(EpicsValue::Enum(2))),
         ] {
             let parsed = parse_link_v2(&format!("{text} MS"));
             let ParsedLink::Db(link) = &parsed else {

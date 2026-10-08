@@ -154,6 +154,18 @@ impl AiRecord {
     }
 }
 
+// Out of line so the cycle that raises nothing does not pay the call's
+// register saves.
+#[cold]
+fn raise_bpt_error(common: &mut crate::server::record::CommonFields) {
+    crate::server::recgbl::rec_gbl_set_sevr_msg(
+        common,
+        crate::server::recgbl::alarm_status::SOFT_ALARM,
+        crate::server::record::AlarmSeverity::Major,
+        "BPT Error",
+    );
+}
+
 impl Record for AiRecord {
     fn acts_before_process(&self) -> bool {
         false
@@ -211,8 +223,8 @@ impl Record for AiRecord {
     // aiRecord.c:121-132: a dset `init_record` returns before the seed, so a
     // soft-channel ai keeps MLST/ALST/LALM and ORAW at 0 and posts its first
     // VAL. ORAW is no deadband tracker but sits on the same C branch.
-    fn seed_deadband_tracking(&mut self, dset_has_init_record: bool) {
-        if !dset_has_init_record {
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init == crate::server::device_support::DsetInit::Absent {
             self.mlst = self.val;
             self.alst = self.val;
             self.lalm = self.val;
@@ -290,7 +302,6 @@ impl Record for AiRecord {
         } // end skip_convert
         self.skip_convert = false;
 
-        self.oraw = self.rval;
         // C `aiRecord.c:170`: `prec->init = FALSE;` on the way out of EVERY
         // process, not just the first one.
         self.init = ConvertPhase::Converted;
@@ -654,12 +665,7 @@ impl Record for AiRecord {
     /// C-equivalent alarm so the misconfiguration is visible.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         if self.bpt_error {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
-                common,
-                crate::server::recgbl::alarm_status::SOFT_ALARM,
-                crate::server::record::AlarmSeverity::Major,
-                "BPT Error",
-            );
+            raise_bpt_error(common);
         }
     }
 
@@ -711,7 +717,18 @@ impl Record for AiRecord {
     /// is `vt.val`. So the finiteness test is on what is being blended INTO,
     /// and `dpvt` is the separate answer to "is there anything to blend into".
     fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
-        let Some(value) = value else {
+        // A `DBR_DOUBLE` reading with SMOO off is the whole dset body; taking
+        // it first keeps the blend's frame and `EpicsValue`'s out-of-line
+        // drop off the per-cycle read.
+        let value = std::mem::ManuallyDrop::new(value);
+        if let Some(EpicsValue::Double(v)) = *value
+            && self.smoo == 0.0
+        {
+            self.val = v;
+            self.soft_history = SoftReadHistory::Prior;
+            return Ok(());
+        }
+        let Some(value) = std::mem::ManuallyDrop::into_inner(value) else {
             self.soft_history = SoftReadHistory::Absent;
             return Ok(());
         };
@@ -767,6 +784,18 @@ impl Record for AiRecord {
         // C re-tests the raw value inside the guard (`if (prec->oraw !=
         // prec->rval)`, aiRecord.c:462), so an unchanged RVAL is not re-posted.
         &[("RVAL", ValuePostGate::OnChange)]
+    }
+
+    /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// inside `if (monitor_mask)` (aiRecord.c:461-464): ORAW advances only
+    /// on a cycle that posts VAL.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        if field == "RVAL" && self.oraw != self.rval {
+            self.oraw = self.rval;
+            true
+        } else {
+            false
+        }
     }
 }
 

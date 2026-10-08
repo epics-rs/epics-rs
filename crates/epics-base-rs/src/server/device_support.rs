@@ -358,6 +358,25 @@ impl DeviceReadOutcome {
     }
 }
 
+/// What the record's dset `init_record` did, as the record's own C
+/// `init_record` tests it before seeding MLST/ALST/LALM.
+///
+/// The record types do not agree on what a failure skips: `bi`, `longin`,
+/// `longout`, `int64in`, `int64out` and `ao` return before the seed, `bo`,
+/// `mbbi`, `mbbo`, `mbbiDirect`, `mbboDirect` and `calcout` seed regardless,
+/// and `ai` seeds only when there is no dset `init_record` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsetInit {
+    /// The dset has no `init_record` entry (devTimestampAI).
+    Absent,
+    /// C status 0, or `ao`/`bo`/`mbbo`'s "do not convert" 2. Every soft
+    /// channel dset lands here.
+    Succeeded,
+    /// Any other status: [`DeviceInitOutcome::Dead`] or an `Err` from
+    /// [`DeviceSupport::init`].
+    Failed,
+}
+
 /// Whether a device support's `init_record` left the record able to process.
 ///
 /// C's `init_record` failure has two shapes and they are not the same record
@@ -737,11 +756,12 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
 /// past `if (!pdset) return S_dev_noDSET`.
 pub fn init_device_support(instance: &mut RecordInstance) {
     let Some(mut dev) = instance.device.take() else {
+        instance.dset_init = DsetInit::Succeeded;
         return;
     };
     let name = instance.name.clone();
-    match dev.init(&mut *instance.record) {
-        Ok(DeviceInitOutcome::Live) => {}
+    let succeeded = match dev.init(&mut *instance.record) {
+        Ok(DeviceInitOutcome::Live) => true,
         Ok(DeviceInitOutcome::Dead { alarm }) => {
             // C's `bad:` arm. The driver has already printed why. The
             // `recGblSetSevr` comes first in every C arm that has one, so it
@@ -751,6 +771,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
                 crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
             }
             instance.enter_pact();
+            false
         }
         Err(e) => {
             eprintln!(
@@ -761,8 +782,16 @@ pub fn init_device_support(instance: &mut RecordInstance) {
             // than presenting a healthy-looking record.
             instance.common.sevr = AlarmSeverity::Invalid;
             instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
+            false
         }
-    }
+    };
+    instance.dset_init = if !dev.has_init_record() {
+        DsetInit::Absent
+    } else if succeeded {
+        DsetInit::Succeeded
+    } else {
+        DsetInit::Failed
+    };
     instance.device = Some(dev);
 }
 

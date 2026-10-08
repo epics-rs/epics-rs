@@ -40,8 +40,8 @@ pub struct LongoutRecord {
     // Cause B (commit 224d5ad5).
     pub adel: i32,
     pub mdel: i32,
-    pub alst: f64,
-    pub mlst: f64,
+    pub alst: i32,
+    pub mlst: i32,
     pub omsl: i16,
     pub dol: String,
     pub simm: i16,
@@ -112,8 +112,8 @@ impl Default for LongoutRecord {
             ivov: 0,
             adel: 0,
             mdel: 0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             omsl: 0,
             dol: String::new(),
             simm: 0,
@@ -296,8 +296,8 @@ impl Record for LongoutRecord {
             CycleCell::Val => CycleRead::Value(CycleValue::Long(self.val)),
             CycleCell::Mdel => CycleRead::Value(CycleValue::Long(self.mdel)),
             CycleCell::Adel => CycleRead::Value(CycleValue::Long(self.adel)),
-            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
-            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Long(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Long(self.alst)),
             CycleCell::Lalm => CycleRead::Value(CycleValue::Long(self.lalm)),
             _ => CycleRead::Absent,
         }
@@ -310,13 +310,13 @@ impl Record for LongoutRecord {
                 self.lalm = v;
                 self.on_put("LALM");
             }
-            (CycleCell::Alst, CycleValue::Double(v)) => {
-                self.validate_put("ALST", &CycleValue::Double(v).lend())?;
+            (CycleCell::Alst, CycleValue::Long(v)) => {
+                self.validate_put("ALST", &CycleValue::Long(v).lend())?;
                 self.alst = v;
                 self.on_put("ALST");
             }
-            (CycleCell::Mlst, CycleValue::Double(v)) => {
-                self.validate_put("MLST", &CycleValue::Double(v).lend())?;
+            (CycleCell::Mlst, CycleValue::Long(v)) => {
+                self.validate_put("MLST", &CycleValue::Long(v).lend())?;
                 self.mlst = v;
                 self.on_put("MLST");
             }
@@ -340,8 +340,8 @@ impl Record for LongoutRecord {
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
             "ADEL" => Some(EpicsValue::Long(self.adel)),
             "MDEL" => Some(EpicsValue::Long(self.mdel)),
-            "ALST" => Some(EpicsValue::Double(self.alst)),
-            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Long(self.alst)),
+            "MLST" => Some(EpicsValue::Long(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -418,12 +418,12 @@ impl Record for LongoutRecord {
                 }
             }
             "ALST" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.alst = v;
                 }
             }
             "MLST" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.mlst = v;
                 }
             }
@@ -547,20 +547,20 @@ mod tests {
         use crate::server::record::Record;
         // C `longoutRecord.c` init_record ends with mlst=alst=lalm=val, so a
         // record initialised to a nonzero VAL posts no spurious first-cycle
-        // monitor (DELTA(mlst,val)==0). The trackers default to 0.0, which
+        // monitor (DELTA(mlst,val)==0). The trackers default to 0, which
         // conflates "never published" with "published 0"; the framework seed
         // must lift them to val via the generic get_field/put_field path.
         let mut r = LongoutRecord::new(5);
-        assert_eq!(r.mlst, 0.0, "precondition: tracker is the 0.0 default");
-        assert_eq!(r.alst, 0.0);
+        assert_eq!(r.mlst, 0, "precondition: tracker is the 0 default");
+        assert_eq!(r.alst, 0);
         assert_eq!(r.lalm, 0);
-        r.seed_deadband_tracking(true);
-        assert_eq!(r.mlst, 5.0, "mlst seeded from val");
-        assert_eq!(r.alst, 5.0, "alst seeded from val");
+        r.seed_deadband_tracking(crate::server::device_support::DsetInit::Succeeded);
+        assert_eq!(r.mlst, 5, "mlst seeded from val");
+        assert_eq!(r.alst, 5, "alst seeded from val");
         assert_eq!(r.lalm, 5, "lalm seeded from val");
         // First process leaves val unchanged: DELTA(mlst=5, val=5)=0 is not
         // > mdel(0), so no DBE_VALUE/DBE_LOG post — matching C.
-        assert!((5.0_f64 - r.mlst).abs() <= 0.0);
+        assert_eq!(r.val.abs_diff(r.mlst), 0);
     }
 
     #[test]

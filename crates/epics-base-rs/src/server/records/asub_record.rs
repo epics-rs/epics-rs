@@ -96,6 +96,9 @@ pub struct ASubRecord {
     /// out-of-i32-range or fractional value is REFUSED — modeling it as i32
     /// keys the put on the integer row instead of accepting any double.
     pub val: i32,
+    /// The VAL `monitor()` last posted (`aSubRecord.c:414-416`), seeded from
+    /// VAL by the init tail.
+    pub oval: i32,
     pub snam: PvString,
     pub inam: PvString,
     /// Input links `INPA..INPU`.
@@ -177,6 +180,7 @@ impl Default for ASubRecord {
     fn default() -> Self {
         Self {
             val: 0,
+            oval: 0,
             snam: PvString::new(),
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
@@ -381,6 +385,32 @@ impl Record for ASubRecord {
         false
     }
 
+    /// `aSubRecord.c:414`: VAL posts `DBE_VALUE | DBE_LOG` on `val != oval`,
+    /// so both deadbands are 0 against the one OVAL cell.
+    fn monitor_deadband_cells(
+        &self,
+        _last_posted: [f64; 2],
+    ) -> Option<crate::server::record::MonitorDeadbandCells> {
+        Some(crate::server::record::MonitorDeadbandCells::Long(
+            crate::server::record::DeadbandCells {
+                val: self.val,
+                mdel: 0,
+                adel: 0,
+                mlst: self.oval,
+                alst: self.oval,
+            },
+        ))
+    }
+
+    fn store_monitor_last_posted(
+        &mut self,
+        _val: crate::server::record::AlarmLimit,
+        _mlst: bool,
+        _alst: bool,
+    ) {
+        self.oval = self.val;
+    }
+
     fn record_type(&self) -> &'static str {
         "aSub"
     }
@@ -456,6 +486,7 @@ impl Record for ASubRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Long(self.val)),
+            "OVAL" => return Some(EpicsValue::Long(self.oval)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "BRSV" => return Some(EpicsValue::Short(self.brsv)),
@@ -493,6 +524,13 @@ impl Record for ASubRecord {
                 // any arithmetic value to epicsInt32, so accept any numeric and
                 // project it onto DBF_LONG rather than rejecting a Double writer.
                 self.val = value
+                    .to_dbf_i32()
+                    .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                return Ok(());
+            }
+            // SPC_NOMOD: only the init tail writes it.
+            "OVAL" => {
+                self.oval = value
                     .to_dbf_i32()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 return Ok(());

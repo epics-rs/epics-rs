@@ -631,7 +631,7 @@ const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 impl Record for ScalcoutRecord {
     /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
     /// LALM; every write to it is in `checkAlarms` (:727-750).
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     fn has_array_monitor_post(&self) -> bool {
         false

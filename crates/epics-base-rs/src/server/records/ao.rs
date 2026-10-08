@@ -421,8 +421,12 @@ impl Record for AoRecord {
 
     /// C `aoRecord.c:157-159` — `mlst = alst = lalm = val`, all three, which is
     /// what the framework default would do anyway; spelled out because the
-    /// derived half above is this record's own.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
+    /// derived half above is this record's own. A dset status other than 0 or
+    /// 2 returns `S_dev_badInitRet` before it (`aoRecord.c:152`).
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init == crate::server::device_support::DsetInit::Failed {
+            return;
+        }
         self.mlst = self.val;
         self.alst = self.val;
         self.lalm = self.val;

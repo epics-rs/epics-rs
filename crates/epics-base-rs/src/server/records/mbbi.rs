@@ -360,6 +360,12 @@ impl Record for MbbiRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `mbbiRecord.c:133-137` keeps the dset status for the return and seeds
+    /// regardless of it.
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
+        crate::server::record::seed_trackers_from_val(self);
+    }
+
     /// UDF belongs to the dset here, not to `process()`. C
     /// `mbbiRecord.c:168-193` assigns `prec->udf = FALSE` at `:174`, INSIDE
     /// `if (status == 0)`, and folds `2` into `0` only at `:192-193`, so a
@@ -425,19 +431,20 @@ impl Record for MbbiRecord {
         InputLinkRequest::As(match soft {
             SoftDtyp::Plain => LinkReadAs::UShort,
             SoftDtyp::Raw => LinkReadAs::Long,
-            SoftDtyp::Async => LinkReadAs::Enum {
-                buffer: self.async_buffer,
-            },
+            SoftDtyp::Async => LinkReadAs::Enum,
         })
     }
 
     /// The Async dset copies its buffer into VAL; the other soft dsets never
     /// read `async_buffer`, so taking every delivered value is exact for it.
     fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
-        let Some(value) = value else {
-            return Ok(());
-        };
-        self.set_val(value)?;
+        match value {
+            None => return Ok(()),
+            Some(EpicsValue::EnumArray(a)) if a.is_empty() => {
+                self.set_val(EpicsValue::Enum(self.async_buffer))?
+            }
+            Some(value) => self.set_val(value)?,
+        }
         self.async_buffer = self.val;
         Ok(())
     }

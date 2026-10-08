@@ -4,6 +4,7 @@ use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
 use super::alarm::AlarmLimit;
 use super::scan::ScanType;
+use crate::server::device_support::DsetInit;
 
 /// Which of a `devXxxSoftRaw` dset's two entry points is delivering a value to
 /// [`Record::raw_soft_input`]. They are not the same function in C, and they do
@@ -506,12 +507,14 @@ pub enum LinkReadAs {
     UShort,
     /// C `dbGetLink(..., DBR_INT64, ...)`.
     Int64,
-    /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer, which holds
-    /// `buffer`. Numeric sources convert as [`Self::UShort`] does. A one-element
-    /// `DBF_STRING` source goes to the SOURCE record's `put_enum_str`
-    /// (`cvt_st_e`), which on a name match stores the source's VAL and leaves
-    /// the buffer as it was; a longer one parses element 0 (`getStringUshort`).
-    Enum { buffer: u16 },
+    /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer. Numeric
+    /// sources convert as [`Self::UShort`] does. A one-element `DBF_STRING`
+    /// source goes to the SOURCE record's `put_enum_str` (`cvt_st_e`), which on
+    /// a name match stores the source's VAL and leaves the buffer as it was; a
+    /// longer one parses element 0 (`getStringUshort`). Where C writes nothing
+    /// the read delivers an empty `EnumArray`, so the buffer stays the
+    /// reader's and this request can be cached in the plan.
+    Enum,
     /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
     /// bytes of the source's char array, taken as the string they spell
     /// (`sseqRecord.c:682-686`: `n_elements` clamped to the record's 40-byte
@@ -3001,17 +3004,19 @@ pub trait Record: Send + Sync + 'static {
     /// MDEL/ADEL to `RBV` (the readback) — its C `monitor()` deadbands
     /// `RBV`, not `VAL`. Such a record returns its readback field here.
     ///
-    /// In the deadband's own domain: C compares `double`s
-    /// (`recGblCheckDeadband`), so a record that stores the cell as one hands
-    /// it over without an `EpicsValue` round trip. `None` is a value the
-    /// deadband cannot compare, which posts unconditionally.
+    /// In the deadband's own domain, which VAL's type picks: C compares
+    /// `double`s (`recGblCheckDeadband`) except on longin/longout and
+    /// int64in/int64out, whose `DELTA` is integer (`int64inRecord.c:363`) —
+    /// through a double, two `epicsInt64` values past 2^53 apart by one
+    /// compared equal. `None` is a value the deadband cannot compare, which
+    /// posts unconditionally.
     ///
     /// Default is `val()`, so existing records are unaffected.
-    fn monitor_deadband_value(&self) -> Option<f64> {
+    fn monitor_deadband_value(&self) -> Option<AlarmLimit> {
         match val_cell(self) {
-            CycleRead::Value(v) => Some(v.to_f64()),
+            CycleRead::Value(v) => Some(v.alarm_limit()),
             CycleRead::Absent => None,
-            CycleRead::ByName => self.val().and_then(|v| v.to_f64()),
+            CycleRead::ByName => self.val().as_ref().and_then(AlarmLimit::from_stored),
         }
     }
 
@@ -3584,24 +3589,13 @@ pub trait Record: Send + Sync + 'static {
     /// ALST); everything else their tail does is
     /// [`Self::init_record_tail`]'s.
     ///
-    /// `dset_has_init_record` is whether the record's dset supplies a C
-    /// `init_record`; only a type whose C seed sits behind that test (ai)
-    /// reads it.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
-        let seed = match self.monitor_deadband_value() {
-            Some(v) if v.is_finite() => v,
-            _ => return,
-        };
-        for field in ["MLST", "ALST", "LALM"] {
-            // Coerce to the cell's own type first. `bi`/`mbbi` declare MLST
-            // DBF_USHORT and reject a Double outright, so seeding them as a
-            // Double left them at 0 with the error dropped on the floor —
-            // silently the no-seed behaviour, for two records C does seed.
-            let Some(current) = self.get_field(field) else {
-                continue;
-            };
-            let coerced = EpicsValue::Double(seed).convert_to(current.db_field_type());
-            let _ = self.put_field(field, coerced);
+    /// `dset_init` is what the dset's `init_record` did. The default is
+    /// `biRecord.c:112-114`'s `if (status) return status;` ahead of the seed;
+    /// a type that seeds after a failed init (mbbi, calcout) or only without
+    /// a dset `init_record` (ai) overrides it.
+    fn seed_deadband_tracking(&mut self, dset_init: DsetInit) {
+        if dset_init != DsetInit::Failed {
+            seed_trackers_from_val(self);
         }
     }
 
@@ -3746,45 +3740,53 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
-    /// C `monitor()`'s four deadband cells, read in one question: the MDEL /
-    /// ADEL thresholds and the MLST / ALST values the record last posted at.
-    /// A deadband this type does not carry is 0; an MLST/ALST it does not
-    /// carry is the instance's own `[MLST, ALST]`, passed in as `last_posted`.
+    /// C `monitor()`'s deadband operands, read in one question: the value
+    /// ([`Self::monitor_deadband_value`]), the MDEL / ADEL thresholds and the
+    /// MLST / ALST values the record last posted at, all in the value's
+    /// domain. A deadband this type does not carry is 0; an MLST/ALST it does
+    /// not carry is the instance's own `[MLST, ALST]`, passed in as
+    /// `last_posted`. `None` is no comparable value.
     ///
     /// Asked as one question because the cycle otherwise asks
     /// [`Self::get_field`] four times through the vtable and pays an
     /// [`EpicsValue`] per answer. Each cell is read through
     /// [`Self::cycle_cell`]; by name, that was measured at ~970 instructions
     /// of an `ai` cycle across the cycle's cell reads.
-    fn monitor_deadband_cells(&self, last_posted: [f64; 2]) -> MonitorDeadbandCells {
-        let f64_of = |cell: CycleCell, absent: f64| match self.cycle_cell(cell) {
-            CycleRead::Value(v) => v.to_f64(),
-            CycleRead::Absent => absent,
-            CycleRead::ByName => self
-                .get_field(cell.name())
-                .and_then(|v| v.to_f64())
-                .unwrap_or(absent),
-        };
-        MonitorDeadbandCells {
-            mdel: f64_of(CycleCell::Mdel, 0.0),
-            adel: f64_of(CycleCell::Adel, 0.0),
-            mlst: f64_of(CycleCell::Mlst, last_posted[0]),
-            alst: f64_of(CycleCell::Alst, last_posted[1]),
-        }
+    fn monitor_deadband_cells(&self, last_posted: [f64; 2]) -> Option<MonitorDeadbandCells> {
+        Some(match self.monitor_deadband_value()? {
+            AlarmLimit::Double(val) => MonitorDeadbandCells::Double(deadband_cells(
+                self,
+                val,
+                last_posted,
+                CycleValue::to_f64,
+            )),
+            AlarmLimit::Long(val) => MonitorDeadbandCells::Long(deadband_cells(
+                self,
+                val,
+                last_posted,
+                CycleValue::to_i32,
+            )),
+            AlarmLimit::Int64(val) => MonitorDeadbandCells::Int64(deadband_cells(
+                self,
+                val,
+                last_posted,
+                CycleValue::to_i64,
+            )),
+        })
     }
 
     /// Store the value this cycle posted at into the cells whose deadband it
     /// crossed — C `monitor()`'s `prec->mlst = prec->val` /
     /// `prec->alst = prec->val`.
     ///
-    /// C declares MLST/ALST with the record's VAL type, so the double is
+    /// C declares MLST/ALST with the record's VAL type, so the value is
     /// converted to whatever the cell holds. Same one-question reason as
     /// [`Self::monitor_deadband_cells`] — this is four more vtable calls
     /// otherwise.
-    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
+    fn store_monitor_last_posted(&mut self, val: AlarmLimit, mlst: bool, alst: bool) {
         for (cell, store) in [(CycleCell::Alst, alst), (CycleCell::Mlst, mlst)] {
             if store {
-                store_cycle_cell(self, cell, CycleValue::Double(val));
+                store_cycle_cell(self, cell, CycleValue::from(val));
             }
         }
     }
@@ -5463,8 +5465,13 @@ pub fn dbput_coerce_value<R: Record + ?Sized>(
     target: DbFieldType,
     value: EpicsValue,
 ) -> CaResult<Converted> {
+    // C's row test (`dbAccess.c:1355`), asked of the request before its shape
+    // is settled: `nRequest > 1 || special == SPC_DBADDR`. A scalar-stored
+    // `SPC_DBADDR` field (`mbbo.VAL`, an `aSub` channel at NOA 1) takes the
+    // `putString*` row, which has no empty-string arm.
+    let array_row = value.count() > 1 || record.field_is_dbaddr(field);
     let value = put_value_in_field_shape(record, field, value);
-    coerce_put_value(record, field, target, value)
+    coerce_put_value_in_row(record, field, target, value, array_row)
 }
 
 /// `value` as the one-element buffer of its OWN element type. The element type
@@ -5548,20 +5555,26 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
 /// `cvt_dbaddr`) and an `FTVL=STRING` buffer, whose `NumericField::of` is
 /// `None` — still belong to this row; it hands them the text unchanged for
 /// their record to store.
+///
+/// A destination stored as a scalar gets its one element back as a scalar;
+/// its enum row is `putStringEnum`, which parses the index with `&end` where
+/// `cvt_st_e` passes NULL, so trailing text after the number is accepted.
 fn put_string_array_row<R: Record + ?Sized>(
     record: &R,
     field: &str,
     target: DbFieldType,
     value: &EpicsValue,
+    array_row: bool,
 ) -> CaResult<Option<Converted>> {
     let texts: &[crate::types::PvString] = match value {
         EpicsValue::String(s) => std::slice::from_ref(s),
         EpicsValue::StringArray(a) => a,
         _ => return Ok(None),
     };
-    if !record.get_field(field).is_some_and(|v| v.is_array()) {
+    if !array_row {
         return Ok(None);
     }
+    let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
     // `putStringString` is a byte copy, and the record stores the text: hand the
     // value over unchanged rather than falling through to the SCALAR numeric
     // row below, which would parse `printf.VAL`'s `"7"` into the number 7.
@@ -5572,10 +5585,19 @@ fn put_string_array_row<R: Record + ?Sized>(
     {
         return Ok(Some(Converted::Stored(value.clone())));
     }
+    if !dest_is_array && target == DbFieldType::Enum {
+        return super::resolve_put_string_enum(field, record, &texts[0])
+            .map(|v| Some(Converted::Stored(v)));
+    }
     let Some(numeric) = c_parse::NumericField::of(target) else {
         return Ok(Some(Converted::Stored(value.clone())));
     };
-    c_parse::put_string_elements(field, numeric, texts).map(Some)
+    match c_parse::put_string_elements(field, numeric, texts)? {
+        Converted::Stored(v) if !dest_is_array => {
+            Ok(Some(Converted::Stored(v.first_element().unwrap_or(v))))
+        }
+        converted => Ok(Some(converted)),
+    }
 }
 
 /// Coerce a written value to a field's stored type — the single owner of C
@@ -5632,13 +5654,26 @@ pub fn coerce_put_value<R: Record + ?Sized>(
     target: DbFieldType,
     value: EpicsValue,
 ) -> CaResult<Converted> {
+    let array_row = record.get_field(field).is_some_and(|v| v.is_array());
+    coerce_put_value_in_row(record, field, target, value, array_row)
+}
+
+/// [`coerce_put_value`] with `dbPut`'s row choice made by the caller:
+/// `array_row` is `dbPutConvertRoutine`, otherwise `dbFastPutConvertRoutine`.
+fn coerce_put_value_in_row<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    target: DbFieldType,
+    value: EpicsValue,
+    array_row: bool,
+) -> CaResult<Converted> {
     // The ARRAY row first, so both counts of the SAME C routine have one owner:
     // a scalar `String` and a `StringArray` into an array destination are both
     // `dbPutConvertRoutine[DBR_STRING][target]` over `nRequest` elements
     // (`dbAccess.c:1350` takes that arm for every `special(SPC_DBADDR)` field,
     // whatever the count). Menu/DTYP/enum fields are never array destinations,
     // so nothing below is shadowed.
-    if let Some(converted) = put_string_array_row(record, field, target, &value)? {
+    if let Some(converted) = put_string_array_row(record, field, target, &value, array_row)? {
         return Ok(converted);
     }
     if let EpicsValue::String(s) = &value {
@@ -6144,6 +6179,27 @@ mod tests {
             .collect()
     }
 
+    /// A deadband cell the `.dbd` declares but the type does not serve still
+    /// loads from `field(MDEL,"5")`, and the deadband then runs at 0: `sel`
+    /// did that while `selRecord.c:316,319` deadbands both.
+    #[test]
+    fn every_declared_deadband_cell_is_served() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        for record_type in RECORD_TYPES {
+            let Some(r) = cycle_record(record_type) else {
+                continue;
+            };
+            for field in ["MDEL", "ADEL", "MLST", "ALST"] {
+                assert_eq!(
+                    r.field_list().iter().any(|d| d.name == field),
+                    r.get_field(field).is_some(),
+                    "{record_type}.{field}: declared and served must agree"
+                );
+            }
+        }
+    }
+
     /// Every one-question cycle accessor must answer exactly what the
     /// `get_field` path it replaces would answer, for every record type in
     /// the database — the overrides exist only to skip a name match, never to
@@ -6169,19 +6225,63 @@ mod tests {
             // Distinct from every seeded cell, so a type that answers from
             // `last_posted` for a cell it carries is caught.
             let last_posted = [-71.5, -72.5];
-            let deadband = r.monitor_deadband_cells(last_posted);
-            let or = |field, absent| f64_of(r, field).unwrap_or(absent);
-            assert_eq!(deadband.mdel, or("MDEL", 0.0), "{record_type} MDEL");
-            assert_eq!(deadband.adel, or("ADEL", 0.0), "{record_type} ADEL");
+            let cell = |field, absent| {
+                r.get_field(field)
+                    .as_ref()
+                    .and_then(CycleValue::from_epics)
+                    .unwrap_or(CycleValue::Double(absent))
+            };
+            // aSub keeps C's one `oval` for both (`aSubRecord.c:414`).
+            let (mlst, alst) = match *record_type {
+                "aSub" => ("OVAL", "OVAL"),
+                _ => ("MLST", "ALST"),
+            };
+            let raw = [
+                cell("MDEL", 0.0),
+                cell("ADEL", 0.0),
+                cell(mlst, last_posted[0]),
+                cell(alst, last_posted[1]),
+            ];
+            let want = r
+                .val()
+                .as_ref()
+                .and_then(AlarmLimit::from_stored)
+                .map(|val| match val {
+                    AlarmLimit::Double(val) => {
+                        let [mdel, adel, mlst, alst] = raw.map(CycleValue::to_f64);
+                        MonitorDeadbandCells::Double(DeadbandCells {
+                            val,
+                            mdel,
+                            adel,
+                            mlst,
+                            alst,
+                        })
+                    }
+                    AlarmLimit::Long(val) => {
+                        let [mdel, adel, mlst, alst] = raw.map(CycleValue::to_i32);
+                        MonitorDeadbandCells::Long(DeadbandCells {
+                            val,
+                            mdel,
+                            adel,
+                            mlst,
+                            alst,
+                        })
+                    }
+                    AlarmLimit::Int64(val) => {
+                        let [mdel, adel, mlst, alst] = raw.map(CycleValue::to_i64);
+                        MonitorDeadbandCells::Int64(DeadbandCells {
+                            val,
+                            mdel,
+                            adel,
+                            mlst,
+                            alst,
+                        })
+                    }
+                });
             assert_eq!(
-                deadband.mlst,
-                or("MLST", last_posted[0]),
-                "{record_type} MLST"
-            );
-            assert_eq!(
-                deadband.alst,
-                or("ALST", last_posted[1]),
-                "{record_type} ALST"
+                r.monitor_deadband_cells(last_posted),
+                want,
+                "{record_type} deadband cells"
             );
 
             let ladder = r
@@ -6226,7 +6326,7 @@ mod tests {
             seed_cycle_cells(&mut *fast);
             seed_cycle_cells(&mut *slow);
 
-            fast.store_monitor_last_posted(23.0, true, true);
+            fast.store_monitor_last_posted(AlarmLimit::Double(23.0), true, true);
             for field in ["ALST", "MLST"] {
                 let target = slow
                     .get_field(field)
@@ -6383,7 +6483,7 @@ mod tests {
             assert_eq!(r.val(), r.get_field(r.primary_field()), "{record_type} val");
             assert_eq!(
                 r.monitor_deadband_value(),
-                r.val().and_then(|v| v.to_f64()),
+                r.val().as_ref().and_then(AlarmLimit::from_stored),
                 "{record_type} monitor_deadband_value"
             );
             assert!(!r.value_is_undefined(), "{record_type} value_is_undefined");
@@ -6696,6 +6796,22 @@ impl CycleValue {
         }
     }
 
+    /// `self` stored into an `epicsInt32` cell.
+    #[inline]
+    pub fn to_i32(self) -> i32 {
+        self.as_int_i64().map_or_else(
+            || crate::types::c_cast::f64_to_i32(self.to_f64()),
+            |i| i as i32,
+        )
+    }
+
+    /// `self` stored into an `epicsInt64` cell.
+    #[inline]
+    pub fn to_i64(self) -> i64 {
+        self.as_int_i64()
+            .unwrap_or_else(|| crate::types::c_cast::f64_to_i64(self.to_f64()))
+    }
+
     /// `self` stored into a cell that holds `carrier`'s variant — the
     /// scalar arms of [`EpicsValue::convert_to`], so `prec->lalm = val`
     /// lands in the cell's own type.
@@ -6712,9 +6828,9 @@ impl CycleValue {
         match carrier {
             Self::Double(_) => Self::Double(f),
             Self::Float(_) => Self::Float(c_cast::f64_to_f32(f)),
-            Self::Long(_) => Self::Long(int.map_or_else(|| c_cast::f64_to_i32(f), |i| i as i32)),
+            Self::Long(_) => Self::Long(self.to_i32()),
             Self::ULong(_) => Self::ULong(int.map_or_else(|| c_cast::f64_to_u32(f), |i| i as u32)),
-            Self::Int64(_) => Self::Int64(int.unwrap_or_else(|| c_cast::f64_to_i64(f))),
+            Self::Int64(_) => Self::Int64(self.to_i64()),
             // Only a 64-bit source keeps its bits; a narrower one goes
             // through the double, as `convert_to` does.
             Self::UInt64(_) => Self::UInt64(match self {
@@ -6803,16 +6919,112 @@ impl From<AlarmLimit> for CycleValue {
     }
 }
 
-/// The four cells C `monitor()`'s deadband compares against — see
-/// [`Record::monitor_deadband_cells`], which is the only producer.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MonitorDeadbandCells {
+/// The operands of C `monitor()`'s deadband test, in one domain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeadbandCells<T> {
+    /// The value the test is for ([`Record::monitor_deadband_value`]).
+    pub val: T,
     /// MDEL, the monitor deadband.
-    pub mdel: f64,
+    pub mdel: T,
     /// ADEL, the archive deadband.
-    pub adel: f64,
+    pub adel: T,
     /// MLST, the value the last `DBE_VALUE` post carried.
-    pub mlst: f64,
+    pub mlst: T,
     /// ALST, the value the last `DBE_LOG` post carried.
-    pub alst: f64,
+    pub alst: T,
+}
+
+/// The four cells beside `val`, each converted by `to` into its domain.
+#[inline]
+fn deadband_cells<R: Record + ?Sized, T>(
+    r: &R,
+    val: T,
+    last_posted: [f64; 2],
+    to: fn(CycleValue) -> T,
+) -> DeadbandCells<T> {
+    let cell = |cell: CycleCell, absent: f64| {
+        to(match r.cycle_cell(cell) {
+            CycleRead::Value(v) => v,
+            CycleRead::Absent => CycleValue::Double(absent),
+            CycleRead::ByName => r
+                .get_field(cell.name())
+                .as_ref()
+                .and_then(CycleValue::from_epics)
+                .unwrap_or(CycleValue::Double(absent)),
+        })
+    };
+    DeadbandCells {
+        val,
+        mdel: cell(CycleCell::Mdel, 0.0),
+        adel: cell(CycleCell::Adel, 0.0),
+        mlst: cell(CycleCell::Mlst, last_posted[0]),
+        alst: cell(CycleCell::Alst, last_posted[1]),
+    }
+}
+
+/// [`DeadbandCells`] in the domain VAL's type picks — see
+/// [`Record::monitor_deadband_cells`], which is the only producer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MonitorDeadbandCells {
+    /// `recGblCheckDeadband`.
+    Double(DeadbandCells<f64>),
+    /// longin/longout `DELTA` (`longinRecord.c:370`).
+    Long(DeadbandCells<i32>),
+    /// int64in/int64out `DELTA` (`int64inRecord.c:363`).
+    Int64(DeadbandCells<i64>),
+}
+
+impl MonitorDeadbandCells {
+    #[inline]
+    pub fn val(&self) -> AlarmLimit {
+        match self {
+            Self::Double(c) => AlarmLimit::Double(c.val),
+            Self::Long(c) => AlarmLimit::Long(c.val),
+            Self::Int64(c) => AlarmLimit::Int64(c.val),
+        }
+    }
+
+    /// Whether VAL crossed `(MDEL, ADEL)`. The integer arms are C's
+    /// `mdel < 0 || DELTA(mlst, val) > (epicsUInt64) mdel`.
+    #[inline]
+    pub fn crossed(&self) -> (bool, bool) {
+        fn delta_crossed(delta: u64, deadband: i64) -> bool {
+            deadband < 0 || delta > deadband as u64
+        }
+        match self {
+            Self::Double(c) => (
+                super::record_instance::check_deadband(c.val, c.mlst, c.mdel),
+                super::record_instance::check_deadband(c.val, c.alst, c.adel),
+            ),
+            Self::Long(c) => (
+                delta_crossed(c.val.abs_diff(c.mlst).into(), c.mdel.into()),
+                delta_crossed(c.val.abs_diff(c.alst).into(), c.adel.into()),
+            ),
+            Self::Int64(c) => (
+                delta_crossed(c.val.abs_diff(c.mlst), c.mdel),
+                delta_crossed(c.val.abs_diff(c.alst), c.adel),
+            ),
+        }
+    }
+}
+
+/// `prec->mlst = prec->alst = prec->lalm = prec->val` for whichever of the
+/// three cells the record serves.
+pub(crate) fn seed_trackers_from_val<R: Record + ?Sized>(rec: &mut R) {
+    let seed = match rec.monitor_deadband_value() {
+        Some(AlarmLimit::Double(v)) if !v.is_finite() => return,
+        Some(v) => v,
+        None => return,
+    };
+    for field in ["MLST", "ALST", "LALM"] {
+        // Coerce to the cell's own type first. `bi`/`mbbi` declare MLST
+        // DBF_USHORT and reject a Double outright, so seeding them as a
+        // Double left them at 0 with the error dropped on the floor —
+        // silently the no-seed behaviour, for two records C does seed.
+        let Some(current) = rec.get_field(field) else {
+            continue;
+        };
+        let coerced = seed.to_epics_value().convert_to(current.db_field_type());
+        let _ = rec.put_field(field, coerced);
+    }
 }

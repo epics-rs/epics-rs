@@ -135,7 +135,7 @@ impl Record for SubRecord {
     /// reaches it. The generic tail runs before the resolution and so cannot
     /// answer that; `ioc_app::wire_subroutine`, which performs the resolution,
     /// does it there.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
     /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
@@ -404,7 +404,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
-        rec.seed_deadband_tracking(true);
+        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Succeeded);
         for field in ["MLST", "ALST", "LALM"] {
             assert_eq!(
                 rec.get_field(field),

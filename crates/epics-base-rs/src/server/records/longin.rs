@@ -78,10 +78,10 @@ pub struct LonginRecord {
     pub aftc: f64,
     #[field(type = "Double")]
     pub afvl: f64,
-    #[field(type = "Double")]
-    pub alst: f64,
-    #[field(type = "Double")]
-    pub mlst: f64,
+    #[field(type = "Long")]
+    pub alst: i32,
+    #[field(type = "Long")]
+    pub mlst: i32,
     // SIMM is `DBF_MENU menu(menuYesNo)` (longinRecord.dbd.pod:475-479):
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
@@ -121,8 +121,8 @@ impl Default for LonginRecord {
             mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             simm: 0,
             siml: String::new(),
             siol: String::new(),

@@ -273,7 +273,7 @@ impl Record for BoRecord {
     /// same tail. (C assigns `mlst` twice, once on each side of the convert at
     /// `:165` and `:172`; only the second is reachable.) bo seeds no ALST: it
     /// has no ADEL.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
         self.lalm = self.val;
     }

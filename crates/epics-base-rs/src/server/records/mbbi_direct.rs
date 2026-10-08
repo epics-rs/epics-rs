@@ -94,7 +94,7 @@ impl Record for MbbiDirectRecord {
     /// C `mbbiDirectRecord.c:128` — `prec->mlst = prec->val`, the whole of this
     /// record's init tail. MLST is `special(SPC_NOMOD)` so it has no `put_field`
     /// arm for the trait default to go through; the record seeds its own cell.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
     }
 

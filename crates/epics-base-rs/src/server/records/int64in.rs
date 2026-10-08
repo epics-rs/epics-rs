@@ -78,10 +78,10 @@ pub struct Int64inRecord {
     pub aftc: f64,
     #[field(type = "Double")]
     pub afvl: f64,
-    #[field(type = "Double")]
-    pub alst: f64,
-    #[field(type = "Double")]
-    pub mlst: f64,
+    #[field(type = "Int64")]
+    pub alst: i64,
+    #[field(type = "Int64")]
+    pub mlst: i64,
     // SIMM is `DBF_MENU menu(menuYesNo)` (int64inRecord.dbd.pod:279-283):
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
@@ -120,8 +120,8 @@ impl Default for Int64inRecord {
             mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             simm: 0,
             siml: String::new(),
             siol: String::new(),

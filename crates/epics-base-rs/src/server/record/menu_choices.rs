@@ -338,13 +338,20 @@ fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
 /// wrapped through the negative side (`> ~0xffff`) is NOT an overflow — it
 /// truncates to its low 16 bits.
 fn epics_parse_uint16(s: &str) -> Option<u16> {
-    let (value, rest) = c_strtoul_base0(s)?;
+    let (_, rest) = c_strtoul_base0(s)?;
     if !rest
         .bytes()
         .all(|b| crate::runtime::stdlib::c_isspace(b as char))
     {
         return None; // S_stdlib_extraneous
     }
+    epics_parse_uint16_units(s)
+}
+
+/// [`epics_parse_uint16`] with a `units` pointer, as `putStringEnum` passes
+/// `&end`: trailing text after the number is left to the caller, not refused.
+fn epics_parse_uint16_units(s: &str) -> Option<u16> {
+    let (value, _) = c_strtoul_base0(s)?;
     if value > 0xffff && value <= !0xffff_u64 {
         return None; // S_stdlib_overflow
     }
@@ -512,8 +519,8 @@ pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
     )
 }
 
-/// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a
-/// `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
+/// C `dbFastLinkConv.c::cvt_st_e` (lines 247-282) — a scalar `DBR_STRING`
+/// write to a `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
 ///
 /// C routes it through the record's `put_enum_str` rset slot
 /// ([`Record::enum_str_state`](crate::server::record::Record::enum_str_state))
@@ -529,13 +536,33 @@ pub fn resolve_enum_state_string<R: crate::server::record::Record + ?Sized>(
     record: &R,
     s: &PvString,
 ) -> CaResult<EpicsValue> {
+    resolve_enum_state(field, record, s, epics_parse_uint16)
+}
+
+/// C `dbConvert.c::putStringEnum` (lines 1149-1190), the `dbPutConvertRoutine`
+/// row a `special(SPC_DBADDR)` enum field (`mbbo.VAL`) takes: as
+/// [`resolve_enum_state_string`], but the index fallback parses with `&end`.
+pub fn resolve_put_string_enum<R: crate::server::record::Record + ?Sized>(
+    field: &str,
+    record: &R,
+    s: &PvString,
+) -> CaResult<EpicsValue> {
+    resolve_enum_state(field, record, s, epics_parse_uint16_units)
+}
+
+fn resolve_enum_state<R: crate::server::record::Record + ?Sized>(
+    field: &str,
+    record: &R,
+    s: &PvString,
+    parse_index: fn(&str) -> Option<u16>,
+) -> CaResult<EpicsValue> {
     let Some(states) = record.enum_state_strings() else {
         return Err(CaError::TypeMismatch(format!(
             "{field}: DBF_ENUM field whose record supplies no enum-state table \
              (C put_enum_str == NULL: S_db_noRSET)"
         )));
     };
-    let index = enum_state_choice(record, &states, s)
+    let index = enum_choice_parsed_by(record, &states, s, parse_index)
         .map(|(EnumChoice::Named(i) | EnumChoice::Index(i))| i)
         .ok_or_else(|| {
             CaError::BadChoice(format!(
@@ -568,10 +595,19 @@ pub(crate) fn enum_state_choice<R: crate::server::record::Record + ?Sized>(
     states: &[PvString],
     s: &PvString,
 ) -> Option<EnumChoice> {
+    enum_choice_parsed_by(record, states, s, epics_parse_uint16)
+}
+
+fn enum_choice_parsed_by<R: crate::server::record::Record + ?Sized>(
+    record: &R,
+    states: &[PvString],
+    s: &PvString,
+    parse_index: fn(&str) -> Option<u16>,
+) -> Option<EnumChoice> {
     if let Some(i) = record.enum_str_state(s) {
         return Some(EnumChoice::Named(i));
     }
-    let value = epics_parse_uint16(&s.as_str_lossy())?;
+    let value = parse_index(&s.as_str_lossy())?;
     (value < states.len() as u16).then_some(EnumChoice::Index(value))
 }
 

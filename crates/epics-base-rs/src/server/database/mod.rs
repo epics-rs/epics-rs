@@ -151,6 +151,7 @@ mod tsel_stamp {
         /// C `recGblGetTimeStampSimm`'s body: store what `TSEL` yielded, then
         /// resolve `TSE`→`TIME`. `is_soft` indicates a Soft Channel device
         /// type.
+        #[inline(always)]
         pub(crate) fn stamp(self, name: &str, common: &mut CommonFields, is_soft: bool) {
             match self {
                 TselStamp::Time(time, utag) => {
@@ -190,6 +191,7 @@ mod tsel_stamp {
     /// number with no provider to answer it — is not a stamp: C writes nothing
     /// into `precord->time` and errlogs, so a misconfigured record holds its
     /// stale stamp rather than timestamping as if healthy.
+    #[inline]
     fn apply_timestamp(name: &str, common: &mut CommonFields, _is_soft: bool) {
         // Single owner of TSE -> TIME resolution; device support that must
         // format the record's resolved time during `read()` routes through the
@@ -198,11 +200,15 @@ mod tsel_stamp {
         // device-time "leave it alone" semantics.
         match crate::server::recgbl::get_time_stamp(common.tse, common.time) {
             Some(t) => common.time = t,
-            None => crate::runtime::log::errlog_printf(&format!(
-                "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {}\n",
-                common.tse
-            )),
+            None => tse_failed(name, common.tse),
         }
+    }
+
+    #[cold]
+    fn tse_failed(name: &str, tse: i16) {
+        crate::runtime::log::errlog_printf(&format!(
+            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {tse}\n"
+        ));
     }
 }
 

@@ -2725,6 +2725,9 @@ pub(crate) fn wire_subroutine(
                 }
             }
         }
+        // `aSubRecord.c:163`: `prec->oval = prec->val`, so the first
+        // `monitor()` posts VAL only if it moved since init.
+        //
         // `aSubRecord.c:162`: `strcpy(prec->onam, prec->snam)`. That seed is
         // what gives `fetch_values`' `strcmp(prec->snam, prec->onam)` (`:261`)
         // its meaning — "the SUBL link delivered a name different from the one
@@ -2735,6 +2738,9 @@ pub(crate) fn wire_subroutine(
         _ => {
             if let Some(snam_field) = instance.record.get_field("SNAM") {
                 let _ = instance.record.put_field("ONAM", snam_field);
+            }
+            if let Some(val) = instance.record.get_field("VAL") {
+                let _ = instance.record.put_field("OVAL", val);
             }
         }
     }

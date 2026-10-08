@@ -6190,7 +6190,10 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     let mut rec = MotorRecord::new();
     rec.pos.rbv = 42.0;
     rec.pos.val = 10.0; // setpoint differs from readback
-    assert_eq!(rec.monitor_deadband_value(), Some(42.0));
+    assert_eq!(
+        rec.monitor_deadband_value(),
+        Some(epics_base_rs::server::record::AlarmLimit::Double(42.0))
+    );
 }
 
 // --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc

@@ -591,7 +591,7 @@ impl Record for MbboRecord {
 
     /// C `mbboRecord.c:179-180` — `mlst = lalm = val`. No ALST: mbbo has no
     /// ADEL.
-    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
         self.lalm = self.val;
     }

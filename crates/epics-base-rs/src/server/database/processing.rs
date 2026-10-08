@@ -8296,9 +8296,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             }
         }
         instance.record.init_record_tail();
-        instance
-            .record
-            .seed_deadband_tracking(instance.dset_has_init_record());
+        instance.record.seed_deadband_tracking(instance.dset_init);
         return;
     }
 
@@ -8402,9 +8400,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    that may or may not remember it (the iocsh `dbLoadRecords` path did
     //    not).
     instance.record.init_record_tail();
-    instance
-        .record
-        .seed_deadband_tracking(instance.dset_has_init_record());
+    instance.record.seed_deadband_tracking(instance.dset_init);
 
     // C's init-time `db_post_events` run during iocInit, before any client can
     // subscribe, so they are observable by nobody. A seed put that made the

@@ -393,6 +393,17 @@ impl Record for BusyRecord {
     // `val == 0` here would be the same C fact written twice, which is how the
     // deleted `is_put_complete() == (self.val == 0)` came to say it in the one
     // place the framework then honoured without the forward-link half.
+    // C `busyRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
+    // simulation is always synchronous: the -1.0 `check_simulation_mode`
+    // takes for an undeclared SDLY.
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: -1.0,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),

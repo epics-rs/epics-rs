@@ -1961,6 +1961,16 @@ impl<'a> ResolvedInputLinks<'a> {
     }
 }
 
+/// The record's SIMM, SIMS and SDLY cells, read as C reads them off the
+/// record struct: three members, no field-name lookup and no
+/// [`EpicsValue`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimmCells {
+    pub simm: i16,
+    pub sims: i16,
+    pub sdly: f64,
+}
+
 pub trait Record: Send + Sync + 'static {
     /// Return the record type name (e.g., "ai", "ao", "bi").
     fn record_type(&self) -> &'static str;
@@ -3501,6 +3511,27 @@ pub trait Record: Send + Sync + 'static {
     /// does not override this loses nothing.
     fn link_text_ref(&self, _link_field: &str) -> Option<&str> {
         None
+    }
+
+    /// SIMM/SIMS/SDLY as stored, lent without an owned field value. Every
+    /// base record type that declares SIMM overrides this (a type whose C
+    /// dbd has no SDLY answers the synchronous `-1.0`). `None` is for
+    /// record crates outside this one, which keep the three fields behind
+    /// [`Self::get_field`]; the callers read them there.
+    fn simm_cells(&self) -> Option<SimmCells> {
+        None
+    }
+
+    /// SIMM as the `i16` the recGbl helpers compare, through
+    /// [`Self::simm_cells`] where the type offers it.
+    fn simm_value(&self) -> Option<i16> {
+        match self.simm_cells() {
+            Some(cells) => Some(cells.simm),
+            None => match self.get_field("SIMM") {
+                Some(EpicsValue::Short(simm)) => Some(simm),
+                _ => None,
+            },
+        }
     }
 
     fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {

@@ -609,6 +609,14 @@ impl Record for MbboRecord {
         }
     }
 
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         mbb_get_field!(self, name,
             "RVAL" => rval: ULong, "ORAW" => oraw: ULong,

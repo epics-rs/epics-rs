@@ -1069,6 +1069,14 @@ impl Record for WaveformRecord {
     // EGU/HOPR/LOPR/PREC are backed by typed storage and exposed through both
     // get_field/put_field and field_list, so populate_display_info reads the
     // loaded values for the DBR_GR display limits (waveformRecord.c:251-252).
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {

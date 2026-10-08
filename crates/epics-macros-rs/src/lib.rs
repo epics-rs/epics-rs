@@ -524,6 +524,35 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // SIMM/SIMS/SDLY — emit `Record::simm_cells`. Keyed on the member names
+    // rather than a marker so a struct that carries the simulation cells
+    // cannot forget to opt in and fall back to the by-name path; a struct
+    // that carries only some of the three is rejected here, since the hook
+    // has no partial form.
+    let cell = |name: &str| field_infos.iter().find(|fi| fi.epics_name == name);
+    let simm_cells_method = match (cell("SIMM"), cell("SIMS"), cell("SDLY")) {
+        (None, None, None) => quote! {},
+        (Some(simm), Some(sims), Some(sdly)) => {
+            let (simm, sims, sdly) = (&simm.ident, &sims.ident, &sdly.ident);
+            quote! {
+                fn simm_cells(&self) -> Option<#krate::server::record::SimmCells> {
+                    Some(#krate::server::record::SimmCells {
+                        simm: self.#simm,
+                        sims: self.#sims,
+                        sdly: self.#sdly,
+                    })
+                }
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "EpicsRecord: a record carrying any of SIMM/SIMS/SDLY must carry all three \
+                 (they back `Record::simm_cells`)",
+            ));
+        }
+    };
+
     // `#[record(constant_init = "LINK:TARGET,...")]` — the record's C
     // `recGblInitConstantLink` table. Omitted entirely when the record declares
     // none, so the trait default (no constant seeds) applies.
@@ -647,6 +676,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
             #menu_method
             #link_text_method
+            #simm_cells_method
         }
     };
 

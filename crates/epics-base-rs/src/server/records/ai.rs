@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     AlarmLimit, AnalogAlarmInput, FieldMetadataOverride, MENU_SIMM, MonitorDeadbandCells,
-    ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+    ProcessOutcome, RawSoftEntry, Record, SimmCells, ValuePostGate,
 };
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
@@ -344,6 +344,14 @@ impl Record for AiRecord {
 
     fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
         self.lalm = lalm.as_f64();
+    }
+
+    fn simm_cells(&self) -> Option<SimmCells> {
+        Some(SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

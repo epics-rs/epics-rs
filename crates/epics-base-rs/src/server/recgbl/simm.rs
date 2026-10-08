@@ -89,11 +89,15 @@ impl SimMode {
 /// (`swaitRecord.c:407-422` is a plain `if (simm == menuYesNoNO) … else …`):
 /// every non-NO value simulates. It says so via
 /// [`Record::rejects_illegal_sim_mode`](crate::server::record::Record::rejects_illegal_sim_mode).
+#[inline]
 pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
-    let simm = record
-        .get_field("SIMM")
-        .and_then(|v| v.to_f64())
-        .unwrap_or(0.0) as i16;
+    let simm = match record.simm_cells() {
+        Some(cells) => cells.simm,
+        None => record
+            .get_field("SIMM")
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0) as i16,
+    };
     // The record's own SIMM menu decides which indices are legal. Every record
     // that declares SIMM declares its menu; a record with no SIMM never reaches
     // here (the caller's entry gate), so the fallback is inert.

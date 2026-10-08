@@ -42,6 +42,10 @@ struct TestStringinRecord {
     val: String,
     #[field(type = "Short")]
     simm: i16,
+    #[field(type = "Short")]
+    sims: i16,
+    #[field(type = "Double")]
+    sdly: f64,
 }
 
 #[derive(EpicsRecord)]
@@ -90,6 +94,8 @@ fn record_type_returns_correct_string() {
     let stringin = TestStringinRecord {
         val: String::new(),
         simm: 0,
+        sims: 0,
+        sdly: -1.0,
     };
     assert_eq!(stringin.record_type(), "stringin");
 
@@ -585,6 +591,34 @@ fn a_type_with_no_link_field_lends_nothing() {
     let rec = TestStringinRecord {
         val: String::new(),
         simm: 0,
+        sims: 0,
+        sdly: -1.0,
     };
     assert_eq!(rec.link_text_ref("VAL"), None);
+}
+
+#[test]
+fn simulation_cells_are_lent_and_a_type_without_them_lends_nothing() {
+    let rec = TestStringinRecord {
+        val: String::new(),
+        simm: 1,
+        sims: 2,
+        sdly: 0.5,
+    };
+    assert_eq!(
+        rec.simm_cells(),
+        Some(epics_base_rs::server::record::SimmCells {
+            simm: 1,
+            sims: 2,
+            sdly: 0.5
+        })
+    );
+    let ai = AiRecord {
+        val: 0.0,
+        high_limit: 0.0,
+        low_limit: 0.0,
+        precision: 0,
+        engineering_units: String::new(),
+    };
+    assert_eq!(ai.simm_cells(), None);
 }

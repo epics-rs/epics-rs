@@ -864,6 +864,17 @@ impl Record for SwaitRecord {
         self.inp_names.get(slot).map(String::as_str)
     }
 
+    // C `swaitRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
+    // simulation is always synchronous: the -1.0 `check_simulation_mode`
+    // takes for an undeclared SDLY.
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: -1.0,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),

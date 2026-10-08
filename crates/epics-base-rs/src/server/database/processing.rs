@@ -7733,18 +7733,40 @@ impl PvDatabase {
     /// pair inside it. The record lock is taken and released here: the
     /// scan-index update re-enters the database.
     pub(crate) fn apply_simm_scan_swap(&self, rec: &Arc<RecordCell>) {
+        let (name, result) = Self::check_simm_under_guard(&mut rec.write());
+        self.move_scan_for_simm(name, result);
+    }
+
+    /// `rec_gbl_check_simm` under a guard the caller already holds, with the
+    /// record name taken only when the result is a scan move. The name is
+    /// needed only to move the scan list, which a SIMM transition does and a
+    /// steady cycle never does.
+    fn check_simm_under_guard(
+        instance: &mut crate::server::record::RecordInstance,
+    ) -> (Option<String>, crate::server::record::CommonFieldPutResult) {
         use crate::server::record::CommonFieldPutResult;
-        let (name, result) = {
-            let mut instance = rec.write();
-            let name = instance.name.clone();
-            let result = instance.rec_gbl_check_simm();
-            (name, result)
-        };
-        if let CommonFieldPutResult::ScanChanged {
-            old_scan,
-            new_scan,
-            phas,
-        } = result
+        let result = instance.rec_gbl_check_simm();
+        let name = matches!(result, CommonFieldPutResult::ScanChanged { .. })
+            .then(|| instance.name.clone());
+        (name, result)
+    }
+
+    /// Hand a [`Self::check_simm_under_guard`] result to the scan-index owner,
+    /// once the record lock is down.
+    fn move_scan_for_simm(
+        &self,
+        name: Option<String>,
+        result: crate::server::record::CommonFieldPutResult,
+    ) {
+        use crate::server::record::CommonFieldPutResult;
+        if let (
+            Some(name),
+            CommonFieldPutResult::ScanChanged {
+                old_scan,
+                new_scan,
+                phas,
+            },
+        ) = (name, result)
         {
             self.update_scan_index(&name, old_scan, new_scan, phas, phas);
         }
@@ -8032,8 +8054,14 @@ impl PvDatabase {
         rec: &Arc<RecordCell>,
         simm: &crate::server::record::record_instance::SimmBlock,
     ) -> (SimOutcome, crate::server::record::PactExit) {
-        // Read SIML, SIOL, SIMS, SDLY from the record
-        let (siml_link, siol_link, sims, sdly, pact_held) = {
+        // Read SIML, SIMS, SDLY from the record. SIOL is parsed further down,
+        // on the paths that read or write it.
+        //
+        // When no SIML read has to leave the lock — PACT held, or a constant
+        // SIML whose C `dbGetLink` delivers nothing — the whole SIMM sequence
+        // (`recGblSaveSimm`, the constant read, `recGblCheckSimm`, the mode
+        // dispatch) runs under this one guard and comes back as `resolved`.
+        let (siml_link, sims, sdly, pact_held, resolved) = {
             // Exclusive, not shared: the SIML/SIOL parse cache is validated
             // and (on a text change) rewritten here, and this is the one
             // stage of the cycle that reads those two links.
@@ -8076,20 +8104,14 @@ impl PvDatabase {
             // and `DBF_OUTLINK` on an output one (`aoRecord.dbd.pod:551`), so
             // its modifier mask (`dbStaticLib.c:2380-2391`) follows the same
             // direction split — CP/CPP is discarded on the output side.
-            let siml_link = instance.sim_link_parse(
-                "SIML",
+            let siml = instance.sim_link_parse(
+                crate::server::record::SimLink::Siml,
                 simm.siml,
                 crate::server::record::LinkFieldType::In,
             );
-            let siol_link = instance.sim_link_parse(
-                "SIOL",
-                simm.siol,
-                if simm.is_input {
-                    crate::server::record::LinkFieldType::In
-                } else {
-                    crate::server::record::LinkFieldType::Out
-                },
-            );
+            // Carried past the guard only for a SIML that must be read.
+            let siml_link = (!pact_held && !crate::server::recgbl::simm::is_constant(siml))
+                .then(|| siml.clone());
             // SIMS is `DBF_MENU` (`mcaRecord.dbd:391`, `aiRecord.dbd.pod:511`
             // and every other), so read the INDEX and not one chosen carrier:
             // base record types answer `EpicsValue::Short` (`records/ai.rs:310`)
@@ -8098,22 +8120,45 @@ impl PvDatabase {
             // `mca`'s SIMS as the `unwrap_or(0)` default, so a simulated mca
             // raised `SIMM_ALARM` at NO_ALARM whatever the database asked for
             // — silently, since a menu index of 0 is a legal value.
-            let sims = instance
-                .resolve_field_upper_at("SIMS", simm.sims)
-                .and_then(|v| v.to_menu_index())
-                .unwrap_or(0);
-            // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
-            // "-1.0"). Absent on record types whose SIMM group Rust does not
-            // yet fully model — default to -1.0 (synchronous) so the async
-            // branch is a no-op there, exactly as a record with the C default
-            // behaves.
-            let sdly = instance
-                .resolve_field_upper_at("SDLY", simm.sdly)
-                .and_then(|v| v.to_f64())
-                .unwrap_or(-1.0);
+            let (sims, sdly) = match instance.record.simm_cells() {
+                Some(cells) => (cells.sims, cells.sdly),
+                None => (
+                    instance
+                        .resolve_field_upper_at("SIMS", simm.sims)
+                        .and_then(|v| v.to_menu_index())
+                        .unwrap_or(0),
+                    // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
+                    // "-1.0"). Absent on record types whose SIMM group Rust
+                    // does not yet fully model — default to -1.0
+                    // (synchronous) so the async branch is a no-op there.
+                    instance
+                        .resolve_field_upper_at("SDLY", simm.sdly)
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(-1.0),
+                ),
+            };
 
-            (siml_link, siol_link, sims, sdly, pact_held)
+            let resolved = siml_link.is_none().then(|| {
+                let moved = if pact_held {
+                    None
+                } else {
+                    instance.rec_gbl_save_simm();
+                    // A constant SIML delivers nothing: SIMM keeps what it
+                    // held, and only `recGblCheckSimm` has work to do.
+                    Some(Self::check_simm_under_guard(&mut instance))
+                };
+                let mode = crate::server::recgbl::simm::resolve_sim_mode(&*instance.record);
+                (mode, instance.pact_exit_without_release(), moved)
+            });
+
+            (siml_link, sims, sdly, pact_held, resolved)
         };
+        let resolved = resolved.map(|(mode, exit, moved)| {
+            if let Some((name, result)) = moved {
+                self.move_scan_for_simm(name, result);
+            }
+            (mode, exit)
+        });
         let is_input = simm.is_input;
         // swait: the simulation replaces the record's input STAGE, not its
         // whole cycle. Declared by the record, not by a type-name list — the
@@ -8138,8 +8183,8 @@ impl PvDatabase {
         // The read itself goes through the SIMM transition owner
         // (`rec_gbl_get_simm`, C `recGblGetSimm`), which is the ONLY site that
         // writes SIMM.
-        if !pact_held {
-            let siml_read_failed = self.rec_gbl_get_simm(rec, &siml_link);
+        if let Some(siml_link) = &siml_link {
+            let siml_read_failed = self.rec_gbl_get_simm(rec, siml_link);
             // W10-E5. `busyRecord.c:399-401` returns from `writeValue` on a
             // failed SIML read — BEFORE `write_busy` and before the SIOL
             // `dbPutLink`. So C never reaches the `switch (prec->simm)` below:
@@ -8174,13 +8219,13 @@ impl PvDatabase {
         // is the single owner of that fact.
         // PACT, if held, belongs to the continuation arm of the uniform body —
         // released there, with its park. Read beside the mode, under one guard.
-        let (mode, no_sim_exit) = {
+        let (mode, no_sim_exit) = resolved.unwrap_or_else(|| {
             let instance = rec.read();
             (
                 crate::server::recgbl::simm::resolve_sim_mode(&*instance.record),
                 instance.pact_exit_without_release(),
             )
-        };
+        });
 
         if !mode.is_simulated() {
             return (SimOutcome::NotSimulated, no_sim_exit); // menuSimmNO
@@ -8220,6 +8265,20 @@ impl PvDatabase {
             drop(instance);
             return (SimOutcome::IllegalMode { is_output }, exit);
         }
+
+        // The simulated paths below are the only readers of SIOL.
+        let siol_link = rec
+            .write()
+            .sim_link_parse(
+                crate::server::record::SimLink::Siol,
+                simm.siol,
+                if simm.is_input {
+                    crate::server::record::LinkFieldType::In
+                } else {
+                    crate::server::record::LinkFieldType::Out
+                },
+            )
+            .clone();
 
         // epics-base 7.0.7 (SIMM menu):
         //   1 = YES — read/write via SIOL using the cooked VAL

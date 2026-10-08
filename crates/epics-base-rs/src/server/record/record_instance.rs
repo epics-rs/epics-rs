@@ -949,10 +949,12 @@ impl ProcessPlan {
     /// so the plan is the same whenever it is built.
     pub(crate) fn of(record: &dyn Record) -> Self {
         let rtype = record.record_type();
-        let declares_simulation = field_desc_of(record, "SIMM").is_some();
+        let simm = field_desc_of(record, "SIMM")
+            .is_some()
+            .then(|| SimmBlock::of(record));
         ProcessPlan {
             dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
-            simm: declares_simulation.then(|| SimmBlock::of(record)),
+            simm,
             sel_nvl: rtype == "sel",
             string_input: !record.string_input_links().is_empty(),
             multi_output_dispatch: crate::server::database::multi_output_dispatch_owned(rtype),
@@ -983,7 +985,10 @@ impl ProcessPlan {
                 || field_desc_of(record, "OEVT").is_some()
                 || crate::server::database::multi_output_dispatch_owned(rtype)
                 || record.declares_multi_output_links()
-                || declares_simulation,
+                // An INPUT type's simulation substitutes its read and
+                // returns before the body; only an output type's SIOL write
+                // reaches this stage.
+                || simm.is_some_and(|block| !block.is_input),
             fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
             soft_channel_skips_convert: record.soft_channel_skips_convert(),
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
@@ -1795,6 +1800,22 @@ impl ParsedInputLink {
     }
 }
 
+/// Which of the SIM block's two links [`RecordInstance::sim_link_parse`] serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimLink {
+    Siml,
+    Siol,
+}
+
+impl SimLink {
+    fn field(self) -> &'static str {
+        match self {
+            SimLink::Siml => "SIML",
+            SimLink::Siol => "SIOL",
+        }
+    }
+}
+
 /// The parse of one SIM-block link (`SIML` / `SIOL`), keyed on the text it
 /// was parsed from — C's `DBLINK` as `dbInitLink` left it. Text-keyed like
 /// [`ParsedInputLink`] rather than committed at a write owner, because the
@@ -2533,12 +2554,50 @@ impl RecordInstance {
     /// through [`Self::resolve_field_stored_at`]. `ftype` is the link's
     /// direction — SIOL is `DBF_INLINK` on an input type and `DBF_OUTLINK`
     /// on an output one, and the modifier mask follows it.
+    #[inline]
     pub(crate) fn sim_link_parse(
         &mut self,
-        field: &str,
+        which: SimLink,
         desc: Option<&'static FieldDesc>,
         ftype: LinkFieldType,
-    ) -> Arc<ParsedLink> {
+    ) -> &Arc<ParsedLink> {
+        // The steady cycle: the type lends the text and the slot holds its
+        // parse. Everything else is `sim_link_refresh`.
+        let cached = match which {
+            SimLink::Siml => &self.parsed_siml,
+            SimLink::Siol => &self.parsed_siol,
+        };
+        let hit = match (self.record.link_text_ref(which.field()), cached) {
+            (Some(text), Some(entry)) => entry.text == text,
+            _ => false,
+        };
+        if !hit {
+            self.sim_link_refresh(which, desc, ftype);
+        }
+        // `sim_link_refresh` leaves the slot filled, so the insert never runs.
+        &self
+            .sim_slot(which)
+            .get_or_insert_with(|| SimLinkParse::fresh("", ftype))
+            .parsed
+    }
+
+    fn sim_slot(&mut self, which: SimLink) -> &mut Option<SimLinkParse> {
+        match which {
+            SimLink::Siml => &mut self.parsed_siml,
+            SimLink::Siol => &mut self.parsed_siol,
+        }
+    }
+
+    /// The miss and the unlent-text paths of [`Self::sim_link_parse`]: read
+    /// the text, compare it with the cached one and reparse when it differs.
+    #[inline(never)]
+    fn sim_link_refresh(
+        &mut self,
+        which: SimLink,
+        desc: Option<&'static FieldDesc>,
+        ftype: LinkFieldType,
+    ) {
+        let field = which.field();
         let owned;
         let text: &str = match self.record.link_text_ref(field) {
             Some(text) => text,
@@ -2550,16 +2609,12 @@ impl RecordInstance {
                 &owned
             }
         };
-        let slot = match field {
-            "SIML" => &mut self.parsed_siml,
-            _ => &mut self.parsed_siol,
+        let slot = match which {
+            SimLink::Siml => &mut self.parsed_siml,
+            SimLink::Siol => &mut self.parsed_siol,
         };
-        match slot {
-            Some(entry) if entry.text == text => entry.parsed.clone(),
-            _ => {
-                let entry = slot.insert(SimLinkParse::fresh(text, ftype));
-                entry.parsed.clone()
-            }
+        if !slot.as_ref().is_some_and(|entry| entry.text == text) {
+            *slot = Some(SimLinkParse::fresh(text, ftype));
         }
     }
 
@@ -4765,15 +4820,14 @@ impl RecordInstance {
     /// A record type with no SSCN/OLDSIMM in its C dbd (`busy`, `swait`) passes
     /// neither pointer to any recGbl helper: no-op here.
     pub fn rec_gbl_save_simm(&mut self) {
-        if !self.record.uses_recgbl_simm_helpers() {
-            return;
-        }
         // C `recGblSaveSimm`: `if (*psscn == USHRT_MAX) return;` — the literal
-        // sentinel, not "any index outside the menu".
-        if self.common.sscn.is_unset() {
+        // sentinel, not "any index outside the menu". Asked before the
+        // helpers question: both answers return, and SSCN unset is the cell
+        // read, where the helpers question is a virtual call and a name match.
+        if self.common.sscn.is_unset() || !self.record.uses_recgbl_simm_helpers() {
             return;
         }
-        if let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") {
+        if let Some(simm) = self.record.simm_value() {
             self.common.oldsimm = simm;
         }
     }
@@ -4808,16 +4862,17 @@ impl RecordInstance {
     /// the SIMM value moved — C `special(SPC_MOD)` pass 1, and the tail of
     /// `recGblGetSimm`/`recGblInitSimm`.
     pub fn rec_gbl_check_simm(&mut self) -> CommonFieldPutResult {
-        if !self.record.uses_recgbl_simm_helpers() {
-            return CommonFieldPutResult::NoChange;
-        }
         let Some(sim_scan) = self.common.sscn.scan() else {
             // `*psscn == USHRT_MAX` — SSCN unset, no swap. An SSCN that is
             // merely ILLEGAL still swaps: C assigns it into SCAN and `scanAdd`
-            // then declines to scan the record.
+            // then declines to scan the record. Asked before the helpers
+            // question, which is a virtual call and a name match.
             return CommonFieldPutResult::NoChange;
         };
-        let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") else {
+        if !self.record.uses_recgbl_simm_helpers() {
+            return CommonFieldPutResult::NoChange;
+        }
+        let Some(simm) = self.record.simm_value() else {
             return CommonFieldPutResult::NoChange;
         };
         if simm == self.common.oldsimm {
@@ -9688,8 +9743,12 @@ mod metadata_cache_tests {
         let mut inst = ai_instance();
         put_siol(&mut inst, "SRC.VAL");
         let desc = siol_desc(&inst);
-        let first = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
-        let second = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let first = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
+        let second = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(db_link(&first).pvname(), "SRC");
     }
@@ -9701,13 +9760,19 @@ mod metadata_cache_tests {
         let mut inst = ai_instance();
         put_siol(&mut inst, "SRC.VAL");
         let desc = siol_desc(&inst);
-        let before = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let before = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         put_siol(&mut inst, "OTHER.VAL");
-        let changed = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let changed = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert!(!Arc::ptr_eq(&before, &changed));
         assert_eq!(db_link(&changed).pvname(), "OTHER");
         put_siol(&mut inst, "OTHER.VAL");
-        let reput = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let reput = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert!(Arc::ptr_eq(&changed, &reput));
     }
 
@@ -9717,14 +9782,18 @@ mod metadata_cache_tests {
         let mut input = ai_instance();
         put_siol(&mut input, "OTHER.VAL CP");
         let desc = siol_desc(&input);
-        let parsed = input.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let parsed = input
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert_eq!(
             db_link(&parsed).policy,
             crate::server::record::LinkProcessPolicy::ChannelProcess
         );
         let mut output = ai_instance();
         put_siol(&mut output, "OTHER.VAL CP");
-        let parsed = output.sim_link_parse("SIOL", desc, LinkFieldType::Out);
+        let parsed = output
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::Out)
+            .clone();
         assert_eq!(
             db_link(&parsed).policy,
             crate::server::record::LinkProcessPolicy::NoProcess
@@ -9741,9 +9810,13 @@ mod metadata_cache_tests {
         assert!(inst.record.get_field("SIOL").is_none());
         inst.declared_overrides
             .insert("SIOL".into(), EpicsValue::String("OVR.VAL".into()));
-        let first = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let first = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert_eq!(db_link(&first).pvname(), "OVR");
-        let second = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let second = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
         assert!(Arc::ptr_eq(&first, &second));
     }
 }

@@ -3515,10 +3515,11 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Asked as one question because the cycle otherwise asks
     /// [`Self::get_field`] four times through the vtable and pays an
-    /// [`EpicsValue`] per answer. This default body
-    /// is codegen'd per record type, so the four asks inside it are static
-    /// calls with literal field names on the type's own cells; overriding it
-    /// buys nothing and no record type should.
+    /// [`EpicsValue`] per answer. Monomorphised per type, the asks inside
+    /// this default are static calls, but each is still a full name match
+    /// and an `EpicsValue` round trip — measured at ~970 instructions of an
+    /// `ai` cycle across the cycle's cell reads. A type that stores the cells
+    /// as fields overrides this and its siblings to read them directly.
     fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
         MonitorDeadbandCells {
             mdel: self.get_field("MDEL").and_then(|v| v.to_f64()),
@@ -4116,11 +4117,11 @@ pub trait Record: Send + Sync + 'static {
     /// that line at the device-support layer (`devSASoft` vs `devAaiSoft`), and
     /// so does this hook.
     ///
-    /// Called by the framework on a soft-DTYP cycle whose INP is constant, with
-    /// `value = Some(constant)` for a non-empty constant and `None` for an
-    /// empty/unset INP. Returns whether the record consumed the input stage.
-    /// Default `false` — the load-once rule.
-    fn read_constant_inp(&mut self, _value: Option<EpicsValue>) -> bool {
+    /// Called by the framework on a soft-DTYP cycle whose INP is constant
+    /// (`ParsedLink::Constant`) or unset (`ParsedLink::None`). The link, not its
+    /// value, is passed so the load-once records copy nothing. Returns whether
+    /// the record consumed the input stage. Default `false` — the load-once rule.
+    fn read_constant_inp(&mut self, _inp: &crate::server::record::ParsedLink) -> bool {
         false
     }
 

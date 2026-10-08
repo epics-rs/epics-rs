@@ -142,9 +142,7 @@ fn a_single_quoted_string_may_contain_a_double_quote() {
     assert_eq!(calc.expr, "A");
     assert_eq!(
         calc.args,
-        vec![CalcArg::Link(Box::new(ParsedLink::Constant(
-            "say \"hi\"".to_string()
-        )))]
+        vec![CalcArg::Link(Box::new(ParsedLink::constant("say \"hi\"")))]
     );
 }
 

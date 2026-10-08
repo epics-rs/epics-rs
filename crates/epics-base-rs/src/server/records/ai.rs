@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+    AlarmLimit, AnalogAlarmInput, FieldMetadataOverride, MENU_SIMM, MonitorDeadbandCells,
+    ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
 };
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
@@ -286,6 +287,65 @@ impl Record for AiRecord {
         }
     }
 
+    /// C `monitor()` reads these as struct members; the default answers each
+    /// through a `get_field` name match and an `EpicsValue`.
+    fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
+        MonitorDeadbandCells {
+            mdel: Some(self.mdel),
+            adel: Some(self.adel),
+            mlst: Some(self.mlst),
+            alst: Some(self.alst),
+        }
+    }
+
+    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
+        if mlst {
+            self.mlst = val;
+        }
+        if alst {
+            self.alst = val;
+        }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Double(self.val))
+    }
+
+    fn monitor_deadband_value(&self) -> Option<f64> {
+        Some(self.val)
+    }
+
+    fn value_is_undefined(&self) -> bool {
+        self.val.is_nan()
+    }
+
+    /// `ai` declares no OVAL, so the default's `get_field("OVAL")` is a miss
+    /// through every name arm on each cycle.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        self.val()
+    }
+
+    /// `hyst` is `None`: `ai` leaves HYST to `CommonFields`.
+    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
+        Some(AnalogAlarmInput {
+            val: AlarmLimit::Double(self.val),
+            hyst: None,
+            lalm: Some(AlarmLimit::Double(self.lalm)),
+        })
+    }
+
+    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
+        Some((self.aftc, self.afvl))
+    }
+
+    fn store_alarm_filter_value(&mut self, afvl: f64) {
+        self.afvl = afvl;
+    }
+
+    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
+        self.lalm = lalm.as_f64();
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -505,8 +565,7 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // AFVL is SPC_NOMOD (read-only to clients); this arm exists so
-            // the framework alarm-filter owner can write the accumulator back.
+            // AFVL is SPC_NOMOD (read-only to clients).
             "AFVL" => match value {
                 EpicsValue::Double(v) => {
                     self.afvl = v;

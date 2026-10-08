@@ -744,15 +744,9 @@ fn test_parse_link_v2() {
     assert_eq!(parse_link_v2(""), ParsedLink::None);
     assert_eq!(parse_link_v2("  "), ParsedLink::None);
 
-    assert_eq!(parse_link_v2("42"), ParsedLink::Constant("42".to_string()));
-    assert_eq!(
-        parse_link_v2("3.14"),
-        ParsedLink::Constant("3.14".to_string())
-    );
-    assert_eq!(
-        parse_link_v2("-1.5"),
-        ParsedLink::Constant("-1.5".to_string())
-    );
+    assert_eq!(parse_link_v2("42"), ParsedLink::constant("42"));
+    assert_eq!(parse_link_v2("3.14"), ParsedLink::constant("3.14"));
+    assert_eq!(parse_link_v2("-1.5"), ParsedLink::constant("-1.5"));
 
     // A modifier-less DB link defaults to NPP (`NoProcess`), matching
     // C `dbParseLink` (memset→0; `pvlOptPP` only on explicit ` PP`).

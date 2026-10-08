@@ -39,8 +39,10 @@ fn db_target(link: &str) -> String {
 #[test]
 fn link_modifier_split_runs_after_the_constant_test() {
     // A bare number IS the constant.
-    assert!(matches!(parse_link_v2("5"), ParsedLink::Constant(c) if c == "5"));
-    assert!(matches!(parse_link_v2("  -3.25e2  "), ParsedLink::Constant(c) if c == "-3.25e2"));
+    assert!(matches!(parse_link_v2("5"), ParsedLink::Constant(c) if c.text() == "5"));
+    assert!(
+        matches!(parse_link_v2("  -3.25e2  "), ParsedLink::Constant(c) if c.text() == "-3.25e2")
+    );
 
     // A number followed by anything is a PV link to a record with that name.
     assert_eq!(db_target("5 PP"), "5.VAL");

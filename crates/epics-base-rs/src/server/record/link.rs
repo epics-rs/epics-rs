@@ -268,11 +268,64 @@ impl HwLink {
     }
 }
 
+/// A CONSTANT link: its text and the value it decodes to, decoded once when
+/// the link is parsed — C decodes at `dbInitLink` and never again, so every
+/// read of a constant is a copy, not a re-parse of the text.
+#[derive(Debug)]
+pub struct ConstantLink {
+    text: String,
+    value: EpicsValue,
+}
+
+impl ConstantLink {
+    /// The C `dbConstLoadScalar` / `dbConstLoadArray` pair
+    /// (`dbConstLink.c:152-199`), which is what a record's `init_record` gets
+    /// out of a constant link through `dbLoadLink` / `dbLoadLinkArray`.
+    ///
+    /// A bracketed constant (`[1, 2, 3]`) is an ARRAY: C hands the text to
+    /// `dbPutConvertJSON`, which yields `nRequest` elements. Yielding the
+    /// bracket text as a String instead left every array-valued constant link
+    /// (`field(INP, "[1,2,3]")` on an aai/waveform, a constant closed-loop aao
+    /// DOL) delivering a nonsense string to a typed array buffer.
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let value = if let Some(inner) = text
+            .trim()
+            .strip_prefix('[')
+            .and_then(|body| body.strip_suffix(']'))
+        {
+            constant_array_value(inner)
+        } else if let Some(v) = parse_c_double(&text) {
+            EpicsValue::Double(v)
+        } else {
+            EpicsValue::String(text.clone().into())
+        };
+        Self { text, value }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn value(&self) -> &EpicsValue {
+        &self.value
+    }
+}
+
+/// Equal by text: the value is a function of it, and comparing the value
+/// would make a `nan` constant unequal to itself.
+impl PartialEq for ConstantLink {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
 /// Parsed link — distinguishes constants, DB links, CA/PVA links, and empty.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParsedLink {
     None,
-    Constant(String),
+    /// Shared for the same reason as `Db`: the link is immutable once parsed.
+    Constant(std::sync::Arc<ConstantLink>),
     /// Shared, not owned: a parsed DB link is immutable after `parse_link_v2`
     /// and the cycle clones the record's `parsed_inp` every process, so the
     /// clone is one atomic increment instead of the link's three heap copies,
@@ -1091,33 +1144,18 @@ impl ParsedLink {
         }
     }
 
-    /// Extract the constant as an EpicsValue — the C `dbConstLoadScalar` /
-    /// `dbConstLoadArray` pair (`dbConstLink.c:152-199`), which is what a
-    /// record's `init_record` gets out of a constant link through `dbLoadLink`
-    /// / `dbLoadLinkArray`.
-    ///
-    /// A bracketed constant (`[1, 2, 3]`) is an ARRAY: C hands the text to
-    /// `dbPutConvertJSON`, which yields `nRequest` elements. Yielding the
-    /// bracket text as a String instead left every array-valued constant link
-    /// (`field(INP, "[1,2,3]")` on an aai/waveform, a constant closed-loop aao
-    /// DOL) delivering a nonsense string to a typed array buffer.
+    /// The constant's value — see [`ConstantLink::new`].
     pub fn constant_value(&self) -> Option<EpicsValue> {
-        if let ParsedLink::Constant(s) = self {
-            if let Some(inner) = s
-                .trim()
-                .strip_prefix('[')
-                .and_then(|body| body.strip_suffix(']'))
-            {
-                return Some(constant_array_value(inner));
-            }
-            if let Some(v) = parse_c_double(s) {
-                Some(EpicsValue::Double(v))
-            } else {
-                Some(EpicsValue::String(s.clone().into()))
-            }
+        if let ParsedLink::Constant(c) = self {
+            Some(c.value().clone())
         } else {
             None
         }
+    }
+
+    /// A CONSTANT link holding `text`.
+    pub fn constant(text: impl Into<String>) -> Self {
+        ParsedLink::Constant(std::sync::Arc::new(ConstantLink::new(text)))
     }
 
     pub fn is_db(&self) -> bool {
@@ -1304,7 +1342,7 @@ fn constant_array_value(inner: &str) -> EpicsValue {
     // second comma-splitter here.
     let json = format!("[{inner}]");
     // C passes the record's `FTVL`; this port types the value afterwards
-    // (see `ParsedLink::constant_value`), so the two element kinds C's
+    // (see `ConstantLink::new`), so the two element kinds C's
     // callbacks admit are tried in turn — a string element is legal only
     // into `DBF_STRING` (`dbConvertJSON.c:78-82`), which is exactly the
     // "all numeric, else strings" split this used to reach by parsing twice.
@@ -1681,7 +1719,7 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
             if decoded.is_empty() {
                 Some(ParsedLink::None)
             } else {
-                Some(ParsedLink::Constant(decoded))
+                Some(ParsedLink::constant(decoded))
             }
         }
         "ca" | "pva" => {
@@ -2467,7 +2505,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // the write instead of alarming. Keep this test above
     // `split_link_modifiers`.
     if parse_c_double(s).is_some() {
-        return ParsedLink::Constant(s.to_string());
+        return ParsedLink::constant(s);
     }
 
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
@@ -2487,7 +2525,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     // is NOT a constant: `"1 2 3"` — `epicsParseDouble` rejects the trailing
     // garbage, so C parses it as a PV_LINK to a record named `1`.
     if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
-        return ParsedLink::Constant(s.to_string());
+        return ParsedLink::constant(s);
     }
 
     // Isolate the target from its modifiers — see [`split_link_modifiers`].
@@ -2613,17 +2651,14 @@ mod json_link_tests {
 
     #[test]
     fn json_const_numeric() {
-        assert_eq!(
-            parse_link_v2("{const: 1.5}"),
-            ParsedLink::Constant("1.5".to_string())
-        );
+        assert_eq!(parse_link_v2("{const: 1.5}"), ParsedLink::constant("1.5"));
     }
 
     #[test]
     fn json_const_quoted_string() {
         assert_eq!(
             parse_link_v2(r#"{const: "hello"}"#),
-            ParsedLink::Constant("hello".to_string())
+            ParsedLink::constant("hello")
         );
     }
 

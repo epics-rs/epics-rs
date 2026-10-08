@@ -73,11 +73,11 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
         return None;
     };
     let parsed = parse_link_v2(link_str.as_str_lossy().as_ref());
-    let ParsedLink::Constant(raw) = &parsed else {
+    let ParsedLink::Constant(constant) = &parsed else {
         return None;
     };
-    let raw = raw.clone();
-    let value = crate::server::recgbl::simm::constant_load_value(&parsed)?;
+    let raw = constant.text();
+    let value = constant.value().clone();
     // C loads into the target field's own DBF type
     // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
     // through the field's descriptor before the put.
@@ -91,7 +91,7 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
                 .map(|v| v.db_field_type())
         });
     let value = match target_type {
-        Some(t) => constant_to_field_type(value, t, &raw),
+        Some(t) => constant_to_field_type(value, t, raw),
         None => value,
     };
     // bo loads into a temporary and stores the BOOLEAN of it

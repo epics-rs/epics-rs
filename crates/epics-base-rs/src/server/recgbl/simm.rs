@@ -270,7 +270,7 @@ mod tests {
     fn constant_and_unset_links_are_both_constant() {
         use crate::server::record::ParsedLink;
         assert!(is_constant(&ParsedLink::None));
-        assert!(is_constant(&ParsedLink::Constant("42".into())));
+        assert!(is_constant(&ParsedLink::constant("42")));
         assert!(!is_constant(&crate::server::record::parse_link_v2(
             "SOME:PV"
         )));

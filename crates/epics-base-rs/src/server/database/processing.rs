@@ -4376,9 +4376,7 @@ impl PvDatabase {
                     // on an EMPTY INP. `Record::read_constant_inp` is that
                     // device-support-layer exception: every other record's default
                     // returns false and nothing happens, exactly as before.
-                    let constant =
-                        crate::server::recgbl::simm::constant_load_value(&instance.parsed_inp);
-                    if instance.record.read_constant_inp(constant) {
+                    if instance.record.read_constant_inp(&instance.parsed_inp) {
                         soft_inp_applied = true;
                     }
                 } else if !had_inp_value

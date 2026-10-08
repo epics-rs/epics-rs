@@ -1542,11 +1542,11 @@ impl Record for WaveformRecord {
     ///
     /// The other three array kinds keep the default (`false`): `devWfSoft.c`
     /// and `devAaiSoft.c` both open with `if (dbLinkIsConstant(pinp)) return 0;`.
-    fn read_constant_inp(&mut self, value: Option<EpicsValue>) -> bool {
+    fn read_constant_inp(&mut self, inp: &crate::server::record::ParsedLink) -> bool {
         if !matches!(self.kind, ArrayKind::SubArray) {
             return false;
         }
-        match value {
+        match inp.constant_value() {
             Some(v) => {
                 let _ = self.sa_load_and_subset(v);
             }

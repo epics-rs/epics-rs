@@ -26,12 +26,12 @@ pub use declared_field_registry::{
 pub use device_menu_registry::register_device_menu;
 pub(crate) use device_menu_registry::{contributed_device_menu, merged_device_menu};
 pub use link::{
-    CaLink, CalcArg, CalcLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue, JsonLinkParse,
-    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP,
-    ParsedLink, PvaJsonLink, StateLink, VxiAddr, check_json_link_text, check_link_assignment,
-    check_link_text, declared_link_type, link_field_type, link_type_refusal, load_link_ls,
-    out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2,
-    parse_output_link_v2, pvajson_identity_key,
+    CaLink, CalcArg, CalcLink, ConstantLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue,
+    JsonLinkParse, LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch,
+    PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, VxiAddr, check_json_link_text,
+    check_link_assignment, check_link_text, declared_link_type, link_field_type, link_type_refusal,
+    load_link_ls, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field,
+    parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
 pub(crate) use link::{PORTED_JSON_LINK_TYPES, json_const_value};
 pub use menu_choices::{

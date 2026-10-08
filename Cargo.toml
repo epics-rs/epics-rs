@@ -74,16 +74,28 @@ mca-rs = { path = "crates/mca-rs", version = "0.31.0" }
 mqtt-rs = { path = "crates/mqtt-rs", version = "0.31.0" }
 modbus-rs = { path = "crates/modbus-rs", version = "0.31.0", package = "epics-modbus-rs" }
 
+# Record processing is frontend-bound -- 44.4 % of issue slots lost to
+# instruction fetch against C softIoc's 36.5 %, with backend stalls under 1 % on
+# both -- so cross-crate inlining pays here in a way it would not in a
+# backend-bound build: 2 588 instructions per record process against cargo's
+# default 2 636, worth 2.2 % of wall clock (10 paired rounds on an idle box,
+# t = −2.49, df = 9). A cold release build pays 41 s → 90 s for it, and
+# every incremental release rebuild pays the same 50 s because cgu=1 relinks
+# the whole image; `dev` is untouched, so `cargo build`/`cargo nextest run`
+# are unaffected.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 # Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
-# image size is a real resource: `cargo build --profile release-embedded ...`
-# reproduces row 5 of the measured strip/LTO size matrix (vs `--release`+strip:
-# CA −15.6/−18.9 %, PVA −19.7/−22.6 %; cold build ~2×).
-# `release` itself is untouched, so host build times are unaffected.
+# image size is a real resource: `cargo build --profile release-embedded ...`.
+# Only `strip` separates it from `release` now that `release` carries the same
+# LTO settings; the measured strip/LTO size matrix it reproduces (row 5: CA
+# −15.6/−18.9 %, PVA −19.7/−22.6 %) was taken against a no-LTO `--release`,
+# so those figures describe the old baseline, not the current one.
 [profile.release-embedded]
 inherits = "release"
 strip = "symbols"
-lto = "fat"
-codegen-units = 1
 
 
 # RTEMS 6 (armv7-rtems-eabihf) needs libc definitions no published 0.2 release

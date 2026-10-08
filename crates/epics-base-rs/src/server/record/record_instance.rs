@@ -1882,6 +1882,18 @@ pub struct RecordInstance {
     /// [`RecordInstance::notify_field_with_origin`] included — advances it
     /// through the owner.
     last_posted: HashMap<String, EpicsValue>,
+    /// Published values for the fields [`Self::collect_subscriber_posts`]'s
+    /// change-detection walk SKIPS whatever happens — the deadband field, the
+    /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
+    /// They are not walk input, so they must not be in `last_posted`: the
+    /// walk's gate asks `last_posted.is_empty()`, and the first alarm
+    /// transition put SEVR/STAT/AMSG/ACKS there, so every later cycle of every
+    /// record ran the whole walk — six vtable calls and one hash probe plus a
+    /// name compare per field — to iterate exactly the four fields it then
+    /// discarded. Same owner and same read accessor as `last_posted`; the two
+    /// differ only in whether the walk can act on the field, which is what the
+    /// gate asks. Linear, because the set is the static skip list.
+    skipped_posted: Vec<(String, EpicsValue)>,
     /// The live store for a field the record's `.dbd` DECLARES but the record
     /// struct has no `put_field` arm / no storage for — the WRITE analog of the
     /// read-side [`Self::declared_default`] fallback.
@@ -2550,6 +2562,7 @@ impl RecordInstance {
             notify: None,
             notify_restart_list: std::collections::VecDeque::new(),
             last_posted: HashMap::new(),
+            skipped_posted: Vec::new(),
             declared_overrides: HashMap::new(),
             link_backed_metadata_links,
             link_backed_metadata_input_slot,
@@ -2802,7 +2815,27 @@ impl RecordInstance {
     /// subscribers, or `None` when the framework has never published one.
     /// The read side of the `last_posted` contract — see the field's docs.
     pub(crate) fn posted_value(&self, field: &str) -> Option<&EpicsValue> {
-        self.last_posted.get(field)
+        if let Some(value) = self.last_posted.get(field) {
+            return Some(value);
+        }
+        self.skipped_posted
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value)
+    }
+
+    /// Whether `collect_subscriber_posts`'s walk discards `field` before it
+    /// change-detects it, for every cycle of this record's life. The terms are
+    /// the walk's own leading `continue` terms, and they answer from
+    /// `&'static` record metadata alone, so the answer cannot change under a
+    /// field once it has been stored. `Record::process_posted_fields` is not
+    /// here: it is an allow list whose membership turns over as the record
+    /// publishes, so it stays a per-cycle term in the walk.
+    fn walk_skips(&self, field: &str) -> bool {
+        field == self.record.monitor_deadband_field()
+            || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field)
+            || field == "UDF"
+            || self.record.event_posted_fields().contains(&field)
     }
 
     /// SINGLE OWNER of `last_posted`: record that `value` has been published
@@ -2816,6 +2849,18 @@ impl RecordInstance {
     /// posts MUST NOT call it: they deliver nothing to a value-class
     /// subscriber, so the value is still owed.
     pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
+        if self.walk_skips(field) {
+            if let Some(slot) = self
+                .skipped_posted
+                .iter_mut()
+                .find(|(name, _)| name == field)
+            {
+                slot.1 = value;
+            } else {
+                self.skipped_posted.push((field.to_string(), value));
+            }
+            return;
+        }
         if let Some(slot) = self.last_posted.get_mut(field) {
             *slot = value;
         } else {
@@ -5853,9 +5898,12 @@ impl RecordInstance {
                 }
             }
         }
-        // Nothing is subscribed, nothing has ever been published and no
-        // forced post fired, so the walk below has no field to reach and
-        // nothing to advance. The record's declared post sets are the walk's
+        // Nothing is subscribed, no field this walk can act on has ever been
+        // published and no forced post fired, so the walk below has no field
+        // to reach and nothing to advance. The published values of the fields
+        // the walk always skips live in `skipped_posted`, so this is exact:
+        // while they shared `last_posted` an alarm transition left it
+        // permanently non-empty and the walk ran forever for nothing. The record's declared post sets are the walk's
         // inputs alone, so asking for them, six more trips through the
         // vtable, is asked only here. Everything a cycle owes whether or not
         // anyone is watching — the TAKEs above and the record's own old-copy
@@ -5901,6 +5949,8 @@ impl RecordInstance {
                 .filter(|field| !self.subscribers.contains_key(*field)),
         );
         for field in tracked {
+            // These four terms can only fire on a SUBSCRIBED field now:
+            // `skipped_posted`, not `last_posted`, holds what they reject.
             if field == deadband_field
                 // SEVR/STAT/AMSG/ACKS are posted by `recGblResetAlarms` itself,
                 // each with its own C mask (recGbl.c:202-222) — the caller emits
@@ -7619,9 +7669,9 @@ impl RecordInstance {
         // is left alone — every post advances it whether or not anyone was
         // subscribed, so it is what was last published, and a change since
         // then is still owed to the field's other subscribers.
-        if !self.last_posted.contains_key(&field_str) {
+        if self.posted_value(&field_str).is_none() {
             if let Some(val) = self.resolve_field(&field_str) {
-                self.last_posted.insert(field_str, val);
+                self.record_value_post(&field_str, val);
             }
         }
         Some(reader)
@@ -10317,5 +10367,67 @@ mod forced_secondary_post_tests {
         let mut inst = ao_with_moved_rval(7);
         assert!(guarded_cycle(&mut inst).is_empty());
         assert_eq!(inst.record.get_field("ORAW"), Some(EpicsValue::Long(7)));
+    }
+}
+
+#[cfg(test)]
+mod skipped_posted_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::records::calc::CalcRecord;
+    use crate::types::DbFieldType;
+
+    fn calc() -> RecordInstance {
+        RecordInstance::new("CALC:SKIP".to_string(), CalcRecord::default())
+    }
+
+    /// Boundary: a field the walk always skips. Its published value must not
+    /// land in `last_posted`, or the walk's gate never fires again — the first
+    /// alarm transition posts SEVR/STAT/AMSG/ACKS, so that one entry cost
+    /// every later cycle of every record the whole walk.
+    #[test]
+    fn a_skipped_field_post_leaves_the_gate_armed() {
+        for field in ["VAL", "SEVR", "STAT", "AMSG", "ACKS", "UDF"] {
+            let mut inst = calc();
+            inst.record_value_post(field, EpicsValue::Long(1));
+            assert!(
+                inst.last_posted.is_empty(),
+                "{field} reached the walk's input"
+            );
+            assert_eq!(inst.posted_value(field), Some(&EpicsValue::Long(1)));
+        }
+    }
+
+    /// The opposite boundary: a field the walk CAN act on must disarm the
+    /// gate, or the walk would stop change-detecting it.
+    #[test]
+    fn a_walkable_field_post_disarms_the_gate() {
+        let mut inst = calc();
+        inst.record_value_post("PREC", EpicsValue::Long(3));
+        assert!(!inst.last_posted.is_empty());
+        assert_eq!(inst.posted_value("PREC"), Some(&EpicsValue::Long(3)));
+    }
+
+    /// The skipped store is still a map: a second post advances the value in
+    /// place rather than shadowing it with a second entry.
+    #[test]
+    fn a_second_skipped_post_advances_in_place() {
+        let mut inst = calc();
+        inst.record_value_post("SEVR", EpicsValue::Long(1));
+        inst.record_value_post("SEVR", EpicsValue::Long(2));
+        assert_eq!(inst.skipped_posted.len(), 1);
+        assert_eq!(inst.posted_value("SEVR"), Some(&EpicsValue::Long(2)));
+    }
+
+    /// `add_subscriber` seeds the published value through the owner, so
+    /// subscribing to a skipped field does not re-arm the walk either.
+    #[test]
+    fn subscribing_to_a_skipped_field_seeds_through_the_owner() {
+        let mut inst = calc();
+        let _rx = inst
+            .add_subscriber("SEVR", 1, DbFieldType::Short, EventMask::VALUE.bits())
+            .expect("SEVR subscriber");
+        assert!(inst.last_posted.is_empty());
+        assert!(inst.posted_value("SEVR").is_some());
     }
 }

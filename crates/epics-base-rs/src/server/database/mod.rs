@@ -355,14 +355,18 @@ pub struct CpTarget {
 ///
 /// The key also carries the instance it names. A sweep otherwise hands the
 /// frame a `&str` and the frame hashes it back into the records map once per
-/// record per cycle, re-deriving what the list already knew. `Weak` and not
-/// `Arc` so a key left behind by a removal keeps nothing alive; a sweep that
-/// cannot upgrade falls back to the name.
+/// record per cycle, re-deriving what the list already knew. It is held
+/// STRONGLY: a key leaving the bucket and its record being destroyed are one
+/// operation (`remove_record_entry` takes the key out as it destroys the
+/// instance), and a handle that outlives its key is caught by `is_destroyed`
+/// under the data lock the frame takes anyway. A `Weak` here was a second,
+/// weaker encoding of the same fact, and it cost a `compare_exchange` loop per
+/// record per scan cycle to decode — 6% of the server's cycles.
 ///
 /// `Ord`/`Eq` are the four sort fields alone — the handle is what the key
 /// names, not part of which key it is — so the ordering contract above is
 /// unchanged and a key built for a lookup need not carry one.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ScanKey {
     phas: i16,
     /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
@@ -376,13 +380,28 @@ struct ScanKey {
     /// allocate — twice, since the cursor step clones the key as well.
     /// `Ord` on `Arc<str>` is `str`'s, so the sort rule above is unchanged.
     name: Arc<str>,
-    /// The instance `name` resolves to — see the type doc.
-    handle: std::sync::Weak<RecordCell>,
+    /// The instance `name` resolves to — see the type doc. `None` only for a
+    /// key built before its record was registered, or for a lookup key.
+    handle: Option<Arc<RecordCell>>,
 }
 
 impl ScanKey {
     fn sort_fields(&self) -> (i16, u32, u64, &str) {
         (self.phas, self.record_type, self.load_order, &self.name)
+    }
+}
+
+// Hand-written because the handle is an `Arc<RecordCell>`, and printing a
+// record cell would take its lock from inside a formatter.
+impl std::fmt::Debug for ScanKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanKey")
+            .field("phas", &self.phas)
+            .field("record_type", &self.record_type)
+            .field("load_order", &self.load_order)
+            .field("name", &self.name)
+            .field("handle", &self.handle.is_some())
+            .finish()
     }
 }
 
@@ -412,7 +431,7 @@ impl ScanKey {
         record_type: &str,
         load_order: u64,
         name: &str,
-        handle: std::sync::Weak<RecordCell>,
+        handle: Option<Arc<RecordCell>>,
     ) -> Self {
         use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
         Self {

@@ -162,10 +162,7 @@ impl PvDatabase {
         };
         // Resolved once here, where a record enters the list, instead of once
         // per record per sweep inside the process frame.
-        let handle = self
-            .get_record_no_resolve(name)
-            .map(|rec| std::sync::Arc::downgrade(&rec))
-            .unwrap_or_default();
+        let handle = self.get_record_no_resolve(name);
         self.inner.scan_index.bucket(list).transition(|keys| {
             keys.insert(super::ScanKey::new(
                 phas,
@@ -341,12 +338,13 @@ impl PvDatabase {
             let inst = rec.read();
             (inst.common.phas, inst.record.record_type())
         };
+        let load_order = rec.load_order();
         Some(super::ScanKey::new(
             phas,
             record_type,
-            rec.load_order(),
+            load_order,
             name,
-            std::sync::Arc::downgrade(&rec),
+            Some(rec),
         ))
     }
 
@@ -468,12 +466,16 @@ impl PvDatabase {
         // The key carries the instance the list was built with; a key whose
         // record has since been replaced falls back to the name, which is what
         // the sequential sweep's `process_record_with_links_sync` arm is for.
-        let Some(rec) = key
-            .handle
-            .upgrade()
-            .or_else(|| self.get_record_no_resolve(&key.name))
-        else {
-            return;
+        let fallback;
+        let rec = match &key.handle {
+            Some(rec) => rec,
+            None => match self.get_record_no_resolve(&key.name) {
+                Some(rec) => {
+                    fallback = rec;
+                    &fallback
+                }
+                None => return,
+            },
         };
         if rec.read().common.scan != scan {
             return;
@@ -578,8 +580,7 @@ impl PvDatabase {
                     continue;
                 }
                 if phas == this {
-                    let _ =
-                        self.process_record_with_links_resolved(&name, rec.clone(), &mut visited);
+                    let _ = self.process_record_with_links_resolved(&name, &rec, &mut visited);
                     debug_assert!(
                         visited.is_empty(),
                         "a returned process frame left its cycle marker behind"
@@ -649,8 +650,18 @@ impl PvDatabase {
             // Read the record's EVNT and compare against the posted
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
-            let Some(rec) = rec.or_else(|| self.get_record(name)) else {
-                continue;
+            // Borrowed when the list carries the cell; owned only when the key
+            // predates its record and the name has to be resolved.
+            let fallback;
+            let rec = match rec {
+                Some(rec) => rec,
+                None => match self.get_record(name) {
+                    Some(rec) => {
+                        fallback = rec;
+                        &fallback
+                    }
+                    None => continue,
+                },
             };
             let evnt = rec.read().common.evnt.clone();
             if normalize_event_name(&evnt) != want {
@@ -783,7 +794,7 @@ impl ScanCursor {
     /// re-find alone when it is — never across processing, as C releases
     /// `psl->lock` around every `dbProcess`.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<Arc<RecordCell>>)> {
+    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<&Arc<RecordCell>>)> {
         let bucket = db.inner.scan_index.bucket(self.list);
         if self.snapshot.is_none()
             || bucket.revision.load(std::sync::atomic::Ordering::Acquire) != self.revision
@@ -792,7 +803,7 @@ impl ScanCursor {
         }
         let key = self.snapshot.as_ref()?.get(self.next)?;
         self.next += 1;
-        Some((&key.name, key.handle.upgrade()))
+        Some((&key.name, key.handle.as_ref()))
     }
 }
 
@@ -950,6 +961,34 @@ mod tests {
 
         db.delete_from_scan_list(ScanType::SEC01, "R:ONE");
         assert_ne!(revision(), re_added, "a removal is a transition");
+    }
+
+    /// The scan key holds its record STRONGLY, so the key leaving the bucket
+    /// is the only thing that frees the record. `remove_record` must take it
+    /// out, or a periodic record is kept alive by the list forever.
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_periodic_record_frees_it() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "SCAN:GONE",
+            Box::new(crate::server::records::calc::CalcRecord::new("VAL+1")),
+        )
+        .await
+        .unwrap();
+        let _ = db
+            .get_record("SCAN:GONE")
+            .unwrap()
+            .write()
+            .set_scan(ScanType::SEC01);
+        db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "SCAN:GONE");
+        let weak = std::sync::Arc::downgrade(&db.get_record("SCAN:GONE").unwrap());
+
+        assert!(db.remove_record("SCAN:GONE").await);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the scan bucket's key outlived the removal and kept the record alive"
+        );
     }
 
     #[test]

@@ -1596,7 +1596,28 @@ fn deliver_converted(
 /// scan-list entry already resolved to its canonical name and cell.
 enum ProcessTarget<'a> {
     Name(&'a str),
-    Resolved(&'a str, Arc<RecordCell>),
+    Resolved(&'a str, &'a Arc<RecordCell>),
+}
+
+/// The frame's record cell: borrowed from the caller's scan snapshot when the
+/// entry came resolved, owned when the frame looked it up. The sibling of
+/// [`FrameName`], and for the same reason — a sweep step otherwise pays an
+/// `Arc` refcount round trip per record per cycle for a cell the scan list
+/// already holds.
+enum FrameRec<'a> {
+    Borrowed(&'a Arc<RecordCell>),
+    Owned(Arc<RecordCell>),
+}
+
+impl std::ops::Deref for FrameRec<'_> {
+    type Target = Arc<RecordCell>;
+
+    fn deref(&self) -> &Arc<RecordCell> {
+        match self {
+            FrameRec::Borrowed(rec) => rec,
+            FrameRec::Owned(rec) => rec,
+        }
+    }
 }
 
 /// The frame's record name: borrowed from the caller's scan snapshot when the
@@ -1796,7 +1817,7 @@ impl PvDatabase {
     pub(crate) fn process_record_with_links_resolved(
         &self,
         name: &str,
-        rec: Arc<RecordCell>,
+        rec: &Arc<RecordCell>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         self.run_process_frame(
@@ -2738,7 +2759,7 @@ impl PvDatabase {
         &self,
         target: ProcessTarget<'a>,
         visited: &mut ProcStack,
-    ) -> CaResult<Option<(FrameName<'a>, Arc<RecordCell>)>> {
+    ) -> CaResult<Option<(FrameName<'a>, FrameRec<'a>)>> {
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
         // and canonical as distinct entries) and for the records-map
@@ -2755,9 +2776,11 @@ impl PvDatabase {
         // outlived its key answers `is_destroyed`; the body checks that under
         // the data lock it takes anyway and reports the record missing.
         let (name, rec) = match target {
-            ProcessTarget::Resolved(name, rec) => (FrameName::Borrowed(name), rec),
+            ProcessTarget::Resolved(name, rec) => {
+                (FrameName::Borrowed(name), FrameRec::Borrowed(rec))
+            }
             ProcessTarget::Name(name) => match self.lookup_record(name) {
-                Some((name, rec)) => (FrameName::Shared(name), rec),
+                Some((name, rec)) => (FrameName::Shared(name), FrameRec::Owned(rec)),
                 // Nothing is registered under the name — C `S_db_notFound`,
                 // which C reaches in `dbNameToAddr` before `dbProcess` is
                 // called at all. Answered BEFORE the marker goes in: this
@@ -2898,7 +2921,7 @@ impl PvDatabase {
     fn entry_did_not_run<'a>(
         &self,
         rec: Option<&Arc<RecordCell>>,
-    ) -> CaResult<Option<(FrameName<'a>, Arc<RecordCell>)>> {
+    ) -> CaResult<Option<(FrameName<'a>, FrameRec<'a>)>> {
         if let Some(rec) = rec {
             let notify = {
                 let mut instance = rec.write();

@@ -467,6 +467,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
         Ok(DeviceInitOutcome::Live)
     }
 
+    /// Whether the C dset this ports has an `init_record` entry. `aiRecord.c`
+    /// seeds MLST/ALST/LALM from VAL only when it does not.
+    fn has_init_record(&self) -> bool {
+        true
+    }
+
     /// Read from hardware into the record.
     ///
     /// Returns a `DeviceReadOutcome` containing:

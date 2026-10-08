@@ -355,6 +355,10 @@ impl Record for AoRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "ao"
     }
@@ -418,7 +422,7 @@ impl Record for AoRecord {
     /// C `aoRecord.c:157-159` — `mlst = alst = lalm = val`, all three, which is
     /// what the framework default would do anyway; spelled out because the
     /// derived half above is this record's own.
-    fn seed_deadband_tracking(&mut self) {
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
         self.mlst = self.val;
         self.alst = self.val;
         self.lalm = self.val;

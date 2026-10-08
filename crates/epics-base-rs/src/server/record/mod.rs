@@ -17,7 +17,7 @@ mod sparse_text;
 
 // Re-export all public types so existing imports continue to work.
 pub use crate::server::recgbl::EventMask;
-pub use alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
+pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::{BkptFlag, CommonFields};
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use declared_field_registry::{

@@ -5918,7 +5918,8 @@ impl PvDatabase {
             // C `monitor()` with its opening `recGblResetAlarms` — AFTER every
             // output of the cycle, so a failed put's LINK_ALARM is committed
             // here and no async write advances MLST/ALST before it returns.
-            let outcome = instance.monitor_cycle();
+            let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
+            let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
 
             let flnk_name = instance.forward_target();
 
@@ -5933,12 +5934,7 @@ impl PvDatabase {
             // at the tail.
 
             // 3. Notify subscribers, still under the segment's own guard.
-            let posts = publish_cycle(
-                instance,
-                &outcome.snapshot,
-                link_backing,
-                outcome.alarm_posts,
-            );
+            let posts = publish_cycle(instance, &cycle_snapshot, link_backing, cycle_alarm_posts);
 
             (
                 flnk_name,
@@ -7061,7 +7057,8 @@ impl PvDatabase {
 
             // C `monitor()` with its opening `recGblResetAlarms` — after every
             // output.
-            let outcome = instance.monitor_cycle();
+            let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
+            let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
 
             // Clear PACT. The release hands back the put-notify parked on this
             // window; it is carried to the tail below (C `recGblFwdLink` →
@@ -7082,9 +7079,9 @@ impl PvDatabase {
             // Notify subscribers, still under this segment's own guard.
             let posts = publish_cycle(
                 &mut instance,
-                &outcome.snapshot,
+                &cycle_snapshot,
                 link_backing,
-                outcome.alarm_posts,
+                cycle_alarm_posts,
             );
 
             // The FLNK's PUTF + put-notify wait-set ride in `flnk_name`
@@ -8008,7 +8005,9 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             }
         }
         instance.record.init_record_tail();
-        instance.record.seed_deadband_tracking();
+        instance
+            .record
+            .seed_deadband_tracking(instance.dset_has_init_record());
         return;
     }
 
@@ -8094,7 +8093,9 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    that may or may not remember it (the iocsh `dbLoadRecords` path did
     //    not).
     instance.record.init_record_tail();
-    instance.record.seed_deadband_tracking();
+    instance
+        .record
+        .seed_deadband_tracking(instance.dset_has_init_record());
 
     // C's init-time `db_post_events` run during iocInit, before any client can
     // subscribe, so they are observable by nobody. A seed put that made the
@@ -8817,8 +8818,9 @@ fn sim_process_tail(
         inst.record.check_alarms(&mut inst.common);
     }
     instance.evaluate_alarms();
-    let outcome = instance.monitor_cycle();
-    publish_cycle(instance, &outcome.snapshot, backing, outcome.alarm_posts)
+    let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
+    let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
+    publish_cycle(instance, &cycle_snapshot, backing, cycle_alarm_posts)
 }
 
 /// The single finalizer for a process cycle, for every path that can end one.

@@ -194,7 +194,11 @@ impl Record for DfanoutRecord {
     /// MLST/ALST/LALM, which is the other half of the note on the MLST/ALST
     /// field declarations above: `caget D:DF.MLST` on a C IOC reads 0 even
     /// when the record was loaded with a nonzero VAL.
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "dfanout"

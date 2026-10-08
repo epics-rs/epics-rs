@@ -699,7 +699,12 @@ fn test_common_field_put() {
         .put_common_field("HIHI", EpicsValue::Double(100.0))
         .unwrap();
     assert_eq!(
-        instance.common.analog_alarm.as_ref().unwrap().hihi,
+        instance
+            .common
+            .analog_alarm
+            .as_ref()
+            .unwrap()
+            .limit(epics_base_rs::server::record::AlarmLimitField::Hihi),
         AlarmLimit::Double(100.0)
     );
 }
@@ -1179,16 +1184,20 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     let mut instance = RecordInstance::new("TEST".into(), rec);
     // HIGH=0.5/Major so VAL=1.0 trips a HIGH alarm — a real
     // NoAlarm -> Major SEVR transition.
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1324,16 +1333,20 @@ fn test_acks_posts_once_with_dbe_value_only() {
         .expect("ACKS subscriber");
     // HIGH=0.5/Major so VAL=1.0 raises a NoAlarm -> Major transition, which
     // makes `recGblResetAlarms` fire the ack rule and move ACKS 0 -> 2.
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1405,16 +1418,20 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
         .expect("RVAL subscriber");
@@ -1485,16 +1502,20 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
     rec.mdel = 100.0;
     rec.adel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
         .expect("RVAL subscriber");
@@ -1532,16 +1553,20 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
     let mut rec = AiRecord::default();
     rec.aftc = 10.0; // AFTC-capable filter enabled (ai carries AFVL)
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     // Seed LALM/AFVL to sentinels, then force a UDF cycle.
     instance
         .record
@@ -2054,16 +2079,20 @@ fn test_snapshot_ai_with_display_metadata() {
     rec.hopr = 100.0;
     rec.lopr = -50.0;
     let mut inst = RecordInstance::new("AI:TEST".into(), rec);
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(90.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(90.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     assert_eq!(snap.value, EpicsValue::Double(42.0));
@@ -2643,16 +2672,20 @@ fn test_ai_aftc_filter_engages_and_seeds() {
     rec.afvl = 0.0; // first sample
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2684,16 +2717,20 @@ fn test_longin_aftc_filter_engages_and_seeds() {
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2721,16 +2758,20 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2759,16 +2800,20 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     rec.afvl = 3.0; // stale accumulator left from a prior AFTC>0 run
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
 
@@ -3016,4 +3061,16 @@ fn r21_menu_field_renders_its_own_choice_not_the_records_states() {
     let rec = mbbi_with_states();
     let inst = RecordInstance::new("MBBI:R21".into(), rec);
     assert_eq!(dbr_string_of(&inst, "SCAN"), "Passive");
+}
+
+/// A `DBF_DOUBLE` analog-alarm slot: limits `[HIHI, HIGH, LOW, LOLO]`, then
+/// severities `[HHSV, HSV, LSV, LLSV]`.
+fn analog_alarm_config(limits: [AlarmLimit; 4], sevs: [i16; 4]) -> AnalogAlarmConfig {
+    use epics_base_rs::server::record::AlarmLimitField::{High, Hihi, Lolo, Low};
+    let mut cfg = AnalogAlarmConfig::double();
+    for (field, limit) in [Hihi, High, Low, Lolo].into_iter().zip(limits) {
+        cfg.set_limit(field, limit);
+    }
+    [cfg.hhsv, cfg.hsv, cfg.lsv, cfg.llsv] = sevs;
+    cfg
 }

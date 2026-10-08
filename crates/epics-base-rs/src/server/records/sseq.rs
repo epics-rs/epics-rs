@@ -1107,6 +1107,10 @@ async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
 }
 
 impl Record for SseqRecord {
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "sseq"
     }

@@ -183,7 +183,7 @@ impl Record for BusyRecord {
     /// default would try to seed them; that attempt is inert today only because
     /// busy's `put_field` binds no MLST/LALM arm, and this override is what
     /// keeps it inert if one is ever added.
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
 
     /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.

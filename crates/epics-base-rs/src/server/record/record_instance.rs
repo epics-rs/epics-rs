@@ -15,7 +15,7 @@ use crate::server::snapshot::{
 use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
-use super::alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
+use super::alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
 use super::link::{
     LinkFieldType, ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_field,
@@ -2195,6 +2195,8 @@ pub(crate) struct MonitorPlan {
     pub(crate) posts_value_monitor: bool,
     /// [`Record::uses_monitor_deadband`].
     pub(crate) uses_deadband: bool,
+    /// [`Record::has_array_monitor_post`].
+    pub(crate) array_monitor_post: bool,
     /// [`Record::monitor_deadband_field`].
     pub(crate) deadband_field: &'static str,
     /// The deadband field is in [`Record::value_only_change_fields`] or
@@ -2218,6 +2220,7 @@ impl MonitorPlan {
         Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             uses_deadband: record.uses_monitor_deadband(),
+            array_monitor_post: record.has_array_monitor_post(),
             deadband_field,
             log_suppressed: record.value_only_change_fields().contains(&deadband_field)
                 || record
@@ -2229,14 +2232,6 @@ impl MonitorPlan {
             subroutine_kind: SubroutineKind::of(record.record_type()),
         }
     }
-}
-
-/// What one `monitor()` hands its publisher: the value snapshot (only the
-/// fields somebody subscribes to carry a value) and the `recGblResetAlarms`
-/// posts with their per-field C masks.
-pub(crate) struct MonitorOutcome {
-    pub(crate) snapshot: ProcessSnapshot,
-    pub(crate) alarm_posts: crate::server::database::AlarmPosts,
 }
 
 /// C `monitor()`'s post of the deadband field, as assembled by the single owner
@@ -2473,7 +2468,15 @@ impl RecordInstance {
     /// only for subscribed fields, decided under the guard the caller
     /// delivers with, so no post is decided on one lock and delivered on
     /// another.
-    pub(crate) fn monitor_cycle(&mut self) -> MonitorOutcome {
+    ///
+    /// The posts land in the caller's `snapshot`, which is the size of a post:
+    /// returned by value it was copied into the caller's slot on every cycle,
+    /// the many that post nothing included. Returns the `recGblResetAlarms`
+    /// posts with their per-field C masks.
+    pub(crate) fn monitor_cycle(
+        &mut self,
+        snapshot: &mut ProcessSnapshot,
+    ) -> crate::server::database::AlarmPosts {
         let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common);
         // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
         // (recGbl.c:194/203/212) when the severity/status OR the alarm
@@ -2494,11 +2497,10 @@ impl RecordInstance {
         // like motor deadbands its readback; its VAL then routes through
         // the change-detected loop in `collect_subscriber_posts`.
         let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
-        let mut snapshot = ProcessSnapshot::new();
         if let Some((field, value)) = deadband.field {
             snapshot.push((field.into(), value, deadband.mask));
         }
-        self.collect_subscriber_posts(&mut snapshot, deadband.mask, alarm_bits, include_val);
+        self.collect_subscriber_posts(snapshot, deadband.mask, alarm_bits, include_val);
         // C waveform/aai/aao `monitor()` posts HASH with a literal
         // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
         // 317-319), independent of the VAL post mask. `array_hash_changed`
@@ -2512,11 +2514,7 @@ impl RecordInstance {
         // `recGblResetAlarms` (recGbl.c:202-222 posts SEVR/STAT/AMSG/ACKS
         // only). UDF reaches a `.UDF` subscriber only through the generic
         // put path (C `dbPut` posts the field it wrote, dbAccess.c:1411-1413).
-        let alarm_posts = crate::server::database::alarm_field_posts(&self.common, &alarm_result);
-        MonitorOutcome {
-            snapshot,
-            alarm_posts,
-        }
+        crate::server::database::alarm_field_posts(&self.common, &alarm_result)
     }
 
     /// This cycle's forward link, resolved from the two things C's
@@ -2734,8 +2732,11 @@ impl RecordInstance {
             // **This match is the single owner of "which records have the analog
             // ladder"** — `evaluate_alarms` runs it off the slot's presence, so a
             // record added here gets the ladder and one absent cannot.
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
-            | "sub" | "scalcout" => Some(AnalogAlarmConfig::default()),
+            "ai" | "ao" | "calc" | "calcout" | "sub" | "scalcout" => {
+                Some(AnalogAlarmConfig::double())
+            }
+            "longin" | "longout" => Some(AnalogAlarmConfig::long()),
+            "int64in" | "int64out" => Some(AnalogAlarmConfig::int64()),
             _ => None,
         };
         let mut common = CommonFields::default();
@@ -2820,6 +2821,12 @@ impl RecordInstance {
         registry: Arc<HashMap<String, Arc<SubroutineFn>>>,
     ) {
         self.init_subroutines = Some(registry);
+    }
+
+    /// Whether this record's dset has a C `init_record`. Every soft-channel
+    /// dset does, and soft channel is the `device == None` case here.
+    pub(crate) fn dset_has_init_record(&self) -> bool {
+        self.device.as_ref().is_none_or(|d| d.has_init_record())
     }
 
     /// C's `if (!pdset) { recGblRecordError(S_dev_noDSET, prec, "init_record");
@@ -4723,22 +4730,22 @@ impl RecordInstance {
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| a.hihi.to_epics_value()),
+                .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
             "HIGH" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| a.high.to_epics_value()),
+                .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
             "LOW" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| a.low.to_epics_value()),
+                .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
             "LOLO" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| a.lolo.to_epics_value()),
+                .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
             "HHSV" => self
                 .common
                 .analog_alarm
@@ -5409,7 +5416,7 @@ impl RecordInstance {
                     AlarmLimit::from_stored(&value),
                     self.common.analog_alarm.as_mut(),
                 ) {
-                    a.hihi = v;
+                    a.set_limit(AlarmLimitField::Hihi, v);
                 }
             }
             "HIGH" => {
@@ -5417,7 +5424,7 @@ impl RecordInstance {
                     AlarmLimit::from_stored(&value),
                     self.common.analog_alarm.as_mut(),
                 ) {
-                    a.high = v;
+                    a.set_limit(AlarmLimitField::High, v);
                 }
             }
             "LOW" => {
@@ -5425,7 +5432,7 @@ impl RecordInstance {
                     AlarmLimit::from_stored(&value),
                     self.common.analog_alarm.as_mut(),
                 ) {
-                    a.low = v;
+                    a.set_limit(AlarmLimitField::Low, v);
                 }
             }
             "LOLO" => {
@@ -5433,7 +5440,7 @@ impl RecordInstance {
                     AlarmLimit::from_stored(&value),
                     self.common.analog_alarm.as_mut(),
                 ) {
-                    a.lolo = v;
+                    a.set_limit(AlarmLimitField::Lolo, v);
                 }
             }
             "HHSV" => {
@@ -5662,7 +5669,7 @@ impl RecordInstance {
         // lives in each record's `Record::check_alarms` hook (C `checkAlarms`);
         // those records carry no analog config, so they never reach here and
         // cannot double-raise.
-        if let Some(alarm_cfg) = self.common.analog_alarm {
+        if self.common.analog_alarm.is_some() {
             // VAL goes down in the variant the record stores it in, not
             // flattened to `f64`: it is what picks the ladder's comparison
             // domain, and `Int64(v) as f64` had already rounded the value
@@ -5670,12 +5677,18 @@ impl RecordInstance {
             let Some(input) = self.record.analog_alarm_input() else {
                 return;
             };
-            self.evaluate_analog_alarm(input, &alarm_cfg);
+            self.evaluate_analog_alarm(input);
         }
     }
 
-    fn evaluate_analog_alarm(&mut self, input: super::AnalogAlarmInput, cfg: &AnalogAlarmConfig) {
-        use crate::server::recgbl::{self, alarm_status};
+    fn evaluate_analog_alarm(&mut self, input: super::AnalogAlarmInput) {
+        use crate::server::recgbl;
+
+        // Borrowed, not copied: the slot is disjoint from the record the
+        // filter below writes, and its last use is before the alarm commit.
+        let Some(cfg) = &self.common.analog_alarm else {
+            return;
+        };
 
         // C `checkAlarms` returns immediately on a UDF cycle: it raises
         // `UDF_ALARM`/`UDFS` (already done by `rec_gbl_check_udf` in
@@ -5731,68 +5744,7 @@ impl RecordInstance {
         // SEVR=INVALID/STAT=HIHI — reproduced by testing `!= 0` and mapping the
         // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
         // `Invalid`).
-        let sevs = [cfg.hhsv, cfg.llsv, cfg.hsv, cfg.lsv];
-        let mut alarm_range = match val {
-            // The `DBF_LONG`/`DBF_INT64` records: a limit, a hysteresis and a
-            // LALM all land here as the exact `epicsInt64` C compares.
-            AlarmLimit::Long(_) | AlarmLimit::Int64(_) => {
-                let v = val.as_i128();
-                super::alarm::analog_alarm_range(
-                    v,
-                    hyst.map_or(self.common.hyst as i128, AlarmLimit::as_i128),
-                    lalm.map_or(v, AlarmLimit::as_i128),
-                    [
-                        cfg.hihi.as_i128(),
-                        cfg.lolo.as_i128(),
-                        cfg.high.as_i128(),
-                        cfg.low.as_i128(),
-                    ],
-                    sevs,
-                )
-            }
-            AlarmLimit::Double(v) => super::alarm::analog_alarm_range(
-                v,
-                hyst.map_or(self.common.hyst, AlarmLimit::as_f64),
-                lalm.map_or(v, AlarmLimit::as_f64),
-                [
-                    cfg.hihi.as_f64(),
-                    cfg.lolo.as_f64(),
-                    cfg.high.as_f64(),
-                    cfg.low.as_f64(),
-                ],
-                sevs,
-            ),
-        };
-
-        // C `range_stat[]` (`int64inRecord.c:250-253`) plus the severity and
-        // `alev` each range selects. ONE table, because C reaches the same
-        // mapping twice — once out of the ladder and once out of the AFTC
-        // filter's `switch (alarmRange)` (`:326-346`).
-        let resolve = |range: u16| -> (AlarmSeverity, u16, Option<AlarmLimit>) {
-            match range {
-                5 => (
-                    AlarmSeverity::from_u16(cfg.hhsv as u16),
-                    alarm_status::HIHI_ALARM,
-                    Some(cfg.hihi),
-                ),
-                4 => (
-                    AlarmSeverity::from_u16(cfg.hsv as u16),
-                    alarm_status::HIGH_ALARM,
-                    Some(cfg.high),
-                ),
-                2 => (
-                    AlarmSeverity::from_u16(cfg.lsv as u16),
-                    alarm_status::LOW_ALARM,
-                    Some(cfg.low),
-                ),
-                1 => (
-                    AlarmSeverity::from_u16(cfg.llsv as u16),
-                    alarm_status::LOLO_ALARM,
-                    Some(cfg.lolo),
-                ),
-                _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, None),
-            }
-        };
+        let mut alarm_range = cfg.range(val, hyst, lalm, self.common.hyst);
 
         // C parity: the alarm-range AFTC low-pass filter
         // (`{ai,longin,int64in,calc}Record.c::checkAlarms`) smooths the
@@ -5828,7 +5780,8 @@ impl RecordInstance {
                 }
             }
         }
-        let (new_sevr, new_stat, alev) = resolve(alarm_range);
+        // C re-maps the filtered range through the same table the ladder used.
+        let (new_sevr, new_stat, alev) = cfg.resolve(alarm_range);
 
         if new_sevr != AlarmSeverity::NoAlarm {
             // C `aiRecord.c:405-406` — the latch is armed to the THRESHOLD, and
@@ -6066,12 +6019,7 @@ impl RecordInstance {
                 cycle_posted.extend(first_cycle);
             }
         }
-        let MonitorPlan {
-            deadband_field,
-            value_masked,
-            aux_post,
-            ..
-        } = self.monitor_plan;
+        let value_masked = self.monitor_plan.value_masked;
         // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
         // `OnChangeForced` fields sit behind, which the record may open on a
         // cycle where VAL's own mask is shut. TAKEn, like `cycle_posted`, so
@@ -6118,6 +6066,11 @@ impl RecordInstance {
         if self.subscribers.is_empty() && self.last_posted.is_empty() && forced_fired == 0 {
             return;
         }
+        let MonitorPlan {
+            deadband_field,
+            aux_post,
+            ..
+        } = self.monitor_plan;
         // Every post this walk adds sits at or past this index, so the
         // published-state advance at the tail covers exactly those.
         let first_post = snapshot.len();
@@ -6626,10 +6579,8 @@ impl RecordInstance {
         self.common.time = crate::runtime::general_time::get_current();
         // UDF already updated above — do not clear unconditionally.
 
-        let MonitorOutcome {
-            snapshot,
-            alarm_posts,
-        } = self.monitor_cycle();
+        let mut snapshot = ProcessSnapshot::new();
+        let alarm_posts = self.monitor_cycle(&mut snapshot);
 
         Ok((snapshot, alarm_posts.to_vec()))
     }
@@ -6735,12 +6686,12 @@ impl RecordInstance {
         // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
         // C never sends. Gating here rather than at each builder keeps the
         // single owner of the deadband post the single enforcer of the set.
-        let in_closed_set = self
-            .record
-            .process_posted_fields()
-            .is_none_or(|allowed| allowed.contains(&field));
-
-        let value = if mask.is_empty() || !in_closed_set {
+        let value = if mask.is_empty()
+            || !self
+                .record
+                .process_posted_fields()
+                .is_none_or(|allowed| allowed.contains(&field))
+        {
             None
         } else if field == "VAL" {
             self.record.val()
@@ -6763,7 +6714,9 @@ impl RecordInstance {
         // event to the snapshot builders, which post `HASH` (the field is
         // excluded from the generic change-detection loop via
         // `event_posted_fields`).
-        if let Some(post) = self.record.array_monitor_post() {
+        if self.monitor_plan.array_monitor_post
+            && let Some(post) = self.record.array_monitor_post()
+        {
             self.array_hash_changed = post.hash_changed;
             return (post.post_value, post.post_archive);
         }
@@ -6778,29 +6731,23 @@ impl RecordInstance {
             return (true, true);
         };
 
-        // The four cells in one ask — see `Record::monitor_deadband_cells`.
-        // `None` for MLST/ALST survives to `check_deadband` as the "nothing
-        // posted yet" state: record types that carry no MLST/ALST cell (sel,
-        // scalcout) have nowhere to hold a last-posted value, and fall back to
-        // the `CommonFields` shadow.
-        let cells = self.record.monitor_deadband_cells();
-        let mdel = cells.mdel.unwrap_or(0.0);
-        let adel = cells.adel.unwrap_or(0.0);
-        let mlst = cells.mlst.or(self.common.mlst);
-        let alst = cells.alst.or(self.common.alst);
-
-        let monitor_trigger = check_deadband(val, mlst, mdel);
-        let archive_trigger = check_deadband(val, alst, adel);
+        // The four cells in one ask — see `Record::monitor_deadband_cells`. A
+        // type that carries no MLST/ALST cell holds them in `CommonFields`.
+        let cells = self
+            .record
+            .monitor_deadband_cells([self.common.mlst, self.common.alst]);
+        let monitor_trigger = check_deadband(val, cells.mlst, cells.mdel);
+        let archive_trigger = check_deadband(val, cells.alst, cells.adel);
 
         if monitor_trigger || archive_trigger {
             self.record
                 .store_monitor_last_posted(val, monitor_trigger, archive_trigger);
         }
         if archive_trigger {
-            self.common.alst = Some(val);
+            self.common.alst = val;
         }
         if monitor_trigger {
-            self.common.mlst = Some(val);
+            self.common.mlst = val;
         }
 
         (monitor_trigger, archive_trigger)
@@ -8011,16 +7958,7 @@ impl RecordInstance {
 /// here: C compares a NaN `*poldval` against a NaN `newval` by these rules
 /// and finds them unchanged. `dbnd.c parse_ok` relies on exactly that when it
 /// seeds its own `last` to `epicsNAN`.
-///
-/// `oldval` is `None` for the record types that carry no MLST/ALST cell to
-/// hold a last-posted value; nothing was posted, so the first post is
-/// unconditional. C has no such state — its MLST is a plain double the record
-/// type initialises (0 for `calc` and `sel`, `prec->val` for `ai`,
-/// aiRecord.c:129-130).
-pub(crate) fn check_deadband(newval: f64, oldval: Option<f64>, deadband: f64) -> bool {
-    let Some(oldval) = oldval else {
-        return true;
-    };
+pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
     // A finite difference means both operands were finite (inf - x is inf,
     // inf - inf and NaN - x are NaN), so the common case is C's own
     // subtract, fabs, compare.
@@ -10034,25 +9972,9 @@ mod check_deadband_tests {
         for (deadband, row) in expected {
             for (i, ((oldval, newval), want)) in pairs.iter().zip(row).enumerate() {
                 assert_eq!(
-                    check_deadband(*newval, Some(*oldval), deadband),
+                    check_deadband(*newval, *oldval, deadband),
                     want,
                     "C pattern {i}: deadband={deadband} oldval={oldval} newval={newval}"
-                );
-            }
-        }
-    }
-
-    /// The port-only state: a record type with no MLST/ALST cell has posted
-    /// nothing, so the first comparison has no baseline and must fire whatever
-    /// the value and the deadband are — including the value C's table says
-    /// would not fire against an equal baseline.
-    #[test]
-    fn never_posted_fires_regardless_of_value_or_deadband() {
-        for value in [0.0, 1.0, NAN, INF, -INF] {
-            for deadband in [-1.0, 0.0, 1.5] {
-                assert!(
-                    check_deadband(value, None, deadband),
-                    "never-posted must fire: value={value} deadband={deadband}"
                 );
             }
         }
@@ -10107,7 +10029,7 @@ mod check_deadband_tests {
         for (deadband, row) in expected {
             for ((oldval, newval, delta), want) in pairs.iter().zip(row) {
                 assert_eq!(
-                    check_deadband(*newval, Some(*oldval), deadband),
+                    check_deadband(*newval, *oldval, deadband),
                     want,
                     "deadband={deadband} oldval={oldval} newval={newval} (C delta={delta})"
                 );
@@ -10119,21 +10041,43 @@ mod check_deadband_tests {
     /// and for the smallest subnormal, and fails only for an equal value.
     #[test]
     fn zero_deadband_posts_one_ulp_but_not_an_equal_value() {
-        assert!(!check_deadband(1.0, Some(1.0), 0.0));
-        assert!(check_deadband(1.0_f64.next_up(), Some(1.0), 0.0));
-        assert!(check_deadband(1.0, Some(1.0_f64.next_up()), 0.0));
-        assert!(check_deadband(f64::from_bits(1), Some(0.0), 0.0));
-        assert!(check_deadband(0.0, Some(-f64::from_bits(1)), 0.0));
+        assert!(!check_deadband(1.0, 1.0, 0.0));
+        assert!(check_deadband(1.0_f64.next_up(), 1.0, 0.0));
+        assert!(check_deadband(1.0, 1.0_f64.next_up(), 0.0));
+        assert!(check_deadband(f64::from_bits(1), 0.0, 0.0));
+        assert!(check_deadband(0.0, -f64::from_bits(1), 0.0));
+    }
+
+    /// No "nothing posted yet" state: the first cycle compares VAL against
+    /// the seed like every other cycle, whether the type carries MLST/ALST
+    /// (ai) or keeps them in `CommonFields` at 0 (aSub).
+    #[test]
+    fn first_cycle_val_equal_to_the_seed_does_not_post() {
+        use super::RecordInstance;
+        use crate::server::records::ai::AiRecord;
+        use crate::server::records::asub_record::ASubRecord;
+
+        let mut asub = RecordInstance::new("A".into(), ASubRecord::default());
+        assert_eq!(asub.check_deadband_ext(), (false, false));
+        let mut moved = ASubRecord::default();
+        moved.val = 2;
+        let mut asub = RecordInstance::new("A".into(), moved);
+        assert_eq!(asub.check_deadband_ext(), (true, true));
+
+        let mut seeded = AiRecord::default();
+        (seeded.val, seeded.mlst, seeded.alst) = (5.0, 5.0, 5.0);
+        let mut ai = RecordInstance::new("B".into(), seeded);
+        assert_eq!(ai.check_deadband_ext(), (false, false));
     }
 
     /// C's compare is strict: a change of exactly the deadband does not post,
     /// in either direction, and one ulp below the deadband does.
     #[test]
     fn a_change_of_exactly_the_deadband_does_not_post() {
-        assert!(!check_deadband(2.5, Some(1.0), 1.5));
-        assert!(!check_deadband(1.0, Some(2.5), 1.5));
-        assert!(check_deadband(2.5, Some(1.0), 1.5_f64.next_down()));
-        assert!(check_deadband(1.0, Some(2.5), 1.5_f64.next_down()));
+        assert!(!check_deadband(2.5, 1.0, 1.5));
+        assert!(!check_deadband(1.0, 2.5, 1.5));
+        assert!(check_deadband(2.5, 1.0, 1.5_f64.next_down()));
+        assert!(check_deadband(1.0, 2.5, 1.5_f64.next_down()));
     }
 }
 

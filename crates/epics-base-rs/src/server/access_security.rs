@@ -371,7 +371,7 @@ const ASG_INP_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 /// was open, and a client that connected while it was shut stayed read-only
 /// after it opened.
 ///
-/// This is that monitor, in-process: one `EventMask::VALUE` subscription per
+/// This is that monitor, in-process: one `VALUE | ALARM` subscription per
 /// distinct link target ([`AccessSecurityConfig::inp_link_targets`]), and
 /// [`notify_asg_field_changed`] on any post. That is the signal
 /// [`AcfCell::store`] already raises, so the CA server's `reeval_access_rights`
@@ -467,10 +467,11 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     );
 }
 
-/// Subscribe one `INP*` target to its record's value events. `false` = not
-/// attached, retry later; the record is not in the database yet, or its
-/// subscriber cap is full (which frees again as clients disconnect, and losing
-/// a security monitor is worth the retry's log noise).
+/// Subscribe one `INP*` target to its record's value and alarm events, the
+/// default mask of C's `ca_add_event(DBR_STS_DOUBLE, ...)` (`asCa.c:193`).
+/// `false` = not attached, retry later; the record is not in the database yet,
+/// or its subscriber cap is full (which frees again as clients disconnect, and
+/// losing a security monitor is worth the retry's log noise).
 fn attach_asg_inp(
     db: &crate::server::database::PvDatabase,
     record: &str,
@@ -484,7 +485,7 @@ fn attach_asg_inp(
         field,
         0,
         crate::types::DbFieldType::Double,
-        crate::server::recgbl::EventMask::VALUE.bits(),
+        (crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM).bits(),
     );
     match reader {
         Some(reader) => {

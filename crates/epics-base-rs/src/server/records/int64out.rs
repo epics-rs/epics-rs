@@ -102,6 +102,10 @@ impl Record for Int64outRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "int64out"
     }

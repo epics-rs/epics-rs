@@ -338,6 +338,11 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
         Ok(DeviceInitOutcome::Live)
     }
 
+    // devTimestamp.c `{6, NULL, initAllow, NULL, NULL}`.
+    fn has_init_record(&self) -> bool {
+        false
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         // C `recGblGetTimeStamp` leaves `prec->time` alone when
         // `epicsTimeGetEvent` fails, and the record-level owner

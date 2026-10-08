@@ -446,7 +446,7 @@ impl Record for SwaitRecord {
 
     /// C `swaitRecord.c::init_record` (:266-) ends without touching
     /// MLST/ALST; both writes are in `monitor()` (:630,:639).
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
 
     /// The same rset shape as `bo`'s `HIGH` and `busy`'s `HIGH`: one named
     /// field answered with a constant. `ODLY` is `DBF_FLOAT`, so it clears
@@ -458,6 +458,10 @@ impl Record for SwaitRecord {
                 precision: Some(SWAIT_ODLY_PRECISION),
                 ..Default::default()
             })
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
     }
 
     fn record_type(&self) -> &'static str {

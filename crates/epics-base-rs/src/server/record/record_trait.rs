@@ -3276,6 +3276,14 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// Whether [`Self::array_monitor_post`] can answer `Some` for this type,
+    /// settled once in the monitor plan so a deadband cycle does not call an
+    /// empty hook. `true` by default: a type that forgets pays the call
+    /// rather than losing its mask rule.
+    fn has_array_monitor_post(&self) -> bool {
+        true
+    }
+
     /// Fields the record posts itself via an event-driven, individually
     /// masked path rather than the generic change-detection loop. The
     /// framework excludes these from that loop so they are neither
@@ -3483,7 +3491,11 @@ pub trait Record: Send + Sync + 'static {
     /// seeds MLST and no LALM, `boRecord.c:172-173` seeds MLST and LALM but no
     /// ALST); everything else their tail does is
     /// [`Self::init_record_tail`]'s.
-    fn seed_deadband_tracking(&mut self) {
+    ///
+    /// `dset_has_init_record` is whether the record's dset supplies a C
+    /// `init_record`; only a type whose C seed sits behind that test (ai)
+    /// reads it.
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
         let seed = match self.monitor_deadband_value() {
             Some(v) if v.is_finite() => v,
             _ => return,
@@ -3644,26 +3656,28 @@ pub trait Record: Send + Sync + 'static {
 
     /// C `monitor()`'s four deadband cells, read in one question: the MDEL /
     /// ADEL thresholds and the MLST / ALST values the record last posted at.
-    /// `None` is a cell this type does not carry, which is the "nothing
-    /// posted yet" state `check_deadband`
-    /// takes for MLST/ALST and a zero deadband for MDEL/ADEL.
+    /// A deadband this type does not carry is 0; an MLST/ALST it does not
+    /// carry is the instance's own `[MLST, ALST]`, passed in as `last_posted`.
     ///
     /// Asked as one question because the cycle otherwise asks
     /// [`Self::get_field`] four times through the vtable and pays an
     /// [`EpicsValue`] per answer. Each cell is read through
     /// [`Self::cycle_cell`]; by name, that was measured at ~970 instructions
     /// of an `ai` cycle across the cycle's cell reads.
-    fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
-        let f64_of = |cell: CycleCell| match self.cycle_cell(cell) {
-            CycleRead::Value(v) => Some(v.to_f64()),
-            CycleRead::Absent => None,
-            CycleRead::ByName => self.get_field(cell.name()).and_then(|v| v.to_f64()),
+    fn monitor_deadband_cells(&self, last_posted: [f64; 2]) -> MonitorDeadbandCells {
+        let f64_of = |cell: CycleCell, absent: f64| match self.cycle_cell(cell) {
+            CycleRead::Value(v) => v.to_f64(),
+            CycleRead::Absent => absent,
+            CycleRead::ByName => self
+                .get_field(cell.name())
+                .and_then(|v| v.to_f64())
+                .unwrap_or(absent),
         };
         MonitorDeadbandCells {
-            mdel: f64_of(CycleCell::Mdel),
-            adel: f64_of(CycleCell::Adel),
-            mlst: f64_of(CycleCell::Mlst),
-            alst: f64_of(CycleCell::Alst),
+            mdel: f64_of(CycleCell::Mdel, 0.0),
+            adel: f64_of(CycleCell::Adel, 0.0),
+            mlst: f64_of(CycleCell::Mlst, last_posted[0]),
+            alst: f64_of(CycleCell::Alst, last_posted[1]),
         }
     }
 
@@ -3685,8 +3699,8 @@ pub trait Record: Send + Sync + 'static {
 
     /// The three cells C `checkAlarms` reads straight off the record — VAL,
     /// HYST and LALM — in one question, in the ladder's own domain. `None`
-    /// is a VAL the ladder has no arm for; a `None` cell is one this type
-    /// does not carry.
+    /// is a VAL the ladder has no arm for; a `None` HYST is one this type
+    /// keeps in `CommonFields`, and a type with no LALM cell latches on VAL.
     ///
     /// Same reason as [`Self::monitor_deadband_cells`]: the ladder runs on
     /// every cycle of every analog record, and asking [`Self::get_field`] by
@@ -3709,7 +3723,7 @@ pub trait Record: Send + Sync + 'static {
         Some(AnalogAlarmInput {
             val,
             hyst: limit(CycleCell::Hyst),
-            lalm: limit(CycleCell::Lalm),
+            lalm: limit(CycleCell::Lalm).unwrap_or(val),
         })
     }
 
@@ -5947,6 +5961,36 @@ mod tests {
         }
     }
 
+    /// `check_deadband_ext` skips [`Record::array_monitor_post`] for a type
+    /// whose [`Record::has_array_monitor_post`] is false, so that type must
+    /// keep the `None` default; and every deadband type without the hook says
+    /// false. A type off the deadband path never asks, so its answer is free.
+    #[test]
+    fn a_type_with_an_array_monitor_post_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        const ARRAYS: &[&str] = &["aai", "aao", "histogram", "waveform"];
+        let mut reached = Vec::new();
+        let mut wrong = Vec::new();
+        for record_type in RECORD_TYPES {
+            let Some(mut r) = cycle_record(record_type) else {
+                continue;
+            };
+            reached.push(*record_type);
+            if r.uses_monitor_deadband()
+                && r.has_array_monitor_post() != ARRAYS.contains(record_type)
+            {
+                wrong.push(format!("{record_type} has_array_monitor_post"));
+            }
+            if !r.has_array_monitor_post() && r.array_monitor_post().is_some() {
+                wrong.push(format!("{record_type} answers but says false"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        for record_type in ARRAYS {
+            assert!(reached.contains(record_type), "{record_type} not reached");
+        }
+    }
+
     /// The cycle skips [`Record::pre_process_actions`] for a type whose
     /// [`Record::acts_before_process`] is false, so that type must keep the
     /// empty default; and every base type without the hook says false.
@@ -6041,11 +6085,23 @@ mod tests {
             seed_cycle_cells(&mut *r);
 
             let r = &*r;
-            let deadband = r.monitor_deadband_cells();
-            assert_eq!(deadband.mdel, f64_of(r, "MDEL"), "{record_type} MDEL");
-            assert_eq!(deadband.adel, f64_of(r, "ADEL"), "{record_type} ADEL");
-            assert_eq!(deadband.mlst, f64_of(r, "MLST"), "{record_type} MLST");
-            assert_eq!(deadband.alst, f64_of(r, "ALST"), "{record_type} ALST");
+            // Distinct from every seeded cell, so a type that answers from
+            // `last_posted` for a cell it carries is caught.
+            let last_posted = [-71.5, -72.5];
+            let deadband = r.monitor_deadband_cells(last_posted);
+            let or = |field, absent| f64_of(r, field).unwrap_or(absent);
+            assert_eq!(deadband.mdel, or("MDEL", 0.0), "{record_type} MDEL");
+            assert_eq!(deadband.adel, or("ADEL", 0.0), "{record_type} ADEL");
+            assert_eq!(
+                deadband.mlst,
+                or("MLST", last_posted[0]),
+                "{record_type} MLST"
+            );
+            assert_eq!(
+                deadband.alst,
+                or("ALST", last_posted[1]),
+                "{record_type} ALST"
+            );
 
             let ladder = r
                 .val()
@@ -6057,7 +6113,8 @@ mod tests {
                         .and_then(|v| AlarmLimit::from_stored(&v)),
                     lalm: r
                         .get_field("LALM")
-                        .and_then(|v| AlarmLimit::from_stored(&v)),
+                        .and_then(|v| AlarmLimit::from_stored(&v))
+                        .unwrap_or(val),
                 });
             assert_eq!(
                 r.analog_alarm_input(),
@@ -6390,8 +6447,8 @@ pub struct AnalogAlarmInput {
     pub val: AlarmLimit,
     /// HYST, or `None` for a type that keeps it in `CommonFields`.
     pub hyst: Option<AlarmLimit>,
-    /// LALM, the armed latch, or `None` for a type with no cell for it.
-    pub lalm: Option<AlarmLimit>,
+    /// LALM, the armed latch; VAL for a type with no cell for it.
+    pub lalm: AlarmLimit,
 }
 
 /// The cells the scan cycle reads or writes on every pass — see
@@ -6673,11 +6730,11 @@ impl From<AlarmLimit> for CycleValue {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MonitorDeadbandCells {
     /// MDEL, the monitor deadband.
-    pub mdel: Option<f64>,
+    pub mdel: f64,
     /// ADEL, the archive deadband.
-    pub adel: Option<f64>,
+    pub adel: f64,
     /// MLST, the value the last `DBE_VALUE` post carried.
-    pub mlst: Option<f64>,
+    pub mlst: f64,
     /// ALST, the value the last `DBE_LOG` post carried.
-    pub alst: Option<f64>,
+    pub alst: f64,
 }

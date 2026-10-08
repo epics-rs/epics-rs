@@ -1066,7 +1066,11 @@ impl Record for AcalcoutRecord {
     /// MLST/ALST/LALM, unlike the `calcout` it is modelled on
     /// (`calcoutRecord.c:217-219`). An `acalcout` given a nonzero initial
     /// VAL posts that value once on its first cycle in C.
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "acalcout"

@@ -606,6 +606,10 @@ impl Record for CompressRecord {
         crate::server::record::CycleHooks::PRE_INPUT
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "compress"
     }

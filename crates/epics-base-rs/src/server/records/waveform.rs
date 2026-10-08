@@ -754,6 +754,10 @@ impl Record for WaveformRecord {
         crate::server::record::CycleHooks::PRE_INPUT
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        !matches!(self.kind, ArrayKind::SubArray)
+    }
+
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
     }

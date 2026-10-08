@@ -184,9 +184,10 @@ pub struct CommonFields {
     // Raw `u8` like [`Self::disp`]/[`Self::rpro`]; the `pp(TRUE)` reprocess is
     // orthogonal and driven by the put-path force-process intercept.
     pub proc_field: u8,
-    // Fallback monitor/archive last-sent values for records without MLST/ALST fields
-    pub mlst: Option<f64>,
-    pub alst: Option<f64>,
+    /// MLST/ALST for a record type that carries no cell of its own: the value
+    /// its last `DBE_VALUE` / `DBE_LOG` post carried, 0 until one does.
+    pub mlst: f64,
+    pub alst: f64,
 }
 
 impl CommonFields {
@@ -294,8 +295,8 @@ impl Default for CommonFields {
             putf: false,
             rpro: 0,
             proc_field: 0,
-            mlst: None,
-            alst: None,
+            mlst: 0.0,
+            alst: 0.0,
         }
     }
 }

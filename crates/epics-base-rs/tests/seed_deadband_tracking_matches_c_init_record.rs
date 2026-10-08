@@ -19,21 +19,22 @@ mod module_records;
 use epics_base_rs::types::EpicsValue;
 
 /// `(record type, a nonzero VAL in the type's own representation, does
-/// `seed_deadband_tracking` seed?)`
+/// `seed_deadband_tracking` seed?)`. Only `ai` answers differently for a dset
+/// without `init_record`; see `without` below.
 const CASES: &[(&str, EpicsValue, bool)] = &[
     // Seeds — std/rec
-    ("ai", EpicsValue::Double(3.0), true), // aiRecord.c:129-131
-    ("ao", EpicsValue::Double(3.0), true), // aoRecord.c:157-159
-    ("bi", EpicsValue::Enum(1), true),     // biRecord.c:110-111
-    ("bo", EpicsValue::Enum(1), true),     // boRecord.c:165-173
+    ("ai", EpicsValue::Double(3.0), false), // aiRecord.c:121-128, dset init_record returns
+    ("ao", EpicsValue::Double(3.0), true),  // aoRecord.c:157-159
+    ("bi", EpicsValue::Enum(1), true),      // biRecord.c:110-111
+    ("bo", EpicsValue::Enum(1), true),      // boRecord.c:165-173
     ("calcout", EpicsValue::Double(3.0), true), // calcoutRecord.c:217-219
     ("int64in", EpicsValue::Int64(3), true), // int64inRecord.c:116-118
     ("int64out", EpicsValue::Int64(3), true), // int64outRecord.c:116-118
-    ("longin", EpicsValue::Long(3), true), // longinRecord.c:120-122
+    ("longin", EpicsValue::Long(3), true),  // longinRecord.c:120-122
     ("longout", EpicsValue::Long(3), true), // longoutRecord.c:123-125
-    ("mbbi", EpicsValue::Enum(3), true),   // mbbiRecord.c:137-138
+    ("mbbi", EpicsValue::Enum(3), true),    // mbbiRecord.c:137-138
     ("mbbiDirect", EpicsValue::Long(3), true), // mbbiDirectRecord.c:128
-    ("mbbo", EpicsValue::UShort(3), true), // mbboRecord.c:179-180
+    ("mbbo", EpicsValue::UShort(3), true),  // mbboRecord.c:179-180
     ("mbboDirect", EpicsValue::Long(3), true), // mbboDirectRecord.c:160
     // Does not seed
     //
@@ -61,7 +62,12 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
     // different record types, and stopping at the first would hide the other.
     let mut wrong = Vec::new();
 
-    for (rtype, val, seeds) in CASES {
+    let without = ("ai", EpicsValue::Double(3.0), true, false); // aiRecord.c:129-131
+    let cases = CASES
+        .iter()
+        .map(|(t, v, s)| (*t, v.clone(), *s, true))
+        .chain([without]);
+    for (rtype, val, seeds, dset_has_init_record) in cases {
         let mut rec =
             module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
         rec.put_field("VAL", val.clone())
@@ -73,9 +79,9 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
              record leaves behind, or the two groups are indistinguishable"
         );
 
-        rec.seed_deadband_tracking();
+        rec.seed_deadband_tracking(dset_has_init_record);
 
-        let want = if *seeds { val } else { 0.0 };
+        let want = if seeds { val } else { 0.0 };
         for field in ["MLST", "ALST", "LALM"] {
             let Some(got) = rec.get_field(field) else {
                 continue; // this type carries no such cell
@@ -85,9 +91,9 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
                 .unwrap_or_else(|| panic!("{rtype}.{field} is not numeric"));
             if got != want {
                 wrong.push(format!(
-                    "{rtype}.{field}: VAL={val}, seed_deadband_tracking {} seed, \
-                     got {got} want {want}",
-                    if *seeds { "does" } else { "does not" }
+                    "{rtype}.{field}: VAL={val}, dset init_record={dset_has_init_record}, \
+                     seed_deadband_tracking {} seed, got {got} want {want}",
+                    if seeds { "does" } else { "does not" }
                 ));
             }
         }

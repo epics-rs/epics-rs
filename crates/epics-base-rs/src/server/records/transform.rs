@@ -538,6 +538,10 @@ impl Record for TransformRecord {
             })
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "transform"
     }
@@ -968,7 +972,7 @@ impl Record for TransformRecord {
     /// Without this, `field(A,"5")` would leave LA=0, make A read "new" on the
     /// very first cycle, and suppress the calc C runs. transform serves no
     /// MLST/ALST/LALM, so there is nothing of the default's work to keep.
-    fn seed_deadband_tracking(&mut self) {
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {
         self.lvals = self.vals;
     }
 
@@ -1241,7 +1245,7 @@ mod tests {
     /// while `A..P` hold their loaded values — i.e. as if every loaded field had
     /// just been written, which suppresses the very calc C performs.
     fn ioc_init(rec: &mut TransformRecord) {
-        rec.seed_deadband_tracking();
+        rec.seed_deadband_tracking(true);
     }
 
     /// An expression that compiles clean and FAILS at eval — C

@@ -163,6 +163,10 @@ impl Record for AiRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "ai"
     }
@@ -197,17 +201,23 @@ impl Record for AiRecord {
                 self.eslo = saved_eslo;
             }
 
-            // Initialize tracking fields from current val
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-
             // C `aiRecord.c:114`: `prec->init = TRUE;` — an initialised record
             // has not converted yet, so the next conversion is the initial one.
             self.init = ConvertPhase::Initial;
         }
         Ok(())
+    }
+
+    // aiRecord.c:121-132: a dset `init_record` returns before the seed, so a
+    // soft-channel ai keeps MLST/ALST/LALM and ORAW at 0 and posts its first
+    // VAL. ORAW is no deadband tracker but sits on the same C branch.
+    fn seed_deadband_tracking(&mut self, dset_has_init_record: bool) {
+        if !dset_has_init_record {
+            self.mlst = self.val;
+            self.alst = self.val;
+            self.lalm = self.val;
+            self.oraw = self.rval;
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

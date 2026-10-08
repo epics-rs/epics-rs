@@ -176,7 +176,11 @@ impl Record for SelRecord {
     /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and
     /// returns; it never touches LALM, whose only writes are in
     /// `checkAlarms` (:270-302).
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_has_init_record: bool) {}
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "sel"

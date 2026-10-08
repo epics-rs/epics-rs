@@ -773,6 +773,11 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 #krate::server::record::CycleHooks::NONE
             }
 
+            // Nor an `array_monitor_post`.
+            fn has_array_monitor_post(&self) -> bool {
+                false
+            }
+
             fn record_type(&self) -> &'static str {
                 #record_type_str
             }

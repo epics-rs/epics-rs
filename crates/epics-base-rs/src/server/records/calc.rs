@@ -1,7 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmLimit, AnalogAlarmInput, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
+    CycleCell, CycleRead, CycleValue, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -322,6 +322,14 @@ fn prev_index(name: &str) -> Option<usize> {
 }
 
 impl Record for CalcRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// C `calcRecord.c::init_record` (:90-114) ends without touching
     /// MLST/ALST/LALM — `sub` and `calcout`, the two records closest to it,
     /// both do seed (`subRecord.c:130-132`, `calcoutRecord.c:217-219`), so
@@ -452,65 +460,6 @@ impl Record for CalcRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    /// The framework's per-cycle cells, read as struct members — the
-    /// defaults would each cost a full `get_field` name match. `calc`'s
-    /// `get_field` has 32 four-character arms, so every one of these is a
-    /// walk through that bucket on every scan cycle.
-    ///
-    /// `hyst` is `None` because `calc` declares no HYST
-    /// (`calcRecord.dbd.pod`).
-    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
-        Some(AnalogAlarmInput {
-            val: AlarmLimit::Double(self.val),
-            hyst: None,
-            lalm: Some(AlarmLimit::Double(self.lalm)),
-        })
-    }
-
-    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        Some((self.aftc, self.afvl))
-    }
-
-    fn store_alarm_filter_value(&mut self, afvl: f64) {
-        self.afvl = afvl;
-    }
-
-    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
-        self.lalm = lalm.as_f64();
-    }
-
-    fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(self.val))
-    }
-
-    fn monitor_deadband_value(&self) -> Option<f64> {
-        Some(self.val)
-    }
-
-    /// `calc` declares no OVAL, so the default's `get_field("OVAL")` is a
-    /// miss through the whole four-character bucket on every cycle.
-    fn output_link_value(&self) -> Option<EpicsValue> {
-        self.val()
-    }
-
-    fn monitor_deadband_cells(&self) -> crate::server::record::MonitorDeadbandCells {
-        crate::server::record::MonitorDeadbandCells {
-            mdel: Some(self.mdel),
-            adel: Some(self.adel),
-            mlst: Some(self.mlst),
-            alst: Some(self.alst),
-        }
-    }
-
-    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
-        if mlst {
-            self.mlst = val;
-        }
-        if alst {
-            self.alst = val;
-        }
-    }
-
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
         // INPA..INPU differ in their last byte alone, so the cycle's 21 asks
         // cost one shape test and one indexed branch instead of 21 name
@@ -542,6 +491,33 @@ impl Record for CalcRecord {
             b'U' => &self.inpu,
             _ => return None,
         })
+    }
+
+    /// C `monitor()` and `checkAlarms` read these as struct members. `calc`
+    /// declares no OVAL and no HYST (`calcRecord.dbd.pod`).
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            CycleCell::Oval | CycleCell::Hyst => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
@@ -116,6 +116,14 @@ impl MbboDirectRecord {
 }
 
 impl Record for MbboDirectRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "mbboDirect"
     }
@@ -404,11 +412,11 @@ impl Record for MbboDirectRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Long(self.val as i32)),
-            CycleCell::Mlst => Some(EpicsValue::Long(self.mlst as i32)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Long(self.val as i32)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Long(self.mlst as i32)),
+            _ => CycleRead::Absent,
         }
     }
 

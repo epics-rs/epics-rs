@@ -1204,10 +1204,39 @@ impl PvDatabase {
         }
     }
 
-    /// [`Self::read_db_link_at`] read as `DBR_DOUBLE`: `None` with no alarm
-    /// for a failed read, `None` with the alarm for a value that does not
-    /// convert. An unfiltered `VAL` the record serves as `DBF_DOUBLE` is
-    /// read straight off its slot, the `dbGetLink` of C's `dbAddr`.
+    /// The read of `link`'s cached target at the reader's request, for a
+    /// caller that has the target in hand: the value as `read_as` asks, and
+    /// the source's alarm only for a read and conversion that both
+    /// succeeded (`dbDbLink.c:228`), as [`Self::read_link_value_as_with_alarm`]
+    /// gates the general path. `None` with no alarm for a non-DB `link`.
+    #[inline(always)]
+    pub(crate) fn read_db_link_as_at(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return (None, None);
+        };
+        if read_as == crate::server::record::LinkReadAs::Double {
+            let (value, alarm) = self.read_db_link_f64_at(db, at);
+            return (value.map(EpicsValue::Double), alarm);
+        }
+        let (Some(value), alarm) = self.read_db_at(db, at) else {
+            return (None, None);
+        };
+        match self.apply_link_read_as(link, read_as, value) {
+            Some(value) => (Some(value), alarm),
+            None => (None, None),
+        }
+    }
+
+    /// [`Self::read_db_link_at`] read as `DBR_DOUBLE`: `None`, with no alarm,
+    /// for a read or a conversion that failed — C inherits only on
+    /// `dbGetLink`'s success (`dbDbLink.c:228`), and a failed conversion is a
+    /// failed status. An unfiltered `VAL` the record serves as `DBF_DOUBLE`
+    /// is read straight off its slot, the `dbGetLink` of C's `dbAddr`.
     #[inline(always)]
     pub(crate) fn read_db_link_f64_at(
         &self,
@@ -1232,7 +1261,10 @@ impl PvDatabase {
             return (Some(value), alarm);
         }
         match self.read_db_at(db, at) {
-            (Some(v), alarm) => (link_value_as_f64(v), alarm),
+            (Some(v), alarm) => match link_value_as_f64(v) {
+                Some(f) => (Some(f), alarm),
+                None => (None, None),
+            },
             (None, _) => (None, None),
         }
     }
@@ -5293,13 +5325,71 @@ mod db_link_addr_tests {
             };
             assert_eq!(value, expect, "{text}");
             assert_eq!(value.map(EpicsValue::Double), native, "{text}");
+            // C inherits only on `dbGetLink`'s success: a value that does
+            // not convert to DOUBLE is a failed status and carries no alarm.
             assert_eq!(
                 alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
                 native_alarm
                     .as_ref()
+                    .filter(|_| native.is_some())
                     .map(|a| (format!("{:?}", a.alarm), a.record)),
                 "{text}"
             );
+        }
+    }
+
+    /// The read with the target in hand answers what the general path
+    /// does, alarm included, at every request type: a failed conversion
+    /// (an array as a string, `abc` as a double) inherits nothing.
+    #[epics_macros_rs::epics_test]
+    async fn the_held_target_read_answers_what_the_general_read_does() {
+        use crate::server::record::{LinkReadAs, Record};
+        use crate::server::records::{
+            calc::CalcRecord, stringin::StringinRecord, waveform::WaveformRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let mut calc = CalcRecord::new("A");
+        calc.put_field("VAL", EpicsValue::Double(4.5)).unwrap();
+        db.add_record("C", Box::new(calc)).await.unwrap();
+        let mut wf = WaveformRecord::new(4, crate::types::DbFieldType::Char);
+        wf.put_field("VAL", EpicsValue::CharArray(b"hi".to_vec().into()))
+            .unwrap();
+        db.add_record("W", Box::new(wf)).await.unwrap();
+        db.add_record("T", Box::new(StringinRecord::new("abc")))
+            .await
+            .unwrap();
+        let requests = [
+            LinkReadAs::Native,
+            LinkReadAs::Double,
+            LinkReadAs::String,
+            LinkReadAs::CharArrayAsString { max_elements: 40 },
+        ];
+        for text in ["C MS", "C NMS", "SRC MS", "W MS", "T MS", "C.NOPE MS"] {
+            let parsed = parse_link_v2(text);
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            for read_as in requests {
+                let (value, alarm) = db.read_db_link_as_at(&parsed, &at, read_as);
+                let (fetch, general_alarm) =
+                    db.read_link_value_as_with_alarm(&parsed, read_as, &mut ProcStack::new());
+                let general = match fetch {
+                    crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
+                    _ => None,
+                };
+                assert_eq!(value, general, "{text} as {read_as:?}");
+                assert_eq!(
+                    alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
+                    general_alarm
+                        .as_ref()
+                        .map(|a| (format!("{:?}", a.alarm), a.record)),
+                    "{text} as {read_as:?}"
+                );
+            }
         }
     }
 

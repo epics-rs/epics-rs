@@ -1,4 +1,4 @@
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
@@ -134,6 +134,14 @@ pub(crate) fn set_bo_high_limit(value: f64) {
 }
 
 impl Record for BoRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "bo"
     }
@@ -413,20 +421,20 @@ impl Record for BoRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
-            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
-            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            _ => CycleRead::Absent,
         }
     }
 
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
         match (cell, value) {
-            (CycleCell::Lalm, EpicsValue::UShort(v)) => self.lalm = v,
-            (CycleCell::Mlst, EpicsValue::UShort(v)) => self.mlst = v,
-            (cell, value) => return self.put_field(cell.name(), value),
+            (CycleCell::Lalm, CycleValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, CycleValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
         }
         Ok(())
     }

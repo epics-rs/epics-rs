@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmLimit, AnalogAlarmInput, FieldMetadataOverride, MENU_SIMM, MonitorDeadbandCells,
-    ProcessOutcome, RawSoftEntry, Record, SimmCells, ValuePostGate,
+    CycleCell, CycleRead, CycleValue, FieldMetadataOverride, MENU_SIMM, ProcessOutcome,
+    RawSoftEntry, Record, SimmCells, ValuePostGate,
 };
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
@@ -155,6 +155,14 @@ impl AiRecord {
 }
 
 impl Record for AiRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "ai"
     }
@@ -287,71 +295,39 @@ impl Record for AiRecord {
         }
     }
 
-    /// C `monitor()` reads these as struct members; the default answers each
-    /// through a `get_field` name match and an `EpicsValue`.
-    fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
-        MonitorDeadbandCells {
-            mdel: Some(self.mdel),
-            adel: Some(self.adel),
-            mlst: Some(self.mlst),
-            alst: Some(self.alst),
-        }
-    }
-
-    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
-        if mlst {
-            self.mlst = val;
-        }
-        if alst {
-            self.alst = val;
-        }
-    }
-
-    fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(self.val))
-    }
-
-    fn monitor_deadband_value(&self) -> Option<f64> {
-        Some(self.val)
-    }
-
-    fn value_is_undefined(&self) -> bool {
-        self.val.is_nan()
-    }
-
-    /// `ai` declares no OVAL, so the default's `get_field("OVAL")` is a miss
-    /// through every name arm on each cycle.
-    fn output_link_value(&self) -> Option<EpicsValue> {
-        self.val()
-    }
-
-    /// `hyst` is `None`: `ai` leaves HYST to `CommonFields`.
-    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
-        Some(AnalogAlarmInput {
-            val: AlarmLimit::Double(self.val),
-            hyst: None,
-            lalm: Some(AlarmLimit::Double(self.lalm)),
-        })
-    }
-
-    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        Some((self.aftc, self.afvl))
-    }
-
-    fn store_alarm_filter_value(&mut self, afvl: f64) {
-        self.afvl = afvl;
-    }
-
-    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
-        self.lalm = lalm.as_f64();
-    }
-
     fn simm_cells(&self) -> Option<SimmCells> {
         Some(SimmCells {
             simm: self.simm,
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    /// C `monitor()` and `checkAlarms` read these as struct members. `ai`
+    /// declares no OVAL and leaves HYST to `CommonFields`.
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            CycleCell::Oval | CycleCell::Hyst => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

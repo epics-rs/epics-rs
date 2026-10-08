@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -349,6 +349,14 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbbiRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// UDF belongs to the dset here, not to `process()`. C
     /// `mbbiRecord.c:168-193` assigns `prec->udf = FALSE` at `:174`, INSIDE
     /// `if (status == 0)`, and folds `2` into `0` only at `:192-193`, so a
@@ -505,14 +513,14 @@ impl Record for MbbiRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
-            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
-            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
-            CycleCell::Aftc => Some(EpicsValue::Double(self.aftc)),
-            CycleCell::Afvl => Some(EpicsValue::Double(self.afvl)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            _ => CycleRead::Absent,
         }
     }
 

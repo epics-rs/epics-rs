@@ -746,6 +746,14 @@ fn dol_is_constant(dol: &str) -> bool {
 }
 
 impl Record for WaveformRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::PRE_INPUT
+    }
+
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
     }

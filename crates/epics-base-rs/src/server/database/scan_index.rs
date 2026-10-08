@@ -349,9 +349,9 @@ impl PvDatabase {
     }
 
     /// A cursor over `list` as it stands at each step — see [`ScanCursor`].
-    pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor {
+    pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor<'_> {
         ScanCursor {
-            list,
+            bucket: self.inner.scan_index.bucket(list),
             snapshot: None,
             next: 0,
             revision: 0,
@@ -741,8 +741,10 @@ impl ScanPassSnapshot {
 /// record that moved within this list (its own processing changed its PHAS) is
 /// advanced from where it is now — C's `pse->pscan_list == psl` branch
 /// (`:1023-1029`).
-pub(crate) struct ScanCursor {
-    list: ScanList,
+pub(crate) struct ScanCursor<'a> {
+    /// The list's bucket, found once at the top of the sweep: a step is an
+    /// index and one revision load, with no bucket lookup behind it.
+    bucket: &'a ScanBucket,
     /// The list as it stood at [`Self::revision`]; `None` before the first
     /// step, which is the one state in which there is no place to keep.
     snapshot: Option<Arc<[super::ScanKey]>>,
@@ -753,7 +755,7 @@ pub(crate) struct ScanCursor {
     revision: u64,
 }
 
-impl ScanCursor {
+impl ScanCursor<'_> {
     /// Where the cursor stands: the entry the last step handed out.
     fn standing(&self) -> Option<&super::ScanKey> {
         self.snapshot.as_ref()?.get(self.next.checked_sub(1)?)
@@ -770,7 +772,7 @@ impl ScanCursor {
     fn resync(&mut self, db: &PvDatabase) {
         let was = self.standing().cloned();
         let live = was.as_ref().and_then(|w| db.live_scan_key(&w.name));
-        let (revision, snapshot) = db.inner.scan_index.bucket(self.list).snapshot();
+        let (revision, snapshot) = self.bucket.snapshot();
         let resume = match live {
             // The rebuilt key is the resume point only if THIS list is where
             // the record landed; one whose SCAN moved it to another list
@@ -795,9 +797,12 @@ impl ScanCursor {
     /// `psl->lock` around every `dbProcess`.
     #[allow(clippy::type_complexity)]
     pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<&Arc<RecordCell>>)> {
-        let bucket = db.inner.scan_index.bucket(self.list);
         if self.snapshot.is_none()
-            || bucket.revision.load(std::sync::atomic::Ordering::Acquire) != self.revision
+            || self
+                .bucket
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                != self.revision
         {
             self.resync(db);
         }

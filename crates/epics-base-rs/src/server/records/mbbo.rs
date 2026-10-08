@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -392,6 +392,14 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbboRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "mbbo"
     }
@@ -618,16 +626,16 @@ impl Record for MbboRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(if self.sdef() {
-                EpicsValue::Enum(self.val)
+            CycleCell::Val => CycleRead::Value(if self.sdef() {
+                CycleValue::Enum(self.val)
             } else {
-                EpicsValue::UShort(self.val)
+                CycleValue::UShort(self.val)
             }),
-            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
-            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
-            _ => None,
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            _ => CycleRead::Absent,
         }
     }
 

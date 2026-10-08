@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -84,6 +84,14 @@ impl BiRecord {
 }
 
 impl Record for BiRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// UDF belongs to the dset here, not to `process()`. C
     /// `biRecord.c:136-141` assigns `prec->udf = FALSE` at `:139`, INSIDE
     /// `if (status == 0)`, and folds `2` into `0` only at `:141`, so a device
@@ -269,23 +277,23 @@ impl Record for BiRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
-            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
-            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
-            CycleCell::Aftc => Some(EpicsValue::Double(self.aftc)),
-            CycleCell::Afvl => Some(EpicsValue::Double(self.afvl)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            _ => CycleRead::Absent,
         }
     }
 
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
         match (cell, value) {
-            (CycleCell::Afvl, EpicsValue::Double(v)) => self.afvl = v,
-            (CycleCell::Lalm, EpicsValue::UShort(v)) => self.lalm = v,
-            (CycleCell::Mlst, EpicsValue::UShort(v)) => self.mlst = v,
-            (cell, value) => return self.put_field(cell.name(), value),
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (CycleCell::Lalm, CycleValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, CycleValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
         }
         Ok(())
     }

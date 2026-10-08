@@ -568,19 +568,26 @@ impl AsyncDbHandle {
 /// more work (motor mid-move) or declining its forward link (busy at
 /// VAL=1) keeps its membership and leaves on the later cycle that reaches
 /// C's `recGblFwdLink`.
+#[inline(always)]
 fn finish_cycle(inst: &mut RecordInstance) {
     if !inst.is_processing() {
         inst.common.putf = false;
     }
-    complete_put_notify(inst);
+    // No wait-set, nothing to leave: the usual cycle ends on this test and
+    // never enters the frame the leave needs.
+    if inst.notify.is_some() {
+        leave_put_notify(inst);
+    }
 }
 
 fn complete_put_notify(inst: &mut RecordInstance) {
-    // No wait-set, nothing to leave: the usual cycle answers here, ahead of
-    // the two record queries below, which are pure reads either way.
-    if inst.notify.is_none() {
-        return;
+    if inst.notify.is_some() {
+        leave_put_notify(inst);
     }
+}
+
+#[inline(never)]
+fn leave_put_notify(inst: &mut RecordInstance) {
     if !inst.record.is_put_complete() || !inst.record.should_fire_forward_link() {
         return;
     }
@@ -3301,10 +3308,13 @@ impl PvDatabase {
             // hook plus `pre_input_link_actions` were taking an acquisition of
             // their own immediately after this one for a list that is empty on
             // all but compress, histogram, scalcout, sseq and waveform.
-            let inst = &mut *instance;
-            let ctx = inst.common.process_context();
-            inst.record.set_process_context(&ctx);
-            let pre_input_actions = instance.record.pre_input_link_actions();
+            instance.push_process_context();
+            let pre_input_actions = if plan.hooks.has(crate::server::record::CycleHooks::PRE_INPUT)
+            {
+                instance.record.pre_input_link_actions()
+            } else {
+                crate::server::record::ProcessActions::new()
+            };
 
             // Everything the stage below could read is unset: the answer C's
             // `dbConstGetValue` gives twelve times over, taken once, and
@@ -3341,26 +3351,14 @@ impl PvDatabase {
                 && let Some(at) = self.inp_addr(instance)
                 && !Arc::ptr_eq(&at.rec, rec)
             {
-                let (inp_value, alarm) = if read_as == crate::server::record::LinkReadAs::Double {
-                    let (value, alarm) = self.read_db_link_f64_at(db, at);
-                    (value.map(EpicsValue::Double), alarm)
-                } else {
-                    let (fetch, alarm) = self.read_db_link_at(db, at);
-                    let inp_value = match fetch {
-                        crate::server::recgbl::simm::LinkFetch::Value(v) => {
-                            self.apply_link_read_as(&instance.parsed_inp, read_as, v)
-                        }
-                        _ => None,
-                    };
-                    (inp_value, alarm)
-                };
+                let (inp_value, alarm) = self.read_db_link_as_at(&instance.parsed_inp, at, read_as);
                 let mut stage = LinkInputs::none();
                 stage.inp_value = inp_value;
-                stage.link_alarms.extend(self.input_link_inheritance(
-                    rec,
-                    &instance.parsed_inp,
-                    alarm,
-                ));
+                if let Some(inherited) =
+                    self.input_link_inheritance(rec, &instance.parsed_inp, alarm)
+                {
+                    stage.link_alarms.push(inherited);
+                }
                 instance.record.set_fetch_gate_failed(false);
                 return InputStage {
                     is_soft,
@@ -3801,7 +3799,9 @@ impl PvDatabase {
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
         )> = Vec::new();
-        link_alarms.extend(inp_link_alarm);
+        if let Some(alarm) = inp_link_alarm {
+            link_alarms.push(alarm);
+        }
         // The two fetches only a deferring cycle has, made once the early
         // return is behind them: built before it, their empty results were
         // dropped on the path that never has them.
@@ -4245,8 +4245,7 @@ impl PvDatabase {
         // put-notify parked on that window is replayed there (C
         // `dbNotifyCompletion`) instead of being stranded.
         let (sim_outcome, sim_pact_exit) = if let Some(simm) = plan.simm {
-            guard.release();
-            self.check_simulation_mode(rec, &simm)
+            self.check_simulation_mode(&mut guard, rec, &simm)
         } else {
             (SimOutcome::NotSimulated, no_sim_pact_exit)
         };
@@ -4692,7 +4691,11 @@ impl PvDatabase {
                 // Pre-process actions: execute ReadDbLink from device support and
                 // record's pre_process_actions() BEFORE process() so the values
                 // are immediately available. Matches C dbGetLink() semantics.
-                let mut pre_actions = instance.record.pre_process_actions();
+                let mut pre_actions = if plan.acts_before_process {
+                    instance.record.pre_process_actions()
+                } else {
+                    crate::server::record::ProcessActions::new()
+                };
                 // Also collect ReadDbLink from device actions; the rest wait
                 // for the record body and join its own actions after it.
                 let mut deferred_device_actions: Option<Vec<_>> = None;
@@ -4840,11 +4843,7 @@ impl PvDatabase {
                 // `dbCommon` directly (`epidRecord.c:195` checks
                 // `pepid->udf`, `timestampRecord.c:90` checks `tse`,
                 // `transformRecord.c:554` checks `ptran->nsev`).
-                {
-                    let inst = &mut *instance;
-                    let ctx = inst.common.process_context();
-                    inst.record.set_process_context(&ctx);
-                }
+                instance.push_process_context();
                 // Tell the record whether this is its own scheduled re-entry
                 // (the `ReprocessAfter` timer, a put-notify completion) or a
                 // fresh cycle. Only this path can be a continuation; the
@@ -6098,15 +6097,21 @@ impl PvDatabase {
     /// lock go, which a handle in hand makes visible at the call and a name
     /// lookup would hide. `parking_lot::RwLock` is not reentrant, so a caller
     /// still holding `rec.write()` would deadlock, not fail.
+    #[inline(always)]
     pub(super) fn apply_pact_exit(&self, name: &str, _rec: &Arc<RecordCell>, exit: PactExit) {
         // NO record lock here, deliberately. This runs from cycle tails and
         // from a `Drop` that can fire while a `rec.write()` guard is still
         // alive in the same scope; parking_lot is not reentrant, so a read
         // here would deadlock on drop order. The bit was minted under the
         // releasing site's own lock instead — see `PactExit`.
-        if !exit.restart_pending() {
-            return;
+        if exit.restart_pending() {
+            self.spawn_notify_restart(name);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn spawn_notify_restart(&self, name: &str) {
         let db = self.clone();
         let put_name = name.to_string();
         // C pins every put-notify callback to the low band —
@@ -8179,6 +8184,7 @@ impl PvDatabase {
     /// stranded it here before.
     fn check_simulation_mode(
         &self,
+        guard: &mut DataGuard<'_>,
         rec: &Arc<RecordCell>,
         simm: &crate::server::record::record_instance::SimmBlock,
     ) -> (SimOutcome, crate::server::record::PactExit) {
@@ -8193,7 +8199,7 @@ impl PvDatabase {
             // Exclusive, not shared: the SIML/SIOL parse cache is validated
             // and (on a text change) rewritten here, and this is the one
             // stage of the cycle that reads those two links.
-            let mut instance = rec.write();
+            let instance = guard.hold();
             // The entry gate — the record's DECLARATION of SIMM — is the
             // caller's `plan.simm`, and reaching here IS that declaration. C's
             // `readValue`/`writeValue` exists only on a record whose dbd
@@ -8275,7 +8281,7 @@ impl PvDatabase {
                     instance.rec_gbl_save_simm();
                     // A constant SIML delivers nothing: SIMM keeps what it
                     // held, and only `recGblCheckSimm` has work to do.
-                    Some(Self::check_simm_under_guard(&mut instance))
+                    Some(Self::check_simm_under_guard(instance))
                 };
                 let mode = crate::server::recgbl::simm::resolve_sim_mode(&*instance.record);
                 (mode, instance.pact_exit_without_release(), moved)
@@ -8283,6 +8289,12 @@ impl PvDatabase {
 
             (siml_link, sims, sdly, pact_held, resolved)
         };
+        // A record that is not simulated goes back to the cycle holding the
+        // guard it came in with. Everything else below locks the record
+        // (or another) itself.
+        if !matches!(&resolved, Some((mode, _, None)) if !mode.is_simulated()) {
+            guard.release();
+        }
         let resolved = resolved.map(|(mode, exit, moved)| {
             if let Some((name, result)) = moved {
                 self.move_scan_for_simm(name, result);
@@ -8698,11 +8710,7 @@ impl PvDatabase {
                         _ => siol_val,
                     };
                     let _ = instance.record.put_field("RVAL", coerced);
-                    {
-                        let inst = &mut *instance;
-                        let ctx = inst.common.process_context();
-                        inst.record.set_process_context(&ctx);
-                    }
+                    instance.push_process_context();
                     let _ = instance.record.process();
                 } else {
                     // Records without RVAL fall back to SIMM=YES semantics: the

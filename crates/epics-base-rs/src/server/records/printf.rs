@@ -820,6 +820,14 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
 }
 
 impl Record for PrintfRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "printf"
     }

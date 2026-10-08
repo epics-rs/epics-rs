@@ -968,6 +968,8 @@ impl ProcessPlan {
             // has one, so the two cannot drift into different files.
             substitutes_input_stage_when_simulating: record.simulation_substitutes_input_stage(),
             redecides_after_output: record.redecides_after_output(),
+            acts_before_process: record.acts_before_process(),
+            hooks: record.cycle_hooks(),
             input_fetch_policy: record.input_fetch_policy(),
             constants_deliver_at_process: record.constant_inputs_deliver_at_process(),
             multi_input_is_db_get_link: record.multi_input_fetch_is_db_get_link(),
@@ -1059,6 +1061,11 @@ pub(crate) struct ProcessPlan {
     /// [`Record::redecides_after_output`]. `false` makes the post-output write
     /// lock disappear.
     pub(crate) redecides_after_output: bool,
+    /// [`Record::acts_before_process`]. `false` drops the vtable call to an
+    /// empty `pre_process_actions` from every cycle.
+    pub(crate) acts_before_process: bool,
+    /// [`Record::cycle_hooks`].
+    pub(crate) hooks: crate::server::record::CycleHooks,
     /// What a failed multi-input read means to this type — see
     /// [`Record::input_fetch_policy`].
     pub(crate) input_fetch_policy: crate::server::record::InputFetchPolicy,
@@ -2198,6 +2205,11 @@ pub(crate) struct MonitorPlan {
     pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
     /// The change-detected aux fields' mask resolver.
     pub(crate) aux_post: AuxPostMask,
+    /// [`Record::cycle_hooks`].
+    pub(crate) hooks: crate::server::record::CycleHooks,
+    /// Whether the type is `sub` or `aSub` — a property of the type, so not
+    /// matched by name every cycle.
+    subroutine_kind: Option<SubroutineKind>,
 }
 
 impl MonitorPlan {
@@ -2213,6 +2225,8 @@ impl MonitorPlan {
                     .contains(&deadband_field),
             value_masked: record.fields_posted_with_value_mask(),
             aux_post: AuxPostMask::of(record),
+            hooks: record.cycle_hooks(),
+            subroutine_kind: SubroutineKind::of(record.record_type()),
         }
     }
 }
@@ -2433,6 +2447,21 @@ impl RecordInstance {
     /// record's multi-input link list, in that same order. See the field.
     pub(crate) fn link_backed_metadata_input_slots(&self) -> &[Option<usize>] {
         &self.link_backed_metadata_input_slot
+    }
+
+    /// Hand the record the framework-owned common state it reads during
+    /// `process()` — only to a type whose [`Record::cycle_hooks`] says it
+    /// takes it; C reads `dbCommon` in place and builds nothing.
+    #[inline(always)]
+    pub(crate) fn push_process_context(&mut self) {
+        if self
+            .monitor_plan
+            .hooks
+            .has(crate::server::record::CycleHooks::CONTEXT)
+        {
+            let ctx = self.common.process_context();
+            self.record.set_process_context(&ctx);
+        }
     }
 
     /// C `monitor()` and the `recGblResetAlarms` it opens with, for every
@@ -5874,7 +5903,7 @@ impl RecordInstance {
         // `sub` and `aSub` have a `do_sub` in their rset at all. For all the
         // others "no subroutine is bound" is their permanent normal state, not
         // an unresolved SNAM, so they must not take `do_sub`'s bad-sub exit.
-        let Some(kind) = SubroutineKind::of(self.record.record_type()) else {
+        let Some(kind) = self.monitor_plan.subroutine_kind else {
             return Ok(SUBROUTINE_STATUS_SKIPPED);
         };
 
@@ -6022,13 +6051,20 @@ impl RecordInstance {
 
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let mut cycle_posted = self.record.take_cycle_posted_fields();
+        let hooks = self.monitor_plan.hooks;
+        let mut cycle_posted = if hooks.has(crate::server::record::CycleHooks::CYCLE_POSTED) {
+            self.record.take_cycle_posted_fields()
+        } else {
+            Vec::new()
+        };
         // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
         // iocInit's per-cycle drain must not be able to eat. Merged here so
         // both reach the same branch with the same mask mapping.
-        let first_cycle = self.record.take_first_monitor_cycle();
-        if !first_cycle.is_empty() {
-            cycle_posted.extend(first_cycle);
+        if hooks.has(crate::server::record::CycleHooks::FIRST_MONITOR) {
+            let first_cycle = self.record.take_first_monitor_cycle();
+            if !first_cycle.is_empty() {
+                cycle_posted.extend(first_cycle);
+            }
         }
         let MonitorPlan {
             deadband_field,
@@ -6483,10 +6519,7 @@ impl RecordInstance {
         // path. `process_local` is the foreign-call path
         // (`db.process_record`); without this a record driven through it
         // (e.g. QSRV group-process members) would not see UDF/TSE.
-        {
-            let ctx = self.common.process_context();
-            self.record.set_process_context(&ctx);
-        }
+        self.push_process_context();
         let outcome = self.record.process()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
@@ -7549,15 +7582,22 @@ impl RecordInstance {
     /// `backing` is the link metadata the process cycle resolved for this
     /// batch, at its own no-lock-held point. See [`Self::make_monitor_snapshot`]
     /// for why it has no default.
+    #[inline(always)]
     pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
-        use crate::server::database::filters::FilteredMonitorEvent;
-
         // Nothing is subscribed to any field, so no post below can land; the
         // per-field lookup is a hash of the field name per post per cycle to
-        // find that out. Same gate as `collect_subscriber_posts`.
+        // find that out. Same gate as `collect_subscriber_posts`, kept in the
+        // inlined half so the unmonitored cycle pays the test and not the
+        // delivery loop's frame.
         if self.subscribers.is_empty() {
             return;
         }
+        self.deliver_snapshot(snapshot, backing);
+    }
+
+    #[inline(never)]
+    fn deliver_snapshot(&self, snapshot: &ProcessSnapshot, backing: LinkBacking<'_>) {
+        use crate::server::database::filters::FilteredMonitorEvent;
 
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -98,6 +98,14 @@ impl Default for SubRecord {
 }
 
 impl Record for SubRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "sub"
     }
@@ -182,24 +190,24 @@ impl Record for SubRecord {
         self.inp.get(slot).map(String::as_str)
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Double(self.val)),
-            CycleCell::Mdel => Some(EpicsValue::Double(self.mdel)),
-            CycleCell::Adel => Some(EpicsValue::Double(self.adel)),
-            CycleCell::Mlst => Some(EpicsValue::Double(self.mlst)),
-            CycleCell::Alst => Some(EpicsValue::Double(self.alst)),
-            CycleCell::Lalm => Some(EpicsValue::Double(self.lalm)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
         }
     }
 
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
         match (cell, value) {
-            (CycleCell::Lalm, EpicsValue::Double(v)) => self.lalm = v,
-            (CycleCell::Alst, EpicsValue::Double(v)) => self.alst = v,
-            (CycleCell::Mlst, EpicsValue::Double(v)) => self.mlst = v,
-            (cell, value) => return self.put_field(cell.name(), value),
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
         }
         Ok(())
     }

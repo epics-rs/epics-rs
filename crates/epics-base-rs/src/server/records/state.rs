@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -61,6 +61,14 @@ impl StateRecord {
 }
 
 impl Record for StateRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "state"
     }
@@ -120,12 +128,15 @@ impl Record for StateRecord {
         &["OVAL"]
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::String(self.val.clone())),
-            CycleCell::Oval => Some(EpicsValue::String(self.oval.clone())),
-            _ => None,
+            CycleCell::Val | CycleCell::Oval => CycleRead::ByName,
+            _ => CycleRead::Absent,
         }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

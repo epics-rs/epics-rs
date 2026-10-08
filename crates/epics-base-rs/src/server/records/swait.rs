@@ -4,7 +4,7 @@ use crate::calc::NumericInputs;
 use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
@@ -436,6 +436,14 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 const SWAIT_ODLY_PRECISION: i16 = 3;
 
 impl Record for SwaitRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// C `swaitRecord.c::init_record` (:266-) ends without touching
     /// MLST/ALST; both writes are in `monitor()` (:630,:639).
     fn seed_deadband_tracking(&mut self) {}
@@ -876,23 +884,23 @@ impl Record for SwaitRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Double(self.val)),
-            CycleCell::Oval => Some(EpicsValue::Double(self.oval)),
-            CycleCell::Mdel => Some(EpicsValue::Double(self.mdel)),
-            CycleCell::Adel => Some(EpicsValue::Double(self.adel)),
-            CycleCell::Mlst => Some(EpicsValue::Double(self.mlst)),
-            CycleCell::Alst => Some(EpicsValue::Double(self.alst)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            _ => CycleRead::Absent,
         }
     }
 
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
         match (cell, value) {
-            (CycleCell::Alst, EpicsValue::Double(v)) => self.alst = v,
-            (CycleCell::Mlst, EpicsValue::Double(v)) => self.mlst = v,
-            (cell, value) => return self.put_field(cell.name(), value),
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
         }
         Ok(())
     }

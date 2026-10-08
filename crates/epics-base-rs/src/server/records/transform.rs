@@ -517,6 +517,15 @@ const TRANSFORM_COPT_CHOICES: &[&str] = &["Conditional", "Always"];
 const TRANSFORM_IVLA_CHOICES: &[&str] = &["Ignore error", "Do Nothing"];
 
 impl Record for TransformRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::FIRST_MONITOR
+            .union(crate::server::record::CycleHooks::CONTEXT)
+    }
+
     /// The one field C's `get_precision` names. Every other field takes
     /// `prec->prec` through `route_field_metadata`, which is the generic seed
     /// arm — a literal cannot come from there.

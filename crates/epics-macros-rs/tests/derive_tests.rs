@@ -641,7 +641,7 @@ struct CycleCellRecord {
 /// a cell the struct does not store and a read-only one.
 #[test]
 fn cycle_cells_answer_as_their_fields_do() {
-    use epics_base_rs::server::record::CycleCell;
+    use epics_base_rs::server::record::{CycleCell, CycleRead, CycleValue};
 
     let rec = || CycleCellRecord {
         val: 3,
@@ -651,18 +651,15 @@ fn cycle_cells_answer_as_their_fields_do() {
     };
     let (mut fast, mut slow) = (rec(), rec());
     for cell in CycleCell::ALL {
-        assert_eq!(
-            fast.cycle_cell(cell),
-            fast.get_field(cell.name()),
-            "{cell:?}"
-        );
-        for value in [
-            EpicsValue::Long(11),
-            EpicsValue::Double(13.0),
-            EpicsValue::String("x".into()),
-        ] {
-            let stored = fast.put_cycle_cell(cell, value.clone());
-            let put = slow.put_field(cell.name(), value);
+        let by_name = fast.get_field(cell.name());
+        match fast.cycle_cell(cell) {
+            CycleRead::Value(v) => assert_eq!(Some(v.into()), by_name, "{cell:?}"),
+            CycleRead::Absent => assert_eq!(by_name, None, "{cell:?}"),
+            CycleRead::ByName => panic!("{cell:?} is stored as a number"),
+        }
+        for value in [CycleValue::Long(11), CycleValue::Double(13.0)] {
+            let stored = fast.put_cycle_cell(cell, value);
+            let put = slow.put_field(cell.name(), value.into());
             assert_eq!(format!("{stored:?}"), format!("{put:?}"), "{cell:?}");
             assert_eq!(fast.get_field(cell.name()), slow.get_field(cell.name()));
         }

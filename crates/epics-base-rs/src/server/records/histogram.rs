@@ -224,6 +224,14 @@ pub(crate) fn set_histogram_sdel_precision(value: i32) {
 }
 
 impl Record for HistogramRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::PRE_INPUT
+    }
+
     fn record_type(&self) -> &'static str {
         "histogram"
     }

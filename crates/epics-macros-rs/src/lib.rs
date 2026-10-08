@@ -308,6 +308,21 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   storage, and the `.dbd` class is not visible to the derive.
 ///
 /// Field names are converted from snake_case to UPPER_CASE for EPICS field names.
+///
+/// A member named after a scan-cycle cell (`MDEL`, `ADEL`, `MLST`, `ALST`,
+/// `HYST`, `LALM`, `AFTC`, `AFVL`, and a numeric `VAL`/`OVAL`) is read by the
+/// cycle as a number, so any other storage type is refused:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs")]
+/// struct Bad {
+///     #[field(type = "String")]
+///     mdel: String,
+/// }
+/// ```
 #[proc_macro_derive(EpicsRecord, attributes(record, field))]
 pub fn derive_epics_record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -644,9 +659,9 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
     // The scan cycle's cells — emit `Record::cycle_cell`/`put_cycle_cell`,
     // keyed on the member names so a struct that stores a cell cannot forget
-    // to opt in and leave the cycle reading it by name. Each arm is the
-    // member's own `get_field`/`put_field` arm; a cell the struct does not
-    // store answers as `get_field`/`put_field` do for an unknown name.
+    // to opt in and leave the cycle reading it by name. A cell is read in the
+    // member's numeric carrier; a put in that carrier is the member's own
+    // `put_field` arm, and any other carrier goes to `put_field` itself.
     let cycle_cells: Vec<_> = [
         ("VAL", "Val"),
         ("OVAL", "Oval"),
@@ -669,36 +684,59 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let cycle_cell_methods = if cycle_cells.iter().all(|(_, _, m)| m.is_none()) {
         quote! {}
     } else {
-        let get_arms = cycle_cells.iter().map(|(_, variant, member)| match member {
-            Some(fi) => {
-                let ident = &fi.ident;
-                let conversion = value_to_epics(&krate, &fi.dbf_type, quote!(self.#ident));
-                quote! { #krate::server::record::CycleCell::#variant => Some(#conversion), }
-            }
-            None => quote! { #krate::server::record::CycleCell::#variant => None, },
-        });
-        let put_arms = cycle_cells.iter().map(|(epics_name, variant, member)| match member {
-            Some(fi) if !fi.read_only => {
-                let extraction = value_from_epics(&krate, &fi.dbf_type, &fi.ident);
-                quote! {
-                    #krate::server::record::CycleCell::#variant => {
-                        self.validate_put(#epics_name, &value)?;
-                        #extraction
-                        self.on_put(#epics_name);
-                        Ok(())
+        let record = quote!(#krate::server::record);
+        let mut get_arms = Vec::new();
+        let mut put_arms = Vec::new();
+        for (epics_name, variant, member) in &cycle_cells {
+            let carrier = member.and_then(|fi| cycle_carrier(&fi.dbf_type));
+            get_arms.push(match (member, &carrier) {
+                (Some(fi), Some(carrier)) => {
+                    let ident = &fi.ident;
+                    quote! {
+                        #record::CycleCell::#variant =>
+                            #record::CycleRead::Value(#record::CycleValue::#carrier(self.#ident)),
                     }
                 }
-            }
-            _ => quote! {
-                #krate::server::record::CycleCell::#variant => self.put_field(#epics_name, value),
-            },
-        });
+                // A string or array VAL is not a number; the cycle reads it
+                // through `get_field`.
+                (Some(_), None) if matches!(*epics_name, "VAL" | "OVAL") => {
+                    quote! { #record::CycleCell::#variant => #record::CycleRead::ByName, }
+                }
+                (Some(fi), None) => {
+                    return Err(syn::Error::new_spanned(
+                        &fi.ident,
+                        format!(
+                            "{epics_name} is a scan-cycle cell and must be stored as \
+                             a number (Double, Float, Long, Int64, Short, UShort, Char or Enum), not {}",
+                            fi.dbf_type
+                        ),
+                    ));
+                }
+                (None, _) => quote! { #record::CycleCell::#variant => #record::CycleRead::Absent, },
+            });
+            put_arms.push(match (member, &carrier) {
+                (Some(fi), Some(carrier)) if !fi.read_only => {
+                    let ident = &fi.ident;
+                    quote! {
+                        #record::CycleCell::#variant => match value {
+                            #record::CycleValue::#carrier(v) => {
+                                self.validate_put(#epics_name, &#record::CycleValue::#carrier(v).lend())?;
+                                self.#ident = v;
+                                self.on_put(#epics_name);
+                                Ok(())
+                            }
+                            other => self.put_field(#epics_name, other.into()),
+                        },
+                    }
+                }
+                _ => quote! {
+                    #record::CycleCell::#variant => self.put_field(#epics_name, value.into()),
+                },
+            });
+        }
         quote! {
             #[inline]
-            fn cycle_cell(
-                &self,
-                cell: #krate::server::record::CycleCell,
-            ) -> Option<#krate::types::EpicsValue> {
+            fn cycle_cell(&self, cell: #record::CycleCell) -> #record::CycleRead {
                 match cell {
                     #(#get_arms)*
                 }
@@ -706,8 +744,8 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
             fn put_cycle_cell(
                 &mut self,
-                cell: #krate::server::record::CycleCell,
-                value: #krate::types::EpicsValue,
+                cell: #record::CycleCell,
+                value: #record::CycleValue,
             ) -> #krate::error::CaResult<()> {
                 match cell {
                     #(#put_arms)*
@@ -725,6 +763,15 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #cycle_cell_methods
             #metadata_override_method
             #link_metadata_field_method
+
+            // The derive emits no `pre_process_actions`.
+            fn acts_before_process(&self) -> bool {
+                false
+            }
+
+            fn cycle_hooks(&self) -> #krate::server::record::CycleHooks {
+                #krate::server::record::CycleHooks::NONE
+            }
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -887,6 +934,16 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
     }
 
     Ok((dbf_type, read_only, menu_choices, link))
+}
+
+/// The `CycleValue` variant a scan-cycle cell of `dbf_type` is read in, or
+/// `None` for a type that is not a number.
+fn cycle_carrier(dbf_type: &str) -> Option<proc_macro2::Ident> {
+    matches!(
+        dbf_type,
+        "Double" | "Float" | "Long" | "Int64" | "Short" | "UShort" | "Char" | "Enum"
+    )
+    .then(|| proc_macro2::Ident::new(dbf_type, proc_macro2::Span::call_site()))
 }
 
 fn value_to_epics(

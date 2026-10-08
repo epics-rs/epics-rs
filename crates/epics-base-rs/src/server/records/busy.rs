@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome,
     Record,
@@ -126,6 +126,14 @@ impl BusyRecord {
 const BUSY_HIGH_PRECISION: i16 = 2;
 
 impl Record for BusyRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// C `busyRecord.c:277-284` `get_precision`: `HIGH` — busy's only
     /// `DBF_DOUBLE` field, so the only one past `dbAccess.c:388-389`'s
     /// float/double gate — takes 2, everything else `recGblGetPrec`'s
@@ -405,13 +413,13 @@ impl Record for BusyRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
-            CycleCell::Oval => Some(EpicsValue::Enum(self.oval)),
-            CycleCell::Mlst => Some(EpicsValue::Enum(self.mlst)),
-            CycleCell::Lalm => Some(EpicsValue::Enum(self.lalm)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Enum(self.oval)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Enum(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Enum(self.lalm)),
+            _ => CycleRead::Absent,
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{MENU_YES_NO, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -101,6 +101,14 @@ fn put_double(slot: &mut f64, value: EpicsValue, field: &str) -> CaResult<()> {
 }
 
 impl Record for EventRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "event"
     }
@@ -177,11 +185,15 @@ impl Record for EventRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::String(self.val.clone().into())),
-            _ => None,
+            CycleCell::Val => CycleRead::ByName,
+            _ => CycleRead::Absent,
         }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone().into()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

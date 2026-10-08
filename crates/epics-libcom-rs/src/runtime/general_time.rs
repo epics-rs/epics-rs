@@ -292,11 +292,16 @@ pub fn notify_clock_sync(t_synced: SystemTime) {
 /// monotonically enforced: if a provider returns a time earlier than
 /// the last provided time, the last provided time is returned and the
 /// error counter is incremented.
+#[inline(always)]
 pub fn get_current() -> SystemTime {
     if USE_OSD_GET_CURRENT.load(Ordering::Relaxed) {
         return osd_time_get_current();
     }
+    get_current_providers()
+}
 
+#[inline(never)]
+fn get_current_providers() -> SystemTime {
     let mut inner = GENERAL_TIME.lock();
     for i in 0..inner.current_providers.len() {
         if let Some(t) = (inner.current_providers[i].get_time)() {
@@ -431,12 +436,18 @@ pub fn highest_current_name() -> Option<String> {
 ///   provider by default — `installLastResortEventProvider`
 ///   (`epicsGeneralTime.c:521-525`) is an iocsh command —
 ///   so an IOC with none holds the old stamp instead of stamping now.
+#[inline(always)]
 pub fn get_event(event: i32) -> Option<SystemTime> {
-    if event < -1 {
-        return None;
-    }
     if event == 0 {
         return Some(get_current());
+    }
+    get_event_providers(event)
+}
+
+#[inline(never)]
+fn get_event_providers(event: i32) -> Option<SystemTime> {
+    if event < -1 {
+        return None;
     }
 
     let mut inner = GENERAL_TIME.lock();

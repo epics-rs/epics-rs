@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -94,6 +94,14 @@ impl Int64outRecord {
 }
 
 impl Record for Int64outRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "int64out"
     }
@@ -183,37 +191,37 @@ impl Record for Int64outRecord {
         })
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::Int64(self.val)),
-            CycleCell::Mdel => Some(EpicsValue::Int64(self.mdel)),
-            CycleCell::Adel => Some(EpicsValue::Int64(self.adel)),
-            CycleCell::Mlst => Some(EpicsValue::Double(self.mlst)),
-            CycleCell::Alst => Some(EpicsValue::Double(self.alst)),
-            CycleCell::Hyst => Some(EpicsValue::Int64(self.hyst)),
-            CycleCell::Lalm => Some(EpicsValue::Int64(self.lalm)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::Int64(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Int64(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Int64(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Hyst => CycleRead::Value(CycleValue::Int64(self.hyst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Int64(self.lalm)),
+            _ => CycleRead::Absent,
         }
     }
 
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
         match (cell, value) {
-            (CycleCell::Lalm, EpicsValue::Int64(v)) => {
-                self.validate_put("LALM", &EpicsValue::Int64(v))?;
+            (CycleCell::Lalm, CycleValue::Int64(v)) => {
+                self.validate_put("LALM", &CycleValue::Int64(v).lend())?;
                 self.lalm = v;
                 self.on_put("LALM");
             }
-            (CycleCell::Alst, EpicsValue::Double(v)) => {
-                self.validate_put("ALST", &EpicsValue::Double(v))?;
+            (CycleCell::Alst, CycleValue::Double(v)) => {
+                self.validate_put("ALST", &CycleValue::Double(v).lend())?;
                 self.alst = v;
                 self.on_put("ALST");
             }
-            (CycleCell::Mlst, EpicsValue::Double(v)) => {
-                self.validate_put("MLST", &EpicsValue::Double(v))?;
+            (CycleCell::Mlst, CycleValue::Double(v)) => {
+                self.validate_put("MLST", &CycleValue::Double(v).lend())?;
                 self.mlst = v;
                 self.on_put("MLST");
             }
-            (cell, value) => return self.put_field(cell.name(), value),
+            (cell, value) => return self.put_field(cell.name(), value.into()),
         }
         Ok(())
     }

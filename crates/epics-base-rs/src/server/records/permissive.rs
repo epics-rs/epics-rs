@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::CycleCell;
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -59,6 +59,14 @@ impl Default for PermissiveRecord {
 }
 
 impl Record for PermissiveRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "permissive"
     }
@@ -104,11 +112,11 @@ impl Record for PermissiveRecord {
         &["OVAL", "OFLG"]
     }
 
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
-            CycleCell::Val => Some(EpicsValue::UShort(self.val)),
-            CycleCell::Oval => Some(EpicsValue::UShort(self.oval)),
-            _ => None,
+            CycleCell::Val => CycleRead::Value(CycleValue::UShort(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::UShort(self.oval)),
+            _ => CycleRead::Absent,
         }
     }
 

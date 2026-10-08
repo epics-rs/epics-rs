@@ -656,7 +656,9 @@ impl LockSet {
         let guard = self.lock.lock();
         // SAFETY: this thread holds `lock`, so it is the only one allowed at
         // `held` (see the `Sync` impl).
-        unsafe { *self.held.get() = Some(guard) };
+        // `held` is `None` whenever the mutex is free (`unlock_outermost` takes it
+        // before releasing), so there is no old guard to drop.
+        unsafe { self.held.get().write(Some(guard)) };
         self.owner.store(me, Ordering::Release);
         self.depth.store(1, Ordering::Relaxed);
     }

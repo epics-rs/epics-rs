@@ -1247,6 +1247,46 @@ pub struct CycleList<T>(std::mem::ManuallyDrop<Vec<T>>);
 /// The actions a record hands the framework for one cycle.
 pub type ProcessActions = CycleList<ProcessAction>;
 
+/// Which of the per-cycle hooks a type can answer with something other than
+/// the trait default. C has no such hooks (`dbCommon` is read as a struct
+/// member), so the cycle settles this once, in the plan, and a type that
+/// claims a bit not set here is never asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CycleHooks(u8);
+
+impl Default for CycleHooks {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl CycleHooks {
+    /// [`Record::pre_input_link_actions`].
+    pub const PRE_INPUT: Self = Self(1);
+    /// [`Record::take_cycle_posted_fields`].
+    pub const CYCLE_POSTED: Self = Self(2);
+    /// [`Record::take_first_monitor_cycle`].
+    pub const FIRST_MONITOR: Self = Self(4);
+    /// [`Record::set_process_context`].
+    pub const CONTEXT: Self = Self(8);
+    /// No hook acts: the stock record.
+    pub const NONE: Self = Self(0);
+    /// Every hook is asked — the default, so a type that never says
+    /// otherwise pays the call and never loses an action.
+    pub const ALL: Self = Self(15);
+
+    /// Both sets together.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether `hook` is among these.
+    #[inline(always)]
+    pub const fn has(self, hook: Self) -> bool {
+        self.0 & hook.0 != 0
+    }
+}
+
 impl<T> CycleList<T> {
     /// An empty list.
     pub fn new() -> Self {
@@ -1628,10 +1668,26 @@ pub type FieldPost = (
 ///
 /// `head` and `rest` carry no meaning of their own: `head` is post 0 and `rest`
 /// is posts 1.., so nothing may read them apart from [`Self::iter`].
+///
+/// A cycle that posts nothing drops its snapshot as one inline test, as
+/// [`CycleList`] does; drop glue over the two fields was an out-of-line call
+/// on every cycle.
 #[derive(Default)]
-pub struct ProcessSnapshot {
+pub struct ProcessSnapshot(std::mem::ManuallyDrop<SnapshotPosts>);
+
+#[derive(Default)]
+struct SnapshotPosts {
     head: Option<FieldPost>,
     rest: Vec<FieldPost>,
+}
+
+impl Drop for ProcessSnapshot {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.head.is_some() || self.0.rest.capacity() != 0 {
+            Self::release(&mut self.0);
+        }
+    }
 }
 
 impl ProcessSnapshot {
@@ -1640,38 +1696,45 @@ impl ProcessSnapshot {
         Self::default()
     }
 
+    #[cold]
+    #[inline(never)]
+    fn release(posts: &mut std::mem::ManuallyDrop<SnapshotPosts>) {
+        // SAFETY: called once, from `drop`, on a field nothing else drops.
+        unsafe { std::mem::ManuallyDrop::drop(posts) }
+    }
+
     /// Add one post, after every post already added.
     pub fn push(&mut self, post: FieldPost) {
-        match self.head {
-            None => self.head = Some(post),
-            Some(_) => self.rest.push(post),
+        match self.0.head {
+            None => self.0.head = Some(post),
+            Some(_) => self.0.rest.push(post),
         }
     }
 
     /// Whether this cycle posted nothing at all.
     pub fn is_empty(&self) -> bool {
-        self.head.is_none()
+        self.0.head.is_none()
     }
 
     /// How many fields this cycle posts.
     pub fn len(&self) -> usize {
-        usize::from(self.head.is_some()) + self.rest.len()
+        usize::from(self.0.head.is_some()) + self.0.rest.len()
     }
 
     /// The cycle's posts, in the order they were added.
     pub fn iter(&self) -> impl Iterator<Item = &FieldPost> {
-        self.head.iter().chain(self.rest.iter())
+        self.0.head.iter().chain(self.0.rest.iter())
     }
 
     /// Keep only the posts `keep` accepts; `keep` sees every post once, in
     /// the order they were added.
     pub fn retain(&mut self, mut keep: impl FnMut(&FieldPost) -> bool) {
-        if self.head.as_ref().is_some_and(|post| !keep(post)) {
-            self.head = None;
+        if self.0.head.as_ref().is_some_and(|post| !keep(post)) {
+            self.0.head = None;
         }
-        self.rest.retain(|post| keep(post));
-        if self.head.is_none() && !self.rest.is_empty() {
-            self.head = Some(self.rest.remove(0));
+        self.0.rest.retain(|post| keep(post));
+        if self.0.head.is_none() && !self.0.rest.is_empty() {
+            self.0.head = Some(self.0.rest.remove(0));
         }
     }
 
@@ -2320,26 +2383,34 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
-    /// One of the cells the scan cycle reads on every pass, answered exactly
-    /// as [`Self::get_field`] answers `cell.name()`.
+    /// One of the cells the scan cycle reads on every pass, in the numeric
+    /// carrier the record stores it in — see [`CycleRead`].
     ///
     /// The cycle's accessors below ([`Self::val`],
     /// [`Self::monitor_deadband_cells`], [`Self::analog_alarm_input`], ...)
     /// read through this rather than through `get_field`, so a type that
     /// stores its cells as members overrides this one method and every
-    /// accessor reads them with no name match. Asked with a constant `cell`
-    /// from a default body monomorphised per type, the override's `match`
-    /// folds to the member read.
-    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
-        self.get_field(cell.name())
+    /// accessor reads them with no name match. The answer is `Copy` with no
+    /// drop, so in a default body monomorphised per type the override's
+    /// `match` folds to the member load.
+    ///
+    /// The default answers by name, except VAL and OVAL: those are
+    /// [`CycleRead::ByName`], because [`Self::val`] and
+    /// [`Self::output_link_value`] then read them by name once rather than
+    /// cloning an array VAL here only to find it is not a number.
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val | CycleCell::Oval => CycleRead::ByName,
+            cell => CycleRead::of_field(self.get_field(cell.name())),
+        }
     }
 
-    /// Store into a cycle cell, exactly as [`Self::put_field`] stores into
-    /// `cell.name()`. The accessors hand over a value already converted to
-    /// the cell's own type, so an override need only take that variant
-    /// directly and pass anything else to `put_field`.
-    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
-        self.put_field(cell.name(), value)
+    /// Store into a numeric cycle cell, exactly as [`Self::put_field`] stores
+    /// `value` into `cell.name()`. The accessors hand over a value already
+    /// converted to the cell's own carrier, so an override need only take
+    /// that variant directly and pass anything else to `put_field`.
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        self.put_field(cell.name(), value.into())
     }
 
     /// Validate a put before it is applied. Return Err to reject.
@@ -2394,7 +2465,11 @@ pub trait Record: Send + Sync + 'static {
     /// Get the primary value.
     fn val(&self) -> Option<EpicsValue> {
         match self.primary_field() {
-            "VAL" => self.cycle_cell(CycleCell::Val),
+            "VAL" => match self.cycle_cell(CycleCell::Val) {
+                CycleRead::Value(v) => Some(v.into()),
+                CycleRead::Absent => None,
+                CycleRead::ByName => self.get_field("VAL"),
+            },
             field => self.get_field(field),
         }
     }
@@ -2841,7 +2916,11 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default is `val()`, so existing records are unaffected.
     fn monitor_deadband_value(&self) -> Option<f64> {
-        self.val().and_then(|v| v.to_f64())
+        match val_cell(self) {
+            CycleRead::Value(v) => Some(v.to_f64()),
+            CycleRead::Absent => None,
+            CycleRead::ByName => self.val().and_then(|v| v.to_f64()),
+        }
     }
 
     /// The FIELD whose VALUE/LOG monitor delivery the MDEL/ADEL
@@ -3575,7 +3654,11 @@ pub trait Record: Send + Sync + 'static {
     /// [`Self::cycle_cell`]; by name, that was measured at ~970 instructions
     /// of an `ai` cycle across the cycle's cell reads.
     fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
-        let f64_of = |cell| self.cycle_cell(cell).and_then(|v| v.to_f64());
+        let f64_of = |cell: CycleCell| match self.cycle_cell(cell) {
+            CycleRead::Value(v) => Some(v.to_f64()),
+            CycleRead::Absent => None,
+            CycleRead::ByName => self.get_field(cell.name()).and_then(|v| v.to_f64()),
+        };
         MonitorDeadbandCells {
             mdel: f64_of(CycleCell::Mdel),
             adel: f64_of(CycleCell::Adel),
@@ -3594,14 +3677,9 @@ pub trait Record: Send + Sync + 'static {
     /// otherwise.
     fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
         for (cell, store) in [(CycleCell::Alst, alst), (CycleCell::Mlst, mlst)] {
-            if !store {
-                continue;
+            if store {
+                store_cycle_cell(self, cell, CycleValue::Double(val));
             }
-            let target = self
-                .cycle_cell(cell)
-                .map(|v| v.db_field_type())
-                .unwrap_or(crate::types::DbFieldType::Double);
-            let _ = self.put_cycle_cell(cell, EpicsValue::Double(val).convert_to(target));
         }
     }
 
@@ -3616,15 +3694,22 @@ pub trait Record: Send + Sync + 'static {
     /// the ladder then converts back to the number C reads as a struct
     /// member.
     fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
-        let val = AlarmLimit::from_ladder_value(&self.val()?)?;
+        let val = match val_cell(self) {
+            CycleRead::Value(v) => v.ladder()?,
+            CycleRead::Absent => return None,
+            CycleRead::ByName => AlarmLimit::from_ladder_value(&self.val()?)?,
+        };
+        let limit = |cell: CycleCell| match self.cycle_cell(cell) {
+            CycleRead::Value(v) => Some(v.alarm_limit()),
+            CycleRead::Absent => None,
+            CycleRead::ByName => self
+                .get_field(cell.name())
+                .and_then(|v| AlarmLimit::from_stored(&v)),
+        };
         Some(AnalogAlarmInput {
             val,
-            hyst: self
-                .cycle_cell(CycleCell::Hyst)
-                .and_then(|v| AlarmLimit::from_stored(&v)),
-            lalm: self
-                .cycle_cell(CycleCell::Lalm)
-                .and_then(|v| AlarmLimit::from_stored(&v)),
+            hyst: limit(CycleCell::Hyst),
+            lalm: limit(CycleCell::Lalm),
         })
     }
 
@@ -3637,28 +3722,26 @@ pub trait Record: Send + Sync + 'static {
     /// used to be a hard-coded list of the four types that DO carry it,
     /// beside the field reads that would have answered the same question.
     fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        let aftc = self.cycle_cell(CycleCell::Aftc)?.to_f64().unwrap_or(0.0);
-        let afvl = self
-            .cycle_cell(CycleCell::Afvl)
-            .and_then(|v| v.to_f64())
-            .unwrap_or(0.0);
+        let f64_of = |cell: CycleCell| match self.cycle_cell(cell) {
+            CycleRead::Value(v) => Some(Some(v.to_f64())),
+            CycleRead::Absent => None,
+            CycleRead::ByName => self.get_field(cell.name()).map(|v| v.to_f64()),
+        };
+        let aftc = f64_of(CycleCell::Aftc)?.unwrap_or(0.0);
+        let afvl = f64_of(CycleCell::Afvl).flatten().unwrap_or(0.0);
         Some((aftc, afvl))
     }
 
     /// Store the AFTC filter accumulator — C's `prec->afvl = afvl`.
     fn store_alarm_filter_value(&mut self, afvl: f64) {
-        let _ = self.put_cycle_cell(CycleCell::Afvl, EpicsValue::Double(afvl));
+        let _ = self.put_cycle_cell(CycleCell::Afvl, CycleValue::Double(afvl));
     }
 
     /// Arm C's `prec->lalm` latch, coerced to the type the cell is declared
     /// with: C declares LALM with the record's VAL type, so an `epicsInt64`
     /// latch must not round through a double.
     fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
-        let target = self
-            .cycle_cell(CycleCell::Lalm)
-            .map(|v| v.db_field_type())
-            .unwrap_or(crate::types::DbFieldType::Double);
-        let _ = self.put_cycle_cell(CycleCell::Lalm, lalm.to_epics_value().convert_to(target));
+        store_cycle_cell(self, CycleCell::Lalm, lalm.into());
     }
 
     /// Which slots of [`Self::multi_input_links`] are wired, as two bitmasks
@@ -4268,6 +4351,11 @@ pub trait Record: Send + Sync + 'static {
     /// A record whose `val()` yields `None` (no primary value) is
     /// also treated as undefined.
     fn value_is_undefined(&self) -> bool {
+        match val_cell(self) {
+            CycleRead::Value(v) => return v.is_nan(),
+            CycleRead::Absent => return true,
+            CycleRead::ByName => {}
+        }
         match self.val() {
             Some(EpicsValue::Double(v)) => v.is_nan(),
             Some(EpicsValue::Float(v)) => v.is_nan(),
@@ -4667,7 +4755,11 @@ pub trait Record: Send + Sync + 'static {
     /// and the just-fetched `DOLD` and whose `OVAL` field is C's "Old Value"
     /// (the previous VAL, used only by the OOPT test), not an output stage.
     fn output_link_value(&self) -> Option<EpicsValue> {
-        self.cycle_cell(CycleCell::Oval).or_else(|| self.val())
+        match self.cycle_cell(CycleCell::Oval) {
+            CycleRead::Value(v) => Some(v.into()),
+            CycleRead::Absent => self.val(),
+            CycleRead::ByName => self.get_field("OVAL").or_else(|| self.val()),
+        }
     }
 
     /// Return multi-output link field pairs: (link_field, value_field).
@@ -4864,6 +4956,24 @@ pub trait Record: Send + Sync + 'static {
     /// to be available during process().
     fn pre_process_actions(&mut self) -> ProcessActions {
         ProcessActions::new()
+    }
+
+    /// The per-cycle hooks this type overrides with a body that can act —
+    /// see [`CycleHooks`]. `ALL` by default; the derive and every base type
+    /// that keeps the empty defaults say `NONE`, and the drift test holds
+    /// them to it.
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::ALL
+    }
+
+    /// Whether [`Self::pre_process_actions`] can return anything for this
+    /// type. C has no such hook, so the cycle settles this once
+    /// (`ProcessPlan::acts_before_process`) rather than call an empty body
+    /// through the vtable every cycle. `true` by default: a type that keeps
+    /// the empty hook says `false`, and one that forgets pays the call
+    /// rather than losing an action.
+    fn acts_before_process(&self) -> bool {
+        true
     }
 
     /// Return actions the framework must execute BEFORE the input-link
@@ -5837,6 +5947,68 @@ mod tests {
         }
     }
 
+    /// The cycle skips [`Record::pre_process_actions`] for a type whose
+    /// [`Record::acts_before_process`] is false, so that type must keep the
+    /// empty default; and every base type without the hook says false.
+    #[test]
+    fn a_type_that_acts_before_process_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        const ACTS: &[&str] = &["scalcout", "sseq"];
+        let mut reached = Vec::new();
+        for record_type in RECORD_TYPES {
+            let Some(mut r) = cycle_record(record_type) else {
+                continue;
+            };
+            reached.push(*record_type);
+            assert_eq!(
+                r.acts_before_process(),
+                ACTS.contains(record_type),
+                "{record_type} acts_before_process"
+            );
+            if !r.acts_before_process() {
+                assert!(
+                    r.pre_process_actions().is_empty(),
+                    "{record_type}: pre_process_actions acted but acts_before_process is false"
+                );
+            }
+        }
+        for record_type in ACTS {
+            assert!(reached.contains(record_type), "{record_type} not reached");
+        }
+    }
+
+    /// A hook the plan will not ask about must be the empty default on a fresh
+    /// record, and a base type outside the listed ones claims no hook at all.
+    #[test]
+    fn a_type_that_overrides_a_cycle_hook_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let expected = |t: &str| match t {
+            "compress" | "histogram" | "waveform" | "aai" | "aao" | "subArray" => {
+                CycleHooks::PRE_INPUT
+            }
+            "acalcout" => CycleHooks::CYCLE_POSTED,
+            "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
+            "sseq" | "scalcout" => CycleHooks::ALL,
+            _ => CycleHooks::NONE,
+        };
+        for record_type in RECORD_TYPES {
+            let Some(mut r) = cycle_record(record_type) else {
+                continue;
+            };
+            let hooks = r.cycle_hooks();
+            assert_eq!(hooks, expected(record_type), "{record_type} cycle_hooks");
+            if !hooks.has(CycleHooks::PRE_INPUT) {
+                assert!(r.pre_input_link_actions().is_empty(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::CYCLE_POSTED) {
+                assert!(r.take_cycle_posted_fields().is_empty(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::FIRST_MONITOR) {
+                assert!(r.take_first_monitor_cycle().is_empty(), "{record_type}");
+            }
+        }
+    }
+
     /// Every field the type declares, rendered — `sel` initialises A..L to
     /// `NaN`, which is never equal to itself, so the comparison is over the
     /// `Debug` form rather than the values.
@@ -5954,12 +6126,12 @@ mod tests {
     /// [`Record::cycle_cell`] is the one read every cycle accessor goes
     /// through, so it is pinned per cell against the `get_field` it stands in
     /// for, and [`Record::put_cycle_cell`] against `put_field` — two records
-    /// of each type, every cell, a value in the cell's own type and one in a
-    /// foreign type, which an override must hand to `put_field` unchanged.
+    /// of each type, every cell, a value in the cell's own carrier and one in
+    /// a foreign carrier, which an override must hand to `put_field`.
     #[test]
     fn every_record_answers_each_cycle_cell_as_its_field_does() {
-        use crate::server::record::CycleCell;
         use crate::server::record::dbd_generated::RECORD_TYPES;
+        use crate::server::record::{CycleCell, CycleRead, CycleValue};
 
         let mut answered = Vec::new();
         for record_type in RECORD_TYPES {
@@ -5974,20 +6146,45 @@ mod tests {
 
             for (i, cell) in CycleCell::ALL.into_iter().enumerate() {
                 let field = cell.name();
-                assert_eq!(
-                    fast.cycle_cell(cell),
-                    fast.get_field(field),
-                    "{record_type} cycle_cell({field})"
-                );
-                let target = slow
-                    .get_field(field)
-                    .map(|v| v.db_field_type())
-                    .unwrap_or(crate::types::DbFieldType::Double);
-                let own = EpicsValue::Double(51.0 + i as f64).convert_to(target);
-                let foreign = EpicsValue::String("7".into());
+                let by_name = fast.get_field(field);
+                let numeric = by_name.as_ref().and_then(CycleValue::from_epics);
+                match fast.cycle_cell(cell) {
+                    CycleRead::Value(v) => {
+                        assert_eq!(Some(v.into()), by_name, "{record_type} cycle_cell({field})");
+                        if cell == CycleCell::Val && fast.primary_field() == "VAL" {
+                            assert_eq!(fast.val(), by_name, "{record_type} val");
+                        }
+                    }
+                    CycleRead::Absent => {
+                        assert_eq!(by_name, None, "{record_type} cycle_cell({field})")
+                    }
+                    // Only the trait default answers a numeric VAL/OVAL by
+                    // name; a type that overrides the hook answers it typed.
+                    // A number is answered typed; only the trait default
+                    // leaves VAL/OVAL to `get_field`.
+                    CycleRead::ByName => assert!(
+                        numeric.is_none()
+                            || matches!(cell, CycleCell::Val | CycleCell::Oval)
+                                && !TYPED_CYCLE_CELLS.contains(record_type),
+                        "{record_type} cycle_cell({field}) by name, get_field {by_name:?}"
+                    ),
+                }
+                if let Some(v) = &by_name {
+                    assert!(
+                        numeric.is_some() || v.is_array() || matches!(v, EpicsValue::String(_)),
+                        "{record_type} {field}: no CycleValue carrier for {v:?}"
+                    );
+                }
+
+                let own = CycleValue::Double(51.0 + i as f64)
+                    .convert_as(numeric.unwrap_or(CycleValue::Double(0.0)));
+                let foreign = match own {
+                    CycleValue::Double(_) => CycleValue::Long(7),
+                    _ => CycleValue::Double(7.5),
+                };
                 for value in [own, foreign] {
-                    let stored = fast.put_cycle_cell(cell, value.clone()).is_ok();
-                    let put = slow.put_field(field, value).is_ok();
+                    let stored = fast.put_cycle_cell(cell, value).is_ok();
+                    let put = slow.put_field(field, value.into()).is_ok();
                     assert_eq!(stored, put, "{record_type} put_cycle_cell({field}) result");
                     assert_eq!(
                         fast.get_field(field),
@@ -5998,72 +6195,125 @@ mod tests {
             }
         }
         // Every type that overrides the pair must be one the loop reached.
-        for record_type in [
-            "acalcout",
-            "ao",
-            "bi",
-            "bo",
-            "busy",
-            "calcout",
-            "dfanout",
-            "event",
-            "int64in",
-            "int64out",
-            "longin",
-            "longout",
-            "mbbi",
-            "mbbiDirect",
-            "mbbo",
-            "mbboDirect",
-            "permissive",
-            "scalcout",
-            "sel",
-            "seq",
-            "fanout",
-            "sseq",
-            "state",
-            "stringin",
-            "stringout",
-            "sub",
-            "swait",
-        ] {
-            assert!(answered.contains(&record_type), "{record_type} not reached");
+        for record_type in TYPED_CYCLE_CELLS {
+            assert!(answered.contains(record_type), "{record_type} not reached");
         }
     }
 
-    /// `Record::val` and `Record::output_link_value` carry SEMANTICS that
-    /// several types legitimately override (`stringout` serves neither from
-    /// OVAL), so they cannot be pinned database-wide. The types whose
-    /// override exists only to skip the name match are listed here, and each
-    /// must still answer what the default body would.
+    /// The types that answer [`Record::cycle_cell`] from their members.
+    const TYPED_CYCLE_CELLS: &[&str] = &[
+        "acalcout",
+        "ai",
+        "ao",
+        "bi",
+        "bo",
+        "busy",
+        "calc",
+        "calcout",
+        "dfanout",
+        "event",
+        "int64in",
+        "int64out",
+        "longin",
+        "longout",
+        "mbbi",
+        "mbbiDirect",
+        "mbbo",
+        "mbboDirect",
+        "permissive",
+        "scalcout",
+        "sel",
+        "seq",
+        "fanout",
+        "sseq",
+        "state",
+        "stringin",
+        "stringout",
+        "sub",
+        "swait",
+    ];
+
+    /// `Record::val` carries SEMANTICS that several types legitimately
+    /// override, so it cannot be pinned database-wide. The types whose
+    /// override exists only to skip the name match for a string VAL, which
+    /// [`Record::cycle_cell`] answers [`CycleRead::ByName`], are listed here,
+    /// and each must still answer what the default body would.
     #[test]
     fn a_speed_override_of_val_answers_what_the_default_would() {
-        const SPEED_OVERRIDES: &[&str] = &["ai", "calc"];
+        const SPEED_OVERRIDES: &[&str] = &["event", "state", "stringin", "stringout"];
 
         for record_type in SPEED_OVERRIDES {
             let mut r = crate::server::db_loader::create_record(record_type)
                 .expect("a listed type is creatable");
-            seed_cycle_cells(&mut *r);
-            let _ = r.put_field("VAL", EpicsValue::Double(41.0));
+            let _ = r.put_field("VAL", EpicsValue::String("41".into()));
 
             let r = &*r;
             assert_eq!(r.val(), r.get_field(r.primary_field()), "{record_type} val");
-            assert_eq!(
-                r.output_link_value(),
-                r.get_field("OVAL").or_else(|| r.val()),
-                "{record_type} output_link_value"
-            );
             assert_eq!(
                 r.monitor_deadband_value(),
                 r.val().and_then(|v| v.to_f64()),
                 "{record_type} monitor_deadband_value"
             );
-            let nan = matches!(r.val(), Some(EpicsValue::Double(v)) if v.is_nan());
+            assert!(!r.value_is_undefined(), "{record_type} value_is_undefined");
+        }
+    }
+
+    /// [`CycleValue`] stands in for the scalar `EpicsValue` arms, so each of
+    /// its answers is pinned against the `EpicsValue` one at the boundaries
+    /// those arms branch on: sign, NaN, range, the signed `Char` byte and
+    /// 64-bit values past a double's mantissa.
+    #[test]
+    fn a_cycle_value_converts_as_its_epics_value_does() {
+        use crate::server::record::CycleValue as V;
+        let values = [
+            V::Double(-1.5),
+            V::Double(f64::NAN),
+            V::Double(1e300),
+            V::Double(65536.7),
+            V::Float(-2.5),
+            V::Float(f32::NAN),
+            V::Long(-1),
+            V::Long(i32::MAX),
+            V::ULong(u32::MAX),
+            V::Int64(i64::MIN),
+            V::Int64((1 << 53) + 1),
+            V::UInt64(u64::MAX),
+            V::Short(-300),
+            V::UShort(u16::MAX),
+            V::Char(0xFF),
+            V::UChar(0xFF),
+            V::Enum(7),
+        ];
+        let show = |v: EpicsValue| format!("{v:?}");
+        for source in values {
+            let wide = EpicsValue::from(source);
             assert_eq!(
-                r.value_is_undefined(),
-                nan,
-                "{record_type} value_is_undefined"
+                format!("{:?}", Some(source)),
+                format!("{:?}", V::from_epics(&wide))
             );
+            assert_eq!(
+                format!("{:?}", Some(source.to_f64())),
+                format!("{:?}", wide.to_f64()),
+                "{source:?} to_f64"
+            );
+            assert_eq!(
+                format!("{:?}", source.ladder()),
+                format!("{:?}", AlarmLimit::from_ladder_value(&wide)),
+                "{source:?} ladder"
+            );
+            assert_eq!(
+                format!("{:?}", Some(source.alarm_limit())),
+                format!("{:?}", AlarmLimit::from_stored(&wide)),
+                "{source:?} alarm_limit"
+            );
+            for carrier in values {
+                let target = EpicsValue::from(carrier).db_field_type();
+                assert_eq!(
+                    show(source.convert_as(carrier).into()),
+                    show(wide.convert_to(target)),
+                    "{source:?} as {target:?}"
+                );
+            }
         }
     }
 
@@ -6187,6 +6437,233 @@ impl CycleCell {
             Self::Lalm => "LALM",
             Self::Aftc => "AFTC",
             Self::Afvl => "AFVL",
+        }
+    }
+}
+
+/// VAL through [`Record::cycle_cell`] where VAL is the primary field, and
+/// [`CycleRead::ByName`] — ask [`Record::val`] — where it is not.
+fn val_cell<R: Record + ?Sized>(r: &R) -> CycleRead {
+    match r.primary_field() {
+        "VAL" => r.cycle_cell(CycleCell::Val),
+        _ => CycleRead::ByName,
+    }
+}
+
+/// C's `prec->cell = value`, in the carrier the cell is stored in.
+fn store_cycle_cell<R: Record + ?Sized>(r: &mut R, cell: CycleCell, value: CycleValue) {
+    let _ = match r.cycle_cell(cell) {
+        CycleRead::Value(held) => r.put_cycle_cell(cell, value.convert_as(held)),
+        CycleRead::Absent => r.put_cycle_cell(cell, CycleValue::Double(value.to_f64())),
+        CycleRead::ByName => {
+            let target = r
+                .get_field(cell.name())
+                .map(|v| v.db_field_type())
+                .unwrap_or(crate::types::DbFieldType::Double);
+            r.put_field(cell.name(), EpicsValue::from(value).convert_to(target))
+        }
+    };
+}
+
+/// How a record answers [`Record::cycle_cell`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CycleRead {
+    /// The cell, held in this numeric carrier.
+    Value(CycleValue),
+    /// The type has no field by that name.
+    Absent,
+    /// The cell is a string or array (VAL/OVAL), or the type keeps the trait
+    /// default, which does not read VAL/OVAL itself: ask `get_field`.
+    ByName,
+}
+
+impl CycleRead {
+    /// The answer `get_field` gives, classified.
+    pub fn of_field(field: Option<EpicsValue>) -> Self {
+        match field {
+            None => Self::Absent,
+            Some(v) => CycleValue::from_epics(&v).map_or(Self::ByName, Self::Value),
+        }
+    }
+}
+
+/// A numeric cycle cell in the carrier its record stores it in — every
+/// scalar DBF number, so [`CycleRead::ByName`] is left for a string or array
+/// cell and the trait default. `Copy` with no drop, so a read through
+/// [`Record::cycle_cell`] costs a member load.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CycleValue {
+    Double(f64),
+    Float(f32),
+    Long(i32),
+    ULong(u32),
+    Int64(i64),
+    UInt64(u64),
+    Short(i16),
+    UShort(u16),
+    Char(u8),
+    UChar(u8),
+    Enum(u16),
+}
+
+impl CycleValue {
+    /// The carrier `value` is in, or `None` for a string or array.
+    #[inline]
+    pub fn from_epics(value: &EpicsValue) -> Option<Self> {
+        Some(match *value {
+            EpicsValue::Double(v) => Self::Double(v),
+            EpicsValue::Float(v) => Self::Float(v),
+            EpicsValue::Long(v) => Self::Long(v),
+            EpicsValue::ULong(v) => Self::ULong(v),
+            EpicsValue::Int64(v) => Self::Int64(v),
+            EpicsValue::UInt64(v) => Self::UInt64(v),
+            EpicsValue::Short(v) => Self::Short(v),
+            EpicsValue::UShort(v) => Self::UShort(v),
+            EpicsValue::Char(v) => Self::Char(v),
+            EpicsValue::UChar(v) => Self::UChar(v),
+            EpicsValue::Enum(v) => Self::Enum(v),
+            _ => return None,
+        })
+    }
+
+    /// As [`EpicsValue::to_f64`] answers the same carrier.
+    #[inline]
+    pub fn to_f64(self) -> f64 {
+        match self {
+            Self::Double(v) => v,
+            Self::Float(v) => v as f64,
+            Self::Long(v) => v as f64,
+            Self::ULong(v) => v as f64,
+            Self::Int64(v) => v as f64,
+            Self::UInt64(v) => v as f64,
+            Self::Short(v) => v as f64,
+            Self::UShort(v) | Self::Enum(v) => v as f64,
+            // DBF_CHAR is epicsInt8.
+            Self::Char(v) => (v as i8) as f64,
+            Self::UChar(v) => v as f64,
+        }
+    }
+
+    /// As `EpicsValue::as_int_i64` answers the same carrier: `Char` has no
+    /// integer view, its sign comes through `to_f64`.
+    #[inline]
+    fn as_int_i64(self) -> Option<i64> {
+        match self {
+            Self::Double(_) | Self::Float(_) | Self::Char(_) => None,
+            Self::Long(v) => Some(v as i64),
+            Self::ULong(v) => Some(v as i64),
+            Self::Int64(v) => Some(v),
+            Self::UInt64(v) => Some(v as i64),
+            Self::Short(v) => Some(v as i64),
+            Self::UShort(v) | Self::Enum(v) => Some(v as i64),
+            Self::UChar(v) => Some(v as i64),
+        }
+    }
+
+    /// `self` stored into a cell that holds `carrier`'s variant — the
+    /// scalar arms of [`EpicsValue::convert_to`], so `prec->lalm = val`
+    /// lands in the cell's own type.
+    #[inline]
+    pub fn convert_as(self, carrier: Self) -> Self {
+        use crate::types::c_cast;
+        // `convert_to` hands a value already in the target type back as is;
+        // through the double, a `Char` 0xFF would saturate to 0.
+        if std::mem::discriminant(&self) == std::mem::discriminant(&carrier) {
+            return self;
+        }
+        let int = self.as_int_i64();
+        let f = self.to_f64();
+        match carrier {
+            Self::Double(_) => Self::Double(f),
+            Self::Float(_) => Self::Float(c_cast::f64_to_f32(f)),
+            Self::Long(_) => Self::Long(int.map_or_else(|| c_cast::f64_to_i32(f), |i| i as i32)),
+            Self::ULong(_) => Self::ULong(int.map_or_else(|| c_cast::f64_to_u32(f), |i| i as u32)),
+            Self::Int64(_) => Self::Int64(int.unwrap_or_else(|| c_cast::f64_to_i64(f))),
+            // Only a 64-bit source keeps its bits; a narrower one goes
+            // through the double, as `convert_to` does.
+            Self::UInt64(_) => Self::UInt64(match self {
+                Self::UInt64(v) => v,
+                Self::Int64(v) => v as u64,
+                _ => c_cast::f64_to_u64(f),
+            }),
+            Self::Short(_) => Self::Short(int.map_or_else(|| c_cast::f64_to_i16(f), |i| i as i16)),
+            Self::UShort(_) => {
+                Self::UShort(int.map_or_else(|| c_cast::f64_to_u16(f), |i| i as u16))
+            }
+            Self::Char(_) => Self::Char(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
+            Self::UChar(_) => Self::UChar(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
+            // `putDoubleEnum` wraps rather than saturates.
+            Self::Enum(_) => Self::Enum(int.unwrap_or(f as i64) as u16),
+        }
+    }
+
+    /// `self` as the `&EpicsValue` a hook such as [`Record::validate_put`]
+    /// takes. A numeric value owns nothing, so it is never dropped: the drop
+    /// of a temporary `EpicsValue` is an out-of-line `drop_glue` call even
+    /// when its variant is known.
+    #[inline]
+    pub fn lend(self) -> std::mem::ManuallyDrop<EpicsValue> {
+        std::mem::ManuallyDrop::new(self.into())
+    }
+
+    /// Whether the cell holds C's undefined double.
+    #[inline]
+    pub fn is_nan(self) -> bool {
+        match self {
+            Self::Double(v) => v.is_nan(),
+            Self::Float(v) => v.is_nan(),
+            _ => false,
+        }
+    }
+
+    /// As [`AlarmLimit::from_ladder_value`] answers the same carrier.
+    #[inline]
+    pub fn ladder(self) -> Option<AlarmLimit> {
+        match self {
+            Self::Double(v) => Some(AlarmLimit::Double(v)),
+            Self::Long(v) => Some(AlarmLimit::Long(v)),
+            Self::Int64(v) => Some(AlarmLimit::Int64(v)),
+            _ => None,
+        }
+    }
+
+    /// As [`AlarmLimit::from_stored`] answers the same carrier.
+    #[inline]
+    pub fn alarm_limit(self) -> AlarmLimit {
+        match self {
+            Self::Long(v) => AlarmLimit::Long(v),
+            Self::Int64(v) => AlarmLimit::Int64(v),
+            other => AlarmLimit::Double(other.to_f64()),
+        }
+    }
+}
+
+impl From<CycleValue> for EpicsValue {
+    #[inline]
+    fn from(value: CycleValue) -> Self {
+        match value {
+            CycleValue::Double(v) => Self::Double(v),
+            CycleValue::Float(v) => Self::Float(v),
+            CycleValue::Long(v) => Self::Long(v),
+            CycleValue::ULong(v) => Self::ULong(v),
+            CycleValue::Int64(v) => Self::Int64(v),
+            CycleValue::UInt64(v) => Self::UInt64(v),
+            CycleValue::Short(v) => Self::Short(v),
+            CycleValue::UShort(v) => Self::UShort(v),
+            CycleValue::Char(v) => Self::Char(v),
+            CycleValue::UChar(v) => Self::UChar(v),
+            CycleValue::Enum(v) => Self::Enum(v),
+        }
+    }
+}
+
+impl From<AlarmLimit> for CycleValue {
+    #[inline]
+    fn from(limit: AlarmLimit) -> Self {
+        match limit {
+            AlarmLimit::Double(v) => Self::Double(v),
+            AlarmLimit::Long(v) => Self::Long(v),
+            AlarmLimit::Int64(v) => Self::Int64(v),
         }
     }
 }

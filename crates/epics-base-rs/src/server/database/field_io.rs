@@ -1186,8 +1186,36 @@ impl PvDatabase {
     /// read wants, which drops the error's text unread. One frame from the
     /// address to the field's accessor, so the value is built once and
     /// handed up, not repacked through a `Result` on the way.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read_field_at(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        addr: crate::server::record::record_instance::FieldAddr,
+    ) -> Option<EpicsValue> {
+        // C's `dbGet` through the `dbAddr`: a slot is a field the record's
+        // typed accessor answers, and `get_slot_f64` is `get_field` followed
+        // by the numeric funnel — the identity on a field served as
+        // `DBF_DOUBLE`, so for one the slot read IS the by-name read. Asked
+        // ahead of the attribute test, which a slot (always a declared
+        // field, `FieldAddr::resolve_in`) never reaches.
+        if let Some(slot) = double_slot(addr) {
+            let value = instance.record.get_slot_f64(slot).map(EpicsValue::Double);
+            debug_assert!(
+                matches!(
+                    (&value, instance.resolve_field_upper_at(field, addr.desc)),
+                    (Some(EpicsValue::Double(a)), Some(EpicsValue::Double(b))) if a.to_bits() == b.to_bits()
+                ),
+                "{}.{field}: get_slot_f64 disagrees with get_field",
+                instance.name
+            );
+            return value;
+        }
+        self.read_field_by_name_at(instance, field, addr)
+    }
+
+    /// [`Self::read_field_at`] for a field with no slot.
+    fn read_field_by_name_at(
         &self,
         instance: &crate::server::record::RecordInstance,
         field: &str,
@@ -1211,22 +1239,6 @@ impl PvDatabase {
             && let Some(value) = self.record_type_attribute(instance.record.record_type(), field)
         {
             return Some(EpicsValue::String(value.into()));
-        }
-        // C's `dbGet` through the `dbAddr`: a slot is a field the record's
-        // typed accessor answers, and `get_slot_f64` is `get_field` followed
-        // by the numeric funnel — the identity on a field served as
-        // `DBF_DOUBLE`, so for one the slot read IS the by-name read.
-        if let Some(slot) = double_slot(addr) {
-            let value = instance.record.get_slot_f64(slot).map(EpicsValue::Double);
-            debug_assert!(
-                matches!(
-                    (&value, instance.resolve_field_upper_at(field, addr.desc)),
-                    (Some(EpicsValue::Double(a)), Some(EpicsValue::Double(b))) if a.to_bits() == b.to_bits()
-                ),
-                "{}.{field}: get_slot_f64 disagrees with get_field",
-                instance.name
-            );
-            return value;
         }
         instance.resolve_field_upper_at(field, addr.desc)
     }

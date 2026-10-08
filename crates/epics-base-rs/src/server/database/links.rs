@@ -643,6 +643,8 @@ impl PvDatabase {
 
     /// [`Self::db_link_addr`] for the reader's own `INP`, lent for as long
     /// as the reader's guard is held: no lock and no refcount on a hit.
+    /// The hit is two loads, so it is taken in the caller's frame.
+    #[inline(always)]
     pub(crate) fn inp_addr<'g>(
         &self,
         instance: &'g crate::server::record::RecordInstance,
@@ -753,13 +755,25 @@ impl PvDatabase {
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
         let target = db.target();
-        match self.read_field_of(&at.rec, db, at.field) {
-            FieldRead::Field(value, alarm) => (
-                value.map(|v| filtered_read(target, v)),
-                alarm.map(|alarm| SourceAlarm::local(SourceId::of(&at.rec), alarm)),
-            ),
-            FieldRead::Shadow(v) => (Some(filtered_read(target, v)), None),
+        if let Some(v) = self.shadow_of(db) {
+            return (Some(filtered_read(target, v)), None);
         }
+        // Built in the shape it is returned in, and filtered in place: each
+        // repack of the value on the way up is a copy the optimiser keeps.
+        let instance = at.rec.read();
+        let mut value = self.read_field_at(&instance, &target.field, at.field);
+        let alarm =
+            (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
+                SourceAlarm::local(
+                    SourceId::of(&at.rec),
+                    LinkAlarm::committed(&instance.common),
+                )
+            });
+        drop(instance);
+        if let Some(suffix) = target.json_suffix.as_deref() {
+            value = value.map(|v| filter_read(suffix, v));
+        }
+        (value, alarm)
     }
 
     /// The read itself: `rec`'s field at `addr`, with the alarm the record
@@ -777,27 +791,33 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
         addr: crate::server::record::record_instance::FieldAddr,
     ) -> FieldRead {
-        let target = db.target();
-        let (record, field): (&str, &str) = (&target.record, &target.field);
-        // `get_pv`'s own first question, and NOT redundant with the records
-        // map: `check_name_free` keeps the three namespaces disjoint, so a
-        // name the map just answered cannot also be a simple PV — but a
-        // simple PV may be registered under a name that SPELLS this record's
-        // field (`REC.FLD`), and that one shadows the field read. Which is
-        // why the `VAL` spelling, where the two names are the same string,
-        // needs no `simple_pvs` lock at all.
-        if !db.target_is_val() {
-            let pv_name = local_name(record, field);
-            if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
-                return FieldRead::Shadow(pv.get());
-            }
+        if let Some(v) = self.shadow_of(db) {
+            return FieldRead::Shadow(v);
         }
         let instance = rec.read();
         FieldRead::Field(
-            self.read_field_at(&instance, field, addr),
+            self.read_field_at(&instance, &db.target().field, addr),
             (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
                 .then(|| LinkAlarm::committed(&instance.common)),
         )
+    }
+
+    /// The simple PV that shadows `db`'s target spelling, read. `get_pv`'s
+    /// own first question, and NOT redundant with the records map:
+    /// `check_name_free` keeps the three namespaces disjoint, so a name the
+    /// map just answered cannot also be a simple PV — but a simple PV may be
+    /// registered under a name that SPELLS this record's field (`REC.FLD`),
+    /// and that one shadows the field read. Which is why the `VAL` spelling,
+    /// where the two names are the same string, needs no `simple_pvs` lock.
+    #[inline(always)]
+    fn shadow_of(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
+        if db.target_is_val() {
+            return None;
+        }
+        let target = db.target();
+        let pv_name = local_name(&target.record, &target.field);
+        let pv = self.inner.simple_pvs.lock().get(&pv_name).cloned()?;
+        Some(pv.get())
     }
 
     /// Read a `Db`-variant link's value honoring C `dbInitLink`'s
@@ -952,7 +972,22 @@ impl PvDatabase {
     ///
     /// `None` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
     /// conversion slot), i.e. a FAILED read — never a silent no-op.
+    #[inline(always)]
     pub(crate) fn apply_link_read_as(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+        value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        match read_as {
+            crate::server::record::LinkReadAs::Native => Some(value),
+            _ => self.convert_link_read(link, read_as, value),
+        }
+    }
+
+    /// [`Self::apply_link_read_as`]'s converting arms, out of the native
+    /// read's frame.
+    fn convert_link_read(
         &self,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
@@ -1297,16 +1332,29 @@ impl PvDatabase {
     ///   `MonitorSwitch`; a PVA link's lset has already applied the MS/NMS/MSI
     ///   gate, so its (already final) severity folds as `MaximizeStatus` to keep
     ///   the remote stat + message. Constant/Hw/Calc links inherit nothing.
-    #[inline]
+    ///
+    /// No alarm — an NMS read, which never takes one — is answered in the
+    /// caller's frame.
+    #[inline(always)]
     pub(crate) fn input_link_inheritance(
         &self,
         reader: &Arc<RecordCell>,
         link: &crate::server::record::ParsedLink,
         alarm: Option<SourceAlarm>,
     ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
+        self.inherit_source_alarm(reader, link, alarm?)
+    }
+
+    /// [`Self::input_link_inheritance`] for a read that carried an alarm.
+    fn inherit_source_alarm(
+        &self,
+        reader: &Arc<RecordCell>,
+        link: &crate::server::record::ParsedLink,
+        alarm: SourceAlarm,
+    ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
         // NMS: `recGblInheritSevrMsg(pvlOptNMS)` is a `break`.
         let inherits = |ms| ms != crate::server::record::MonitorSwitch::NoMaximize;
-        let SourceAlarm { alarm, record } = alarm?;
+        let SourceAlarm { alarm, record } = alarm;
         match link {
             crate::server::record::ParsedLink::Db(db) => {
                 // C's `precord != dbChannelRecord(chan)`, asked as the pointer
@@ -5262,13 +5310,13 @@ mod db_link_addr_tests {
         assert!(weak_a.upgrade().is_none() && weak_b.upgrade().is_none());
     }
 
-    /// The `DBR_DOUBLE` read answers what the native read converted
-    /// answers, on each side of each boundary of its slot path: a `VAL`
-    /// slot with and without the alarm, a filtered `VAL`, a non-`VAL`
-    /// slot, a `VAL` with no slot, an array, a string that does and does
-    /// not convert, and a field that does not exist.
+    /// The `DBR_DOUBLE` read answers what the general path's `DBR_DOUBLE`
+    /// read does, alarm included, on each side of each boundary of its slot
+    /// path: a `VAL` slot with and without the alarm, a filtered `VAL`, a
+    /// non-`VAL` slot, a `VAL` with no slot, an array, a string that does
+    /// and does not convert, and a field that does not exist.
     #[epics_macros_rs::epics_test]
-    async fn the_double_read_answers_what_the_native_read_converts_to() {
+    async fn the_double_read_answers_what_the_general_read_does() {
         use crate::server::record::{LinkReadAs, Record};
         use crate::server::records::{
             calc::CalcRecord, stringin::StringinRecord, waveform::WaveformRecord,
@@ -5316,22 +5364,21 @@ mod db_link_addr_tests {
                 "{text}"
             );
             let (value, alarm) = db.read_db_link_f64_at(link, &at);
-            let (fetch, native_alarm) = db.read_db_link_at(link, &at);
-            let native = match fetch {
-                crate::server::recgbl::simm::LinkFetch::Value(v) => {
-                    db.apply_link_read_as(&parsed, LinkReadAs::Double, v)
-                }
+            let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+                &parsed,
+                LinkReadAs::Double,
+                &mut ProcStack::new(),
+            );
+            let general = match fetch {
+                crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
                 _ => None,
             };
             assert_eq!(value, expect, "{text}");
-            assert_eq!(value.map(EpicsValue::Double), native, "{text}");
-            // C inherits only on `dbGetLink`'s success: a value that does
-            // not convert to DOUBLE is a failed status and carries no alarm.
+            assert_eq!(value.map(EpicsValue::Double), general, "{text}");
             assert_eq!(
                 alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
-                native_alarm
+                general_alarm
                     .as_ref()
-                    .filter(|_| native.is_some())
                     .map(|a| (format!("{:?}", a.alarm), a.record)),
                 "{text}"
             );

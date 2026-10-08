@@ -748,7 +748,7 @@ impl DbLink {
     /// [`Self::release_addr`] must not run while the returned borrow lives.
     /// `PvDatabase::inp_addr` guarantees it by lending only through the
     /// reader's guard, which `release_addr`'s callers hold exclusively.
-    #[inline]
+    #[inline(always)]
     pub(crate) unsafe fn lend_addr(
         &self,
         revision: u64,

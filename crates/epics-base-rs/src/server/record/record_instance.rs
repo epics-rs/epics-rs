@@ -979,6 +979,7 @@ impl ProcessPlan {
             dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
                 rtype,
             ) && record.declares_multi_output_links(),
+            has_multi_input_links: !record.multi_input_links().is_empty(),
             narrows_input_links: record.narrows_input_links(),
             output_stage: record.can_device_write()
                 || field_desc_of(record, "OUT").is_some()
@@ -1088,6 +1089,11 @@ pub(crate) struct ProcessPlan {
     /// `dispatch_multi_output`, and `multi_output_dispatch_owned` excludes
     /// them from the generic block, so no type can answer `true` to both.
     pub(crate) dispatches_generic_multi_output: bool,
+    /// This type declares [`Record::multi_input_links`] at all. `false` — every
+    /// type but calc, calcout, sel, sub, aSub and the sCalc/aCalc family — makes
+    /// the cycle's read of which links are wired a constant instead of a
+    /// virtual call and a mask.
+    pub(crate) has_multi_input_links: bool,
     /// This type can narrow the cycle's input list — see
     /// [`Record::narrows_input_links`]. `false` makes the guard that asks
     /// disappear.
@@ -2496,21 +2502,23 @@ impl RecordInstance {
     /// call once a cycle, and the two derivations could disagree about a
     /// record whose veto changed in between.
     pub(crate) fn forward_target(&self) -> ForwardTarget {
-        if !self.record.should_fire_forward_link() {
-            return ForwardTarget::None;
-        }
+        // The link kind goes first: with nothing to fire (the common empty
+        // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
         match &self.parsed_flnk {
-            ParsedLink::Db(l) => ForwardTarget::Db {
+            ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
                 name: l.target().record.clone(),
                 putf: self.common.putf,
                 notify: self.notify.clone(),
             },
-            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_) => self
-                .parsed_flnk
-                .external_pv_name()
-                .map_or(ForwardTarget::None, |s| {
-                    ForwardTarget::External(s.to_string())
-                }),
+            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_)
+                if self.record.should_fire_forward_link() =>
+            {
+                self.parsed_flnk
+                    .external_pv_name()
+                    .map_or(ForwardTarget::None, |s| {
+                        ForwardTarget::External(s.to_string())
+                    })
+            }
             // Constant / Hw / Calc / None carry no forward action.
             _ => ForwardTarget::None,
         }
@@ -7973,8 +7981,16 @@ pub(crate) fn check_deadband(newval: f64, oldval: Option<f64>, deadband: f64) ->
     let Some(oldval) = oldval else {
         return true;
     };
+    // A finite difference means both operands were finite (inf - x is inf,
+    // inf - inf and NaN - x are NaN), so the common case is C's own
+    // subtract, fabs, compare.
+    let delta = (oldval - newval).abs();
+    if delta.is_finite() {
+        return delta > deadband;
+    }
     let delta = if newval.is_finite() && oldval.is_finite() {
-        (oldval - newval).abs()
+        // The subtraction overflowed.
+        f64::INFINITY
     } else if newval.is_nan() != oldval.is_nan() || newval.is_infinite() != oldval.is_infinite() {
         // One is NaN or +/-inf and the other is not.
         f64::INFINITY
@@ -10000,6 +10016,84 @@ mod check_deadband_tests {
                 );
             }
         }
+    }
+
+    const MAX: f64 = f64::MAX;
+
+    /// The boundaries C's table leaves out, against deadbands it never uses.
+    /// Every expectation is C's `delta > deadband` with `delta` from
+    /// recGbl.c:348-363: finite operands give `fabs(old - new)`, which is
+    /// `inf` when the subtraction overflows; a NaN/inf mismatch or opposite
+    /// infinities give `epicsINF`; both NaN and same-signed infinities keep
+    /// `delta = 0`. A NaN deadband fails every compare, an `inf` one fails
+    /// every compare including `inf > inf`, and `-inf` passes even `0`.
+    #[test]
+    fn matches_c_at_the_non_finite_and_overflow_boundaries() {
+        // [oldval, newval] and C's delta for the pair.
+        let pairs: [(f64, f64, f64); 13] = [
+            (MAX, -MAX, INF), // finite operands, the subtraction overflows
+            (-MAX, MAX, INF),
+            (1.0, NAN, INF),
+            (NAN, 1.0, INF),
+            (1.0, INF, INF),
+            (INF, 1.0, INF),
+            (1.0, -INF, INF),
+            (-INF, 1.0, INF),
+            (INF, -INF, INF),
+            (-INF, INF, INF),
+            (NAN, NAN, 0.0),
+            (INF, INF, 0.0),
+            (1.0, 2.0, 1.0),
+        ];
+        // deadband, then the expected update per pair.
+        let expected: [(f64, [bool; 13]); 5] = [
+            (
+                0.0,
+                [
+                    true, true, true, true, true, true, true, true, true, true, false, false, true,
+                ],
+            ),
+            (
+                MAX,
+                [
+                    true, true, true, true, true, true, true, true, true, true, false, false, false,
+                ],
+            ),
+            (INF, [false; 13]),
+            (NAN, [false; 13]),
+            (-INF, [true; 13]),
+        ];
+
+        for (deadband, row) in expected {
+            for ((oldval, newval, delta), want) in pairs.iter().zip(row) {
+                assert_eq!(
+                    check_deadband(*newval, Some(*oldval), deadband),
+                    want,
+                    "deadband={deadband} oldval={oldval} newval={newval} (C delta={delta})"
+                );
+            }
+        }
+    }
+
+    /// Deadband 0 posts any change at all: C's `delta > 0` holds for one ulp
+    /// and for the smallest subnormal, and fails only for an equal value.
+    #[test]
+    fn zero_deadband_posts_one_ulp_but_not_an_equal_value() {
+        assert!(!check_deadband(1.0, Some(1.0), 0.0));
+        assert!(check_deadband(1.0_f64.next_up(), Some(1.0), 0.0));
+        assert!(check_deadband(1.0, Some(1.0_f64.next_up()), 0.0));
+        assert!(check_deadband(f64::from_bits(1), Some(0.0), 0.0));
+        assert!(check_deadband(0.0, Some(-f64::from_bits(1)), 0.0));
+    }
+
+    /// C's compare is strict: a change of exactly the deadband does not post,
+    /// in either direction, and one ulp below the deadband does.
+    #[test]
+    fn a_change_of_exactly_the_deadband_does_not_post() {
+        assert!(!check_deadband(2.5, Some(1.0), 1.5));
+        assert!(!check_deadband(1.0, Some(2.5), 1.5));
+        assert!(check_deadband(2.5, Some(1.0), 1.5_f64.next_down()));
+        assert!(check_deadband(1.0, Some(2.5), 1.5_f64.next_down()));
     }
 }
 

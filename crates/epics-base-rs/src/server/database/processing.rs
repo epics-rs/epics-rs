@@ -963,6 +963,16 @@ impl InputLinkTexts {
         }
     }
 
+    /// The links of a type that declares none: read, and none set.
+    pub(crate) fn read_none() -> Self {
+        Self {
+            links: &[],
+            own: &[],
+            wired: 0,
+            read: true,
+        }
+    }
+
     /// The record's own set links, as `instance` holds them now.
     pub(crate) fn read_own(instance: &RecordInstance) -> Self {
         let own = instance.record.multi_input_links();
@@ -3965,7 +3975,11 @@ impl PvDatabase {
                     instance.common.lcnt = 0;
                     false
                 };
-            let input_link_texts = Self::read_input_link_texts(instance);
+            let input_link_texts = if plan.has_multi_input_links {
+                Self::read_input_link_texts(instance)
+            } else {
+                InputLinkTexts::read_none()
+            };
             // C reads a link-backed field's metadata live inside the rset,
             // under the TARGET record's lock (`dbDbLink.c:240-261`). A poster
             // here holds THIS record's lock and cannot reach for a second one,
@@ -8253,7 +8267,9 @@ impl PvDatabase {
             };
 
             let resolved = siml_link.is_none().then(|| {
-                let moved = if pact_held {
+                // `recGblSaveSimm` and `recGblCheckSimm` both return on the
+                // `*psscn == USHRT_MAX` test, so an unset SSCN owes neither.
+                let moved = if pact_held || instance.common.sscn.is_unset() {
                     None
                 } else {
                     instance.rec_gbl_save_simm();
@@ -8928,6 +8944,23 @@ mod input_link_texts_tests {
         assert!(!texts.is_set(links.len() - 1), "the last is too");
         assert!(!texts.none_set());
         assert!(InputLinkTexts::read_own(&calc()).none_set());
+    }
+
+    /// The boundary the plan flag draws: a type with no multi-input links
+    /// reads as "read, none set" without asking the record, and a type with
+    /// them is not that.
+    #[test]
+    fn a_type_with_no_multi_input_links_reads_as_none_set() {
+        use crate::server::record::record_instance::ProcessPlan;
+        let ai = RecordInstance::new_boxed(
+            "AI".to_string(),
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        );
+        assert!(ai.record.multi_input_links().is_empty());
+        assert!(!ProcessPlan::of(&*ai.record).has_multi_input_links);
+        assert!(InputLinkTexts::read_none().none_set());
+        assert!(InputLinkTexts::read_own(&ai).none_set());
+        assert!(ProcessPlan::of(&*calc().record).has_multi_input_links);
     }
 
     #[test]

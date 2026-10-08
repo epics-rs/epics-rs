@@ -449,7 +449,9 @@ impl LockRecord {
     /// Whether this record still locks through the bootstrap set, which is
     /// what `dblsr` reports as "no lock set" (`dbLock.c:900-901`).
     pub(crate) fn is_bootstrap(&self) -> bool {
-        std::ptr::eq(self.set(), bootstrap_set())
+        // The bootstrap set is the one set whose id is 0 (`FIRST_SET_ID` is 2),
+        // so the question is one load, not a `OnceLock` probe.
+        self.set().id == 0
     }
 
     /// C `dbScanLock`'s body (`dbLock.c:184-213`) — take the set the cell

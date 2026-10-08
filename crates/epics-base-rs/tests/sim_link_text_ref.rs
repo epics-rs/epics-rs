@@ -1,44 +1,70 @@
-use epics_base_rs::server::record::Record;
-use epics_base_rs::server::records::{
-    ai::AiRecord, ao::AoRecord, bi::BiRecord, bo::BoRecord, busy::BusyRecord, event::EventRecord,
-    histogram::HistogramRecord, int64in::Int64inRecord, int64out::Int64outRecord,
-    longin::LonginRecord, longout::LongoutRecord, lsi::LsiRecord, lso::LsoRecord, mbbi::MbbiRecord,
-    mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord, mbbo_direct::MbboDirectRecord,
-    stringin::StringinRecord, stringout::StringoutRecord, swait::SwaitRecord,
-    waveform::WaveformRecord,
-};
+use epics_base_rs::server::db_loader::create_record;
+use epics_base_rs::server::record::{FieldDeclaration, Record};
+use epics_base_rs::server::records::{busy::BusyRecord, swait::SwaitRecord};
 use epics_base_rs::types::EpicsValue;
 
+/// Every arm of `create_record_raw`'s base registry.
+const BASE_TYPES: &[&str] = &[
+    "ai",
+    "ao",
+    "bi",
+    "bo",
+    "stringin",
+    "stringout",
+    "longin",
+    "longout",
+    "int64in",
+    "int64out",
+    "lsi",
+    "lso",
+    "mbbi",
+    "mbbo",
+    "mbbiDirect",
+    "mbboDirect",
+    "event",
+    "printf",
+    "waveform",
+    "aai",
+    "aao",
+    "subArray",
+    "calc",
+    "fanout",
+    "seq",
+    "calcout",
+    "dfanout",
+    "compress",
+    "histogram",
+    "sel",
+    "sub",
+    "aSub",
+    "permissive",
+    "state",
+];
+
+fn declares_simm(rec: &dyn Record) -> bool {
+    rec.field_list().iter().any(|f| f.name == "SIMM")
+}
+
+/// The records the simulation block reads SIML/SIOL from: every base type
+/// that declares SIMM, the three waveform kinds included.
 fn sim_records() -> Vec<Box<dyn Record>> {
-    vec![
-        Box::new(AiRecord::default()),
-        Box::new(AoRecord::default()),
-        Box::new(BiRecord::default()),
-        Box::new(BoRecord::default()),
-        Box::new(BusyRecord::default()),
-        Box::new(EventRecord::default()),
-        Box::new(HistogramRecord::default()),
-        Box::new(Int64inRecord::default()),
-        Box::new(Int64outRecord::default()),
-        Box::new(LonginRecord::default()),
-        Box::new(LongoutRecord::default()),
-        Box::new(LsiRecord::default()),
-        Box::new(LsoRecord::default()),
-        Box::new(MbbiRecord::default()),
-        Box::new(MbbiDirectRecord::default()),
-        Box::new(MbboRecord::default()),
-        Box::new(MbboDirectRecord::default()),
-        Box::new(StringinRecord::default()),
-        Box::new(StringoutRecord::default()),
-        Box::new(SwaitRecord::default()),
-        Box::new(WaveformRecord::default()),
-    ]
+    let mut records: Vec<Box<dyn Record>> = BASE_TYPES
+        .iter()
+        .map(|t| create_record(t).unwrap())
+        .collect();
+    // busy and swait are module-owned, not in the base registry.
+    records.push(Box::new(BusyRecord::default()));
+    records.push(Box::new(SwaitRecord::default()));
+    records.retain(|rec| declares_simm(&**rec));
+    records
 }
 
 #[test]
 fn sim_links_are_lent_as_the_text_get_field_serves() {
+    let records = sim_records();
+    assert_eq!(records.len(), 23, "the SIMM-declaring population changed");
     let mut failures = Vec::new();
-    for mut rec in sim_records() {
+    for mut rec in records {
         let rt = rec.record_type();
         if rec.link_text_ref("SIML") != Some("") || rec.link_text_ref("SIOL") != Some("") {
             failures.push(format!(

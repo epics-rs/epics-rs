@@ -960,9 +960,12 @@ mod tests {
             let rec = db.get_record(from).expect("record");
             let mut inst = rec.write();
             inst.common.flnk = to.to_string();
-            inst.parsed_flnk = crate::server::record::parse_link_field(
-                to,
-                crate::server::record::LinkFieldType::Fwd,
+            inst.set_link_cache(
+                "FLNK",
+                crate::server::record::parse_link_field(
+                    to,
+                    crate::server::record::LinkFieldType::Fwd,
+                ),
             );
         }
         db.build_lock_sets();

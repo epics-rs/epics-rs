@@ -1,4 +1,6 @@
 pub(crate) mod breakpoint;
+#[cfg(test)]
+mod cycle_plan_tests;
 pub mod db_access;
 mod field_io;
 pub mod filters;
@@ -2629,7 +2631,7 @@ impl PvDatabase {
         let put = if inst.common_link_text(field).is_some() {
             inst.put_common_field_db_load(field, value).map(|_| ())
         } else {
-            inst.record.put_field(field, value)
+            inst.put_declared_field(field, value)
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");
         // C brackets every link write with the special pair — `dbPutSpecial`

@@ -2647,7 +2647,8 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
         let mut inst = rec.write();
         inst.common.dtyp = "Raw Soft Channel".into();
         inst.common.inp = "SRC_LI".to_string();
-        inst.parsed_inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
+        let inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
+        inst.set_link_cache("INP", inp);
         inst.record
             .put_field("MASK", EpicsValue::Long(0x0F))
             .unwrap();
@@ -6797,7 +6798,8 @@ async fn test_tsel_cp_link_registration() {
     if let Some(rec_arc) = db.get_record("TARGET") {
         let mut inst = rec_arc.write();
         inst.common.tsel = "TSE_SRC CP".to_string();
-        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.set_link_cache("TSEL", tsel);
     }
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("TSE_SRC");
@@ -6839,7 +6841,8 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
         let rec = db.get_record("TS_DST").unwrap();
         let mut inst = rec.write();
         inst.common.tsel = "TSE_SRC.TIME".to_string();
-        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.set_link_cache("TSEL", tsel);
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6912,7 +6915,8 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         let rec = db.get_record("TS_CADST").unwrap();
         let mut inst = rec.write();
         inst.common.tsel = "ca://TSE_SRC.TIME".to_string();
-        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.set_link_cache("TSEL", tsel);
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6988,7 +6992,8 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         let rec = db.get_record("TS_NLDST").unwrap();
         let mut inst = rec.write();
         inst.common.tsel = "TSE_SRC.TIME".to_string();
-        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+        let tsel = parse_link_v2(&inst.common.tsel);
+        inst.set_link_cache("TSEL", tsel);
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

@@ -827,11 +827,11 @@ fn test_link_cache_invalidation() {
     let rec = AiRecord::new(0.0);
     let mut instance = RecordInstance::new("TEMP".into(), rec);
 
-    assert_eq!(instance.parsed_inp, ParsedLink::None);
+    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
     instance
         .put_common_field("INP", EpicsValue::String("SOURCE.VAL".into()))
         .unwrap();
-    if let ParsedLink::Db(ref db) = instance.parsed_inp {
+    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
         assert_eq!(db.target().record, "SOURCE");
     } else {
         panic!("expected Db link");
@@ -840,7 +840,7 @@ fn test_link_cache_invalidation() {
     instance
         .put_common_field("INP", EpicsValue::String("OTHER".into()))
         .unwrap();
-    if let ParsedLink::Db(ref db) = instance.parsed_inp {
+    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
         assert_eq!(db.pvname(), "OTHER");
     } else {
         panic!("expected Db link");
@@ -849,7 +849,7 @@ fn test_link_cache_invalidation() {
     instance
         .put_common_field("INP", EpicsValue::String("".into()))
         .unwrap();
-    assert_eq!(instance.parsed_inp, ParsedLink::None);
+    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
 }
 
 #[test]

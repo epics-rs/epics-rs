@@ -1543,7 +1543,7 @@ impl PvDatabase {
                     }
                     PutRequest::Write(value) => {
                         special_before_put(&mut instance, &field);
-                        match instance.record.put_field(&field, value.clone()) {
+                        match instance.put_declared_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
                                 // C `dbPut` (dbAccess.c:1399-1405) keeps the value
@@ -1875,7 +1875,7 @@ impl PvDatabase {
                     }
                     PutRequest::Write(value) => {
                         special_before_put(&mut instance, &field);
-                        match instance.record.put_field(&field, value.clone()) {
+                        match instance.put_declared_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
                                 // C returns the after-put special() status from
@@ -2957,7 +2957,7 @@ impl PvDatabase {
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        match instance.record.put_field(&field, value.clone()) {
+                        match instance.put_declared_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
                                 // C returns the after-put special() status from
@@ -3503,7 +3503,7 @@ impl PvDatabase {
                         value,
                     ) {
                         Ok(crate::types::c_parse::Converted::Stored(v)) => {
-                            match instance.record.put_field(&field, v.clone()) {
+                            match instance.put_declared_field(&field, v.clone()) {
                                 Ok(()) => None,
                                 Err(CaError::FieldNotFound(_)) => {
                                     instance.put_common_field(&field, v)?;
@@ -3526,7 +3526,7 @@ impl PvDatabase {
                             &field,
                             value,
                         );
-                        match instance.record.put_field(&field, value.clone()) {
+                        match instance.put_declared_field(&field, value.clone()) {
                             Ok(()) => None,
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?;

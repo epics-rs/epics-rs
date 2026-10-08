@@ -167,9 +167,9 @@ record(ownsOut, "SCALER:2") {
     assert_eq!(instance.common.out, "TARGET:PV PP");
     // Framework dispatch: unarmed, because the record type owns the field.
     assert!(
-        matches!(instance.parsed_out, ParsedLink::None),
+        matches!(instance.parsed_out.link(), ParsedLink::None),
         "framework OUT dispatch must stay unarmed for a record that owns OUT, \
          got {:?}",
-        instance.parsed_out
+        instance.parsed_out.link()
     );
 }

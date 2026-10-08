@@ -89,7 +89,10 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
         inst.common.inp = "ca://UP:PV CP".to_string();
-        inst.parsed_inp = epics_base_rs::server::record::parse_link_v2("ca://UP:PV CP");
+        inst.set_link_cache(
+            "INP",
+            epics_base_rs::server::record::parse_link_v2("ca://UP:PV CP"),
+        );
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;

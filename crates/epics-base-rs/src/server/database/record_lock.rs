@@ -2641,6 +2641,53 @@ mod tests {
         assert!(!set.is_locked());
     }
 
+    /// Boundary: an exclusive borrow through `write_in` is refused at the
+    /// park as a shared one is.
+    #[test]
+    fn a_park_with_a_live_write_in_borrow_of_the_record_panics_at_the_park() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "UB:WIN");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let gate = FrameGate::of_held(cell.lock_record());
+            let frame = gate.frame(&cell);
+            let _b = frame.write();
+            cell.unheld(|| ());
+        }));
+        assert!(r.is_err());
+        assert!(set.is_locked());
+        drop(outer);
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: a borrow of ANOTHER record, held by an outer frame, is
+    /// refused at the park of this one (debug builds count borrows per thread;
+    /// release builds keep the per-record check only).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_park_with_a_live_borrow_of_another_record_panics_at_the_park() {
+        let db = PvDatabase::new();
+        let outer_cell = adopted_cell(&db, "UB:OUTER");
+        let parked = adopted_cell(&db, "UB:PARKED");
+        let outer = db.lock_instance(&outer_cell);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let gate = FrameGate::of_held(outer_cell.lock_record());
+            let frame = gate.frame(&outer_cell);
+            let _b = frame.read();
+            let _inner = db.lock_instance(&parked);
+            parked.unheld(|| ());
+        }));
+        let msg = r.expect_err("the park must be refused");
+        let msg = msg
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| msg.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(msg.contains("borrow of a record in its set"), "{msg}");
+        drop(outer);
+    }
+
     /// Boundary: a panic inside a frame body, with a nested frame on the
     /// same set and the record borrowed for writing, unwinds every hold. C
     /// has no unwinding to compare against; the port must not leave the
@@ -2706,7 +2753,7 @@ mod tests {
             let src = db.get_record("LF:SRC").expect("record");
             let mut inst = src.write();
             inst.common.inp = "LF:DST".to_string();
-            inst.parsed_inp = parse_link_field("LF:DST", LinkFieldType::In);
+            inst.set_link_cache("INP", parse_link_field("LF:DST", LinkFieldType::In));
         }
         db.build_lock_sets();
         let locks = &db.inner.record_locks;

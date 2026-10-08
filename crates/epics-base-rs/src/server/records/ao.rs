@@ -541,15 +541,6 @@ impl Record for AoRecord {
         }
     }
 
-    /// C never calls `db_post_events` on `oraw`/`orbv` — they are bookkeeping
-    /// for the RVAL/RBV posts above, not fields any C `monitor()` emits. The
-    /// generic change-detection loop would post them, so they are excluded
-    /// from it here; a `caput` to either still posts through the put path, as
-    /// it does for every field.
-    fn event_posted_fields(&self) -> &'static [&'static str] {
-        &["ORAW", "ORBV"]
-    }
-
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // DOL/OMSL handling is done by the framework (processing.rs):
         // - A real (DB/CA/PVA) link is fetched and applied to VAL before

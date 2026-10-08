@@ -944,6 +944,95 @@ impl SimmBlock {
 }
 
 impl ProcessPlan {
+    /// The type-static half of [`CyclePlan::ConstSoftIn`]: the `ai`/`bi`
+    /// shape with no simulation block, which the arm's per-cycle SIMM test
+    /// makes equivalent to the declared one.
+    pub(crate) const PLAIN_INPUT: ProcessPlan = ProcessPlan {
+        dset_can_refuse: true,
+        simm: None,
+        sel_nvl: false,
+        string_input: false,
+        multi_output_dispatch: false,
+        reads_sell: false,
+        posts_software_event: false,
+        resolves_subroutine_from_link: false,
+        substitutes_input_stage_when_simulating: false,
+        redecides_after_output: false,
+        acts_before_process: false,
+        hooks: crate::server::record::CycleHooks::NONE,
+        input_fetch_policy: crate::server::record::InputFetchPolicy::ReadAll,
+        constants_deliver_at_process: false,
+        multi_input_is_db_get_link: true,
+        multi_inputs_read_native: true,
+        dispatches_generic_multi_output: false,
+        has_multi_input_links: false,
+        narrows_input_links: false,
+        output_stage: false,
+        fetches_dol_closed_loop: false,
+        soft_channel_skips_convert: true,
+        skips_timestamp_when_undefined: false,
+        restamps_time_after_completion: false,
+        clears_udf: true,
+    };
+
+    /// Whether this type's cycle is [`Self::PLAIN_INPUT`] once the simulation
+    /// block is set aside. Compared field by field so a field added to the
+    /// struct fails to compile here rather than silently defaulting.
+    pub(crate) fn is_plain_input(&self) -> bool {
+        let ProcessPlan {
+            dset_can_refuse,
+            simm: _,
+            sel_nvl,
+            string_input,
+            multi_output_dispatch,
+            reads_sell,
+            posts_software_event,
+            resolves_subroutine_from_link,
+            substitutes_input_stage_when_simulating,
+            redecides_after_output,
+            acts_before_process,
+            hooks,
+            input_fetch_policy,
+            constants_deliver_at_process,
+            multi_input_is_db_get_link,
+            multi_inputs_read_native,
+            dispatches_generic_multi_output,
+            has_multi_input_links,
+            narrows_input_links,
+            output_stage,
+            fetches_dol_closed_loop,
+            soft_channel_skips_convert,
+            skips_timestamp_when_undefined,
+            restamps_time_after_completion,
+            clears_udf,
+        } = *self;
+        let p = &Self::PLAIN_INPUT;
+        dset_can_refuse == p.dset_can_refuse
+            && sel_nvl == p.sel_nvl
+            && string_input == p.string_input
+            && multi_output_dispatch == p.multi_output_dispatch
+            && reads_sell == p.reads_sell
+            && posts_software_event == p.posts_software_event
+            && resolves_subroutine_from_link == p.resolves_subroutine_from_link
+            && substitutes_input_stage_when_simulating == p.substitutes_input_stage_when_simulating
+            && redecides_after_output == p.redecides_after_output
+            && acts_before_process == p.acts_before_process
+            && hooks == p.hooks
+            && input_fetch_policy == p.input_fetch_policy
+            && constants_deliver_at_process == p.constants_deliver_at_process
+            && multi_input_is_db_get_link == p.multi_input_is_db_get_link
+            && multi_inputs_read_native == p.multi_inputs_read_native
+            && dispatches_generic_multi_output == p.dispatches_generic_multi_output
+            && has_multi_input_links == p.has_multi_input_links
+            && narrows_input_links == p.narrows_input_links
+            && output_stage == p.output_stage
+            && fetches_dol_closed_loop == p.fetches_dol_closed_loop
+            && soft_channel_skips_convert == p.soft_channel_skips_convert
+            && skips_timestamp_when_undefined == p.skips_timestamp_when_undefined
+            && restamps_time_after_completion == p.restamps_time_after_completion
+            && clears_udf == p.clears_udf
+    }
+
     /// The answers, asked of the record type once. Pure in the record's
     /// type: every input is a `Record` method or a table keyed on its name,
     /// so the plan is the same whenever it is built.
@@ -1011,6 +1100,62 @@ pub(crate) struct UdfAlarm {
     pub(crate) exact_one: bool,
     pub(crate) severity: Option<crate::server::record::AlarmSeverity>,
     pub(crate) message: &'static str,
+}
+
+mod link_cache {
+    use crate::server::record::ParsedLink;
+
+    /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
+    /// replaceable only from `record_instance` — through
+    /// `RecordInstance::set_link_cache`, which stamps the `CyclePlan`.
+    #[derive(Debug)]
+    pub struct LinkCache(ParsedLink);
+
+    impl LinkCache {
+        pub(super) const fn none() -> Self {
+            LinkCache(ParsedLink::None)
+        }
+
+        pub fn link(&self) -> &ParsedLink {
+            &self.0
+        }
+
+        pub(super) fn replace(&mut self, link: ParsedLink) {
+            self.0 = link;
+        }
+    }
+
+    impl std::ops::Deref for LinkCache {
+        type Target = ParsedLink;
+
+        fn deref(&self) -> &ParsedLink {
+            &self.0
+        }
+    }
+}
+
+pub use link_cache::LinkCache;
+
+/// How one process cycle of one record instance runs, resolved from the
+/// instance's own link kinds and device type (where [`ProcessPlan`] holds what
+/// the record *type* fixes). Resolved by [`RecordInstance::cycle_plan`] and
+/// stale exactly when [`RecordInstance::invalidate_plan`] has run since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CyclePlan {
+    /// Every feature test runs: the cycle as the port always ran it.
+    General,
+    /// A soft-channel input record whose INP, SDIS and SIML are constants and
+    /// whose SSCN is unset, with the plan of [`ProcessPlan::PLAIN_INPUT`]: the
+    /// cycle with those answers folded in. SIMM and the device slot are not
+    /// part of the stamp; [`RecordInstance::cycle_plan`] tests them per cycle.
+    ConstSoftIn,
+    /// [`Self::ConstSoftIn`] with INP a non-PP DB link read at the type's
+    /// request and TSE not -2: the input stage is the in-guard slot read of
+    /// `soft_db_inp_stage` when the target resolves and is not this record,
+    /// the general stage otherwise. The request the record's dset makes of
+    /// INP, which DTYP alone decides, is stamped with it
+    /// ([`RecordInstance::plan_inp_as`]).
+    DbSoftIn,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -1120,6 +1265,40 @@ pub(crate) struct ProcessPlan {
     pub(crate) skips_timestamp_when_undefined: bool,
     pub(crate) restamps_time_after_completion: bool,
     pub(crate) clears_udf: bool,
+}
+
+/// How many record borrows this thread holds, in builds with debug
+/// assertions: the set-wide answer to "may this thread park, or enter a
+/// nested frame, now?" that the per-record borrow flag cannot give. A borrow
+/// is taken only by the thread holding the record's set, so a thread's count
+/// is the count of live borrows in every set it holds. Compiled out of
+/// release builds, where the park keeps its per-record check.
+pub(crate) mod live_borrows {
+    #[cfg(debug_assertions)]
+    thread_local! {
+        static LIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[inline(always)]
+    pub(super) fn taken() {
+        #[cfg(debug_assertions)]
+        LIVE.with(|c| c.set(c.get() + 1));
+    }
+
+    #[inline(always)]
+    pub(super) fn dropped() {
+        #[cfg(debug_assertions)]
+        LIVE.with(|c| c.set(c.get() - 1));
+    }
+
+    /// Borrows of record data this thread holds now; `0` where not counted.
+    #[inline(always)]
+    pub(crate) fn count() -> usize {
+        #[cfg(debug_assertions)]
+        return LIVE.with(|c| c.get());
+        #[cfg(not(debug_assertions))]
+        0
+    }
 }
 
 /// The allocation every holder of a record shares — the port's `precord`.
@@ -1401,6 +1580,7 @@ impl RecordCell {
             "record data read while this thread holds it for writing"
         );
         self.borrow.store(borrow + 1, Ordering::Relaxed);
+        live_borrows::taken();
         RecordRef {
             cell: self,
             _set: Some(set),
@@ -1434,6 +1614,7 @@ impl RecordCell {
             "record data read while this thread holds it for writing"
         );
         self.borrow.store(borrow + 1, Ordering::Relaxed);
+        live_borrows::taken();
         RecordRef {
             cell: self,
             _set: None,
@@ -1462,6 +1643,7 @@ impl RecordCell {
             "record data read while this thread holds it for writing"
         );
         self.borrow.store(borrow + 1, Ordering::Relaxed);
+        live_borrows::taken();
         RecordRef {
             cell: self,
             _set: None,
@@ -1483,6 +1665,7 @@ impl RecordCell {
             "record data written while this thread still holds a guard of it"
         );
         self.borrow.store(-1, Ordering::Relaxed);
+        live_borrows::taken();
         RecordMut {
             cell: self,
             _set: set,
@@ -1513,6 +1696,7 @@ impl RecordCell {
             "record data written while this thread still holds a guard of it"
         );
         self.borrow.store(-1, Ordering::Relaxed);
+        live_borrows::taken();
         HeldMut { cell: self, held }
     }
 
@@ -1551,6 +1735,13 @@ impl RecordCell {
             self.borrow.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "a record was given up to a park with a borrow of it live"
+        );
+        // A borrow of ANOTHER record in the set crosses the park just as
+        // unseen — an outer frame's `HeldMut` of the chain's entry record.
+        debug_assert_eq!(
+            live_borrows::count(),
+            0,
+            "a record was given up to a park with a borrow of a record in its set live"
         );
         self.lock_record.unheld(f)
     }
@@ -1598,6 +1789,7 @@ impl Drop for RecordRef<'_> {
         // the count is never touched by a thread outside the set.
         let borrow = self.cell.borrow.load(Ordering::Relaxed);
         self.cell.borrow.store(borrow - 1, Ordering::Relaxed);
+        live_borrows::dropped();
     }
 }
 
@@ -1666,6 +1858,7 @@ impl Drop for HeldMut<'_> {
         self.cell
             .borrow
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        live_borrows::dropped();
     }
 }
 
@@ -1674,6 +1867,7 @@ impl Drop for RecordMut<'_> {
         self.cell
             .borrow
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        live_borrows::dropped();
     }
 }
 
@@ -2002,7 +2196,7 @@ pub struct RecordInstance {
     /// kinds and a server can sweep them with one uniform test.
     destroyed: bool,
     // Link parse cache
-    pub parsed_inp: ParsedLink,
+    pub parsed_inp: LinkCache,
     /// The parsed form of each [`Record::multi_input_links`] slot the record
     /// has wired, validated against the text the record holds NOW on every
     /// read — see [`ParsedInputLink::validated`], the one writer. The record's
@@ -2017,10 +2211,10 @@ pub struct RecordInstance {
     /// SIMM-declaring record's first cycle; never set on any other type.
     parsed_siml: Option<SimLinkParse>,
     parsed_siol: Option<SimLinkParse>,
-    pub parsed_out: ParsedLink,
-    pub parsed_flnk: ParsedLink,
-    pub parsed_sdis: ParsedLink,
-    pub parsed_tsel: ParsedLink,
+    pub parsed_out: LinkCache,
+    pub parsed_flnk: LinkCache,
+    pub parsed_sdis: LinkCache,
+    pub parsed_tsel: LinkCache,
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
@@ -2196,6 +2390,19 @@ pub struct RecordInstance {
     /// its own `epicsCallback`, independent of the record's SDLY/async
     /// re-entry, so an SDLY defer must not cancel the watchdog nor vice versa.
     pub watchdog_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Revision of everything [`CyclePlan`] was resolved from. Bumped only by
+    /// [`Self::invalidate_plan`].
+    plan_rev: u32,
+    /// The plan resolved at `cycle_plan.0`; stale when that is not `plan_rev`.
+    cycle_plan: (u32, CyclePlan),
+    /// The request [`CyclePlan::DbSoftIn`] was stamped with; read only by that arm.
+    plan_inp_as: crate::server::record::LinkReadAs,
+    /// Test knob: run every cycle as [`CyclePlan::General`], the reference a
+    /// plain arm is compared against.
+    #[cfg(test)]
+    pub(crate) plan_forced_general: bool,
+    #[cfg(test)]
+    ran_arm: CyclePlan,
     /// Per-record info tags from `info("key", "value")` directives in
     /// the .db file (epics-base info(...) grammar). Consumers include
     /// asyn (`asyn:READBACK`), record-as-PV bridge tags
@@ -2503,6 +2710,12 @@ pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
     ("FLNK", super::link::LinkFieldType::Fwd),
 ];
 
+/// The previous-value trackers a C `monitor()` compares against and never
+/// posts: `oraw`/`orbv` (the last RVAL/RBV) on the raw-value records, and
+/// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type.
+/// A `caput` to one still posts, through the put path.
+const MONITOR_TRACKER_FIELDS: [&str; 5] = ["ORAW", "ORBV", "MLST", "ALST", "LALM"];
+
 impl RecordInstance {
     pub fn new(name: String, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
@@ -2521,19 +2734,22 @@ impl RecordInstance {
         })
     }
 
-    /// The parse cache of one `COMMON_LINK_FIELDS` entry, or `None` for any
-    /// other field name. The only mutable handle on the cache outside
-    /// `put_common_field`, so the iocInit locality commit cannot reach a slot
-    /// that has no matching raw text.
-    pub fn common_link_cache_mut(&mut self, field: &str) -> Option<&mut ParsedLink> {
-        Some(match field {
+    /// Replace the parse cache of one `COMMON_LINK_FIELDS` entry, or return
+    /// `false` for any other field name. The only writer of the five caches
+    /// ([`LinkCache`] has no other way in), so the plan stamp they feed is
+    /// bumped here and cannot be skipped.
+    pub fn set_link_cache(&mut self, field: &str, link: ParsedLink) -> bool {
+        let slot = match field {
             "INP" => &mut self.parsed_inp,
             "OUT" => &mut self.parsed_out,
             "TSEL" => &mut self.parsed_tsel,
             "SDIS" => &mut self.parsed_sdis,
             "FLNK" => &mut self.parsed_flnk,
-            _ => return None,
-        })
+            _ => return false,
+        };
+        slot.replace(link);
+        self.invalidate_plan();
+        true
     }
 
     /// The link fields whose target metadata this record's rset serves — the
@@ -2625,6 +2841,125 @@ impl RecordInstance {
         crate::server::database::alarm_field_posts(&self.common, &alarm_result)
     }
 
+    /// The plan this cycle runs under, re-resolved when anything it was
+    /// resolved from has changed since.
+    #[inline(always)]
+    pub(crate) fn cycle_plan(&mut self, plan: &ProcessPlan, is_continuation: bool) -> CyclePlan {
+        if self.cycle_plan.0 != self.plan_rev {
+            self.replan(plan);
+        }
+        #[cfg(test)]
+        if self.plan_forced_general {
+            return CyclePlan::General;
+        }
+        let arm = match self.cycle_plan.1 {
+            // What the stamp does not own: SIMM is a record field a client
+            // writes, the device slot is set by init, and a continuation
+            // re-enters with PACT held.
+            CyclePlan::ConstSoftIn | CyclePlan::DbSoftIn
+                if is_continuation
+                    || self.device.is_some()
+                    || self.record.simm_cells().is_none_or(|c| c.simm != 0) =>
+            {
+                CyclePlan::General
+            }
+            p => p,
+        };
+        #[cfg(test)]
+        {
+            self.ran_arm = arm;
+        }
+        arm
+    }
+
+    /// The INP request stamped with [`CyclePlan::DbSoftIn`].
+    #[inline(always)]
+    pub(crate) fn plan_inp_as(&self) -> crate::server::record::LinkReadAs {
+        self.plan_inp_as
+    }
+
+    /// The arm the last cycle dispatched to, for the differential harness.
+    #[cfg(test)]
+    pub(crate) fn ran_arm(&self) -> CyclePlan {
+        self.ran_arm
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn replan(&mut self, plan: &ProcessPlan) {
+        let plain = plan.is_plain_input()
+            && self.common.dtyp.is_soft()
+            && self.common.sscn.is_unset()
+            && crate::server::recgbl::simm::is_constant(self.parsed_sdis.link())
+            && plan.simm.is_some_and(|simm| {
+                crate::server::recgbl::simm::is_constant(self.sim_link_parse(
+                    SimLink::Siml,
+                    simm.siml,
+                    LinkFieldType::In,
+                ))
+            });
+        let db_request = || match self.parsed_inp.link() {
+            ParsedLink::Db(db)
+                if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
+                    && self.common.tse != -2 =>
+            {
+                match crate::server::record::InputLinkRequest::for_inp(
+                    &*self.record,
+                    self.common.dtyp.soft(),
+                ) {
+                    crate::server::record::InputLinkRequest::As(read_as) => Some(read_as),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let arm = if !plain {
+            CyclePlan::General
+        } else if crate::server::recgbl::simm::is_constant(self.parsed_inp.link()) {
+            CyclePlan::ConstSoftIn
+        } else if let Some(read_as) = db_request() {
+            self.plan_inp_as = read_as;
+            CyclePlan::DbSoftIn
+        } else {
+            CyclePlan::General
+        };
+        self.cycle_plan = (self.plan_rev, arm);
+    }
+
+    /// The single owner of [`CyclePlan`] staleness: whatever the plan was
+    /// resolved from — a link text, DTYP, TSE, TSEL, SSCN — changed.
+    pub(crate) fn invalidate_plan(&mut self) {
+        self.plan_rev = self.plan_rev.wrapping_add(1);
+    }
+
+    /// [`Self::invalidate_plan`] when `field` is one the plan reads. Both
+    /// field-put funnels — the common one and [`Self::put_declared_field`] —
+    /// ask it, so the list of such fields has one home.
+    pub(crate) fn invalidate_plan_for(&mut self, field: &str) {
+        if matches!(
+            field,
+            "FLNK" | "INP" | "OUT" | "DTYP" | "TSE" | "TSEL" | "SSCN" | "SDIS" | "SIML" | "SIOL"
+        ) {
+            self.invalidate_plan();
+        }
+    }
+
+    /// [`Self::put_declared_field`] for the framework's own stores
+    /// (`Record::put_field_internal`): device property posts, `post_fields`,
+    /// withheld `post_write_fields`.
+    pub(crate) fn put_internal_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        self.invalidate_plan_for(field);
+        self.record.put_field_internal(field, value)
+    }
+
+    /// The funnel for a put of a field the record TYPE declares (as opposed
+    /// to `dbCommon`'s): `Record::put_field` plus the plan stamp. A record
+    /// type's own link text (SIML, SIOL) is changed only through here.
+    pub(crate) fn put_declared_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        self.invalidate_plan_for(field);
+        self.record.put_field(field, value)
+    }
+
     /// This cycle's forward link, resolved from the two things C's
     /// `dbScanFwdLink` reads: the record's own veto
     /// ([`Record::should_fire_forward_link`]) and `FLNK`'s parsed kind.
@@ -2636,10 +2971,11 @@ impl RecordInstance {
     /// database paid a second acquisition and a second `should_fire_forward_link`
     /// call once a cycle, and the two derivations could disagree about a
     /// record whose veto changed in between.
+    #[inline(always)]
     pub(crate) fn forward_target(&self) -> ForwardTarget {
         // The link kind goes first: with nothing to fire (the common empty
         // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
-        match &self.parsed_flnk {
+        match self.parsed_flnk.link() {
             ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
                 name: l.target().record.clone(),
                 putf: self.common.putf,
@@ -2857,11 +3193,11 @@ impl RecordInstance {
             record,
             common,
             subscribers: HashMap::new(),
-            parsed_inp: ParsedLink::None,
-            parsed_out: ParsedLink::None,
-            parsed_flnk: ParsedLink::None,
-            parsed_sdis: ParsedLink::None,
-            parsed_tsel: ParsedLink::None,
+            parsed_inp: LinkCache::none(),
+            parsed_out: LinkCache::none(),
+            parsed_flnk: LinkCache::none(),
+            parsed_sdis: LinkCache::none(),
+            parsed_tsel: LinkCache::none(),
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
             parsed_siml: None,
             parsed_siol: None,
@@ -2882,6 +3218,13 @@ impl RecordInstance {
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watchdog_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            plan_rev: 1,
+            cycle_plan: (0, CyclePlan::General),
+            plan_inp_as: crate::server::record::LinkReadAs::Native,
+            #[cfg(test)]
+            plan_forced_general: false,
+            #[cfg(test)]
+            ran_arm: CyclePlan::General,
             info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
         }
@@ -5136,6 +5479,9 @@ impl RecordInstance {
                 super::check_json_link_text(&text)?;
             }
         }
+        // The common fields a `CyclePlan` is resolved from. This is the funnel
+        // for them, so the stamp is bumped here and not per arm.
+        self.invalidate_plan_for(name.as_str());
         match name.as_str() {
             // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
             // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
@@ -5260,7 +5606,7 @@ impl RecordInstance {
             "FLNK" => {
                 if let EpicsValue::String(s) = value {
                     self.common.flnk = s.as_str_lossy().into_owned();
-                    self.parsed_flnk = parse_forward_link_v2(&self.common.flnk);
+                    self.set_link_cache("FLNK", parse_forward_link_v2(&self.common.flnk));
                 }
             }
             "INP" => {
@@ -5276,7 +5622,7 @@ impl RecordInstance {
                     self.check_link_assignment("INP", &s.as_str_lossy(), bound)?;
                     self.common.inp = s.as_str_lossy().into_owned();
                     if !self.record_declares_field("INP") {
-                        self.parsed_inp = parse_link_v2(&self.common.inp);
+                        self.set_link_cache("INP", parse_link_v2(&self.common.inp));
                     }
                 }
             }
@@ -5309,7 +5655,7 @@ impl RecordInstance {
                     // default that `parse_link_v2` would otherwise
                     // apply.
                     if !self.record_declares_field("OUT") {
-                        self.parsed_out = parse_output_link_v2(&self.common.out);
+                        self.set_link_cache("OUT", parse_output_link_v2(&self.common.out));
                     }
                     // C `longoutRecord.c::special` (PR #6c573b4 part 2)
                     // and similar OOCH-style hooks need `after=true`
@@ -5355,7 +5701,7 @@ impl RecordInstance {
             "TSEL" => {
                 if let EpicsValue::String(s) = value {
                     self.common.tsel = s.as_str_lossy().into_owned();
-                    self.parsed_tsel = parse_link_v2(&self.common.tsel);
+                    self.set_link_cache("TSEL", parse_link_v2(&self.common.tsel));
                 }
             }
             "UTAG" => {
@@ -5476,7 +5822,7 @@ impl RecordInstance {
             "SDIS" => {
                 if let EpicsValue::String(s) = value {
                     self.common.sdis = s.as_str_lossy().into_owned();
-                    self.parsed_sdis = parse_link_v2(&self.common.sdis);
+                    self.set_link_cache("SDIS", parse_link_v2(&self.common.sdis));
                 }
             }
             "DISS" => {
@@ -5582,7 +5928,7 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     self.common.out = s.as_str_lossy().into_owned();
                     // Bare OUT link is NPP — see the "OUT" arm.
-                    self.parsed_out = parse_output_link_v2(&self.common.out);
+                    self.set_link_cache("OUT", parse_output_link_v2(&self.common.out));
                 }
             }
             // C `dbNameToAddr` (dbAccess.c:660-676) resolves the field part
@@ -6086,7 +6432,7 @@ impl RecordInstance {
     /// * The deadband field (default VAL), the
     ///   [`recgbl::RECGBL_POSTED_ALARM_FIELDS`](crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS)
     ///   (SEVR/STAT/AMSG/ACKS) and UDF are emitted by the caller with their own
-    ///   C masks and are skipped here.
+    ///   C masks and are skipped here, as are the [`MONITOR_TRACKER_FIELDS`].
     /// * [`Record::event_posted_fields`] post from their own event path
     ///   (waveform HASH) — never from change detection.
     /// * [`Record::process_posted_fields`], when declared, is the closed set of
@@ -6232,6 +6578,7 @@ impl RecordInstance {
                 // still posts, through the generic put path).
                 || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field.as_str())
                 || field == "UDF"
+                || MONITOR_TRACKER_FIELDS.contains(&field.as_str())
                 || event_posted.contains(&field.as_str())
                 || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
@@ -6595,7 +6942,7 @@ impl RecordInstance {
         // this path. Same store-then-`DBE_VALUE`-post as
         // `PvDatabase::publish_post_write_fields`.
         for (field, value) in outcome.post_write_fields {
-            if self.record.put_field_internal(&field, value).is_ok() {
+            if self.put_internal_field(&field, value).is_ok() {
                 self.notify_field_written(&field);
                 self.notify_field(&field, crate::server::recgbl::EventMask::VALUE);
             }
@@ -6734,6 +7081,7 @@ impl RecordInstance {
     /// feeds into [`Self::deadband_post`] and [`Self::collect_subscriber_posts`].
     /// Keeping it in one place is what stops the rule from holding on the
     /// synchronous path but not the async-continuation / put-notify paths.
+    #[inline(always)]
     pub(crate) fn value_include_classes(&mut self) -> (bool, bool) {
         // fanout/seq "trigger" records post VAL only with the alarm events
         // `recGblResetAlarms` returns, never DBE_VALUE/DBE_LOG — see
@@ -6766,6 +7114,7 @@ impl RecordInstance {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn deadband_post(
         &self,
         alarm_bits: EventMask,
@@ -6813,6 +7162,7 @@ impl RecordInstance {
         }
     }
 
+    #[inline(always)]
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
         // C waveform/aai/aao `monitor()` (waveformRecord.c:291-326) replaces
         // the analog MDEL/ADEL deadband with the MPST/APST "Always vs On
@@ -8006,7 +8356,7 @@ impl RecordInstance {
 
     /// Empty the INP link's address cell (`DbLink::release_addr`).
     fn release_inp_addr(&mut self) {
-        if let ParsedLink::Db(db) = &self.parsed_inp {
+        if let ParsedLink::Db(db) = self.parsed_inp.link() {
             // SAFETY: `&mut self` excludes every `PvDatabase::inp_addr`
             // borrow, the only lender of this cell.
             unsafe { db.release_addr() }

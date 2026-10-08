@@ -668,7 +668,7 @@ impl PvDatabase {
         instance: &'g crate::server::record::RecordInstance,
     ) -> Option<&'g crate::server::record::record_instance::ResolvedTarget> {
         use crate::server::record::record_instance::LinkTargetResolver;
-        let crate::server::record::ParsedLink::Db(db) = &instance.parsed_inp else {
+        let crate::server::record::ParsedLink::Db(db) = instance.parsed_inp.link() else {
             return None;
         };
         // SAFETY: `release_addr` runs only with the reader exclusively
@@ -4007,11 +4007,8 @@ impl PvDatabase {
             let mut inst = rec.write();
             for (field, link) in rewrites {
                 let is_refusal = matches!(link, crate::server::record::ParsedLink::None);
-                if let Some(slot) = inst.common_link_cache_mut(field) {
-                    *slot = link;
-                    if !is_refusal {
-                        converted += 1;
-                    }
+                if inst.set_link_cache(field, link) && !is_refusal {
+                    converted += 1;
                 }
             }
         }
@@ -4689,7 +4686,7 @@ mod cp_link_locality_tests {
             inst.common.inp = "SRC CP".to_string();
             // Seed the parse cache as load would, so the assertion proves
             // setup_cp_links leaves a local CP link untouched.
-            inst.parsed_inp = crate::server::record::parse_link_v2("SRC CP");
+            inst.set_link_cache("INP", crate::server::record::parse_link_v2("SRC CP"));
         }
 
         db.initialize_link_locality().await;

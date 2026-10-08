@@ -1820,6 +1820,13 @@ impl<'a> InFrame<'a> {
         self.cell.write_in(self.set)
     }
 
+    /// The set the frame holds, which a link target merged into it is read
+    /// under without taking it again.
+    #[inline(always)]
+    pub(crate) fn set(&self) -> &'a SetGuard {
+        self.set
+    }
+
     /// The record's process plan — fixed at construction, so no lock.
     #[inline(always)]
     pub(crate) fn process_plan(&self) -> &'a crate::server::record::record_instance::ProcessPlan {
@@ -2632,5 +2639,214 @@ mod tests {
         assert_eq!(set.depth.load(Ordering::Relaxed), 1);
         drop(outer);
         assert!(!set.is_locked());
+    }
+
+    /// Boundary: a panic inside a frame body, with a nested frame on the
+    /// same set and the record borrowed for writing, unwinds every hold. C
+    /// has no unwinding to compare against; the port must not leave the
+    /// set, its owner or the record's borrow flag behind for the next thread.
+    #[test]
+    fn a_panic_inside_a_frame_gives_the_set_and_the_record_back() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "FR:PANIC");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let gate = FrameGate::Taken(db.lock_instance(&cell));
+            db.with_frame(&cell, |inner| {
+                let mut held = inner.write();
+                held.common.putf = true;
+                let _outer = gate.frame(&cell);
+                panic!("frame body panicked");
+            })
+        }));
+        assert!(caught.is_err());
+
+        let set = cell.lock_record().set();
+        assert!(!set.is_locked(), "the mutex was released on unwind");
+        assert_eq!(set.depth.load(Ordering::Relaxed), 0);
+        assert_eq!(set.owner.load(Ordering::Acquire), 0);
+
+        // Another thread takes the set fresh and finds the borrow flag clear:
+        // `write` asserts it is, and a non-reentrant hold would block here.
+        let other = cell.clone();
+        std::thread::spawn(move || {
+            other.write().common.putf = false;
+        })
+        .join()
+        .expect("the next thread takes the set and the record");
+    }
+
+    /// One poll of a future that never suspends — `add_record` on a database
+    /// with no runtime work to wait for — so these tests stay reactor-free.
+    fn ready<F: std::future::Future>(fut: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(fut).poll(&mut cx) {
+            std::task::Poll::Ready(out) => out,
+            std::task::Poll::Pending => panic!("the future suspended"),
+        }
+    }
+
+    /// Boundary: a link-field write from inside a frame — an OUT link aimed
+    /// at its target's `FLNK` (`links.rs` `write_db_link_value` →
+    /// `put_pv_already_locked`). The put is refused, as C `dbPut` refuses a
+    /// link field, but the `link_field_write` guard still relinks while the
+    /// frame holds its set; the frame's record must stay in the held set
+    /// (Rule R). The frame's write borrow is released first: the relink
+    /// reads the frame record's link text.
+    #[test]
+    fn an_in_frame_link_field_write_keeps_the_frame_record_in_its_set() {
+        use crate::server::record::{LinkFieldType, parse_link_field};
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+
+        let db = PvDatabase::new();
+        for name in ["LF:SRC", "LF:DST", "LF:NEXT"] {
+            ready(db.add_record(name, Box::new(AiRecord::new(0.0)))).expect("add_record");
+        }
+        {
+            let src = db.get_record("LF:SRC").expect("record");
+            let mut inst = src.write();
+            inst.common.inp = "LF:DST".to_string();
+            inst.parsed_inp = parse_link_field("LF:DST", LinkFieldType::In);
+        }
+        db.build_lock_sets();
+        let locks = &db.inner.record_locks;
+        let before = locks.set_id_of("LF:SRC").expect("a set");
+        assert_eq!(locks.set_id_of("LF:DST"), Some(before));
+        assert_ne!(locks.set_id_of("LF:NEXT"), Some(before));
+
+        let src = db.get_record("LF:SRC").expect("record");
+        let gate = FrameGate::Taken(db.lock_instance(&src));
+        let frame = gate.frame(&src);
+        frame.write().common.putf = true;
+
+        let crate::server::record::ParsedLink::Db(link) =
+            crate::server::record::parse_output_link_v2("LF:DST.FLNK")
+        else {
+            panic!("a local DB link");
+        };
+        let alarm = super::super::links::LinkAlarm {
+            stat: 0,
+            sevr: crate::server::record::AlarmSeverity::NoAlarm,
+            amsg: Default::default(),
+        };
+        let mut visited = crate::server::database::ProcStack::new();
+        let failed = db.write_db_link_value(
+            &link,
+            EpicsValue::String("LF:NEXT".into()),
+            super::super::links::OutLinkSrc {
+                putf: false,
+                notify: None,
+                alarm: &alarm,
+                field: "OUT",
+            },
+            &mut visited,
+        );
+        assert!(failed, "dbPut refuses a link field");
+        assert_eq!(
+            db.get_record("LF:DST").expect("record").read().common.flnk,
+            ""
+        );
+
+        assert_eq!(
+            locks.set_id_of("LF:SRC"),
+            Some(before),
+            "the frame's record stayed"
+        );
+        assert_eq!(locks.set_id_of("LF:DST"), Some(before));
+        assert_ne!(locks.set_id_of("LF:NEXT"), Some(before));
+        assert!(gate.set().holds(src.lock_record()));
+        // The frame handle still borrows under the held set after the relink.
+        frame.write().common.putf = false;
+        drop(gate);
+        assert!(!src.lock_record().set().is_locked());
+    }
+
+    /// Boundary: `ProcessAction::ArmWatchdog` run inside the frame
+    /// `execute_process_actions` takes for a `special()` drain (histogram
+    /// SDEL). C `wdogInit` runs under the caller's `dbScanLock` and takes
+    /// nothing more, so the arm must read the record under the frame's
+    /// single hold, not re-acquire its set.
+    #[test]
+    fn an_in_frame_watchdog_arm_reads_under_the_frame_s_single_hold() {
+        use crate::error::CaResult;
+        use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record, RecordCell};
+        use crate::types::EpicsValue;
+        use std::sync::{Mutex, OnceLock, Weak};
+
+        /// Arms a watchdog and records its set's depth each time the test
+        /// thread asks for the interval.
+        struct WatchdogProbe {
+            cell: Arc<OnceLock<Weak<RecordCell>>>,
+            depths: Arc<Mutex<Vec<usize>>>,
+            thread: std::thread::ThreadId,
+        }
+
+        impl Record for WatchdogProbe {
+            fn record_type(&self) -> &'static str {
+                "watchdog_depth_probe"
+            }
+            fn process(&mut self) -> CaResult<ProcessOutcome> {
+                Ok(ProcessOutcome::complete())
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "VAL" => Some(EpicsValue::Double(0.0)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &[]
+            }
+            fn watchdog_interval(&self) -> Option<Duration> {
+                // `add_record` asks before the cell is known and the armed
+                // tick asks from a callback thread; only the arm itself, on
+                // the test thread, is measured.
+                let cell = self.cell.get().and_then(Weak::upgrade);
+                if let Some(cell) = cell.filter(|_| std::thread::current().id() == self.thread) {
+                    let depth = cell.lock_record().set().depth.load(Ordering::Relaxed);
+                    self.depths.lock().expect("probe mutex").push(depth);
+                }
+                Some(Duration::from_secs(3600))
+            }
+        }
+
+        let cell = Arc::new(OnceLock::new());
+        let depths = Arc::new(Mutex::new(Vec::new()));
+        let db = PvDatabase::new();
+        ready(db.add_record(
+            "WD:ARM",
+            Box::new(WatchdogProbe {
+                cell: Arc::clone(&cell),
+                depths: Arc::clone(&depths),
+                thread: std::thread::current().id(),
+            }),
+        ))
+        .expect("add_record");
+        db.build_lock_sets();
+        let rec = db.get_record("WD:ARM").expect("record");
+        cell.set(Arc::downgrade(&rec)).expect("cell set once");
+        let generation = rec.read().watchdog_generation.clone();
+        let before = generation.load(Ordering::Acquire);
+
+        let mut visited = crate::server::database::ProcStack::new();
+        db.execute_process_actions("WD:ARM", &rec, [ProcessAction::ArmWatchdog], &mut visited);
+
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            before + 1,
+            "the arm bumped the watchdog generation once"
+        );
+        assert_eq!(
+            *depths.lock().expect("probe mutex"),
+            [1],
+            "the arm read the record once, under the frame's single hold"
+        );
+        let set = rec.lock_record().set();
+        assert!(!set.is_locked(), "the frame released the set");
+        assert_eq!(set.depth.load(Ordering::Relaxed), 0);
+        assert_eq!(set.owner.load(Ordering::Acquire), 0);
     }
 }

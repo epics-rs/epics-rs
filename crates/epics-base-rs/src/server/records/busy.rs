@@ -471,11 +471,8 @@ impl Record for BusyRecord {
                     // any unmatched name to state 0, so `caput BUSY Opne` drove
                     // the record to Done and reported success.
                     EpicsValue::String(ref s) => {
-                        let resolved = crate::server::record::resolve_enum_state_string(
-                            "VAL",
-                            self.enum_state_strings().as_deref(),
-                            s,
-                        )?;
+                        let resolved =
+                            crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                         match resolved {
                             EpicsValue::Enum(v) => v,
                             _ => return Err(CaError::TypeMismatch(name.to_string())),
@@ -661,6 +658,10 @@ impl Record for BusyRecord {
         Some(crate::server::record::binary_enum_states(
             &self.znam, &self.onam,
         ))
+    }
+
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
     }
 
     /// C `get_enum_str` (busyRecord.c:286-306): VAL 0 -> ZNAM, 1 -> ONAM, and any

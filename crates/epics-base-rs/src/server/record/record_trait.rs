@@ -506,10 +506,12 @@ pub enum LinkReadAs {
     UShort,
     /// C `dbGetLink(..., DBR_INT64, ...)`.
     Int64,
-    /// C `dbGetLink(..., DBR_ENUM, ...)`. Numeric sources convert as
-    /// [`Self::UShort`] does; a `DBF_STRING` source does not parse
-    /// (`cvt_st_e` asks the SOURCE record's `put_enum_str`), so it fails.
-    Enum,
+    /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer, which holds
+    /// `buffer`. Numeric sources convert as [`Self::UShort`] does. A one-element
+    /// `DBF_STRING` source goes to the SOURCE record's `put_enum_str`
+    /// (`cvt_st_e`), which on a name match stores the source's VAL and leaves
+    /// the buffer as it was; a longer one parses element 0 (`getStringUshort`).
+    Enum { buffer: u16 },
     /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
     /// bytes of the source's char array, taken as the string they spell
     /// (`sseqRecord.c:682-686`: `n_elements` clamped to the record's 40-byte
@@ -529,7 +531,7 @@ impl LinkReadAs {
             Self::ULong => T::ULong,
             Self::UShort => T::UShort,
             Self::Int64 => T::Int64,
-            Self::Enum => T::Enum,
+            Self::Enum { .. } => T::Enum,
             Self::Native | Self::CharArrayAsString { .. } => return None,
         })
     }
@@ -2384,15 +2386,10 @@ pub trait Record: Send + Sync + 'static {
             .any(|f| f.eq_ignore_ascii_case(field))
     }
 
-    /// The record's `DBF_ENUM` state strings — the C rset slot pair
-    /// `get_enum_strs` / `put_enum_str`, which in C read the same fields and
-    /// are therefore ONE table here.
-    ///
-    /// It is what a client reads as the `DBR_ENUM` choice list AND the set of
-    /// names a `DBR_STRING` put to the record's `DBF_ENUM` `VAL` may name
-    /// (`dbConvert.c::putStringEnum` → [`crate::server::record::resolve_enum_state_string`]). Taking
-    /// both from one table is the point: a name the record advertises is a name
-    /// a client may put, by construction — the two cannot drift.
+    /// The record's `DBF_ENUM` state strings — the C rset slot
+    /// `get_enum_strs`: what a client reads as the `DBR_ENUM` choice list, and
+    /// the `no_str` bound a numeric `DBR_STRING` put is held to. The names a
+    /// put may match are [`Self::enum_str_state`]'s, which C scans untrimmed.
     ///
     /// The table is already trimmed to C's `no_str`: `bi`/`bo`/`busy` drop
     /// `ONAM` when `ZNAM` is set and `ONAM` is empty (`boRecord.c:342-352`);
@@ -2404,6 +2401,25 @@ pub trait Record: Send + Sync + 'static {
     /// `DBF_LONG`. C then fails a `DBR_STRING` put with `S_db_noRSET`.
     fn enum_state_strings(&self) -> Option<Vec<PvString>> {
         None
+    }
+
+    /// The record's `put_enum_str` rset slot: the state `name` selects, or
+    /// `None` (`S_db_badChoice`). Only called when [`Self::enum_state_strings`]
+    /// is `Some`. Default: the label list, for a record with no slots of its
+    /// own to scan.
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        self.enum_state_strings()?
+            .iter()
+            .position(|state| state.as_bytes() == name.as_bytes())
+            .map(|i| i as u16)
+    }
+
+    /// Whether that slot's store also clears UDF. C's bi and mbbi do
+    /// (`biRecord.c:227`, `mbbiRecord.c:284`); bo, mbbo and busy store VAL
+    /// alone (`boRecord.c:360-368`, `mbboRecord.c:354-371`,
+    /// `busyRecord.c:321-329`).
+    fn enum_str_clears_udf(&self) -> bool {
+        false
     }
 
     /// The record's `get_enum_str` rset slot — how a `DBR_STRING` READ of its
@@ -5652,12 +5668,7 @@ pub fn coerce_put_value<R: Record + ?Sized>(
                 .map(Converted::Stored);
         }
         if target == DbFieldType::Enum {
-            return super::resolve_enum_state_string(
-                field,
-                record.enum_state_strings().as_deref(),
-                s,
-            )
-            .map(Converted::Stored);
+            return super::resolve_enum_state_string(field, record, s).map(Converted::Stored);
         }
         if let Some(numeric) = c_parse::NumericField::of(target) {
             return c_parse::put_string(field, numeric, &s.as_str_lossy());
@@ -6669,12 +6680,12 @@ impl CycleValue {
         }
     }
 
-    /// As `EpicsValue::as_int_i64` answers the same carrier: `Char` has no
-    /// integer view, its sign comes through `to_f64`.
+    /// As `EpicsValue::as_int_i64` answers the same carrier.
     #[inline]
     fn as_int_i64(self) -> Option<i64> {
         match self {
-            Self::Double(_) | Self::Float(_) | Self::Char(_) => None,
+            Self::Double(_) | Self::Float(_) => None,
+            Self::Char(v) => Some(v as i8 as i64),
             Self::Long(v) => Some(v as i64),
             Self::ULong(v) => Some(v as i64),
             Self::Int64(v) => Some(v),
@@ -6717,8 +6728,7 @@ impl CycleValue {
             }
             Self::Char(_) => Self::Char(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
             Self::UChar(_) => Self::UChar(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
-            // `putDoubleEnum` wraps rather than saturates.
-            Self::Enum(_) => Self::Enum(int.unwrap_or(f as i64) as u16),
+            Self::Enum(_) => Self::Enum(int.map_or_else(|| c_cast::f64_to_u16(f), |i| i as u16)),
         }
     }
 

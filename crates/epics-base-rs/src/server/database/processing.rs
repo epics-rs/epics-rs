@@ -1491,7 +1491,7 @@ impl PvDatabase {
         let owned;
         let owned_target;
         let (record, common, parsed, read) = if let Some((db, at)) = held_target {
-            let read = self.read_db_link_at(db, at);
+            let read = self.read_db_link_at(Some(rec.set()), db, at);
             (&mut *inst.record, &mut inst.common, parsed, read)
         } else {
             owned_target = target.cloned();
@@ -3385,7 +3385,8 @@ impl PvDatabase {
                 && let Some(at) = self.inp_addr(instance)
                 && !Arc::ptr_eq(&at.rec, rec.unframed())
             {
-                let (inp_value, alarm) = self.read_db_link_as_at(&instance.parsed_inp, at, read_as);
+                let (inp_value, alarm) =
+                    self.read_db_link_as_at(rec.set(), &instance.parsed_inp, at, read_as);
                 let mut stage = LinkInputs::none();
                 stage.inp_value = inp_value;
                 if let Some(inherited) =
@@ -4538,7 +4539,20 @@ impl PvDatabase {
                     // ParsedLink::None and Constant don't reach this branch — the
                     // former is "no link configured", the latter has its own
                     // None-as-no-value semantics.
-                    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "INP");
+                    // The Async twins read through `dbChannelGetField`, not
+                    // `dbGetLink`: their failure is `recGblSetSevr(READ_ALARM)`
+                    // with no message (`devBiSoftCallback.c:179`).
+                    if instance.common.dtyp.soft()
+                        == Some(crate::server::device_support::SoftDtyp::Async)
+                    {
+                        crate::server::recgbl::rec_gbl_set_sevr(
+                            &mut instance.common,
+                            crate::server::recgbl::alarm_status::READ_ALARM,
+                            crate::server::record::AlarmSeverity::Invalid,
+                        );
+                    } else {
+                        crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "INP");
+                    }
                     // C's failure arm — `devAiSoft.c:92` drops the dset's
                     // "a read has completed" state so the next good reading is
                     // taken unsmoothed.

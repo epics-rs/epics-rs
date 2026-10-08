@@ -2594,11 +2594,6 @@ impl PvDatabase {
     ) -> CaResult<crate::server::record::ProcessCompletion> {
         let field = field.to_ascii_uppercase();
         let want_notify = notify_request.wants_notify();
-        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
-        // relinks the target's lock set. The obligation is taken out here, so
-        // that every exit path below discharges it; see
-        // `record_lock.rs`'s `LinkFieldWrite`.
-        let _relink = self.link_field_write(record_name, &field);
 
         // Get record Arc — alias-aware (epics-base PR #336) so a CA
         // client that connects via an alias name can put fields on
@@ -2660,6 +2655,13 @@ impl PvDatabase {
             // ([`check_no_mod_in_db_put`]).
             check_no_mod_in_db_put(&instance, &field)?;
         }
+        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
+        // relinks the record's lock set, and its parse/`dbCanSetLink` refusals
+        // return before it does. Taken out below them, so a refused put never
+        // relinks (a relink reads the caller's frame record too), and above
+        // every write guard so that each later exit discharges it; see
+        // `record_lock.rs`'s `LockSetEdit`.
+        let _relink = self.link_field_write(record_name, &field);
 
         // C `processNotifyCommon` (dbNotify.c:225-232) tests PACT ABOVE the
         // put — `if (precord->pact) { ... pnotify->state =
@@ -3410,11 +3412,40 @@ impl PvDatabase {
             // for the reason C's do — one `dbCommon`, one `lset`. Held
             // until return.
             let _record_gate = self.acquire_put_gate(base, &field, Some(&value));
+            // An autosave restore is a `dbPutField` (`reboot_restore`), so
+            // a saved link text is held to `dbCanSetLink` exactly as a
+            // `caput` is — that arm of `dbStaticLib.c:2634-2642` is the
+            // one autosave takes. Above the no-mod gate for the reason
+            // given at the other body: C's link route is above `dbPut`.
+            // Both refusals read only what the gate above keeps still.
+            {
+                let instance = rec.read();
+                if let Some(text) = check_link_put(
+                    instance.record.record_type(),
+                    instance.common.dtyp.as_str(),
+                    &field,
+                    &value,
+                )? {
+                    value = text;
+                }
+                // The SPC_NOMOD half of `dbPutSpecial(paddr, 0)`, refused
+                // before the rset's `special()` is ever dispatched
+                // (`dbAccess.c:122-127`). `dbPutField` — the call this body
+                // models — reaches it like every other entry, through `dbPut`
+                // (`dbAccess.c:1265`), so an autosave restore cannot write a
+                // field the `.dbd` declares immutable. This route was the one
+                // dbPut-analogue body that skipped the gate, which left
+                // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
+                // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
+                // IPTR) restorable, and dbCommon's with them.
+                check_no_mod_in_db_put(&instance, &field)?;
+            }
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
             // field relinks the record's lock set, inside the gate window
-            // above, which holds both sets the relink moves between. The
-            // obligation is taken out here so that every exit path below
-            // discharges it; see `record_lock.rs`'s `LockSetEdit`.
+            // above, which holds both sets the relink moves between. Below
+            // the refusals C returns before relinking, above the write guard
+            // so that every later exit discharges it; see `record_lock.rs`'s
+            // `LockSetEdit`.
             let _relink = self.link_field_write(base, &field);
             // The canonical name itself is wanted further down, by
             // `update_scan_index` and `run_special_actions`.
@@ -3436,30 +3467,6 @@ impl PvDatabase {
             let common_result = {
                 let mut instance = rec.write();
 
-                // The SPC_NOMOD half of that same pass-0 call, refused before
-                // the rset's `special()` is ever dispatched
-                // (`dbPutSpecial`, `dbAccess.c:122-127`). `dbPutField` — the
-                // call this body models — reaches it like every other entry,
-                // through `dbPut` (`dbAccess.c:1265`), so an autosave restore
-                // cannot write a field the `.dbd` declares immutable. This
-                // route was the one dbPut-analogue body that skipped the gate,
-                // which left asynRecord's twelve `special(SPC_NOMOD)` fields
-                // (OMAX, AINP, TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP,
-                // SPR, OPTR, IPTR) restorable, and dbCommon's with them.
-                // An autosave restore is a `dbPutField` (`reboot_restore`), so
-                // a saved link text is held to `dbCanSetLink` exactly as a
-                // `caput` is — that arm of `dbStaticLib.c:2634-2642` is the
-                // one autosave takes. Above the no-mod gate for the reason
-                // given at the other body: C's link route is above `dbPut`.
-                if let Some(text) = check_link_put(
-                    instance.record.record_type(),
-                    instance.common.dtyp.as_str(),
-                    &field,
-                    &value,
-                )? {
-                    value = text;
-                }
-                check_no_mod_in_db_put(&instance, &field)?;
                 // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
                 // `dbPut` runs on every entry path including the `dbPutField`
                 // this body models (autosave's `reboot_restore`). A non-zero
@@ -4986,6 +4993,64 @@ record(ai, "OTHER") {
         drop(held);
         drop(gate);
 
+        assert_eq!(ids(), before);
+    }
+
+    /// The `dbPutField` routes accept link fields, but their DISP, request
+    /// type and `dbCanSetLink` refusals return before C's relink, so a
+    /// refused put relinks nothing either — including from inside a frame
+    /// that holds a record of the same set for writing.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_db_put_field_link_put_relinks_nothing() {
+        use super::super::FrameGate;
+        use crate::server::ioc_builder::IocBuilder;
+        use std::collections::HashMap;
+
+        let (db, _) = IocBuilder::new()
+            .db_string(
+                r#"record(ai, "SRC") {
+    field(FLNK, "DST")
+}
+record(ai, "DST") {
+}
+record(ai, "OFF") {
+    field(DISP, "1")
+}
+record(ai, "OTHER") {
+}"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let ids = || ["SRC", "DST", "OFF", "OTHER"].map(|r| db.lock_set_of(r).unwrap().id);
+        let before = ids();
+        let other = || EpicsValue::String("OTHER".into());
+        let refusals = [
+            ("DST.FLNK", EpicsValue::Double(1.0)),
+            ("DST.INP", EpicsValue::String("#C0 S0".into())),
+            ("OFF.FLNK", other()),
+        ];
+
+        let src = db.get_record("SRC").unwrap();
+        let gate = FrameGate::of_held(src.lock_record());
+        let held = gate.frame(&src).write();
+        for (name, value) in refusals.clone() {
+            let (record, field) = name.split_once('.').unwrap();
+            let refused = db.put_record_field_from_ca_already_locked(record, field, value);
+            assert!(refused.is_err(), "{name}: {refused:?}");
+        }
+        drop(held);
+        drop(gate);
+        assert_eq!(ids(), before);
+
+        // The autosave route refuses on request type and `dbCanSetLink`; it
+        // takes the put gate itself, so it runs outside the frame.
+        for (name, value) in refusals.into_iter().take(2) {
+            let refused = db.put_pv_no_process(name, value).await;
+            assert!(refused.is_err(), "{name}: {refused:?}");
+        }
         assert_eq!(ids(), before);
     }
 }

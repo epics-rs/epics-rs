@@ -83,6 +83,10 @@ pub struct MbbiRecord {
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
+    /// `devMbbiSoftCallback`'s private `devPvt->buffer.value`: calloc'd 0 and
+    /// written only by a conversion that stores, so a read that stores nothing
+    /// (a state name, NORD=0) hands back the last delivered value, not VAL.
+    async_buffer: u16,
 }
 
 impl Default for MbbiRecord {
@@ -155,6 +159,7 @@ impl Default for MbbiRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
+            async_buffer: 0,
         }
     }
 }
@@ -332,9 +337,7 @@ macro_rules! mbb_put_field {
                     EpicsValue::Short(v) => { $self.val = v as u16; }
                     // C rset `put_enum_str` — the one string→state converter.
                     EpicsValue::String(ref s) => {
-                        let resolved = crate::server::record::resolve_enum_state_string(
-                            "VAL",
-                            $self.enum_state_strings().as_deref(),
+                        let resolved = crate::server::record::resolve_enum_state_string("VAL", &*$self,
                             s,
                         )?;
                         if let EpicsValue::Enum(v) = resolved { $self.val = v; }
@@ -422,8 +425,31 @@ impl Record for MbbiRecord {
         InputLinkRequest::As(match soft {
             SoftDtyp::Plain => LinkReadAs::UShort,
             SoftDtyp::Raw => LinkReadAs::Long,
-            SoftDtyp::Async => LinkReadAs::Enum,
+            SoftDtyp::Async => LinkReadAs::Enum {
+                buffer: self.async_buffer,
+            },
         })
+    }
+
+    /// The Async dset copies its buffer into VAL; the other soft dsets never
+    /// read `async_buffer`, so taking every delivered value is exact for it.
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        self.set_val(value)?;
+        self.async_buffer = self.val;
+        Ok(())
+    }
+
+    /// `dbPutFieldLink` rebinds the dset on every INP put (`del_record`, then
+    /// `add_record`'s fresh calloc'd devPvt, `dbAccess.c:1158-1197`), so the
+    /// Async buffer restarts at 0; a DTYP put alone rebinds nothing.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && field == "INP" {
+            self.async_buffer = 0;
+        }
+        Ok(())
     }
 
     /// `devMbbiSoftRaw` reads INP as `DBR_LONG` but loads a constant one as
@@ -466,6 +492,23 @@ impl Record for MbbiRecord {
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ]))
+    }
+
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::multibit_enum_str_state(
+            self.sdef(),
+            [
+                &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+                &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+                &self.ftst, &self.ffst,
+            ],
+            name,
+        )
+    }
+
+    /// `prec->udf = FALSE` (`mbbiRecord.c:284`).
+    fn enum_str_clears_udf(&self) -> bool {
+        true
     }
 
     /// C `get_enum_str` (mbbiRecord.c:235-255): any `val <= 15` reads its state slot,
@@ -698,27 +741,28 @@ impl Record for MbbiRecord {
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         // VAL is DBF_ENUM (mbbiRecord.dbd.pod): the state index. C reads the
         // link as DBR_USHORT, so every numeric carrier coerces to u16.
-        match value {
-            EpicsValue::Enum(v) => self.val = v,
-            EpicsValue::UShort(v) => self.val = v,
-            EpicsValue::ULong(v) => self.val = v as u16,
-            EpicsValue::Long(v) => self.val = v as u16,
-            EpicsValue::Short(v) => self.val = v as u16,
-            // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
-            // `dbConvert.c::putStringEnum` — the one string→state converter,
-            // over `enum_state_strings` (the same table `get_enum_strs` serves).
-            EpicsValue::String(ref s) => {
-                let resolved = crate::server::record::resolve_enum_state_string(
-                    "VAL",
-                    self.enum_state_strings().as_deref(),
-                    s,
-                )?;
-                if let EpicsValue::Enum(v) = resolved {
-                    self.val = v;
+        // The numeric carriers own nothing, so their arms skip
+        // `EpicsValue`'s drop, which is out of line and would run on every
+        // soft read.
+        let value = std::mem::ManuallyDrop::new(value);
+        self.val = match *value {
+            EpicsValue::Enum(v) | EpicsValue::UShort(v) => v,
+            EpicsValue::ULong(v) => v as u16,
+            EpicsValue::Long(v) => v as u16,
+            EpicsValue::Short(v) => v as u16,
+            _ => {
+                // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
+                // `dbConvert.c::putStringEnum` — the one string→state
+                // converter (`Record::enum_str_state`).
+                let EpicsValue::String(s) = std::mem::ManuallyDrop::into_inner(value) else {
+                    return Err(CaError::TypeMismatch("VAL".into()));
+                };
+                match crate::server::record::resolve_enum_state_string("VAL", &*self, &s)? {
+                    EpicsValue::Enum(v) => v,
+                    _ => return Ok(()),
                 }
             }
-            _ => return Err(CaError::TypeMismatch("VAL".into())),
-        }
+        };
         Ok(())
     }
 

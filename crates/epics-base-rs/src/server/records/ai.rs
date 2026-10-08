@@ -689,13 +689,14 @@ impl Record for AiRecord {
     /// that through three `get_field("VAL")` probes and a `put_field` by name;
     /// anything else still takes it.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        match value {
-            EpicsValue::Double(v) => {
-                self.val = v;
-                Ok(())
-            }
-            other => self.put_field_internal("VAL", other),
+        // A `Double` owns nothing, so its arm skips `EpicsValue`'s drop,
+        // which is out of line and would run on every soft read.
+        let value = std::mem::ManuallyDrop::new(value);
+        if let EpicsValue::Double(v) = *value {
+            self.val = v;
+            return Ok(());
         }
+        self.put_field_internal("VAL", std::mem::ManuallyDrop::into_inner(value))
     }
 
     /// C `devAiSoft.c::read_ai` (:81-93) and `devAiSoftCallback.c::read_ai`

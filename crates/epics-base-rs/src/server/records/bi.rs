@@ -45,6 +45,10 @@ pub struct BiRecord {
     pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
+    /// `devBiSoftCallback`'s private `devPvt->buffer.value`: calloc'd 0 and
+    /// written only by a conversion that stores, so a read that stores nothing
+    /// (a state name, NORD=0) hands back the last delivered value, not VAL.
+    async_buffer: u16,
 }
 
 impl Default for BiRecord {
@@ -70,6 +74,7 @@ impl Default for BiRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
+            async_buffer: 0,
         }
     }
 }
@@ -235,6 +240,15 @@ impl Record for BiRecord {
         ))
     }
 
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
+    }
+
+    /// `prec->udf = FALSE` (`biRecord.c:227`).
+    fn enum_str_clears_udf(&self) -> bool {
+        true
+    }
+
     /// C `get_enum_str` (biRecord.c:173-192): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
@@ -256,8 +270,31 @@ impl Record for BiRecord {
         InputLinkRequest::As(match soft {
             SoftDtyp::Plain => LinkReadAs::UShort,
             SoftDtyp::Raw => LinkReadAs::ULong,
-            SoftDtyp::Async => LinkReadAs::Enum,
+            SoftDtyp::Async => LinkReadAs::Enum {
+                buffer: self.async_buffer,
+            },
         })
+    }
+
+    /// The Async dset copies its buffer into VAL; the other soft dsets never
+    /// read `async_buffer`, so taking every delivered value is exact for it.
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        self.set_val(value)?;
+        self.async_buffer = self.val;
+        Ok(())
+    }
+
+    /// `dbPutFieldLink` rebinds the dset on every INP put (`del_record`, then
+    /// `add_record`'s fresh calloc'd devPvt, `dbAccess.c:1158-1197`), so the
+    /// Async buffer restarts at 0; a DTYP put alone rebinds nothing.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && field == "INP" {
+            self.async_buffer = 0;
+        }
+        Ok(())
     }
 
     /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
@@ -354,15 +391,12 @@ impl Record for BiRecord {
                 }
                 // C rset `put_enum_str` (biRecord.c:208-217), reached from
                 // `dbConvert.c::putStringEnum`. The framework's put paths
-                // already resolve a DBR_STRING against `enum_state_strings`
+                // already resolve a DBR_STRING through `enum_str_state`
                 // before they reach here; a direct caller takes the same
                 // converter, so there is one string→state rule.
                 EpicsValue::String(ref s) => {
-                    let resolved = crate::server::record::resolve_enum_state_string(
-                        "VAL",
-                        self.enum_state_strings().as_deref(),
-                        s,
-                    )?;
+                    let resolved =
+                        crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                     if let EpicsValue::Enum(v) = resolved {
                         self.val = v;
                     }

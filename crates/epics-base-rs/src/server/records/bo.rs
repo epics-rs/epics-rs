@@ -485,13 +485,10 @@ impl Record for BoRecord {
                 }
                 // C rset `put_enum_str` (boRecord.c), reached from
                 // `dbConvert.c::putStringEnum` — one converter, shared with the
-                // framework's put paths (see `Record::enum_state_strings`).
+                // framework's put paths (see `Record::enum_str_state`).
                 EpicsValue::String(ref s) => {
-                    let resolved = crate::server::record::resolve_enum_state_string(
-                        "VAL",
-                        self.enum_state_strings().as_deref(),
-                        s,
-                    )?;
+                    let resolved =
+                        crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                     if let EpicsValue::Enum(v) = resolved {
                         self.val = v;
                     }
@@ -677,6 +674,10 @@ impl Record for BoRecord {
         Some(crate::server::record::binary_enum_states(
             &self.znam, &self.onam,
         ))
+    }
+
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
     }
 
     /// C `get_enum_str` (boRecord.c:320-339): VAL 0 -> ZNAM, 1 -> ONAM, and any

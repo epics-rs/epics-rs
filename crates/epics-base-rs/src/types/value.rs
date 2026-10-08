@@ -843,8 +843,9 @@ impl EpicsValue {
             // then truncates off the low bits (C/pvxs `static_cast`).
             Self::UShort(v) => *v as i64,
             Self::ULong(v) => *v as i64,
-            // epicsUInt8 widens unsigned (0xFF -> 255), unlike the signed
-            // `Char` which `to_f64` reinterprets as epicsInt8 and is excluded.
+            // `Char` is epicsInt8, as `to_f64` reads it; epicsUInt8 widens
+            // unsigned (0xFF -> 255).
+            Self::Char(v) => *v as i8 as i64,
             Self::UChar(v) => *v as i64,
             _ => return None,
         })
@@ -1043,17 +1044,11 @@ impl EpicsValue {
             DbFieldType::Float => {
                 EpicsValue::Float(c_cast::f64_to_f32(self.to_f64().unwrap_or(0.0)))
             }
-            // C's numeric→`DBF_ENUM`/`DBF_MENU` put is `putDoubleEnum`
-            // (`dbConvert.c`): `*pfield = (epicsEnum16)*psrc`, a WRAPPING cast of
-            // the truncated value, not a saturating clamp. A float `-1.0` must
-            // land as `65535` (served signed as `-1`), matching `caput REC.HSV -1`
-            // on a compiled softIoc — `c_cast::f64_to_u16` saturates it to `0`,
-            // which silently clamped every out-of-range menu-ordinal put. Truncate
-            // toward zero via the `i64` view, then take the low 16 bits like the
-            // integer-source path above.
+            // `putDoubleEnum` is the same `(epicsEnum16)` cast as
+            // `putDoubleUshort`, so it takes the same `c_cast` policy.
             DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => self.to_f64().unwrap_or(0.0) as i64 as u16,
+                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)

@@ -373,11 +373,9 @@ macro_rules! mbb_put_field {
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
                     // C rset `put_enum_str` (mbboRecord.c:354-371) — the one
-                    // string→state converter, over `enum_state_strings`.
+                    // string→state converter (`Record::enum_str_state`).
                     EpicsValue::String(ref s) => {
-                        let resolved = crate::server::record::resolve_enum_state_string(
-                            "VAL",
-                            $self.enum_state_strings().as_deref(),
+                        let resolved = crate::server::record::resolve_enum_state_string("VAL", &*$self,
                             s,
                         )?;
                         if let EpicsValue::Enum(v) = resolved { $self.val = v; }
@@ -491,6 +489,18 @@ impl Record for MbboRecord {
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ]))
+    }
+
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::multibit_enum_str_state(
+            self.sdef(),
+            [
+                &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+                &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+                &self.ftst, &self.ffst,
+            ],
+            name,
+        )
     }
 
     /// C `get_enum_str` (mbboRecord.c:315-333): any `val <= 15` reads its state slot,

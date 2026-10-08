@@ -86,6 +86,18 @@ record({rtype}, "GENERAL") {{
 const NO_ALARM: EpicsValue = EpicsValue::Short(0);
 /// `LINK_ALARM`: `dbGetLink` failed, so `setLinkAlarm` ran.
 const LINK: EpicsValue = EpicsValue::Short(14);
+/// `READ_ALARM`: an Async dset's `dbChannelGetField` failed.
+const READ: EpicsValue = EpicsValue::Short(1);
+
+/// The failed-read status `dtyp` raises: the Callback twins do not go
+/// through `dbGetLink`, so they raise READ, not `setLinkAlarm`'s LINK.
+fn failed(dtyp: &str) -> EpicsValue {
+    if dtyp == "Async Soft Channel" {
+        READ
+    } else {
+        LINK
+    }
+}
 
 /// devAiSoft reads `DBR_DOUBLE` into VAL, devAiSoftRaw `DBR_LONG` into RVAL:
 /// an int64 outside i32 keeps its value in one and wraps in the other, and
@@ -135,9 +147,33 @@ async fn ai_reads_inp_at_its_dsets_type() {
     .await;
     // `cvt_st_d` / `cvt_st_l`: the empty string is a successful 0, a word is
     // a failed read.
-    for dtyp in ["Soft Channel", "Raw Soft Channel"] {
+    for dtyp in ["Soft Channel", "Raw Soft Channel", "Async Soft Channel"] {
         assert_both_paths("ai", dtyp, "EMPTY", &["VAL"], &[Double(0.0), NO_ALARM]).await;
-        assert_both_paths("ai", dtyp, "WORD", &["VAL"], &[Double(0.0), LINK]).await;
+        assert_both_paths("ai", dtyp, "WORD", &["VAL"], &[Double(0.0), failed(dtyp)]).await;
+    }
+}
+
+/// `setLinkAlarm` names the link (`"field INP"`); the Callback twins'
+/// `recGblSetSevr(READ_ALARM)` carries no message. softIoc: AMSG empty.
+#[epics_macros_rs::epics_test]
+async fn a_failed_async_read_raises_read_without_a_message() {
+    let db = ioc(r#"record(ai, "PLAIN") {
+    field(INP, "WORD")
+}
+record(ai, "ASYNC") {
+    field(DTYP, "Async Soft Channel")
+    field(INP, "WORD")
+}"#)
+    .await;
+    for (name, stat, amsg) in [("PLAIN", 14, "field INP"), ("ASYNC", 1, "")] {
+        db.process_record(name).await.unwrap();
+        let rec = db.get_record(name).unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            (inst.common.stat, inst.common.amsg.as_str()),
+            (stat, amsg),
+            "{name}"
+        );
     }
 }
 
@@ -151,7 +187,7 @@ async fn bi_reads_inp_at_its_dsets_type() {
         ("Soft Channel", "NEG", vec![Enum(65535), NO_ALARM]),
         ("Async Soft Channel", "NEG", vec![Enum(65535), NO_ALARM]),
         ("Soft Channel", "HEX", vec![Enum(16), NO_ALARM]),
-        ("Async Soft Channel", "HEX", vec![Enum(0), LINK]),
+        ("Async Soft Channel", "HEX", vec![Enum(0), READ]),
         ("Soft Channel", "WORD", vec![Enum(0), LINK]),
     ] {
         assert_both_paths("bi", dtyp, source, &["VAL"], &expect).await;
@@ -174,7 +210,7 @@ async fn mbbi_reads_inp_at_its_dsets_type() {
         ("Soft Channel", "NEG", vec![Enum(65535), NO_ALARM]),
         ("Async Soft Channel", "NEG", vec![Enum(65535), NO_ALARM]),
         ("Soft Channel", "HEX", vec![Enum(16), NO_ALARM]),
-        ("Async Soft Channel", "HEX", vec![Enum(0), LINK]),
+        ("Async Soft Channel", "HEX", vec![Enum(0), READ]),
         ("Soft Channel", "WORD", vec![Enum(0), LINK]),
     ] {
         assert_both_paths("mbbi", dtyp, source, &["VAL"], &expect).await;
@@ -196,7 +232,7 @@ async fn mbbi_direct_reads_inp_at_its_dsets_type() {
         for (source, expect) in [
             ("NEG", vec![Long(-1), NO_ALARM]),
             ("HEX", vec![Long(16), NO_ALARM]),
-            ("WORD", vec![Long(0), LINK]),
+            ("WORD", vec![Long(0), failed(dtyp)]),
         ] {
             assert_both_paths("mbbiDirect", dtyp, source, &["VAL"], &expect).await;
         }
@@ -250,7 +286,7 @@ async fn longin_reads_inp_at_its_dsets_type() {
             ("BIG", vec![Long(5), NO_ALARM]),
             ("HEX", vec![Long(16), NO_ALARM]),
             ("EMPTY", vec![Long(0), NO_ALARM]),
-            ("WORD", vec![Long(0), LINK]),
+            ("WORD", vec![Long(0), failed(dtyp)]),
         ] {
             assert_both_paths("longin", dtyp, source, &["VAL"], &expect).await;
         }
@@ -268,9 +304,36 @@ async fn int64in_reads_inp_at_its_dsets_type() {
             ("NEG", vec![Int64(-1), NO_ALARM]),
             ("HEX", vec![Int64(16), NO_ALARM]),
             ("EMPTY", vec![Int64(0), NO_ALARM]),
-            ("WORD", vec![Int64(0), LINK]),
+            ("WORD", vec![Int64(0), failed(dtyp)]),
         ] {
             assert_both_paths("int64in", dtyp, source, &["VAL"], &expect).await;
+        }
+    }
+}
+
+/// A double outside `u16` narrows by the `c_cast` policy in both bi dsets,
+/// `DBR_USHORT` and `DBR_ENUM` alike. softIoc on x86 stores the undefined
+/// cast's 65535 and 4464; the port saturates to 0 and 65535.
+#[epics_macros_rs::epics_test]
+async fn bi_narrows_an_out_of_range_double_alike_in_both_dsets() {
+    use EpicsValue::Enum;
+    for (source, val) in [("-1", 0), ("70000", 65535)] {
+        for dtyp in ["Soft Channel", "Async Soft Channel"] {
+            let db = ioc(&format!(
+                r#"record(ai, "D") {{
+    field(VAL, "{source}")
+}}
+record(bi, "R") {{
+    field(DTYP, "{dtyp}")
+    field(INP, "D")
+}}"#
+            ))
+            .await;
+            assert_eq!(
+                read_after_process(&db, "R", &["VAL"]).await,
+                [Enum(val), NO_ALARM],
+                "{dtyp} from {source}"
+            );
         }
     }
 }

@@ -80,17 +80,13 @@ fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
 
 /// [`link_value_as_f64`] for the integer requests: element 0 through C's GET
 /// table, so a string source parses (`cvt_st_l` and siblings) and an integer
-/// source narrows by cast. A `DBR_ENUM` read of a string asks the source
-/// record's `put_enum_str` in C (`cvt_st_e`), which no port record serves.
+/// source narrows by cast.
 fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValue> {
     let scalar = if value.is_array() {
         value.first_element()?
     } else {
         value
     };
-    if target == DbFieldType::Enum && matches!(scalar, EpicsValue::String(_)) {
-        return None;
-    }
     scalar.get_convert(target).ok()
 }
 
@@ -692,7 +688,13 @@ impl PvDatabase {
                     &rec,
                     &db.target().field,
                 );
-                Some(crate::server::record::record_instance::ResolvedTarget { rec, field })
+                Some(crate::server::record::record_instance::ResolvedTarget {
+                    f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
+                        .then(|| super::field_io::double_slot(field))
+                        .flatten(),
+                    rec,
+                    field,
+                })
             }
             LinkTarget::LocalNotRecord | LinkTarget::External => None,
         }
@@ -770,9 +772,11 @@ impl PvDatabase {
     /// the filtered value and, for an inheriting link, the source's alarm.
     /// Both [`Self::read_link_value_and_alarm`]'s hit and
     /// [`Self::read_db_link_at`] are this, so the two cannot disagree.
+    /// `held` is the reader's set, which a target merged into it rides.
     #[inline(always)]
     fn read_db_at(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
@@ -782,7 +786,10 @@ impl PvDatabase {
         }
         // Built in the shape it is returned in, and filtered in place: each
         // repack of the value on the way up is a copy the optimiser keeps.
-        let instance = at.rec.read();
+        let instance = match held {
+            Some(set) => at.rec.read_in(set),
+            None => at.rec.read(),
+        };
         let mut value = self.read_field_at(&instance, &target.field, at.field);
         let alarm =
             (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
@@ -1026,11 +1033,67 @@ impl PvDatabase {
             LinkReadAs::ULong => link_value_get_as(value, DbFieldType::ULong),
             LinkReadAs::UShort => link_value_get_as(value, DbFieldType::UShort),
             LinkReadAs::Int64 => link_value_get_as(value, DbFieldType::Int64),
-            LinkReadAs::Enum => link_value_get_as(value, DbFieldType::Enum),
+            LinkReadAs::Enum { buffer } => self.enum_read_of(link, value, buffer),
             LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
+        }
+    }
+
+    /// The `DBR_ENUM` form of a value just read from `link` into a buffer
+    /// holding `buffer`. A one-element string is C's `cvt_st_e`, which hands
+    /// it to the source's `put_enum_str` with the SOURCE's `dbAddr`: a state
+    /// name stores the source's VAL (no post) and the buffer is not written.
+    /// More elements take `dbGet`'s table, `getStringUshort` on element 0;
+    /// none (NORD=0) is `dbGet`'s `n <= 0` arm, which converts nothing and
+    /// succeeds, so the buffer is delivered as it was.
+    fn enum_read_of(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+        buffer: u16,
+    ) -> Option<EpicsValue> {
+        use crate::server::record::EnumChoice;
+        if value.is_array() && value.count() == 0 {
+            return Some(EpicsValue::Enum(buffer));
+        }
+        let one = value.count() == 1;
+        let scalar = if value.is_array() {
+            value.first_element()?
+        } else {
+            value
+        };
+        let EpicsValue::String(s) = scalar else {
+            return scalar.get_convert(DbFieldType::Enum).ok();
+        };
+        if !one {
+            let EpicsValue::UShort(v) = EpicsValue::String(s)
+                .get_convert(DbFieldType::UShort)
+                .ok()?
+            else {
+                return None;
+            };
+            return Some(EpicsValue::Enum(v));
+        }
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return None;
+        };
+        let at = self.db_link_addr(db)?;
+        let mut source = at.rec.write();
+        let states = source.record.enum_state_strings()?;
+        match crate::server::record::enum_state_choice(&*source.record, &states, &s)? {
+            EnumChoice::Named(i) => {
+                source
+                    .record
+                    .put_field_internal("VAL", EpicsValue::Enum(i))
+                    .ok()?;
+                if source.record.enum_str_clears_udf() {
+                    source.common.udf = 0;
+                }
+                Some(EpicsValue::Enum(buffer))
+            }
+            EnumChoice::Index(i) => Some(EpicsValue::Enum(i)),
         }
     }
 
@@ -1209,7 +1272,7 @@ impl PvDatabase {
         // is a `break` — so its alarm is not carried to the fold that
         // would drop it.
         if let (crate::server::record::ParsedLink::Db(db), Some(at)) = (link, at) {
-            return self.read_db_link_at(db, at);
+            return self.read_db_link_at(None, db, at);
         }
         let (value, alarm) = self.read_link_value_and_alarm(link);
         let fetch = match value {
@@ -1256,11 +1319,12 @@ impl PvDatabase {
     #[inline(always)]
     pub(crate) fn read_db_link_at(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        match self.read_db_at(db, at) {
+        match self.read_db_at(held, db, at) {
             (Some(v), alarm) => (LinkFetch::Value(v), alarm),
             (None, _) => (LinkFetch::Failed, None),
         }
@@ -1274,6 +1338,7 @@ impl PvDatabase {
     #[inline(always)]
     pub(crate) fn read_db_link_as_at(
         &self,
+        held: &crate::server::database::SetGuard,
         link: &crate::server::record::ParsedLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
         read_as: crate::server::record::LinkReadAs,
@@ -1282,10 +1347,10 @@ impl PvDatabase {
             return (None, None);
         };
         if read_as == crate::server::record::LinkReadAs::Double {
-            let (value, alarm) = self.read_db_link_f64_at(db, at);
+            let (value, alarm) = self.read_db_link_f64_at(held, db, at);
             return (value.map(EpicsValue::Double), alarm);
         }
-        let (Some(value), alarm) = self.read_db_at(db, at) else {
+        let (Some(value), alarm) = self.read_db_at(Some(held), db, at) else {
             return (None, None);
         };
         match self.apply_link_read_as(link, read_as, value) {
@@ -1302,14 +1367,12 @@ impl PvDatabase {
     #[inline(always)]
     pub(crate) fn read_db_link_f64_at(
         &self,
+        held: &crate::server::database::SetGuard,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (Option<f64>, Option<SourceAlarm>) {
-        if db.target_is_val()
-            && db.target().json_suffix.is_none()
-            && let Some(slot) = super::field_io::double_slot(at.field)
-        {
-            let instance = at.rec.read();
+        if let Some(slot) = at.f64_slot {
+            let instance = at.rec.read_in(held);
             let Some(value) = instance.record.get_slot_f64(slot) else {
                 return (None, None);
             };
@@ -1322,7 +1385,7 @@ impl PvDatabase {
                 });
             return (Some(value), alarm);
         }
-        match self.read_db_at(db, at) {
+        match self.read_db_at(Some(held), db, at) {
             (Some(v), alarm) => match link_value_as_f64(v) {
                 Some(f) => (Some(f), alarm),
                 None => (None, None),
@@ -1431,7 +1494,7 @@ impl PvDatabase {
         if let crate::server::record::ParsedLink::Db(db) = link
             && let Some(at) = self.db_link_addr(db)
         {
-            return self.read_db_at(db, &at);
+            return self.read_db_at(None, db, &at);
         }
         self.read_unresolved_link_value_and_alarm(link)
     }
@@ -5390,7 +5453,8 @@ mod db_link_addr_tests {
                 slot_path,
                 "{text}"
             );
-            let (value, alarm) = db.read_db_link_f64_at(link, &at);
+            let held = db.lock_record(&link.target().record);
+            let (value, alarm) = db.read_db_link_f64_at(held.set(), link, &at);
             let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
                 &parsed,
                 LinkReadAs::Double,
@@ -5442,7 +5506,7 @@ mod db_link_addr_tests {
             LinkReadAs::ULong,
             LinkReadAs::UShort,
             LinkReadAs::Int64,
-            LinkReadAs::Enum,
+            LinkReadAs::Enum { buffer: 7 },
             LinkReadAs::String,
             LinkReadAs::CharArrayAsString { max_elements: 40 },
         ];
@@ -5453,7 +5517,8 @@ mod db_link_addr_tests {
             };
             let at = db.db_link_addr(link).expect("a local target");
             for read_as in requests {
-                let (value, alarm) = db.read_db_link_as_at(&parsed, &at, read_as);
+                let held = db.lock_record(&link.target().record);
+                let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
                 let (fetch, general_alarm) =
                     db.read_link_value_as_with_alarm(&parsed, read_as, &mut ProcStack::new());
                 let general = match fetch {
@@ -5515,22 +5580,31 @@ mod db_link_addr_tests {
             ),
             ("NEG", LinkReadAs::UShort, Some(EpicsValue::UShort(65535))),
             ("NEG", LinkReadAs::ULong, Some(EpicsValue::ULong(u32::MAX))),
-            ("NEG", LinkReadAs::Enum, Some(EpicsValue::Enum(65535))),
+            (
+                "NEG",
+                LinkReadAs::Enum { buffer: 7 },
+                Some(EpicsValue::Enum(65535)),
+            ),
             ("HEX", LinkReadAs::Long, Some(EpicsValue::Long(16))),
             ("HEX", LinkReadAs::Int64, Some(EpicsValue::Int64(16))),
             ("HEX", LinkReadAs::UShort, Some(EpicsValue::UShort(16))),
             ("EXP", LinkReadAs::ULong, Some(EpicsValue::ULong(1000))),
             ("WORD", LinkReadAs::Long, None),
-            ("WORD", LinkReadAs::Enum, None),
-            ("HEX", LinkReadAs::Enum, None),
-            ("M", LinkReadAs::Enum, Some(EpicsValue::Enum(2))),
+            ("WORD", LinkReadAs::Enum { buffer: 7 }, None),
+            ("HEX", LinkReadAs::Enum { buffer: 7 }, None),
+            (
+                "M",
+                LinkReadAs::Enum { buffer: 7 },
+                Some(EpicsValue::Enum(2)),
+            ),
         ] {
             let parsed = parse_link_v2(&format!("{text} MS"));
             let ParsedLink::Db(link) = &parsed else {
                 panic!("{text} parses to a Db link");
             };
             let at = db.db_link_addr(link).expect("a local target");
-            let (value, alarm) = db.read_db_link_as_at(&parsed, &at, read_as);
+            let held = db.lock_record(&link.target().record);
+            let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
             assert_eq!(value, expect, "{text} as {read_as:?}");
             assert_eq!(alarm.is_some(), expect.is_some(), "{text} as {read_as:?}");
         }

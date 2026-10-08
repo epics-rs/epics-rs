@@ -1419,7 +1419,7 @@ impl RecordCell {
     /// # Panics
     ///
     /// As [`Self::read`].
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read_in<'a>(
         &'a self,
         held: &'a crate::server::database::SetGuard,
@@ -1971,6 +1971,9 @@ fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
 pub(crate) struct ResolvedTarget {
     pub(crate) rec: Arc<RecordCell>,
     pub(crate) field: FieldAddr,
+    /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
+    /// addresses an unfiltered `VAL` the record serves as `DBF_DOUBLE`.
+    pub(crate) f64_slot: Option<super::record_trait::FieldSlot>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

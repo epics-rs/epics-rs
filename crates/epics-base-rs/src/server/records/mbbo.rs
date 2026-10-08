@@ -601,6 +601,14 @@ impl Record for MbboRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => Some(&self.siml),
+            "SIOL" => Some(&self.siol),
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         mbb_get_field!(self, name,
             "RVAL" => rval: ULong, "ORAW" => oraw: ULong,

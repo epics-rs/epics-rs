@@ -83,9 +83,9 @@ pub struct LonginRecord {
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub siml: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub siol: String,
     // SVAL is `DBF_LONG` (longinRecord.dbd.pod:466-468) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,

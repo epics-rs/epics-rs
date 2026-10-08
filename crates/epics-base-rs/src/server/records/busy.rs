@@ -373,6 +373,14 @@ impl Record for BusyRecord {
         true
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => Some(&self.siml),
+            "SIOL" => Some(&self.siol),
+            _ => None,
+        }
+    }
+
     // NO `is_put_complete` override, and none is wanted: the gate above is the
     // whole of it. `is_put_complete` answers a different C question — did
     // device support take the cycle async (`busyRecord.c:254`) — and busy's

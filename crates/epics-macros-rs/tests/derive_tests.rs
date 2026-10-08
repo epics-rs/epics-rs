@@ -552,3 +552,39 @@ fn put_get_roundtrip_multiple_fields() {
     // read-only field still readable
     assert_eq!(calc.get_field("LAST_VAL"), Some(EpicsValue::Double(0.0)));
 }
+
+// ---------------------------------------------------------------------------
+// link_text_ref
+// ---------------------------------------------------------------------------
+
+#[derive(EpicsRecord)]
+#[record(type = "longin", crate_path = "epics_base_rs")]
+struct LinkFieldRecord {
+    #[field(type = "String", link)]
+    siol: String,
+    #[field(type = "String")]
+    egu: String,
+}
+
+#[test]
+fn link_fields_are_lent_and_others_are_not() {
+    let mut rec = LinkFieldRecord {
+        siol: String::new(),
+        egu: String::new(),
+    };
+    assert_eq!(rec.link_text_ref("SIOL"), Some(""));
+    rec.put_field("SIOL", EpicsValue::String("OTHER.VAL".into()))
+        .unwrap();
+    assert_eq!(rec.link_text_ref("SIOL"), Some("OTHER.VAL"));
+    assert_eq!(rec.link_text_ref("EGU"), None);
+    assert_eq!(rec.link_text_ref("VAL"), None);
+}
+
+#[test]
+fn a_type_with_no_link_field_lends_nothing() {
+    let rec = TestStringinRecord {
+        val: String::new(),
+        simm: 0,
+    };
+    assert_eq!(rec.link_text_ref("VAL"), None);
+}

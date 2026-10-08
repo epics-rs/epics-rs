@@ -83,9 +83,9 @@ pub struct Int64inRecord {
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub siml: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub siol: String,
     // SVAL is `DBF_INT64` (int64inRecord.dbd.pod:270-272) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_INT64,

@@ -18,7 +18,8 @@ use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 use super::alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
 use super::link::{
-    ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
+    LinkFieldType, ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_field,
+    parse_link_v2, parse_output_link_v2,
 };
 use super::menu_choices::MenuBound;
 use super::record_trait::{
@@ -888,6 +889,60 @@ pub(crate) enum ForwardTarget {
     /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger.
     External(String),
 }
+/// What C's `readValue`/`writeValue` reaches as struct members — `prec->siml`,
+/// `->siol`, `->sims`, `->sdly` — and which stage of the cycle C put the SIOL
+/// read in.
+///
+/// C names these fields at compile time; this port resolved all four BY NAME
+/// on every cycle of every record whose `.dbd` declares SIMM (`ai`, `bi`,
+/// `longin`, `mbbi`, `waveform`, ...). Each resolution upper-cased the name
+/// into a fresh `String` and then scanned the record type's field table and
+/// `dbCommon`'s — measured as the single largest cost of an `ai` cycle, more
+/// than the record body. The declaration is fixed at the type, so it is read
+/// here once per record instance and the cycle reads through it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SimmBlock {
+    pub(crate) siml: Option<&'static FieldDesc>,
+    pub(crate) siol: Option<&'static FieldDesc>,
+    pub(crate) sims: Option<&'static FieldDesc>,
+    pub(crate) sdly: Option<&'static FieldDesc>,
+    /// C put this type's SIOL read in the INPUT stage: `readValue` reads SIOL
+    /// IN (`aiRecord.c`, `mbbiRecord.c:388-394`, `waveformRecord.c:351`,
+    /// `histogramRecord.c:384`, `mcaRecord.c:1097`, and `aai` through
+    /// `devAaiSoft.c:89`), where `writeValue` writes VAL OUT to it. Answering
+    /// this from the record TYPE NAME meant allocating that name as a `String`
+    /// once per cycle to match against it.
+    pub(crate) is_input: bool,
+}
+
+impl SimmBlock {
+    fn of(record: &dyn Record) -> Self {
+        let rtype = record.record_type();
+        SimmBlock {
+            siml: field_desc_of(record, "SIML"),
+            siol: field_desc_of(record, "SIOL"),
+            sims: field_desc_of(record, "SIMS"),
+            sdly: field_desc_of(record, "SDLY"),
+            is_input: record.simulation_substitutes_input_stage()
+                || matches!(
+                    rtype,
+                    "ai" | "bi"
+                        | "mbbi"
+                        | "mbbiDirect"
+                        | "longin"
+                        | "int64in"
+                        | "stringin"
+                        | "lsi"
+                        | "event"
+                        | "waveform"
+                        | "histogram"
+                        | "aai"
+                        | "mca"
+                ),
+        }
+    }
+}
+
 impl ProcessPlan {
     /// The answers, asked of the record type once. Pure in the record's
     /// type: every input is a `Record` method or a table keyed on its name,
@@ -897,7 +952,7 @@ impl ProcessPlan {
         let declares_simulation = field_desc_of(record, "SIMM").is_some();
         ProcessPlan {
             dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
-            simulation: declares_simulation,
+            simm: declares_simulation.then(|| SimmBlock::of(record)),
             sel_nvl: rtype == "sel",
             string_input: !record.string_input_links().is_empty(),
             multi_output_dispatch: crate::server::database::multi_output_dispatch_owned(rtype),
@@ -968,9 +1023,11 @@ pub(crate) struct ProcessPlan {
     /// cycle (`dev_sup_process_refusal`). `false` for `calc`, `sub`, `fanout`
     /// and `calcout`, whose C `process()` has no such line.
     pub(crate) dset_can_refuse: bool,
-    /// This type's dbd declares SIMM, so it has a C `readValue`/`writeValue`
-    /// simulation block at all.
-    pub(crate) simulation: bool,
+    /// This type's dbd declares SIMM — it has a C `readValue`/`writeValue`
+    /// simulation block at all — and the four fields that block reaches.
+    /// `None` is the type without the block; there is no state in which the
+    /// block exists and its fields are unresolved.
+    pub(crate) simm: Option<SimmBlock>,
     /// This type is `sel`, the only one with an NVL link feeding SELN.
     pub(crate) sel_nvl: bool,
     /// This type declares at least one string-input link.
@@ -1738,6 +1795,26 @@ impl ParsedInputLink {
     }
 }
 
+/// The parse of one SIM-block link (`SIML` / `SIOL`), keyed on the text it
+/// was parsed from — C's `DBLINK` as `dbInitLink` left it. Text-keyed like
+/// [`ParsedInputLink`] rather than committed at a write owner, because the
+/// text has no single writer: every SIMM-declaring type stores it in its own
+/// struct and `mca` leaves it in the instance's override store.
+pub(crate) struct SimLinkParse {
+    text: String,
+    parsed: Arc<ParsedLink>,
+}
+
+impl SimLinkParse {
+    /// The parse of `text` for `ftype`, shared.
+    fn fresh(text: &str, ftype: LinkFieldType) -> Self {
+        SimLinkParse {
+            text: text.to_owned(),
+            parsed: Arc::new(parse_link_field(text, ftype)),
+        }
+    }
+}
+
 /// The text of link field `field` of `record`, `None` when the link is unset
 /// — [`RecordInstance::link_text`] over the record alone.
 fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
@@ -1792,6 +1869,12 @@ pub struct RecordInstance {
     /// holds for every entry by construction. C parses a link once at
     /// `dbInitLink`; the port parsed every set `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
+    /// The parse of SIML / SIOL for the text the record held at the last
+    /// simulated-mode check, validated against the current text on every
+    /// read by [`Self::sim_link_parse`], the one writer. `None` until a
+    /// SIMM-declaring record's first cycle; never set on any other type.
+    parsed_siml: Option<SimLinkParse>,
+    parsed_siol: Option<SimLinkParse>,
     pub parsed_out: ParsedLink,
     pub parsed_flnk: ParsedLink,
     pub parsed_sdis: ParsedLink,
@@ -1944,17 +2027,6 @@ pub struct RecordInstance {
     /// which the cycle then reads for itself. Taken once because the
     /// alternative is searching the pre-read list by name, per link, per pass.
     link_backed_metadata_input_slot: Vec<Option<usize>>,
-    /// Does this record type's `.dbd` declare a simulation block — i.e. the
-    /// SIMM field C's `readValue`/`writeValue` dispatch on?
-    ///
-    /// `dbCommon` declares none of SIMM/SIML/SIOL/SIMS/SDLY, so the answer is
-    /// a property of the record TYPE, and for 18 of the 41 types this port
-    /// carries (calc, calcout, sub, aSub, sel, seq, fanout, compress,
-    /// subArray, ...) it is `false`: their C record support has no
-    /// `readValue`/`writeValue` at all. Taken once here because the process
-    /// cycle asks it on every pass, where resolving SIMM by name costs a
-    /// scan of the record's declared field list and `dbCommon`'s.
-    declares_simulation: bool,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -2423,12 +2495,6 @@ impl RecordInstance {
         }
     }
 
-    /// Does this record's `.dbd` declare the simulation block — the gate C's
-    /// `readValue`/`writeValue` exist behind. See the field.
-    pub(crate) fn declares_simulation(&self) -> bool {
-        self.declares_simulation
-    }
-
     /// The parse of multi-input link `slot` for a reader that holds the
     /// record shared: the cached one when its text is the record's current
     /// text, a fresh parse otherwise — never written back, since the fetch
@@ -2450,6 +2516,50 @@ impl RecordInstance {
         match self.parsed_inputs.get(slot) {
             Some(Some(entry)) if entry.text == text => Some(entry.parsed.clone()),
             _ => Some(Arc::new(parse_link_v2(text))),
+        }
+    }
+
+    /// The parse of SIM-block link `field` (`"SIML"` or `"SIOL"`) for the
+    /// text the record holds now: the cached one when its text is that text
+    /// byte for byte, otherwise a fresh parse committed to the cache. C
+    /// parses the link once at `dbInitLink` and again on each put of the
+    /// field; this parses once per distinct text the field has held, so a
+    /// re-put of the same text costs the compare and no parse.
+    ///
+    /// `desc` is the field's declaration from the type's `SimmBlock`, for
+    /// the owned fallback: a type that lends the text through
+    /// [`Record::link_text_ref`] is read without a copy, one that does not
+    /// (`mca`, whose SIML/SIOL live in the instance's override store) is read
+    /// through [`Self::resolve_field_stored_at`]. `ftype` is the link's
+    /// direction — SIOL is `DBF_INLINK` on an input type and `DBF_OUTLINK`
+    /// on an output one, and the modifier mask follows it.
+    pub(crate) fn sim_link_parse(
+        &mut self,
+        field: &str,
+        desc: Option<&'static FieldDesc>,
+        ftype: LinkFieldType,
+    ) -> Arc<ParsedLink> {
+        let owned;
+        let text: &str = match self.record.link_text_ref(field) {
+            Some(text) => text,
+            None => {
+                owned = match self.resolve_field_stored_at(field, desc) {
+                    Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                    _ => String::new(),
+                };
+                &owned
+            }
+        };
+        let slot = match field {
+            "SIML" => &mut self.parsed_siml,
+            _ => &mut self.parsed_siol,
+        };
+        match slot {
+            Some(entry) if entry.text == text => entry.parsed.clone(),
+            _ => {
+                let entry = slot.insert(SimLinkParse::fresh(text, ftype));
+                entry.parsed.clone()
+            }
         }
     }
 
@@ -2505,8 +2615,6 @@ impl RecordInstance {
                     .position(|(mf, _)| mf == lf)
             })
             .collect();
-        // The gate on the whole simulation block — see the field's own doc.
-        let declares_simulation = field_desc_of(record.as_ref(), "SIMM").is_some();
         let udf_alarm = record.raises_udf_alarm().then(|| UdfAlarm {
             exact_one: record.udf_alarm_on_exact_one(),
             severity: record.udf_alarm_severity(),
@@ -2555,6 +2663,8 @@ impl RecordInstance {
             parsed_sdis: ParsedLink::None,
             parsed_tsel: ParsedLink::None,
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
+            parsed_siml: None,
+            parsed_siol: None,
             device: None,
             subroutine: None,
             init_subroutines: None,
@@ -2566,7 +2676,6 @@ impl RecordInstance {
             declared_overrides: HashMap::new(),
             link_backed_metadata_links,
             link_backed_metadata_input_slot,
-            declares_simulation,
             udf_alarm,
             monitor_plan,
             array_hash_changed: false,
@@ -3413,7 +3522,7 @@ impl RecordInstance {
 
     /// [`Self::resolve_field_stored`] with `desc` = [`Self::field_desc`]`(name)`.
     #[inline]
-    fn resolve_field_stored_at(
+    pub(crate) fn resolve_field_stored_at(
         &self,
         name: &str,
         desc: Option<&'static FieldDesc>,
@@ -9555,6 +9664,88 @@ mod metadata_cache_tests {
             "PROPERTY subscriber must receive event after process_local reports took_metadata_change"
         );
     }
+
+    fn siol_desc(inst: &RecordInstance) -> Option<&'static FieldDesc> {
+        field_desc_of(&*inst.record, "SIOL")
+    }
+
+    fn put_siol(inst: &mut RecordInstance, text: &str) {
+        inst.record
+            .put_field("SIOL", EpicsValue::String(text.into()))
+            .expect("ai.SIOL put");
+    }
+
+    fn db_link(parsed: &ParsedLink) -> &crate::server::record::DbLink {
+        match parsed {
+            ParsedLink::Db(db) => db,
+            other => panic!("expected a Db link, got {other:?}"),
+        }
+    }
+
+    /// An unchanged SIOL text is served from the cache, not reparsed.
+    #[test]
+    fn sim_link_parse_reuses_the_parse_for_unchanged_text() {
+        let mut inst = ai_instance();
+        put_siol(&mut inst, "SRC.VAL");
+        let desc = siol_desc(&inst);
+        let first = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        let second = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(db_link(&first).pvname(), "SRC");
+    }
+
+    /// A put of a new text is caught at the next read; a re-put of the same
+    /// text is not reparsed.
+    #[test]
+    fn sim_link_parse_reparses_on_text_change_only() {
+        let mut inst = ai_instance();
+        put_siol(&mut inst, "SRC.VAL");
+        let desc = siol_desc(&inst);
+        let before = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        put_siol(&mut inst, "OTHER.VAL");
+        let changed = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert!(!Arc::ptr_eq(&before, &changed));
+        assert_eq!(db_link(&changed).pvname(), "OTHER");
+        put_siol(&mut inst, "OTHER.VAL");
+        let reput = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert!(Arc::ptr_eq(&changed, &reput));
+    }
+
+    /// SIOL's CP survives as `DBF_INLINK` and is discarded as `DBF_OUTLINK`.
+    #[test]
+    fn sim_link_parse_modifier_mask_follows_direction() {
+        let mut input = ai_instance();
+        put_siol(&mut input, "OTHER.VAL CP");
+        let desc = siol_desc(&input);
+        let parsed = input.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert_eq!(
+            db_link(&parsed).policy,
+            crate::server::record::LinkProcessPolicy::ChannelProcess
+        );
+        let mut output = ai_instance();
+        put_siol(&mut output, "OTHER.VAL CP");
+        let parsed = output.sim_link_parse("SIOL", desc, LinkFieldType::Out);
+        assert_eq!(
+            db_link(&parsed).policy,
+            crate::server::record::LinkProcessPolicy::NoProcess
+        );
+    }
+
+    /// A type that stores no SIOL (as `mca`) is read through the override
+    /// store, and its parse is cached like any other.
+    #[test]
+    fn sim_link_parse_reads_unmodeled_text_from_the_override_store() {
+        use crate::server::records::dfanout::DfanoutRecord;
+        let desc = siol_desc(&ai_instance());
+        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        assert!(inst.record.get_field("SIOL").is_none());
+        inst.declared_overrides
+            .insert("SIOL".into(), EpicsValue::String("OVR.VAL".into()));
+        let first = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert_eq!(db_link(&first).pvname(), "OVR");
+        let second = inst.sim_link_parse("SIOL", desc, LinkFieldType::In);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }
 
 #[cfg(test)]
@@ -9987,10 +10178,10 @@ mod declaration_gate_tests {
         assert!(calc.resolve_string_view_field("CALC").is_some());
     }
 
-    /// `declares_simulation` replaced `resolve_field("SIMM").is_some()` as the
+    /// `ProcessPlan::simm` replaced `resolve_field("SIMM").is_some()` as the
     /// gate on `PvDatabase::check_simulation_mode`, so it must answer the same
     /// thing for every record type the port carries — a type that gained the
-    /// simulation block while the flag said otherwise would silently stop
+    /// simulation block while the plan said otherwise would silently stop
     /// simulating, and one that lost it would resolve SIML/SIOL by name on
     /// every process cycle again.
     #[test]
@@ -10001,13 +10192,14 @@ mod declaration_gate_tests {
             let Ok(record) = crate::server::db_loader::create_record(rtype) else {
                 continue;
             };
+            let plan = ProcessPlan::of(record.as_ref());
             let instance = inst(&format!("SIM:{rtype}"), record);
             assert_eq!(
-                instance.declares_simulation(),
+                plan.simm.is_some(),
                 instance.resolve_field("SIMM").is_some(),
                 "{rtype}"
             );
-            declared += usize::from(instance.declares_simulation());
+            declared += usize::from(plan.simm.is_some());
         }
         // Both arms have to be populated or the equality above is vacuous.
         assert!(declared > 0, "no record type declared a simulation block");
@@ -10145,8 +10337,8 @@ mod declaration_gate_tests {
 
     #[test]
     fn a_record_type_without_readvalue_declares_no_simulation_block() {
-        assert!(!inst("C:GOOD", Box::new(CalcRecord::default())).declares_simulation());
-        assert!(inst("B:ONE", Box::new(BiRecord::default())).declares_simulation());
+        assert!(ProcessPlan::of(&CalcRecord::default()).simm.is_none());
+        assert!(ProcessPlan::of(&BiRecord::default()).simm.is_some());
     }
 }
 

@@ -766,62 +766,56 @@ impl PvDatabase {
         }
     }
 
-    /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
+    /// **The single owner of the name an external link reads through** — C
+    /// `dbCaAddLink`'s verbatim `pv_link.pvname`, which this port qualifies
+    /// with the link's own scheme ([`ParsedLink::external_pv_name`](crate::server::record::ParsedLink::external_pv_name)).
     ///
-    /// `visited` is the caller's processing-chain state so a PP source is
-    /// processed within the same chain — see
-    /// [`Self::process_passive_db_source`] for why a fresh set would
-    /// defeat the cycle guard.
-    pub(crate) fn read_link_value(
+    /// [`PvDatabase::resolve_external_pv`](super::PvDatabase::resolve_external_pv) accepts the bare body too, and
+    /// resolves it as `LinkTarget::Any`: every registered lset in turn, the
+    /// first holding a cached value wins. A reader that spelled the name
+    /// itself therefore read a `pva` link off the `ca` link set whenever both
+    /// were installed — measured, and the reason `external_pv_name` qualifies
+    /// the two variants that know their scheme. Deriving the name here and
+    /// nowhere else is what keeps the bare spelling from coming back.
+    fn read_external_link_value(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<EpicsValue> {
+        let name = link.external_pv_name()?;
+        self.resolve_external_pv(&name)
+    }
+
+    /// [`Self::read_link_value`] and the source's alarm off the SAME read —
+    /// C `dbGetLink`, whose `dbDbGetValue` tail folds the source's severity in
+    /// from the cell the value was just read from (`dbDbLink.c:220-232`).
+    ///
+    /// Asking the two separately — a value read, then
+    /// [`Self::read_link_with_alarm`] with its value thrown away — read the
+    /// target TWICE per cycle per link: two name resolutions and two value
+    /// reads where C resolves nothing and reads once through its `dbAddr`. It
+    /// also tore, since the severity then came off a later read than the value
+    /// it was reported with.
+    pub(crate) fn read_link_value_and_alarm_at_source(
         &self,
         link: &crate::server::record::ParsedLink,
         visited: &mut ProcStack,
-    ) -> Option<EpicsValue> {
-        match link {
-            crate::server::record::ParsedLink::None => None,
-            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv),
-            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name),
-            // Resolve through the per-link identity key (not bare `j.pv`)
-            // so two same-PV structured links keep distinct configs —
-            // matches the boundary key the write/scan/alarm paths use via
-            // `external_pv_name` (pvxs per-link `pvaLinkConfig`,
-            // ioc/pvalink.h:65).
-            crate::server::record::ParsedLink::PvaJson(j) => {
-                self.resolve_external_pv(&j.link_identity_key())
-            }
-            // A CONSTANT (or unset) link delivers NOTHING at process time —
-            // `dbConstGetValue` (`dbConstLink.c:219-225`) sets `*pnRequest = 0`
-            // and returns 0, so the reader's buffer keeps whatever it held. The
-            // constant reaches the record exactly once, at init, through
-            // [`super::PvDatabase::rec_gbl_init_constant_links`]. Handing the
-            // parsed text back here is what let the `ReadDbLink` executor
-            // re-apply a constant every cycle (sseq `SELL="3"` stomping a
-            // client's `caput SELN 5`, a compress with `INP="5"` filling its
-            // buffer with 5s). `None` here is classified as
-            // [`LinkFetch::NoData`](crate::server::recgbl::simm::LinkFetch::NoData) — success, nothing delivered — by
-            // [`empty_read_fetch`], never as a failed read.
-            crate::server::record::ParsedLink::Constant(_) => None,
-            crate::server::record::ParsedLink::Db(db) => {
-                // PP: process source record if Passive before reading.
-                // Threads the caller's `visited` so an A↔B PP
-                // cycle terminates at the existing cycle guard instead
-                // of recursing with a fresh set.
-                self.process_passive_db_source(db, visited);
-                self.read_db_link_value(db)
-            }
-            // Hardware links are dispatched by device support directly
-            // — there's no canonical "value" available from a generic
-            // read; return None so the framework treats the link as
-            // unresolvable for value-read purposes.
-            crate::server::record::ParsedLink::Hw(_) => None,
-            // lnkCalc: fetch each input PV, evaluate the expr,
-            // return the result. The timestamp half is not here — C keeps
-            // it on the link (`clink->time`) and serves it from the lset
-            // (`lnkCalc_getTimestampTag`), so this port answers it from
-            // `db_get_time_stamp_tag`, the one owner of link→timestamp.
-            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc),
-            crate::server::record::ParsedLink::State(st) => Some(self.read_state_link(st)),
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        // PP: process a Passive DB source before reading, threading the
+        // caller's chain state so an A<->B cycle terminates at the existing
+        // guard — `read_link_value`'s rule, unchanged.
+        if let crate::server::record::ParsedLink::Db(db) = link {
+            self.process_passive_db_source(db, visited);
         }
+        let (value, alarm) = self.read_link_value_and_alarm(link);
+        // A failed read inherits NOTHING: the gate
+        // [`Self::read_link_with_alarm_at`] applies, kept at the primitive
+        // here too so the illegal "no value, but here is the source's
+        // severity" pair cannot leave it.
+        let alarm = match value {
+            None if !crate::server::recgbl::simm::is_constant(link) => None,
+            _ => alarm,
+        };
+        (value, alarm)
     }
 
     /// C `dbGetLink(plink, dbrType, ...)` — an input-link read for the DBR class
@@ -845,19 +839,26 @@ impl PvDatabase {
     /// be one `Option` here, which is how the `ReadDbLink` executor came to
     /// re-deliver a constant on every cycle while the multi-input fetch (same
     /// links, same records) correctly ignored it.
-    pub(crate) fn read_link_value_as(
+    /// [`Self::read_link_value_as`] and the source's alarm off the SAME read —
+    /// see [`Self::read_link_value_and_alarm_at_source`].
+    ///
+    /// A conversion failure carries no alarm, which is where the separate-read
+    /// caller already stood: it asked for the severity only inside its
+    /// `LinkFetch::Value` arm.
+    pub(crate) fn read_link_value_as_with_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut ProcStack,
-    ) -> crate::server::recgbl::simm::LinkFetch {
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        let Some(value) = self.read_link_value(link, visited) else {
-            return empty_read_fetch(link);
+        let (value, alarm) = self.read_link_value_and_alarm_at_source(link, visited);
+        let Some(value) = value else {
+            return (empty_read_fetch(link), None);
         };
         match self.apply_link_read_as(link, read_as, value) {
-            Some(v) => LinkFetch::Value(v),
-            None => LinkFetch::Failed,
+            Some(v) => (LinkFetch::Value(v), alarm),
+            None => (LinkFetch::Failed, None),
         }
     }
 
@@ -954,12 +955,9 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::None => None,
-            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv),
-            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name),
-            // Per-link identity key, as in `read_link_value` above.
-            crate::server::record::ParsedLink::PvaJson(j) => {
-                self.resolve_external_pv(&j.link_identity_key())
-            }
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => self.read_external_link_value(link),
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => self.read_db_link_value(db),
             // Hardware links carry no generic readable value.
@@ -1268,6 +1266,11 @@ impl PvDatabase {
             // `processing.rs`. Without this, a connected external link
             // carrying a remote MINOR/MAJOR severity never folded into
             // the owning record's LINK_ALARM (B2).
+            //
+            // The name is `external_pv_name`'s, scheme and all: it is also the
+            // per-link identity key a structured link resolves by, so two
+            // same-PV links keep distinct configs (pvxs per-link
+            // `pvaLinkConfig`, ioc/pvalink.h:65).
             crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
             | crate::server::record::ParsedLink::Ca(_) => {
@@ -1281,7 +1284,11 @@ impl PvDatabase {
             // A `lnkCalc` link computes its value from its own inputs; the
             // jlink has no source record whose alarm could be inherited
             // (`lnkCalc`'s lset implements no `getAlarm`), so it reads as a
-            // value with no alarm.
+            // value with no alarm. The timestamp half is not
+            // here either — C keeps it on the link (`clink->time`) and serves
+            // it from the lset (`lnkCalc_getTimestampTag`), so this port
+            // answers it from `db_get_time_stamp_tag`, the one owner of
+            // link→timestamp.
             crate::server::record::ParsedLink::Calc(calc) => (self.evaluate_calc_link(calc), None),
             // `lnkState`'s lset implements no `getAlarm`, so a state link
             // reads as a value with no alarm to inherit.
@@ -1769,6 +1776,19 @@ impl PvDatabase {
         is_soft: bool,
         visited: &mut ProcStack,
     ) -> Option<EpicsValue> {
+        self.read_link_value_soft_with_alarm(link, is_soft, visited)
+            .0
+    }
+
+    /// [`Self::read_link_value_soft`] and the source's alarm off the SAME
+    /// read. The arms decide only WHETHER the link reads this cycle; the read
+    /// is [`Self::read_link_value_and_alarm_at_source`]'s.
+    pub(crate) fn read_link_value_soft_with_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        is_soft: bool,
+        visited: &mut ProcStack,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
         match link {
             // A CONSTANT input link delivers NOTHING at process time. C
             // `dbConstGetValue` (`dbConstLink.c:219-225`) returns status 0
@@ -1787,33 +1807,32 @@ impl PvDatabase {
             // into an aai/waveform whose INP is an unset/constant link, which
             // is how EVERY device-fed and client-fed array record is
             // configured) was clobbered on the next scan.
-            crate::server::record::ParsedLink::Constant(_) => None,
-            crate::server::record::ParsedLink::Db(db) if is_soft => {
-                // PP: process source record if Passive before reading
-                self.process_passive_db_source(db, visited);
-                self.read_db_link_value(db)
+            crate::server::record::ParsedLink::Constant(_) => (None, None),
+            crate::server::record::ParsedLink::Db(_) if is_soft => {
+                self.read_link_value_and_alarm_at_source(link, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
                 if is_soft =>
             {
-                let name = link
-                    .external_pv_name()
-                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                self.resolve_external_pv(&name)
+                self.read_link_value_and_alarm_at_source(link, visited)
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
             // soft path) or remote CA/PVA, but the calc evaluation
             // is uniform either way.
-            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc),
+            crate::server::record::ParsedLink::Calc(_) => {
+                self.read_link_value_and_alarm_at_source(link, visited)
+            }
             // A state link answers whatever the DTYP, for the same reason a
             // calc link does: `lnkState`'s own lset implements `getValue`
             // (`lnkState.c:139-151`), so there is no device support to route
             // around and no target record to process first.
-            crate::server::record::ParsedLink::State(st) => Some(self.read_state_link(st)),
-            _ => None,
+            crate::server::record::ParsedLink::State(_) => {
+                self.read_link_value_and_alarm_at_source(link, visited)
+            }
+            _ => (None, None),
         }
     }
 
@@ -4537,7 +4556,9 @@ mod nonlocal_db_link_read_tests {
         );
 
         let mut visited = crate::server::database::ProcStack::new();
-        let v = db.read_link_value(&link, &mut visited);
+        let v = db
+            .read_link_value_and_alarm_at_source(&link, &mut visited)
+            .0;
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -4587,7 +4608,9 @@ mod nonlocal_db_link_read_tests {
 
         let link = parse_link_v2("SRC");
         let mut visited = crate::server::database::ProcStack::new();
-        let v = db.read_link_value(&link, &mut visited);
+        let v = db
+            .read_link_value_and_alarm_at_source(&link, &mut visited)
+            .0;
         assert_eq!(
             v,
             Some(EpicsValue::Double(7.0)),

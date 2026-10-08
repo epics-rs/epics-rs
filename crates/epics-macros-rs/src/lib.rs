@@ -302,6 +302,10 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `&'static [&'static str]` choice table and is emitted through
 ///   `Record::menu_field_choices` (the framework promotes the stored menu
 ///   index to `EpicsValue::Enum` and attaches these labels).
+/// - `#[field(type = "String", link)]` — a `DBF_INLINK`/`DBF_OUTLINK`/
+///   `DBF_FWDLINK` field, lent through `Record::link_text_ref`. The `type`
+///   cannot say this: link fields and `DBF_STRING` fields share `"String"`
+///   storage, and the `.dbd` class is not visible to the derive.
 ///
 /// Field names are converted from snake_case to UPPER_CASE for EPICS field names.
 #[proc_macro_derive(EpicsRecord, attributes(record, field))]
@@ -377,6 +381,7 @@ struct FieldInfo {
     /// non-menu field. `SOME_CONST` must resolve to a
     /// `&'static [&'static str]` in the record's module.
     menu_choices: Option<syn::Expr>,
+    link: bool,
 }
 
 fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -412,7 +417,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let mut field_infos = Vec::new();
     for f in &fields.named {
         let ident = f.ident.as_ref().unwrap().clone();
-        let (dbf_type, read_only, menu_choices) = parse_field_attrs(f)?;
+        let (dbf_type, read_only, menu_choices, link) = parse_field_attrs(f)?;
         let epics_name = ident.to_string().to_uppercase();
         field_infos.push(FieldInfo {
             ident,
@@ -420,6 +425,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             dbf_type,
             read_only,
             menu_choices,
+            link,
         });
     }
 
@@ -488,6 +494,30 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
                 match field {
                     #(#menu_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
+
+    // `#[field(..., link)]` fields — emit `Record::link_text_ref`. Omitted
+    // when no field is a link, so the trait default (lend nothing) applies.
+    let link_arms: Vec<_> = field_infos
+        .iter()
+        .filter(|fi| fi.link)
+        .map(|fi| {
+            let epics_name = &fi.epics_name;
+            let ident = &fi.ident;
+            quote! { #epics_name => Some(&self.#ident), }
+        })
+        .collect();
+    let link_text_method = if link_arms.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+                match link_field {
+                    #(#link_arms)*
                     _ => None,
                 }
             }
@@ -616,6 +646,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
 
             #menu_method
+            #link_text_method
         }
     };
 
@@ -705,10 +736,11 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     })
 }
 
-fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<syn::Expr>)> {
+fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<syn::Expr>, bool)> {
     let mut dbf_type = None;
     let mut read_only = false;
     let mut menu_choices = None;
+    let mut link = false;
 
     for attr in &field.attrs {
         if attr.path().is_ident("field") {
@@ -730,8 +762,11 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
                     let value = meta.value()?;
                     menu_choices = Some(value.parse::<syn::Expr>()?);
                     Ok(())
+                } else if meta.path.is_ident("link") {
+                    link = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type`, `read_only`, or `menu_choices`"))
+                    Err(meta.error("expected `type`, `read_only`, `menu_choices`, or `link`"))
                 }
             })?;
         }
@@ -739,8 +774,14 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
 
     let dbf_type = dbf_type
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
+    if link && dbf_type != "String" {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`link` lends a `&str`, so it needs #[field(type = \"String\")]",
+        ));
+    }
 
-    Ok((dbf_type, read_only, menu_choices))
+    Ok((dbf_type, read_only, menu_choices, link))
 }
 
 fn value_to_epics(

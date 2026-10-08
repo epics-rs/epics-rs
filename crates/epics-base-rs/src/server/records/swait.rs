@@ -852,6 +852,11 @@ impl Record for SwaitRecord {
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 12 clones on every cycle of a record that wires none of them.
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => return Some(&self.siml),
+            "SIOL" => return Some(&self.siol),
+            _ => {}
+        }
         let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
             return None;
         };

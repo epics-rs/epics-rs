@@ -1058,6 +1058,14 @@ impl Record for WaveformRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => Some(&self.siml),
+            "SIOL" => Some(&self.siol),
+            _ => None,
+        }
+    }
+
     // EGU/HOPR/LOPR/PREC are backed by typed storage and exposed through both
     // get_field/put_field and field_list, so populate_display_info reads the
     // loaded values for the DBR_GR display limits (waveformRecord.c:251-252).

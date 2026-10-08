@@ -623,6 +623,14 @@ impl Record for HistogramRecord {
         Ok(())
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => Some(&self.siml),
+            "SIOL" => Some(&self.siol),
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.

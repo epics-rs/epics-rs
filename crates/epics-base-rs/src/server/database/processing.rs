@@ -905,7 +905,7 @@ enum SimOutcome {
     /// output write to SIOL. Carries the SIOL link, the SIMS severity, and
     /// the RAW-mode flag (write RVAL vs OVAL).
     RedirectOutputToSiol {
-        siol: crate::server::record::ParsedLink,
+        siol: Arc<crate::server::record::ParsedLink>,
         sims: i16,
         raw_mode: bool,
     },
@@ -3383,10 +3383,23 @@ impl PvDatabase {
         // request (stringin/lsi ask for `DBR_STRING`/`dbGetLinkLS` —
         // `devSiSoft.c:53`, `devLsiSoft.c:32` — so an ENUM/MENU source
         // delivers its state label, not the index).
-        let inp_value = inp.as_ref().and_then(|inp_parsed| {
-            self.read_link_value_soft(inp_parsed, is_soft, visited)
-                .and_then(|v| self.typed_input_value(rec, "INP", inp_parsed, v))
-        });
+        //
+        // Value and source alarm come off ONE read (C `dbGetLink` reads once
+        // through the link's `dbAddr` and folds the source's severity in the
+        // same call). The alarm is the RAW read's: C's `dbDbGetValue` tail
+        // gates on the READ's status, and the second read this replaces had no
+        // conversion applied to it either.
+        let (inp_value, inp_source_alarm) = match inp.as_ref() {
+            Some(inp_parsed) => {
+                let (raw, alarm) =
+                    self.read_link_value_soft_with_alarm(inp_parsed, is_soft, visited);
+                (
+                    raw.and_then(|v| self.typed_input_value(rec, "INP", inp_parsed, v)),
+                    alarm,
+                )
+            }
+            None => (None, None),
+        };
 
         // C `readLocked` (`devAiSoft.c:54-63`): the same `dbLinkDoLocked` that
         // read the value reads the source's timestamp, under the source's lock
@@ -3444,8 +3457,7 @@ impl PvDatabase {
         )> = if let Some(inp_parsed) = inp.as_ref()
             && is_soft
         {
-            let (_v, alarm) = self.read_link_with_alarm(inp_parsed);
-            self.input_link_inheritance(rec, inp_parsed, alarm)
+            self.input_link_inheritance(rec, inp_parsed, inp_source_alarm)
         } else {
             None
         };
@@ -4135,9 +4147,9 @@ impl PvDatabase {
         // carried to whichever `recGblFwdLink` tail this cycle ends at, so the
         // put-notify parked on that window is replayed there (C
         // `dbNotifyCompletion`) instead of being stranded.
-        let (sim_outcome, sim_pact_exit) = if plan.simulation {
+        let (sim_outcome, sim_pact_exit) = if let Some(simm) = plan.simm {
             guard.release();
-            self.check_simulation_mode(rec)
+            self.check_simulation_mode(rec, &simm)
         } else {
             (SimOutcome::NotSimulated, no_sim_pact_exit)
         };
@@ -6266,7 +6278,10 @@ impl PvDatabase {
             return true;
         };
         use crate::server::recgbl::simm::LinkFetch;
-        match self.read_link_value_as(&parsed, read_as, visited) {
+        // One read for both halves — see
+        // `PvDatabase::read_link_value_and_alarm_at_source`.
+        let (fetch, source_alarm) = self.read_link_value_as_with_alarm(&parsed, read_as, visited);
+        match fetch {
             // C `dbConstGetValue`: SUCCESS with nothing written. The target
             // field keeps what it holds (a client's `caput SELN 5` survives a
             // `field(SELL,"3")`), no LINK alarm is raised, and the link did NOT
@@ -6280,10 +6295,7 @@ impl PvDatabase {
                 // folds the SOURCE's committed alarm into the READER per the
                 // link's MS class. The source has already been processed above
                 // (a PP link), so its alarm is the one this cycle sees.
-                let inheritance = {
-                    let alarm = self.read_link_with_alarm(&parsed).1;
-                    self.input_link_inheritance(rec, &parsed, alarm)
-                };
+                let inheritance = self.input_link_inheritance(rec, &parsed, source_alarm);
                 let mut instance = rec.write();
                 // A value the target field REJECTS is a failed read, not a
                 // silent no-op: C `dbGetLink`'s conversion failure comes back as
@@ -7245,7 +7257,7 @@ impl PvDatabase {
     fn write_simulated_output_siol(
         &self,
         rec: &Arc<RecordCell>,
-        sim_output: &Option<(crate::server::record::ParsedLink, i16, bool)>,
+        sim_output: &Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
         skip_out: bool,
         src: super::links::OutLinkSrc<'_>,
         visited: &mut ProcStack,
@@ -8020,37 +8032,24 @@ impl PvDatabase {
     fn check_simulation_mode(
         &self,
         rec: &Arc<RecordCell>,
+        simm: &crate::server::record::record_instance::SimmBlock,
     ) -> (SimOutcome, crate::server::record::PactExit) {
-        // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
-        let (siml_link, siol_link, sims, sdly, _rtype, is_input, input_stage, pact_held) = {
-            let instance = rec.read();
-            // The entry gate is the SIM BLOCK's own marker — the SIMM field.
-            // C's `readValue`/`writeValue` exists only on a record whose dbd
-            // declares SIMM, and it dispatches on SIMM alone; the SIML/SIOL
-            // links are read INSIDE that dispatch, never as a precondition for
-            // it. Gating on "SIML and SIOL are both empty" (the pre-fix gate)
-            // made `caput REC.SIMM 1` + `caput REC.SVAL 42` — simulate against
-            // a constant, the standard idiom — a complete no-op on every
-            // record, because an unset SIOL is exactly the case C serves from
-            // SVAL (R12-61).
-            //
-            // It is asked FIRST, and of the record's DECLARATION. It used to be
-            // asked fifth, by `resolve_field("SIMM")`, after SIML, SIOL, SIMS
-            // and SDLY had each been resolved by name — so every calc, sub,
-            // aSub, sel, seq and fanout in a database paid four full field
-            // scans per process cycle to reach a gate that was always going to
-            // turn it away.
-            if !instance.declares_simulation() {
-                return (
-                    SimOutcome::NotSimulated,
-                    instance.pact_exit_without_release(),
-                );
-            }
-            let rtype = instance.record.record_type().to_string();
-            // swait: the simulation replaces the record's input STAGE, not its
-            // whole cycle. Declared by the record, not by a type-name list —
-            // the classification is a property of where C put the SIOL read.
-            let input_stage = instance.record.simulation_substitutes_input_stage();
+        // Read SIML, SIOL, SIMS, SDLY from the record
+        let (siml_link, siol_link, sims, sdly, pact_held) = {
+            // Exclusive, not shared: the SIML/SIOL parse cache is validated
+            // and (on a text change) rewritten here, and this is the one
+            // stage of the cycle that reads those two links.
+            let mut instance = rec.write();
+            // The entry gate — the record's DECLARATION of SIMM — is the
+            // caller's `plan.simm`, and reaching here IS that declaration. C's
+            // `readValue`/`writeValue` exists only on a record whose dbd
+            // declares SIMM and dispatches on SIMM alone; the SIML/SIOL links
+            // are read INSIDE that dispatch, never as a precondition for it.
+            // Gating on "SIML and SIOL are both empty" (the pre-fix gate) made
+            // `caput REC.SIMM 1` + `caput REC.SVAL 42` — simulate against a
+            // constant, the standard idiom — a complete no-op on every record,
+            // because an unset SIOL is exactly the case C serves from SVAL
+            // (R12-61).
             // C `prec->pact` at process entry — the value every readValue/
             // writeValue simulation guard keys on. The framework holds the
             // `processing` flag across an async wait owned by PACT (the SDLY
@@ -8064,93 +8063,35 @@ impl PvDatabase {
             // a token" (`is_continuation`), which conflates the PACT-owning
             // continuation with the pact=FALSE re-trigger.
             let pact_held = instance.is_processing();
-            // Every input record whose DBD declares SIML/SIOL/SIMM/SIMS.
-            // `mbbi`/`mbbiDirect` are input records: `mbbiRecord.c:125-126`
-            // (and mbbiDirectRecord.c) declare SIML+SIOL, and
-            // `mbbiRecord.c:388-394` reads `dbGetLink(&prec->siol,
-            // DBR_ULONG, &prec->sval)` then `rval = sval` — input
-            // semantics. Omitting them sent a simulated mbbi down the
-            // OUTPUT branch, which writes VAL out to SIOL instead of
-            // reading the value in from it.
+            // The two links as C holds them: `prec->siml` / `prec->siol` are
+            // `DBLINK`s that `dbInitLink` parsed once and a put re-parses, so
+            // `recGblGetSimm` and `readValue`/`writeValue` read a parse, never
+            // text. `sim_link_parse` is that parse, keyed on the text the
+            // record holds (a changed text is re-parsed at the next cycle, so
+            // the 21 record types that store the text need no write hook);
+            // the text itself is lent by `link_text_ref` where the type
+            // offers it and resolved through the instance's stored-field
+            // chain where it does not — `mca` keeps SIML/SIOL in the
+            // declared-override store (`mca-rs/src/record/mod.rs:896-902`).
             //
-            // `waveform`/`histogram` are also `readValue` inputs: both call
-            // `readValue` at the START of `process()` and read SIOL in
-            // (`waveformRecord.c:139`->`:351` `dbGetLink(&siol, ftvl, bptr)`;
-            // `histogramRecord.c:209`->`:384` `dbGetLink(&siol, DBR_DOUBLE,
-            // &sval)`). They are classified as inputs so a simulated cycle
-            // reads SIOL rather than running the real device read and writing
-            // VAL back out. Each lands the value where its own C `readValue`
-            // lands it, through `Record::land_simulated_value`: `waveform` puts
-            // the SIOL array in VAL (the default `set_val`), `histogram` puts
-            // the scalar in SGNL and bins it (`histogramRecord.c:385` +
-            // `:219` `add_count`), because its VAL is the bin-count array.
-            //
-            // `aai` is also a SIOL-reading input, but the SIOL read lives in
-            // its soft DEVICE support, not the record support. `aaiRecord.c::
-            // readValue` (:342) raises SIMM_ALARM then calls `read_aai`, and
-            // `devAaiSoft.c::read_aai` (:89) reads
-            // `simm == YES ? &prec->siol : &prec->inp` — i.e. SIMM=YES reads
-            // the SIOL array into VAL, observably identical to `waveform`. (The
-            // record-support `readValue` alone looks device-only, which is
-            // misleading: the soft device is what redirects to SIOL, exactly as
-            // `devAaoSoft.c::write_aao` (:56) writes `simm == YES ? &siol :
-            // &out` for the `aao` OUTPUT twin.) So `aai` is classified as an
-            // input alongside `waveform`; its SIOL array lands in VAL via the
-            // same `set_val` path. `aao` is correctly EXCLUDED: its soft device
-            // writes VAL out to SIOL, which the OUTPUT redirect (`!is_input` ->
-            // `RedirectOutputToSiol` -> `write_simulated_output_siol`, VAL array
-            // -> SIOL) already reproduces.
-            let is_input = input_stage
-                || matches!(
-                    rtype.as_str(),
-                    "ai" | "bi"
-                        | "mbbi"
-                        | "mbbiDirect"
-                        | "longin"
-                        | "int64in"
-                        | "stringin"
-                        | "lsi"
-                        | "event"
-                        | "waveform"
-                        | "histogram"
-                        | "aai"
-                        // synApps `mca`: `mcaRecord.c:1097` `readValue` reads
-                        // SIOL IN (`dbGetLink(&siol, ftvl, bptr, NULL,
-                        // &nRequest)` with `nRequest = nmax`), exactly as
-                        // `waveform` does. Omitting it sent a simulated mca
-                        // down the OUTPUT branch, which writes VAL out to SIOL.
-                        | "mca"
-                );
-
-            // Resolve the SIM-block fields through the INSTANCE, not through
-            // `Record::get_field`. A record need not model every field its
-            // `.dbd` declares, and `mca` deliberately does not model
-            // SIML/SIOL — it leaves them to the framework
-            // (`mca-rs/src/record/mod.rs:896-902`) — so their link text lives
-            // in the instance's declared-override store and `record.get_field`
-            // answers `None`. That read an empty SIOL on every simulated mca.
-            // `resolve_field` is the single owner of "what does this field read
-            // as": record state, dbCommon, virtual, override, `.dbd` initial.
-            let siml = instance
-                .resolve_field("SIML")
-                .and_then(|v| {
-                    if let EpicsValue::String(s) = v {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let siol = instance
-                .resolve_field("SIOL")
-                .and_then(|v| {
-                    if let EpicsValue::String(s) = v {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            // SIOL is `DBF_INLINK` on an input record (`aiRecord.dbd.pod:492`)
+            // and `DBF_OUTLINK` on an output one (`aoRecord.dbd.pod:551`), so
+            // its modifier mask (`dbStaticLib.c:2380-2391`) follows the same
+            // direction split — CP/CPP is discarded on the output side.
+            let siml_link = instance.sim_link_parse(
+                "SIML",
+                simm.siml,
+                crate::server::record::LinkFieldType::In,
+            );
+            let siol_link = instance.sim_link_parse(
+                "SIOL",
+                simm.siol,
+                if simm.is_input {
+                    crate::server::record::LinkFieldType::In
+                } else {
+                    crate::server::record::LinkFieldType::Out
+                },
+            );
             // SIMS is `DBF_MENU` (`mcaRecord.dbd:391`, `aiRecord.dbd.pod:511`
             // and every other), so read the INDEX and not one chosen carrier:
             // base record types answer `EpicsValue::Short` (`records/ai.rs:310`)
@@ -8160,7 +8101,7 @@ impl PvDatabase {
             // raised `SIMM_ALARM` at NO_ALARM whatever the database asked for
             // — silently, since a menu index of 0 is a legal value.
             let sims = instance
-                .resolve_field("SIMS")
+                .resolve_field_upper_at("SIMS", simm.sims)
                 .and_then(|v| v.to_menu_index())
                 .unwrap_or(0);
             // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
@@ -8169,35 +8110,17 @@ impl PvDatabase {
             // branch is a no-op there, exactly as a record with the C default
             // behaves.
             let sdly = instance
-                .resolve_field("SDLY")
+                .resolve_field_upper_at("SDLY", simm.sdly)
                 .and_then(|v| v.to_f64())
                 .unwrap_or(-1.0);
 
-            let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
-            // SIOL is `DBF_INLINK` on an input record (`aiRecord.dbd.pod:492`)
-            // and `DBF_OUTLINK` on an output one (`aoRecord.dbd.pod:551`), so
-            // its modifier mask (`dbStaticLib.c:2380-2391`) follows the same
-            // direction split — CP/CPP is discarded on the output side.
-            let siol_parsed = crate::server::record::parse_link_field(
-                siol.as_str_lossy().as_ref(),
-                if is_input {
-                    crate::server::record::LinkFieldType::In
-                } else {
-                    crate::server::record::LinkFieldType::Out
-                },
-            );
-
-            (
-                siml_parsed,
-                siol_parsed,
-                sims,
-                sdly,
-                rtype,
-                is_input,
-                input_stage,
-                pact_held,
-            )
+            (siml_link, siol_link, sims, sdly, pact_held)
         };
+        let is_input = simm.is_input;
+        // swait: the simulation replaces the record's input STAGE, not its
+        // whole cycle. Declared by the record, not by a type-name list — the
+        // classification is a property of where C put the SIOL read.
+        let input_stage = rec.process_plan().substitutes_input_stage_when_simulating;
 
         // Read SIML -> update SIMM, but only when PACT is not held. C resolves
         // the simulation mode in `recGblGetSimm` (`dbGetLink(&prec->siml,

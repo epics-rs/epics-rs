@@ -160,6 +160,14 @@ impl Record for EventRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+        match link_field {
+            "SIML" => Some(&self.siml),
+            "SIOL" => Some(&self.siol),
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone().into())),

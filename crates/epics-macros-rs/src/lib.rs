@@ -295,6 +295,22 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   whose C `process()` keeps `prec->udf = FALSE` inside `if (status == 0)`
 ///   and folds `2` into `0` only afterwards (or not at all); omitted, the
 ///   trait default `true` applies
+/// - `#[record(type = "longin", soft_input_read_as = Long)]` — emit
+///   `Record::soft_input_request` answering `LinkReadAs::Long` under every
+///   soft DTYP, for a record whose soft dsets all hand INP's `dbGetLink` one
+///   `dbrType`; omitted, the trait default (the record's own INP request)
+///   applies. A name that is not a `LinkReadAs` variant does not compile:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs", soft_input_read_as = Lnog)]
+/// struct Bad {
+///     #[field(type = "Long")]
+///     val: i32,
+/// }
+/// ```
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -384,6 +400,12 @@ struct RecordAttrs {
     /// trait default `true` applies), which is `aiRecord.c:158-161`'s shape and
     /// the majority.
     dset_owns_udf_on_computed: bool,
+    /// `#[record(soft_input_read_as = Long)]` — the `LinkReadAs` variant every
+    /// soft dset of the record type reads INP at (`devLiSoft` and
+    /// `devLiSoftCallback` both ask `DBR_LONG`). Emitted as
+    /// `Record::soft_input_request`; the variant path is resolved by rustc, so
+    /// a misspelt one is a compile error.
+    soft_input_read_as: Option<syn::Ident>,
 }
 
 struct FieldInfo {
@@ -657,6 +679,22 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    // `#[record(soft_input_read_as = Variant)]` — emit
+    // `Record::soft_input_request` answering that variant under every soft DTYP.
+    let soft_input_request_method = match &attrs.soft_input_read_as {
+        Some(variant) => quote! {
+            fn soft_input_request(
+                &self,
+                _soft: #krate::server::device_support::SoftDtyp,
+            ) -> #krate::server::record::InputLinkRequest {
+                #krate::server::record::InputLinkRequest::As(
+                    #krate::server::record::LinkReadAs::#variant,
+                )
+            }
+        },
+        None => quote! {},
+    };
+
     // The scan cycle's cells — emit `Record::cycle_cell`/`put_cycle_cell`,
     // keyed on the member names so a struct that stores a cell cannot forget
     // to opt in and leave the cycle reading it by name. A cell is read in the
@@ -760,6 +798,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #init_method
             #value_monitor_method
             #computed_udf_method
+            #soft_input_request_method
             #cycle_cell_methods
             #metadata_override_method
             #link_metadata_field_method
@@ -819,6 +858,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut link_metadata_field: Option<syn::Path> = None;
     let mut no_value_monitor = false;
     let mut dset_owns_udf_on_computed = false;
+    let mut soft_input_read_as: Option<syn::Ident> = None;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -867,11 +907,15 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                     // Bare flag.
                     dset_owns_udf_on_computed = true;
                     Ok(())
+                } else if meta.path.is_ident("soft_input_read_as") {
+                    soft_input_read_as = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
-                         `no_value_monitor` or `dset_owns_udf_on_computed`",
+                         `no_value_monitor`, `dset_owns_udf_on_computed` or \
+                         `soft_input_read_as`",
                     ))
                 }
             })?;
@@ -890,6 +934,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         link_metadata_field,
         no_value_monitor,
         dset_owns_udf_on_computed,
+        soft_input_read_as,
     })
 }
 

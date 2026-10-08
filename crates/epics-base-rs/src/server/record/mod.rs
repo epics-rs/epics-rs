@@ -19,6 +19,7 @@ mod sparse_text;
 pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::{BkptFlag, CommonFields};
+pub(crate) use constant_link::constant_load_scalar;
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use declared_field_registry::{
     declared_field, declared_field_table, declared_fields, register_declared_fields,

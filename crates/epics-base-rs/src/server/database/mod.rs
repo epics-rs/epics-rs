@@ -2785,27 +2785,24 @@ impl PvDatabase {
         &self,
         record: &Arc<RecordCell>,
     ) -> PostBacking {
-        self.resolve_link_backed_metadata_for_posts_with(record, &InputLinkTexts::none())
-    }
-
-    /// [`Self::resolve_link_backed_metadata_for_posts`] for the cycle that has
-    /// already read this record's link fields — see
-    /// [`Self::resolve_link_backed_metadata_with`].
-    pub(crate) fn resolve_link_backed_metadata_for_posts_with(
-        &self,
-        record: &Arc<RecordCell>,
-        prefetched: &InputLinkTexts,
-    ) -> PostBacking {
-        // Nothing to resolve and no lock taken — the same two answers the
-        // ungated door gives, and both of them are answers, not declines.
-        if prefetched.none_set() {
-            return PostBacking::empty();
-        }
-        let plan = Self::plan_link_backed_metadata_for_posts(&record.read(), prefetched);
+        let plan =
+            Self::plan_link_backed_metadata_for_posts(&record.read(), &InputLinkTexts::none());
         self.resolve_link_backed_metadata_plan(plan)
     }
 
-    /// The first half of [`Self::resolve_link_backed_metadata_for_posts_with`]:
+    /// [`Self::resolve_link_backed_metadata_for_posts`] for a poster inside the
+    /// record's frame. The plan's read guard drops before the resolve, which
+    /// reads the link targets.
+    pub(crate) fn resolve_link_backed_metadata_for_posts_in(
+        &self,
+        frame: InFrame<'_>,
+    ) -> PostBacking {
+        let plan =
+            Self::plan_link_backed_metadata_for_posts(&frame.read(), &InputLinkTexts::none());
+        self.resolve_link_backed_metadata_plan(plan)
+    }
+
+    /// The first half of [`Self::resolve_link_backed_metadata_for_posts`]:
     /// everything it asks of THIS record, under the caller's acquisition of
     /// it. The process cycle asks from inside its entry guard, so the gate
     /// costs it no second acquisition; the other posters ask under a read

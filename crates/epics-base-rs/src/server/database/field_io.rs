@@ -1441,11 +1441,10 @@ impl PvDatabase {
     fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
-        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
-        // relinks the target's lock set. The obligation is taken out here, so
-        // that every exit path below discharges it; see
-        // `record_lock.rs`'s `LinkFieldWrite`.
-        let _relink = self.link_field_write(base, &field);
+        // No `link_field_write` obligation: this body refuses every link
+        // field (`check_not_link_field`), so it never changes link text, and
+        // a relink on that refusal would read every record in the region —
+        // the calling frame's own among them.
 
         // Check simple PVs first. The lookup is its own statement so the
         // `!Send` directory guard is down before `pv.set(…).await` — see the
@@ -1815,12 +1814,8 @@ impl PvDatabase {
             // including `dbPutSpecial(paddr, 1)` and the scan-list move, so
             // both tails below stay inside the window.
             let _record_gate = self.acquire_put_gate(base, &field, Some(&value));
-            // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
-            // field relinks the record's lock set, inside the gate window
-            // above, which holds both sets the relink moves between. The
-            // obligation is taken out here so that every exit path below
-            // discharges it; see `record_lock.rs`'s `LockSetEdit`.
-            let _relink = self.link_field_write(base, &field);
+            // No `link_field_write` obligation: `check_not_link_field` below
+            // refuses every link field, as in `put_pv_body`.
             // The canonical name itself is wanted further down, by
             // `update_scan_index` and `run_special_actions`.
             let canonical_base: String =
@@ -2559,7 +2554,7 @@ impl PvDatabase {
             };
             // `apply_pact_exit` takes no record lock, by construction — the
             // drain it spawns takes the record's write gate itself.
-            self.apply_pact_exit(&name, &member, exit);
+            self.apply_pact_exit(&name, exit);
         }
     }
 
@@ -4946,5 +4941,51 @@ mod tests {
             "a refused restore leaves A at 3.5, got {:?}",
             db.get_pv("TY:CALC.A")
         );
+    }
+
+    /// A `dbPut` of a link field is refused before anything changes, so it
+    /// owes no relink: the lock sets keep their ids, and nothing reads the
+    /// calling frame's record, which a frame holding it for writing (an OUT
+    /// link put from inside its process) would turn into a panic.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_link_field_put_relinks_nothing() {
+        use super::super::FrameGate;
+        use crate::error::CaError;
+        use crate::server::ioc_builder::IocBuilder;
+        use std::collections::HashMap;
+
+        let (db, _) = IocBuilder::new()
+            .db_string(
+                r#"record(ai, "SRC") {
+    field(FLNK, "DST")
+}
+record(ai, "DST") {
+}
+record(ai, "OTHER") {
+}"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let ids = || ["SRC", "DST", "OTHER"].map(|r| db.lock_set_of(r).unwrap().id);
+        let before = ids();
+        assert_eq!(before[0], before[1], "FLNK joins SRC and DST");
+
+        let src = db.get_record("SRC").unwrap();
+        let gate = FrameGate::of_held(src.lock_record());
+        let held = gate.frame(&src).write();
+        for name in ["DST.FLNK", "DST.INP"] {
+            let refused = db.put_pv_already_locked(name, EpicsValue::String("OTHER".into()));
+            assert!(
+                matches!(refused, Err(CaError::BadDbrType(_))),
+                "{name}: {refused:?}"
+            );
+        }
+        drop(held);
+        drop(gate);
+
+        assert_eq!(ids(), before);
     }
 }

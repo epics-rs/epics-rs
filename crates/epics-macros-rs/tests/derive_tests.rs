@@ -665,3 +665,37 @@ fn cycle_cells_answer_as_their_fields_do() {
         }
     }
 }
+
+#[derive(EpicsRecord)]
+#[record(type = "longin", crate_path = "epics_base_rs", soft_input_read_as = Long)]
+struct SoftLonginRecord {
+    #[field(type = "Long")]
+    val: i32,
+}
+
+/// `soft_input_read_as` answers its variant under every soft DTYP, and its
+/// absence leaves the record's own INP request.
+#[test]
+fn soft_input_read_as_names_every_soft_dsets_request() {
+    use epics_base_rs::server::device_support::SoftDtyp;
+    use epics_base_rs::server::record::{InputLinkRequest, LinkReadAs};
+
+    let rec = SoftLonginRecord { val: 0 };
+    for soft in [SoftDtyp::Plain, SoftDtyp::Raw, SoftDtyp::Async] {
+        assert_eq!(
+            rec.soft_input_request(soft),
+            InputLinkRequest::As(LinkReadAs::Long)
+        );
+    }
+    let plain = AiRecord {
+        val: 0.0,
+        high_limit: 0.0,
+        low_limit: 0.0,
+        precision: 0,
+        engineering_units: String::new(),
+    };
+    assert_eq!(
+        plain.soft_input_request(SoftDtyp::Plain),
+        plain.input_link_request("INP")
+    );
+}

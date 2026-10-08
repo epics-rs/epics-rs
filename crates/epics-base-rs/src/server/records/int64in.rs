@@ -36,10 +36,13 @@ fn int64in_metadata_override(
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold, the longin
 // twin. `devI64inSoft.c::readLocked` likewise returns the `dbGetLink` status,
 // never 2.
+// `soft_input_read_as`: devI64inSoft and devI64inSoftCallback read INP as
+// `DBR_INT64` (`devI64inSoft.c:40`, `devI64inSoftCallback.c:62`).
 #[record(
     type = "int64in",
     metadata_override = int64in_metadata_override,
-    dset_owns_udf_on_computed
+    dset_owns_udf_on_computed,
+    soft_input_read_as = Int64
 )]
 pub struct Int64inRecord {
     #[field(type = "Int64")]

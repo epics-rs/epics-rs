@@ -26,10 +26,13 @@ fn longin_metadata_override(
 // exactly where it was. The soft dset returns 0 rather than 2 for that reason
 // (`devLiSoft.c::readLocked` ends `return status`), and `devAsynInt32.c`'s
 // `processLi:1057-1060` writes `pr->udf = 0` itself before returning 0.
+// `soft_input_read_as`: devLiSoft and devLiSoftCallback read INP as
+// `DBR_LONG` (`devLiSoft.c:51`, `devLiSoftCallback.c:62`).
 #[record(
     type = "longin",
     metadata_override = longin_metadata_override,
-    dset_owns_udf_on_computed
+    dset_owns_udf_on_computed,
+    soft_input_read_as = Long
 )]
 pub struct LonginRecord {
     #[field(type = "Long")]

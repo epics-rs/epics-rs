@@ -411,6 +411,36 @@ impl Record for MbbiRecord {
         }
     }
 
+    /// `devMbbiSoft.c:51` reads INP as `DBR_USHORT`, `devMbbiSoftRaw.c:55` as
+    /// `DBR_LONG`, `devMbbiSoftCallback.c:62` as `DBR_ENUM`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain => LinkReadAs::UShort,
+            SoftDtyp::Raw => LinkReadAs::Long,
+            SoftDtyp::Async => LinkReadAs::Enum,
+        })
+    }
+
+    /// `devMbbiSoftRaw` reads INP as `DBR_LONG` but loads a constant one as
+    /// `DBF_ULONG` (`devMbbiSoftRaw.c:42`), so `4294967295` loads and does not
+    /// read.
+    fn soft_input_load_type(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> Option<crate::types::DbFieldType> {
+        use crate::server::device_support::SoftDtyp;
+        use crate::types::DbFieldType;
+        Some(match soft {
+            SoftDtyp::Raw => DbFieldType::ULong,
+            SoftDtyp::Plain | SoftDtyp::Async => DbFieldType::UShort,
+        })
+    }
+
     /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
     /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
     /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` (`:55`) followed by
@@ -670,6 +700,7 @@ impl Record for MbbiRecord {
         // link as DBR_USHORT, so every numeric carrier coerces to u16.
         match value {
             EpicsValue::Enum(v) => self.val = v,
+            EpicsValue::UShort(v) => self.val = v,
             EpicsValue::ULong(v) => self.val = v as u16,
             EpicsValue::Long(v) => self.val = v as u16,
             EpicsValue::Short(v) => self.val = v as u16,

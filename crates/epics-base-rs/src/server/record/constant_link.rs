@@ -122,3 +122,37 @@ pub fn reseed_constant_input_link<R: Record + ?Sized>(
         .map(|(link, target)| ConstantInitLink::new(link, target))?;
     rec_gbl_init_constant_link(record, &seed).map(|_| seed.target_field)
 }
+
+/// C `dbConstLoadScalar(plink, dbrType, pbuffer)` (`dbConstLink.c`) — the
+/// scalar load a soft dset's `recGblInitConstantLink(&prec->inp, dbrType, …)`
+/// runs: the link TEXT through `convert[dbrType]`, which is the `epicsParse*`
+/// row with trailing text allowed (`1e3` into `DBF_LONG` is 1), a range check
+/// that refuses rather than saturates, and the text itself for `DBF_STRING`.
+/// A choice type loads as `DBF_USHORT`. `None` is a non-zero status: the
+/// destination is not touched.
+///
+/// A JSON array constant (`[…]`) is `dbPutConvertJSON` in C and stays with
+/// the link's own parsed value.
+pub(crate) fn constant_load_scalar(
+    constant: &super::ConstantLink,
+    dbr_type: DbFieldType,
+) -> Option<crate::types::c_parse::Converted> {
+    use crate::types::c_parse::{self, Converted, NumericField};
+    let text = constant.text();
+    if text.is_empty() {
+        return None;
+    }
+    if text.starts_with('[') && text.ends_with(']') {
+        return Some(Converted::Stored(constant.value().clone()));
+    }
+    let dbr_type = match dbr_type {
+        DbFieldType::Enum => DbFieldType::UShort,
+        t => t,
+    };
+    match NumericField::of(dbr_type) {
+        Some(row) => c_parse::put_string("INP", row, text).ok(),
+        // `cvt_st_st`: the text itself; the field's own put applies the
+        // `MAX_STRING_SIZE` cut.
+        None => Some(Converted::Stored(EpicsValue::String(PvString::from(text)))),
+    }
+}

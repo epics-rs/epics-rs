@@ -727,6 +727,20 @@ impl Record for AiRecord {
         Ok(())
     }
 
+    /// `devAiSoft.c:57` and `devAiSoftCallback.c:64` read INP as `DBR_DOUBLE`,
+    /// `devAiSoftRaw.c:50` as `DBR_LONG`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain | SoftDtyp::Async => LinkReadAs::Double,
+            SoftDtyp::Raw => LinkReadAs::Long,
+        })
+    }
+
     /// C `devAiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_LONG,
     /// &prec->rval)` at init (`devAiSoftRaw.c:38-42`), `dbGetLink(pinp,
     /// DBR_LONG, &prec->rval, 0, 0)` per read (`:50`), and `read_ai` returns 0,

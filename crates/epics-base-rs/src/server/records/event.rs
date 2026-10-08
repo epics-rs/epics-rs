@@ -117,6 +117,15 @@ impl Record for EventRecord {
         "event"
     }
 
+    /// `devEventSoft.c:56` reads INP as `DBR_STRING`; C ships no other soft
+    /// event dset.
+    fn soft_input_request(
+        &self,
+        _soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(crate::server::record::LinkReadAs::String)
+    }
+
     /// C `eventRecord.c::process` never clears UDF: the record's one
     /// `prec->udf = FALSE` is inside `readValue`'s simulated SIOL branch
     /// (`:191`), which the framework's simulation tail already reproduces. A

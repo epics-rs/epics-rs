@@ -116,6 +116,15 @@ impl Record for MbbiDirectRecord {
         false
     }
 
+    /// `devMbbiDirectSoft.c:51`, `devMbbiDirectSoftRaw.c:54` and
+    /// `devMbbiDirectSoftCallback.c:62` all read INP as `DBR_ULONG`.
+    fn soft_input_request(
+        &self,
+        _soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(crate::server::record::LinkReadAs::ULong)
+    }
+
     /// C `devMbbiDirectSoftRaw` — `recGblInitConstantLink(&prec->inp,
     /// DBF_ULONG, &prec->rval)` at init (`devMbbiDirectSoftRaw.c:42`, unmasked),
     /// and per read `dbGetLink(&prec->inp, DBR_ULONG, &prec->rval, 0, 0)` then

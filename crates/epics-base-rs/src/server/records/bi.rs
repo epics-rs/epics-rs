@@ -245,6 +245,21 @@ impl Record for BiRecord {
         ))
     }
 
+    /// `devBiSoft.c:50` reads INP as `DBR_USHORT`, `devBiSoftRaw.c:50` as
+    /// `DBR_ULONG`, `devBiSoftCallback.c:62` as `DBR_ENUM`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain => LinkReadAs::UShort,
+            SoftDtyp::Raw => LinkReadAs::ULong,
+            SoftDtyp::Async => LinkReadAs::Enum,
+        })
+    }
+
     /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
     /// &prec->rval)` at init, `dbGetLink(.., DBR_ULONG, &prec->rval, ..)` +
     /// `if (prec->mask) prec->rval &= prec->mask;` per read (epics-base

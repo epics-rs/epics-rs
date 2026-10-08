@@ -9,6 +9,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 use super::filters::ChannelName;
 use super::link_set::LinkDbfType;
 use super::processing::ProcStack;
+use super::record_lock::InFrame;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
 /// The `record[.FIELD]` name a link target is addressed by in the local
@@ -75,6 +76,22 @@ fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
         Some(value)
     };
     scalar.and_then(|s| s.get_convert_f64())
+}
+
+/// [`link_value_as_f64`] for the integer requests: element 0 through C's GET
+/// table, so a string source parses (`cvt_st_l` and siblings) and an integer
+/// source narrows by cast. A `DBR_ENUM` read of a string asks the source
+/// record's `put_enum_str` in C (`cvt_st_e`), which no port record serves.
+fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValue> {
+    let scalar = if value.is_array() {
+        value.first_element()?
+    } else {
+        value
+    };
+    if target == DbFieldType::Enum && matches!(scalar, EpicsValue::String(_)) {
+        return None;
+    }
+    scalar.get_convert(target).ok()
 }
 
 fn empty_read_fetch(
@@ -222,6 +239,11 @@ pub(crate) struct SourceId(usize);
 impl SourceId {
     pub(crate) fn of(rec: &RecordCell) -> Self {
         SourceId(std::ptr::from_ref(rec) as usize)
+    }
+
+    /// The frame's own record. Identity only: nothing is read through it.
+    pub(crate) fn of_frame(frame: InFrame<'_>) -> Self {
+        Self::of(frame.unframed())
     }
 }
 
@@ -1000,6 +1022,11 @@ impl PvDatabase {
             // its element 0 (C asks for one element, so `dbGet` converts offset
             // 0), the same rule the multi-input fetch applies.
             LinkReadAs::Double => link_value_as_f64(value).map(EpicsValue::Double),
+            LinkReadAs::Long => link_value_get_as(value, DbFieldType::Long),
+            LinkReadAs::ULong => link_value_get_as(value, DbFieldType::ULong),
+            LinkReadAs::UShort => link_value_get_as(value, DbFieldType::UShort),
+            LinkReadAs::Int64 => link_value_get_as(value, DbFieldType::Int64),
+            LinkReadAs::Enum => link_value_get_as(value, DbFieldType::Enum),
             LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
@@ -1338,7 +1365,7 @@ impl PvDatabase {
     #[inline(always)]
     pub(crate) fn input_link_inheritance(
         &self,
-        reader: &Arc<RecordCell>,
+        reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         alarm: Option<SourceAlarm>,
     ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
@@ -1348,7 +1375,7 @@ impl PvDatabase {
     /// [`Self::input_link_inheritance`] for a read that carried an alarm.
     fn inherit_source_alarm(
         &self,
-        reader: &Arc<RecordCell>,
+        reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         alarm: SourceAlarm,
     ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
@@ -1361,7 +1388,7 @@ impl PvDatabase {
                 // test it is. The handle came off the same read that produced
                 // the alarm, so there is no second lookup and no name to
                 // canonicalise: an alias and the record it names ARE one cell.
-                if record == Some(SourceId::of(reader)) {
+                if record == Some(SourceId::of_frame(reader)) {
                     return None;
                 }
                 inherits(db.monitor_switch).then_some((db.monitor_switch, alarm))
@@ -1384,7 +1411,7 @@ impl PvDatabase {
     pub(crate) fn fold_input_link_alarm(
         &self,
         common: &mut crate::server::record::CommonFields,
-        reader: &Arc<RecordCell>,
+        reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         alarm: SourceAlarm,
     ) {
@@ -2647,7 +2674,7 @@ impl PvDatabase {
     /// after `dbNameToAddr` / `dbCaGet*`.
     pub(crate) fn multi_out_buffer_choice(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         link_field: &str,
         link: &crate::server::record::ParsedLink,
         staged: EpicsValue,
@@ -2675,7 +2702,7 @@ impl PvDatabase {
     /// structurally impossible rather than fixed at the record.
     pub(crate) fn dispatch_multi_output_values(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         src: OutLinkSrc<'_>,
         skip_out: bool,
         plan: &crate::server::record::record_instance::ProcessPlan,
@@ -2796,7 +2823,7 @@ impl PvDatabase {
     /// every failing put owes the record is already raised here.
     pub(crate) fn write_out_link_value(
         &self,
-        src_rec: &Arc<RecordCell>,
+        src_rec: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
         src: OutLinkSrc<'_>,
@@ -2912,7 +2939,7 @@ impl PvDatabase {
     /// the live STAT/SEVR fields, and post the monitor — matching the
     /// observable end state (record reads INVALID/SOFT_ALARM, a
     /// `DBE_ALARM` subscriber on STAT/SEVR is notified).
-    fn apply_selm_alarm(rec: &Arc<RecordCell>, alarm: Option<(u16, AlarmSeverity)>) {
+    fn apply_selm_alarm(rec: InFrame<'_>, alarm: Option<(u16, AlarmSeverity)>) {
         let Some((stat, sevr)) = alarm else {
             return;
         };
@@ -2963,7 +2990,7 @@ impl PvDatabase {
     ///
     /// `sseq` reads its own SELL→SELN in `SseqRecord::pre_input_link_actions`
     /// (the async machine owns the whole cycle), so it is not handled here.
-    pub(crate) fn read_sell_into_seln(&self, rec: &Arc<RecordCell>, phase: SellPhase) {
+    pub(crate) fn read_sell_into_seln(&self, rec: InFrame<'_>, phase: SellPhase) {
         let sell = {
             let instance = rec.read();
             let record_type = instance.record.record_type();
@@ -2995,7 +3022,7 @@ impl PvDatabase {
         // (`fanoutRecord.c:88`, `dfanoutRecord.c:102`, `seqRecord.c:121`
         // `recGblInitConstantLink(&sell, DBF_USHORT, &seln)`), so a
         // `caput REC.SELN` STAYS put.
-        if let Some(val) = self.db_get_link(rec, "SELL", &parsed).value() {
+        if let Some(val) = self.db_get_link_in(rec, "SELL", &parsed).value() {
             // The conversion routine is chosen by the SOURCE type — an integer
             // source wraps mod 2^16, a float source is UB. `dbr_ushort_cast`
             // owns that split. SELN is a `DBF_USHORT` (u16) field either way,
@@ -3028,7 +3055,7 @@ impl PvDatabase {
     /// its range alarm directly into the already-committed SEVR.
     pub(crate) fn dispatch_multi_output(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         phase: MultiOutPhase,
         visited: &mut ProcStack,
     ) -> MultiOutDispatch {
@@ -3352,7 +3379,7 @@ impl PvDatabase {
                         instance.common.callback_priority()
                     };
                     let db = self.clone();
-                    let rec = rec.clone();
+                    let rec = Arc::clone(rec.unframed());
                     crate::runtime::task::spawn_background(prio, async move {
                         for idx in active {
                             let dly = groups[idx].dly;
@@ -3366,9 +3393,10 @@ impl PvDatabase {
                                 // C `processCallback`'s `dbScanLock` /
                                 // `dbScanUnlock` pair (`seqRecord.c:252`,
                                 // `:274`) — held for this group alone.
-                                let _gate = db.lock_instance(&rec);
                                 let mut visited = crate::server::database::ProcStack::new();
-                                db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited);
+                                db.with_frame(&rec, |frame| {
+                                    db.seq_group_step(frame, &rec_name, &groups, idx, &mut visited)
+                                });
                             }
                         }
                         // `pgrp == NULL` → `prec->rset->process(prec)`
@@ -3438,7 +3466,7 @@ impl PvDatabase {
     /// LNKn put failed propagates that LINK_ALARM into the NEXT group's target.
     fn seq_group_step(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         rec_name: &str,
         groups: &[SeqGroup],
         idx: usize,
@@ -3460,7 +3488,7 @@ impl PvDatabase {
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
             let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-            self.db_get_input_link(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited)
+            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited)
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)
@@ -3474,7 +3502,7 @@ impl PvDatabase {
         // nothing at all; the only other call is `asyncFinish`'s (`:224`),
         // which lands the last hop's time on the record. Through the owner,
         // so TSEL is re-resolved per group exactly as C's re-entry does.
-        self.rec_gbl_get_time_stamp(rec);
+        self.rec_gbl_get_time_stamp_in(rec);
         // C `seqRecord.c:264` drives LNKn via `dbPutLink` (`DBR_DOUBLE,
         // &dov`), whose `DBF_OUTLINK` target is processed by `dbDbPutValue`
         // (`dbDbLink.c:388`) only when the link carries an explicit `PP`
@@ -3529,7 +3557,7 @@ impl PvDatabase {
     /// `SCAN="Event"` records whose `EVNT` resolves to that name.
     /// No-op for any other record type, or when `VAL` is empty /
     /// resolves to event 0 (`eventNameToHandle` returns NULL).
-    pub(crate) fn dispatch_event_record(&self, rec: &Arc<RecordCell>) {
+    pub(crate) fn dispatch_event_record(&self, rec: InFrame<'_>) {
         let event_name = {
             let instance = rec.read();
             if !posts_software_event(instance.record.record_type()) {
@@ -3612,11 +3640,9 @@ impl PvDatabase {
     /// goes through [`SnapshotCell::update`](super::snapshot::SnapshotCell),
     /// which moves that revision, so no cached `false` can outlive the
     /// registration that makes it wrong.
-    pub(crate) fn sources_cp_edges(
-        &self,
-        source_record: &str,
-        rec: &crate::server::record::RecordCell,
-    ) -> bool {
+    pub(crate) fn sources_cp_edges(&self, source_record: &str, rec: InFrame<'_>) -> bool {
+        // The cache is atomics on the cell, outside the data the frame guards.
+        let rec = rec.unframed();
         // Revision first, map second — see `SnapshotCell::revision`.
         let revision = self.inner.cp_links.revision();
         if let Some(cached) = rec.cached_cp_edges(revision) {
@@ -4642,24 +4668,24 @@ mod cp_link_locality_tests {
         let src = db.get_record("SRC").unwrap();
 
         assert!(
-            !db.sources_cp_edges("SRC", &src),
+            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
             "no CP edge names SRC yet"
         );
         assert!(
-            !db.sources_cp_edges("SRC", &src),
+            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
             "the second ask is the cached one and must answer the same"
         );
 
         db.register_cp_link("SRC", "HOLDER", false).await;
         assert!(
-            db.sources_cp_edges("SRC", &src),
+            db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
             "the registration moved the registry revision, so the cached \
              `false` must not have survived it"
         );
 
         db.remove_record("HOLDER").await;
         assert!(
-            !db.sources_cp_edges("SRC", &src),
+            !db.with_frame(&src, |f| db.sources_cp_edges("SRC", f)),
             "removing the holder drops the edge, and the same revision gate \
              must expire the cached `true`"
         );
@@ -5167,7 +5193,8 @@ mod db_link_addr_tests {
             assert_eq!(value, Some(EpicsValue::Double(1.0)));
             (
                 alarm.is_some(),
-                db.input_link_inheritance(&reader, &link, alarm).is_some(),
+                db.with_frame(&reader, |f| db.input_link_inheritance(f, &link, alarm))
+                    .is_some(),
             )
         };
         assert_eq!(alarm_of("SRC"), (false, false));
@@ -5411,6 +5438,11 @@ mod db_link_addr_tests {
         let requests = [
             LinkReadAs::Native,
             LinkReadAs::Double,
+            LinkReadAs::Long,
+            LinkReadAs::ULong,
+            LinkReadAs::UShort,
+            LinkReadAs::Int64,
+            LinkReadAs::Enum,
             LinkReadAs::String,
             LinkReadAs::CharArrayAsString { max_elements: 40 },
         ];
@@ -5437,6 +5469,70 @@ mod db_link_addr_tests {
                     "{text} as {read_as:?}"
                 );
             }
+        }
+    }
+
+    /// Each integer request on the edge C's GET table defines: an integer
+    /// source narrows by cast, a string parses with base auto-detect, and a
+    /// `DBR_ENUM` read of a string fails. A failed read inherits no alarm.
+    #[epics_macros_rs::epics_test]
+    async fn the_integer_requests_convert_as_c_dbget_does() {
+        use crate::server::record::LinkReadAs;
+        use crate::server::records::{
+            int64in::Int64inRecord, longin::LonginRecord, mbbi::MbbiRecord,
+            stringin::StringinRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("BIG", Box::new(Int64inRecord::new(0x1_0000_0005)))
+            .await
+            .unwrap();
+        db.add_record("NEG", Box::new(LonginRecord::new(-1)))
+            .await
+            .unwrap();
+        db.add_record("HEX", Box::new(StringinRecord::new("0x10")))
+            .await
+            .unwrap();
+        db.add_record("EXP", Box::new(StringinRecord::new("1e3")))
+            .await
+            .unwrap();
+        db.add_record("WORD", Box::new(StringinRecord::new("One")))
+            .await
+            .unwrap();
+        db.add_record("M", Box::new(MbbiRecord::new(2)))
+            .await
+            .unwrap();
+        for (text, read_as, expect) in [
+            ("BIG", LinkReadAs::Long, Some(EpicsValue::Long(5))),
+            (
+                "BIG",
+                LinkReadAs::Int64,
+                Some(EpicsValue::Int64(0x1_0000_0005)),
+            ),
+            (
+                "BIG",
+                LinkReadAs::Double,
+                Some(EpicsValue::Double(4294967301.0)),
+            ),
+            ("NEG", LinkReadAs::UShort, Some(EpicsValue::UShort(65535))),
+            ("NEG", LinkReadAs::ULong, Some(EpicsValue::ULong(u32::MAX))),
+            ("NEG", LinkReadAs::Enum, Some(EpicsValue::Enum(65535))),
+            ("HEX", LinkReadAs::Long, Some(EpicsValue::Long(16))),
+            ("HEX", LinkReadAs::Int64, Some(EpicsValue::Int64(16))),
+            ("HEX", LinkReadAs::UShort, Some(EpicsValue::UShort(16))),
+            ("EXP", LinkReadAs::ULong, Some(EpicsValue::ULong(1000))),
+            ("WORD", LinkReadAs::Long, None),
+            ("WORD", LinkReadAs::Enum, None),
+            ("HEX", LinkReadAs::Enum, None),
+            ("M", LinkReadAs::Enum, Some(EpicsValue::Enum(2))),
+        ] {
+            let parsed = parse_link_v2(&format!("{text} MS"));
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            let (value, alarm) = db.read_db_link_as_at(&parsed, &at, read_as);
+            assert_eq!(value, expect, "{text} as {read_as:?}");
+            assert_eq!(alarm.is_some(), expect.is_some(), "{text} as {read_as:?}");
         }
     }
 

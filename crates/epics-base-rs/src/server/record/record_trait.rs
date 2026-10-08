@@ -498,11 +498,41 @@ pub enum LinkReadAs {
     String,
     /// C `dbGetLink(..., DBR_DOUBLE, ...)`.
     Double,
+    /// C `dbGetLink(..., DBR_LONG, ...)`.
+    Long,
+    /// C `dbGetLink(..., DBR_ULONG, ...)`.
+    ULong,
+    /// C `dbGetLink(..., DBR_USHORT, ...)`.
+    UShort,
+    /// C `dbGetLink(..., DBR_INT64, ...)`.
+    Int64,
+    /// C `dbGetLink(..., DBR_ENUM, ...)`. Numeric sources convert as
+    /// [`Self::UShort`] does; a `DBF_STRING` source does not parse
+    /// (`cvt_st_e` asks the SOURCE record's `put_enum_str`), so it fails.
+    Enum,
     /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
     /// bytes of the source's char array, taken as the string they spell
     /// (`sseqRecord.c:682-686`: `n_elements` clamped to the record's 40-byte
     /// `s` buffer, then `strcmp`/`atof` read it as a C string).
     CharArrayAsString { max_elements: usize },
+}
+
+impl LinkReadAs {
+    /// The scalar `dbrType` this request names; `None` for the native read and
+    /// the char-array one, which name none.
+    pub(crate) fn dbr_type(self) -> Option<crate::types::DbFieldType> {
+        use crate::types::DbFieldType as T;
+        Some(match self {
+            Self::String => T::String,
+            Self::Double => T::Double,
+            Self::Long => T::Long,
+            Self::ULong => T::ULong,
+            Self::UShort => T::UShort,
+            Self::Int64 => T::Int64,
+            Self::Enum => T::Enum,
+            Self::Native | Self::CharArrayAsString { .. } => return None,
+        })
+    }
 }
 
 /// A record's per-link `dbGetLink` request, asked BEFORE the link's source is
@@ -529,6 +559,22 @@ pub enum InputLinkRequest {
     /// The request depends on the source's DBF class / element count: resolve
     /// the target and ask [`Record::input_link_read_as_from_source`].
     FromSource,
+}
+
+impl InputLinkRequest {
+    /// INP's request under the record's DTYP, the one answer both INP reads of
+    /// a cycle ask: a soft DTYP's dset decides it
+    /// ([`Record::soft_input_request`]), any other leaves it to the record.
+    #[inline]
+    pub(crate) fn for_inp(
+        record: &dyn Record,
+        soft: Option<crate::server::device_support::SoftDtyp>,
+    ) -> Self {
+        match soft {
+            Some(soft) => record.soft_input_request(soft),
+            None => record.input_link_request("INP"),
+        }
+    }
 }
 
 /// How C gates a secondary field named by
@@ -2546,6 +2592,36 @@ pub trait Record: Send + Sync + 'static {
         match value {
             Some(value) => self.set_val(value),
             None => Ok(()),
+        }
+    }
+
+    /// The `dbrType` the record type's `soft` INPUT dset hands its INP
+    /// `dbGetLink` — `devAiSoft` asks `DBR_DOUBLE`, `devAiSoftRaw` `DBR_LONG`.
+    /// The request is the dset's, not the record's: one record type reads INP
+    /// at a different type under each of its soft DTYPs.
+    ///
+    /// Default: the record's own [`Self::input_link_request`] for `INP`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> InputLinkRequest {
+        let _ = soft;
+        self.input_link_request("INP")
+    }
+
+    /// The `dbrType` the same soft dset's `init_record` loads a constant INP
+    /// at — `recGblInitConstantLink(&prec->inp, dbrType, …)`, a call of its own
+    /// in C. `None` keeps the link's own parsed value.
+    ///
+    /// Default: the type [`Self::soft_input_request`] reads at, which is the
+    /// init type of every soft dset but `devMbbiSoftRaw`.
+    fn soft_input_load_type(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> Option<crate::types::DbFieldType> {
+        match self.soft_input_request(soft) {
+            InputLinkRequest::As(read_as) => read_as.dbr_type(),
+            InputLinkRequest::NotRead | InputLinkRequest::FromSource => None,
         }
     }
 

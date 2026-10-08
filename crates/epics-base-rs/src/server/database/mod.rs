@@ -21,7 +21,7 @@ pub(crate) use links::{
     multi_output_dispatch_owned, posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
 pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts, ProcStack};
-pub(crate) use record_lock::{LockRecord, SetGuard};
+pub(crate) use record_lock::{FrameGate, InFrame, LockRecord, SetGuard};
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};

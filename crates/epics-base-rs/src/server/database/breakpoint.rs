@@ -480,7 +480,7 @@ impl BreakpointTable {
         // of the set still process while one is stopped. The thread marks
         // itself suspended here and nowhere else, so what
         // `epicsThreadShowAll` reports is this call, not a flag beside it.
-        rec.lock_record().unheld(crate::runtime::task::suspend_self);
+        rec.unheld(crate::runtime::task::suspend_self);
         Before::Run
     }
 

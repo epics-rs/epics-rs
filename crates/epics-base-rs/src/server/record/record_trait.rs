@@ -3697,10 +3697,13 @@ pub trait Record: Send + Sync + 'static {
         }
     }
 
-    /// The three cells C `checkAlarms` reads straight off the record — VAL,
-    /// HYST and LALM — in one question, in the ladder's own domain. `None`
-    /// is a VAL the ladder has no arm for; a `None` HYST is one this type
-    /// keeps in `CommonFields`, and a type with no LALM cell latches on VAL.
+    /// The cells C `checkAlarms` reads straight off the record — VAL, HYST,
+    /// LALM, AFTC and AFVL — in one question, in the ladder's own domain.
+    /// `None` is a VAL the ladder has no arm for; a `None` HYST is one this
+    /// type keeps in `CommonFields`, and a type with no LALM cell latches on
+    /// VAL. A type with no AFTC field (`ao`, `longout`, `int64out`, `calcout`,
+    /// per their `.dbd.pod`) has no filter block in C and answers AFTC = AFVL
+    /// = 0: a disabled filter with nothing to clear.
     ///
     /// Same reason as [`Self::monitor_deadband_cells`]: the ladder runs on
     /// every cycle of every analog record, and asking [`Self::get_field`] by
@@ -3720,30 +3723,21 @@ pub trait Record: Send + Sync + 'static {
                 .get_field(cell.name())
                 .and_then(|v| AlarmLimit::from_stored(&v)),
         };
+        let f64_of = |cell: CycleCell| match self.cycle_cell(cell) {
+            CycleRead::Value(v) => v.to_f64(),
+            CycleRead::Absent => 0.0,
+            CycleRead::ByName => self
+                .get_field(cell.name())
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0),
+        };
         Some(AnalogAlarmInput {
             val,
             hyst: limit(CycleCell::Hyst),
             lalm: limit(CycleCell::Lalm).unwrap_or(val),
+            aftc: f64_of(CycleCell::Aftc),
+            afvl: f64_of(CycleCell::Afvl),
         })
-    }
-
-    /// C `checkAlarms`'s AFTC low-pass cells — the time constant and the
-    /// filter accumulator — in one question.
-    ///
-    /// `None` is a record type that carries no AFTC field, and so has no
-    /// filter block in its C `checkAlarms` at all: `ao`, `longout`,
-    /// `int64out` and `calcout` (confirmed against their `.dbd.pod`). That
-    /// used to be a hard-coded list of the four types that DO carry it,
-    /// beside the field reads that would have answered the same question.
-    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        let f64_of = |cell: CycleCell| match self.cycle_cell(cell) {
-            CycleRead::Value(v) => Some(Some(v.to_f64())),
-            CycleRead::Absent => None,
-            CycleRead::ByName => self.get_field(cell.name()).map(|v| v.to_f64()),
-        };
-        let aftc = f64_of(CycleCell::Aftc)?.unwrap_or(0.0);
-        let afvl = f64_of(CycleCell::Afvl).flatten().unwrap_or(0.0);
-        Some((aftc, afvl))
     }
 
     /// Store the AFTC filter accumulator — C's `prec->afvl = afvl`.
@@ -6115,20 +6109,14 @@ mod tests {
                         .get_field("LALM")
                         .and_then(|v| AlarmLimit::from_stored(&v))
                         .unwrap_or(val),
+                    aftc: f64_of(r, "AFTC").unwrap_or(0.0),
+                    afvl: f64_of(r, "AFVL").unwrap_or(0.0),
                 });
             assert_eq!(
                 r.analog_alarm_input(),
                 ladder,
                 "{record_type} analog_alarm_input"
             );
-
-            let filter = r.get_field("AFTC").map(|aftc| {
-                (
-                    aftc.to_f64().unwrap_or(0.0),
-                    f64_of(r, "AFVL").unwrap_or(0.0),
-                )
-            });
-            assert_eq!(r.alarm_filter_cells(), filter, "{record_type} AFTC/AFVL");
         }
     }
 
@@ -6449,6 +6437,10 @@ pub struct AnalogAlarmInput {
     pub hyst: Option<AlarmLimit>,
     /// LALM, the armed latch; VAL for a type with no cell for it.
     pub lalm: AlarmLimit,
+    /// AFTC, the alarm filter time constant; 0 for a type with no filter.
+    pub aftc: f64,
+    /// AFVL, the alarm filter accumulator; 0 for a type with no filter.
+    pub afvl: f64,
 }
 
 /// The cells the scan cycle reads or writes on every pass — see

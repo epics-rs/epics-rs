@@ -353,6 +353,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::server::record::RecordCell;
+use crate::server::record::record_instance::{HeldMut, RecordRef};
 
 use crate::runtime::sync::{
     MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
@@ -467,25 +468,41 @@ impl LockRecord {
     #[inline]
     pub(crate) fn acquire(&self) -> SetGuard {
         let set = self.set();
-        if set.owner.load(Ordering::Acquire) == thread_key() {
+        let me = thread_key();
+        if set.owner.load(Ordering::Acquire) == me {
             // This thread holds the set, so by Rule R the record cannot leave
             // it: no re-check, and nothing but the depth counter to touch.
             // This is every `rec.read()` / `rec.write()` inside a process
             // cycle, which is why it is inlined and the rest is not.
-            return set.reenter(false);
+            return set.reenter();
         }
-        self.acquire_fresh()
+        self.acquire_fresh(me)
     }
 
-    /// The set was not held: take whatever set the record is behind by the
-    /// time the mutex is ours — a merge can move the record while this
-    /// thread waits, and the set it then holds would be the wrong one.
+    /// The set was not held. The common case is a free mutex and a record
+    /// that has not moved: one `try_lock`, the publication, one re-check of
+    /// the cell, and none of the loop's saved registers.
+    #[inline(never)]
+    fn acquire_fresh(&self, me: u64) -> SetGuard {
+        let set = self.set();
+        if let Some(guard) = set.try_lock_fresh(me) {
+            if std::ptr::eq(self.set(), set) {
+                return guard;
+            }
+        }
+        self.acquire_contended(me)
+    }
+
+    /// Take whatever set the record is behind by the time the mutex is ours
+    /// — a merge can move the record while this thread waits, and the set it
+    /// then holds would be the wrong one. A hold [`Self::acquire_fresh`]
+    /// took and lost the re-check on is given back by dropping it first.
     #[cold]
     #[inline(never)]
-    fn acquire_fresh(&self) -> SetGuard {
+    fn acquire_contended(&self, me: u64) -> SetGuard {
         loop {
             let set = self.set();
-            let guard = set.acquire(false);
+            let guard = set.acquire_as(me);
             if std::ptr::eq(self.set(), set) {
                 return guard;
             }
@@ -597,40 +614,44 @@ impl LockSet {
     /// TLS load, one compare and a plain counter — no read-modify-write.
     /// `depth` is written only by the owning thread, which is what makes a
     /// load-then-store correct.
-    fn acquire(&'static self, many: bool) -> SetGuard {
-        let me = thread_key();
+    fn acquire(&'static self) -> SetGuard {
+        self.acquire_as(thread_key())
+    }
+
+    /// [`Self::acquire`] for a caller that has already asked for the key.
+    fn acquire_as(&'static self, me: u64) -> SetGuard {
         if self.owner.load(Ordering::Acquire) == me {
-            return self.reenter(many);
+            return self.reenter();
         }
         self.lock_fresh(me);
-        if many {
-            self.many_holds.fetch_add(1, Ordering::Relaxed);
-        }
-        SetGuard {
-            set: self,
-            outermost: true,
-            many,
-        }
+        SetGuard::of(self)
     }
 
     /// One more level on a thread that already holds the set. The caller
     /// has checked `owner`.
     #[inline]
-    fn reenter(&'static self, many: bool) -> SetGuard {
+    fn reenter(&'static self) -> SetGuard {
         self.depth
             .store(self.depth.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-        if many {
-            self.many_holds.fetch_add(1, Ordering::Relaxed);
-        }
-        SetGuard {
-            set: self,
-            outermost: false,
-            many,
-        }
+        SetGuard::of(self)
     }
 
-    /// Take the mutex on a thread that does not hold it and publish the hold.
-    fn lock_fresh(&'static self, me: u64) {
+    /// [`Self::lock_fresh`] if the mutex is free, without waiting for it.
+    #[inline(always)]
+    fn try_lock_fresh(&'static self, me: u64) -> Option<SetGuard> {
+        Self::debug_check_fresh();
+        let guard = self.lock.try_lock()?;
+        // SAFETY: as in `lock_fresh`. `held` is `None` while the mutex is free.
+        unsafe { self.held.get().write(Some(guard)) };
+        self.owner.store(me, Ordering::Release);
+        self.depth.store(1, Ordering::Relaxed);
+        Some(SetGuard::of(self))
+    }
+
+    /// The lock-order rules a fresh acquisition is held to — compiled out of
+    /// a release build, shared by every way of taking the mutex.
+    #[inline(always)]
+    fn debug_check_fresh() {
         // A fresh acquisition is rung L1 of the order in the module doc. L46
         // sits below it, so a thread that holds the registration gate and
         // reaches here is closing the cycle `update_scan_index` opens from
@@ -653,6 +674,11 @@ impl LockSet {
              the records map or the alias table; clone the record handle out \
              under the guard and drop it before locking the record"
         );
+    }
+
+    /// Take the mutex on a thread that does not hold it and publish the hold.
+    fn lock_fresh(&'static self, me: u64) {
+        Self::debug_check_fresh();
         let guard = self.lock.lock();
         // SAFETY: this thread holds `lock`, so it is the only one allowed at
         // `held` (see the `Sync` impl).
@@ -710,15 +736,28 @@ impl LockSet {
             0,
             "a lock set was given up from inside a many-lock transaction"
         );
+        // The set is retaken on every exit of `f`, an unwind included: the
+        // frame's outer `SetGuard` releases a hold this thread must own.
         self.unlock_outermost();
-        let r = f();
-        self.lock_fresh(me);
-        r
+        let _retake = Retake { set: self, me };
+        f()
     }
 
     /// C's `epicsMutexTryLock` probe in `dbLockShowLocked` (`dbLock.c:963-965`).
     fn is_locked(&self) -> bool {
         self.lock.try_lock().is_none()
+    }
+}
+
+/// Takes back the set [`LockSet::unheld`] gave up, when dropped.
+struct Retake {
+    set: &'static LockSet,
+    me: u64,
+}
+
+impl Drop for Retake {
+    fn drop(&mut self) {
+        self.set.lock_fresh(self.me);
     }
 }
 
@@ -729,13 +768,26 @@ impl LockSet {
 /// `!Send` too.
 pub(crate) struct SetGuard {
     set: Set,
-    /// `false` for a recursive re-entry, which acquired no new mutex. The
-    /// outermost hold's mutex guard is in [`LockSet::held`].
-    outermost: bool,
-    many: bool,
+    /// A raw-pointer marker: the set is `Sync`, which would make this guard
+    /// `Send`, and a hold must be released by the thread that took it.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl SetGuard {
+    #[inline(always)]
+    fn of(set: Set) -> Self {
+        Self {
+            set,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Whether this is a hold on [`bootstrap_set`] (id 0).
+    #[inline(always)]
+    fn on_bootstrap(&self) -> bool {
+        self.set.id == 0
+    }
+
     /// Whether `record` is in the set this guard holds — C `dbLockGetLockId`
     /// equality. Rule R makes the answer stable for the guard's lifetime:
     /// a record cannot leave a set while a thread holds it.
@@ -746,17 +798,15 @@ impl SetGuard {
 }
 
 impl Drop for SetGuard {
+    #[inline]
     fn drop(&mut self) {
-        if self.many {
-            self.set.many_holds.fetch_sub(1, Ordering::Relaxed);
-        }
-        if self.outermost {
+        // `depth` counts this thread's live holds, so the one that takes it
+        // to zero is the one that gives the mutex up — whichever order the
+        // guards are dropped in.
+        let depth = self.set.depth.load(Ordering::Relaxed) - 1;
+        self.set.depth.store(depth, Ordering::Relaxed);
+        if depth == 0 {
             self.set.unlock_outermost();
-        } else {
-            self.set.depth.store(
-                self.set.depth.load(Ordering::Relaxed) - 1,
-                Ordering::Relaxed,
-            );
         }
     }
 }
@@ -768,7 +818,7 @@ fn hold_sorted(sets: &[Set]) -> Vec<SetGuard> {
     let mut sets: Vec<Set> = sets.to_vec();
     sets.sort_unstable_by_key(|set| set.id);
     sets.dedup_by_key(|set| set.id);
-    sets.into_iter().map(|set| set.acquire(false)).collect()
+    sets.into_iter().map(|set| set.acquire()).collect()
 }
 
 /// C's `lockSetsActive` / `lockSetsFree` / `next_id` (`dbLock.c:42-70`) plus
@@ -1314,7 +1364,7 @@ impl PvDatabase {
     /// `built` promises that no registered record is on the bootstrap set
     /// from here on ([`Registry::every_set`]).
     fn init_sets(&self, names: &[String]) {
-        let _out_of = bootstrap_set().acquire(false);
+        let _out_of = bootstrap_set().acquire();
         let mut registry = self.inner.record_locks.lock();
         for name in names {
             let lr = registry.lock_record_of(name);
@@ -1381,7 +1431,7 @@ impl PvDatabase {
         if !lr.is_bootstrap() {
             return;
         }
-        let _out_of = bootstrap_set().acquire(false);
+        let _out_of = bootstrap_set().acquire();
         self.inner.record_locks.lock().mint_for(name, lr);
     }
 
@@ -1695,6 +1745,107 @@ pub struct RecordWriteGuard {
     _guard: SetGuard,
 }
 
+impl RecordWriteGuard {
+    /// The set this gate holds, for the frame that writes under it.
+    #[inline(always)]
+    pub(crate) fn set(&self) -> &SetGuard {
+        &self._guard
+    }
+}
+
+/// The set a process frame runs under: the one it took at its entry, or the
+/// one its caller's frame already holds.
+///
+/// The second case counts nothing — no level on `depth`, no release — so the
+/// set still reads as held exactly once to `unheld` (a breakpoint parks only
+/// a thread that holds its set once). It is the caller's hold, borrowed for a
+/// call that returns before the caller's guard drops.
+pub(crate) enum FrameGate {
+    Taken(RecordWriteGuard),
+    Held(std::mem::ManuallyDrop<SetGuard>),
+}
+
+impl FrameGate {
+    /// The gate of a recursive FLNK/OUT/CP frame or a transaction owner's:
+    /// the set this thread holds already. A thread that does not hold it —
+    /// which no caller is meant to be — takes it, as `write()` always did.
+    #[inline(always)]
+    pub(crate) fn of_held(lr: &LockRecord) -> Self {
+        let set = lr.set();
+        if set.owner.load(Ordering::Acquire) == thread_key() {
+            return Self::Held(std::mem::ManuallyDrop::new(SetGuard::of(set)));
+        }
+        Self::Taken(RecordWriteGuard {
+            _guard: lr.acquire(),
+        })
+    }
+
+    /// The set the frame writes under.
+    #[inline(always)]
+    pub(crate) fn set(&self) -> &SetGuard {
+        match self {
+            Self::Taken(gate) => gate.set(),
+            Self::Held(set) => set,
+        }
+    }
+}
+
+/// A process frame's own record, reached through the set the frame holds.
+///
+/// **Invariant:** inside a process frame the record is read and written only
+/// through this handle, whose `read`/`write` borrow under the frame's
+/// [`SetGuard`] and never take the set, the thread key or the depth again.
+/// `RecordCell::read`/`write` are for code that holds no frame; a frame
+/// function takes a `InFrame` and has no `Arc<RecordCell>` to call them on.
+/// The cell leaves only through [`Self::unframed`], which names the exit.
+///
+/// **Owner/gate:** [`FrameGate::frame`] — the one constructor, so a
+/// `InFrame` exists only beside the gate that proves the set is held.
+#[derive(Clone, Copy)]
+pub(crate) struct InFrame<'a> {
+    cell: &'a Arc<RecordCell>,
+    set: &'a SetGuard,
+}
+
+impl<'a> InFrame<'a> {
+    /// Shared access under the frame's set.
+    #[inline(always)]
+    pub(crate) fn read(&self) -> RecordRef<'a> {
+        self.cell.read_held(self.set)
+    }
+
+    /// Exclusive access under the frame's set.
+    #[inline(always)]
+    pub(crate) fn write(&self) -> HeldMut<'a> {
+        self.cell.write_in(self.set)
+    }
+
+    /// The record's process plan — fixed at construction, so no lock.
+    #[inline(always)]
+    pub(crate) fn process_plan(&self) -> &'a crate::server::record::record_instance::ProcessPlan {
+        self.cell.process_plan()
+    }
+
+    /// The cell, for work that leaves the frame — a spawn, a name for
+    /// another set. Reading or writing through it is a bypass of the gate.
+    #[inline(always)]
+    pub(crate) fn unframed(&self) -> &'a Arc<RecordCell> {
+        self.cell
+    }
+}
+
+impl FrameGate {
+    /// The handle a frame function takes for `rec`, which this gate holds.
+    #[inline(always)]
+    pub(crate) fn frame<'a>(&'a self, rec: &'a Arc<RecordCell>) -> InFrame<'a> {
+        debug_assert!(self.set().holds(rec.lock_record()));
+        InFrame {
+            cell: rec,
+            set: self.set(),
+        }
+    }
+}
+
 /// RAII guard for the lock sets of a declared record set — the `DBManyLocker`
 /// equivalent.
 ///
@@ -1704,7 +1855,27 @@ pub struct RecordWriteGuard {
 /// every plain write to any record of any of those sets blocks.
 #[must_use = "the locked epoch ends as soon as the guard is dropped"]
 pub struct ManyRecordWriteGuard {
-    _guards: Vec<SetGuard>,
+    guards: Vec<SetGuard>,
+}
+
+impl ManyRecordWriteGuard {
+    /// Count `guards` as the locked list C's `dbScanLockMany` adds a reference
+    /// for (`dbLock.c:404`); [`Drop`] gives the references back before the
+    /// sets are released.
+    fn new(guards: Vec<SetGuard>) -> Self {
+        for guard in &guards {
+            guard.set.many_holds.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { guards }
+    }
+}
+
+impl Drop for ManyRecordWriteGuard {
+    fn drop(&mut self) {
+        for guard in &self.guards {
+            guard.set.many_holds.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl PvDatabase {
@@ -1744,17 +1915,30 @@ impl PvDatabase {
     /// on 2000 records at 10 Hz.
     pub fn lock_instance(&self, rec: &Arc<RecordCell>) -> RecordWriteGuard {
         let lr = rec.lock_record();
-        if lr.is_bootstrap() {
-            // First gate this record has ever been given. C mints the set in
-            // `dbLockInitRecords` before anything can lock; the port allows a
-            // database with no `iocInit` at all, so the set is minted on
-            // demand here — once per record, off every later pass. The name
-            // is read and the guard dropped BEFORE the move: a guard taken
-            // through the bootstrap set must not outlive the record's stay
-            // in it.
-            let name = rec.read().name.clone();
-            self.ensure_set_for(&name, lr);
+        let guard = lr.acquire();
+        if guard.on_bootstrap() {
+            return self.lock_instance_off_bootstrap(rec, lr, guard);
         }
+        RecordWriteGuard { _guard: guard }
+    }
+
+    /// First gate this record has ever been given. C mints the set in
+    /// `dbLockInitRecords` before anything can lock; the port allows a
+    /// database with no `iocInit` at all, so the set is minted on demand
+    /// here — once per record, off every later pass. The name is read and
+    /// the bootstrap hold dropped BEFORE the move: a guard taken through the
+    /// bootstrap set must not outlive the record's stay in it.
+    #[cold]
+    #[inline(never)]
+    fn lock_instance_off_bootstrap(
+        &self,
+        rec: &Arc<RecordCell>,
+        lr: &Arc<LockRecord>,
+        bootstrap: SetGuard,
+    ) -> RecordWriteGuard {
+        let name = rec.read().name.clone();
+        drop(bootstrap);
+        self.ensure_set_for(&name, lr);
         RecordWriteGuard {
             _guard: lr.acquire(),
         }
@@ -1796,7 +1980,7 @@ impl PvDatabase {
             sets.sort_unstable_by_key(|set| set.id);
             sets.dedup_by_key(|set| set.id);
 
-            let guards: Vec<SetGuard> = sets.iter().map(|set| set.acquire(true)).collect();
+            let guards = ManyRecordWriteGuard::new(sets.iter().map(|set| set.acquire()).collect());
 
             // `dbLockUpdateRefs(locker, 0)` (`dbLock.c:432-436`): if a merge
             // moved any member while the sets were being taken, release
@@ -1806,7 +1990,7 @@ impl PvDatabase {
                 .iter()
                 .all(|name| matches!(self.inner.record_locks.set_id_of(name), Some(id) if held.contains(&id)))
             {
-                return ManyRecordWriteGuard { _guards: guards };
+                return guards;
             }
             drop(guards);
         }
@@ -2093,7 +2277,8 @@ mod tests {
         let apart = cell("RI:C");
         db.merge_sets("RI:A", "RI:B");
 
-        let mut held = reader.write();
+        let gate = db.lock_instance(&reader);
+        let mut held = reader.write_in(gate.set());
         let (_, set) = held.split();
         assert!(
             linked.read_in(set).rides_held_set(),
@@ -2223,5 +2408,229 @@ mod tests {
             sets.iter().all(|set| !std::ptr::eq(*set, bootstrap_set())),
             "every_set() must not hand a relink the bootstrap set"
         );
+    }
+
+    /// Boundary: the hold that gives the mutex up is the one that takes the
+    /// depth to zero, not the one taken first. Dropping the outer guard
+    /// first must leave the set held for the inner one.
+    #[test]
+    fn the_last_guard_dropped_releases_whichever_order_they_go() {
+        let db = PvDatabase::new();
+        let outer = db.lock_record("RE:ORDER");
+        let inner = db.lock_record("RE:ORDER");
+
+        let db2 = db.clone();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let entered2 = entered.clone();
+        let h = std::thread::spawn(move || {
+            let _g = db2.lock_record("RE:ORDER");
+            entered2.store(1, Ordering::SeqCst);
+        });
+
+        drop(outer);
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "the inner guard still holds the set"
+        );
+        drop(inner);
+        h.join().unwrap();
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    /// Boundary: a many-lock epoch's reference on each set is given back
+    /// when the epoch ends, and a single hold on the same set never counted.
+    #[test]
+    fn a_many_epoch_counts_its_reference_and_returns_it() {
+        let db = PvDatabase::new();
+        let lr = db.ensure_set("RE:MANY");
+        let set = lr.set();
+        let _plain = db.lock_record("RE:MANY");
+        assert_eq!(set.many_holds.load(Ordering::Relaxed), 0);
+        let epoch = db.lock_records(&["RE:MANY".to_string()]);
+        assert_eq!(set.many_holds.load(Ordering::Relaxed), 1);
+        drop(epoch);
+        assert_eq!(set.many_holds.load(Ordering::Relaxed), 0);
+    }
+
+    /// Boundary: a thread blocked on a record's set while a merge runs under
+    /// it wakes holding the old set; the re-check sends it to the set the
+    /// record is behind now, and the guard it returns holds that one.
+    #[test]
+    fn a_merge_while_a_thread_waits_sends_it_to_the_new_set() {
+        let db = PvDatabase::new();
+        let a = db.ensure_set("MG:A");
+        db.ensure_set("MG:B");
+        let held = db.lock_record("MG:A");
+
+        let db2 = db.clone();
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || {
+            let g = a2.acquire();
+            (
+                g.holds(&a2),
+                a2.set().id,
+                db2.inner.record_locks.set_id_of("MG:A"),
+            )
+        });
+        std::thread::sleep(SETTLE);
+        db.merge_sets("MG:A", "MG:B");
+        drop(held);
+        let (holds, id, registry_id) = h.join().unwrap();
+        assert!(holds, "the guard holds the set the record is behind");
+        assert_eq!(Some(id), registry_id);
+        assert_eq!(
+            db.inner.record_locks.set_id_of("MG:A"),
+            db.inner.record_locks.set_id_of("MG:B"),
+            "the merge joined the two"
+        );
+        assert!(!a.set().is_locked(), "every hold has been given back");
+    }
+
+    /// Boundary: a first lock on a record still behind the bootstrap set
+    /// (id 0) mints its set, and the guard returned is on that set, not on
+    /// the bootstrap one.
+    #[test]
+    fn locking_an_instance_on_the_bootstrap_set_moves_it_off_first() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "BS:ONE");
+        assert!(cell.lock_record().is_bootstrap());
+        let guard = db.lock_instance(&cell);
+        assert!(!cell.lock_record().is_bootstrap());
+        assert!(guard._guard.holds(cell.lock_record()));
+        drop(guard);
+        assert!(!bootstrap_set().is_locked(), "the bootstrap hold is gone");
+    }
+
+    /// Boundary: a write under the frame's own set guard touches the borrow
+    /// flag and nothing of the lock — the depth counter reads the same
+    /// before, during and after, where `write()` would have counted a level.
+    #[test]
+    fn a_hold_inside_a_frame_leaves_the_depth_alone() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "FR:ONE");
+        let gate = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        {
+            let mut held = cell.write_in(gate.set());
+            held.common.putf = true;
+            assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        // The flag came back: the plain route can take the record again, and
+        // it is the one that counts a level.
+        {
+            let _again = cell.write();
+            assert_eq!(set.depth.load(Ordering::Relaxed), 2);
+        }
+        drop(gate);
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: the frame's guard is the proof, and a guard of another set
+    /// is not one.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "another lock set")]
+    fn a_hold_under_the_guard_of_another_set_is_refused() {
+        let db = PvDatabase::new();
+        let one = adopted_cell(&db, "FR:A");
+        let other = adopted_cell(&db, "FR:B");
+        let gate = db.lock_instance(&other);
+        let _held = one.write_in(gate.set());
+    }
+
+    /// Boundary: the handle a frame function takes reads and writes under the
+    /// frame's set and counts no level, however often it is asked.
+    #[test]
+    fn the_frame_handle_counts_no_level() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "FR:HANDLE");
+        let gate = FrameGate::Taken(db.lock_instance(&cell));
+        let frame = gate.frame(&cell);
+        let set = cell.lock_record().set();
+        for _ in 0..3 {
+            frame.write().common.putf = true;
+            let _a = frame.read();
+            let _b = frame.read();
+            assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        }
+        drop(gate);
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: a recursive frame borrows its caller's hold — no level, no
+    /// release — and a thread that holds nothing takes the set instead.
+    #[test]
+    fn a_recursive_frame_gate_borrows_the_hold_and_an_unheld_one_takes_it() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "FR:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        {
+            let inner = FrameGate::of_held(cell.lock_record());
+            assert!(matches!(inner, FrameGate::Held(_)));
+            assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+            inner.frame(&cell).write().common.putf = true;
+        }
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        assert!(set.is_locked());
+        drop(outer);
+        assert!(!set.is_locked());
+        {
+            let taken = FrameGate::of_held(cell.lock_record());
+            assert!(matches!(taken, FrameGate::Taken(_)));
+            assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        }
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: `f` unwinds out of the park. The set is retaken, so the
+    /// frame's outer guard releases a hold the thread owns and the next
+    /// holder finds the set consistent.
+    #[test]
+    fn a_panic_inside_unheld_s_park_leaves_the_set_consistent_for_the_next_holder() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "UH:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cell.unheld(|| {
+                assert!(!set.is_locked());
+                panic!("park unwound");
+            })
+        }));
+        assert!(r.is_err());
+        assert!(set.is_locked());
+        assert_eq!(set.owner.load(Ordering::Relaxed), thread_key());
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        drop(outer);
+        assert!(!set.is_locked());
+        let again = db.lock_instance(&cell);
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        drop(again);
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: a borrow that adds no depth is still refused at the park.
+    #[test]
+    fn a_park_with_a_live_borrow_of_the_record_panics_at_the_park() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "UB:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let gate = FrameGate::of_held(cell.lock_record());
+            let frame = gate.frame(&cell);
+            let _b = frame.read();
+            cell.unheld(|| ());
+        }));
+        assert!(r.is_err());
+        assert!(set.is_locked());
+        assert_eq!(set.depth.load(Ordering::Relaxed), 1);
+        drop(outer);
+        assert!(!set.is_locked());
     }
 }

@@ -1440,6 +1440,34 @@ impl RecordCell {
         }
     }
 
+    /// [`Self::read_in`] for a record known to be in `held`'s set — a process
+    /// frame's own record — so the membership test is a debug assertion only.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::read`]; and, in a debug build, if `held` is another set.
+    #[inline(always)]
+    pub(crate) fn read_held<'a>(
+        &'a self,
+        held: &'a crate::server::database::SetGuard,
+    ) -> RecordRef<'a> {
+        use std::sync::atomic::Ordering;
+        debug_assert!(
+            held.holds(&self.lock_record),
+            "record read under the guard of another lock set"
+        );
+        let borrow = self.borrow.load(Ordering::Relaxed);
+        assert!(
+            borrow >= 0,
+            "record data read while this thread holds it for writing"
+        );
+        self.borrow.store(borrow + 1, Ordering::Relaxed);
+        RecordRef {
+            cell: self,
+            _set: None,
+        }
+    }
+
     /// Exclusive access to the record — C `dbScanLock` followed by writing
     /// the fields. Blocks and recurses as [`Self::read`] does.
     ///
@@ -1461,6 +1489,33 @@ impl RecordCell {
         }
     }
 
+    /// [`Self::write`] for a thread that holds `held`, this record's set:
+    /// only the borrow flag is touched — no thread key, no depth counter,
+    /// and nothing to give back on drop but the flag. The shape of a process
+    /// frame, which takes the set once at its entry and never again; the
+    /// borrow is bound to `held` so it cannot outlive the hold.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::write`]; and, in a debug build, if `held` is another set.
+    #[inline(always)]
+    pub(crate) fn write_in<'a>(
+        &'a self,
+        held: &'a crate::server::database::SetGuard,
+    ) -> HeldMut<'a> {
+        use std::sync::atomic::Ordering;
+        debug_assert!(
+            held.holds(&self.lock_record),
+            "record written under the guard of another lock set"
+        );
+        assert!(
+            self.borrow.load(Ordering::Relaxed) == 0,
+            "record data written while this thread still holds a guard of it"
+        );
+        self.borrow.store(-1, Ordering::Relaxed);
+        HeldMut { cell: self, held }
+    }
+
     /// The answer this record cached for `registry_revision`, or `None` when
     /// it has not heard one for that revision.
     ///
@@ -1480,6 +1535,24 @@ impl RecordCell {
         self.cp_edges.store(present, Ordering::Relaxed);
         self.cp_edges_revision
             .store(registry_revision, Ordering::Release);
+    }
+
+    /// Give up this record's lock set for the duration of `f` — the
+    /// breakpoint park. Cold, so it checks what the set cannot see:
+    /// [`HeldMut`] and [`Self::read_held`] add no depth, and a borrow of
+    /// this record live across the park would be read by another thread.
+    ///
+    /// # Panics
+    ///
+    /// If a borrow of this record is live, or as [`LockSet::unheld`].
+    #[cold]
+    pub(crate) fn unheld<R>(&self, f: impl FnOnce() -> R) -> R {
+        assert_eq!(
+            self.borrow.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a record was given up to a park with a borrow of it live"
+        );
+        self.lock_record.unheld(f)
     }
 
     /// The lock-set cell — C `precord->lset`.
@@ -1553,14 +1626,46 @@ impl std::ops::DerefMut for RecordMut<'_> {
     }
 }
 
-impl RecordMut<'_> {
-    /// The instance and the set guard it is held under, apart — for a
-    /// caller that writes the record while it reads another record of the
-    /// same set through [`RecordCell::read_in`].
+/// An exclusive borrow of a record under a set guard the caller holds — what
+/// [`RecordCell::write_in`] hands out. Carries no hold of its own.
+#[must_use = "the record's borrow flag is cleared as soon as the guard is dropped"]
+pub(crate) struct HeldMut<'a> {
+    cell: &'a RecordCell,
+    held: &'a crate::server::database::SetGuard,
+}
+
+impl std::ops::Deref for HeldMut<'_> {
+    type Target = RecordInstance;
+
+    fn deref(&self) -> &RecordInstance {
+        // SAFETY: as `RecordMut`: this thread holds the record's set (`held`)
+        // and the borrow count admitted the one exclusive borrow.
+        unsafe { &*self.cell.data.0.get() }
+    }
+}
+
+impl std::ops::DerefMut for HeldMut<'_> {
+    fn deref_mut(&mut self) -> &mut RecordInstance {
+        // SAFETY: as `deref`, through the unique borrow of the guard.
+        unsafe { &mut *self.cell.data.0.get() }
+    }
+}
+
+impl<'a> HeldMut<'a> {
+    /// The instance and the set guard it is held under, apart — as
+    /// [`RecordMut::split`].
     #[inline]
-    pub(crate) fn split(&mut self) -> (&mut RecordInstance, &crate::server::database::SetGuard) {
-        // SAFETY: as `deref_mut`; the set guard is a separate field.
-        (unsafe { &mut *self.cell.data.0.get() }, &self._set)
+    pub(crate) fn split(&mut self) -> (&mut RecordInstance, &'a crate::server::database::SetGuard) {
+        // SAFETY: as `deref_mut`; the set guard is a separate borrow.
+        (unsafe { &mut *self.cell.data.0.get() }, self.held)
+    }
+}
+
+impl Drop for HeldMut<'_> {
+    fn drop(&mut self) {
+        self.cell
+            .borrow
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -5704,11 +5809,16 @@ impl RecordInstance {
         // out records (ao/longout/int64out/calcout) have no `AFVL` and just
         // return. Running the range check here would drift `LALM` to `val`
         // (NaN on an undefined cycle) and filter `AFVL` — both observable.
+        let super::AnalogAlarmInput {
+            val,
+            hyst,
+            lalm,
+            aftc,
+            afvl,
+        } = input;
         if self.common.udf != 0 {
-            if let Some((_, afvl)) = self.record.alarm_filter_cells() {
-                if afvl != 0.0 {
-                    self.record.store_alarm_filter_value(0.0);
-                }
+            if afvl != 0.0 {
+                self.record.store_alarm_filter_value(0.0);
             }
             return;
         }
@@ -5726,7 +5836,6 @@ impl RecordInstance {
         // to the declared type its only remaining readers are the
         // `DBF_DOUBLE` records and longin/longout, and every `epicsInt32` is
         // an `f64` exactly.
-        let super::AnalogAlarmInput { val, hyst, lalm } = input;
 
         // C-style per-level hysteresis: alarm fires if val passes the level,
         // OR if we were already at that alarm level (lalm == alev) and val
@@ -5749,35 +5858,32 @@ impl RecordInstance {
         // C parity: the alarm-range AFTC low-pass filter
         // (`{ai,longin,int64in,calc}Record.c::checkAlarms`) smooths the
         // integer `alarmRange` and re-maps. Only records that carry the
-        // AFTC/AFVL fields run it — `ao`/`longout`/`int64out`/`calcout`
-        // have no AFTC field (confirmed via the respective `.dbd.pod`),
-        // so they are excluded.
-        if let Some((aftc, afvl)) = self.record.alarm_filter_cells() {
-            if aftc > 0.0 {
-                let now = crate::runtime::general_time::get_current();
-                let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
-                    alarm_range,
-                    aftc,
-                    afvl,
-                    self.common.time,
-                    now,
-                );
-                self.record.store_alarm_filter_value(new_afvl);
-                // C re-maps through the SAME `switch (alarmRange)` the ladder
-                // fell out of, so the filter changes only the range and
-                // `resolve` below answers for both.
-                alarm_range = filtered_range;
-            } else {
-                // aftc <= 0 disables the filter. C `checkAlarms`
-                // (e.g. aiRecord.c:356,401) initialises the local
-                // `afvl = 0` and unconditionally stores `prec->afvl =
-                // afvl` at the end, so a disabled filter drives AFVL to
-                // 0. Mirror that here so a stale accumulator from a prior
-                // `aftc > 0` run cannot mis-seed the filter if AFTC is
-                // re-enabled later.
-                if afvl != 0.0 {
-                    self.record.store_alarm_filter_value(0.0);
-                }
+        // AFTC/AFVL fields run it; the rest answer AFTC = AFVL = 0 and so
+        // take neither arm's store.
+        if aftc > 0.0 {
+            let now = crate::runtime::general_time::get_current();
+            let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
+                alarm_range,
+                aftc,
+                afvl,
+                self.common.time,
+                now,
+            );
+            self.record.store_alarm_filter_value(new_afvl);
+            // C re-maps through the SAME `switch (alarmRange)` the ladder
+            // fell out of, so the filter changes only the range and
+            // `resolve` below answers for both.
+            alarm_range = filtered_range;
+        } else {
+            // aftc <= 0 disables the filter. C `checkAlarms`
+            // (e.g. aiRecord.c:356,401) initialises the local
+            // `afvl = 0` and unconditionally stores `prec->afvl =
+            // afvl` at the end, so a disabled filter drives AFVL to
+            // 0. Mirror that here so a stale accumulator from a prior
+            // `aftc > 0` run cannot mis-seed the filter if AFTC is
+            // re-enabled later.
+            if afvl != 0.0 {
+                self.record.store_alarm_filter_value(0.0);
             }
         }
         // C re-maps the filtered range through the same table the ladder used.

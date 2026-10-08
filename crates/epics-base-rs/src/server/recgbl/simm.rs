@@ -98,17 +98,22 @@ pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0) as i16,
     };
-    // The record's own SIMM menu decides which indices are legal. Every record
-    // that declares SIMM declares its menu; a record with no SIMM never reaches
-    // here (the caller's entry gate), so the fallback is inert.
-    let choices = record
-        .menu_field_choices("SIMM")
-        .map(|c| c.len())
-        .unwrap_or(0);
+    // The record's own SIMM menu decides which indices are legal, and only
+    // index 2 asks — NO and YES are legal in both menus, so the steady cycle
+    // does not look the menu up. Every record that declares SIMM declares its
+    // menu; a record with no SIMM never reaches here (the caller's entry
+    // gate), so the fallback is inert.
     match simm {
         0 => SimMode::No,
         1 => SimMode::Yes,
-        2 if choices >= 3 => SimMode::Raw,
+        2 if record
+            .menu_field_choices("SIMM")
+            .map(|c| c.len())
+            .unwrap_or(0)
+            >= 3 =>
+        {
+            SimMode::Raw
+        }
         // swait's `else` arm: anything that is not NO simulates.
         _ if !record.rejects_illegal_sim_mode() => SimMode::Yes,
         _ => SimMode::Illegal,

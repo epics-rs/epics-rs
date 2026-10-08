@@ -2554,7 +2554,7 @@ impl RecordInstance {
     /// through [`Self::resolve_field_stored_at`]. `ftype` is the link's
     /// direction — SIOL is `DBF_INLINK` on an input type and `DBF_OUTLINK`
     /// on an output one, and the modifier mask follows it.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn sim_link_parse(
         &mut self,
         which: SimLink,
@@ -2563,28 +2563,27 @@ impl RecordInstance {
     ) -> &Arc<ParsedLink> {
         // The steady cycle: the type lends the text and the slot holds its
         // parse. Everything else is `sim_link_refresh`.
-        let cached = match which {
-            SimLink::Siml => &self.parsed_siml,
-            SimLink::Siol => &self.parsed_siol,
-        };
-        let hit = match (self.record.link_text_ref(which.field()), cached) {
+        let hit = match (
+            self.record.link_text_ref(which.field()),
+            self.sim_slot_ref(which),
+        ) {
             (Some(text), Some(entry)) => entry.text == text,
             _ => false,
         };
         if !hit {
             self.sim_link_refresh(which, desc, ftype);
         }
-        // `sim_link_refresh` leaves the slot filled, so the insert never runs.
-        &self
-            .sim_slot(which)
-            .get_or_insert_with(|| SimLinkParse::fresh("", ftype))
-            .parsed
+        match self.sim_slot_ref(which) {
+            Some(entry) => &entry.parsed,
+            None => unreachable!("sim_link_refresh fills the slot"),
+        }
     }
 
-    fn sim_slot(&mut self, which: SimLink) -> &mut Option<SimLinkParse> {
+    #[inline(always)]
+    fn sim_slot_ref(&self, which: SimLink) -> &Option<SimLinkParse> {
         match which {
-            SimLink::Siml => &mut self.parsed_siml,
-            SimLink::Siol => &mut self.parsed_siol,
+            SimLink::Siml => &self.parsed_siml,
+            SimLink::Siol => &self.parsed_siol,
         }
     }
 

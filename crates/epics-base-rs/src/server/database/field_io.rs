@@ -1201,6 +1201,26 @@ impl PvDatabase {
         {
             return Some(EpicsValue::String(value.into()));
         }
+        // C's `dbGet` through the `dbAddr`: a slot is a field the record's
+        // typed accessor answers, and `get_slot_f64` is `get_field` followed
+        // by the numeric funnel — the identity on a field served as
+        // `DBF_DOUBLE`, so for one the slot read IS the by-name read.
+        if let Some(slot) = addr.slot
+            && let Some(desc) = addr.desc
+            && desc.dbf_type == crate::types::DbFieldType::Double
+            && !desc.runtime_typed
+        {
+            let value = instance.record.get_slot_f64(slot).map(EpicsValue::Double);
+            debug_assert!(
+                matches!(
+                    (&value, instance.resolve_field_upper_at(field, addr.desc)),
+                    (Some(EpicsValue::Double(a)), Some(EpicsValue::Double(b))) if a.to_bits() == b.to_bits()
+                ),
+                "{}.{field}: get_slot_f64 disagrees with get_field",
+                instance.name
+            );
+            return value;
+        }
         instance.resolve_field_upper_at(field, addr.desc)
     }
 

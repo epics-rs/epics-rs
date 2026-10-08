@@ -1697,17 +1697,25 @@ struct LinkInputs {
     inp_source_time: Option<std::time::SystemTime>,
     inp_source_utag: Option<u64>,
     inp_link_remote_time: Option<(i64, i32, u64)>,
+    resolved_link_fields: Vec<&'static str>,
+    link_alarms: Vec<(
+        crate::server::record::MonitorSwitch,
+        super::links::LinkAlarm,
+    )>,
+    /// The reads only a closed-loop DOL, `sel`, a string-input type or `aSub`
+    /// make. Boxed so the cycle that has none of them — every `ai` — drops
+    /// one null pointer, not six owners.
+    rare: Option<Box<RareInputs>>,
+}
+
+/// See [`LinkInputs::rare`].
+struct RareInputs {
     dol_info: Option<(crate::server::record::ParsedLink, i16)>,
     dol_fetch: Option<crate::server::recgbl::simm::LinkFetch>,
     dol_read_failed: bool,
     sel_nvl_value: Option<EpicsValue>,
     string_input_values: Vec<(String, EpicsValue)>,
     asub_dynamic: Option<AsubDynamicSub>,
-    resolved_link_fields: Vec<&'static str>,
-    link_alarms: Vec<(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )>,
 }
 
 impl InputStage {
@@ -1731,12 +1739,7 @@ impl LinkInputs {
             inp_source_time: None,
             inp_source_utag: None,
             inp_link_remote_time: None,
-            dol_info: None,
-            dol_fetch: None,
-            dol_read_failed: false,
-            sel_nvl_value: None,
-            string_input_values: Vec::new(),
-            asub_dynamic: None,
+            rare: None,
             resolved_link_fields: Vec::new(),
             link_alarms: Vec::new(),
         }
@@ -3202,6 +3205,7 @@ impl PvDatabase {
     /// that cycle used to walk the whole stage to learn it: the empty INP read
     /// through three classifiers, twelve slots asked for a text that was
     /// never set. It now gets [`InputStage::none`] from inside that guard.
+    #[inline(always)]
     fn fetch_input_stage(
         &self,
         name: &str,
@@ -3298,15 +3302,55 @@ impl PvDatabase {
             // fetch's to own once the guard is released. The type-static
             // halves come off the plan; the per-instance halves were read
             // under this guard.
-            let only_own_inputs = crate::server::recgbl::simm::is_constant(&instance.parsed_inp)
-                && dol.is_none()
+            let no_other_reads = dol.is_none()
                 && pre_input_actions.is_empty()
                 && !plan.string_input
                 && !plan.sel_nvl
                 && !plan.resolves_subroutine_from_link;
+            let only_own_inputs =
+                no_other_reads && crate::server::recgbl::simm::is_constant(&instance.parsed_inp);
             if only_own_inputs && input_link_texts.none_set() {
                 instance.record.set_fetch_gate_failed(false);
                 return InputStage::none(is_soft, 0);
+            }
+            // The soft INP of a record with no other read: a DB link to
+            // another local record, read at the request the record names,
+            // under this guard, as C `dbGetLink` reads through the held lock
+            // set. Nothing is cloned out and nothing is locked again; a link
+            // that needs the guard released (a PP source, a self-link, a
+            // target found by name, a remote timestamp to adopt) takes the
+            // general path below.
+            if no_other_reads
+                && is_soft
+                && !wants_source_time
+                && input_link_texts.none_set()
+                && let crate::server::record::ParsedLink::Db(db) = &instance.parsed_inp
+                && db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
+                && let crate::server::record::InputLinkRequest::As(read_as) =
+                    instance.record.input_link_request("INP")
+                && let Some(at) = self.db_link_addr(db)
+                && !Arc::ptr_eq(&at.rec, rec)
+            {
+                let (fetch, alarm) = self.read_db_link_at(db, &at);
+                let inp_value = match fetch {
+                    crate::server::recgbl::simm::LinkFetch::Value(v) => {
+                        self.apply_link_read_as(&instance.parsed_inp, read_as, v)
+                    }
+                    _ => None,
+                };
+                let mut stage = LinkInputs::none();
+                stage.inp_value = inp_value;
+                stage.link_alarms.extend(self.input_link_inheritance(
+                    rec,
+                    &instance.parsed_inp,
+                    alarm,
+                ));
+                instance.record.set_fetch_gate_failed(false);
+                return InputStage {
+                    is_soft,
+                    resolved: 0,
+                    links: Some(stage),
+                };
             }
             // The cycle whose only reads are the record's own input links,
             // each at its own type — a wired `calc` — is the multi-input
@@ -3323,16 +3367,30 @@ impl PvDatabase {
                 // finding out.
                 let inp = (!crate::server::recgbl::simm::is_constant(&instance.parsed_inp))
                     .then(|| instance.parsed_inp.clone());
-                Ok((inp, is_soft, wants_source_time, dol, pre_input_actions))
+                // Asked here, under the hold, so the typed conversion below
+                // does not lock the reader again just to ask it.
+                let inp_request = inp
+                    .is_some()
+                    .then(|| instance.record.input_link_request("INP"));
+                Ok((
+                    inp,
+                    inp_request,
+                    is_soft,
+                    wants_source_time,
+                    dol,
+                    pre_input_actions,
+                ))
             }
         };
-        let (inp, is_soft, wants_source_time, dol_info, pre_input_actions) = match shape {
-            Ok(general) => general,
-            Err(is_soft) => {
-                let resolved = self.fetch_own_native_inputs(guard, plan, input_link_texts, visited);
-                return InputStage::none(is_soft, resolved);
-            }
-        };
+        let (inp, inp_request, is_soft, wants_source_time, dol_info, pre_input_actions) =
+            match shape {
+                Ok(general) => general,
+                Err(is_soft) => {
+                    let resolved =
+                        self.fetch_own_native_inputs(guard, plan, input_link_texts, visited);
+                    return InputStage::none(is_soft, resolved);
+                }
+            };
         // The reads between here and the multi-input loop — pre-input
         // actions, INP, DOL, NVL — go through the by-name link readers, which
         // take the record's lock themselves; the loop takes the guard back.
@@ -3394,7 +3452,15 @@ impl PvDatabase {
                 let (raw, alarm) =
                     self.read_link_value_soft_with_alarm(inp_parsed, is_soft, visited);
                 (
-                    raw.and_then(|v| self.typed_input_value(rec, "INP", inp_parsed, v)),
+                    raw.and_then(|v| {
+                        self.typed_input_value_requested(
+                            rec,
+                            "INP",
+                            inp_parsed,
+                            inp_request.expect("INP request is asked with the link"),
+                            v,
+                        )
+                    }),
                     alarm,
                 )
             }
@@ -3472,6 +3538,7 @@ impl PvDatabase {
         // `pvxs/ioc/pvalink_lset.cpp:577-593`.
         let inp_link_remote_time: Option<(i64, i32, u64)> = inp
             .as_ref()
+            .filter(|inp_parsed| !matches!(inp_parsed, crate::server::record::ParsedLink::Db(_)))
             .and_then(|inp_parsed| inp_parsed.external_pv_name())
             .and_then(|name| self.external_link_time(&name));
 
@@ -3807,14 +3874,24 @@ impl PvDatabase {
                 inp_source_time,
                 inp_source_utag,
                 inp_link_remote_time,
-                dol_info,
-                dol_fetch,
-                dol_read_failed,
-                sel_nvl_value,
-                string_input_values,
-                asub_dynamic,
                 resolved_link_fields,
                 link_alarms,
+                rare: (dol_info.is_some()
+                    || dol_fetch.is_some()
+                    || dol_read_failed
+                    || sel_nvl_value.is_some()
+                    || !string_input_values.is_empty()
+                    || asub_dynamic.is_some())
+                .then(|| {
+                    Box::new(RareInputs {
+                        dol_info,
+                        dol_fetch,
+                        dol_read_failed,
+                        sel_nvl_value,
+                        string_input_values,
+                        asub_dynamic,
+                    })
+                }),
             }),
         }
     }
@@ -4282,17 +4359,23 @@ impl PvDatabase {
                 // the reader's own `default:` arm (no declared request for this
                 // source class): nothing is attempted and nothing changes.
                 let links = stage.links.as_mut();
-                let dol_fetch = links.as_ref().and_then(|l| l.dol_fetch.as_ref());
+                let dol_fetch = links
+                    .as_ref()
+                    .and_then(|l| l.rare.as_ref())
+                    .and_then(|r| r.dol_fetch.as_ref());
                 if let Some(crate::server::recgbl::simm::LinkFetch::Failed) = dol_fetch {
                     instance.record.closed_loop_dol_read_failed();
                 }
                 let mut links = links;
-                if let Some(crate::server::recgbl::simm::LinkFetch::Value(dol_val)) =
-                    links.as_mut().and_then(|l| l.dol_fetch.take())
+                if let Some(crate::server::recgbl::simm::LinkFetch::Value(dol_val)) = links
+                    .as_mut()
+                    .and_then(|l| l.rare.as_mut())
+                    .and_then(|r| r.dol_fetch.take())
                 {
                     let oif = links
                         .as_ref()
-                        .and_then(|l| l.dol_info.as_ref())
+                        .and_then(|l| l.rare.as_ref())
+                        .and_then(|r| r.dol_info.as_ref())
                         .map(|(_, oif)| *oif)
                         .unwrap_or(0);
                     if oif == 1 {
@@ -4439,10 +4522,11 @@ impl PvDatabase {
                 // AA..LL never populated and the record calculated on an empty
                 // array. The view is `get_convert_f64`, C's DBR_DOUBLE get row,
                 // not `to_f64`: the two disagree on an empty DBF_STRING source.
-                let (sel_nvl_value, string_input_values) = match links {
-                    Some(l) => (
-                        l.sel_nvl_value.take(),
-                        Some(std::mem::take(&mut l.string_input_values)),
+                let (sel_nvl_value, string_input_values) = match links.and_then(|l| l.rare.as_mut())
+                {
+                    Some(r) => (
+                        r.sel_nvl_value.take(),
+                        Some(std::mem::take(&mut r.string_input_values)),
                     ),
                     None => (None, None),
                 };
@@ -4751,7 +4835,10 @@ impl PvDatabase {
                 // Apply the aSub LFLG=READ resolution computed above (outside the
                 // lock). The single apply owner; the bad-sub skip is carried on the
                 // instance and consumed by `run_registered_subroutine`.
-                if let Some(ds) = links.and_then(|l| l.asub_dynamic.as_ref()) {
+                if let Some(ds) = links
+                    .and_then(|l| l.rare.as_ref())
+                    .and_then(|r| r.asub_dynamic.as_ref())
+                {
                     apply_asub_dynamic_sub(instance, ds);
                 }
 
@@ -5254,7 +5341,9 @@ impl PvDatabase {
                 // (mbboRecord.c:210) and the failed closed-loop DOL read
                 // (mbboRecord.c:205) jump to the identical label.
                 let skips_ts_undef = plan.skips_timestamp_when_undefined
-                    && (instance.common.udf != 0 || links.is_some_and(|l| l.dol_read_failed));
+                    && (instance.common.udf != 0
+                        || links
+                            .is_some_and(|l| l.rare.as_ref().is_some_and(|r| r.dol_read_failed)));
                 if !restamps_after && !skips_ts_undef {
                     let inst = &mut *instance;
                     tsel.stamp(&inst.name, &mut inst.common, is_soft);
@@ -7616,6 +7705,25 @@ impl PvDatabase {
                 let source = self.resolve_out_target(link);
                 record.input_link_read_as_from_source(link_field, &source)
             }
+        }
+    }
+
+    /// [`Self::typed_input_value`] with the record's request already asked
+    /// under a hold the caller had. Only `FromSource` — the source decides
+    /// the type — still needs the reader.
+    fn typed_input_value_requested(
+        &self,
+        rec: &Arc<RecordCell>,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        request: crate::server::record::InputLinkRequest,
+        value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        use crate::server::record::InputLinkRequest;
+        match request {
+            InputLinkRequest::As(read_as) => self.apply_link_read_as(link, read_as, value),
+            InputLinkRequest::NotRead => None,
+            InputLinkRequest::FromSource => self.typed_input_value(rec, link_field, link, value),
         }
     }
 

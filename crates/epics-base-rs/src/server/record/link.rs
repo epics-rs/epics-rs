@@ -656,9 +656,72 @@ pub struct DbLink {
     /// link — the value read, the self-link test, the out-target resolve —
     /// where C dereferences a `dbAddr` it filled in at `dbInitLink`.
     channel: crate::server::database::filters::ChannelName,
+    /// C's `dbAddr` from `dbDbInitLink`: the local record and field this
+    /// link resolved to, so a read does no name work. Not part of the link's
+    /// identity — a clone starts empty and equality ignores it.
+    addr: DbAddrCell,
+}
+
+/// The resolved target of a [`DbLink`], stamped with the name-map revision
+/// it was resolved under and re-resolved once that moves (records and
+/// aliases can come and go after `iocInit` here, unlike C). `Weak`, because
+/// the link lives inside a record and two records linking each other would
+/// otherwise keep both alive.
+#[derive(Default)]
+struct DbAddrCell(parking_lot::Mutex<Option<CachedDbAddr>>);
+
+struct CachedDbAddr {
+    rec: std::sync::Weak<super::record_instance::RecordCell>,
+    field: super::record_instance::FieldAddr,
+    revision: u64,
+}
+
+impl Clone for DbAddrCell {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for DbAddrCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for DbAddrCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DbAddrCell")
+    }
 }
 
 impl DbLink {
+    /// The local target at name-map `revision`: the cached one while the
+    /// maps are at the revision it was resolved under, else `resolve`'s
+    /// answer, cached when it is a local record. A miss is asked again on
+    /// the next read, as the by-name path always did.
+    pub(crate) fn local_addr(
+        &self,
+        revision: u64,
+        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
+    ) -> Option<super::record_instance::ResolvedTarget> {
+        if let Some(cached) = &*self.addr.0.lock()
+            && cached.revision == revision
+            && let Some(rec) = cached.rec.upgrade()
+        {
+            return Some(super::record_instance::ResolvedTarget {
+                rec,
+                field: cached.field,
+            });
+        }
+        let target = resolve()?;
+        *self.addr.0.lock() = Some(CachedDbAddr {
+            rec: std::sync::Arc::downgrade(&target.rec),
+            field: target.field,
+            revision,
+        });
+        Some(target)
+    }
+
     /// Build a DB link from the modifier-stripped PV name, applying C
     /// `dbNameToAddr`'s record/field split (`split_record_field`) and its
     /// "absent field name" fallback to `VAL` (`dbFindFieldPart`,
@@ -687,6 +750,7 @@ impl DbLink {
             policy,
             monitor_switch,
             channel,
+            addr: DbAddrCell::default(),
         }
     }
 

@@ -64,6 +64,19 @@ fn filter_read(suffix: &str, v: EpicsValue) -> EpicsValue {
         .unwrap_or(v)
 }
 
+/// C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes its
+/// element 0 (C asks for one element, so `dbGet` converts offset 0), the same
+/// rule the multi-input fetch applies.
+#[inline]
+fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
+    let scalar = if value.is_array() {
+        value.first_element()
+    } else {
+        Some(value)
+    };
+    scalar.and_then(|s| s.get_convert_f64())
+}
+
 fn empty_read_fetch(
     link: &crate::server::record::ParsedLink,
 ) -> crate::server::recgbl::simm::LinkFetch {
@@ -625,18 +638,40 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
     ) -> Option<crate::server::record::record_instance::ResolvedTarget> {
         use crate::server::record::record_instance::LinkTargetResolver;
-        db.local_addr(self.name_revision(), || {
-            match self.link_target(&db.target().record) {
-                LinkTarget::Local(rec) => {
-                    let field = crate::server::record::record_instance::FieldAddr::resolve_in(
-                        &rec,
-                        &db.target().field,
-                    );
-                    Some(crate::server::record::record_instance::ResolvedTarget { rec, field })
-                }
-                LinkTarget::LocalNotRecord | LinkTarget::External => None,
+        db.local_addr(self.name_revision(), || self.resolve_db_link(db))
+    }
+
+    /// [`Self::db_link_addr`] for the reader's own `INP`, lent for as long
+    /// as the reader's guard is held: no lock and no refcount on a hit.
+    pub(crate) fn inp_addr<'g>(
+        &self,
+        instance: &'g crate::server::record::RecordInstance,
+    ) -> Option<&'g crate::server::record::record_instance::ResolvedTarget> {
+        use crate::server::record::record_instance::LinkTargetResolver;
+        let crate::server::record::ParsedLink::Db(db) = &instance.parsed_inp else {
+            return None;
+        };
+        // SAFETY: `release_addr` runs only with the reader exclusively
+        // borrowed (`RecordInstance::destroy`, `release_link_targets_to`),
+        // `instance` is borrowed for `'g`, and no other instance holds this
+        // `Arc<DbLink>`: every `parsed_inp` is its own parse.
+        unsafe { db.lend_addr(self.name_revision(), || self.resolve_db_link(db)) }
+    }
+
+    fn resolve_db_link(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::record::record_instance::ResolvedTarget> {
+        match self.link_target(&db.target().record) {
+            LinkTarget::Local(rec) => {
+                let field = crate::server::record::record_instance::FieldAddr::resolve_in(
+                    &rec,
+                    &db.target().field,
+                );
+                Some(crate::server::record::record_instance::ResolvedTarget { rec, field })
             }
-        })
+            LinkTarget::LocalNotRecord | LinkTarget::External => None,
+        }
     }
 
     /// [`Self::link_target`] for a DB link, through its cached address.
@@ -667,32 +702,63 @@ impl PvDatabase {
     /// The external arm is left to the CALLER, which alone knows the name to
     /// use: an external read keeps the channel filter (C hands `dbCaAddLink`
     /// the verbatim `pv_link.pvname`) and the local name never has it.
-    #[inline(always)]
     fn read_db_target(&self, db: &crate::server::record::DbLink) -> TargetValue {
+        match self.db_link_addr(db) {
+            Some(at) => self.target_value_of(&at.rec, db, at.field),
+            None => self.read_db_target_by_name(db),
+        }
+    }
+
+    /// [`Self::read_db_target`] for a target the cache does not hold.
+    fn read_db_target_by_name(&self, db: &crate::server::record::DbLink) -> TargetValue {
         let target = db.target();
-        let (rec, addr) = match self.db_link_addr(db) {
-            Some(at) => (at.rec, at.field),
-            None => match self.link_target(&target.record) {
-                LinkTarget::Local(rec) => {
-                    let addr = crate::server::record::record_instance::FieldAddr::resolve(
-                        rec.rdes(),
-                        &target.field,
-                    );
-                    (rec, addr)
-                }
-                // A simple PV under the target's own name — the value `get_pv`
-                // answers with before it ever reaches a record.
-                LinkTarget::LocalNotRecord => {
-                    return TargetValue::NoRecord(
-                        self.get_pv(&local_name(&target.record, &target.field)).ok(),
-                    );
-                }
-                LinkTarget::External => return TargetValue::External,
-            },
-        };
-        match self.read_field_of(&rec, db, addr) {
+        match self.link_target(&target.record) {
+            LinkTarget::Local(rec) => {
+                let addr = crate::server::record::record_instance::FieldAddr::resolve(
+                    rec.rdes(),
+                    &target.field,
+                );
+                self.target_value_of(&rec, db, addr)
+            }
+            // A simple PV under the target's own name — the value `get_pv`
+            // answers with before it ever reaches a record.
+            LinkTarget::LocalNotRecord => {
+                TargetValue::NoRecord(self.get_pv(&local_name(&target.record, &target.field)).ok())
+            }
+            LinkTarget::External => TargetValue::External,
+        }
+    }
+
+    #[inline(always)]
+    fn target_value_of(
+        &self,
+        rec: &RecordCell,
+        db: &crate::server::record::DbLink,
+        addr: crate::server::record::record_instance::FieldAddr,
+    ) -> TargetValue {
+        match self.read_field_of(rec, db, addr) {
             FieldRead::Shadow(value) => TargetValue::NoRecord(Some(value)),
-            FieldRead::Field(value, alarm) => TargetValue::Record(value, SourceId::of(&rec), alarm),
+            FieldRead::Field(value, alarm) => TargetValue::Record(value, SourceId::of(rec), alarm),
+        }
+    }
+
+    /// The read through a cached target, packed as the caller consumes it:
+    /// the filtered value and, for an inheriting link, the source's alarm.
+    /// Both [`Self::read_link_value_and_alarm`]'s hit and
+    /// [`Self::read_db_link_at`] are this, so the two cannot disagree.
+    #[inline(always)]
+    fn read_db_at(
+        &self,
+        db: &crate::server::record::DbLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        let target = db.target();
+        match self.read_field_of(&at.rec, db, at.field) {
+            FieldRead::Field(value, alarm) => (
+                value.map(|v| filtered_read(target, v)),
+                alarm.map(|alarm| SourceAlarm::local(SourceId::of(&at.rec), alarm)),
+            ),
+            FieldRead::Shadow(v) => (Some(filtered_read(target, v)), None),
         }
     }
 
@@ -720,7 +786,7 @@ impl PvDatabase {
         // field (`REC.FLD`), and that one shadows the field read. Which is
         // why the `VAL` spelling, where the two names are the same string,
         // needs no `simple_pvs` lock at all.
-        if field != "VAL" {
+        if !db.target_is_val() {
             let pv_name = local_name(record, field);
             if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
                 return FieldRead::Shadow(pv.get());
@@ -898,16 +964,7 @@ impl PvDatabase {
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
             // its element 0 (C asks for one element, so `dbGet` converts offset
             // 0), the same rule the multi-input fetch applies.
-            LinkReadAs::Double => {
-                let scalar = if value.is_array() {
-                    value.first_element()
-                } else {
-                    Some(value)
-                };
-                scalar
-                    .and_then(|s| s.get_convert_f64())
-                    .map(EpicsValue::Double)
-            }
+            LinkReadAs::Double => link_value_as_f64(value).map(EpicsValue::Double),
             LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
@@ -1141,14 +1198,42 @@ impl PvDatabase {
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        let target = db.target();
-        match self.read_field_of(&at.rec, db, at.field) {
-            FieldRead::Field(Some(v), alarm) => (
-                LinkFetch::Value(filtered_read(target, v)),
-                alarm.map(|alarm| SourceAlarm::local(SourceId::of(&at.rec), alarm)),
-            ),
-            FieldRead::Shadow(v) => (LinkFetch::Value(filtered_read(target, v)), None),
-            FieldRead::Field(None, _) => (LinkFetch::Failed, None),
+        match self.read_db_at(db, at) {
+            (Some(v), alarm) => (LinkFetch::Value(v), alarm),
+            (None, _) => (LinkFetch::Failed, None),
+        }
+    }
+
+    /// [`Self::read_db_link_at`] read as `DBR_DOUBLE`: `None` with no alarm
+    /// for a failed read, `None` with the alarm for a value that does not
+    /// convert. An unfiltered `VAL` the record serves as `DBF_DOUBLE` is
+    /// read straight off its slot, the `dbGetLink` of C's `dbAddr`.
+    #[inline(always)]
+    pub(crate) fn read_db_link_f64_at(
+        &self,
+        db: &crate::server::record::DbLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+    ) -> (Option<f64>, Option<SourceAlarm>) {
+        if db.target_is_val()
+            && db.target().json_suffix.is_none()
+            && let Some(slot) = super::field_io::double_slot(at.field)
+        {
+            let instance = at.rec.read();
+            let Some(value) = instance.record.get_slot_f64(slot) else {
+                return (None, None);
+            };
+            let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
+                .then(|| {
+                    SourceAlarm::local(
+                        SourceId::of(&at.rec),
+                        LinkAlarm::committed(&instance.common),
+                    )
+                });
+            return (Some(value), alarm);
+        }
+        match self.read_db_at(db, at) {
+            (Some(v), alarm) => (link_value_as_f64(v), alarm),
+            (None, _) => (None, None),
         }
     }
 
@@ -1231,7 +1316,24 @@ impl PvDatabase {
     /// The raw value+alarm read behind [`Self::read_link_with_alarm`]. Never
     /// call this directly from a process path — it cannot tell "constant" from
     /// "failed"; that is the classifier's job.
+    #[inline]
     fn read_link_value_and_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        if let crate::server::record::ParsedLink::Db(db) = link
+            && let Some(at) = self.db_link_addr(db)
+        {
+            return self.read_db_at(db, &at);
+        }
+        self.read_unresolved_link_value_and_alarm(link)
+    }
+
+    /// [`Self::read_link_value_and_alarm`] for every link that is not a DB
+    /// link with a cached target.
+    #[cold]
+    #[inline(never)]
+    fn read_unresolved_link_value_and_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
@@ -1250,7 +1352,7 @@ impl PvDatabase {
                 // link target spelled with an alias still propagates MS/NMS —
                 // and it comes off the cell the value was just read from, not
                 // a second lookup of the same name.
-                let (value, alarm) = match self.read_db_target(db) {
+                let (value, alarm) = match self.read_db_target_by_name(db) {
                     TargetValue::Record(value, rec, alarm) => {
                         (value, alarm.map(|alarm| SourceAlarm::local(rec, alarm)))
                     }
@@ -5012,6 +5114,193 @@ mod db_link_addr_tests {
         let _old = db.get_record("SRC").unwrap();
         assert!(db.remove_record("SRC").await);
         assert_eq!(read(&db, &link), Some(EpicsValue::Double(9.0)));
+    }
+
+    /// The shadow test is decided by the link's spelling: a `VAL` target
+    /// cannot be shadowed, a simple PV spelled `REC.FLD` shadows that field.
+    #[epics_macros_rs::epics_test]
+    async fn only_a_non_val_target_can_be_shadowed() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_pv("SRC.DESC", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        for (text, is_val) in [
+            ("SRC", true),
+            ("SRC.VAL", true),
+            ("SRC.{\"arr\":{}}", true),
+            ("SRC.DESC", false),
+        ] {
+            let ParsedLink::Db(link) = parse_link_v2(text) else {
+                panic!("{text} parses to a Db link");
+            };
+            assert_eq!(link.target_is_val(), is_val, "{text}");
+        }
+        assert_eq!(
+            read(&db, &parse_link_v2("SRC")),
+            Some(EpicsValue::Double(1.0))
+        );
+        assert_eq!(
+            read(&db, &parse_link_v2("SRC.DESC")),
+            Some(EpicsValue::Double(5.0))
+        );
+    }
+
+    async fn add_soft_ai(db: &PvDatabase, name: &str, inp: &str) {
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record(name)
+            .unwrap()
+            .write()
+            .put_common_field_db_load("INP", EpicsValue::String(inp.into()))
+            .unwrap();
+    }
+
+    async fn ai_val(db: &PvDatabase, name: &str) -> Option<EpicsValue> {
+        db.get_record(name).unwrap().read().resolve_field("VAL")
+    }
+
+    /// The held-guard INP read lends a strong address; removing the target
+    /// releases it (the owner sweep), and a target re-added under the name
+    /// is re-resolved and read on the next cycle.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_inp_target_releases_the_lent_address() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        add_soft_ai(&db, "READER", "SRC").await;
+        db.process_record("READER").await.unwrap();
+        assert_eq!(ai_val(&db, "READER").await, Some(EpicsValue::Double(1.0)));
+        let src = db.get_record("SRC").unwrap();
+        assert_eq!(
+            Arc::strong_count(&src),
+            3,
+            "the map, the lent address, this test"
+        );
+        assert!(db.remove_record("SRC").await);
+        assert_eq!(
+            Arc::strong_count(&src),
+            1,
+            "the lent address outlived the removal"
+        );
+        drop(src);
+        db.add_record("SRC", Box::new(AiRecord::new(7.0)))
+            .await
+            .unwrap();
+        db.process_record("READER").await.unwrap();
+        assert_eq!(ai_val(&db, "READER").await, Some(EpicsValue::Double(7.0)));
+    }
+
+    /// A destroyed reader drops its lent address: the target keeps only
+    /// the handles that are not the reader's.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_reader_releases_its_lent_address() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        add_soft_ai(&db, "READER", "SRC").await;
+        db.process_record("READER").await.unwrap();
+        let src = db.get_record("SRC").unwrap();
+        assert_eq!(Arc::strong_count(&src), 3);
+        let reader = db.get_record("READER").unwrap();
+        assert!(db.remove_record("READER").await);
+        assert_eq!(Arc::strong_count(&src), 2, "the map and this test");
+        drop(reader);
+    }
+
+    /// Two records whose INPs read each other hold each other through
+    /// their lent addresses; the database's drop still frees both.
+    #[epics_macros_rs::epics_test]
+    async fn dropping_the_database_frees_inps_that_read_each_other() {
+        let db = PvDatabase::new();
+        add_soft_ai(&db, "CYC:A", "CYC:B").await;
+        add_soft_ai(&db, "CYC:B", "CYC:A").await;
+        db.process_record("CYC:A").await.unwrap();
+        db.process_record("CYC:B").await.unwrap();
+        let a = db.get_record("CYC:A").unwrap();
+        let b = db.get_record("CYC:B").unwrap();
+        assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (3, 3));
+        let (weak_a, weak_b) = (Arc::downgrade(&a), Arc::downgrade(&b));
+        drop((a, b, db));
+        assert!(weak_a.upgrade().is_none() && weak_b.upgrade().is_none());
+    }
+
+    /// The `DBR_DOUBLE` read answers what the native read converted
+    /// answers, on each side of each boundary of its slot path: a `VAL`
+    /// slot with and without the alarm, a filtered `VAL`, a non-`VAL`
+    /// slot, a `VAL` with no slot, an array, a string that does and does
+    /// not convert, and a field that does not exist.
+    #[epics_macros_rs::epics_test]
+    async fn the_double_read_answers_what_the_native_read_converts_to() {
+        use crate::server::record::{LinkReadAs, Record};
+        use crate::server::records::{
+            calc::CalcRecord, stringin::StringinRecord, waveform::WaveformRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let mut calc = CalcRecord::new("A");
+        calc.put_field("A", EpicsValue::Double(2.5)).unwrap();
+        calc.put_field("VAL", EpicsValue::Double(4.5)).unwrap();
+        db.add_record("C", Box::new(calc)).await.unwrap();
+        let mut wf = WaveformRecord::new(4, crate::types::DbFieldType::Double);
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![6.0, 7.0].into()))
+            .unwrap();
+        db.add_record("W", Box::new(wf)).await.unwrap();
+        db.add_record("S", Box::new(StringinRecord::new("3.25")))
+            .await
+            .unwrap();
+        db.add_record("T", Box::new(StringinRecord::new("abc")))
+            .await
+            .unwrap();
+        for (text, slot_path, expect) in [
+            ("C MS", true, Some(4.5)),
+            ("C NMS", true, Some(4.5)),
+            ("C.VAL MS", true, Some(4.5)),
+            ("C.{\"arr\":{}} MS", false, Some(4.5)),
+            ("C.A MS", false, Some(2.5)),
+            ("SRC MS", false, Some(1.5)),
+            ("W MS", false, Some(6.0)),
+            ("S MS", false, Some(3.25)),
+            ("T MS", false, None),
+            ("C.NOPE MS", false, None),
+        ] {
+            let parsed = parse_link_v2(text);
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            assert_eq!(
+                link.target_is_val()
+                    && link.target().json_suffix.is_none()
+                    && crate::server::database::field_io::double_slot(at.field).is_some(),
+                slot_path,
+                "{text}"
+            );
+            let (value, alarm) = db.read_db_link_f64_at(link, &at);
+            let (fetch, native_alarm) = db.read_db_link_at(link, &at);
+            let native = match fetch {
+                crate::server::recgbl::simm::LinkFetch::Value(v) => {
+                    db.apply_link_read_as(&parsed, LinkReadAs::Double, v)
+                }
+                _ => None,
+            };
+            assert_eq!(value, expect, "{text}");
+            assert_eq!(value.map(EpicsValue::Double), native, "{text}");
+            assert_eq!(
+                alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
+                native_alarm
+                    .as_ref()
+                    .map(|a| (format!("{:?}", a.alarm), a.record)),
+                "{text}"
+            );
+        }
     }
 
     /// A link reads through the cached slot exactly what the by-name read

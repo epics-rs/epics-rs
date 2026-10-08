@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -615,6 +616,19 @@ impl Record for MbboRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(if self.sdef() {
+                EpicsValue::Enum(self.val)
+            } else {
+                EpicsValue::UShort(self.val)
+            }),
+            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
+            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

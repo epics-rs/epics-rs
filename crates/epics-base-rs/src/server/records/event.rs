@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{MENU_YES_NO, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -174,6 +175,13 @@ impl Record for EventRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::String(self.val.clone().into())),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

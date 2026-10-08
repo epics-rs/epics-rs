@@ -8,6 +8,7 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -276,6 +277,40 @@ impl Record for LongoutRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Long(self.val)),
+            CycleCell::Mdel => Some(EpicsValue::Long(self.mdel)),
+            CycleCell::Adel => Some(EpicsValue::Long(self.adel)),
+            CycleCell::Mlst => Some(EpicsValue::Double(self.mlst)),
+            CycleCell::Alst => Some(EpicsValue::Double(self.alst)),
+            CycleCell::Lalm => Some(EpicsValue::Long(self.lalm)),
+            _ => None,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, EpicsValue::Long(v)) => {
+                self.validate_put("LALM", &EpicsValue::Long(v))?;
+                self.lalm = v;
+                self.on_put("LALM");
+            }
+            (CycleCell::Alst, EpicsValue::Double(v)) => {
+                self.validate_put("ALST", &EpicsValue::Double(v))?;
+                self.alst = v;
+                self.on_put("ALST");
+            }
+            (CycleCell::Mlst, EpicsValue::Double(v)) => {
+                self.validate_put("MLST", &EpicsValue::Double(v))?;
+                self.mlst = v;
+                self.on_put("MLST");
+            }
+            (cell, value) => return self.put_field(cell.name(), value),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

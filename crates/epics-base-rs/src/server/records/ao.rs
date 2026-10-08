@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{
     FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
 };
@@ -642,6 +643,29 @@ impl Record for AoRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Double(self.val)),
+            CycleCell::Oval => Some(EpicsValue::Double(self.oval)),
+            CycleCell::Mdel => Some(EpicsValue::Double(self.mdel)),
+            CycleCell::Adel => Some(EpicsValue::Double(self.adel)),
+            CycleCell::Mlst => Some(EpicsValue::Double(self.mlst)),
+            CycleCell::Alst => Some(EpicsValue::Double(self.alst)),
+            CycleCell::Lalm => Some(EpicsValue::Double(self.lalm)),
+            _ => None,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, EpicsValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, EpicsValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, EpicsValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

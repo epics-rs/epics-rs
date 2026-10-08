@@ -656,6 +656,9 @@ pub struct DbLink {
     /// link — the value read, the self-link test, the out-target resolve —
     /// where C dereferences a `dbAddr` it filled in at `dbInitLink`.
     channel: crate::server::database::filters::ChannelName,
+    /// Whether [`Self::target`] addresses `VAL`, whose local name is the
+    /// record's own and so cannot be a simple PV shadowing the field.
+    target_is_val: bool,
     /// C's `dbAddr` from `dbDbInitLink`: the local record and field this
     /// link resolved to, so a read does no name work. Not part of the link's
     /// identity — a clone starts empty and equality ignores it.
@@ -664,11 +667,25 @@ pub struct DbLink {
 
 /// The resolved target of a [`DbLink`], stamped with the name-map revision
 /// it was resolved under and re-resolved once that moves (records and
-/// aliases can come and go after `iocInit` here, unlike C). `Weak`, because
-/// the link lives inside a record and two records linking each other would
-/// otherwise keep both alive.
+/// aliases can come and go after `iocInit` here, unlike C).
+///
+/// Two caches, because a link target handle never outlives its target's map
+/// entry and only the reader's `INP` is reached by the sweep that enforces
+/// it. `owned` (any link, any caller) keeps a `Weak`, so no record is held
+/// by a link no sweep reaches. `lent` ([`DbLink::lend_addr`], reachable only
+/// through `PvDatabase::inp_addr`) keeps strong handles, which
+/// [`DbLink::release_addr`] drops when the target is removed or the reader
+/// destroyed; until then it keeps every target it has published — one per
+/// retarget, not per read — since a lent one may still be borrowed.
 #[derive(Default)]
-struct DbAddrCell(parking_lot::Mutex<Option<CachedDbAddr>>);
+struct DbAddrCell {
+    owned: parking_lot::Mutex<Option<CachedDbAddr>>,
+    /// The name-map revision `current` answers for.
+    revision: std::sync::atomic::AtomicU64,
+    /// The newest entry of `lent`, or null.
+    current: std::sync::atomic::AtomicPtr<super::record_instance::ResolvedTarget>,
+    lent: parking_lot::Mutex<Vec<std::sync::Arc<super::record_instance::ResolvedTarget>>>,
+}
 
 struct CachedDbAddr {
     rec: std::sync::Weak<super::record_instance::RecordCell>,
@@ -704,7 +721,7 @@ impl DbLink {
         revision: u64,
         resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
     ) -> Option<super::record_instance::ResolvedTarget> {
-        if let Some(cached) = &*self.addr.0.lock()
+        if let Some(cached) = &*self.addr.owned.lock()
             && cached.revision == revision
             && let Some(rec) = cached.rec.upgrade()
         {
@@ -714,12 +731,86 @@ impl DbLink {
             });
         }
         let target = resolve()?;
-        *self.addr.0.lock() = Some(CachedDbAddr {
+        *self.addr.owned.lock() = Some(CachedDbAddr {
             rec: std::sync::Arc::downgrade(&target.rec),
             field: target.field,
             revision,
         });
         Some(target)
+    }
+
+    /// [`Self::local_addr`] lent instead of cloned: on a hit two loads and
+    /// a compare, no lock and no refcount — C's `dbAddr` dereference. The
+    /// handle is strong (see [`DbAddrCell`]).
+    ///
+    /// # Safety
+    ///
+    /// [`Self::release_addr`] must not run while the returned borrow lives.
+    /// `PvDatabase::inp_addr` guarantees it by lending only through the
+    /// reader's guard, which `release_addr`'s callers hold exclusively.
+    #[inline]
+    pub(crate) unsafe fn lend_addr(
+        &self,
+        revision: u64,
+        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
+    ) -> Option<&super::record_instance::ResolvedTarget> {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.addr.revision.load(Acquire) == revision {
+            let at = self.addr.current.load(Acquire);
+            if !at.is_null() {
+                // SAFETY: a non-null `current` points into `lent`, which only
+                // `release_addr` empties, and the caller excludes that.
+                return Some(unsafe { &*at });
+            }
+        }
+        // SAFETY: as above, for the entry the miss publishes.
+        self.publish_lent(revision, resolve)
+            .map(|at| unsafe { &*std::sync::Arc::as_ptr(&at) })
+    }
+
+    /// Resolve (outside the cell lock: `resolve` takes record locks) and
+    /// publish the answer to `lent`. The same record re-resolved under a moved
+    /// revision keeps its entry, since its field address is a function of
+    /// the record.
+    #[cold]
+    #[inline(never)]
+    fn publish_lent(
+        &self,
+        revision: u64,
+        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
+    ) -> Option<std::sync::Arc<super::record_instance::ResolvedTarget>> {
+        use std::sync::atomic::Ordering::Release;
+        let target = resolve()?;
+        let mut lent = self.addr.lent.lock();
+        let entry = match lent.last() {
+            Some(last) if std::sync::Arc::ptr_eq(&last.rec, &target.rec) => last.clone(),
+            _ => {
+                let entry = std::sync::Arc::new(target);
+                lent.push(entry.clone());
+                entry
+            }
+        };
+        self.addr
+            .current
+            .store(std::sync::Arc::as_ptr(&entry).cast_mut(), Release);
+        self.addr.revision.store(revision, Release);
+        Some(entry)
+    }
+
+    /// Drop every lent target the cell holds — the [`DbAddrCell`] half of the
+    /// rule that a link target handle never outlives its target's map
+    /// entry.
+    ///
+    /// # Safety
+    ///
+    /// No borrow from [`Self::lend_addr`] may be live: call it only with
+    /// the reader that lends this link exclusively borrowed.
+    pub(crate) unsafe fn release_addr(&self) {
+        let mut lent = self.addr.lent.lock();
+        self.addr
+            .current
+            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        lent.clear();
     }
 
     /// Build a DB link from the modifier-stripped PV name, applying C
@@ -744,12 +835,14 @@ impl DbLink {
         } else {
             format!("{record}.{field}")
         });
+        let target_is_val = channel.field == "VAL";
         Self {
             record,
             field,
             policy,
             monitor_switch,
             channel,
+            target_is_val,
             addr: DbAddrCell::default(),
         }
     }
@@ -782,6 +875,11 @@ impl DbLink {
     /// filter begin" one answer instead of four.
     pub fn target(&self) -> &crate::server::database::filters::ChannelName {
         &self.channel
+    }
+
+    /// Whether [`Self::target`]'s field is `VAL` (see `target_is_val`).
+    pub(crate) fn target_is_val(&self) -> bool {
+        self.target_is_val
     }
 }
 

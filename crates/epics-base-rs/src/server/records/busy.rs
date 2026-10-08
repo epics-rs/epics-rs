@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome,
     Record,
@@ -402,6 +403,16 @@ impl Record for BusyRecord {
             sims: self.sims,
             sdly: -1.0,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
+            CycleCell::Oval => Some(EpicsValue::Enum(self.oval)),
+            CycleCell::Mlst => Some(EpicsValue::Enum(self.mlst)),
+            CycleCell::Lalm => Some(EpicsValue::Enum(self.lalm)),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

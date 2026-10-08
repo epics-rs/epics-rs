@@ -7880,6 +7880,7 @@ impl RecordInstance {
         for entry in self.parsed_inputs.iter_mut().flatten() {
             entry.release_target();
         }
+        self.release_inp_addr();
         first
     }
 
@@ -7893,6 +7894,18 @@ impl RecordInstance {
             if entry.targets(cell) {
                 entry.release_target();
             }
+        }
+        // Every handle the INP cell holds, not only `cell`'s: the removal
+        // moved the name revision, so the next read re-resolves anyway.
+        self.release_inp_addr();
+    }
+
+    /// Empty the INP link's address cell (`DbLink::release_addr`).
+    fn release_inp_addr(&mut self) {
+        if let ParsedLink::Db(db) = &self.parsed_inp {
+            // SAFETY: `&mut self` excludes every `PvDatabase::inp_addr`
+            // borrow, the only lender of this cell.
+            unsafe { db.release_addr() }
         }
     }
 

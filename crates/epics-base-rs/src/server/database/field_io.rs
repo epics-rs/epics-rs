@@ -1075,6 +1075,17 @@ fn dbput_post_put_field(
 /// internals — exactly what `record_declaration_order` carries. A record type
 /// the generated table does not know declares nothing, which is what C's
 /// `!precordType` guard answers too.
+/// The slot whose `get_slot_f64` is the field's value itself: a field the
+/// record serves as `DBF_DOUBLE`, where the numeric funnel is the identity.
+#[inline(always)]
+pub(crate) fn double_slot(
+    addr: crate::server::record::record_instance::FieldAddr,
+) -> Option<crate::server::record::FieldSlot> {
+    let desc = addr.desc?;
+    (desc.dbf_type == crate::types::DbFieldType::Double && !desc.runtime_typed)
+        .then_some(addr.slot?)
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
@@ -1205,11 +1216,7 @@ impl PvDatabase {
         // typed accessor answers, and `get_slot_f64` is `get_field` followed
         // by the numeric funnel — the identity on a field served as
         // `DBF_DOUBLE`, so for one the slot read IS the by-name read.
-        if let Some(slot) = addr.slot
-            && let Some(desc) = addr.desc
-            && desc.dbf_type == crate::types::DbFieldType::Double
-            && !desc.runtime_typed
-        {
+        if let Some(slot) = double_slot(addr) {
             let value = instance.record.get_slot_f64(slot).map(EpicsValue::Double);
             debug_assert!(
                 matches!(

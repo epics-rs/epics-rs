@@ -698,6 +698,20 @@ impl Record for AiRecord {
         true
     }
 
+    /// C `devAiSoft.c::read_ai` stores `prec->val = value`. A `DOUBLE` delivery
+    /// is already VAL's shape and type, so the generic owner would only confirm
+    /// that through three `get_field("VAL")` probes and a `put_field` by name;
+    /// anything else still takes it.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        match value {
+            EpicsValue::Double(v) => {
+                self.val = v;
+                Ok(())
+            }
+            other => self.put_field_internal("VAL", other),
+        }
+    }
+
     /// C `devAiSoft.c::read_ai` (:81-93) and `devAiSoftCallback.c::read_ai`
     /// (:180-194): both soft `ai` dsets apply `SMOO` themselves, before the
     /// record body ever runs. `aiRecord.c:440-444` — the copy `process()`
@@ -758,6 +772,27 @@ impl Record for AiRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set_val`'s typed `DOUBLE` store must land what the generic internal
+    /// delivery lands, and every other shape must still reach that owner.
+    #[test]
+    fn set_val_lands_what_internal_delivery_lands() {
+        for value in [
+            EpicsValue::Double(2.5),
+            EpicsValue::Double(f64::NAN),
+            EpicsValue::Long(7),
+            EpicsValue::String("3.25".into()),
+            EpicsValue::String("x".into()),
+            EpicsValue::DoubleArray(vec![4.5, 9.0].into()),
+            EpicsValue::DoubleArray(Vec::new().into()),
+        ] {
+            let (mut fast, mut slow) = (AiRecord::new(1.0), AiRecord::new(1.0));
+            let stored = fast.set_val(value.clone());
+            let put = crate::server::record::put_field_internal_default(&mut slow, "VAL", value);
+            assert_eq!(format!("{stored:?}"), format!("{put:?}"));
+            assert_eq!(fast.val.to_bits(), slow.val.to_bits());
+        }
+    }
 
     /// ROFF is DBF_ULONG (aiRecord.dbd.pod:442): a client caput of the full
     /// unsigned range stores and reads back as that value (served ULong,

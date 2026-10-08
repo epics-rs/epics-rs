@@ -3328,15 +3328,21 @@ impl PvDatabase {
                 && db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
                 && let crate::server::record::InputLinkRequest::As(read_as) =
                     instance.record.input_link_request("INP")
-                && let Some(at) = self.db_link_addr(db)
+                && let Some(at) = self.inp_addr(instance)
                 && !Arc::ptr_eq(&at.rec, rec)
             {
-                let (fetch, alarm) = self.read_db_link_at(db, &at);
-                let inp_value = match fetch {
-                    crate::server::recgbl::simm::LinkFetch::Value(v) => {
-                        self.apply_link_read_as(&instance.parsed_inp, read_as, v)
-                    }
-                    _ => None,
+                let (inp_value, alarm) = if read_as == crate::server::record::LinkReadAs::Double {
+                    let (value, alarm) = self.read_db_link_f64_at(db, at);
+                    (value.map(EpicsValue::Double), alarm)
+                } else {
+                    let (fetch, alarm) = self.read_db_link_at(db, at);
+                    let inp_value = match fetch {
+                        crate::server::recgbl::simm::LinkFetch::Value(v) => {
+                            self.apply_link_read_as(&instance.parsed_inp, read_as, v)
+                        }
+                        _ => None,
+                    };
+                    (inp_value, alarm)
                 };
                 let mut stage = LinkInputs::none();
                 stage.inp_value = inp_value;

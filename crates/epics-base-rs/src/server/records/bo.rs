@@ -1,3 +1,4 @@
+use crate::server::record::CycleCell;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
@@ -410,6 +411,24 @@ impl Record for BoRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
+            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
+            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
+            _ => None,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, EpicsValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, EpicsValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

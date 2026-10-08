@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -266,6 +267,27 @@ impl Record for BiRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Enum(self.val)),
+            CycleCell::Mlst => Some(EpicsValue::UShort(self.mlst)),
+            CycleCell::Lalm => Some(EpicsValue::UShort(self.lalm)),
+            CycleCell::Aftc => Some(EpicsValue::Double(self.aftc)),
+            CycleCell::Afvl => Some(EpicsValue::Double(self.afvl)),
+            _ => None,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Afvl, EpicsValue::Double(v)) => self.afvl = v,
+            (CycleCell::Lalm, EpicsValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, EpicsValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

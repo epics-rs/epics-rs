@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::EpicsValue;
 
@@ -239,6 +240,14 @@ impl Record for MbbiDirectRecord {
             sims: self.sims,
             sdly: self.sdly,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Long(self.val as i32)),
+            CycleCell::Mlst => Some(EpicsValue::Long(self.mlst as i32)),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

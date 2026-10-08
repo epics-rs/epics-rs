@@ -622,3 +622,49 @@ fn simulation_cells_are_lent_and_a_type_without_them_lends_nothing() {
     };
     assert_eq!(ai.simm_cells(), None);
 }
+
+#[derive(EpicsRecord)]
+#[record(type = "longin", crate_path = "epics_base_rs")]
+struct CycleCellRecord {
+    #[field(type = "Long")]
+    val: i32,
+    #[field(type = "Long")]
+    mdel: i32,
+    #[field(type = "Double")]
+    mlst: f64,
+    #[field(type = "Long", read_only)]
+    lalm: i32,
+}
+
+/// `cycle_cell`/`put_cycle_cell` are emitted from the member names and must
+/// answer exactly as the member's own `get_field`/`put_field` arm, including
+/// a cell the struct does not store and a read-only one.
+#[test]
+fn cycle_cells_answer_as_their_fields_do() {
+    use epics_base_rs::server::record::CycleCell;
+
+    let rec = || CycleCellRecord {
+        val: 3,
+        mdel: 5,
+        mlst: 7.0,
+        lalm: 9,
+    };
+    let (mut fast, mut slow) = (rec(), rec());
+    for cell in CycleCell::ALL {
+        assert_eq!(
+            fast.cycle_cell(cell),
+            fast.get_field(cell.name()),
+            "{cell:?}"
+        );
+        for value in [
+            EpicsValue::Long(11),
+            EpicsValue::Double(13.0),
+            EpicsValue::String("x".into()),
+        ] {
+            let stored = fast.put_cycle_cell(cell, value.clone());
+            let put = slow.put_field(cell.name(), value);
+            assert_eq!(format!("{stored:?}"), format!("{put:?}"), "{cell:?}");
+            assert_eq!(fast.get_field(cell.name()), slow.get_field(cell.name()));
+        }
+    }
+}

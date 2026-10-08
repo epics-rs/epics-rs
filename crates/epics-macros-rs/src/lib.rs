@@ -642,12 +642,87 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    // The scan cycle's cells — emit `Record::cycle_cell`/`put_cycle_cell`,
+    // keyed on the member names so a struct that stores a cell cannot forget
+    // to opt in and leave the cycle reading it by name. Each arm is the
+    // member's own `get_field`/`put_field` arm; a cell the struct does not
+    // store answers as `get_field`/`put_field` do for an unknown name.
+    let cycle_cells: Vec<_> = [
+        ("VAL", "Val"),
+        ("OVAL", "Oval"),
+        ("MDEL", "Mdel"),
+        ("ADEL", "Adel"),
+        ("MLST", "Mlst"),
+        ("ALST", "Alst"),
+        ("HYST", "Hyst"),
+        ("LALM", "Lalm"),
+        ("AFTC", "Aftc"),
+        ("AFVL", "Afvl"),
+    ]
+    .into_iter()
+    .map(|(epics_name, variant)| {
+        let variant = proc_macro2::Ident::new(variant, proc_macro2::Span::call_site());
+        let member = field_infos.iter().find(|fi| fi.epics_name == epics_name);
+        (epics_name, variant, member)
+    })
+    .collect();
+    let cycle_cell_methods = if cycle_cells.iter().all(|(_, _, m)| m.is_none()) {
+        quote! {}
+    } else {
+        let get_arms = cycle_cells.iter().map(|(_, variant, member)| match member {
+            Some(fi) => {
+                let ident = &fi.ident;
+                let conversion = value_to_epics(&krate, &fi.dbf_type, quote!(self.#ident));
+                quote! { #krate::server::record::CycleCell::#variant => Some(#conversion), }
+            }
+            None => quote! { #krate::server::record::CycleCell::#variant => None, },
+        });
+        let put_arms = cycle_cells.iter().map(|(epics_name, variant, member)| match member {
+            Some(fi) if !fi.read_only => {
+                let extraction = value_from_epics(&krate, &fi.dbf_type, &fi.ident);
+                quote! {
+                    #krate::server::record::CycleCell::#variant => {
+                        self.validate_put(#epics_name, &value)?;
+                        #extraction
+                        self.on_put(#epics_name);
+                        Ok(())
+                    }
+                }
+            }
+            _ => quote! {
+                #krate::server::record::CycleCell::#variant => self.put_field(#epics_name, value),
+            },
+        });
+        quote! {
+            #[inline]
+            fn cycle_cell(
+                &self,
+                cell: #krate::server::record::CycleCell,
+            ) -> Option<#krate::types::EpicsValue> {
+                match cell {
+                    #(#get_arms)*
+                }
+            }
+
+            fn put_cycle_cell(
+                &mut self,
+                cell: #krate::server::record::CycleCell,
+                value: #krate::types::EpicsValue,
+            ) -> #krate::error::CaResult<()> {
+                match cell {
+                    #(#put_arms)*
+                }
+            }
+        }
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
             #constant_init_method
             #init_method
             #value_monitor_method
             #computed_udf_method
+            #cycle_cell_methods
             #metadata_override_method
             #link_metadata_field_method
 

@@ -5,6 +5,7 @@ use super::link_status::{
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::record::CycleCell;
 use crate::server::record::{
     CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions, ProcessOutcome,
     Record, RecordProcessResult, parse_link_v2,
@@ -1607,6 +1608,13 @@ impl Record for SseqRecord {
             // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
             // break` → no put.
             DbFieldType::Int64 | DbFieldType::UInt64 => None,
+        }
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::Long(self.val)),
+            _ => None,
         }
     }
 

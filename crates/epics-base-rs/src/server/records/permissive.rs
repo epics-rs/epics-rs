@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::CycleCell;
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -101,6 +102,14 @@ impl Record for PermissiveRecord {
     /// the GET path.
     fn event_posted_fields(&self) -> &'static [&'static str] {
         &["OVAL", "OFLG"]
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        match cell {
+            CycleCell::Val => Some(EpicsValue::UShort(self.val)),
+            CycleCell::Oval => Some(EpicsValue::UShort(self.oval)),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

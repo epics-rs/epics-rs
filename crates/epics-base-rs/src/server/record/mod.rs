@@ -52,7 +52,7 @@ pub(crate) use record_instance::{SimLink, ambient_write_origin, value_as_dbr_str
 pub(crate) use record_trait::value_gate;
 pub use record_trait::{
     AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink,
-    CycleList, CyclePostMask, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME,
+    CycleCell, CycleList, CyclePostMask, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME,
     FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkReadAs, MonitorDeadbandCells, OutTarget, ProcessAction, ProcessActions,
     ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult,

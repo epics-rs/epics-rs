@@ -2320,6 +2320,28 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// One of the cells the scan cycle reads on every pass, answered exactly
+    /// as [`Self::get_field`] answers `cell.name()`.
+    ///
+    /// The cycle's accessors below ([`Self::val`],
+    /// [`Self::monitor_deadband_cells`], [`Self::analog_alarm_input`], ...)
+    /// read through this rather than through `get_field`, so a type that
+    /// stores its cells as members overrides this one method and every
+    /// accessor reads them with no name match. Asked with a constant `cell`
+    /// from a default body monomorphised per type, the override's `match`
+    /// folds to the member read.
+    fn cycle_cell(&self, cell: CycleCell) -> Option<EpicsValue> {
+        self.get_field(cell.name())
+    }
+
+    /// Store into a cycle cell, exactly as [`Self::put_field`] stores into
+    /// `cell.name()`. The accessors hand over a value already converted to
+    /// the cell's own type, so an override need only take that variant
+    /// directly and pass anything else to `put_field`.
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: EpicsValue) -> CaResult<()> {
+        self.put_field(cell.name(), value)
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())
@@ -2371,7 +2393,10 @@ pub trait Record: Send + Sync + 'static {
 
     /// Get the primary value.
     fn val(&self) -> Option<EpicsValue> {
-        self.get_field(self.primary_field())
+        match self.primary_field() {
+            "VAL" => self.cycle_cell(CycleCell::Val),
+            field => self.get_field(field),
+        }
     }
 
     /// Set the primary value.
@@ -3546,17 +3571,16 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Asked as one question because the cycle otherwise asks
     /// [`Self::get_field`] four times through the vtable and pays an
-    /// [`EpicsValue`] per answer. Monomorphised per type, the asks inside
-    /// this default are static calls, but each is still a full name match
-    /// and an `EpicsValue` round trip — measured at ~970 instructions of an
-    /// `ai` cycle across the cycle's cell reads. A type that stores the cells
-    /// as fields overrides this and its siblings to read them directly.
+    /// [`EpicsValue`] per answer. Each cell is read through
+    /// [`Self::cycle_cell`]; by name, that was measured at ~970 instructions
+    /// of an `ai` cycle across the cycle's cell reads.
     fn monitor_deadband_cells(&self) -> MonitorDeadbandCells {
+        let f64_of = |cell| self.cycle_cell(cell).and_then(|v| v.to_f64());
         MonitorDeadbandCells {
-            mdel: self.get_field("MDEL").and_then(|v| v.to_f64()),
-            adel: self.get_field("ADEL").and_then(|v| v.to_f64()),
-            mlst: self.get_field("MLST").and_then(|v| v.to_f64()),
-            alst: self.get_field("ALST").and_then(|v| v.to_f64()),
+            mdel: f64_of(CycleCell::Mdel),
+            adel: f64_of(CycleCell::Adel),
+            mlst: f64_of(CycleCell::Mlst),
+            alst: f64_of(CycleCell::Alst),
         }
     }
 
@@ -3569,15 +3593,15 @@ pub trait Record: Send + Sync + 'static {
     /// [`Self::monitor_deadband_cells`] — this is four more vtable calls
     /// otherwise.
     fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
-        for (field, store) in [("ALST", alst), ("MLST", mlst)] {
+        for (cell, store) in [(CycleCell::Alst, alst), (CycleCell::Mlst, mlst)] {
             if !store {
                 continue;
             }
             let target = self
-                .get_field(field)
+                .cycle_cell(cell)
                 .map(|v| v.db_field_type())
                 .unwrap_or(crate::types::DbFieldType::Double);
-            let _ = self.put_field(field, EpicsValue::Double(val).convert_to(target));
+            let _ = self.put_cycle_cell(cell, EpicsValue::Double(val).convert_to(target));
         }
     }
 
@@ -3596,10 +3620,10 @@ pub trait Record: Send + Sync + 'static {
         Some(AnalogAlarmInput {
             val,
             hyst: self
-                .get_field("HYST")
+                .cycle_cell(CycleCell::Hyst)
                 .and_then(|v| AlarmLimit::from_stored(&v)),
             lalm: self
-                .get_field("LALM")
+                .cycle_cell(CycleCell::Lalm)
                 .and_then(|v| AlarmLimit::from_stored(&v)),
         })
     }
@@ -3613,9 +3637,9 @@ pub trait Record: Send + Sync + 'static {
     /// used to be a hard-coded list of the four types that DO carry it,
     /// beside the field reads that would have answered the same question.
     fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        let aftc = self.get_field("AFTC")?.to_f64().unwrap_or(0.0);
+        let aftc = self.cycle_cell(CycleCell::Aftc)?.to_f64().unwrap_or(0.0);
         let afvl = self
-            .get_field("AFVL")
+            .cycle_cell(CycleCell::Afvl)
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0);
         Some((aftc, afvl))
@@ -3623,7 +3647,7 @@ pub trait Record: Send + Sync + 'static {
 
     /// Store the AFTC filter accumulator — C's `prec->afvl = afvl`.
     fn store_alarm_filter_value(&mut self, afvl: f64) {
-        let _ = self.put_field("AFVL", EpicsValue::Double(afvl));
+        let _ = self.put_cycle_cell(CycleCell::Afvl, EpicsValue::Double(afvl));
     }
 
     /// Arm C's `prec->lalm` latch, coerced to the type the cell is declared
@@ -3631,10 +3655,10 @@ pub trait Record: Send + Sync + 'static {
     /// latch must not round through a double.
     fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
         let target = self
-            .get_field("LALM")
+            .cycle_cell(CycleCell::Lalm)
             .map(|v| v.db_field_type())
             .unwrap_or(crate::types::DbFieldType::Double);
-        let _ = self.put_field("LALM", lalm.to_epics_value().convert_to(target));
+        let _ = self.put_cycle_cell(CycleCell::Lalm, lalm.to_epics_value().convert_to(target));
     }
 
     /// Which slots of [`Self::multi_input_links`] are wired, as two bitmasks
@@ -4643,7 +4667,7 @@ pub trait Record: Send + Sync + 'static {
     /// and the just-fetched `DOLD` and whose `OVAL` field is C's "Old Value"
     /// (the previous VAL, used only by the OOPT test), not an output stage.
     fn output_link_value(&self) -> Option<EpicsValue> {
-        self.get_field("OVAL").or_else(|| self.val())
+        self.cycle_cell(CycleCell::Oval).or_else(|| self.val())
     }
 
     /// Return multi-output link field pairs: (link_field, value_field).
@@ -5839,7 +5863,7 @@ mod tests {
         let f64_of = |r: &dyn Record, field: &str| r.get_field(field).and_then(|v| v.to_f64());
 
         for record_type in RECORD_TYPES {
-            let Ok(mut r) = crate::server::db_loader::create_record(record_type) else {
+            let Some(mut r) = cycle_record(record_type) else {
                 continue;
             };
             seed_cycle_cells(&mut *r);
@@ -5890,10 +5914,9 @@ mod tests {
         use crate::server::record::dbd_generated::RECORD_TYPES;
 
         for record_type in RECORD_TYPES {
-            let (Ok(mut fast), Ok(mut slow)) = (
-                crate::server::db_loader::create_record(record_type),
-                crate::server::db_loader::create_record(record_type),
-            ) else {
+            let (Some(mut fast), Some(mut slow)) =
+                (cycle_record(record_type), cycle_record(record_type))
+            else {
                 continue;
             };
             seed_cycle_cells(&mut *fast);
@@ -5928,6 +5951,86 @@ mod tests {
         }
     }
 
+    /// [`Record::cycle_cell`] is the one read every cycle accessor goes
+    /// through, so it is pinned per cell against the `get_field` it stands in
+    /// for, and [`Record::put_cycle_cell`] against `put_field` — two records
+    /// of each type, every cell, a value in the cell's own type and one in a
+    /// foreign type, which an override must hand to `put_field` unchanged.
+    #[test]
+    fn every_record_answers_each_cycle_cell_as_its_field_does() {
+        use crate::server::record::CycleCell;
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        let mut answered = Vec::new();
+        for record_type in RECORD_TYPES {
+            let (Some(mut fast), Some(mut slow)) =
+                (cycle_record(record_type), cycle_record(record_type))
+            else {
+                continue;
+            };
+            answered.push(*record_type);
+            seed_cycle_cells(&mut *fast);
+            seed_cycle_cells(&mut *slow);
+
+            for (i, cell) in CycleCell::ALL.into_iter().enumerate() {
+                let field = cell.name();
+                assert_eq!(
+                    fast.cycle_cell(cell),
+                    fast.get_field(field),
+                    "{record_type} cycle_cell({field})"
+                );
+                let target = slow
+                    .get_field(field)
+                    .map(|v| v.db_field_type())
+                    .unwrap_or(crate::types::DbFieldType::Double);
+                let own = EpicsValue::Double(51.0 + i as f64).convert_to(target);
+                let foreign = EpicsValue::String("7".into());
+                for value in [own, foreign] {
+                    let stored = fast.put_cycle_cell(cell, value.clone()).is_ok();
+                    let put = slow.put_field(field, value).is_ok();
+                    assert_eq!(stored, put, "{record_type} put_cycle_cell({field}) result");
+                    assert_eq!(
+                        fast.get_field(field),
+                        slow.get_field(field),
+                        "{record_type} put_cycle_cell({field})"
+                    );
+                }
+            }
+        }
+        // Every type that overrides the pair must be one the loop reached.
+        for record_type in [
+            "acalcout",
+            "ao",
+            "bi",
+            "bo",
+            "busy",
+            "calcout",
+            "dfanout",
+            "event",
+            "int64in",
+            "int64out",
+            "longin",
+            "longout",
+            "mbbi",
+            "mbbiDirect",
+            "mbbo",
+            "mbboDirect",
+            "permissive",
+            "scalcout",
+            "sel",
+            "seq",
+            "fanout",
+            "sseq",
+            "state",
+            "stringin",
+            "stringout",
+            "sub",
+            "swait",
+        ] {
+            assert!(answered.contains(&record_type), "{record_type} not reached");
+        }
+    }
+
     /// `Record::val` and `Record::output_link_value` carry SEMANTICS that
     /// several types legitimately override (`stringout` serves neither from
     /// OVAL), so they cannot be pinned database-wide. The types whose
@@ -5935,7 +6038,7 @@ mod tests {
     /// must still answer what the default body would.
     #[test]
     fn a_speed_override_of_val_answers_what_the_default_would() {
-        const SPEED_OVERRIDES: &[&str] = &["calc"];
+        const SPEED_OVERRIDES: &[&str] = &["ai", "calc"];
 
         for record_type in SPEED_OVERRIDES {
             let mut r = crate::server::db_loader::create_record(record_type)
@@ -5950,7 +6053,40 @@ mod tests {
                 r.get_field("OVAL").or_else(|| r.val()),
                 "{record_type} output_link_value"
             );
+            assert_eq!(
+                r.monitor_deadband_value(),
+                r.val().and_then(|v| v.to_f64()),
+                "{record_type} monitor_deadband_value"
+            );
+            let nan = matches!(r.val(), Some(EpicsValue::Double(v)) if v.is_nan());
+            assert_eq!(
+                r.value_is_undefined(),
+                nan,
+                "{record_type} value_is_undefined"
+            );
         }
+    }
+
+    /// A record of `record_type` with its `.dbd` initials applied, including
+    /// the module-owned types (calc, busy, asyn) base vendors but does not
+    /// register, so the cycle-cell pins reach every type that overrides them.
+    fn cycle_record(record_type: &str) -> Option<Box<dyn Record>> {
+        use crate::server::records::*;
+        let factory: fn() -> Box<dyn Record> = match record_type {
+            "acalcout" => || Box::new(acalcout::AcalcoutRecord::default()),
+            "asyn" => || Box::new(asyn_record::AsynRecord::default()),
+            "busy" => || Box::new(busy::BusyRecord::default()),
+            "scalcout" => || Box::new(scalcout::ScalcoutRecord::default()),
+            "sseq" => || Box::new(sseq::SseqRecord::default()),
+            "swait" => || Box::new(swait::SwaitRecord::default()),
+            "transform" => || Box::new(transform::TransformRecord::default()),
+            _ => return crate::server::db_loader::create_record(record_type).ok(),
+        };
+        let factories = std::collections::HashMap::from([(
+            record_type.to_string(),
+            Box::new(factory) as crate::server::db_loader::RecordFactory,
+        )]);
+        crate::server::db_loader::create_record_with_factories(record_type, &factories).ok()
     }
 
     /// Distinct values in every cell the cycle accessors read, each in the
@@ -6006,6 +6142,53 @@ pub struct AnalogAlarmInput {
     pub hyst: Option<AlarmLimit>,
     /// LALM, the armed latch, or `None` for a type with no cell for it.
     pub lalm: Option<AlarmLimit>,
+}
+
+/// The cells the scan cycle reads or writes on every pass — see
+/// [`Record::cycle_cell`], the one accessor every cycle read goes through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CycleCell {
+    Val,
+    Oval,
+    Mdel,
+    Adel,
+    Mlst,
+    Alst,
+    Hyst,
+    Lalm,
+    Aftc,
+    Afvl,
+}
+
+impl CycleCell {
+    pub const ALL: [CycleCell; 10] = [
+        Self::Val,
+        Self::Oval,
+        Self::Mdel,
+        Self::Adel,
+        Self::Mlst,
+        Self::Alst,
+        Self::Hyst,
+        Self::Lalm,
+        Self::Aftc,
+        Self::Afvl,
+    ];
+
+    /// The field name the cell answers for.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Val => "VAL",
+            Self::Oval => "OVAL",
+            Self::Mdel => "MDEL",
+            Self::Adel => "ADEL",
+            Self::Mlst => "MLST",
+            Self::Alst => "ALST",
+            Self::Hyst => "HYST",
+            Self::Lalm => "LALM",
+            Self::Aftc => "AFTC",
+            Self::Afvl => "AFVL",
+        }
+    }
 }
 
 /// The four cells C `monitor()`'s deadband compares against — see

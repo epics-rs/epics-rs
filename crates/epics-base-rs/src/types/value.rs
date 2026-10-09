@@ -1950,6 +1950,21 @@ mod int_narrow_scalar_tests {
             EpicsValue::Long(99)
         );
     }
+    /// `PUT(epicsFloat64, char)` (`dbConvert.c:1631`) is a signed cast. softIoc
+    /// R7.0.10.1, a CHAR waveform with `INP "[-5.5,-1.9,100.7]"` and a scalar
+    /// one with `INP "-5.5"`: `fb ff 64` and `fb`. `CycleValue::convert_as`
+    /// is the same row (`record_trait` tests).
+    #[test]
+    fn a_double_narrows_into_char_signed_dbconvert_c_1631() {
+        assert_eq!(
+            EpicsValue::DoubleArray(vec![-5.5, -1.9, 100.7].into()).convert_to(DbFieldType::Char),
+            EpicsValue::CharArray(vec![0xfb, 0xff, 0x64].into())
+        );
+        assert_eq!(
+            EpicsValue::Double(-5.5).convert_to(DbFieldType::Char),
+            EpicsValue::Char(0xfb)
+        );
+    }
 }
 
 #[cfg(test)]

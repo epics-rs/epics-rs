@@ -75,10 +75,10 @@ fn is_pv_link(inp: &str) -> bool {
 /// C `dev<T>SoftCallback::add_record`, for one record, at the point
 /// `iocInit.c::doResolveLinks` calls it.
 ///
-/// Reports and returns; `doResolveLinks` discards the status
-/// (`iocInit.c:551-554`), so the record is built either way and the operator's
-/// only warning that its INP can never be read is this line.
-pub(crate) fn add_record(instance: &RecordInstance, name: &str) {
+/// `doResolveLinks` discards the status (`iocInit.c:551-554`), so the record
+/// is built either way; the refusal survives only as the NULL `dpvt` that
+/// makes every `read_xxx` return 2 unread (`devAiSoftCallback.c:171-172`).
+pub(crate) fn add_record(instance: &mut RecordInstance, name: &str) {
     // The dset gate: `add_record` is `devXxxSoftCallback`'s dsxt entry, so it
     // exists only for a record whose DTYP selected that dset. This predicate
     // is the hook's own, not its caller's — the init owner calls the hook for
@@ -101,4 +101,6 @@ pub(crate) fn add_record(instance: &RecordInstance, name: &str) {
         name,
         &format!("{dset} (add_record) Illegal INP field"),
     );
+    instance.common.dtyp.refuse_link();
+    instance.invalidate_plan();
 }

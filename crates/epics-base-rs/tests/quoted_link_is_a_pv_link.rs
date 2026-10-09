@@ -59,6 +59,6 @@ fn numeric_text_is_still_a_constant() {
     assert_eq!(parse_link_v2("1.50"), ParsedLink::constant("1.50"));
     assert_eq!(
         parse_link_v2(r#"{const:"hello"}"#),
-        ParsedLink::constant("hello")
+        ParsedLink::json_constant(r#""hello""#)
     );
 }

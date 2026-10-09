@@ -140,7 +140,9 @@ pub(crate) fn constant_load_scalar(
 ) -> Option<crate::types::c_parse::Converted> {
     use crate::types::c_parse::{self, Converted, NumericField};
     let text = constant.text();
-    if text.is_empty() {
+    // `dbConstLoadScalar`'s `!pstr[0]` refusal; `lnkConst_loadScalar` hands
+    // a `{const:""}` to `cvt_st_*`, which loads 0 or "".
+    if text.is_empty() && !constant.is_json() {
         return None;
     }
     let dbr_type = match dbr_type {

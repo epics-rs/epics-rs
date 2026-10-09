@@ -25,7 +25,6 @@
 //! [`cmd_db_pvd_dump`] for what the port measures instead.
 
 use super::registry::*;
-use crate::server::record::dbd_generated::RECORD_TYPES;
 use crate::server::record::{
     Asl, FieldDeclaration, FieldDesc, HwLink, HwLinkKind, ParsedLink, Special,
 };
@@ -113,13 +112,14 @@ fn print_escaped(s: &str) -> String {
 /// where it is used rather than exported.
 fn record_names_by_type(ctx: &CommandContext) -> Vec<String> {
     let mut names = ctx.block_on(ctx.db().all_record_names());
+    let record_types = crate::server::record::record_types();
     let rank = |name: &String| {
         let record_type = ctx
             .db()
             .get_record(name)
             .map(|rec| rec.read().record.record_type().to_string())
             .unwrap_or_default();
-        match RECORD_TYPES.iter().position(|t| *t == record_type) {
+        match record_types.iter().position(|t| *t == record_type) {
             Some(i) => (0usize, i, String::new()),
             None => (1usize, 0, record_type),
         }
@@ -200,7 +200,7 @@ fn cmd_db_dump_record() -> CommandDef {
             // generated table plus whatever a runtime registration added, which
             // is exactly the set a loaded record can carry.
             if let Some(wanted) = wanted
-                && !RECORD_TYPES.contains(&wanted)
+                && !crate::server::record::record_types().contains(&wanted)
                 && !names
                     .iter()
                     .any(|name| record_type_of(name).as_deref() == Some(wanted))
@@ -302,9 +302,10 @@ fn c_special_code(special: Special) -> i16 {
 /// `papFldDes`. It cannot be the caller's iteration position: the port drops
 /// C's `DBF_NOACCESS` internals, which are interleaved with the rest from
 /// `MLOK` at 13 onwards, so the index must come from
-/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order),
-/// and is `None` for a record type registered at runtime, whose declaration
-/// order the generator never saw.
+/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order)
+/// or a contributed crate's ([`crate::server::record::register_contributed_dbd`]),
+/// and is `None` for a record type registered at runtime with no generated
+/// table, whose declaration order the generator never saw.
 fn dump_field_lines(desc: &FieldDesc, ind_record_type: Option<usize>) -> Vec<String> {
     let special = c_special_code(desc.special);
     let mut lines = vec![format!("    {}", desc.name)];
@@ -343,11 +344,7 @@ fn dump_field_lines(desc: &FieldDesc, ind_record_type: Option<usize>) -> Vec<Str
 /// Unlike `dbDumpField`'s plain `strcmp`, this one takes the `NULL`/`""`/`"*"`
 /// sentinel (`:907-910`): all three dump every menu.
 ///
-/// The report is complete for the menus `epics-base-rs` declares. A downstream
-/// crate's `.dbd` menus are generated into that crate's own `MENUS` and are not
-/// visible from here, because a record type registers its FIELDS with the
-/// process (`register_declared_fields`) and its menus have no such funnel;
-/// C has one `pdbbase->menuList` for every loaded `.dbd`.
+/// A downstream crate's menus appear once it registered its generated `DBD`.
 fn cmd_db_dump_menu() -> CommandDef {
     CommandDef::new(
         "dbDumpMenu",
@@ -373,9 +370,9 @@ fn cmd_db_dump_menu() -> CommandDef {
                 ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.clone()),
                 _ => None,
             };
-            for (name, idents, values) in crate::server::record::dbd_generated::MENUS {
+            for (name, idents, values) in crate::server::record::menus() {
                 if let Some(w) = wanted.as_deref()
-                    && *name != w
+                    && name != w
                 {
                     continue;
                 }
@@ -416,8 +413,8 @@ fn cmd_db_dump_menu() -> CommandDef {
 /// The remaining columns are `.dbd` facts and print unchanged.
 ///
 /// Everything else C prints comes out of
-/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order),
-/// which is C's `papFldDes` order — `.dbd` declaration order with dbCommon
+/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order)
+/// (or a contributed crate's generated twin), which is C's `papFldDes` order — `.dbd` declaration order with dbCommon
 /// spliced in at the record's `include` and the `DBF_NOACCESS` internals kept —
 /// so `no_fields`, every `index`, the `sortind` permutation, `link_ind` and
 /// `indvalFlddes` are C's own numbers rather than an index into one of the two
@@ -447,9 +444,9 @@ fn cmd_db_dump_record_type() -> CommandDef {
                 ArgValue::String(s) => Some(s.clone()),
                 _ => None,
             };
-            for record_type in RECORD_TYPES {
+            for record_type in crate::server::record::record_types() {
                 if let Some(w) = wanted.as_deref()
-                    && *record_type != w
+                    && record_type != w
                 {
                     continue;
                 }
@@ -477,13 +474,13 @@ fn cmd_db_dump_record_type() -> CommandDef {
 fn dump_record_type_lines(record_type: &str) -> Vec<String> {
     use crate::server::record::dbd_generated as dbd;
 
-    let Some(decl) = dbd::record_declaration_order(record_type) else {
+    let Some(decl) = crate::server::record::record_declaration_order(record_type) else {
         return Vec::new();
     };
     // The port keeps dbCommon separate from a record's own fields and drops the
     // `DBF_NOACCESS` internals from both, so a name in `decl` may have no
     // descriptor. Those are exactly C's internals, which are never links.
-    let own = dbd::record_fields(record_type).unwrap_or(&[]);
+    let own = crate::server::record::record_fields(record_type).unwrap_or(&[]);
     let declared_dbf = |name: &str| {
         dbd::DB_COMMON_FIELDS
             .iter()
@@ -507,7 +504,7 @@ fn dump_record_type_lines(record_type: &str) -> Vec<String> {
         format!(
             "name({record_type}) no_fields({}) no_prompt({}) no_links({})",
             decl.len(),
-            dbd::record_no_prompt(record_type).unwrap_or(0),
+            crate::server::record::record_no_prompt(record_type).unwrap_or(0),
             link_ind.len()
         ),
         "index name\tsortind sortname".to_string(),
@@ -615,20 +612,18 @@ fn cmd_db_dump_field() -> CommandDef {
             let wanted_type = name_arg(&args[1]);
             let wanted_field = name_arg(&args[2]);
 
-            for record_type in RECORD_TYPES {
+            for record_type in crate::server::record::record_types() {
                 if let Some(wanted) = wanted_type.as_deref()
-                    && *record_type != wanted
+                    && record_type != wanted
                 {
                     continue;
                 }
                 // C's trailing space before the newline.
                 ctx.println(&format!("recordtype({record_type}) "));
                 let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
-                let own =
-                    crate::server::record::dbd_generated::record_fields(record_type).unwrap_or(&[]);
+                let own = crate::server::record::record_fields(record_type).unwrap_or(&[]);
                 let decl =
-                    crate::server::record::dbd_generated::record_declaration_order(record_type)
-                        .unwrap_or(&[]);
+                    crate::server::record::record_declaration_order(record_type).unwrap_or(&[]);
                 for desc in common.iter().chain(own.iter()) {
                     if let Some(wanted) = wanted_field.as_deref()
                         && desc.name != wanted
@@ -669,11 +664,11 @@ fn cmd_db_dump_field() -> CommandDef {
 /// `pdset`, which the generator never sees because a port device support is a
 /// Rust type rather than a linker symbol.
 ///
-/// A record type whose device menu was contributed at runtime
+/// A device menu contributed at runtime
 /// ([`register_device_menu`](crate::server::record::register_device_menu),
-/// how `asyn-rs` adds its `DTYP`s) has choices but no declared link type: the
-/// registry carries names only. Those print the `choice` line alone rather than
-/// a guessed `link_type`.
+/// how `asyn-rs` and `std-rs` add their `DTYP`s) carries the link type of each
+/// `device()` line its crate's `.dbd` declares; a menu registered as bare names
+/// prints the `choice` line alone rather than a guessed `link_type`.
 fn cmd_db_dump_device() -> CommandDef {
     CommandDef::new(
         "dbDumpDevice",
@@ -696,24 +691,21 @@ fn cmd_db_dump_device() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
             let wanted = type_filter(&args[1]);
-            for record_type in RECORD_TYPES {
+            for record_type in crate::server::record::record_types() {
                 if let Some(wanted) = wanted
-                    && *record_type != wanted
+                    && record_type != wanted
                 {
                     continue;
                 }
-                let declared = crate::server::record::dbd_generated::device_menu(record_type)
-                    .unwrap_or_default();
-                let contributed = crate::server::record::contributed_device_menu(record_type);
-                if declared.is_empty() && contributed.is_empty() {
-                    continue;
-                }
+                let declared = crate::server::record::dbd_generated::device_link_types(record_type)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&(choice, link_type)| (choice, Some(link_type)));
+                let contributed = crate::server::record::contributed_device_rows(record_type);
                 ctx.println(&format!("recordtype({record_type})"));
-                for choice in declared.iter().copied().chain(contributed) {
+                for (choice, link_type) in declared.chain(contributed) {
                     ctx.println(&format!("\tchoice:    {choice}"));
-                    if let Some(link_type) =
-                        crate::server::record::dbd_generated::device_link_type(record_type, choice)
-                    {
+                    if let Some(link_type) = link_type {
                         ctx.println(&format!("\tlink_type: {}", c_link_type_number(link_type)));
                     }
                 }
@@ -1846,7 +1838,7 @@ variable(seqDLYprecision,int)
         let all = run(&ctx, "dbDumpRecordType", &["pdbbase"]).unwrap();
         assert_eq!(
             all.lines().filter(|l| l.starts_with("name(")).count(),
-            RECORD_TYPES.len()
+            crate::server::record::record_types().len()
         );
     }
 
@@ -1857,7 +1849,7 @@ variable(seqDLYprecision,int)
     #[test]
     fn dump_record_type_sort_and_links_hold_for_every_type() {
         use crate::server::record::dbd_generated as dbd;
-        for record_type in RECORD_TYPES {
+        for record_type in dbd::RECORD_TYPES {
             let lines = dump_record_type_lines(record_type);
             let decl = dbd::record_declaration_order(record_type).unwrap();
             let rows = &lines[2..2 + decl.len()];
@@ -1939,7 +1931,7 @@ variable(seqDLYprecision,int)
         assert_eq!(all, star);
         assert_eq!(
             all.lines().filter(|l| l.starts_with("menu(")).count(),
-            crate::server::record::dbd_generated::MENUS.len()
+            crate::server::record::menus().len()
         );
     }
 

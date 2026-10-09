@@ -47259,13 +47259,10 @@ pub static DEVICE_LINK_TYPES_SWAIT: &[(&str, DbLinkType)] =
 pub static DEVICE_LINK_TYPES_WAVEFORM: &[(&str, DbLinkType)] =
     &[("Soft Channel", DbLinkType::Constant)];
 
-/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.
-///
-/// `None` when no vendored `.dbd` declares that `device()` — a downstream
-/// crate registering its device support at runtime (asyn, motor) brings no
-/// `.dbd`, so there is no declaration to enforce and none is invented.
-pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
-    let table = match record_type {
+/// Every `device()` line for a record type as `(choice, link type)`, in
+/// declaration order: [`device_menu`]'s choices, each with its link type.
+pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {
+    Some(match record_type {
         "aai" => DEVICE_LINK_TYPES_AAI,
         "aao" => DEVICE_LINK_TYPES_AAO,
         "acalcout" => DEVICE_LINK_TYPES_ACALCOUT,
@@ -47296,8 +47293,16 @@ pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
         "swait" => DEVICE_LINK_TYPES_SWAIT,
         "waveform" => DEVICE_LINK_TYPES_WAVEFORM,
         _ => return None,
-    };
-    table
+    })
+}
+
+/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.
+///
+/// `None` when no vendored `.dbd` declares that `device()` — a downstream
+/// crate registering its device support at runtime (asyn, motor) brings no
+/// `.dbd`, so there is no declaration to enforce and none is invented.
+pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
+    device_link_types(record_type)?
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))
         .map(|(_, lt)| *lt)

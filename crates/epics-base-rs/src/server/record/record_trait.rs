@@ -2830,6 +2830,13 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The `(dbrType, *pnReq)` an ARRAY soft dset's `init_record` hands
+    /// `dbLoadLinkArray` (`devWfSoft.c:43`, `devAaiSoft.c:59`,
+    /// `devSASoft.c:61-67`). `None`, the default, is a scalar dset.
+    fn soft_input_array_request(&self) -> Option<(crate::types::DbFieldType, usize)> {
+        None
+    }
+
     /// The rest of the soft INPUT device support's `init_record`, once the
     /// constant-INP load above has (or has not) landed.
     ///
@@ -3247,7 +3254,8 @@ pub trait Record: Send + Sync + 'static {
 
     /// Whether an alarm transition alone posts the deadband field. C
     /// `monitor()` posts VAL inside `if (monitor_mask)` for every type but
-    /// aSub, whose guard is `if (prec->val != prec->oval)` (`aSubRecord.c:414`):
+    /// aSub, state and permissive, whose guard is the VAL/OVAL change
+    /// (`aSubRecord.c:414`, `stateRecord.c:115`, `permissiveRecord.c:107`):
     /// there the alarm bits ride a changed VAL and never post it alone.
     fn alarm_alone_posts_value(&self) -> bool {
         true
@@ -5782,7 +5790,7 @@ pub trait Record: Send + Sync + 'static {
 ///
 /// An `EnumWithChoices` carrier is left alone in both — it is a transient link
 /// payload, not a stored value, and `convert_to` collapses it to a bare index.
-/// [`StoredShape`] carries the rest of the shared rule.
+/// `StoredShape` carries the rest of the shared rule.
 pub fn put_value_in_field_shape<R: Record + ?Sized>(
     record: &R,
     field: &str,
@@ -6471,6 +6479,16 @@ mod declaration_numbering_tests {
 mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
+
+    /// `prec->lalm = val` into a CHAR cell is `PUT(epicsFloat64, char)`
+    /// (`dbConvert.c:1631`), a signed cast: -5.5 is 0xfb.
+    #[test]
+    fn a_double_into_a_char_cell_is_signed_dbconvert_c_1631() {
+        assert_eq!(
+            CycleValue::Double(-5.5).convert_as(CycleValue::Char(0)),
+            CycleValue::Char(0xfb)
+        );
+    }
 
     /// Each scalar request names the `dbrType` of the same name.
     #[test]

@@ -146,7 +146,7 @@ impl Record for MbbiDirectRecord {
     /// and per read `dbGetLink(&prec->inp, DBR_ULONG, &prec->rval, 0, 0)` then
     /// `prec->rval &= prec->mask` (`:60-61`). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
-    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
         if soft == crate::server::device_support::SoftDtyp::Raw {
             self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);

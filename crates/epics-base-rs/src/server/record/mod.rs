@@ -2,6 +2,7 @@ mod alarm;
 pub mod bpt_generated;
 mod common_fields;
 mod constant_link;
+mod contributed_dbd;
 pub mod dbd_generated;
 mod declared_field_registry;
 mod device_menu_registry;
@@ -22,18 +23,25 @@ pub(crate) use common_fields::StampBegun;
 pub use common_fields::{BkptFlag, CommonFields, TimeLast};
 pub(crate) use constant_link::constant_load_scalar;
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
+pub use contributed_dbd::{ContributedDbd, register_contributed_dbd};
+pub(crate) use contributed_dbd::{
+    menus, record_declaration_order, record_fields, record_no_prompt, record_types,
+};
 pub use declared_field_registry::{
     declared_field, declared_field_table, declared_fields, register_declared_fields,
 };
-pub use device_menu_registry::register_device_menu;
-pub(crate) use device_menu_registry::{contributed_device_menu, merged_device_menu};
+pub use device_menu_registry::{DeviceMenu, register_device_menu};
+pub(crate) use device_menu_registry::{
+    contributed_device_menu, contributed_device_rows, merged_device_menu,
+};
 pub use link::{
-    CaLink, CalcArg, CalcLink, ConstantLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue,
-    JsonLinkParse, LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch,
-    PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, VxiAddr, check_json_link_text,
-    check_link_assignment, check_link_text, declared_link_type, link_field_type, link_type_refusal,
-    load_link_ls, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field,
-    parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+    CaLink, CalcArg, CalcLink, ConstLoadError, ConstantLink, DbLink, DbLinkType, HwLink,
+    HwLinkKind, JlinkValue, JsonLinkParse, LinkFieldType, LinkProcessPolicy, LinkType, LsLoad,
+    MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, VxiAddr,
+    check_json_link_text, check_link_assignment, check_link_text, declared_link_type,
+    link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp, parse_c_double,
+    parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
+    pvajson_identity_key,
 };
 pub(crate) use link::{DbLinkAnswer, PORTED_JSON_LINK_TYPES, json_const_value};
 pub(crate) use menu_choices::{EnumChoice, enum_state_choice};

@@ -3258,7 +3258,9 @@ pub fn universal_asyn_factory(
     // instead of binding a dset the record type never calls (a calcout
     // never invokes write(), so the record loaded, computed OVAL and wrote
     // nothing to the driver).
-    if !asyn_device_menu(ctx.record_type).is_some_and(|menu| menu.contains(&ctx.dtyp)) {
+    if !asyn_device_menu(ctx.record_type)
+        .is_some_and(|menu| menu.iter().any(|&(choice, _)| choice == ctx.dtyp))
+    {
         return None;
     }
 
@@ -3435,8 +3437,8 @@ pub fn register_asyn_device_support(
 /// call suffices for every IOC in the process.
 pub fn register_asyn_device_menus() {
     for &record_type in ASYN_DEVICE_MENU_RECORD_TYPES {
-        if let Some(choices) = asyn_device_menu(record_type) {
-            epics_base_rs::server::record::register_device_menu(record_type, choices);
+        if let Some(rows) = asyn_device_menu(record_type) {
+            epics_base_rs::server::record::register_device_menu(record_type, rows);
         }
     }
 }
@@ -3465,11 +3467,16 @@ static ASYN_DEVICE_MENU_RECORD_TYPES: &[&str] = &{
 /// "asynInt32")`), so it is added here rather than in the generated table.
 /// The binding itself is the universal factory + the unconditional readback
 /// forced in `init` (devBusyAsyn.c parity).
-fn asyn_device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+fn asyn_device_menu(
+    record_type: &str,
+) -> Option<&'static [(&'static str, epics_base_rs::server::record::DbLinkType)]> {
     if record_type == "busy" {
-        return Some(&["asynInt32"]);
+        return Some(&[(
+            "asynInt32",
+            epics_base_rs::server::record::DbLinkType::InstIo,
+        )]);
     }
-    crate::dbd_generated::device_menu(record_type)
+    crate::dbd_generated::device_link_types(record_type)
 }
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
@@ -8149,10 +8156,21 @@ mod tests {
     #[test]
     fn asyn_device_menu_is_the_generated_table_plus_busy() {
         for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
-            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::device_menu(rt));
+            assert_eq!(
+                asyn_device_menu(rt),
+                crate::dbd_generated::device_link_types(rt)
+            );
             assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&rt));
         }
-        assert_eq!(asyn_device_menu("busy"), Some(&["asynInt32"][..]));
+        assert_eq!(
+            asyn_device_menu("busy"),
+            Some(
+                &[(
+                    "asynInt32",
+                    epics_base_rs::server::record::DbLinkType::InstIo
+                )][..]
+            )
+        );
         assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&"busy"));
         assert_eq!(
             ASYN_DEVICE_MENU_RECORD_TYPES.len(),

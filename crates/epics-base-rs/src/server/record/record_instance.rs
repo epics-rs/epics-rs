@@ -1472,7 +1472,8 @@ pub(crate) use link_cache::{LinkSlots, PreparedCommonLink, PreparedLink, Prepare
 pub(crate) enum CyclePlan {
     /// Every feature test runs: the cycle as the port always ran it.
     General,
-    /// A soft-channel input record whose INP, SDIS and SIML are constants and
+    /// A soft-channel input record whose INP is not read
+    /// ([`RecordInstance::dset_reads_inp`]), whose SDIS and SIML are constants and
     /// whose SSCN is unset, with the plan of [`ProcessPlan::PLAIN_INPUT`]: the
     /// cycle with those answers folded in. SIMM and the device slot are not
     /// part of the stamp; [`RecordInstance::cycle_plan`] tests them per cycle.
@@ -3261,7 +3262,7 @@ impl RecordInstance {
 
     /// Replace the parse cache of one `COMMON_LINK_FIELDS` entry, or return
     /// `false` for any other field name. The only writer of the five caches
-    /// ([`LinkCache`] has no other way in), so the plan stamp they feed is
+    /// (`LinkCache` has no other way in), so the plan stamp they feed is
     /// bumped here and cannot be skipped.
     pub fn set_link_cache(&mut self, field: &str, link: ParsedLink) -> bool {
         let mut link = link;
@@ -3445,7 +3446,7 @@ impl RecordInstance {
         };
         let arm = if !plain {
             CyclePlan::General
-        } else if crate::server::recgbl::simm::is_constant(self.parsed_inp.link()) {
+        } else if !self.dset_reads_inp() {
             CyclePlan::ConstSoftIn
         } else if reads_double() {
             CyclePlan::DbSoftIn
@@ -3453,6 +3454,15 @@ impl RecordInstance {
             CyclePlan::General
         };
         self.cycle_plan = (self.plan_rev, arm);
+    }
+
+    /// Whether the soft dset's `read_xxx` reaches INP this cycle: not for a
+    /// constant (`dbConstGetValue` reads nothing), and not for an `Async`
+    /// dset whose `add_record` refused the link.
+    #[inline]
+    pub(crate) fn dset_reads_inp(&self) -> bool {
+        !crate::server::recgbl::simm::is_constant(self.parsed_inp.link())
+            && !self.common.dtyp.link_refused()
     }
 
     /// The single owner of [`CyclePlan`] staleness: whatever the plan was

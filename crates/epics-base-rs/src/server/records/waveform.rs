@@ -513,11 +513,12 @@ impl WaveformRecord {
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return;
         }
-        let dol = parse_link_v2(&self.dol);
-        let Some(value) = crate::server::recgbl::simm::constant_load_value(&dol) else {
-            // Not a constant (a real link — fetched per cycle instead), or an
-            // unset one: C `dbConstLoadArray` rejects an empty constant with
-            // `S_db_badField`, leaving NORD and UDF untouched.
+        // Not a constant (a real link — fetched per cycle instead), or a load
+        // that failed: C leaves NORD and UDF untouched.
+        let crate::server::record::ParsedLink::Constant(dol) = parse_link_v2(&self.dol) else {
+            return;
+        };
+        let Ok(value) = dol.load_array(self.ftvl_element_type(), self.val_capacity()) else {
             return;
         };
         // `land_val_in_buffer` IS `dbLoadLinkArray`'s landing rule: convert
@@ -1049,6 +1050,15 @@ impl Record for WaveformRecord {
     /// * subArray — `devSASoft.c:58-74` loads and subsets (NORD comes from the
     ///   slice, `subset()`), and leaves NORD alone when the load fails; its seed
     ///   is 0 to begin with.
+    fn soft_input_array_request(&self) -> Option<(DbFieldType, usize)> {
+        let nreq = match self.kind {
+            ArrayKind::Waveform | ArrayKind::Aai => self.nelm,
+            ArrayKind::SubArray => self.indx.saturating_add(self.nelm).min(self.malm.max(1)),
+            ArrayKind::Aao => return None,
+        };
+        Some((self.ftvl_element_type(), nreq.max(0) as usize))
+    }
+
     fn soft_input_dset_init(&mut self, loaded: bool) {
         // `prebuilt_nord`: the elements a caller loaded are not C's calloc'd
         // buffer, and the dset's zeroing arm exists because C's buffer IS empty.
@@ -1600,11 +1610,22 @@ impl Record for WaveformRecord {
         if !matches!(self.kind, ArrayKind::SubArray) {
             return false;
         }
-        match inp.constant_value() {
-            Some(v) => {
+        let loaded = match (inp, self.soft_input_array_request()) {
+            (crate::server::record::ParsedLink::Constant(c), Some((ftvl, nreq))) => {
+                c.load_array(ftvl, nreq)
+            }
+            _ => Err(crate::server::record::ConstLoadError::BadField),
+        };
+        match loaded {
+            Ok(v) => {
                 let _ = self.sa_load_and_subset(v);
             }
-            None => {
+            // `if (!status) subset(...)`: the record keeps its slice and the
+            // status reaches `process`.
+            Err(crate::server::record::ConstLoadError::Conversion) => {
+                self.inp_read_failed = true;
+            }
+            Err(crate::server::record::ConstLoadError::BadField) => {
                 // `S_db_badField` — the INP is empty: nRequest = NORD, subset
                 // the buffer the client wrote.
                 let n_request = self.nord;

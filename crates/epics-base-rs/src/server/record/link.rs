@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use crate::error::{CaError, CaResult, LinkRefusal};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
-use crate::types::{DbfLinkClass, EpicsValue};
+use crate::types::{DbFieldType, DbfLinkClass, EpicsValue, PvString};
 
 /// Link processing policy for input/output links.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -275,6 +275,196 @@ impl HwLink {
 pub struct ConstantLink {
     text: String,
     value: EpicsValue,
+    /// `Some` for a `{const: …}` link: the value `lnkConst` parsed, which its
+    /// `loadArray` converts by its own type instead of handing the text to
+    /// `dbPutConvertJSON` as `dbConstLink` does.
+    json: Option<LnkConst>,
+}
+
+/// `const_link.type` and its value (`lnkConst.c:26-38`), one variant per
+/// state the yajl callbacks can leave it in; `Empty` is `a0`, `[]`.
+#[derive(Debug, Clone, PartialEq)]
+enum LnkConst {
+    Integer(i64),
+    Double(f64),
+    String(String),
+    Integers(Vec<i64>),
+    Doubles(Vec<f64>),
+    Strings(Vec<String>),
+    Empty,
+}
+
+/// Why a constant link's `loadArray` stored nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstLoadError {
+    /// `S_db_badField`: an empty constant, `{const:[]}`, or text
+    /// `dbPutConvertJSON` refuses. `devSASoft.c:106` treats it as "no INP".
+    BadField,
+    /// A scalar string's `cvt_st_*` status (`lnkConst.c:490-492`).
+    Conversion,
+}
+
+/// `dbValueSize(DBR_STRING) - 1`, the `cvt_st_st` cut under a NULL `paddr`.
+const DBR_STRING_CAPACITY: usize = 39;
+
+impl LnkConst {
+    /// The yajl callbacks `lnkConst_integer` / `_double` / `_string` /
+    /// `_boolean` over the link's value. `None` is a value they refuse: null,
+    /// a map, a nested array, strings mixed with numbers, or an integer yajl
+    /// overflows on.
+    fn of(v: &serde_json::Value) -> Option<Self> {
+        use serde_json::Value as J;
+        let int = |v: &J| match v {
+            J::Bool(b) => Some(i64::from(*b)),
+            J::Number(n) => n.as_i64(),
+            _ => None,
+        };
+        let real = |v: &J| match v {
+            J::Number(n) if n.is_f64() => n.as_f64(),
+            v => int(v).map(|i| i as f64),
+        };
+        Some(match v {
+            J::String(s) => Self::String(s.clone()),
+            J::Array(items) if items.is_empty() => Self::Empty,
+            J::Array(items) => {
+                if let Some(v) = items.iter().map(int).collect::<Option<Vec<_>>>() {
+                    Self::Integers(v)
+                } else if let Some(v) = items.iter().map(real).collect::<Option<Vec<_>>>() {
+                    // `lnkConst_double` promotes an `ai64` array to `af64`.
+                    Self::Doubles(v)
+                } else {
+                    Self::Strings(
+                        items
+                            .iter()
+                            .map(|v| v.as_str().map(str::to_owned))
+                            .collect::<Option<_>>()?,
+                    )
+                }
+            }
+            v => match (int(v), real(v)) {
+                (Some(i), _) => Self::Integer(i),
+                (None, Some(d)) => Self::Double(d),
+                (None, None) => return None,
+            },
+        })
+    }
+
+    /// C `lnkConst_loadArray` (`lnkConst.c:451-541`): every element through
+    /// `dbFastPutConvertRoutine[its own type][dbrType]` with a NULL `paddr`.
+    fn load_array(&self, dbr_type: DbFieldType, nreq: usize) -> Result<EpicsValue, ConstLoadError> {
+        // `cvt_st_e` dereferences the NULL `paddr`; a choice loads as the
+        // index it is.
+        let row = match dbr_type {
+            DbFieldType::Enum => DbFieldType::UShort,
+            t => t,
+        };
+        let head = |n: usize| n.min(nreq);
+        let mut loaded = match self {
+            Self::Integer(i) => integers_into(row, std::slice::from_ref(i)),
+            Self::Double(d) => doubles_into(row, std::slice::from_ref(d)),
+            // The long-string branch: a `strncpy` of `nReq` bytes, NUL
+            // forced into the last, NORD counting the NUL.
+            Self::String(s) if row == DbFieldType::Char => {
+                let bytes = s.as_bytes();
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let mut chars = bytes[..end.min(nreq.saturating_sub(1))].to_vec();
+                if nreq > 0 {
+                    chars.push(0);
+                }
+                return Ok(EpicsValue::CharArray(chars.into()));
+            }
+            Self::String(s) => match strings_into(row, std::slice::from_ref(s)) {
+                (loaded, true) => loaded,
+                (_, false) => return Err(ConstLoadError::Conversion),
+            },
+            Self::Integers(v) => integers_into(row, &v[..head(v.len())]),
+            Self::Doubles(v) => doubles_into(row, &v[..head(v.len())]),
+            // The array arm ignores each `conv` status: a refused element
+            // keeps the calloc'd buffer's zero.
+            Self::Strings(v) => strings_into(row, &v[..head(v.len())]).0,
+            Self::Empty => return Err(ConstLoadError::BadField),
+        };
+        loaded.truncate(nreq);
+        Ok(if dbr_type == row {
+            loaded
+        } else {
+            loaded.convert_to(dbr_type)
+        })
+    }
+}
+
+/// `cvtInt64ToString` / `cvt_q_*`.
+fn integers_into(row: DbFieldType, v: &[i64]) -> EpicsValue {
+    if row == DbFieldType::String {
+        return EpicsValue::StringArray(v.iter().map(|i| PvString::from(i.to_string())).collect());
+    }
+    EpicsValue::Int64Array(v.to_vec().into()).convert_to(row)
+}
+
+/// `cvt_d_*`; `cvt_d_st` finds no rset under the NULL `paddr` and keeps its
+/// precision of 6.
+fn doubles_into(row: DbFieldType, v: &[f64]) -> EpicsValue {
+    if row == DbFieldType::String {
+        return EpicsValue::StringArray(
+            v.iter()
+                .map(|d| dbr_string(crate::types::codec::cvt_double_to_string(*d, 6).as_bytes()))
+                .collect(),
+        );
+    }
+    EpicsValue::DoubleArray(v.to_vec().into()).convert_to(row)
+}
+
+/// `cvt_st_*`, and whether every element converted; a refused element is 0.
+fn strings_into(row: DbFieldType, v: &[String]) -> (EpicsValue, bool) {
+    use crate::types::c_parse::{Converted, NumericField, put_string};
+    let Some(numeric) = NumericField::of(row) else {
+        return (
+            EpicsValue::StringArray(v.iter().map(|s| dbr_string(s.as_bytes())).collect()),
+            true,
+        );
+    };
+    let mut converted = true;
+    let elems: Vec<Option<EpicsValue>> = v
+        .iter()
+        .map(|s| match put_string("INP", numeric, s) {
+            Ok(Converted::Stored(x)) => Some(x),
+            Ok(Converted::Unchanged) => None,
+            Err(_) => {
+                converted = false;
+                None
+            }
+        })
+        .collect();
+    macro_rules! pack {
+        ($array:ident, $scalar:ident) => {
+            EpicsValue::$array(
+                elems
+                    .into_iter()
+                    .map(|e| match e {
+                        Some(EpicsValue::$scalar(x)) => x,
+                        _ => Default::default(),
+                    })
+                    .collect(),
+            )
+        };
+    }
+    let packed = match numeric {
+        NumericField::Char => pack!(CharArray, Char),
+        NumericField::UChar => pack!(UCharArray, UChar),
+        NumericField::Short => pack!(ShortArray, Short),
+        NumericField::UShort => pack!(UShortArray, UShort),
+        NumericField::Long => pack!(LongArray, Long),
+        NumericField::ULong => pack!(ULongArray, ULong),
+        NumericField::Int64 => pack!(Int64Array, Int64),
+        NumericField::UInt64 => pack!(UInt64Array, UInt64),
+        NumericField::Float => pack!(FloatArray, Float),
+        NumericField::Double => pack!(DoubleArray, Double),
+    };
+    (packed, converted)
+}
+
+fn dbr_string(bytes: &[u8]) -> PvString {
+    PvString::from_bytes(&bytes[..bytes.len().min(DBR_STRING_CAPACITY)])
 }
 
 impl ConstantLink {
@@ -300,11 +490,44 @@ impl ConstantLink {
         } else {
             EpicsValue::String(text.clone().into())
         };
-        Self { text, value }
+        Self {
+            text,
+            value,
+            json: None,
+        }
+    }
+
+    /// C `dbLoadLinkArray` on a constant link: `lnkConst_loadArray` for a
+    /// `{const: …}` link, else `dbConstLoadArray` (`dbConstLink.c:194-212`),
+    /// the text through `dbPutConvertJSON`. The value is `dbr_type`-typed and
+    /// its length is the `*pnReq` C returns.
+    pub fn load_array(
+        &self,
+        dbr_type: DbFieldType,
+        nreq: usize,
+    ) -> Result<EpicsValue, ConstLoadError> {
+        if let Some(json) = &self.json {
+            return json.load_array(dbr_type, nreq);
+        }
+        if self.text.is_empty() {
+            return Err(ConstLoadError::BadField);
+        }
+        let row = match dbr_type {
+            DbFieldType::Enum => DbFieldType::UShort,
+            t => t,
+        };
+        crate::server::db_convert_json::db_put_convert_json(&self.text, row, nreq)
+            .map_err(|_| ConstLoadError::BadField)
     }
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether this is a `{const: …}` link, loaded by `lnkConst` rather than
+    /// `dbConstLink`.
+    pub fn is_json(&self) -> bool {
+        self.json.is_some()
     }
 
     pub fn value(&self) -> &EpicsValue {
@@ -312,11 +535,11 @@ impl ConstantLink {
     }
 }
 
-/// Equal by text: the value is a function of it, and comparing the value
-/// would make a `nan` constant unequal to itself.
+/// Equal by text and source: the value is a function of them, and comparing
+/// the value would make a `nan` constant unequal to itself.
 impl PartialEq for ConstantLink {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text
+        self.text == other.text && self.json == other.json
     }
 }
 
@@ -1380,6 +1603,22 @@ impl ParsedLink {
         ParsedLink::Constant(std::sync::Arc::new(ConstantLink::new(text)))
     }
 
+    /// A `{const: <value>}` link, `value` being the JSON text. A quoted string
+    /// is a yajl string — its escapes are decoded here (`lnkConst.c:199`
+    /// receives the DECODED bytes from `yajl_parser.c:273-281`); a bare token
+    /// is taken verbatim, as is an array. `{const:""}` is a constant too: its
+    /// `sc40` loads like any string (`cvt_st_d` of "" is 0, a CHAR array gets
+    /// the lone NUL), unlike an empty CONSTANT link `dbConstLoad*` refuses.
+    pub fn json_constant(value: &str) -> Self {
+        let decoded = decode_json_string_token(value).unwrap_or_else(|| value.to_string());
+        let json = serde_json::from_str(value)
+            .ok()
+            .and_then(|v| LnkConst::of(&v));
+        let mut constant = ConstantLink::new(decoded);
+        constant.json = json;
+        ParsedLink::Constant(std::sync::Arc::new(constant))
+    }
+
     pub fn is_db(&self) -> bool {
         matches!(self, ParsedLink::Db(_))
     }
@@ -1965,24 +2204,7 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
     };
     let key = key_raw.trim_matches('"').to_ascii_lowercase();
     match key.as_str() {
-        "const" => {
-            // Constant: bare numeric, quoted string, or array. A quoted string
-            // is a yajl string — its escapes are decoded here, by the one owner
-            // (`lnkConst.c:199` receives the DECODED bytes from
-            // `yajl_parser.c:273-281`); a bare token carries no escapes and is
-            // taken verbatim, as is an array (its elements are decoded by
-            // `constant_array_value`).
-            let v = rest.trim_end_matches(',').trim();
-            let decoded = match decode_json_string_token(v) {
-                Some(s) => s,
-                None => v.to_string(),
-            };
-            if decoded.is_empty() {
-                Some(ParsedLink::None)
-            } else {
-                Some(ParsedLink::constant(decoded))
-            }
-        }
+        "const" => Some(ParsedLink::json_constant(rest.trim_end_matches(',').trim())),
         "ca" | "pva" => {
             // pvxs accepts the link value in two forms (pvxs/ioc/pvalink_jlif.cpp:24-31
             // documents the string shorthand; pva_parse_string at :143-149
@@ -2912,21 +3134,27 @@ mod json_link_tests {
 
     #[test]
     fn json_const_numeric() {
-        assert_eq!(parse_link_v2("{const: 1.5}"), ParsedLink::constant("1.5"));
+        assert_eq!(
+            parse_link_v2("{const: 1.5}"),
+            ParsedLink::json_constant("1.5")
+        );
     }
 
     #[test]
     fn json_const_quoted_string() {
         assert_eq!(
             parse_link_v2(r#"{const: "hello"}"#),
-            ParsedLink::constant("hello")
+            ParsedLink::json_constant(r#""hello""#)
         );
     }
 
     #[test]
-    fn json_const_empty_is_none() {
-        // `{const: ""}` matches base's empty-link convention.
-        assert_eq!(parse_link_v2(r#"{const: ""}"#), ParsedLink::None);
+    fn json_const_empty_is_a_constant() {
+        // An `sc40` "" (`lnkConst.c:199`), not the empty link: it loads.
+        let ParsedLink::Constant(c) = parse_link_v2(r#"{const: ""}"#) else {
+            panic!("not a constant");
+        };
+        assert!(c.is_json() && c.text().is_empty());
     }
 
     #[test]

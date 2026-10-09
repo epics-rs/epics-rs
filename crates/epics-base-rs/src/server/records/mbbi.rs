@@ -467,7 +467,7 @@ impl Record for MbbiRecord {
     /// `prec->rval &= prec->mask` (`:74`, unconditional in MASK — unlike `bi`,
     /// whose dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → state-index convert then runs.
-    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
         if soft == crate::server::device_support::SoftDtyp::Raw {
             self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);

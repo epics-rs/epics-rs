@@ -455,7 +455,7 @@ impl Record for MbboRecord {
         false
     }
 
-    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
         if soft == crate::server::device_support::SoftDtyp::Raw {
             self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);

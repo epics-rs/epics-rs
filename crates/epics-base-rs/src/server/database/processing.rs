@@ -3754,7 +3754,8 @@ impl PvDatabase {
         instance: &mut crate::server::record::RecordInstance,
         request: V::Request,
     ) -> Option<Option<V>> {
-        if !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
+        if !instance.dset_reads_inp()
+            || !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
             if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive)
         {
             return None;
@@ -3981,8 +3982,7 @@ impl PvDatabase {
                 && !plan.string_input
                 && !plan.sel_nvl
                 && !plan.resolves_subroutine_from_link;
-            let only_own_inputs = no_other_reads
-                && crate::server::recgbl::simm::is_constant(instance.parsed_inp.link());
+            let only_own_inputs = no_other_reads && !instance.dset_reads_inp();
             if only_own_inputs && input_link_texts.none_set() {
                 instance.record.set_fetch_gate_failed(false);
                 return InputStage::none(is_soft, 0);
@@ -4006,11 +4006,13 @@ impl PvDatabase {
                 Err(is_soft)
             } else {
                 // A constant (or unset) INP is no read — C `dbConstGetValue`
-                // returns 0 without touching the buffer — so nothing below
+                // returns 0 without touching the buffer — nor is one an Async
+                // dset refused at `add_record` (`dpvt` NULL), so nothing below
                 // asks it: not the soft read, not the source alarm, not a
                 // remote time. `None` says so once, instead of each reader
                 // finding out.
-                let inp = (!crate::server::recgbl::simm::is_constant(instance.parsed_inp.link()))
+                let inp = instance
+                    .dset_reads_inp()
                     .then(|| instance.parsed_inp.clone());
                 // Asked here, under the hold, so the typed conversion below
                 // does not lock the reader again just to ask it.
@@ -5156,6 +5158,7 @@ impl PvDatabase {
                     }
                 } else if !had_inp_value
                     && stage_is_soft
+                    && instance.dset_reads_inp()
                     && matches!(
                         *instance.parsed_inp,
                         crate::server::record::ParsedLink::Db(_)
@@ -8746,13 +8749,21 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);
         let soft = instance.common.dtyp.soft();
         let raw_dset = soft == Some(crate::server::device_support::SoftDtyp::Raw);
-        // The dset's own `recGblInitConstantLink` type, or the link's parsed
-        // value for a dset that names none.
+        // An array dset's `dbLoadLinkArray`, the dset's own
+        // `recGblInitConstantLink` type, or the link's parsed value for a dset
+        // that names none.
         let load = match (
             &inp,
+            instance.record.soft_input_array_request(),
             soft.and_then(|s| instance.record.soft_input_load_type(s)),
         ) {
-            (crate::server::record::ParsedLink::Constant(constant), Some(dbr_type)) => {
+            (crate::server::record::ParsedLink::Constant(constant), Some((ftvl, nreq)), _) => {
+                constant
+                    .load_array(ftvl, nreq)
+                    .ok()
+                    .map(crate::types::c_parse::Converted::Stored)
+            }
+            (crate::server::record::ParsedLink::Constant(constant), None, Some(dbr_type)) => {
                 crate::server::record::constant_load_scalar(constant, dbr_type)
             }
             _ => crate::server::recgbl::simm::constant_load_value(&inp)

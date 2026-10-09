@@ -35,6 +35,7 @@
 
 #![allow(clippy::all)]
 
+use epics_base_rs::server::record::DbLinkType;
 use epics_base_rs::server::record::{Asl, Base, FieldDesc, Special};
 use epics_base_rs::types::{DbFieldType, DbfCode};
 
@@ -1784,6 +1785,79 @@ pub static TIMESTAMP_DECL: &[&str] = &[
     "FLNK", "VAL", "OVAL", "RVAL", "TST",
 ];
 
+// ---------------------------------------------------------------------
+// Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration
+// order. The index is wire-visible: it IS the value of the DTYP field.
+// ---------------------------------------------------------------------
+
+/// `device(ai, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AI: &[&str] = &["Sec Past Epoch"];
+
+/// `device(epid, ...)` choices, in declaration order.
+pub static DEVICE_MENU_EPID: &[&str] = &["Soft Channel", "Async Soft Channel", "Fast Epid"];
+
+/// `device(stringin, ...)` choices, in declaration order.
+pub static DEVICE_MENU_STRINGIN: &[&str] = &["Time of Day"];
+
+/// The device menu for a record type — the choices its `DTYP` field selects
+/// among, in `.dbd` declaration order. `None` for a record type that declares
+/// no device support: C has no `dbDeviceMenu` for it, and its DTYP renders as
+/// the empty string.
+pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "ai" => DEVICE_MENU_AI,
+        "epid" => DEVICE_MENU_EPID,
+        "stringin" => DEVICE_MENU_STRINGIN,
+        _ => return None,
+    })
+}
+
+/// The record types [`device_menu`] returns `Some` for, in `.dbd` name order.
+pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &["ai", "epid", "stringin"];
+
+// ---------------------------------------------------------------------
+// Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the
+// half of the `device()` declaration `dbCanSetLink` enforces.
+// ---------------------------------------------------------------------
+
+/// `device(ai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
+pub static DEVICE_LINK_TYPES_AI: &[(&str, DbLinkType)] =
+    &[("Sec Past Epoch", DbLinkType::Constant)];
+
+/// `device(epid, LINK_TYPE, ...)` — the link type each DTYP choice demands.
+pub static DEVICE_LINK_TYPES_EPID: &[(&str, DbLinkType)] = &[
+    ("Soft Channel", DbLinkType::Constant),
+    ("Async Soft Channel", DbLinkType::Constant),
+    ("Fast Epid", DbLinkType::InstIo),
+];
+
+/// `device(stringin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
+pub static DEVICE_LINK_TYPES_STRINGIN: &[(&str, DbLinkType)] =
+    &[("Time of Day", DbLinkType::Constant)];
+
+/// Every `device()` line for a record type as `(choice, link type)`, in
+/// declaration order: [`device_menu`]'s choices, each with its link type.
+pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {
+    Some(match record_type {
+        "ai" => DEVICE_LINK_TYPES_AI,
+        "epid" => DEVICE_LINK_TYPES_EPID,
+        "stringin" => DEVICE_LINK_TYPES_STRINGIN,
+        _ => return None,
+    })
+}
+
+/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.
+///
+/// `None` when no vendored `.dbd` declares that `device()` — a downstream
+/// crate registering its device support at runtime (asyn, motor) brings no
+/// `.dbd`, so there is no declaration to enforce and none is invented.
+pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
+    device_link_types(record_type)?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))
+        .map(|(_, lt)| *lt)
+}
+
 /// The record-own field table for a record type name, or `None` for a type
 /// no vendored `.dbd` declares.
 pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
@@ -1848,3 +1922,13 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["epid", "throttle", "timestamp"];
+
+/// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
+pub static DBD: epics_base_rs::server::record::ContributedDbd =
+    epics_base_rs::server::record::ContributedDbd {
+        record_types: RECORD_TYPES,
+        record_declaration_order,
+        record_fields,
+        record_no_prompt,
+        menus: MENUS,
+    };

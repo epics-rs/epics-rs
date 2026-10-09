@@ -25,38 +25,99 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
-/// The contributed menus, keyed by record type. Each value is the list of
-/// `&'static` choice slices registered for that type, in registration order —
-/// one slice per contributing crate. Kept as a list (rather than a flattened
-/// `Vec`) so re-registering the SAME slice is idempotent (see
+use super::DbLinkType;
+
+/// One contributed device menu: the `device()` lines a downstream crate's
+/// `.dbd` declares for a record type, or bare choice names when no `.dbd`
+/// declares them and so no link type is known.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMenu {
+    /// `(choice, link_type)` per `device()` line — a generated
+    /// `device_link_types()` table.
+    Declared(&'static [(&'static str, DbLinkType)]),
+    /// Choice names alone; `dbDumpDevice` prints no `link_type` for them.
+    Undeclared(&'static [&'static str]),
+}
+
+impl DeviceMenu {
+    fn rows(self) -> Box<dyn Iterator<Item = (&'static str, Option<DbLinkType>)>> {
+        match self {
+            DeviceMenu::Declared(rows) => Box::new(rows.iter().map(|&(n, lt)| (n, Some(lt)))),
+            DeviceMenu::Undeclared(names) => Box::new(names.iter().map(|&n| (n, None))),
+        }
+    }
+}
+
+impl From<&'static [(&'static str, DbLinkType)]> for DeviceMenu {
+    fn from(rows: &'static [(&'static str, DbLinkType)]) -> Self {
+        DeviceMenu::Declared(rows)
+    }
+}
+
+impl<const N: usize> From<&'static [(&'static str, DbLinkType); N]> for DeviceMenu {
+    fn from(rows: &'static [(&'static str, DbLinkType); N]) -> Self {
+        DeviceMenu::Declared(rows)
+    }
+}
+
+impl From<&'static [&'static str]> for DeviceMenu {
+    fn from(names: &'static [&'static str]) -> Self {
+        DeviceMenu::Undeclared(names)
+    }
+}
+
+impl<const N: usize> From<&'static [&'static str; N]> for DeviceMenu {
+    fn from(names: &'static [&'static str; N]) -> Self {
+        DeviceMenu::Undeclared(names)
+    }
+}
+
+/// The contributed menus, keyed by record type, one entry per contributing
+/// crate in registration order. Kept as a list (rather than a flattened
+/// `Vec`) so re-registering the SAME menu is idempotent (see
 /// [`register_device_menu`]): a second `IocApplication` built in one process, or
 /// a helper called twice, must not double the menu.
-static CONTRIBUTED: OnceLock<RwLock<HashMap<String, Vec<&'static [&'static str]>>>> =
-    OnceLock::new();
+static CONTRIBUTED: OnceLock<RwLock<HashMap<String, Vec<DeviceMenu>>>> = OnceLock::new();
 
-fn registry() -> &'static RwLock<HashMap<String, Vec<&'static [&'static str]>>> {
+fn registry() -> &'static RwLock<HashMap<String, Vec<DeviceMenu>>> {
     CONTRIBUTED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Contribute a device-support DTYP menu for `record_type` — the choices a
 /// downstream crate's device support adds to that record type's `DTYP` list,
-/// in the crate's `.dbd` declaration order.
+/// in the crate's `.dbd` declaration order. Pass the generated
+/// `device_link_types(record_type)` table so `dbDumpDevice` can print each
+/// choice's `link_type`.
 ///
 /// The choices are appended AFTER base's declared menu and after any menu
 /// registered by an earlier call, matching C's load-order `dbDeviceMenu`
-/// concatenation. Registering a slice already present for this record type
+/// concatenation. Registering a menu already present for this record type
 /// (by content) is a no-op, so wiring the same support twice in one process is
 /// safe.
-///
-/// The caller is `asyn_rs::adapter::register_asyn_device_menus`, which walks
-/// asyn's generated `DEVICE_MENU_RECORD_TYPES`.
-pub fn register_device_menu(record_type: &str, choices: &'static [&'static str]) {
+pub fn register_device_menu(record_type: &str, menu: impl Into<DeviceMenu>) {
+    let menu = menu.into();
     let mut map = registry()
         .write()
         .expect("device-menu registry lock poisoned");
     let list = map.entry(record_type.to_string()).or_default();
-    if !list.contains(&choices) {
-        list.push(choices);
+    if !list.contains(&menu) {
+        list.push(menu);
+    }
+}
+
+/// The contributed `(choice, link_type)` rows for `record_type`, flattened in
+/// registration order; the link type is `None` for an undeclared menu.
+pub(crate) fn contributed_device_rows(
+    record_type: &str,
+) -> Vec<(&'static str, Option<DbLinkType>)> {
+    match CONTRIBUTED.get() {
+        Some(lock) => lock
+            .read()
+            .expect("device-menu registry lock poisoned")
+            .get(record_type)
+            .map(|list| list.iter().flat_map(|menu| menu.rows()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
@@ -64,19 +125,10 @@ pub fn register_device_menu(record_type: &str, choices: &'static [&'static str])
 /// or an empty `Vec` if none. The `device_choices` merge appends these after
 /// the base-declared menu.
 pub(crate) fn contributed_device_menu(record_type: &str) -> Vec<&'static str> {
-    match CONTRIBUTED.get() {
-        Some(lock) => lock
-            .read()
-            .expect("device-menu registry lock poisoned")
-            .get(record_type)
-            .map(|list| {
-                list.iter()
-                    .flat_map(|slice| slice.iter().copied())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        None => Vec::new(),
-    }
+    contributed_device_rows(record_type)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The full DTYP menu for `record_type` — the static `device()` declarations

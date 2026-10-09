@@ -62,17 +62,37 @@ pub use records::timestamp::TimestampRecord;
 pub const STD_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
 
 /// Return the epid record type factory for injection into IocBuilder.
+///
+/// Also loads std's `.dbd` ([`register_std_dbd`]), as `stdSupport.dbd` does in
+/// C: without its `device()` menus a std DTYP serves only the bound choice and
+/// a DTYP put by name is refused. Every factory below does the same.
 pub fn epid_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     ("epid", Box::new(|| Box::new(EpidRecord::default())))
+}
+
+/// Hand std's generated `.dbd` to base, C's `dbLoadDatabase` of it: the
+/// record types and menus the dbStatic reports walk, and the `device()` menus
+/// base's DTYP choice lists append. Idempotent: base dedups a repeat.
+pub fn register_std_dbd() {
+    use records::dbd_generated::{DBD, DEVICE_MENU_RECORD_TYPES, device_link_types};
+    epics_base_rs::server::record::register_contributed_dbd(&DBD);
+    for &record_type in DEVICE_MENU_RECORD_TYPES {
+        if let Some(rows) = device_link_types(record_type) {
+            epics_base_rs::server::record::register_device_menu(record_type, rows);
+        }
+    }
 }
 
 /// Return the throttle record type factory for injection into IocBuilder.
 pub fn throttle_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     ("throttle", Box::new(|| Box::new(ThrottleRecord::default())))
 }
 
 /// Return the timestamp record type factory for injection into IocBuilder.
 pub fn timestamp_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     (
         "timestamp",
         Box::new(|| Box::new(TimestampRecord::default())),
@@ -100,6 +120,7 @@ pub fn register_std_record_types() {
 /// `devTimeOfDay.c` (`devAiTodSeconds`) for injection into a builder.
 pub fn sec_past_epoch_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory)
 {
+    register_std_dbd();
     (
         "Sec Past Epoch",
         Box::new(|| Box::new(SecPastEpochDeviceSupport::new())),
@@ -109,6 +130,7 @@ pub fn sec_past_epoch_device_factory() -> (&'static str, epics_base_rs::server::
 /// Return the "Time of Day" (`stringin`) device support factory from
 /// `devTimeOfDay.c` (`devSiTodString`) for injection into a builder.
 pub fn time_of_day_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory) {
+    register_std_dbd();
     (
         "Time of Day",
         Box::new(|| Box::new(TimeOfDayStringDeviceSupport::new())),

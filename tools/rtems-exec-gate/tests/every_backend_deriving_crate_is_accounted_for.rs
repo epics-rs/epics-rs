@@ -198,6 +198,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("scaler-rs", "tests/cnt_abort_cancels_delayed_start.rs"),
     ("scaler-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/e2e_tests.rs"),
+    ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),
     ("std-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/snl_runners_drive_the_db.rs"),
     ("std-rs", "tests/timestamp_monitor_gate.rs"),

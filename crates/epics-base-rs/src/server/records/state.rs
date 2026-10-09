@@ -117,6 +117,11 @@ impl Record for StateRecord {
         Some(changed)
     }
 
+    /// The `recGblResetAlarms` mask rides the `strncmp` branch's post only.
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
+    }
+
     /// C `stateRecord.c::monitor` (lines 120-129) posts only `VAL`. `OVAL`
     /// is a `SPC_NOMOD` tracker C never posts (no `db_post_events` call, and
     /// `dbPut`'s written-field post can't reach a `SPC_NOMOD` field).
@@ -137,6 +142,12 @@ impl Record for StateRecord {
 
     fn val(&self) -> Option<EpicsValue> {
         Some(EpicsValue::String(self.val.clone()))
+    }
+
+    /// C `process` sets `udf = FALSE` unconditionally (`stateRecord.c:99`);
+    /// the default would copy VAL through [`Self::val`] to say the same.
+    fn value_is_undefined(&self) -> bool {
+        false
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

@@ -837,6 +837,24 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     }
     out.push_str("];\n");
 
+    // Base's tables are base's own lookups; a downstream crate hands its set
+    // to base through `register_contributed_dbd`, its `dbLoadDatabase`.
+    if base != "crate" {
+        writeln!(
+            out,
+            "\n/// This crate's tables, for `{base}::server::record::register_contributed_dbd`.\n\
+             pub static DBD: {base}::server::record::ContributedDbd =\n\
+             \x20   {base}::server::record::ContributedDbd {{\n\
+             \x20       record_types: RECORD_TYPES,\n\
+             \x20       record_declaration_order,\n\
+             \x20       record_fields,\n\
+             \x20       record_no_prompt,\n\
+             \x20       menus: MENUS,\n\
+             \x20   }};"
+        )
+        .unwrap();
+    }
+
     Ok(out)
 }
 
@@ -984,21 +1002,26 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
         link_consts.push((record, konst));
     }
     out.push_str(
+        "/// Every `device()` line for a record type as `(choice, link type)`, in\n\
+         /// declaration order: [`device_menu`]'s choices, each with its link type.\n\
+         pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {\n",
+    );
+    emit_str_lookup(
+        out,
+        "record_type",
+        link_consts
+            .iter()
+            .map(|(record, konst)| (*record, konst.as_str())),
+    );
+    out.push_str("}\n\n");
+    out.push_str(
         "/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.\n\
          ///\n\
          /// `None` when no vendored `.dbd` declares that `device()` — a downstream\n\
          /// crate registering its device support at runtime (asyn, motor) brings no\n\
          /// `.dbd`, so there is no declaration to enforce and none is invented.\n\
          pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {\n\
-         \x20   let table = match record_type {\n",
-    );
-    for (record, konst) in &link_consts {
-        writeln!(out, "        {} => {konst},", rust_str(record)).unwrap();
-    }
-    out.push_str(
-        "        _ => return None,\n\
-         \x20   };\n\
-         \x20   table\n\
+         \x20   device_link_types(record_type)?\n\
          \x20       .iter()\n\
          \x20       .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))\n\
          \x20       .map(|(_, lt)| *lt)\n\

@@ -99,6 +99,11 @@ impl Record for PermissiveRecord {
         Some(changed)
     }
 
+    /// The `recGblResetAlarms` mask rides the `oval != val` post only.
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
+    }
+
     /// C `permissiveRecord.c::monitor` (lines 90-117) posts only `VAL` and
     /// `WFLG`. `OVAL`/`OFLG` are `SPC_NOMOD` trackers C never posts: no
     /// record code calls `db_post_events` on them, and `dbPut`'s

@@ -3,7 +3,10 @@
 //! (`devEpidSoftCallback.c:120-132`) and not to `devEpidSoft`, so it follows
 //! the dset the epid was loaded with, whatever DTYP is put afterwards.
 //! rs-only pin: no built C std module is present to run softIoc with epid.
-//! The menu is `stdSupport.dbd:13-14`'s, which std-rs does not register.
+//! The DTYP put is by name, through the `stdSupport.dbd:13-15` menu.
+
+// Drives the put over a CA server, which the exec backend does not build.
+#![cfg(tokio_backend)]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,10 +15,8 @@ use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServerBuilder;
 
-static EPID_MENU: &[&str] = &["Soft Channel", "Async Soft Channel"];
-
 async fn trig_fires_after_dtyp_put(load: &str, put: &str) -> bool {
-    epics_base_rs::server::record::register_device_menu("epid", EPID_MENU);
+    std_rs::register_std_dbd();
     let db_str = format!(
         r#"
 record(ao, "SRC") {{ field(VAL, "1.0") }}
@@ -41,8 +42,11 @@ record(epid, "PID") {{
         .await
         .unwrap();
     let db = server.database().clone();
-    let index = EPID_MENU.iter().position(|n| *n == put).unwrap() as u16;
-    db.put_record_field_from_ca("PID", "DTYP", EpicsValue::Enum(index))
+    let index = std_rs::records::dbd_generated::DEVICE_MENU_EPID
+        .iter()
+        .position(|n| *n == put)
+        .unwrap() as u16;
+    db.put_record_field_from_ca("PID", "DTYP", EpicsValue::String(put.into()))
         .await
         .unwrap();
     assert_eq!(

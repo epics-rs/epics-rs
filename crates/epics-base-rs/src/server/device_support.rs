@@ -76,7 +76,7 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
 /// calls per cycle to re-derive an answer fixed when DTYP was written.
 ///
 /// The classification is stored WITH the name and the fields are private, so
-/// the two cannot disagree before iocInit. [`Self::bind`] then fixes it: C's
+/// the two cannot disagree before iocInit. `bind` then fixes it: C's
 /// `dset` is chosen once from DTYP at init, and a later DTYP put stores the
 /// menu index without touching the running record's dset.
 #[derive(Clone, Debug)]
@@ -96,6 +96,9 @@ enum DsetClass {
     Named(Option<SoftDtyp>),
     /// After init: the class the record was bound to.
     Bound(Option<SoftDtyp>),
+    /// Bound to `Async`, whose `add_record` refused INP: C's `dpvt` stays
+    /// NULL, so every `read_xxx` returns 2 without reading.
+    AsyncRefused,
 }
 
 impl Dtyp {
@@ -117,7 +120,7 @@ impl Dtyp {
         self.skips_input_convert = matches!(self.soft(), Some(SoftDtyp::Plain | SoftDtyp::Async));
     }
 
-    /// A put to DTYP. Before [`Self::bind`] the class follows the name; after
+    /// A put to DTYP. Before `bind` the class follows the name; after
     /// it, only the name changes.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
@@ -140,8 +143,21 @@ impl Dtyp {
     /// [`crate::server::record::Record::init_soft_dset`] for it.
     pub fn rebind(&mut self) -> Option<SoftDtyp> {
         let soft = classify_soft(&self.name);
-        self.class = DsetClass::Bound(soft);
+        self.set_class(DsetClass::Bound(soft));
         soft
+    }
+
+    /// C `dev<T>SoftCallback::add_record` failing: only a record bound to
+    /// `Async` has that hook.
+    pub(crate) fn refuse_link(&mut self) {
+        if let DsetClass::Bound(Some(SoftDtyp::Async)) = self.class {
+            self.set_class(DsetClass::AsyncRefused);
+        }
+    }
+
+    /// The bound dset never reads INP (C `read_xxx` with a NULL `dpvt`).
+    pub fn link_refused(&self) -> bool {
+        matches!(self.class, DsetClass::AsyncRefused)
     }
 
     /// The DTYP text, as a client put it or the `.db` declared it.
@@ -150,10 +166,11 @@ impl Dtyp {
     }
 
     /// The soft-channel flavour the record runs — [`classify_soft`]'s answer
-    /// for the name, frozen by [`Self::bind`].
+    /// for the name, frozen by `bind`.
     pub fn soft(&self) -> Option<SoftDtyp> {
         match self.class {
             DsetClass::Named(soft) | DsetClass::Bound(soft) => soft,
+            DsetClass::AsyncRefused => Some(SoftDtyp::Async),
         }
     }
 
@@ -1075,13 +1092,36 @@ mod tests {
         assert_eq!(dtyp.bind(), Some(SoftDtyp::Plain));
         dtyp.set_name("Raw Soft Channel");
         assert_eq!(dtyp.soft(), Some(SoftDtyp::Plain));
+        assert!(dtyp.skips_input_convert());
         assert_eq!(dtyp.rebind(), Some(SoftDtyp::Raw));
         assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
+        // The RVAL convert follows the rebound class, not the init one.
+        assert!(!dtyp.skips_input_convert());
         // Still bound: the next DTYP put alone changes nothing again.
         dtyp.set_name("Soft Channel");
         assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
         dtyp.set_name("asynInt32");
         assert_eq!(dtyp.rebind(), None);
+    }
+
+    /// Only a bound `Async` dset has an `add_record` to fail, and an INP/OUT
+    /// put's rebind fetches the dset afresh.
+    #[test]
+    fn only_a_bound_async_dset_refuses_its_link_devaisoftcallback_c_171() {
+        let mut dtyp = Dtyp::new("Async Soft Channel");
+        dtyp.refuse_link();
+        assert!(!dtyp.link_refused());
+        dtyp.bind();
+        dtyp.refuse_link();
+        assert!(dtyp.link_refused());
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Async));
+        assert!(dtyp.skips_input_convert());
+        assert_eq!(dtyp.rebind(), Some(SoftDtyp::Async));
+        assert!(!dtyp.link_refused());
+        let mut plain = Dtyp::new("Soft Channel");
+        plain.bind();
+        plain.refuse_link();
+        assert!(!plain.link_refused());
     }
 
     #[test]

@@ -27,7 +27,9 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 fn text(db: &PvDatabase) -> String {
     match db.get_pv("P").unwrap() {
-        EpicsValue::CharArray(b) => String::from_utf8_lossy(&b).into_owned(),
+        EpicsValue::CharArray(b) => {
+            String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
+        }
         other => panic!("printf VAL must be a CharArray, got {other:?}"),
     }
 }

@@ -21,7 +21,9 @@ async fn val_len(db: &epics_base_rs::server::database::PvDatabase, rec: &str) ->
     let inst = db.get_record(rec).unwrap_or_else(|| panic!("{rec}"));
     let inst = inst.read();
     let v = match inst.record.get_field("VAL") {
-        Some(EpicsValue::CharArray(b)) => String::from_utf8_lossy(&b).into_owned(),
+        Some(EpicsValue::CharArray(b)) => {
+            String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
+        }
         Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
         other => panic!("{rec}.VAL: {other:?}"),
     };

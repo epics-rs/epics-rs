@@ -306,6 +306,58 @@ impl AsyncToken {
     }
 }
 
+/// How an out-of-band poster treats one field: C's record code writes a
+/// field and then decides per field whether to `db_post_events` it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PostRule {
+    /// Write and post.
+    Always,
+    /// Write and post only if the value differs from the held one; an
+    /// equal value is neither written nor posted.
+    OnChange,
+    /// Write, never post.
+    Silent,
+}
+
+/// One field of an out-of-band post. A bare `(field, value)` posts
+/// [`PostRule::Always`].
+pub trait PostItem {
+    fn field(&self) -> &str;
+    fn value(&self) -> &EpicsValue;
+    fn rule(&self) -> PostRule;
+    fn into_parts(self) -> (String, EpicsValue);
+}
+
+impl PostItem for (String, EpicsValue) {
+    fn field(&self) -> &str {
+        &self.0
+    }
+    fn value(&self) -> &EpicsValue {
+        &self.1
+    }
+    fn rule(&self) -> PostRule {
+        PostRule::Always
+    }
+    fn into_parts(self) -> (String, EpicsValue) {
+        self
+    }
+}
+
+impl PostItem for (String, EpicsValue, PostRule) {
+    fn field(&self) -> &str {
+        &self.0
+    }
+    fn value(&self) -> &EpicsValue {
+        &self.1
+    }
+    fn rule(&self) -> PostRule {
+        self.2
+    }
+    fn into_parts(self) -> (String, EpicsValue) {
+        (self.0, self.1)
+    }
+}
+
 /// A cycle-free handle for driving async-side database updates from
 /// OUTSIDE a record's `process()` cycle.
 ///
@@ -371,10 +423,10 @@ impl AsyncDbHandle {
     /// [`Self::post_fields_with_mask`], dropped whole unless `current` holds
     /// once the record write lock is taken — see
     /// [`PvDatabase::post_fields_with_mask_if`].
-    pub(crate) fn post_fields_with_mask_if(
+    pub(crate) fn post_fields_with_mask_if<P: PostItem>(
         &self,
         name: &str,
-        fields: Vec<(String, EpicsValue)>,
+        fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
     ) -> CaResult<Vec<String>> {
@@ -2789,10 +2841,10 @@ impl PvDatabase {
     /// write lock and posting nothing when it says no. A check made before
     /// the lock is taken can be overtaken by a put that holds it; asked under
     /// the lock, it sees every put that ran before this post.
-    pub(crate) fn post_fields_with_mask_if(
+    pub(crate) fn post_fields_with_mask_if<P: PostItem>(
         &self,
         name: &str,
-        fields: Vec<(String, EpicsValue)>,
+        fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
     ) -> CaResult<Vec<String>> {
@@ -2808,20 +2860,27 @@ impl PvDatabase {
         let link_backing = link_backing.as_link_backing();
         let mut links = crate::server::record::PreparedLinks::for_puts(
             &rec,
-            fields.iter().map(|(f, v)| (f.as_str(), v)),
+            fields.iter().map(|p| (p.field(), p.value())),
         );
         let mut inst = rec.write();
         if !current() {
             return Ok(Vec::new());
         }
         let mut posted = Vec::with_capacity(fields.len());
-        for (field, value) in fields {
+        for item in fields {
+            let rule = item.rule();
+            let (field, value) = item.into_parts();
+            if rule == PostRule::OnChange && inst.resolve_field(&field).as_ref() == Some(&value) {
+                continue;
+            }
             inst.put_internal_field_of(&field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must
             // invalidate the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
-            inst.notify_field_backed(&field, mask, link_backing);
-            posted.push(field);
+            if rule != PostRule::Silent {
+                inst.notify_field_backed(&field, mask, link_backing);
+                posted.push(field);
+            }
         }
         Ok(posted)
     }
@@ -9376,11 +9435,12 @@ fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
     if is_soft {
         return;
     }
-    if let Some((stat, sevr)) = instance.device.as_ref().and_then(|d| d.last_alarm()) {
-        crate::server::recgbl::rec_gbl_set_sevr(
+    if let Some(alarm) = instance.device.as_ref().and_then(|d| d.last_alarm()) {
+        crate::server::recgbl::rec_gbl_set_sevr_msg(
             &mut instance.common,
-            stat,
-            crate::server::record::AlarmSeverity::from_u16(sevr),
+            alarm.stat,
+            crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
+            alarm.msg,
         );
     }
 }

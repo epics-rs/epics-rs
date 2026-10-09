@@ -2,9 +2,7 @@ use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::calc_compile;
-use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
-};
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, post_link_status};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
@@ -559,13 +557,13 @@ impl CalcoutRecord {
     /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
     /// which C answers without classifying. No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = self
+        let mut links: Vec<(&'static str, String)> = self
             .input_links()
             .into_iter()
             .enumerate()
-            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
+            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link))
             .collect();
-        links.push(("OUTV", self.out.as_str().to_owned(), LinkRole::Output));
+        links.push(("OUTV", self.out.as_str().to_owned()));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),

@@ -9236,7 +9236,9 @@ mod tests {
                 );
                 assert_eq!(
                     inst.resolve_field("VAL"),
-                    Some(EpicsValue::CharArray(text.as_bytes()[..n].to_vec().into())),
+                    Some(EpicsValue::CharArray(
+                        [&text.as_bytes()[..n], b"\0"].concat().into()
+                    )),
                     "{rec}.VAL after a {n}-char dbpf"
                 );
             }

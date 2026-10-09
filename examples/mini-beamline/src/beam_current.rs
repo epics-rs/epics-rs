@@ -118,7 +118,7 @@ pub mod ioc_support {
             Ok(WriteStart::Synchronous)
         }
 
-        fn last_alarm(&self) -> Option<(u16, u16)> {
+        fn last_alarm(&self) -> Option<epics_base_rs::server::device_support::DeviceAlarm<'_>> {
             None
         }
 

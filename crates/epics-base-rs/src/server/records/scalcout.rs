@@ -7,9 +7,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
-};
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, post_link_status};
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
@@ -539,20 +537,12 @@ impl ScalcoutRecord {
     /// mirroring C `sCalcoutRecord.c::init_record` (254-288) and the
     /// `special()` re-classification (508-569). No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(25);
         for i in 0..12 {
-            links.push((
-                SCALCOUT_INAV_NAMES[i],
-                self.inp_links[i].clone(),
-                LinkRole::Input,
-            ));
-            links.push((
-                SCALCOUT_IAAV_NAMES[i],
-                self.str_inp_links[i].clone(),
-                LinkRole::Input,
-            ));
+            links.push((SCALCOUT_INAV_NAMES[i], self.inp_links[i].clone()));
+            links.push((SCALCOUT_IAAV_NAMES[i], self.str_inp_links[i].clone()));
         }
-        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        links.push(("OUTV", self.out.clone()));
         // C `sCalcoutRecord.c:287`, `:569`, `:1015`, `:1045`.
         post_link_status(
             self.async_ctx.as_ref(),

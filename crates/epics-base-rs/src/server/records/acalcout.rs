@@ -110,7 +110,7 @@ use super::calc_compile;
 use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
-use super::link_status::{LINK_CON, LinkRole, LinkStatusGen, post_link_status};
+use super::link_status::{LINK_CON, LinkStatusGen, post_link_status};
 use crate::server::database::AsyncDbHandle;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
@@ -983,12 +983,12 @@ impl AcalcoutRecord {
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(25);
         for i in 0..12 {
-            links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
-            links.push((IAAV_NAMES[i], self.ina_links[i].clone(), LinkRole::Input));
+            links.push((INAV_NAMES[i], self.inp_links[i].clone()));
+            links.push((IAAV_NAMES[i], self.ina_links[i].clone()));
         }
-        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        links.push(("OUTV", self.out.clone()));
         // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
         post_link_status(
             self.async_ctx.as_ref(),

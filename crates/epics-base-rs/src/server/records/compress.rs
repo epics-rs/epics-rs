@@ -105,14 +105,6 @@ pub struct CompressRecord {
     /// after `special()`, for the same put. One meaning on every path: "the
     /// field set the last `monitor()` posted".
     monitor_posts: &'static [&'static str],
-    // True only while applying this cycle's INP read (set in
-    // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
-    // C's element-count reset lives in `process` and keys on `prec->wptr` (the
-    // INP read buffer) — a CA put to VAL goes through `put_array_info`, never
-    // `process`, so it must NOT reset. In Rust both the INP read and a direct
-    // VAL put reach `push_array` via `put_field("VAL")`; this flag is how
-    // `push_array` tells them apart so only the INP-driven ingest can reset.
-    inp_read_pending: bool,
 }
 
 impl Default for CompressRecord {
@@ -148,7 +140,6 @@ impl Default for CompressRecord {
             cycle_emitted: false,
             inpn: 0,
             monitor_posts: &[],
-            inp_read_pending: false,
         }
     }
 }
@@ -428,25 +419,6 @@ impl CompressRecord {
         // A non-empty ingestion happened this cycle; whether it emitted is
         // recorded by `put_one`. See `cycle_ingested`/`cycle_emitted`.
         self.cycle_ingested = true;
-        // C compressRecord.c:334-340: when the INP source's element count
-        // changes between INP-driven cycles, C frees the buffer and `reset()`s,
-        // restarting accumulation clean at the new length. Without this the
-        // rolling Average (ALG=3) keeps stale per-element partial sums from the
-        // old length and blends them with the new waveform → a corrupt average.
-        // C gates the reset on `prec->wptr` already being allocated (a prior
-        // INP read), so the FIRST INP read does not reset; and the reset lives
-        // in `process` (the INP path), NOT in a CA put to VAL (`put_array_info`).
-        // `inp_read_pending` confines the reset to the INP-driven ingest: a
-        // direct VAL put / unit-test `push_array` is a raw buffer op and never
-        // resets. The reset clears no completion-gate state, so C-1's emit gate
-        // holds (a reset cycle still ingests, then the algorithm decides emit).
-        if self.inp_read_pending {
-            self.inp_read_pending = false;
-            if self.inpn != 0 && input.len() != self.inpn {
-                self.reset();
-            }
-            self.inpn = input.len();
-        }
         match self.alg {
             // Circular Buffer (alg=4): every sample independent.
             4 => {
@@ -458,6 +430,9 @@ impl CompressRecord {
             // C `array_average` does NOT apply ILIL/IHIL filtering —
             // the skip loop lives only in `compress_array`.
             3 => self.push_array_average(input),
+            // C `process` (:354-359) picks the N-to-1 path by element count: a
+            // one-element array is `compress_scalar`'s running CVB, not a chunk.
+            _ if input.len() == 1 => self.compress_scalar(input[0]),
             // N-to-1 algorithms (Low/High/N_to_1_Average/Median):
             // C `compress_array` (compressRecord.c:154-221).
             _ => self.compress_array(input),
@@ -694,10 +669,6 @@ impl Record for CompressRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // Safety net: clear the INP-read marker for any cycle whose read never
-        // reached `push_array` (no INP, empty/error read, scalar via
-        // `push_value`), so a later direct VAL put cannot inherit a stale mark.
-        self.inp_read_pending = false;
         // C's `process()` does NOT inspect RES: the reset is `special()`'s, and
         // `special()` zeroes RES as part of `reset()`. A record can never enter
         // `process()` with RES set.
@@ -1003,19 +974,22 @@ impl Record for CompressRecord {
     /// C's `dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, 0, &nelements)`
     /// inside `process()` (:341).
     ///
-    /// It is the ONLY INP-driven ingest, which is what `inp_read_pending`
-    /// records: C's element-count reset (`nelements != prec->inpn` frees WPTR
-    /// and `reset()`s, :334-340) lives in `process` and keys on WPTR, the INP
-    /// read buffer — a CA put to VAL reaches `put_field` directly, never
-    /// `set_val`, and must NOT reset. Marking the ingest here instead of in
-    /// `pre_process_actions` is what makes the mark fire for a LOADED record:
-    /// the old mark rode on the dead `ReadDbLink` above.
+    /// It is the ONLY INP-driven ingest, so it owns INPN and C's element-count
+    /// reset (:334-340): a changed count frees WPTR and `reset()`s, and the
+    /// first read, with no WPTR yet, only latches. A scalar source latches 1. A
+    /// CA put to VAL is `put_array_info`, never reaches here, and never resets.
     ///
     /// The read is `DBF_DOUBLE`, so a `Double`/`DoubleArray` carrier is already
     /// in the ingest's type and goes straight into the ring; only another
     /// carrier needs the converter, which asks `get_field("VAL")` its shape.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        self.inp_read_pending = true;
+        let nelements = value.count() as usize;
+        if nelements > 0 {
+            if self.inpn != 0 && nelements != self.inpn {
+                self.reset();
+            }
+            self.inpn = nelements;
+        }
         match value {
             EpicsValue::DoubleArray(arr) => self.push_array(&arr),
             EpicsValue::Double(v) => self.push_value(v),
@@ -1128,18 +1102,14 @@ mod pbuf_tests {
         let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=3 (Average)
         rec.n = 2; // average over 2 cycles
 
-        // `inp_read_pending` marks each push as the INP-driven ingest (what
-        // `pre_process_actions` sets in the real process path); only those may
-        // trigger the element-count reset.
+        // `set_val` is the INP-driven ingest; only it may reset on a count change.
+        let inp = |v: &[f64]| EpicsValue::DoubleArray(v.to_vec().into());
         // Cycle 1: length 4, mid-window (inx 0 -> 1, no emit).
-        rec.inp_read_pending = true;
-        rec.push_array(&[10.0, 20.0, 30.0, 40.0]);
+        rec.set_val(inp(&[10.0, 20.0, 30.0, 40.0])).unwrap();
         // Cycle 2: length CHANGES to 2 -> reset + restart (inx 0 -> 1, no emit).
-        rec.inp_read_pending = true;
-        rec.push_array(&[2.0, 2.0]);
+        rec.set_val(inp(&[2.0, 2.0])).unwrap();
         // Cycle 3: length 2 again -> inx 1 -> 2 -> emit mean([2,2],[4,4])=[3,3].
-        rec.inp_read_pending = true;
-        rec.push_array(&[4.0, 4.0]);
+        rec.set_val(inp(&[4.0, 4.0])).unwrap();
 
         // Clean restart: the average is the mean of the two post-resize
         // 2-element waveforms, NOT a blend with the stale length-4 cycle-1 data

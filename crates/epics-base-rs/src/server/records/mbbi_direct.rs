@@ -315,6 +315,7 @@ impl Record for MbbiDirectRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::Long(self.sval)),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             // B0..B1F are DBF_UCHAR (mbbiDirectRecord.dbd.pod). Serve the bit as
@@ -405,6 +406,13 @@ impl Record for MbbiDirectRecord {
                     self.sdly = v;
                 } else {
                     return Err(CaError::TypeMismatch("SDLY".into()));
+                }
+            }
+            "SVAL" => {
+                if let EpicsValue::Long(v) = value {
+                    self.sval = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SVAL".into()));
                 }
             }
             _ => {

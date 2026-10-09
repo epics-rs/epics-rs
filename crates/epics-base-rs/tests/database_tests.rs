@@ -10452,7 +10452,7 @@ async fn init_applies_constant_dol_across_record_types() {
         let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"hello".to_vec().into())),
+            Some(EpicsValue::CharArray(b"hello\0".to_vec().into())),
             "lso JSON const DOL → VAL"
         );
         assert_eq!(

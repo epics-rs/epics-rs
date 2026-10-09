@@ -1,0 +1,10 @@
+record(ai,"SV"){field(VAL,"42.7") field(PREC,"1")}
+record(longout,"SW"){}
+record(mbbi,"SB"){field(SIML,"SW") field(SIOL,"SV") field(SDLY,"0.5") field(SIMS,"MINOR")}
+record(mbbiDirect,"SD"){field(SIML,"SW") field(SIOL,"SV") field(SDLY,"0.5") field(SIMS,"MINOR")}
+record(bi,"SI"){field(SIML,"SW") field(SIOL,"SV") field(SDLY,"0.5") field(SIMS,"MINOR")}
+record(event,"SE"){field(SIML,"SW") field(SIOL,"SV") field(SDLY,"0.5") field(SIMS,"MINOR")}
+record(mbbi,"SBN"){field(SIML,"SW") field(SIOL,"SV") field(SIMS,"MINOR")}
+record(stringin,"SS"){field(VAL,"simv")}
+record(stringin,"DS"){field(SIML,"SW") field(SIOL,"SS") field(SDLY,"0.5") field(SIMS,"MINOR")}
+record(stringin,"CS"){}

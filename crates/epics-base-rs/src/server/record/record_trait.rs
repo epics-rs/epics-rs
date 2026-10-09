@@ -887,6 +887,9 @@ pub struct MonitorValueClasses {
     pub archive: bool,
     /// See [`ArrayMonitorPost::hash_changed`].
     pub hash_changed: bool,
+    /// The record marked fields for [`Record::take_cycle_posted_fields`] in
+    /// this call, so this cycle takes them whatever its static hooks say.
+    pub marked: bool,
 }
 
 impl MonitorValueClasses {
@@ -895,6 +898,7 @@ impl MonitorValueClasses {
         value: true,
         archive: true,
         hash_changed: false,
+        marked: false,
     };
 }
 
@@ -911,6 +915,7 @@ pub fn monitor_deadband_classes<R: Record + ?Sized>(
             value: post.post_value,
             archive: post.post_archive,
             hash_changed: post.hash_changed,
+            marked: false,
         };
     }
     // A value the deadband cannot compare posts unconditionally.
@@ -925,6 +930,7 @@ pub fn monitor_deadband_classes<R: Record + ?Sized>(
         value,
         archive,
         hash_changed: false,
+        marked: false,
     }
 }
 
@@ -3321,6 +3327,7 @@ pub trait Record: Send + Sync + 'static {
                 value: changed || val_always,
                 archive: changed || archive_always,
                 hash_changed: false,
+                marked: false,
             };
         }
         if !gate.uses_deadband {
@@ -6742,7 +6749,7 @@ mod tests {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
             "compress" | "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
-            "acalcout" | "aSub" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
+            "acalcout" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
             "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,
             _ => CycleHooks::NONE,

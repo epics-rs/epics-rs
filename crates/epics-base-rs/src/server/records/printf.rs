@@ -1,9 +1,7 @@
+use super::lsi::LongStringVal;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{InputLinkRequest, LinkReadAs, ProcessOutcome, Record};
-use crate::types::{EpicsValue, PvString, SharedArray};
-
-/// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
-const MAX_STRING_SIZE: usize = 40;
+use crate::types::{EpicsValue, PvString};
 
 /// Truncate `s` to at most `max` bytes. C keeps the result in a fixed
 /// `char[SIZV]` and copies it byte for byte, so the cut is on a raw byte
@@ -29,10 +27,9 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
 // can recover the string content instead of stringifying a
 // coerced f64.
 pub struct PrintfRecord {
-    /// VAL's bytes, without C's terminating NUL. Shared, so the cycle's
-    /// readers (`val`, the monitor post, the OUT write) take a reference to
-    /// it instead of a copy.
-    pub val: SharedArray<u8>,
+    /// VAL's `LEN` elements. Shared, so the cycle's readers (`val`, the
+    /// monitor post, the OUT write) take a reference to it instead of a copy.
+    pub val: LongStringVal,
     pub sizv: u16,
     /// Private with `inp_links`: [`Record::put_field`] is their one writer,
     /// and it moves `links_generation`.
@@ -43,11 +40,6 @@ pub struct PrintfRecord {
     /// type. `%s` reads the string form, numeric conversions read the
     /// numeric form.
     pub vals: [EpicsValue; 10],
-    /// LEN: byte length of the formatted VAL string INCLUDING the
-    /// terminating NUL, recomputed each process cycle. C
-    /// `printfRecord.c:322` `prec->len = pval - prec->val` and posted at
-    /// :400 (DBF_ULONG, like lsi/lso).
-    pub len: u32,
     /// IVLS: the "Invalid Link String" emitted in place of any format
     /// directive whose input link did not resolve this cycle. C
     /// `printfRecord.c:306-307` `flags & F_BADLNK ? prec->ivls : format`;
@@ -76,7 +68,7 @@ pub struct PrintfRecord {
 impl Default for PrintfRecord {
     fn default() -> Self {
         Self {
-            val: SharedArray::default(),
+            val: LongStringVal::default(),
             // Intentional deviation from C `printfRecord.dbd.pod`
             // `field(SIZV,DBF_USHORT){ initial("41") }`: the port defaults to a
             // larger 256-byte result buffer rather than C's 41. Kept by design
@@ -86,7 +78,6 @@ impl Default for PrintfRecord {
             fmt: PvString::new(),
             inp_links: Default::default(),
             vals: std::array::from_fn(|_| EpicsValue::Double(0.0)),
-            len: 0,
             ivls: PvString::from("LNK"),
             resolved: [false; 10],
             prog: Vec::new(),
@@ -938,21 +929,15 @@ impl Record for PrintfRecord {
         let mut out = std::mem::take(&mut self.fmt_buf);
         out.clear();
         self.apply_fmt(&mut out);
-        // In place while no monitor snapshot still holds the last VAL.
-        if !self.val.is_shared() && self.val.len() == out.len() {
-            self.val.make_mut().copy_from_slice(&out);
-        } else {
-            self.val = out.as_slice().into();
-        }
-        self.fmt_buf = out;
         // C `printfRecord.c:321-322`: `*pval++ = 0; prec->len = pval - prec->val`
         // — LEN counts the formatted bytes plus the terminating NUL.
-        self.len = (self.val.len() + 1) as u32;
+        self.val.set_text(&out);
+        self.fmt_buf = out;
         Ok(ProcessOutcome::complete())
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.val.clone()))
+        Some(EpicsValue::CharArray(self.val.elements().clone()))
     }
 
     /// `devPrintfSoft.c::write_string` puts VAL; printf has no OVAL stage.
@@ -961,7 +946,7 @@ impl Record for PrintfRecord {
     }
 
     fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
-        Some(crate::server::record::ValueView::Char(&self.val))
+        Some(crate::server::record::ValueView::Char(self.val.elements()))
     }
 
     /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
@@ -977,8 +962,8 @@ impl Record for PrintfRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.val.clone())),
-            "LEN" => Some(EpicsValue::ULong(self.len)),
+            "VAL" => self.val(),
+            "LEN" => Some(EpicsValue::ULong(self.val.len())),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone())),
             "IVLS" => Some(EpicsValue::String(self.ivls.clone())),
@@ -1019,21 +1004,8 @@ impl Record for PrintfRecord {
             // already capped at `MAX_STRING_SIZE` by dbConvert, a DBR_CHAR
             // long-string source is bounded only by SIZV.
             "VAL" => {
-                let mut text = match value {
-                    EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
-                    EpicsValue::CharArray(bytes) => {
-                        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        PvString::from_bytes(bytes[..end].to_vec())
-                    }
-                    _ => return Err(CaError::TypeMismatch("VAL".into())),
-                };
-                let max = (self.sizv as usize).saturating_sub(1);
-                if text.len() > max {
-                    text = truncate_bytes(text, max);
-                }
-                self.val = text.as_bytes().into();
-                // C `printfRecord.c:321-322`: LEN counts the bytes plus NUL.
-                self.len = (self.val.len() + 1) as u32;
+                self.val
+                    .put(value, (self.sizv as usize).saturating_sub(1))?;
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {
@@ -1413,7 +1385,7 @@ mod libc_differential {
 mod tests {
     /// VAL as text, for comparing against the expected format output.
     fn val(rec: &PrintfRecord) -> String {
-        String::from_utf8_lossy(&rec.val).into_owned()
+        String::from_utf8_lossy(rec.val.text()).into_owned()
     }
 
     use super::*;
@@ -1454,8 +1426,9 @@ mod tests {
     /// the value is past 32 bits or negative into unsigned. softIoc R7.0.10.1
     /// on x86-64 prints the `cvttsd2si` result there (INT_MIN for `%d` of 3e9);
     /// the port takes `c_cast`'s rule, the one owner every field, link and wire
-    /// conversion shares: the 32-bit step saturates and a narrower width wraps
-    /// it (softIoc: `%hhd` of 300 is 44, `%hu` of -2.7 is 65534). Columns:
+    /// conversion shares: a 32-bit width saturates, and a narrower one wraps
+    /// x86's step, so it prints 0 there as softIoc does (`%hhd` of 300 is 44,
+    /// `%hu` of -2.7 is 65534). Columns:
     /// `%d %x %u %hd %hhd %ld %lld %llu %hhu %hu %o %X`, then the stars.
     #[test]
     fn double_sources_saturate_where_c_x86_64_prints_int_min_by_ub() {
@@ -1535,13 +1508,13 @@ mod tests {
                     "2147483647",
                     "b2d05e00",
                     "3000000000",
-                    "-1",
-                    "-1",
+                    "0",
+                    "0",
                     "2147483647",
                     "3000000000",
                     "3000000000",
-                    "255",
-                    "65535",
+                    "0",
+                    "0",
                     "26264057000",
                     "B2D05E00",
                 ],
@@ -1569,13 +1542,13 @@ mod tests {
                     "2147483647",
                     "ffffffff",
                     "4294967295",
-                    "-1",
-                    "-1",
+                    "0",
+                    "0",
                     "2147483647",
                     "5000000000",
                     "5000000000",
-                    "255",
-                    "65535",
+                    "0",
+                    "0",
                     "37777777777",
                     "FFFFFFFF",
                 ],
@@ -1586,13 +1559,13 @@ mod tests {
                     "2147483647",
                     "ffffffff",
                     "4294967295",
-                    "-1",
-                    "-1",
+                    "0",
+                    "0",
                     "2147483647",
                     "9223372036854775807",
                     "10000000000000000000",
-                    "255",
-                    "65535",
+                    "0",
+                    "0",
                     "37777777777",
                     "FFFFFFFF",
                 ],
@@ -1620,13 +1593,13 @@ mod tests {
                     "2147483647",
                     "ffffffff",
                     "4294967295",
-                    "-1",
-                    "-1",
+                    "0",
+                    "0",
                     "2147483647",
                     "9223372036854775807",
                     "18446744073709551615",
-                    "255",
-                    "65535",
+                    "0",
+                    "0",
                     "37777777777",
                     "FFFFFFFF",
                 ],
@@ -1637,13 +1610,13 @@ mod tests {
                     "2147483647",
                     "ffffffff",
                     "4294967295",
-                    "-1",
-                    "-1",
+                    "0",
+                    "0",
                     "2147483647",
                     "9223372036854775807",
                     "18446744073709551615",
-                    "255",
-                    "65535",
+                    "0",
+                    "0",
                     "37777777777",
                     "FFFFFFFF",
                 ],
@@ -1889,7 +1862,7 @@ mod tests {
             let mut rec = rec_with(fmt);
             rec.process().unwrap();
             assert_eq!(val(&rec), want, "{fmt}");
-            assert_eq!(rec.len, want.len() as u32 + 1, "{fmt}");
+            assert_eq!(rec.val.len(), want.len() as u32 + 1, "{fmt}");
         }
         let mut rec = rec_with("x%*");
         assert_eq!(
@@ -1926,7 +1899,7 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(val(&rec), "name=motor1");
         // 11 chars + 1 NUL.
-        assert_eq!(rec.len, 12);
+        assert_eq!(rec.val.len(), 12);
         assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(12)));
     }
 
@@ -1937,7 +1910,7 @@ mod tests {
         let mut rec = rec_with("");
         rec.process().unwrap();
         assert_eq!(val(&rec), "");
-        assert_eq!(rec.len, 1);
+        assert_eq!(rec.val.len(), 1);
         assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(1)));
     }
 
@@ -2046,17 +2019,17 @@ mod tests {
                 rec.set_input(i, v.clone());
             }
             rec.process().unwrap();
-            (rec.val.to_vec(), rec.len)
+            (rec.val.text().to_vec(), rec.val.len())
         };
         let d = EpicsValue::Double;
         assert_eq!(bytes("[%c]", &[d(65.0)]).0, b"[A]");
-        // epicsInt8 is the low byte of the 32-bit convert; 3e9 is past it,
-        // where x86-64 softIoc writes NUL and the saturated step 0xff.
+        // epicsInt8 is the low byte of the 32-bit convert; past it x86-64
+        // softIoc writes NUL, which LEN counts.
         assert_eq!(bytes("[%c]", &[d(300.0)]).0, b"[,]");
         assert_eq!(bytes("[%c]", &[d(-1.0)]).0, b"[\xff]");
         assert_eq!(bytes("[%c]", &[d(-2.7)]).0, b"[\xfe]");
         assert_eq!(bytes("[%c]", &[d(200.0)]).0, b"[\xc8]");
-        assert_eq!(bytes("[%c]", &[d(3e9)]), (b"[\xff]".to_vec(), 4));
+        assert_eq!(bytes("[%c]", &[d(3e9)]), (b"[\0]".to_vec(), 4));
         assert_eq!(bytes("%3c|", &[d(-23.0)]).0, b"  \xe9|");
         assert_eq!(
             bytes(
@@ -2077,7 +2050,7 @@ mod tests {
             .unwrap();
         assert_eq!(rec.ivls.as_bytes(), &"\u{e9}".repeat(9).as_bytes()[..15]);
         rec.process().unwrap();
-        assert_eq!(rec.len, 16);
+        assert_eq!(rec.val.len(), 16);
     }
 
     /// A failed `*` width link short-circuits BEFORE the conversion arg
@@ -2181,7 +2154,7 @@ mod tests {
         rec.set_input(0, EpicsValue::Double(1.0));
         rec.process().unwrap();
         assert_eq!(val(&rec), "v=1");
-        assert_eq!(rec.len, 4);
+        assert_eq!(rec.val.len(), 4);
     }
 
     /// The contract of [`Record::input_links_generation`]: while it stands
@@ -2234,7 +2207,10 @@ mod tests {
         let held = rec.val();
         rec.set_input(0, EpicsValue::Double(2.0));
         rec.process().unwrap();
-        assert_eq!(held, Some(EpicsValue::CharArray(b"v=1".as_slice().into())));
+        assert_eq!(
+            held,
+            Some(EpicsValue::CharArray(b"v=1\0".as_slice().into()))
+        );
         assert_eq!(val(&rec), "v=2");
         drop(held);
         rec.set_input(0, EpicsValue::Double(3.0));

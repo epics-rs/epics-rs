@@ -382,18 +382,10 @@ impl TransformRecord {
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(2 * NUM_CHANNELS);
+        let mut links: Vec<(&'static str, String)> = Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
-            links.push((
-                IAV_FIELD_NAMES[i],
-                self.inp_links[i].clone(),
-                LinkRole::Input,
-            ));
-            links.push((
-                OAV_FIELD_NAMES[i],
-                self.out_links[i].clone(),
-                LinkRole::Output,
-            ));
+            links.push((IAV_FIELD_NAMES[i], self.inp_links[i].clone()));
+            links.push((OAV_FIELD_NAMES[i], self.out_links[i].clone()));
         }
         // C `transformRecord.c:741`, `:858`, `:863`.
         post_link_status(

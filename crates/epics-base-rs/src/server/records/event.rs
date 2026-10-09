@@ -302,6 +302,7 @@ impl Record for EventRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
@@ -323,6 +324,7 @@ impl Record for EventRecord {
             "SIMM" => put_short(&mut self.simm, value, name)?,
             "SIMS" => put_short(&mut self.sims, value, name)?,
             "SDLY" => put_double(&mut self.sdly, value, name)?,
+            "SVAL" => put_pv_string(&mut self.sval, value, name)?,
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         self.on_put(name);

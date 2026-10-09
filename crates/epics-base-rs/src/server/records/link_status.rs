@@ -54,11 +54,11 @@ pub struct LinkStatusToken {
 impl LinkStatusToken {
     /// Post `fields` on record `name` under `mask`, unless a later token was
     /// issued — decided under the record write lock the post takes.
-    pub fn post(
+    pub fn post<P: crate::server::database::PostItem>(
         self,
         handle: &AsyncDbHandle,
         name: &str,
-        fields: Vec<(String, EpicsValue)>,
+        fields: Vec<P>,
         mask: crate::server::recgbl::EventMask,
     ) {
         let _ = handle.post_fields_with_mask_if(name, fields, mask, || {
@@ -95,25 +95,16 @@ pub fn link_is_external(status: i16) -> bool {
     status == LINK_EXT_NC || status == LINK_EXT_OK
 }
 
-/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1): an
-/// external or unresolvable link of either direction, and a constant OUTPUT link
-/// (sseqRecord.c:225).
+/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1): what
+/// `dbGetLinkDBFtype` answers for an external, unresolvable or constant link.
 pub(crate) const DBF_UNKNOWN: i16 = -1;
 
-/// C `DBF_NOACCESS` (dbFldTypes.h — dbStatic index 17), the code `init_record`
-/// stores for a constant INPUT link (sseqRecord.c:206). It is not "unknown": the
-/// constant HAS been consumed, once, by `recGblInitConstantLink` at init, and the
-/// code exists to make the per-cycle read switch fall to `default: break` so the
-/// constant is never re-read over a client's value. `DTn` is a wire-visible
-/// diagnostic field, so the code itself has to be C's — the port served -1 where
-/// C serves 17.
+/// C `DBF_NOACCESS` (dbFldTypes.h — dbStatic index 17), the code sseq's
+/// `init_record` alone stores for a constant DOL (sseqRecord.c:206); `special`
+/// and `checkLinks` overwrite it with `DBF_unknown` (:1014, :881).
 pub(crate) const DBF_NOACCESS: i16 = 17;
 
-/// Which end of the record a link is attached to. C's `init_record` classifies a
-/// CONSTANT link differently by direction — an input constant is loaded and marked
-/// `DBF_NOACCESS` (sseqRecord.c:203-207), an output constant has no target at all
-/// and stays `DBF_unknown` (:224-226) — so the classifier cannot answer without
-/// being told which it is.
+/// Which end of the record a link is attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRole {
     /// `DOL`/`INP`: read from.
@@ -168,17 +159,10 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
 /// no gate to observe here because there is no way to run this against a
 /// half-built database.
-pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16, i16) {
+pub fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
-        // Empty / constant link: C → CON. The field-type code is the direction's
-        // (see [`DBF_NOACCESS`]).
-        LinkType::Empty | LinkType::Constant => (
-            LINK_CON,
-            match role {
-                LinkRole::Input => DBF_NOACCESS,
-                LinkRole::Output => DBF_UNKNOWN,
-            },
-        ),
+        // Empty / constant link: C → CON, no target type.
+        LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
         // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
         // type. A DB-syntax link whose target is not on this IOC resolves to
         // `None` and falls through to EXT_NC (C `init_record` else branch).
@@ -201,8 +185,7 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
 /// set the `lset` (dbAccess.c:1181-1208), so a runtime put reads Constant
 /// whatever the target and nothing is classified.
 ///
-/// `links` pairs each status FIELD with the link string it describes and that
-/// link's [`LinkRole`]. Every caller passes its complete set, so a refresh is
+/// `links` pairs each status FIELD with the link string it describes. Every caller passes its complete set, so a refresh is
 /// always a whole-record classification, never a per-field patch — which is
 /// what makes the [`LinkStatusGen`] gate sufficient to keep "only the latest
 /// classification is published" true.
@@ -228,7 +211,7 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
 pub fn post_link_status(
     ctx: Option<&(String, AsyncDbHandle)>,
     generation: &LinkStatusGen,
-    links: Vec<(&'static str, String, LinkRole)>,
+    links: Vec<(&'static str, String)>,
     mask: crate::server::recgbl::EventMask,
 ) {
     let Some((name, handle)) = ctx else {
@@ -244,8 +227,8 @@ pub fn post_link_status(
     sched.schedule_record_init(&init_key, async move {
         let fields: Vec<(String, EpicsValue)> = links
             .into_iter()
-            .map(|(field, link, role)| {
-                let (status, _ft) = classify_link(&handle, &link, role);
+            .map(|(field, link)| {
+                let (status, _ft) = classify_link(&handle, &link);
                 (field.to_string(), EpicsValue::Enum(status as u16))
             })
             .collect();

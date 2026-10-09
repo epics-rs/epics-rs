@@ -1,10 +1,10 @@
 use super::link_status::{
     DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC,
-    LINK_LOC as LNKV_LOC, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkRole, LinkStatusGen,
-    classify_link, link_is_external,
+    LINK_LOC as LNKV_LOC, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen, classify_link,
+    link_is_external,
 };
 use crate::error::{CaError, CaResult};
-use crate::server::database::AsyncDbHandle;
+use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions, ProcessOutcome,
@@ -93,6 +93,17 @@ fn wait_config_err(wait: i16, lnk_status: i16) -> i16 {
     i16::from(wait != 0 && lnk_status == LNKV_LOC)
 }
 
+/// The C code a [`SseqRecord::refresh_link_status`] stands for.
+#[derive(Clone, Copy)]
+enum LinkCheck {
+    /// `init_record` (sseqRecord.c:203-240).
+    Init,
+    /// `special` on `DOLn` (`lnk` false) or `LNKn` of `step`.
+    Special { step: usize, lnk: bool },
+    /// `checkLinks` (:848-967), from a `WAITn` put or the re-poll.
+    CheckLinks,
+}
+
 /// Both halves of every step's value pair — the fields whose ONLY post path is
 /// the record's own mark ([`Record::fields_posted_only_when_marked`]).
 ///
@@ -107,6 +118,13 @@ fn wait_config_err(wait: i16, lnk_status: i16) -> i16 {
 static VALUE_PAIR_FIELDS: [&str; 2 * NUM_STEPS] = [
     "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "STR1", "STR2", "STR3",
     "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
+];
+
+/// The fields a process cycle may post; see `process_posted_fields`.
+static PROCESS_POSTED_FIELDS: [&str; 4 + 3 * NUM_STEPS] = [
+    "VAL", "BUSY", "ABORT", "ABORTING", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8",
+    "DO9", "DOA", "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
+    "WTG1", "WTG2", "WTG3", "WTG4", "WTG5", "WTG6", "WTG7", "WTG8", "WTG9", "WTGA",
 ];
 
 /// Which half of a step's value pair a write came FROM — the other half is
@@ -555,7 +573,7 @@ impl SseqRecord {
             // some link still classifies EXT_NC. A record whose links all
             // resolved is never re-classified, so its `WERRn` stays put.
             if self.links_not_ok() {
-                self.refresh_link_status(false);
+                self.refresh_link_status(LinkCheck::CheckLinks);
             }
         }
         // C `process` (sseqRecord.c:318-335): resolve the selection. With
@@ -1028,11 +1046,13 @@ impl SseqRecord {
     ///     to drive it. The refresh runs at record init, on `special()` of
     ///     a DOL/LNK/WAIT field, and at sequence start instead.
     ///
-    /// `WERRn` is written by C's `checkLinks` alone, so `check_links` says
-    /// whether C schedules it for this trigger; it also runs whenever a link
-    /// still classifies EXT_NC (C's `LINKS_NOT_OK`). Otherwise `WERRn` keeps
-    /// its value: a record whose links are all local at init reads 0.
-    fn refresh_link_status(&self, check_links: bool) {
+    /// What gets posted follows the C code that `trigger` stands for, field
+    /// by field: `init_record` and `special` post the status they set and
+    /// write `DTn`/`LTn` silently; `checkLinks` re-posts a local link's
+    /// status every pass, a CA link's only when it toggles, a constant's
+    /// never, and `WERRn` only when it changes. `checkLinks` follows `init`
+    /// and `special` whenever C schedules it there (`LINKS_NOT_OK`).
+    fn refresh_link_status(&self, trigger: LinkCheck) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
@@ -1054,35 +1074,78 @@ impl SseqRecord {
         // The parking key; `name` itself moves into the future below.
         let init_key = name.clone();
         sched.schedule_record_init(&init_key, async move {
-            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
-            let mut werrs = [0i16; NUM_STEPS];
-            let mut not_ok = false;
-            for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
-                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input);
-                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output);
-                not_ok |= dol_status == LNKV_EXT_NC || lnk_status == LNKV_EXT_NC;
-                werrs[i] = wait_config_err(*wait, lnk_status);
-                fields.push((
-                    DOLV_FIELDS[i].to_string(),
-                    EpicsValue::Enum(dol_status as u16),
-                ));
-                fields.push((
-                    LNKV_FIELDS[i].to_string(),
-                    EpicsValue::Enum(lnk_status as u16),
-                ));
-                fields.push((DT_FIELDS[i].to_string(), EpicsValue::Short(dol_ft)));
-                fields.push((LT_FIELDS[i].to_string(), EpicsValue::Short(lnk_ft)));
-            }
-            if check_links || not_ok {
-                for (i, werr) in werrs.into_iter().enumerate() {
-                    fields.push((WERR_FIELDS[i].to_string(), EpicsValue::Short(werr)));
+            let class: Vec<(i16, i16, i16, i16)> = groups
+                .iter()
+                .map(|(dol, lnk, _)| {
+                    let (ds, dt) = classify_link(&handle, dol);
+                    let (ls, lt) = classify_link(&handle, lnk);
+                    (ds, dt, ls, lt)
+                })
+                .collect();
+            let not_ok = class
+                .iter()
+                .any(|&(ds, _, ls, _)| ds == LNKV_EXT_NC || ls == LNKV_EXT_NC);
+            let mut fields: Vec<(String, EpicsValue, PostRule)> = Vec::new();
+            let mut push = |f: &str, v: EpicsValue, r: PostRule| {
+                fields.push((f.to_string(), v, r));
+            };
+            let status = |s: i16| EpicsValue::Enum(s as u16);
+            let run_check_links = match trigger {
+                LinkCheck::Init => {
+                    // sseqRecord.c:221, :240. Only `init_record` marks a
+                    // constant DOL `DBF_NOACCESS` (:206).
+                    for (i, &(ds, dt, ls, lt)) in class.iter().enumerate() {
+                        let dt = if ds == LNKV_CON { DBF_NOACCESS } else { dt };
+                        push(DOLV_FIELDS[i], status(ds), PostRule::Always);
+                        push(DT_FIELDS[i], EpicsValue::Short(dt), PostRule::Silent);
+                        push(LNKV_FIELDS[i], status(ls), PostRule::Always);
+                        push(LT_FIELDS[i], EpicsValue::Short(lt), PostRule::Silent);
+                    }
+                    not_ok
+                }
+                LinkCheck::Special { step, lnk } => {
+                    // sseqRecord.c:1005-1011 (DOLn), :1047-1057 (LNKn).
+                    let (ds, dt, ls, lt) = class[step];
+                    let put = if lnk {
+                        push(LNKV_FIELDS[step], status(ls), PostRule::Always);
+                        push(LT_FIELDS[step], EpicsValue::Short(lt), PostRule::Silent);
+                        ls
+                    } else {
+                        push(DOLV_FIELDS[step], status(ds), PostRule::Always);
+                        push(DT_FIELDS[step], EpicsValue::Short(dt), PostRule::Silent);
+                        ds
+                    };
+                    // `special` runs before `dbAddLink` (dbAccess.c:1181,
+                    // :1208), so a put naming a PV reads `dbGetLinkDBFtype`
+                    // -1 and sets LINKS_NOT_OK (:1015, :1070); a constant has
+                    // no `pv_link.pvname` and skips that check.
+                    put != LNKV_CON || not_ok
+                }
+                LinkCheck::CheckLinks => true,
+            };
+            if run_check_links {
+                // sseqRecord.c:863-950: DB_LINK posts LOC every pass, CA_LINK
+                // posts only an EXT/EXT_NC toggle, CONSTANT is left alone.
+                let rule = |s: i16| match s {
+                    LNKV_LOC => Some(PostRule::Always),
+                    LNKV_CON => None,
+                    _ => Some(PostRule::OnChange),
+                };
+                for (i, &(ds, dt, ls, lt)) in class.iter().enumerate() {
+                    if let Some(r) = rule(ds) {
+                        push(DOLV_FIELDS[i], status(ds), r);
+                    }
+                    push(DT_FIELDS[i], EpicsValue::Short(dt), PostRule::Silent);
+                    if let Some(r) = rule(ls) {
+                        push(LNKV_FIELDS[i], status(ls), r);
+                    }
+                    let werr = wait_config_err(groups[i].2, ls);
+                    push(WERR_FIELDS[i], EpicsValue::Short(werr), PostRule::OnChange);
+                    push(LT_FIELDS[i], EpicsValue::Short(lt), PostRule::Silent);
                 }
             }
-            // Publish only if no newer refresh was issued meanwhile.
-            // `DBE_VALUE` alone, as C: `dol_status` `sseqRecord.c:221`, `:867`,
-            // `:872`, `:877`, `:1005`, `:1008`, `:1011`; `lnk_status` `:240`,
-            // `:900`, `:905`, `:914`, `:1047`, `:1052`, `:1057`;
-            // `waitConfigErr` `:910`, `:919`, `:925`, `:932`.
+            // Publish only if no newer refresh was issued meanwhile, at
+            // C's literal `DBE_VALUE`.
             token.post(
                 &handle,
                 &name,
@@ -1201,6 +1264,13 @@ impl Record for SseqRecord {
     /// `VALUE_PAIR_FIELDS`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &VALUE_PAIR_FIELDS
+    }
+
+    /// C's process path posts these and nothing else (`asyncFinish` :474-505,
+    /// `processCallback` :654-699, WTGn :343/:559/:728); `DTn`/`LTn`, which
+    /// `checkLinks` writes silently, never post.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED_FIELDS)
     }
 
     /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
@@ -1364,17 +1434,15 @@ impl Record for SseqRecord {
             return Ok(());
         }
         // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics
-        // (C `sseqRecord.c::special`, `SPC_MOD`). C schedules `checkLinks` on
-        // every `WAITn` put, and on a `DOLn`/`LNKn` put naming a PV, where
-        // `dbGetLinkDBFtype` answers -1 inside `special` and sets
-        // `LINKS_NOT_OK` (:1015, :1070).
+        // (C `sseqRecord.c::special`, `SPC_MOD`); a `WAITn` put only
+        // schedules `checkLinks`.
         if Self::is_link_config_field(field) {
-            let check_links = match Self::step_index_from_suffix(field) {
-                Some((idx, "DOL")) => !self.steps[idx].dol.is_empty(),
-                Some((idx, "LNK")) => !self.steps[idx].lnk.is_empty(),
-                _ => true,
+            let trigger = match Self::step_index_from_suffix(field) {
+                Some((step, "DOL")) => LinkCheck::Special { step, lnk: false },
+                Some((step, "LNK")) => LinkCheck::Special { step, lnk: true },
+                _ => LinkCheck::CheckLinks,
             };
-            self.refresh_link_status(check_links);
+            self.refresh_link_status(trigger);
             return Ok(());
         }
         // ABORTING is `special(SPC_MOD)` but C `sseqRecord.c::special` has NO
@@ -1472,7 +1540,7 @@ impl Record for SseqRecord {
         // initial status (sseqRecord.c:203-240). This is the framework's
         // init-time hook, so refresh now that the async surface exists.
         // `init_record` itself never runs `checkLinks`.
-        self.refresh_link_status(false);
+        self.refresh_link_status(LinkCheck::Init);
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -2185,9 +2253,8 @@ mod tests {
         // openable/readable (clients previously got field-not-found). With
         // no async context wired, the link-status fields hold their C
         // `init_record` classification of an empty (constant) link: `CON`
-        // status, and the field-type code of the link's DIRECTION —
-        // `DBF_NOACCESS` (17) for the consumed DOL constant, `DBF_unknown` (-1)
-        // for the LNK constant, which has no target (sseqRecord.c:204-225).
+        // status, `DBF_NOACCESS` (17) for the consumed DOL constant and
+        // `DBF_unknown` (-1) for the LNK constant (sseqRecord.c:204-225).
         let rec = SseqRecord::new();
         assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(17)));
         assert_eq!(rec.get_field("LT1"), Some(EpicsValue::Short(-1)));

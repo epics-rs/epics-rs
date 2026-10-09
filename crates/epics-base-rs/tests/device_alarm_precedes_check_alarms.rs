@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
+use epics_base_rs::server::device_support::{
+    DeviceAlarm, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -29,8 +31,12 @@ impl DeviceSupport for AlarmingDevice {
         "alarmingRead"
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
-        Some((alarm_status::READ_ALARM, 3))
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        Some(DeviceAlarm {
+            stat: alarm_status::READ_ALARM,
+            sevr: 3,
+            msg: "",
+        })
     }
 }
 

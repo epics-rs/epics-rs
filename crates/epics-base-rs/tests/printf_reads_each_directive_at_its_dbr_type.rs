@@ -84,7 +84,7 @@ async fn check(rows: &[(&str, &str, &[u8], f64)]) {
         let got_sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
         let mut want_val = b"[".to_vec();
         want_val.extend_from_slice(want);
-        want_val.push(b']');
+        want_val.extend_from_slice(b"]\0");
         if got.as_ref() != want_val.as_slice() || got_sevr != *sevr {
             failed.push(format!(
                 "{fmt} of {src}: {:?} sevr {got_sevr}, softIoc {:?} sevr {sevr}",

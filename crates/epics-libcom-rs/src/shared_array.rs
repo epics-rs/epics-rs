@@ -40,6 +40,16 @@ impl<T> SharedArray<T> {
         self
     }
 
+    /// Write access in place, while this is the only holder and serves the
+    /// whole buffer; `None` where a write would have to copy.
+    #[inline]
+    pub fn get_mut(&mut self) -> Option<&mut [T]> {
+        if self.len != self.buf.len() {
+            return None;
+        }
+        Arc::get_mut(&mut self.buf)
+    }
+
     /// Whether both views read the same buffer.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.buf, &other.buf)

@@ -257,15 +257,21 @@ async fn a_u64_max_requested_as_uint64_is_exact() {
     assert_eq!(v, Some(EpicsValue::UInt64(u64::MAX)));
 }
 
+/// x86-64 softIoc R7.0.10: inf, -inf, NaN and 1e10 land in a `DBF_SHORT` as
+/// 0 — `cvttsd2si`'s `INT_MIN`, cut to 16 bits — and 65537 as 1.
 #[epics_macros_rs::epics_test]
-async fn an_infinite_double_requested_as_short_saturates() {
-    let (v, _) = read(
-        EpicsValue::Double(f64::INFINITY),
-        "src_f64",
-        LinkReadAs::Short,
-    )
-    .await;
-    assert_eq!(v, Some(EpicsValue::Short(i16::MAX)));
+async fn an_out_of_range_double_requested_as_short_is_zero_like_softioc() {
+    for (src, want) in [
+        (f64::INFINITY, 0),
+        (f64::NEG_INFINITY, 0),
+        (f64::NAN, 0),
+        (1e10, 0),
+        (65537.0, 1),
+        (-2.7, -2),
+    ] {
+        let (v, _) = read(EpicsValue::Double(src), "src_f64", LinkReadAs::Short).await;
+        assert_eq!(v, Some(EpicsValue::Short(want)), "{src}");
+    }
 }
 
 /// The general fetch path (a `PP` source is not a read the reader's own

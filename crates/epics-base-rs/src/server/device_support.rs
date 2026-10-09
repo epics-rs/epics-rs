@@ -536,6 +536,16 @@ pub struct PropertyPost {
     pub post_field: String,
 }
 
+/// The alarm a device raises after a transfer: C's
+/// `recGblSetSevrMsg(prec, stat, sevr, msg)`, with an empty `msg` for a
+/// plain `recGblSetSevr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceAlarm<'a> {
+    pub stat: u16,
+    pub sevr: u16,
+    pub msg: &'a str,
+}
+
 /// Trait for custom device support implementations.
 /// When DTYP is set to something other than "" or "Soft Channel",
 /// the registered DeviceSupport is used instead of link resolution.
@@ -568,9 +578,9 @@ pub trait DeviceSupport: Send + Sync + 'static {
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()>;
     fn dtyp(&self) -> &str;
 
-    /// Return the last alarm (status, severity) from the driver.
+    /// Return the alarm the driver's last transfer left.
     /// None means the driver does not override alarms.
-    fn last_alarm(&self) -> Option<(u16, u16)> {
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
         None
     }
 

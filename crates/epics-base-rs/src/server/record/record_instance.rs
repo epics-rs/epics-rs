@@ -3336,7 +3336,7 @@ impl RecordInstance {
             EventMask::NONE
         };
 
-        let (include_val, include_archive) = self.value_include_classes();
+        let (include_val, include_archive, marked) = self.value_include_classes();
         // The deadband-tracked field posts with the classes that actually
         // fired: MDEL crossing → DBE_VALUE, ADEL crossing → DBE_LOG, alarm
         // movement → DBE_ALARM — and nothing else (C `monitor()` per-field
@@ -3347,7 +3347,7 @@ impl RecordInstance {
         if let Some((field, value)) = deadband.field {
             snapshot.push((field.into(), value, deadband.mask));
         }
-        self.collect_subscriber_posts(snapshot, deadband.mask, alarm_bits, include_val);
+        self.collect_subscriber_posts(snapshot, deadband.mask, alarm_bits, include_val, marked);
         // C waveform/aai/aao `monitor()` posts HASH with a literal
         // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
         // 317-319), independent of the VAL post mask. `array_hash_changed`
@@ -7157,6 +7157,7 @@ impl RecordInstance {
         deadband_mask: EventMask,
         alarm_bits: EventMask,
         include_val: bool,
+        marked: bool,
     ) {
         use crate::server::record::{CycleHooks, CyclePostMask, ValuePostGate, value_gate};
 
@@ -7168,6 +7169,7 @@ impl RecordInstance {
         // record itself is not asked.
         if deadband_mask.is_empty()
             && !self.monitor_plan.forced_secondary
+            && !marked
             && !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::FIRST_MONITOR))
             && self.subscribers.is_empty()
             && self.last_posted.is_empty()
@@ -7177,7 +7179,7 @@ impl RecordInstance {
 
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let mut cycle_posted = if hooks.has(CycleHooks::CYCLE_POSTED) {
+        let mut cycle_posted = if marked || hooks.has(CycleHooks::CYCLE_POSTED) {
             self.record.take_cycle_posted_fields()
         } else {
             Vec::new()
@@ -7480,7 +7482,7 @@ impl RecordInstance {
             if name == deadband_field {
                 // The record's own value, not the notify's copy of it: C posts
                 // the field itself (`db_post_events(pmr, &pmr->rbv, ...)`).
-                let (include_val, include_archive) = self.value_include_classes();
+                let (include_val, include_archive, _) = self.value_include_classes();
                 // No alarm bits: `recGblResetAlarms` has not run on this pending
                 // pass, so the post carries only the classes MDEL/ADEL fired.
                 let deadband = self.deadband_post(EventMask::NONE, include_val, include_archive);
@@ -7827,15 +7829,17 @@ impl RecordInstance {
     /// feeds into [`Self::deadband_post`] and [`Self::collect_subscriber_posts`].
     /// Keeping it in one place is what stops the rule from holding on the
     /// synchronous path but not the async-continuation / put-notify paths.
+    ///
+    /// The third answer is [`MonitorValueClasses::marked`](crate::server::record::MonitorValueClasses::marked).
     #[inline(always)]
-    pub(crate) fn value_include_classes(&mut self) -> (bool, bool) {
+    pub(crate) fn value_include_classes(&mut self) -> (bool, bool, bool) {
         // fanout/seq "trigger" records post VAL only with the alarm events
         // `recGblResetAlarms` returns, never DBE_VALUE/DBE_LOG — see
         // `Record::process_posts_value_monitor`. The alarm bits still reach VAL
         // via `deadband_post`'s `alarm_bits`, so an alarm transition still posts
         // it; only the value/archive classes are suppressed.
         if !self.monitor_plan.posts_value_monitor {
-            return (false, false);
+            return (false, false, false);
         }
         // lsi/lso and the binary records gate on their own change test (C
         // `lsiRecord.c`/`lsoRecord.c` monitor: `len != olen || memcmp(oval,
@@ -7847,7 +7851,7 @@ impl RecordInstance {
             .monitor_value_classes(self.monitor_plan.value_gate, &mut last_posted);
         [self.common.mlst, self.common.alst] = last_posted;
         self.array_hash_changed = classes.hash_changed;
-        (classes.value, classes.archive)
+        (classes.value, classes.archive, classes.marked)
     }
 
     #[inline(always)]
@@ -11297,11 +11301,11 @@ mod check_deadband_tests {
         use crate::server::records::asub_record::ASubRecord;
 
         let mut asub = RecordInstance::new("A".into(), ASubRecord::default());
-        assert_eq!(asub.value_include_classes(), (false, false));
+        assert_eq!(asub.value_include_classes(), (false, false, false));
         let mut moved = ASubRecord::default();
         moved.val = 2;
         let mut asub = RecordInstance::new("A".into(), moved);
-        assert_eq!(asub.value_include_classes(), (true, true));
+        assert_eq!(asub.value_include_classes(), (true, true, false));
 
         let mut seeded = AiRecord::default();
         (seeded.val, seeded.mlst, seeded.alst) = (5.0, 5.0, 5.0);
@@ -11951,7 +11955,13 @@ mod forced_secondary_post_tests {
     /// One guarded monitor cycle; the fields it posted, in order.
     fn guarded_cycle(inst: &mut RecordInstance) -> Vec<String> {
         let mut snapshot = ProcessSnapshot::new();
-        inst.collect_subscriber_posts(&mut snapshot, EventMask::VALUE, EventMask::NONE, true);
+        inst.collect_subscriber_posts(
+            &mut snapshot,
+            EventMask::VALUE,
+            EventMask::NONE,
+            true,
+            false,
+        );
         snapshot
             .iter()
             .map(|(field, _, _)| field.to_string())
@@ -11998,7 +12008,7 @@ mod forced_secondary_post_tests {
         let mut inst = RecordInstance::new("AI:RVAL".to_string(), rec);
         let cycle = |inst: &mut RecordInstance, mask| {
             let mut snapshot = ProcessSnapshot::new();
-            inst.collect_subscriber_posts(&mut snapshot, mask, EventMask::NONE, true);
+            inst.collect_subscriber_posts(&mut snapshot, mask, EventMask::NONE, true, false);
             snapshot
                 .iter()
                 .map(|(field, _, mask)| (field.to_string(), *mask))

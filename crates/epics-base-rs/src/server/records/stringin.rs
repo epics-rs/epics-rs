@@ -31,6 +31,9 @@ pub struct StringinRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    /// The SIOL read's buffer (`dbGetLink(&prec->siol, DBR_STRING,
+    /// prec->sval)`, stringinRecord.c:208), copied to VAL on success.
+    pub sval: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menu(stringinPOST)` Post Value Monitors (0=On Change, 1=Always).
@@ -50,6 +53,7 @@ impl Default for StringinRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -224,6 +228,7 @@ impl Record for StringinRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "MPST" => Some(EpicsValue::Short(self.mpst)),
@@ -276,6 +281,13 @@ impl Record for StringinRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::String(s) => {
+                    self.sval = truncate_string(s);
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SVAL".into())),
             },
             "SIMS" => match value {
                 EpicsValue::Short(v) => {

@@ -43,10 +43,12 @@
 //! The widths narrower than 32 bits take one more, DEFINED step. Both
 //! targets compile `(epicsInt8) d` / `(epicsUInt16) d` as a 32-bit convert
 //! followed by a truncation to the low bits (x86-64 `cvttsd2si %eax` then
-//! `%al`/`%ax`; aarch64 `fcvtzs w0` then the same), so the narrow helpers are
-//! [`f64_to_i32`] then a wrapping `as`: softIoc stores 300 into a `DBF_CHAR`
-//! as 44 and -2.7 into a `DBF_USHORT` as 65534. Only the 32-bit step carries
-//! the saturation policy (an x86-64 IOC stores 0 for 1e10, an ARM one 255).
+//! `%al`/`%ax`; aarch64 `fcvtzs w0` then the same): softIoc stores 300 into a
+//! `DBF_CHAR` as 44 and -2.7 into a `DBF_USHORT` as 65534. Their 32-bit step
+//! is x86-64's, whose out-of-range answer `INT_MIN` has all low bits clear:
+//! x86-64 softIoc R7.0.10 stores 0 for inf, -inf, NaN, 5e9 and 1e10 into a
+//! `DBF_SHORT`/`DBF_CHAR` field and reads 0 through a `DBR_USHORT` link. A
+//! saturated step would store -1 there, a value no x86 IOC produces.
 //!
 //! No alarm is raised: `dbConvert`'s routines run on the put path, outside the
 //! record's own process cycle, so an alarm raised here would be erased by the
@@ -78,25 +80,35 @@ pub fn f64_to_i64(v: f64) -> i64 {
     v as i64
 }
 
+/// The 32-bit step of a narrow cast, x86-64 `cvttsd2si`: truncated toward
+/// zero, `INT_MIN` for NaN and anything outside `i32`.
+fn narrow_step(v: f64) -> i32 {
+    if v > -2_147_483_649.0 && v < 2_147_483_648.0 {
+        v as i32
+    } else {
+        i32::MIN
+    }
+}
+
 /// C `(char) d` / `(epicsInt8) d`: the 32-bit convert, then the low byte.
 pub fn f64_to_i8(v: f64) -> i8 {
-    f64_to_i32(v) as i8
+    narrow_step(v) as i8
 }
 
 /// C `(epicsUInt8) d`: the 32-bit convert, then the low byte.
 pub fn f64_to_u8(v: f64) -> u8 {
-    f64_to_i32(v) as u8
+    narrow_step(v) as u8
 }
 
 /// C `(epicsInt16) d`: the 32-bit convert, then the low 16 bits.
 pub fn f64_to_i16(v: f64) -> i16 {
-    f64_to_i32(v) as i16
+    narrow_step(v) as i16
 }
 
 /// C `(epicsUInt16) d` / `(epicsEnum16) d`: the 32-bit convert, then the low
 /// 16 bits.
 pub fn f64_to_u16(v: f64) -> u16 {
-    f64_to_i32(v) as u16
+    narrow_step(v) as u16
 }
 
 /// C `(epicsUInt32) d`, saturated: clamps to `u32`'s range, negatives and
@@ -154,13 +166,9 @@ pub fn f64_to_f32(v: f64) -> f32 {
 mod tests {
     use super::*;
 
-    /// The 32-bit step saturates and sends NaN to 0; a narrower dest wraps
-    /// that result.
-    ///
-    /// The out-of-range rows are exactly where a compiled x86-64 IOC would store
-    /// the "integer indefinite" instead (`3.0e9 -> i32` = `INT_MIN` there). We
-    /// deliberately do not: see the module docs — that value is UB, an ARM IOC
-    /// saturates just as this does, and CBUG-E2 signed off on clean.
+    /// A 32-bit-or-wider dest saturates and sends NaN to 0 (CBUG-E2); a
+    /// narrower one wraps x86-64's 32-bit step, whose out-of-range answer
+    /// `INT_MIN` cuts to 0.
     #[test]
     fn out_of_range_saturates_and_nan_is_zero() {
         #[allow(clippy::type_complexity)]
@@ -179,14 +187,14 @@ mod tests {
             (65535.7, -1, 255, -1, 65535, 65535, 65535, 65535, 65535),
             // softIoc: 70000 -> DBF_CHAR 112, DBF_USHORT 4464.
             (70000.9, 112, 112, 4464, 4464, 70000, 70000, 70000, 70000),
-            // Past i32: the 32-bit step saturates (an x86-64 IOC stores INT_MIN
-            // there, so 0 in every narrow dest; an ARM one agrees with this).
+            // Past i32: a wide dest saturates; a narrow one takes x86-64's
+            // INT_MIN step, so 0 (softIoc: 5e9 and 1e10 -> DBF_SHORT 0).
             (
                 3.0e9,
-                -1,
-                255,
-                -1,
-                65535,
+                0,
+                0,
+                0,
+                0,
                 i32::MAX,
                 3000000000,
                 3000000000,
@@ -206,10 +214,10 @@ mod tests {
             ),
             (
                 4294967295.5,
-                -1,
-                255,
-                -1,
-                65535,
+                0,
+                0,
+                0,
+                0,
                 i32::MAX,
                 u32::MAX,
                 4294967295,
@@ -217,41 +225,30 @@ mod tests {
             ),
             (
                 1.0e19,
-                -1,
-                255,
-                -1,
-                65535,
+                0,
+                0,
+                0,
+                0,
                 i32::MAX,
                 u32::MAX,
                 i64::MAX,
                 10000000000000000000,
             ),
             (-1.0e19, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
-            (
-                1.0e300,
-                -1,
-                255,
-                -1,
-                65535,
-                i32::MAX,
-                u32::MAX,
-                i64::MAX,
-                u64::MAX,
-            ),
+            (1.0e300, 0, 0, 0, 0, i32::MAX, u32::MAX, i64::MAX, u64::MAX),
             (
                 f64::INFINITY,
-                -1,
-                255,
-                -1,
-                65535,
+                0,
+                0,
+                0,
+                0,
                 i32::MAX,
                 u32::MAX,
                 i64::MAX,
                 u64::MAX,
             ),
             (f64::NEG_INFINITY, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
-            // NaN is 0 in every destination — an ARM IOC agrees; an x86 one stores
-            // INT_MIN, which is 0 in the narrow ones too.
+            // NaN is 0 in every destination: x86's INT_MIN in the narrow ones.
             (f64::NAN, 0, 0, 0, 0, 0, 0, 0, 0),
         ];
         for &(d, i8v, u8v, i16v, u16v, i32v, u32v, i64v, u64v) in rows {
@@ -271,7 +268,6 @@ mod tests {
     #[test]
     fn saturation_is_rusts_native_as() {
         assert_eq!(f64_to_i32(3.0e9), 3.0e9 as i32);
-        assert_eq!(f64_to_i16(70000.9), 70000.9_f64 as i32 as i16);
         assert_eq!(f64_to_u32(-1.0), -1.0_f64 as u32);
     }
 }

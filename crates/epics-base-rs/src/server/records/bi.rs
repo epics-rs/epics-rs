@@ -375,6 +375,7 @@ impl Record for BiRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::ULong(self.sval)),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
@@ -541,6 +542,13 @@ impl Record for BiRecord {
             "SDLY" => match value {
                 EpicsValue::Double(v) => {
                     self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::ULong(v) => {
+                    self.sval = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

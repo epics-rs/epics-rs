@@ -18,7 +18,7 @@
 #![cfg(feature = "client-core")]
 
 use epics_base_rs::server::records::bi::BiRecord;
-use epics_base_rs::server::records::lsi::LsiRecord;
+use epics_base_rs::server::records::lsi::{LongStringVal, LsiRecord};
 use epics_base_rs::server::records::printf::PrintfRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -416,7 +416,7 @@ async fn long_string_count_clamp_trims_char_array() {
 #[serial]
 async fn printf_val_native_type_is_scalar_dbr_string() {
     let mut rec = PrintfRecord::default();
-    rec.val = b"log: 42".as_slice().into();
+    rec.val = LongStringVal::from_text(b"log: 42");
     let server = CaServer::builder()
         .port(0)
         .record("R3C2:PF:VAL", rec)

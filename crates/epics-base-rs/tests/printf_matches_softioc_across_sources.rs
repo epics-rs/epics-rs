@@ -87,7 +87,7 @@ async fn diverging(keep: impl Fn(&str, &str) -> bool) -> Vec<String> {
             let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap().to_f64().unwrap();
             let mut expect = b"[".to_vec();
             expect.extend_from_slice(want);
-            expect.push(b']');
+            expect.extend_from_slice(b"]\0");
             if got.as_ref() != expect.as_slice() || (sevr == 3.0) != *invalid {
                 out.push(format!(
                     "{conv} of {src}: {:?} sevr {sevr}, softIoc {:?} invalid {invalid}",

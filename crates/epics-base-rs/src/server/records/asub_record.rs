@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     CyclePostMask, FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs,
-    ProcessOutcome, Record,
+    MonitorValueClasses, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -428,10 +428,18 @@ fn channel_is_scalar(v: &EpicsValue) -> bool {
 }
 
 impl ASubRecord {
-    /// The ON CHANGE arm of C `monitor()` (`aSubRecord.c:422-438`) over the
-    /// channels written since it last ran.
+    /// [`Record::monitor_value_classes`] on a cycle with a `VALx`/`NEVx`
+    /// written since the last one: out of line, so a clean cycle takes no
+    /// frame.
     #[inline(never)]
-    fn mark_changed_outputs(&mut self) {
+    fn monitor_outputs(&mut self, changed: bool) -> MonitorValueClasses {
+        let marked = self.eflg == EFLG_ON_CHANGE && self.mark_changed_outputs();
+        monitor_classes(changed, marked)
+    }
+
+    /// The ON CHANGE arm of C `monitor()` (`aSubRecord.c:422-438`) over the
+    /// channels written since it last ran; true when it marked any.
+    fn mark_changed_outputs(&mut self) -> bool {
         let mut dirty = std::mem::take(&mut self.out_dirty);
         while dirty != 0 {
             let i = dirty.trailing_zeros() as usize;
@@ -446,6 +454,7 @@ impl ASubRecord {
                 }
             }
         }
+        self.val_marks != 0
     }
 
     #[inline(never)]
@@ -463,6 +472,15 @@ impl ASubRecord {
             }
         }
         marks
+    }
+}
+
+fn monitor_classes(changed: bool, marked: bool) -> MonitorValueClasses {
+    MonitorValueClasses {
+        value: changed,
+        archive: changed,
+        hash_changed: false,
+        marked,
     }
 }
 
@@ -507,7 +525,7 @@ impl Record for ASubRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::CYCLE_POSTED
+        crate::server::record::CycleHooks::NONE
     }
 
     fn has_array_monitor_post(&self) -> bool {
@@ -518,14 +536,25 @@ impl Record for ASubRecord {
     /// against OVAL (`:414-417`), then under `EFLG=ON CHANGE` each `VALx`
     /// against the `OVLx` it last posted, not against the cycle's start
     /// (`:422-438`): a client put to `VALx` moves neither copy, so the next
-    /// cycle posts it again.
+    /// cycle posts it again. The marks are made here and reported as
+    /// `marked`, so the cycle that made them takes them.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> MonitorValueClasses {
+        let changed = self.monitor_value_changed() == Some(true);
+        if self.out_dirty == 0 {
+            return monitor_classes(changed, false);
+        }
+        self.monitor_outputs(changed)
+    }
+
+    /// `aSubRecord.c:414-417`.
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.val != self.oval;
         if changed {
             self.oval = self.val;
-        }
-        if self.out_dirty != 0 && self.eflg == EFLG_ON_CHANGE {
-            self.mark_changed_outputs();
         }
         Some(changed)
     }

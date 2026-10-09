@@ -7,7 +7,7 @@ use epics_base_rs::server::record::{
     link_field_type,
 };
 use epics_base_rs::server::records::link_status::{
-    LINK_CON, LINK_EXT_NC, LinkRole, LinkStatusGen, classify_link,
+    LINK_CON, LINK_EXT_NC, LinkStatusGen, classify_link,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -237,10 +237,8 @@ impl ThrottleRecord {
         // The parking key; `name` itself moves into the future below.
         let init_key = name.clone();
         sched.schedule_record_init(&init_key, async move {
-            // OUT is written to, SINP is read from — the classifier answers a
-            // CONSTANT link's field-type code by direction.
-            let (ov, _) = classify_link(&handle, &out, LinkRole::Output);
-            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input);
+            let (ov, _) = classify_link(&handle, &out);
+            let (siv, _) = classify_link(&handle, &sinp);
             token.post(
                 &handle,
                 &name,

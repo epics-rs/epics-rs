@@ -168,10 +168,13 @@ impl fmt::Display for EpicsValue {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
-            Self::CharArray(arr) => match std::str::from_utf8(arr) {
-                Ok(s) => write!(f, "{s}"),
-                Err(_) => write!(f, "{arr:?}"),
-            },
+            Self::CharArray(arr) => {
+                let text = nul_terminated(arr);
+                match std::str::from_utf8(text) {
+                    Ok(s) => write!(f, "{s}"),
+                    Err(_) => write!(f, "{text:?}"),
+                }
+            }
             Self::StringArray(arr) => {
                 write!(f, "[")?;
                 for (i, s) in arr.iter().enumerate() {
@@ -184,6 +187,11 @@ impl fmt::Display for EpicsValue {
             }
         }
     }
+}
+
+/// A char array's text: its elements before the first NUL.
+fn nul_terminated(chars: &[u8]) -> &[u8] {
+    &chars[..chars.iter().position(|&c| c == 0).unwrap_or(chars.len())]
 }
 
 /// Append `arr` as big-endian DBR elements, `wire` giving each element's
@@ -1106,9 +1114,11 @@ impl EpicsValue {
                 DbFieldType::ULong => {
                     EpicsValue::ULongArray(bytes.iter().map(|&b| b as i8 as u32).collect())
                 }
-                // CharArray as text: preserve the byte buffer verbatim
-                // (no UTF-8 validation), matching pvxs raw-byte storage.
-                DbFieldType::String => EpicsValue::String(PvString::from_bytes(bytes.to_vec())),
+                // CharArray as text: the bytes before the NUL, verbatim (no
+                // UTF-8 validation), matching pvxs raw-byte storage.
+                DbFieldType::String => {
+                    EpicsValue::String(PvString::from_bytes(nul_terminated(bytes).to_vec()))
+                }
                 DbFieldType::Char => EpicsValue::CharArray(bytes.clone()),
                 // epicsInt8 -> epicsUInt8 is byte-identity (C `charToUchar`
                 // casts the signed source: -1/0xFF -> 255/0xFF), so the raw

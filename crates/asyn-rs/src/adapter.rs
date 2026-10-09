@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime};
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::device_support::WriteStart;
 use epics_base_rs::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost, WriteCompletion,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
+    WriteCompletion,
 };
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
@@ -2611,11 +2612,15 @@ impl DeviceSupport for AsynDeviceSupport {
         &self.iface_type
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
         if self.last_alarm_status == 0 && self.last_alarm_severity == 0 {
             None
         } else {
-            Some((self.last_alarm_status, self.last_alarm_severity))
+            Some(DeviceAlarm {
+                stat: self.last_alarm_status,
+                sevr: self.last_alarm_severity,
+                msg: "",
+            })
         }
     }
 
@@ -5452,7 +5457,7 @@ mod tests {
             "zero-samples skips the convert so VAL is not overwritten from RVAL"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -5497,7 +5502,7 @@ mod tests {
 
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 3)),
             "the sample's driver alarm (COMM/INVALID) must propagate on read"
         );
@@ -5545,7 +5550,7 @@ mod tests {
             "transport error must discard the averaged value (VAL stays stale), got {val}"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((10, 3)),
             "transport Timeout must map to TIMEOUT_ALARM/INVALID"
         );
@@ -5560,7 +5565,7 @@ mod tests {
         let outcome2 = ads.read(&mut rec).unwrap();
         assert!(outcome2.did_compute());
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -5599,7 +5604,7 @@ mod tests {
 
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 2)),
             "the sample's EPICS alarm (COMM/MAJOR) must win over the transport Timeout mapping"
         );
@@ -6423,7 +6428,7 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"HELLO".to_vec().into())),
+            Some(EpicsValue::CharArray(b"HELLO\0".to_vec().into())),
             "the record is bound and reads from the transport"
         );
     }
@@ -6696,7 +6701,7 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(7)));
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((3, 1)),
             "IoIntr read must surface the driver alarm carried by the ring entry"
         );
@@ -6714,7 +6719,11 @@ mod tests {
         }
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
-        assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
+        assert_eq!(
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
+            None,
+            "clean entry => no alarm"
+        );
     }
 
     /// A transport-error I/O Intr sample (`aux_status != Success`): C `processAi`
@@ -6734,7 +6743,7 @@ mod tests {
             .push_with_overflow(intr_entry(11, 0));
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(11)));
-        assert_eq!(ads.last_alarm(), None);
+        assert_eq!(ads.last_alarm().map(|a| (a.stat, a.sevr)), None);
         // Now a transport-error interrupt carrying a different value.
         ads.interrupt_fifo
             .lock()
@@ -6753,7 +6762,7 @@ mod tests {
             "transport error must keep the prior value (C return -1), not store 99"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((10, 3)),
             "transport Timeout maps to TIMEOUT_ALARM(10)/INVALID(3)"
         );
@@ -6780,7 +6789,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "input asynError default => READ_ALARM(1)/INVALID(3)"
         );
@@ -6808,7 +6817,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((2, 3)),
             "scalar output readback asynError default => WRITE_ALARM(2)/INVALID(3)"
         );
@@ -6835,7 +6844,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((7, 2)),
             "sample STATE_ALARM/MAJOR must win over the transport Timeout mapping"
         );
@@ -6870,7 +6879,7 @@ mod tests {
             "error value discarded"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 3)),
             "Disconnected maps to COMM_ALARM(9)/INVALID(3)"
         );
@@ -6882,7 +6891,7 @@ mod tests {
         // Second read: the clean entry is the value stored.
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(50)));
-        assert_eq!(ads.last_alarm(), None);
+        assert_eq!(ads.last_alarm().map(|a| (a.stat, a.sevr)), None);
     }
 
     /// Array dsets gate the same way (devAsynXXXArray.cpp:317 copies bptr/nord
@@ -6957,7 +6966,7 @@ mod tests {
             "transport error must keep the prior array (C devAsynXXXArray.cpp:317)"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "array dset uses READ_ALARM(1) even for aao output, not WRITE_ALARM"
         );
@@ -6982,7 +6991,7 @@ mod tests {
             "non-success device read must keep the prior VAL (C return -1), not store 5"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "the alarm is still raised: READ_ALARM(1)/INVALID(3)"
         );
@@ -7002,7 +7011,11 @@ mod tests {
             Some(EpicsValue::Long(5)),
             "a success device read stores the value"
         );
-        assert_eq!(ads.last_alarm(), None, "success read raises no alarm");
+        assert_eq!(
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
+            None,
+            "success read raises no alarm"
+        );
     }
 
     /// Init-time output readback (asyn:READBACK) seeds the record's value only on
@@ -7661,7 +7674,7 @@ mod tests {
             "asynFloat64 ai applies ASLO/AOFF: 5*2 + 1 = 11"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             None,
             "a well-typed sample raises no alarm"
         );
@@ -7679,7 +7692,7 @@ mod tests {
         }
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((READ_ALARM, AlarmSeverity::Invalid as u16)),
             "an Int32 sample on an asynFloat64 record is a TypeMismatch: READ/INVALID, \
              the same alarm the polled read raises"
@@ -8339,7 +8352,7 @@ mod tests {
         // Generic asynError on an output record -> WRITE_ALARM/INVALID (NOT
         // READ_ALARM, which the path used before the direction fix).
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -8755,7 +8768,7 @@ mod tests {
             "0-byte write then read: {seq:?}"
         );
         assert_eq!(
-            dev.last_alarm(),
+            dev.last_alarm().map(|a| (a.stat, a.sevr)),
             None,
             "a leading-NUL command must NOT raise LINK_ALARM (C does not reject it)"
         );
@@ -8826,7 +8839,7 @@ mod tests {
         // CharArray (matching the waveform CHAR shape, not a fixed String).
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec().into())),
+            Some(EpicsValue::CharArray(b"STATUS=OK\0".to_vec().into())),
             "reply must populate the lsi VAL"
         );
     }
@@ -8861,7 +8874,7 @@ mod tests {
 
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(reply.clone().into())),
+            Some(EpicsValue::CharArray([&reply[..], b"\0"].concat().into())),
             "all 50 reply bytes must land — SIZV is the bound, not MAX_STRING_SIZE"
         );
         assert_eq!(

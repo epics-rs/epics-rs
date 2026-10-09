@@ -1,0 +1,817 @@
+DBF_DOUBLE[8]:      1         5         3         7         2         8         
+4         6         
+DBF_DOUBLE[8]:      9         1         8         2         7         3         
+6         4         
+DBF_DOUBLE[8]:      0.5       1.5       2.5       3.5       4.5       5.5       
+6.5       7.5       
+DBF_DOUBLE[4]:      0.5       2.5       4.5       6.5       
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      1.5       3.5       5.5       7.5       
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      1         3         5         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[6]:      5         3         5.5       4.5       4.5       5.5       
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      2         7         3         6         4         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[2]:      8         3         
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      4         6         3         7         2         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      5         5         5         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      6         4         5         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      1         2         4         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      2         7         3         6         4         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      8         3         6         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      4         4         1         9         0         2         
+7         7         
+DBF_DOUBLE[8]:      1         2         3         4         5         6         
+7         8         
+DBF_DOUBLE[4]:      1         3         5         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      2         4         6         8         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      1.5       3.5       5.5       7.5       
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[6]:      2.25      2.75      1.75      6.25      2.25      3.75      
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      9         0         2         7         7         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      8         3         4         2         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      7         7         2         0         9         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      1         5         4         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      5         3         3.66666666667       7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      4         1         0         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      4         4         1         9         0         2         
+7         7         
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      6         4         2         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE:         3         
+DBF_DOUBLE:         1         
+DBF_DOUBLE:         4         
+DBF_DOUBLE:         1         
+DBF_DOUBLE:         5         
+DBF_DOUBLE:         9         
+DBF_DOUBLE:         2         
+DBF_DOUBLE[4]:      1         3         5         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      2         4         6         8         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      1.5       3.5       5.5       7.5       
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[6]:      2.25      2.75      1.75      6.25      2.25      3.75      
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      9         0         2         7         7         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      8         3         4         2         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      7         7         2         0         9         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      1         5         4         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      5         3         3.66666666667       7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      4         1         0         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      4         4         1         9         0         2         
+7         7         
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      6         4         2         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[2]:      1         1         
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         2         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_DOUBLE:         9         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_SHORT:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_STRING:         "N to 1 Average"    
+DBF_DOUBLE[4]:      1         3         5         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      2         4         6         8         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[6]:      2.25      2.75      1.75      6.25      2.25      3.75      
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      7         7         2         0         9         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      1         5         4         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      5         3         3.66666666667       7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      4         1         0         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      4         4         1         9         0         2         
+7         7         
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      6         4         2         7         
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[2]:      1         1         
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         2         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_DOUBLE:         9         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      2         4         6         8         10        12        
+14        16        
+DBF_DOUBLE[4]:      2         6         10        14        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      4         8         12        16        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      3         7         11        15        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[6]:      1.5       3         4.5       6         7.5       9         
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          6 = 0x6   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      8         10        12        14        16        
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[2]:      4         10        
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[5]:      16        14        12        10        8         
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[3]:      11        7         3         
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          3 = 0x3   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      7         4         10        15        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      7         2         8         14        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[8]:      2         4         6         8         10        12        
+14        16        
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          8 = 0x8   
+DBF_ULONG:          5 = 0x5   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[4]:      7         4         10        16        
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          4 = 0x4   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           8 = 0x8   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[2]:      1         1         
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          2 = 0x2   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         2         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_DOUBLE:         9         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          3 = 0x3   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   
+DBF_SHORT:          0 = 0x0   
+DBF_DOUBLE:         5         
+DBF_DOUBLE:         3         
+DBF_DOUBLE:         8         
+DBF_DOUBLE:         1         
+DBF_DOUBLE:         6         
+DBF_DOUBLE:         3         
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          1 = 0x1   
+DBF_ULONG:          2 = 0x2   
+DBF_DOUBLE:         1         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          1 = 0x1   
+DBF_DOUBLE:         8         
+DBF_LONG:           1 = 0x1   
+DBF_ULONG:          3 = 0x3   
+DBF_DOUBLE[0]: (empty)        
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_ULONG:          0 = 0x0   
+DBF_DOUBLE:         0         
+DBF_LONG:           0 = 0x0   
+DBF_ULONG:          2 = 0x2   

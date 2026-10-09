@@ -39,7 +39,9 @@ fn loaded(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> (Strin
     let inst = inst.read();
     let val = match inst.record.get_field("VAL") {
         Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-        Some(EpicsValue::CharArray(b)) => String::from_utf8_lossy(&b).into_owned(),
+        Some(EpicsValue::CharArray(b)) => {
+            String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
+        }
         other => panic!("{rec}.VAL: {other:?}"),
     };
     let len = match inst.record.get_field("LEN") {

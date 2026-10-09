@@ -58,7 +58,7 @@ async fn directive_shapes_match_softioc() {
         let len = db.get_pv(&format!("{rec}.LEN")).unwrap();
         let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap();
         let want_sevr = EpicsValue::Short(if invalid { 3 } else { 0 });
-        if got != want.as_bytes()
+        if got != [want.as_bytes(), b"\0"].concat()
             || len != EpicsValue::ULong(want.len() as u32 + 1)
             || sevr != want_sevr
         {

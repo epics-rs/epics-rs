@@ -1,8 +1,7 @@
 //! A double into an 8/16-bit DBR type is C's 32-bit convert then its low
 //! bits (`c_cast`), pinned to softIoc R7.0.10.1 through a DB link: waveform
 //! INP at FTVL CHAR/UCHAR/SHORT/USHORT and printf `%hhd %hhu %hd %hu`. Past
-//! 32 bits softIoc on x86-64 stores INT_MIN's low bits (0); the port
-//! saturates the 32-bit step as aarch64 does (5e9 `%hd` is -1).
+//! 32 bits softIoc on x86-64 stores INT_MIN's low bits, 0.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -18,10 +17,10 @@ const ROWS: &[(&str, i64, i64, i64, i64)] = &[
     ("-1.5", -1, 255, -1, 65535),
     ("200.7", -56, 200, 200, 200),
     ("0/0", 0, 0, 0, 0),
-    // Past 32 bits: aarch64 C, by the rule (x86-64 softIoc: 0 0 0 0).
-    ("1e10", -1, 255, -1, 65535),
-    ("5e9", -1, 255, -1, 65535),
-    ("1/0", -1, 255, -1, 65535),
+    ("1e10", 0, 0, 0, 0),
+    ("5e9", 0, 0, 0, 0),
+    ("2147483648", 0, 0, 0, 0),
+    ("1/0", 0, 0, 0, 0),
 ];
 
 const FTVL: [&str; 4] = ["CHAR", "UCHAR", "SHORT", "USHORT"];
@@ -63,7 +62,9 @@ async fn narrow_double_casts_match_softioc() {
                     .unwrap();
                 let got = match db.get_pv(&format!("{rec}.VAL")).unwrap() {
                     EpicsValue::CharArray(b) if rec.starts_with('P') => {
-                        String::from_utf8_lossy(&b).parse::<i64>().unwrap()
+                        String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default())
+                            .parse::<i64>()
+                            .unwrap()
                     }
                     EpicsValue::CharArray(b) => b[0] as i8 as i64,
                     EpicsValue::UCharArray(b) => b[0] as i64,

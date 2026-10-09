@@ -1,0 +1,33 @@
+dbpf SW 0
+dbpf SB.PROC 1
+dbpf SD.PROC 1
+dbpf SI.PROC 1
+dbpf SE.PROC 1
+dbpf SBN.PROC 1
+dbpf DS.PROC 1
+dbpf SW 1
+dbpf SB.PROC 1
+dbpf SD.PROC 1
+dbpf SI.PROC 1
+dbpf SE.PROC 1
+dbpf SBN.PROC 1
+dbpf DS.PROC 1
+dbpf CS.SIMM 1
+dbpf CS.SVAL abc
+dbpf CS.PROC 1
+epicsThreadSleep 1
+dbgf SB.SVAL
+dbgf SB.VAL
+dbgf SB.STAT
+dbgf SD.SVAL
+dbgf SD.VAL
+dbgf SI.SVAL
+dbgf SI.VAL
+dbgf SE.SVAL
+dbgf SE.VAL
+dbgf SBN.SVAL
+dbgf SBN.VAL
+dbgf DS.SVAL
+dbgf DS.VAL
+dbgf CS.SVAL
+dbgf CS.VAL

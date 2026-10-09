@@ -3956,6 +3956,10 @@ impl RecordInstance {
         {
             self.common.sevr = AlarmSeverity::from_u16(self.common.udfs as u16);
         }
+        // C `iocInit.c::doInitRecord0` binds `prec->dset` for every record
+        // (`:529`), including one whose `init_record` returns S_dev_noDSET
+        // below; an unbound class would still follow a later DTYP put.
+        self.common.dtyp.bind();
         // C `<rec>Record.c::init_record`'s FIRST statement, for the 26 record
         // types that make it: `if (!pdset) { recGblRecordError(S_dev_noDSET,
         // …); return S_dev_noDSET; }` (`aiRecord.c:105-110`,
@@ -6374,11 +6378,11 @@ impl RecordInstance {
             // name (asyn's "asynInt32", scaler-rs's "Asyn Scaler") back to
             // NoChange, leaving DTYP unset after a valid put.
             "DTYP" => match value {
-                EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned().into(),
+                EpicsValue::String(s) => self.common.dtyp.set_name(s.as_str_lossy()),
                 EpicsValue::Enum(i) => {
                     let merged = super::merged_device_menu(self.record.record_type());
                     match merged.get(i as usize) {
-                        Some(name) => self.common.dtyp = (*name).into(),
+                        Some(name) => self.common.dtyp.set_name(*name),
                         None => return Ok(CommonFieldPutResult::NoChange),
                     }
                 }
@@ -6905,8 +6909,8 @@ impl RecordInstance {
                 alarm_range,
                 aftc,
                 afvl,
+                self.common.time_last.get(),
                 self.common.time,
-                crate::runtime::general_time::get_current,
             );
             self.record.store_alarm_filter_value(new_afvl);
             // C re-maps through the SAME `switch (alarmRange)` the ladder
@@ -7753,6 +7757,7 @@ impl RecordInstance {
         }
         // Stamped before the alarm hooks, as `process_cycle` does (C
         // aiRecord.c:156/164).
+        let _begun = self.common.begin_stamp();
         self.common.time = crate::runtime::general_time::get_current();
 
         // Per-record alarm hook (C `checkAlarms()`).
@@ -9270,6 +9275,16 @@ mod device_menu_marking_tests {
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
         let inst = RecordInstance::new("X".into(), CalcRecord::default());
         assert_eq!(inst.dtyp_index(), 0);
+    }
+
+    #[test]
+    fn a_record_without_its_dset_is_still_bound_iocinit_529() {
+        let mut inst = RecordInstance::new("X".into(), AiRecord::default());
+        inst.common.dtyp = "asynInt32".into();
+        assert!(!inst.init_record_reaches_body());
+        inst.run_init_passes("X");
+        inst.common.dtyp.set_name("Soft Channel");
+        assert_eq!(inst.common.dtyp.soft(), None);
     }
 
     /// A downstream crate's registered device menu (asyn's) is merged AFTER the
@@ -11104,7 +11119,7 @@ mod aftc_filter_tests {
     #[test]
     fn disabled_when_aftc_le_zero() {
         // aftc=0 means filter disabled — pass-through.
-        let (out, afvl) = aftc_filter(2, 0.0, 0.0, at(0.0), || at(1.0));
+        let (out, afvl) = aftc_filter(2, 0.0, 0.0, at(0.0), at(1.0));
         assert_eq!(out, 2);
         assert_eq!(afvl, 0.0);
     }
@@ -11113,7 +11128,7 @@ mod aftc_filter_tests {
     fn initial_sample_seeds_state_unchanged_alarm() {
         // afvl=0 means first sample after enable — alarm passes through
         // and accumulator seeds with the raw severity.
-        let (out, afvl) = aftc_filter(2, 3.0, 0.0, at(0.0), || at(0.5));
+        let (out, afvl) = aftc_filter(2, 3.0, 0.0, at(0.0), at(0.5));
         assert_eq!(out, 2);
         assert_eq!(afvl, 2.0);
     }
@@ -11126,7 +11141,7 @@ mod aftc_filter_tests {
         // accumulator crosses the threshold.
         // Seed with afvl=0.01 (tiny prior, simulating "almost no alarm
         // yet"); the filter must keep alarm at 0 after one short tick.
-        let (out, afvl) = aftc_filter(2, 3.0, 0.01, at(0.0), || at(0.1));
+        let (out, afvl) = aftc_filter(2, 3.0, 0.01, at(0.0), at(0.1));
         assert_eq!(out, 0, "filter should suppress alarm rise on a 0.1s tick");
         assert!(afvl > 0.0 && afvl < 2.0);
     }
@@ -11134,7 +11149,7 @@ mod aftc_filter_tests {
     #[test]
     fn dt_zero_is_no_op() {
         // Two evaluations at the same instant produce no filter advance.
-        let (out, afvl) = aftc_filter(2, 3.0, 1.5, at(0.0), || at(0.0));
+        let (out, afvl) = aftc_filter(2, 3.0, 1.5, at(0.0), at(0.0));
         assert_eq!(out, 1); // floor(|1.5|) = 1
         assert_eq!(afvl, 1.5);
     }
@@ -11149,7 +11164,7 @@ mod aftc_filter_tests {
         let mut alarm = 0;
         for i in 1..=100 {
             let now = at(i as f64 * 0.05);
-            let (out, new_afvl) = aftc_filter(2, aftc, afvl, last, || now);
+            let (out, new_afvl) = aftc_filter(2, aftc, afvl, last, now);
             alarm = out;
             afvl = new_afvl;
             last = now;

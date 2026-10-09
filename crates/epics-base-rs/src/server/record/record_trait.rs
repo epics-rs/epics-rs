@@ -1770,7 +1770,7 @@ pub enum CommonFieldPutResult {
 /// `set_device_did_compute` framework-set-hook pattern: additive,
 /// no `process()` / `read()` signature change.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ProcessContext<'a> {
+pub struct ProcessContext {
     /// `dbCommon.udf` — value is undefined. C records check this at the
     /// top of `process()` (e.g. `epidRecord.c:195`).
     pub udf: bool,
@@ -1801,22 +1801,12 @@ pub struct ProcessContext<'a> {
     /// member is the device-provided value that helper returns verbatim on
     /// the `TSE == epicsTimeEventDeviceTime (-2)` branch.
     pub time: std::time::SystemTime,
-    /// `dbCommon.dtyp` — device-support type name. A record's
-    /// `process()` / pre-process hooks can branch on the DTYP to mirror
-    /// C device support that lives in a separate DSET (e.g. the epid
-    /// record's `devEpidSoftCallback` callback DSET drives the TRIG
-    /// readback link, whereas `devEpidSoft` does not).
-    ///
-    /// Borrowed from `dbCommon`, not owned: the context is built under the
-    /// record's own guard and handed straight to the hook, which is the whole
-    /// of its life. Owning it cost a `String` per build — two per cycle, three
-    /// for a record with device support — and the one reader
-    /// (`EpidRecord::set_process_context`) copies into its own cell anyway.
-    ///
-    /// `dbCommon.tsel` used to sit beside it and was read by nobody, so it is
-    /// not here; a hook that needs the TSEL text should take it the same way
-    /// this one does.
-    pub dtyp: &'a str,
+    /// The soft-channel dset the record was bound to at iocInit
+    /// ([`crate::server::device_support::Dtyp::soft`]), not the current DTYP
+    /// name: C keeps `prec->dset` from `initDevSup`, so a runtime DTYP put
+    /// changes nothing a hook may branch on (the epid record's
+    /// `devEpidSoftCallback` TRIG write).
+    pub soft: Option<crate::server::device_support::SoftDtyp>,
     /// The callback band `dbCommon.prio` selects for work this cycle defers —
     /// C `seqRecord.c:145-146`, which re-runs
     /// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of every

@@ -46,14 +46,14 @@ use std::time::SystemTime;
 /// is defined per record (`aiRecord.c:47`, `longinRecord.c:45`,
 /// `int64inRecord.c:44`, `mbbiRecord.c:44`).
 ///
-/// `time_now` is called only by the smoothing arm: C reads no clock in
-/// `checkAlarms`, so a disabled or seeding filter must not either.
+/// `t` is `time_new - time_last`, the record's two stamps
+/// (`epicsTimeDiffInSeconds(&prec->time, timeLast)`); C reads no clock here.
 pub fn aftc_filter(
     raw_alarm: u16,
     aftc: f64,
     afvl_in: f64,
     time_last: SystemTime,
-    time_now: impl FnOnce() -> SystemTime,
+    time_new: SystemTime,
 ) -> (u16, f64) {
     // C `aiRecord.c:47` — `#define THRESHOLD 0.6321` (≈ 1 - 1/e).
     const THRESHOLD: f64 = 0.6321;
@@ -73,7 +73,7 @@ pub fn aftc_filter(
     // C `aiRecord.c:364-377` — exponential smoothing of the integer
     // range with a signed contribution and a fold-back on the fractional
     // part.
-    let dt = time_now()
+    let dt = time_new
         .duration_since(time_last)
         .unwrap_or_default()
         .as_secs_f64();
@@ -97,25 +97,19 @@ pub fn aftc_filter(
 #[cfg(test)]
 mod tests {
     use super::aftc_filter;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
-    fn no_clock() -> SystemTime {
-        panic!("the clock was read")
+    fn at(secs: f64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
     }
 
+    /// softIocPVX: bi OSV=MAJOR AFTC=2 seeded at state 1, then state 0 after
+    /// a 3 s pause reads SEVR=MINOR AFVL=-0.8; with no gap it stays MAJOR.
     #[test]
-    fn a_disabled_or_seeding_filter_reads_no_clock_mbbirecord_c_319() {
-        assert_eq!(
-            aftc_filter(2, 0.0, 1.5, SystemTime::UNIX_EPOCH, no_clock),
-            (2, 0.0)
-        );
-        assert_eq!(
-            aftc_filter(2, -1.0, 0.0, SystemTime::UNIX_EPOCH, no_clock),
-            (2, 0.0)
-        );
-        assert_eq!(
-            aftc_filter(2, 3.0, 0.0, SystemTime::UNIX_EPOCH, no_clock),
-            (2, 2.0)
-        );
+    fn the_gap_is_the_two_stamps_birecord_c_259() {
+        let (sev, afvl) = aftc_filter(0, 2.0, 2.0, at(10.0), at(13.0));
+        assert_eq!(sev, 1);
+        assert!((afvl + 0.8).abs() < 1e-12, "{afvl}");
+        assert_eq!(aftc_filter(0, 2.0, 2.0, at(10.0), at(10.0)), (2, 2.0));
     }
 }

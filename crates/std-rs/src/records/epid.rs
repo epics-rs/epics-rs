@@ -247,16 +247,12 @@ pub struct EpidRecord {
     /// no field write, no monitor, and FBOP stays 0 so the next full cycle
     /// re-reads and seeds for real.
     pub(crate) outl_seed: Option<f64>,
-    /// Framework-owned `dbCommon.dtyp`, pushed by the framework via
-    /// [`Record::set_process_context`] before the input-link fetch.
-    /// C device support for the epid record lives in two distinct
-    /// DSETs — `devEpidSoft` (`devEpidSoft.c`, no TRIG handling) and
-    /// `devEpidSoftCallback` (`devEpidSoftCallback.c`, which drives the
-    /// TRIG readback link). [`Record::pre_input_link_actions`] checks
-    /// this via [`EpidRecord::is_async_callback_dtyp`] to emit the TRIG
-    /// write only when the callback DSET (`stdSupport.dbd:14`, DTYP
-    /// `"Async Soft Channel"`) is selected.
-    dtyp: String,
+    /// Whether the record runs `devEpidSoftCallback` (`devEpidSoftCallback.c`,
+    /// which drives the TRIG readback link) rather than `devEpidSoft`
+    /// (`devEpidSoft.c`, no TRIG). Taken from the dset bound at init through
+    /// [`Record::set_process_context`]; a runtime DTYP put leaves it, as C
+    /// leaves `prec->dset`.
+    async_callback: bool,
     /// Epid-owned `dbCommon.udf` projection, returned by
     /// [`Record::value_is_undefined`]. C `epidRecord.c` has
     /// `special = NULL` (line 105) — there is no operator UDF clear,
@@ -376,7 +372,7 @@ impl Default for EpidRecord {
             ctp: now,
             device_did_compute: false,
             inp_constant: false,
-            dtyp: String::new(),
+            async_callback: false,
             udf: true,
             compute_skipped: false,
             outl_write: false,
@@ -471,19 +467,11 @@ impl EpidRecord {
         self.ca_trig
     }
 
-    /// True when DTYP selects the `devEpidSoftCB` DSET — the only epid
+    /// True when the record is bound to `devEpidSoftCB`
+    /// (`stdSupport.dbd:14`, DTYP `"Async Soft Channel"`) — the only epid
     /// device support that touches the TRIG readback link.
-    ///
-    /// The string is the one `stdSupport.dbd:14` registers,
-    /// `device(epid,CONSTANT,devEpidSoftCB,"Async Soft Channel")`, and
-    /// is what a `.db` written against the C module sets (this crate
-    /// ships one: `db/async_pid_control.db`). epid deliberately reuses
-    /// base's soft-channel DTYP strings for record-specific behaviour,
-    /// so device selection is by the (record type, DTYP) pair and the
-    /// match belongs here in the epid body rather than in base's
-    /// `is_soft_dtyp`, which is keyed on DTYP alone.
     pub fn is_async_callback_dtyp(&self) -> bool {
-        self.dtyp == "Async Soft Channel"
+        self.async_callback
     }
 
     /// Owner setter for `EpidRecord::outl_write`. Only `do_pid` calls
@@ -1121,8 +1109,8 @@ impl Record for EpidRecord {
     /// captures it so `process()` can gate `do_pid` on it.
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.udf = ctx.udf;
-        self.dtyp.clear();
-        self.dtyp.push_str(ctx.dtyp);
+        self.async_callback =
+            ctx.soft == Some(epics_base_rs::server::device_support::SoftDtyp::Async);
     }
 
     /// C `devEpidSoftCallback.c:120-132` — the DB-type TRIG readback

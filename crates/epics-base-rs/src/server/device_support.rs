@@ -76,28 +76,72 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
 /// calls per cycle to re-derive an answer fixed when DTYP was written.
 ///
 /// The classification is stored WITH the name and the fields are private, so
-/// the two cannot disagree: [`Self::new`] is the only constructor and it is
-/// the only place [`classify_soft`] runs.
+/// the two cannot disagree before iocInit. [`Self::bind`] then fixes it: C's
+/// `dset` is chosen once from DTYP at init, and a later DTYP put stores the
+/// menu index without touching the running record's dset.
 #[derive(Clone, Debug)]
 pub struct Dtyp {
     name: String,
-    soft: Option<SoftDtyp>,
-    /// `soft` is `Plain` or `Async`: the classes whose input dset returns 2.
-    /// Stored with the class so the process cycle tests one byte.
+    class: DsetClass,
+    /// `soft()` is `Plain` or `Async`: the classes whose input dset returns 2.
+    /// Stored with the class so the process cycle tests one byte; written only
+    /// by [`Self::set_class`].
     skips_input_convert: bool,
+}
+
+/// Which soft dset a record runs, and whether DTYP may still change it.
+#[derive(Clone, Copy, Debug)]
+enum DsetClass {
+    /// Before init: the class the current name would bind.
+    Named(Option<SoftDtyp>),
+    /// After init: the class the record was bound to.
+    Bound(Option<SoftDtyp>),
 }
 
 impl Dtyp {
     /// Classify `name` once and keep the answer beside it.
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
-        let soft = classify_soft(&name);
-        let skips_input_convert = matches!(soft, Some(SoftDtyp::Plain | SoftDtyp::Async));
-        Self {
+        let mut dtyp = Self {
             name,
-            soft,
-            skips_input_convert,
+            class: DsetClass::Named(None),
+            skips_input_convert: false,
+        };
+        dtyp.set_class(DsetClass::Named(classify_soft(&dtyp.name)));
+        dtyp
+    }
+
+    /// The one writer of `class`, and so of the byte derived from it.
+    fn set_class(&mut self, class: DsetClass) {
+        self.class = class;
+        self.skips_input_convert = matches!(self.soft(), Some(SoftDtyp::Plain | SoftDtyp::Async));
+    }
+
+    /// A put to DTYP. Before [`Self::bind`] the class follows the name; after
+    /// it, only the name changes.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+        if let DsetClass::Named(_) = self.class {
+            self.set_class(DsetClass::Named(classify_soft(&self.name)));
         }
+    }
+
+    /// Fix the class at init, as C's `dbInitRecord` fixes `prec->dset`.
+    pub(crate) fn bind(&mut self) -> Option<SoftDtyp> {
+        let soft = self.soft();
+        self.set_class(DsetClass::Bound(soft));
+        soft
+    }
+
+    /// C `dbPutFieldLink`'s device-link rebind (`dbAccess.c:1127-1199`): an
+    /// INP/OUT put sets `prec->dset` from the CURRENT DTYP and calls the new
+    /// dset's `add_record`, never its `init_record`. So the class follows the
+    /// name again and stays bound; the caller must not run
+    /// [`crate::server::record::Record::init_soft_dset`] for it.
+    pub fn rebind(&mut self) -> Option<SoftDtyp> {
+        let soft = classify_soft(&self.name);
+        self.class = DsetClass::Bound(soft);
+        soft
     }
 
     /// The DTYP text, as a client put it or the `.db` declared it.
@@ -105,10 +149,12 @@ impl Dtyp {
         &self.name
     }
 
-    /// The soft-channel flavour this DTYP names — [`classify_soft`]'s answer,
-    /// taken when the name was set.
+    /// The soft-channel flavour the record runs — [`classify_soft`]'s answer
+    /// for the name, frozen by [`Self::bind`].
     pub fn soft(&self) -> Option<SoftDtyp> {
-        self.soft
+        match self.class {
+            DsetClass::Named(soft) | DsetClass::Bound(soft) => soft,
+        }
     }
 
     /// `Plain` or `Async` soft channel — the input dset returns 2, never
@@ -120,7 +166,7 @@ impl Dtyp {
 
     /// [`is_soft_dtyp`] for a DTYP that already carries its class.
     pub fn is_soft(&self) -> bool {
-        self.soft.is_some()
+        self.soft().is_some()
     }
 }
 
@@ -742,6 +788,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// of init outcome so the record is addressable; a failed init leaves
 /// the alarm set.
 pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceSupport>) {
+    instance.common.dtyp.bind();
     attach_device_to_record(instance, dev);
     init_device_support(instance);
 }
@@ -1013,6 +1060,21 @@ mod tests {
     /// `Dtyp` — the whole point of keeping the two together is that a reader
     /// may trust `soft()` without re-deriving it.
     #[test]
+    fn a_device_link_put_rebinds_to_the_current_dtyp_dbaccess_1128() {
+        let mut dtyp = Dtyp::new("Soft Channel");
+        assert_eq!(dtyp.bind(), Some(SoftDtyp::Plain));
+        dtyp.set_name("Raw Soft Channel");
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Plain));
+        assert_eq!(dtyp.rebind(), Some(SoftDtyp::Raw));
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
+        // Still bound: the next DTYP put alone changes nothing again.
+        dtyp.set_name("Soft Channel");
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
+        dtyp.set_name("asynInt32");
+        assert_eq!(dtyp.rebind(), None);
+    }
+
+    #[test]
     fn a_dtyp_carries_the_class_its_name_classifies_to() {
         let names = [
             "",
@@ -1032,6 +1094,11 @@ mod tests {
                 assert_eq!(built.as_str(), name);
                 assert_eq!(built.soft(), classify_soft(name), "{name:?}");
                 assert_eq!(built.is_soft(), is_soft_dtyp(name), "{name:?}");
+                assert_eq!(
+                    built.skips_input_convert(),
+                    matches!(classify_soft(name), Some(SoftDtyp::Plain | SoftDtyp::Async)),
+                    "{name:?}"
+                );
                 assert_eq!(built.clone().soft(), classify_soft(name), "{name:?} clone");
             }
         }

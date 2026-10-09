@@ -5710,6 +5710,10 @@ impl PvDatabase {
                 // reads this cycle's TIME. `Record::alarms_before_stamp` names
                 // the calc-family exception.
                 //
+                // C `process()` takes `timeLast` before `readValue` writes any
+                // device time; here the device time lands just below.
+                let begun = instance.common.begin_stamp();
+
                 // Device support timestamp override
                 if !is_soft {
                     let (dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
@@ -5812,11 +5816,18 @@ impl PvDatabase {
                 if !plan.output_stage {
                     apply_device_alarm(instance, is_soft);
                 }
-                let stamps_here = !restamps_after && !skips_ts_undef;
-                if stamps_here && !plan.alarms_before_stamp {
-                    let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
-                }
+                // The stamp after `checkAlarms` takes the same `begun`: TIME_LAST
+                // was set before the device time landed.
+                let stamp_late =
+                    match (!restamps_after && !skips_ts_undef, plan.alarms_before_stamp) {
+                        (true, false) => {
+                            let inst = &mut *instance;
+                            tsel.stamp_begun(begun, &inst.name, &mut inst.common, is_soft);
+                            None
+                        }
+                        (true, true) => Some(begun),
+                        (false, _) => None,
+                    };
 
                 // Per-record alarm hook — record-type-specific STATE / COS
                 // / limit / SOFT alarms (C `checkAlarms()`). Records that
@@ -5839,9 +5850,9 @@ impl PvDatabase {
                 }
 
                 // calcout, scalcout and acalcout stamp after `checkAlarms`.
-                if stamps_here && plan.alarms_before_stamp {
+                if let Some(begun) = stamp_late {
                     let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                    tsel.stamp_begun(begun, &inst.name, &mut inst.common, is_soft);
                 }
 
                 // IVOA gate severity for a redirected SIMM output. C decides
@@ -7372,6 +7383,10 @@ impl PvDatabase {
                 // is no device to take an alarm, time stamp or user tag from.
                 let is_soft = instance.common.dtyp.is_soft();
 
+                // C `process()` takes `timeLast` before `readValue` writes any
+                // device time; here the device time lands just below.
+                let begun = instance.common.begin_stamp();
+
                 // Device support timestamp override. C device support writes
                 // `prec->utag` directly during `read()` — the event-system
                 // pulse-id path, since `epicsTimeStamp` carries no tag. Adopt the
@@ -7396,11 +7411,13 @@ impl PvDatabase {
                 // aiRecord.c:156/164), and BEFORE the output stage — C
                 // `aoRecord.c:190` stamps the record ahead of `writeValue` so a
                 // downstream TSEL fetch sees this cycle's time.
-                let alarms_first = instance.record.alarms_before_stamp();
-                if !alarms_first {
+                let stamp_late = if instance.record.alarms_before_stamp() {
+                    Some(begun)
+                } else {
                     let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
-                }
+                    tsel.stamp_begun(begun, &inst.name, &mut inst.common, is_soft);
+                    None
+                };
 
                 // Per-record alarm hook (C `checkAlarms()`).
                 {
@@ -7410,9 +7427,9 @@ impl PvDatabase {
 
                 // Evaluate alarms
                 instance.evaluate_alarms();
-                if alarms_first {
+                if let Some(begun) = stamp_late {
                     let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                    tsel.stamp_begun(begun, &inst.name, &mut inst.common, is_soft);
                 }
 
                 // Device support alarm override.

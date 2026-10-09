@@ -159,6 +159,21 @@ mod tsel_stamp {
         /// type.
         #[inline(always)]
         pub(crate) fn stamp(self, name: &str, common: &mut CommonFields, is_soft: bool) {
+            let begun = common.begin_stamp();
+            self.stamp_begun(begun, name, common, is_soft);
+        }
+
+        /// [`Self::stamp`] for a cycle that opened its stamp earlier, so a
+        /// device or INP-source time could land in between as C's `readValue`
+        /// does after `process()` took `timeLast`.
+        #[inline(always)]
+        pub(crate) fn stamp_begun(
+            self,
+            _begun: crate::server::record::StampBegun,
+            name: &str,
+            common: &mut CommonFields,
+            is_soft: bool,
+        ) {
             match self {
                 TselStamp::Time(time, utag) => {
                     common.time = time;

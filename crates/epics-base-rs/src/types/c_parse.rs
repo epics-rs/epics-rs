@@ -744,19 +744,24 @@ fn strtod(s: &str) -> Option<(f64, Literal)> {
         Some(b'+') => (1.0, &t[1..]),
         _ => (1.0, t),
     };
-    let lower = body.to_ascii_lowercase();
+    let has_word = |word: &str| {
+        body.get(..word.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(word))
+    };
 
-    if lower.starts_with("infinity") || lower.starts_with("inf") {
+    if has_word("inf") {
         return Some((sign * f64::INFINITY, Literal::NonFinite));
     }
-    if lower.starts_with("nan") {
+    if has_word("nan") {
         // `strtod` gives NaN the sign it was written with; NaN has no ordering,
         // so only the sign bit differs and no consumer of a record field reads it.
         return Some((f64::NAN, Literal::NonFinite));
     }
-    if lower.starts_with("0x") {
-        let (v, significant) = hex_float(&lower[2..])?;
-        return Some((sign * v, Literal::Finite { significant }));
+    // `0x` with no hex digit after it is the decimal `0` and trailing text.
+    if has_word("0x") {
+        if let Some((v, significant)) = hex_float(&body[2..]) {
+            return Some((sign * v, Literal::Finite { significant }));
+        }
     }
 
     // Decimal: the longest prefix Rust's own parser accepts, which is the same
@@ -841,7 +846,7 @@ fn hex_float(s: &str) -> Option<(f64, bool)> {
     if digits == 0 {
         return None;
     }
-    if i < b.len() && b[i] == b'p' {
+    if i < b.len() && (b[i] | 0x20) == b'p' {
         let mut j = i + 1;
         let neg = b.get(j) == Some(&b'-');
         if b.get(j) == Some(&b'+') || neg {
@@ -873,6 +878,38 @@ mod tests {
             // `None` for both would let a store-skip pass as a refusal.
             Ok(Converted::Unchanged) | Err(_) => None,
         }
+    }
+
+    #[test]
+    fn strtod_words_and_hex_are_case_blind_epicsstdlib_150() {
+        // softIoc R7.0.10, `caput H <s>` into an ao VAL.
+        for (s, v) in [("0X1P4", 16.0), ("0x1p4", 16.0), ("0x1.8P1", 3.0)] {
+            assert_eq!(
+                put(NumericField::Double, s),
+                Some(EpicsValue::Double(v)),
+                "{s}"
+            );
+        }
+        assert_eq!(
+            put(NumericField::Double, "INF"),
+            Some(EpicsValue::Double(f64::INFINITY))
+        );
+        assert_eq!(
+            put(NumericField::Double, "-Inf"),
+            Some(EpicsValue::Double(f64::NEG_INFINITY))
+        );
+        assert!(
+            matches!(put(NumericField::Double, "NAN"), Some(EpicsValue::Double(v)) if v.is_nan())
+        );
+    }
+
+    #[test]
+    fn a_0x_without_hex_digits_reads_as_zero_epicsstdlib_150() {
+        // softIoc R7.0.10: `caput H 0XG` stores 0.
+        assert_eq!(
+            put(NumericField::Double, "0XG"),
+            Some(EpicsValue::Double(0.0))
+        );
     }
 
     /// The array row — same parse, no empty-string carve-out.

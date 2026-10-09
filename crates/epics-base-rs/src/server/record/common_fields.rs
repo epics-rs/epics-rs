@@ -43,6 +43,27 @@ impl Clone for BkptFlag {
     }
 }
 
+/// See [`CommonFields::time_last`]. Outside the crate it can only be read or
+/// reset to the default, so `begin_stamp` stays its one writer.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeLast(SystemTime);
+
+impl TimeLast {
+    pub fn get(self) -> SystemTime {
+        self.0
+    }
+}
+
+impl Default for TimeLast {
+    fn default() -> Self {
+        TimeLast(crate::runtime::general_time::epics_epoch())
+    }
+}
+
+/// Proof that [`CommonFields::begin_stamp`] ran for this cycle.
+#[must_use]
+pub(crate) struct StampBegun(());
+
 /// Common fields shared by all records.
 #[derive(Clone, Debug)]
 pub struct CommonFields {
@@ -117,6 +138,10 @@ pub struct CommonFields {
     pub dtyp: crate::server::device_support::Dtyp,
     // Timestamp
     pub time: SystemTime,
+    /// C `process()`'s local `timeLast`: [`Self::time`] as it stood when this
+    /// cycle's stamp began, before any device-supplied time. The AFTC filter
+    /// measures its gap from here.
+    pub time_last: TimeLast,
     pub tse: i16,
     pub tsel: String,
     /// Time-tag — C `dbCommon.dbd.pod` `field(UTAG,DBF_UINT64)`. A
@@ -214,7 +239,7 @@ impl CommonFields {
     /// Build a [`ProcessContext`](super::record_trait::ProcessContext)
     /// snapshot of the framework-owned state a record's `process()` or
     /// device support's `read()` needs to observe during the cycle.
-    pub fn process_context(&self) -> super::record_trait::ProcessContext<'_> {
+    pub fn process_context(&self) -> super::record_trait::ProcessContext {
         super::record_trait::ProcessContext {
             udf: self.udf != 0,
             udfs: AlarmSeverity::from_u16(self.udfs as u16),
@@ -222,9 +247,17 @@ impl CommonFields {
             phas: self.phas,
             tse: self.tse,
             time: self.time,
-            dtyp: self.dtyp.as_str(),
+            soft: self.dtyp.soft(),
             callback_priority: self.callback_priority(),
         }
+    }
+
+    /// Open this cycle's stamp: the only writer of [`Self::time_last`], and
+    /// the only source of the token `TselStamp::stamp_begun` takes.
+    #[inline(always)]
+    pub(crate) fn begin_stamp(&mut self) -> StampBegun {
+        self.time_last = TimeLast(self.time);
+        StampBegun(())
     }
 
     /// The callback band this record's `PRIO` selects — C
@@ -275,6 +308,7 @@ impl Default for CommonFields {
             // to the record's raw EPICS seconds). See
             // [`crate::runtime::general_time::epics_epoch`].
             time: crate::runtime::general_time::epics_epoch(),
+            time_last: TimeLast::default(),
             tse: 0,
             tsel: String::new(),
             utag: 0,

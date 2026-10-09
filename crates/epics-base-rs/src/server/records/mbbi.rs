@@ -710,8 +710,8 @@ impl Record for MbbiRecord {
             raw_sev as u16,
             self.aftc,
             self.afvl,
+            common.time_last.get(),
             common.time,
-            crate::runtime::general_time::get_current,
         );
         self.afvl = new_afvl;
         let sev = AlarmSeverity::from_u16(filtered);

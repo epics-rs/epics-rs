@@ -213,8 +213,8 @@ impl Record for BiRecord {
             state_sev as u16,
             self.aftc,
             self.afvl,
+            common.time_last.get(),
             common.time,
-            crate::runtime::general_time::get_current,
         );
         self.afvl = new_afvl;
         // C biRecord.c:272-273 — `recGblSetSevr(prec, STATE_ALARM, asev)`.

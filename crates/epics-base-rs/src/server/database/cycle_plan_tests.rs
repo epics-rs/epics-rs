@@ -184,20 +184,22 @@ const SCENARIOS: &[Scenario] = &[
         ..BASE
     },
     Scenario {
-        name: "DB link INP, DTYP switched to Raw Soft Channel and back",
-        arms: "DDGGGDD",
+        // The dset is bound at init (`iocInit.c:529`): the DTYP puts change
+        // the name only, so every cycle runs the Raw Soft dset.
+        name: "DB link INP, Raw Soft Channel at load, DTYP put at runtime",
+        arms: "GGGGGGG",
         db: with_fixtures!(
             r#"record(ai, "S") { field(VAL, "1.5") }
-               record(ai, "T") { field(INP, "S NPP") field(DTYP, "Soft Channel") field(FLNK, "F")
+               record(ai, "T") { field(INP, "S NPP") field(DTYP, "Raw Soft Channel") field(FLNK, "F")
                 field(ASLO, "2") field(AOFF, "1") }"#
         ),
         steps: &[
             &[],
             &[("S", "2.7")],
-            &[("T.DTYP", "Raw Soft Channel")],
+            &[("T.DTYP", "Soft Channel")],
             &[("S", "3.7")],
             &[],
-            &[("T.DTYP", "Soft Channel")],
+            &[("T.DTYP", "Raw Soft Channel")],
             &[("S", "4.7")],
         ],
         ..BASE

@@ -273,7 +273,7 @@ fn test_field_list() {
 // ============================================================
 use epics_base_rs::server::record::{EPICS_TIME_EVENT_DEVICE_TIME, ProcessContext};
 
-fn ctx_with_tse(tse: i16) -> ProcessContext<'static> {
+fn ctx_with_tse(tse: i16) -> ProcessContext {
     ProcessContext {
         udf: false,
         udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
@@ -281,7 +281,7 @@ fn ctx_with_tse(tse: i16) -> ProcessContext<'static> {
         phas: 0,
         tse,
         time: std::time::SystemTime::UNIX_EPOCH,
-        dtyp: "",
+        soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }

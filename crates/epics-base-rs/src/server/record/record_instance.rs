@@ -10228,14 +10228,8 @@ mod metadata_cache_tests {
         // `process` leaves VAL at 0 (already 0), settling the monitor gate.
         let _ = inst.process_local().unwrap();
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
-        // status 0 -> C `if (!status)` drives every OUT link (aSub's
-        // `multi_output_links` gate reads the cycle status); a bad-sub status
-        // would suppress all 21.
-        assert_eq!(
-            inst.record.multi_output_links().len(),
-            21,
-            "empty-SNAM do_sub status must be 0, not S_db_BadSub"
-        );
+        // VAL is the status; with no OUTx wired there is no pair to drive.
+        assert!(inst.record.multi_output_links().is_empty());
 
         // A client caput lands on VAL (DBF_LONG, not process-passive: it posts
         // but does not itself process, leaving VAL non-zero — exactly how the

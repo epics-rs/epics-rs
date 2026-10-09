@@ -22,12 +22,29 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
     PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
-/// C `dbGetLinkLS`'s char arm (`dbLink.c:507-522`): a CHAR/UCHAR source is
+/// C `dbGetLinkLS` (`dbLink.c:497-525`) landing a link read in a SIZV buffer.
+/// Any non-char source is a DBR_STRING read through a `MAX_STRING_SIZE`
+/// buffer, so it keeps at most 39 bytes whatever SIZV is. `Ok(None)` is the
+/// empty char read, which leaves VAL; `Err` is a value no link read delivers.
+pub(crate) fn link_ls_read(value: EpicsValue, sizv: u16) -> Result<Option<PvString>, EpicsValue> {
+    Ok(match value {
+        EpicsValue::String(s) => Some(truncate_bytes(
+            s,
+            MAX_STRING_SIZE.min(sizv as usize).saturating_sub(1),
+        )),
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => link_ls_chars(&b, sizv),
+        EpicsValue::Char(b) | EpicsValue::UChar(b) => {
+            Some(link_ls_chars(&[b], sizv).unwrap_or_default())
+        }
+        other => return Err(other),
+    })
+}
+
+/// `dbGetLinkLS`'s char arm (`dbLink.c:507-522`): a CHAR/UCHAR source is
 /// read as up to SIZV raw elements and `pbuffer[--len] = 0` then overwrites
 /// the last one read, so "hij" with no NUL lands as "hi". `None` is the
-/// empty read, which writes `pbuffer[-1]` and leaves VAL. Its DBR_STRING
-/// arm is the plain cut to SIZV - 1.
-pub(crate) fn link_ls_chars(read: &[u8], sizv: u16) -> Option<PvString> {
+/// empty read, which writes `pbuffer[-1]` and leaves VAL.
+fn link_ls_chars(read: &[u8], sizv: u16) -> Option<PvString> {
     let n = read.len().min(sizv as usize);
     let text = &read[..n.checked_sub(1)?];
     let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
@@ -96,25 +113,6 @@ impl LsiRecord {
             rec.len = (rec.val.len() + 1) as u32;
         }
         rec
-    }
-
-    /// The char-source read of `dbGetLinkLS`; any other read is the VAL put.
-    /// Kept out of [`Record::soft_input_read`] so the DBR_STRING read does
-    /// not pay this match's dispatch.
-    fn land_link_chars(&mut self, value: EpicsValue) -> CaResult<()> {
-        match value {
-            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
-                if let Some(v) = link_ls_chars(&b, self.sizv) {
-                    self.val = v;
-                }
-            }
-            EpicsValue::Char(b) | EpicsValue::UChar(b) => {
-                self.val = link_ls_chars(&[b], self.sizv).unwrap_or_default()
-            }
-            other => return self.set_val(other),
-        }
-        self.len = (self.val.len() + 1) as u32;
-        Ok(())
     }
 
     /// VAL's byte capacity: SIZV less the NUL. VAL never exceeds it — every
@@ -287,18 +285,20 @@ impl Record for LsiRecord {
 
     /// `devLsiSoft.c::readLocked` is `dbGetLinkLS(pinp, prec->val, prec->sizv,
     /// &prec->len)`: the read (DBR_STRING, or a char source's bytes up to
-    /// SIZV) lands in VAL cut to SIZV, and LEN is `strlen + 1`. The read is
+    /// SIZV) lands in VAL through [`link_ls_read`], and LEN is `strlen + 1`. The read is
     /// already VAL's text, so it skips the generic put's shape lookups and
     /// its 40-byte DBR_STRING put cap, which C's char-source read does not have.
     fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
-        match value {
-            Some(EpicsValue::String(s)) => {
-                self.val = truncate_bytes(s, self.capacity());
+        let Some(value) = value else { return Ok(()) };
+        match link_ls_read(value, self.sizv) {
+            Ok(read) => {
+                if let Some(v) = read {
+                    self.val = v;
+                }
                 self.len = (self.val.len() + 1) as u32;
                 Ok(())
             }
-            Some(other) => self.land_link_chars(other),
-            None => Ok(()),
+            Err(other) => self.set_val(other),
         }
     }
 

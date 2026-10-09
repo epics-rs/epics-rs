@@ -351,6 +351,10 @@ mod ioc {
     fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
         let macros = HashMap::new();
         let mut builder = IocBuilder::new();
+        #[cfg(feature = "bench-subroutines")]
+        {
+            builder = builder.register_subroutine("benchNoop", |_r| Ok(0));
+        }
         if db_files.is_empty() {
             println!(
                 "realtime-pva-ioc: no database named on the boot command line; \

@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs, ProcessOutcome,
-    Record,
+    CyclePostMask, FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs,
+    ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -106,10 +106,26 @@ pub struct ASubRecord {
     inp: [String; NUM_ARGS],
     /// Input values `A..U` — native typed via `fta`.
     pub a: [EpicsValue; NUM_ARGS],
-    /// Output values `VALA..VALU` — native typed via `ftva`.
-    pub vala: [EpicsValue; NUM_ARGS],
-    /// Output links `OUTA..OUTU`.
-    pub out: [String; NUM_ARGS],
+    /// Output values `VALA..VALU` — native typed via `ftva`. Private with
+    /// `neva`: [`Self::put_field`] is their one writer, and it sets `out_dirty`.
+    vala: [EpicsValue; NUM_ARGS],
+    /// `OVLA..OVLU` / `ONVA..ONVU`: the `vala`/`neva` that `monitor()` last
+    /// posted (`aSubRecord.c:422-438`), seeded from them by the init tail.
+    ovla: [EpicsValue; NUM_ARGS],
+    onva: [i32; NUM_ARGS],
+    /// Bit `i`: `monitor()` posts `VALx` (`val_marks`) / `NEVx` (`nev_marks`)
+    /// this cycle, drained by [`Record::take_cycle_posted_fields`].
+    val_marks: u32,
+    nev_marks: u32,
+    /// Bit `i`: `vala[i]`/`neva[i]` written since the last ON CHANGE
+    /// `monitor()`, which left every clean channel equal to its `OVLx`.
+    out_dirty: u32,
+    /// Output links `OUTA..OUTU`. Private with `wired_outs`: [`Self::put_field`]
+    /// is their one writer.
+    out: [String; NUM_ARGS],
+    /// The `(OUTx, VALx)` pairs whose `OUTx` is set, in channel order: what
+    /// C's push loop does work for, `dbPutLink` on an unset link being a no-op.
+    wired_outs: Vec<(&'static str, &'static str)>,
     /// Input element-type menu `FTA..FTU` (`menuFtype`).
     fta: [i16; NUM_ARGS],
     /// Output element-type menu `FTVA..FTVU` (`menuFtype`).
@@ -121,7 +137,7 @@ pub struct ASubRecord {
     /// Input elements-used `NEA..NEU`.
     pub nea: [i32; NUM_ARGS],
     /// Output elements-used `NEVA..NEVU`.
-    pub neva: [i32; NUM_ARGS],
+    neva: [i32; NUM_ARGS],
     /// Bad-return severity (`menuAlarmSevr`, default NO_ALARM). C
     /// `aSubRecord.c::do_sub` raises `SOFT_ALARM` at this severity when the
     /// subroutine returns a negative status (applied by the framework's
@@ -190,7 +206,13 @@ impl Default for ASubRecord {
             inp: std::array::from_fn(|_| String::new()),
             a: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
             vala: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
+            ovla: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
+            onva: [1; NUM_ARGS],
+            val_marks: 0,
+            nev_marks: 0,
+            out_dirty: 0,
             out: std::array::from_fn(|_| String::new()),
+            wired_outs: Vec::new(),
             fta: [FTYPE_DOUBLE; NUM_ARGS],
             ftva: [FTYPE_DOUBLE; NUM_ARGS],
             noa: [1; NUM_ARGS],
@@ -216,42 +238,44 @@ impl Default for ASubRecord {
 /// leaves at 0.
 const SUBROUTINE_NOT_RUN: i64 = -1;
 
-/// Parse a per-channel field name into `(prefix, channel index)`.
-/// E.g. `"INPC"` -> `("INP", 2)`, `"VALU"` -> `("VAL", 20)`,
-/// `"M"` -> `("", 12)`.
-fn parse_channel(name: &str) -> Option<(&'static str, usize)> {
-    const PREFIXES: [&str; 7] = ["INP", "OUT", "VAL", "FTV", "FT", "NOV", "NO"];
-    // Single-letter input value field A..U.
-    if name.len() == 1 {
-        let c = name.chars().next().unwrap();
-        return SUFFIX.iter().position(|&s| s == c).map(|i| ("", i));
-    }
-    // NEA..NEU and NEVA..NEVU.
-    if let Some(rest) = name.strip_prefix("NEV") {
-        if rest.len() == 1 {
-            let c = rest.chars().next().unwrap();
-            return SUFFIX.iter().position(|&s| s == c).map(|i| ("NEV", i));
-        }
+/// The per-channel field family a name such as `INPC` belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chan {
+    /// Input value `A..U`.
+    Value,
+    Inp,
+    Out,
+    Val,
+    Ft,
+    Ftv,
+    No,
+    Nov,
+    Ne,
+    Nev,
+}
+
+/// Parse a per-channel field name into `(family, channel index)`.
+/// E.g. `"INPC"` -> `(Inp, 2)`, `"VALU"` -> `(Val, 20)`, `"M"` -> `(Value, 12)`.
+fn parse_channel(name: &str) -> Option<(Chan, usize)> {
+    let (&last, head) = name.as_bytes().split_last()?;
+    let idx = usize::from(last.wrapping_sub(b'A'));
+    if idx >= NUM_ARGS {
         return None;
     }
-    if let Some(rest) = name.strip_prefix("NE") {
-        if rest.len() == 1 {
-            let c = rest.chars().next().unwrap();
-            return SUFFIX.iter().position(|&s| s == c).map(|i| ("NE", i));
-        }
-        return None;
-    }
-    for prefix in PREFIXES {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            if rest.len() == 1 {
-                let c = rest.chars().next().unwrap();
-                if let Some(i) = SUFFIX.iter().position(|&s| s == c) {
-                    return Some((prefix, i));
-                }
-            }
-        }
-    }
-    None
+    let chan = match head {
+        b"" => Chan::Value,
+        b"INP" => Chan::Inp,
+        b"OUT" => Chan::Out,
+        b"VAL" => Chan::Val,
+        b"FT" => Chan::Ft,
+        b"FTV" => Chan::Ftv,
+        b"NO" => Chan::No,
+        b"NOV" => Chan::Nov,
+        b"NE" => Chan::Ne,
+        b"NEV" => Chan::Nev,
+        _ => return None,
+    };
+    Some((chan, idx))
 }
 
 /// The `menuFtype` of an `FTx` index, with C `initFields`'s clamp: an index
@@ -403,27 +427,127 @@ fn channel_is_scalar(v: &EpicsValue) -> bool {
     }
 }
 
+impl ASubRecord {
+    /// The ON CHANGE arm of C `monitor()` (`aSubRecord.c:422-438`) over the
+    /// channels written since it last ran.
+    #[inline(never)]
+    fn mark_changed_outputs(&mut self) {
+        let mut dirty = std::mem::take(&mut self.out_dirty);
+        while dirty != 0 {
+            let i = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            let nev = self.neva[i];
+            if nev != self.onva[i] || !same_prefix(&self.ovla[i], &self.vala[i], nev) {
+                self.ovla[i] = self.vala[i].clone();
+                self.val_marks |= 1 << i;
+                if nev != self.onva[i] {
+                    self.onva[i] = nev;
+                    self.nev_marks |= 1 << i;
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn take_output_marks(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let val_marks = std::mem::take(&mut self.val_marks);
+        let nev_marks = std::mem::take(&mut self.nev_marks);
+        let fields = asub_output_event_fields();
+        let mut marks = Vec::new();
+        for i in 0..NUM_ARGS {
+            if val_marks & 1 << i != 0 {
+                marks.push((fields[2 * i], CyclePostMask::MonitorValueLog));
+            }
+            if nev_marks & 1 << i != 0 {
+                marks.push((fields[2 * i + 1], CyclePostMask::MonitorValueLog));
+            }
+        }
+        marks
+    }
+}
+
+/// C's `memcmp(povl, pval, dbValueSize(ftv) * nev)` (`aSubRecord.c:432`): the
+/// first `nev` elements compared as bytes, so a NaN equals its own bits.
+fn same_prefix(old: &EpicsValue, new: &EpicsValue, nev: i32) -> bool {
+    fn head<T>(v: &[T], n: usize) -> &[T] {
+        &v[..n.min(v.len())]
+    }
+    fn bits<T: Copy, K: PartialEq>(a: &[T], b: &[T], n: usize, key: fn(T) -> K) -> bool {
+        head(a, n)
+            .iter()
+            .map(|v| key(*v))
+            .eq(head(b, n).iter().map(|v| key(*v)))
+    }
+    let n = nev.max(0) as usize;
+    if n == 0 {
+        return true;
+    }
+    use EpicsValue as V;
+    match (old, new) {
+        (V::Double(a), V::Double(b)) => a.to_bits() == b.to_bits(),
+        (V::Float(a), V::Float(b)) => a.to_bits() == b.to_bits(),
+        (V::DoubleArray(a), V::DoubleArray(b)) => bits(a, b, n, f64::to_bits),
+        (V::FloatArray(a), V::FloatArray(b)) => bits(a, b, n, f32::to_bits),
+        (V::CharArray(a), V::CharArray(b)) => head(a, n) == head(b, n),
+        (V::UCharArray(a), V::UCharArray(b)) => head(a, n) == head(b, n),
+        (V::ShortArray(a), V::ShortArray(b)) => head(a, n) == head(b, n),
+        (V::UShortArray(a), V::UShortArray(b)) => head(a, n) == head(b, n),
+        (V::LongArray(a), V::LongArray(b)) => head(a, n) == head(b, n),
+        (V::ULongArray(a), V::ULongArray(b)) => head(a, n) == head(b, n),
+        (V::Int64Array(a), V::Int64Array(b)) => head(a, n) == head(b, n),
+        (V::UInt64Array(a), V::UInt64Array(b)) => head(a, n) == head(b, n),
+        (V::StringArray(a), V::StringArray(b)) => head(a, n) == head(b, n),
+        (a, b) => a == b,
+    }
+}
+
 impl Record for ASubRecord {
     fn acts_before_process(&self) -> bool {
         false
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::CYCLE_POSTED
     }
 
     fn has_array_monitor_post(&self) -> bool {
         false
     }
 
-    /// `aSubRecord.c:414-417`: `if (prec->val != prec->oval) { db_post_events(...);
-    /// prec->oval = prec->val; }`.
+    /// C `monitor()` (`aSubRecord.c:405-451`), entered once per cycle: VAL
+    /// against OVAL (`:414-417`), then under `EFLG=ON CHANGE` each `VALx`
+    /// against the `OVLx` it last posted, not against the cycle's start
+    /// (`:422-438`): a client put to `VALx` moves neither copy, so the next
+    /// cycle posts it again.
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.val != self.oval;
         if changed {
             self.oval = self.val;
         }
+        if self.out_dirty != 0 && self.eflg == EFLG_ON_CHANGE {
+            self.mark_changed_outputs();
+        }
         Some(changed)
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        if self.val_marks == 0 {
+            return Vec::new();
+        }
+        self.take_output_marks()
+    }
+
+    /// `VALx`/`NEVx` post from `monitor()`'s own `OVLx` test (or EFLG=ALWAYS),
+    /// never from the framework's change detection.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        asub_output_event_fields()
+    }
+
+    fn init_record_tail(&mut self) {
+        // C `init_record`'s tail (`aSubRecord.c:164-171`).
+        self.ovla = self.vala.clone();
+        self.onva = self.neva;
+        self.out_dirty = 0;
     }
 
     fn alarm_alone_posts_value(&self) -> bool {
@@ -483,18 +607,18 @@ impl Record for ASubRecord {
     /// resizes it, so the capacity belongs to the declaration and only the
     /// served count moves.
     fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        let (prefix, idx) = parse_channel(field)?;
-        match prefix {
-            "" => Some(self.noa[idx].max(0) as u32),
-            "VAL" => Some(self.nova[idx].max(0) as u32),
+        let (chan, idx) = parse_channel(field)?;
+        match chan {
+            Chan::Value => Some(self.noa[idx].max(0) as u32),
+            Chan::Val => Some(self.nova[idx].max(0) as u32),
             _ => None,
         }
     }
 
     fn dbaddr_stored_as_scalar(&self, field: &str) -> bool {
         match parse_channel(field) {
-            Some(("", idx)) => !self.a[idx].is_array(),
-            Some(("VAL", idx)) => channel_is_scalar(&self.vala[idx]),
+            Some((Chan::Value, idx)) => !self.a[idx].is_array(),
+            Some((Chan::Val, idx)) => channel_is_scalar(&self.vala[idx]),
             _ => false,
         }
     }
@@ -511,33 +635,35 @@ impl Record for ASubRecord {
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
-        match name {
-            "VAL" => return Some(EpicsValue::Long(self.val)),
-            "OVAL" => return Some(EpicsValue::Long(self.oval)),
-            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
-            "INAM" => return Some(EpicsValue::String(self.inam.clone())),
-            "BRSV" => return Some(EpicsValue::Short(self.brsv)),
-            "PREC" => return Some(EpicsValue::Short(self.prec)),
-            "EFLG" => return Some(EpicsValue::Short(self.eflg)),
-            "LFLG" => return Some(EpicsValue::Short(self.lflg)),
-            "SUBL" => return Some(EpicsValue::String(self.subl.clone().into())),
-            "ONAM" => return Some(EpicsValue::String(self.onam.clone())),
-            _ => {}
+        // Channels first: no scalar name below parses as one, and the OUT
+        // multi-output dispatch asks for all 21 `OUTx` every cycle.
+        if let Some((chan, idx)) = parse_channel(name) {
+            return Some(match chan {
+                Chan::Value => self.a[idx].clone(),
+                Chan::Inp => EpicsValue::String(self.inp[idx].clone().into()),
+                Chan::Val => channel_get(&self.vala[idx]),
+                Chan::Out => EpicsValue::String(self.out[idx].clone().into()),
+                Chan::Ft => EpicsValue::Short(self.fta[idx]),
+                Chan::Ftv => EpicsValue::Short(self.ftva[idx]),
+                Chan::No => EpicsValue::Long(self.noa[idx]),
+                Chan::Nov => EpicsValue::Long(self.nova[idx]),
+                Chan::Ne => EpicsValue::Long(self.nea[idx]),
+                Chan::Nev => EpicsValue::Long(self.neva[idx]),
+            });
         }
-        let (prefix, idx) = parse_channel(name)?;
-        Some(match prefix {
-            "" => self.a[idx].clone(), // input value A..U
-            "INP" => EpicsValue::String(self.inp[idx].clone().into()),
-            "VAL" => channel_get(&self.vala[idx]),
-            "OUT" => EpicsValue::String(self.out[idx].clone().into()),
-            "FT" => EpicsValue::Short(self.fta[idx]),
-            "FTV" => EpicsValue::Short(self.ftva[idx]),
-            "NO" => EpicsValue::Long(self.noa[idx]),
-            "NOV" => EpicsValue::Long(self.nova[idx]),
-            "NE" => EpicsValue::Long(self.nea[idx]),
-            "NEV" => EpicsValue::Long(self.neva[idx]),
-            _ => return None,
-        })
+        match name {
+            "VAL" => Some(EpicsValue::Long(self.val)),
+            "OVAL" => Some(EpicsValue::Long(self.oval)),
+            "SNAM" => Some(EpicsValue::String(self.snam.clone())),
+            "INAM" => Some(EpicsValue::String(self.inam.clone())),
+            "BRSV" => Some(EpicsValue::Short(self.brsv)),
+            "PREC" => Some(EpicsValue::Short(self.prec)),
+            "EFLG" => Some(EpicsValue::Short(self.eflg)),
+            "LFLG" => Some(EpicsValue::Short(self.lflg)),
+            "SUBL" => Some(EpicsValue::String(self.subl.clone().into())),
+            "ONAM" => Some(EpicsValue::String(self.onam.clone())),
+            _ => None,
+        }
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -628,31 +754,40 @@ impl Record for ASubRecord {
             }
             _ => {}
         }
-        let (prefix, idx) =
+        let (chan, idx) =
             parse_channel(name).ok_or_else(|| CaError::FieldNotFound(name.to_string()))?;
-        match prefix {
+        if matches!(chan, Chan::Val | Chan::Ftv | Chan::Nov | Chan::Nev) {
+            self.out_dirty |= 1 << idx;
+        }
+        match chan {
             // Input value A..U — shaped to the channel's declared FTx/NOx.
             // C `fetch_values` lands every link value in the FTx-typed
             // NOx-element buffer (aSubRecord.c:278-288); a direct put takes
             // the same conversion through `dbPut` into that buffer. NEx
             // tracks the elements actually delivered.
-            "" => match shape_channel_value(value, self.fta[idx], self.noa[idx]) {
+            Chan::Value => match shape_channel_value(value, self.fta[idx], self.noa[idx]) {
                 ChannelDelivery::Delivered { value, count } => {
                     self.nea[idx] = count;
                     self.a[idx] = value;
                 }
                 ChannelDelivery::Empty => self.nea[idx] = 0,
             },
-            "INP" | "OUT" => {
+            Chan::Inp | Chan::Out => {
                 let s = match value {
                     EpicsValue::String(s) => s.as_str_lossy().into_owned(),
                     _ => return Err(CaError::TypeMismatch(name.into())),
                 };
-                if prefix == "INP" {
+                if chan == Chan::Inp {
                     self.inp[idx] = s;
                     self.links_generation += 1;
                 } else {
                     self.out[idx] = s;
+                    self.wired_outs = asub_output_links()
+                        .iter()
+                        .zip(&self.out)
+                        .filter(|(_, out)| !out.is_empty())
+                        .map(|(pair, _)| *pair)
+                        .collect();
                 }
             }
             // Output value VALA..VALU — shaped to the channel's declared
@@ -661,14 +796,14 @@ impl Record for ASubRecord {
             // shape can leave `do_sub`, and the OUT push reads that buffer
             // (`dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], ...)`,
             // aSubRecord.c:237-239). NEVx tracks the elements written.
-            "VAL" => match shape_channel_value(value, self.ftva[idx], self.nova[idx]) {
+            Chan::Val => match shape_channel_value(value, self.ftva[idx], self.nova[idx]) {
                 ChannelDelivery::Delivered { value, count } => {
                     self.neva[idx] = count;
                     self.vala[idx] = value;
                 }
                 ChannelDelivery::Empty => self.neva[idx] = 0,
             },
-            "FT" | "FTV" | "NO" | "NOV" | "NE" | "NEV" => {
+            Chan::Ft | Chan::Ftv | Chan::No | Chan::Nov | Chan::Ne | Chan::Nev => {
                 let v = match value {
                     EpicsValue::Short(v) => v as i32,
                     EpicsValue::Long(v) => v,
@@ -677,7 +812,7 @@ impl Record for ASubRecord {
                         .map(|f| f as i32)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?,
                 };
-                match prefix {
+                match chan {
                     // FTx/NOx and FTVx/NOVx declare their cell's element type
                     // and capacity: C `initFields` clamps them (out-of-menu
                     // FTx -> CHAR at aSubRecord.c:186-187, NOx 0 -> 1 at
@@ -686,34 +821,33 @@ impl Record for ASubRecord {
                     // both the input and the output triple. All four are
                     // SPC_NOMOD, so these puts are the load path —
                     // re-deriving the cell here is that allocation.
-                    "FT" => {
+                    Chan::Ft => {
                         self.fta[idx] = channel_ftype(v as i16).index();
                         self.links_generation += 1;
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
                         self.nea[idx] = self.noa[idx].max(1);
                     }
-                    "NO" => {
+                    Chan::No => {
                         self.noa[idx] = v.max(1);
                         self.links_generation += 1;
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
                         self.nea[idx] = self.noa[idx];
                     }
-                    "FTV" => {
+                    Chan::Ftv => {
                         self.ftva[idx] = channel_ftype(v as i16).index();
                         self.vala[idx] = channel_default(self.ftva[idx], self.nova[idx]);
                         self.neva[idx] = self.nova[idx].max(1);
                     }
-                    "NOV" => {
+                    Chan::Nov => {
                         self.nova[idx] = v.max(1);
                         self.vala[idx] = channel_default(self.ftva[idx], self.nova[idx]);
                         self.neva[idx] = self.nova[idx];
                     }
-                    "NE" => self.nea[idx] = v,
-                    "NEV" => self.neva[idx] = v,
+                    Chan::Ne => self.nea[idx] = v,
+                    Chan::Nev => self.neva[idx] = v,
                     _ => unreachable!(),
                 }
             }
-            _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         Ok(())
     }
@@ -834,7 +968,7 @@ impl Record for ASubRecord {
     /// the source is, so no read resolves the source first.
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
         let Some(idx) = parse_channel(link_field)
-            .filter(|(prefix, _)| *prefix == "INP")
+            .filter(|&(chan, _)| chan == Chan::Inp)
             .map(|(_, idx)| idx)
         else {
             return InputLinkRequest::As(LinkReadAs::Native);
@@ -880,16 +1014,15 @@ impl Record for ASubRecord {
     /// record. `status` is 0 only when `fetch_values` succeeded AND `do_sub` ran
     /// and returned 0, so a failed input link, an unresolved SNAM and a
     /// subroutine that reported failure each suppress every push — the gate is
-    /// the status itself, not a per-link condition. The framework's generic
-    /// `multi_output_links` dispatch skips an empty link name, which is C's
-    /// `dbPutLink` on an unset link (a no-op).
+    /// the status itself, not a per-link condition. Only the wired pairs are
+    /// lent: C's `dbPutLink` on an unset link is a no-op.
     fn declares_multi_output_links(&self) -> bool {
         true
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if self.sub_status == 0 {
-            asub_output_links()
+            &self.wired_outs
         } else {
             &[]
         }
@@ -899,6 +1032,33 @@ impl Record for ASubRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only wired OUTx pairs are driven, rewired by a put to OUTx and
+    /// withheld while the cycle status is non-zero.
+    #[test]
+    fn multi_output_links_lends_the_wired_pairs() {
+        let mut rec = ASubRecord::default();
+        let out = |rec: &mut ASubRecord, link: &str, text: &str| {
+            rec.put_field(link, EpicsValue::String(text.into()))
+                .unwrap();
+        };
+        out(&mut rec, "OUTC", "X");
+        out(&mut rec, "OUTA", "Y");
+        assert!(rec.multi_output_links().is_empty(), "never ran");
+        rec.set_subroutine_status(0);
+        assert_eq!(
+            rec.multi_output_links(),
+            [("OUTA", "VALA"), ("OUTC", "VALC")]
+        );
+        out(&mut rec, "OUTA", "");
+        out(&mut rec, "OUTU", "Z");
+        assert_eq!(
+            rec.multi_output_links(),
+            [("OUTC", "VALC"), ("OUTU", "VALU")]
+        );
+        rec.set_subroutine_status(-1);
+        assert!(rec.multi_output_links().is_empty());
+    }
 
     /// input/output channels M..U exist (C `NUM_ARGS == 21`).
     #[test]

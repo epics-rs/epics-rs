@@ -85,8 +85,14 @@ pub struct TransformRecord {
     /// recompile anything — C picks the new macro up at the next CLCx compile
     /// (`special`, `:682`), and so does [`Self::recompile`].
     cmts: [String; NUM_CHANNELS],
-    pub inp_links: [String; NUM_CHANNELS],
-    pub out_links: [String; NUM_CHANNELS],
+    /// INPA..INPP / OUTA..OUTP. Private with `inp_linked` / `out_linked`:
+    /// [`Self::put_field`] is their one writer.
+    inp_links: [String; NUM_CHANNELS],
+    out_links: [String; NUM_CHANNELS],
+    /// Bit `i` set when `inp_links[i]` is not C's CONSTANT ([`Self::no_inlink`]).
+    inp_linked: u16,
+    /// Bit `i` set when `out_links[i]` is not C's CONSTANT ([`Self::no_outlink`]).
+    out_linked: u16,
     pub copt: i16, // calc option: 0=Conditional (calc only an unlinked, unchanged channel), 1=Always. Gates CALC-eval, NOT the OUTx write.
     pub ivla: i16, // 0=Ignore error, 1=Do Nothing
     pub prec: i16,
@@ -147,6 +153,8 @@ impl Default for TransformRecord {
             cmts: Default::default(),
             inp_links: Default::default(),
             out_links: Default::default(),
+            inp_linked: 0,
+            out_linked: 0,
             copt: 0,
             ivla: 0,
             prec: 0,
@@ -301,13 +309,22 @@ impl TransformRecord {
 
     /// C's `no_inlink` (`transformRecord.c:571`).
     fn no_inlink(&self, i: usize) -> bool {
-        Self::link_is_constant(&parse_link_v2(&self.inp_links[i]))
+        self.inp_linked & 1 << i == 0
     }
 
     /// C's `if (plink->type != CONSTANT)` on OUTx (`transformRecord.c:606`),
     /// negated. An OUT field parses under the OUT modifier mask.
     fn no_outlink(&self, i: usize) -> bool {
-        Self::link_is_constant(&parse_output_link_v2(&self.out_links[i]))
+        self.out_linked & 1 << i == 0
+    }
+
+    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read.
+    fn set_linked(mask: &mut u16, i: usize, parsed: &ParsedLink) {
+        if Self::link_is_constant(parsed) {
+            *mask &= !(1 << i);
+        } else {
+            *mask |= 1 << i;
+        }
     }
 
     /// C's `same` test, `transformRecord.c:573-575`:
@@ -896,6 +913,8 @@ impl Record for TransformRecord {
             match value {
                 EpicsValue::String(s) => {
                     self.inp_links[idx] = s.as_str_lossy().into_owned();
+                    let parsed = parse_link_v2(&self.inp_links[idx]);
+                    Self::set_linked(&mut self.inp_linked, idx, &parsed);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
@@ -905,6 +924,8 @@ impl Record for TransformRecord {
             match value {
                 EpicsValue::String(s) => {
                     self.out_links[idx] = s.as_str_lossy().into_owned();
+                    let parsed = parse_output_link_v2(&self.out_links[idx]);
+                    Self::set_linked(&mut self.out_linked, idx, &parsed);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
@@ -1224,6 +1245,46 @@ mod tests {
         assert!(!TransformRecord::is_link_status_field("IVLA"));
         assert!(!TransformRecord::is_link_status_field("LAV"));
         assert!(!TransformRecord::is_link_status_field("INPA"));
+    }
+
+    /// `no_inlink`/`no_outlink` follow every INPx/OUTx put: in Conditional
+    /// mode a constant-seeded channel recalcs each cycle and a linked one does
+    /// not (C `transformRecord.c:571`), and a runtime put repoints it.
+    #[test]
+    fn link_put_repoints_no_inlink_and_no_outlink() {
+        let mut rec = TransformRecord::new();
+        rec.put_field("INPA", EpicsValue::String("2".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("CLCA", EpicsValue::String("A+1".into()))
+            .unwrap();
+        ioc_init(&mut rec);
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
+
+        rec.put_field("INPA", EpicsValue::String("SRC:PV".into()))
+            .unwrap();
+        assert!(!rec.no_inlink(0));
+        rec.process().unwrap();
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::Double(3.0)),
+            "a linked, unchanged channel does not recalc"
+        );
+
+        rec.put_field("INPA", EpicsValue::String(String::new().into()))
+            .unwrap();
+        assert!(rec.no_inlink(0));
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(4.0)));
+
+        assert!(rec.no_outlink(1));
+        rec.put_field("OUTB", EpicsValue::String("SINK:PV".into()))
+            .unwrap();
+        assert!(!rec.no_outlink(1));
+        rec.put_field("OUTB", EpicsValue::String("5".into()))
+            .unwrap();
+        assert!(rec.no_outlink(1));
     }
 
     /// VERS is the code-version constant (C `transformRecord.c:92 #define

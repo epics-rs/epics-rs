@@ -864,7 +864,13 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
         0,
         "the step never entered the waiting set (C never sets `waiting` here)"
     );
-    // ... and the record says so: WERRn is the misconfig report.
+    // WERRn is written by C's `checkLinks` alone, which neither init (every
+    // link is local) nor a start runs: oracleIoc reads 0 here. A `WAIT1` put
+    // schedules it, and then the dropped wait is reported.
+    assert_eq!(read_short(db.get_pv("SSEQ_WDB.WERR1").ok()), 0);
+    db.put_pv("SSEQ_WDB.WAIT1", EpicsValue::Short(1))
+        .await
+        .unwrap();
     poll_i16(
         &db,
         "SSEQ_WDB.WERR1",
@@ -1214,4 +1220,44 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     )
     .await;
     poll_short(&db, "SSEQ_NB.WTG1", 0, "step 1 cleared at finish").await;
+}
+
+/// `WERRn` follows C's `checkLinks` schedule, pinned against oracleIoc: a
+/// record whose links are all local never runs it at init (0), a `LNKn` put
+/// naming a PV does (1), and an EXT_NC link anywhere keeps it armed from init
+/// (`LINKS_NOT_OK`, sseqRecord.c:237/252), so the local wait reads 1.
+#[epics_macros_rs::epics_test]
+async fn sseq_werr_follows_c_check_links_schedule() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_WE_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let local = || {
+        let mut sseq = SseqRecord::new();
+        sseq.put_field("LNK1", EpicsValue::String("SSEQ_WE_TGT".into()))
+            .unwrap();
+        sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
+        sseq
+    };
+    db.add_record("SSEQ_WE_L", Box::new(local())).await.unwrap();
+    let mut ext = local();
+    ext.put_field("LNK2", EpicsValue::String("SSEQ_WE_NOPE CA".into()))
+        .unwrap();
+    db.add_record("SSEQ_WE_X", Box::new(ext)).await.unwrap();
+
+    poll_i16(&db, "SSEQ_WE_L.LNK1V", 2, "LNK1 classifies Local PV").await;
+    poll_i16(&db, "SSEQ_WE_X.WERR1", 1, "LINKS_NOT_OK runs checkLinks").await;
+    assert_eq!(read_short(db.get_pv("SSEQ_WE_L.WERR1").ok()), 0);
+
+    db.put_record_field_from_ca(
+        "SSEQ_WE_L",
+        "LNK1",
+        EpicsValue::String("SSEQ_WE_TGT2".into()),
+    )
+    .await
+    .unwrap();
+    poll_i16(&db, "SSEQ_WE_L.WERR1", 1, "a LNK1 put runs checkLinks").await;
 }

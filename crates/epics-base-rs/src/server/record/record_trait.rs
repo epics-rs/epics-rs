@@ -3740,6 +3740,13 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The software event a process of this record posts — C `event`'s
+    /// `postEvent(prec->epvt)` (`eventRecord.c:120`), the handle settled at
+    /// the VAL write. `None` posts nothing.
+    fn software_event(&self) -> Option<&crate::server::records::event::EventHandle> {
+        None
+    }
+
     /// Fields the record posts itself via an event-driven, individually
     /// masked path rather than the generic change-detection loop. The
     /// framework excludes these from that loop so they are neither
@@ -6735,7 +6742,7 @@ mod tests {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
             "compress" | "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
-            "acalcout" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
+            "acalcout" | "aSub" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
             "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,
             _ => CycleHooks::NONE,

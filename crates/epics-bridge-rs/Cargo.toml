@@ -53,6 +53,9 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # accessor has to be compiled by the same flag that compiles the reporter
 # thread which prints it.
 bringup-probes = ["epics-pva-rs?/bringup-probes"]
+# `realtime-pva-ioc` registers the do-nothing aSub subroutine `benchNoop` that
+# the record benches' x-asub-link.db names, as softIoc loads it from a .so.
+bench-subroutines = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is

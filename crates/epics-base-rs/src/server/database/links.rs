@@ -3737,19 +3737,9 @@ impl PvDatabase {
     /// No-op for any other record type, or when `VAL` is empty /
     /// resolves to event 0 (`eventNameToHandle` returns NULL).
     pub(crate) fn dispatch_event_record(&self, rec: InFrame<'_>) {
-        let event_name = {
-            let instance = rec.read();
-            if !posts_software_event(instance.record.record_type()) {
-                return;
-            }
-            match instance.record.get_field("VAL") {
-                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                _ => return,
-            }
-        };
-        if event_name.trim().is_empty() {
+        let Some(event) = rec.read().record.software_event().cloned() else {
             return;
-        }
+        };
         // C `postEvent` queues callbacks on the scan ring buffer —
         // the event-scanned records run on a separate callback thread,
         // NOT recursively inside this process cycle. Spawn the routed
@@ -3764,7 +3754,7 @@ impl PvDatabase {
         crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
             async move {
-                db.post_event_named(&event_name).await;
+                db.post_event_named(event.name()).await;
             },
         );
     }

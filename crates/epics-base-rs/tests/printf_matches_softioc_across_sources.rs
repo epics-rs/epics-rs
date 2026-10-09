@@ -48,11 +48,10 @@ const ROWS: [Row; 14] = [
     ("BI", [(b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"1", false), (b"\x01", false), (b"1.000000", false), (b"1.000000", false), (b"on", false), (b"\x01", false)]),
 ];
 
-/// Cells links.rs owns, left out: `%ls` of a non-char source is C's
-/// one-element DBR_CHAR convert, which `char_bytes_as_string` refuses; `%s`
-/// of an ai at PREC 0 is C's DBR_STRING at precision, `dbr_string_of`.
+/// The cell links.rs owns, left out: `%s` of an ai at PREC 0 is C's
+/// DBR_STRING at precision ("3" for 2.7), `dbr_string_of`.
 fn routed(src: &str, conv: &str) -> bool {
-    conv == "%ls" || (src == "A27" && conv == "%s")
+    src == "A27" && conv == "%s"
 }
 
 async fn diverging(keep: impl Fn(&str, &str) -> bool) -> Vec<String> {

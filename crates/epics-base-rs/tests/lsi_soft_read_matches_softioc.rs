@@ -2,7 +2,9 @@
 //! `dbGetLinkLS`): a CHAR waveform source copies up to SIZV bytes, a string
 //! source reads DBR_STRING (39 bytes), and LEN is `strlen + 1`. A VAL put on
 //! the Passive record processes it (VAL is pp) and the INP read replaces it.
-//! UDF is pinned by `soft_input_udf_follows_the_device`.
+//! UDF is pinned by `soft_input_udf_follows_the_device`. A long-string
+//! source (lso VAL) is `DBF_STRING` to `dbGetLinkLS` (`lsoRecord.c:184`), so
+//! it reads as DBR_STRING: 39 bytes, LEN 40.
 //!
 //! ```text
 //! lso W(61 chars) -> WF CHAR   L  SIZV 80 LEN 62   L2 SIZV 20 LEN 20
@@ -157,4 +159,85 @@ record(lso, "O100") { field(DOL, "W") field(OMSL, "closed_loop") field(SIZV, "10
         .unwrap();
     process(&db, "O100").await;
     assert_eq!(num(&db, "O100.LEN"), 71.0, "O100");
+}
+
+/// A non-char source goes through `dbGetLinkLS`'s DBR_STRING arm, a
+/// `MAX_STRING_SIZE` buffer, whatever the reader's SIZV. softIoc R7.0.10.1,
+/// lsi sources (SIZV 100) written with `caput -S S60.VAL$`:
+///
+/// ```text
+/// source 60 / 39 / 40 chars -> lso DOL, lsi INP (SIZV 100): 39 chars LEN 40
+/// source 60 chars -> lso DOL, lsi INP (SIZV 20): 19 chars LEN 20
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_string_source_keeps_39_bytes_like_softioc() {
+    const DB: &str = r#"
+record(lsi, "S60") { field(SIZV, "100") }
+record(lsi, "S39") { field(SIZV, "100") }
+record(lsi, "S40") { field(SIZV, "100") }
+record(lso, "O60") { field(SIZV, "100") field(OMSL, "closed_loop") field(DOL, "S60") }
+record(lso, "O39") { field(SIZV, "100") field(OMSL, "closed_loop") field(DOL, "S39") }
+record(lso, "O40") { field(SIZV, "100") field(OMSL, "closed_loop") field(DOL, "S40") }
+record(lsi, "I60") { field(SIZV, "100") field(INP, "S60") }
+record(lsi, "I39") { field(SIZV, "100") field(INP, "S39") }
+record(lsi, "I40") { field(SIZV, "100") field(INP, "S40") }
+record(lsi, "I20") { field(SIZV, "20") field(INP, "S60") }
+record(lso, "O20") { field(SIZV, "20") field(OMSL, "closed_loop") field(DOL, "S60") }
+"#;
+    let db = IocBuilder::new()
+        .db_string(DB, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    let x: String = (0..60).map(|i| (b'a' + i % 26) as char).collect();
+    for (rec, n) in [("S60", 60), ("S39", 39), ("S40", 40)] {
+        db.put_record_field_from_ca(
+            rec,
+            "VAL",
+            EpicsValue::CharArray((&x.as_bytes()[..n]).into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text(&db, rec), x[..n], "{rec}");
+    }
+    let rows = [
+        ("O60", 39),
+        ("O39", 39),
+        ("O40", 39),
+        ("I60", 39),
+        ("I39", 39),
+        ("I40", 39),
+        ("I20", 19),
+        ("O20", 19),
+    ];
+    for (rec, n) in rows {
+        process(&db, rec).await;
+        let got = (text(&db, rec), num(&db, &format!("{rec}.LEN")));
+        assert_eq!(got, (x[..n].to_string(), n as f64 + 1.0), "{rec}");
+    }
+}
+
+#[epics_macros_rs::epics_test]
+async fn lsi_reads_a_long_string_source_as_dbr_string() {
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(lso, "W") { field(SIZV, "100") }
+record(lsi, "L4") { field(SIZV, "80") field(INP, "W") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    db.put_record_field_from_ca("W", "VAL", EpicsValue::CharArray(X.as_bytes().into()))
+        .await
+        .unwrap();
+    process(&db, "L4").await;
+    assert_eq!(num(&db, "L4.LEN"), 40.0, "L4.LEN");
+    assert_eq!(text(&db, "L4"), X[..39], "L4.VAL");
 }

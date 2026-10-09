@@ -144,17 +144,10 @@ impl Record for LsoRecord {
     /// The closed-loop DOL read lands through `dbGetLinkLS`
     /// (`lsoRecord.c:114`), not the 40-byte DBR_STRING put of a VAL write.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        match value {
-            EpicsValue::String(s) => self.val = truncate_bytes(s, self.capacity()),
-            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
-                if let Some(v) = super::lsi::link_ls_chars(&b, self.sizv) {
-                    self.val = v;
-                }
-            }
-            EpicsValue::Char(b) | EpicsValue::UChar(b) => {
-                self.val = super::lsi::link_ls_chars(&[b], self.sizv).unwrap_or_default()
-            }
-            other => return self.put_field_internal("VAL", other),
+        match super::lsi::link_ls_read(value, self.sizv) {
+            Ok(Some(v)) => self.val = v,
+            Ok(None) => {}
+            Err(other) => return self.put_field_internal("VAL", other),
         }
         self.len = (self.val.len() + 1) as u32;
         Ok(())

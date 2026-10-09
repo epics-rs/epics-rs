@@ -162,3 +162,26 @@ async fn r9_77_calc_val_still_logs_on_adel_crossing() {
         event.mask
     );
 }
+
+/// A numeric event name ("1") is still a string with no deadband: C reposts it
+/// on every cycle. The port parsed it as a number for the MDEL test and posted
+/// only when it moved (softIoc camonitor: 6 updates in 3 s at `.5 second`, the
+/// port 1).
+#[epics_macros_rs::epics_test]
+async fn r9_77_numeric_event_name_reposts_each_cycle() {
+    let db = PvDatabase::new();
+    db.add_record("EV", Box::new(EventRecord::new("1")))
+        .await
+        .unwrap();
+    let mut rx = subscribe_val(&db, "EV", DbFieldType::String).await;
+
+    process(&db, "EV").await;
+    rx.try_recv().expect("first cycle posts");
+
+    process(&db, "EV").await;
+
+    let event = rx
+        .try_recv()
+        .expect("an unchanged numeric event name posts again, as C's unguarded post does");
+    assert_eq!(event.mask, EventMask::VALUE, "got {:?}", event.mask);
+}

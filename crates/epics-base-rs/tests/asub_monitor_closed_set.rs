@@ -249,3 +249,30 @@ async fn asub_output_pairs_follow_the_eflg_switch() {
         );
     }
 }
+
+/// `EFLG=ON CHANGE` compares `VALx` against the `OVLx` its last post left, not
+/// against the cycle's start (`aSubRecord.c:432`), pinned against oracleIoc:
+/// after `caput VALA 1.5` the next cycle posts 1.5 again, and after
+/// `caput 2.5; caput 1.5` the cycle is silent, because OVLA already holds 1.5.
+#[epics_macros_rs::epics_test]
+async fn asub_on_change_compares_vala_against_ovla() {
+    let db = PvDatabase::new();
+    let mut y = ASubRecord::default();
+    y.put_field("FTVA", EpicsValue::Short(FT_DOUBLE)).unwrap();
+    db.add_record("Y", Box::new(y)).await.unwrap();
+    let mut rx = subscribe(&db, "Y", "VALA", 1);
+    let count = |rx: &mut EventReader| std::iter::from_fn(|| rx.try_recv().ok()).count();
+    let put = |v: f64| db.put_record_field_from_ca("Y", "VALA", EpicsValue::Double(v));
+
+    put(1.5).await.unwrap();
+    assert_eq!(count(&mut rx), 1, "the put posts");
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 1, "VALA 1.5 != OVLA 0: the cycle posts");
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 0, "OVLA caught up: silent");
+    put(2.5).await.unwrap();
+    put(1.5).await.unwrap();
+    assert_eq!(count(&mut rx), 2, "each put posts");
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 0, "VALA 1.5 == OVLA 1.5: silent");
+}

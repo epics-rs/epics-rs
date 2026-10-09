@@ -212,6 +212,87 @@ fn read_be<T, const N: usize>(
         .collect()
 }
 
+/// A numeric scalar classified once for narrowing: an integer source keeps
+/// its bits through the `i64` view, so an integer target truncates to the low
+/// N bits (C/pvxs `static_cast`: `uint32 0xffffffff -> int32 -1`, and
+/// `getLongUInt64`: -200 -> 0xffffffffffffff38); only a float takes the
+/// `c_cast` policy.
+#[derive(Clone, Copy)]
+enum Num {
+    Int(i64),
+    /// Its own case only for the `f64` view, which is unsigned.
+    U64(u64),
+    /// Its own case only so a `Float` target keeps it as it is.
+    F32(f32),
+    Float(f64),
+}
+
+impl Num {
+    #[inline]
+    fn int(self) -> Option<i64> {
+        match self {
+            Self::Int(i) => Some(i),
+            Self::U64(u) => Some(u as i64),
+            Self::F32(_) | Self::Float(_) => None,
+        }
+    }
+
+    #[inline]
+    fn f64(self) -> f64 {
+        match self {
+            Self::Int(i) => i as f64,
+            Self::U64(u) => u as f64,
+            Self::F32(f) => f as f64,
+            Self::Float(f) => f,
+        }
+    }
+
+    /// The value in a numeric `target`; `None` for `String`, the text
+    /// projection, which is the caller's.
+    #[inline(always)]
+    fn to_field(self, target: DbFieldType) -> Option<EpicsValue> {
+        let i = self.int();
+        Some(match target {
+            DbFieldType::String => return None,
+            DbFieldType::Double => EpicsValue::Double(self.f64()),
+            DbFieldType::Float => EpicsValue::Float(match self {
+                Self::F32(f) => f,
+                _ => c_cast::f64_to_f32(self.f64()),
+            }),
+            DbFieldType::Short => {
+                EpicsValue::Short(i.map_or_else(|| c_cast::f64_to_i16(self.f64()), |i| i as i16))
+            }
+            // `putDoubleEnum` is the same `(epicsEnum16)` cast as
+            // `putDoubleUshort`, so it takes the same `c_cast` policy.
+            DbFieldType::Enum => {
+                EpicsValue::Enum(i.map_or_else(|| c_cast::f64_to_u16(self.f64()), |i| i as u16))
+            }
+            // `Char` carries the epicsInt8's bits: C `(epicsInt8) d`.
+            DbFieldType::Char => {
+                EpicsValue::Char(i.map_or_else(|| c_cast::f64_to_i8(self.f64()) as u8, |i| i as u8))
+            }
+            DbFieldType::Long => {
+                EpicsValue::Long(i.map_or_else(|| c_cast::f64_to_i32(self.f64()), |i| i as i32))
+            }
+            DbFieldType::Int64 => {
+                EpicsValue::Int64(i.unwrap_or_else(|| c_cast::f64_to_i64(self.f64())))
+            }
+            DbFieldType::UInt64 => {
+                EpicsValue::UInt64(i.map_or_else(|| c_cast::f64_to_u64(self.f64()), |i| i as u64))
+            }
+            DbFieldType::UShort => {
+                EpicsValue::UShort(i.map_or_else(|| c_cast::f64_to_u16(self.f64()), |i| i as u16))
+            }
+            DbFieldType::ULong => {
+                EpicsValue::ULong(i.map_or_else(|| c_cast::f64_to_u32(self.f64()), |i| i as u32))
+            }
+            DbFieldType::UChar => {
+                EpicsValue::UChar(i.map_or_else(|| c_cast::f64_to_u8(self.f64()), |i| i as u8))
+            }
+        })
+    }
+}
+
 impl EpicsValue {
     /// The label for an enum `index` against its `choices`:
     /// `choices[index]` when in range, else the decimal index — pvxs
@@ -833,20 +914,24 @@ impl EpicsValue {
     /// reinterprets it as signed `epicsInt8`, a contract this view must
     /// not silently change.
     pub(crate) fn as_int_i64(&self) -> Option<i64> {
-        Some(match self {
-            Self::Short(v) => *v as i64,
-            Self::Enum(v) => *v as i64,
-            Self::Long(v) => *v as i64,
-            Self::Int64(v) => *v,
-            Self::UInt64(v) => *v as i64,
-            // u16/u32 widen losslessly into the i64 view; an integer target
-            // then truncates off the low bits (C/pvxs `static_cast`).
-            Self::UShort(v) => *v as i64,
-            Self::ULong(v) => *v as i64,
-            // `Char` is epicsInt8, as `to_f64` reads it; epicsUInt8 widens
-            // unsigned (0xFF -> 255).
-            Self::Char(v) => *v as i8 as i64,
-            Self::UChar(v) => *v as i64,
+        self.num()?.int()
+    }
+
+    /// A numeric scalar as the one [`Num`] every narrowing reads, and the
+    /// classification [`Self::as_int_i64`] is a view of.
+    #[inline]
+    fn num(&self) -> Option<Num> {
+        Some(match *self {
+            Self::Double(v) => Num::Float(v),
+            Self::Float(v) => Num::F32(v),
+            Self::UInt64(v) => Num::U64(v),
+            Self::Short(v) => Num::Int(v as i64),
+            Self::Enum(v) | Self::UShort(v) => Num::Int(v as i64),
+            Self::Long(v) => Num::Int(v as i64),
+            Self::Int64(v) => Num::Int(v),
+            Self::ULong(v) => Num::Int(v as i64),
+            Self::Char(v) => Num::Int(v as i8 as i64),
+            Self::UChar(v) => Num::Int(v as i64),
             _ => return None,
         })
     }
@@ -887,6 +972,16 @@ impl EpicsValue {
     /// share one body; they do not share one in C and the differences are
     /// observable on the wire.
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
+        match self.num().and_then(|n| n.to_field(target)) {
+            Some(v) => v,
+            None => self.convert_other(target),
+        }
+    }
+
+    /// [`Self::convert_to`] for every row but a numeric scalar into a numeric
+    /// field, which stays out of line so that row carries no frame for these.
+    #[inline(never)]
+    fn convert_other(&self, target: DbFieldType) -> EpicsValue {
         // pvalink NTEnum carrier (pvxs `pvaGetValue` scalar switch,
         // `pvxs/ioc/pvalink_lset.cpp:330-360`): a DBR_STRING target stores the
         // label `choices[index]` (with the "%u" index fallback out of
@@ -1035,72 +1130,19 @@ impl EpicsValue {
         // `-1`, not the f64 round-trip's saturated `i32::MAX`. Float/double
         // sources have no integer view, so they keep the f64 path; that path
         // also serves the String/Float/Double targets for every source.
-        match target {
-            DbFieldType::String => EpicsValue::String(format!("{self}").into()),
-            DbFieldType::Short => EpicsValue::Short(match self.as_int_i64() {
-                Some(i) => i as i16,
-                None => c_cast::f64_to_i16(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::Float => {
-                EpicsValue::Float(c_cast::f64_to_f32(self.to_f64().unwrap_or(0.0)))
+        match (target, self) {
+            // String → CharArray / UCharArray, for a waveform FTVL=CHAR/UCHAR.
+            (DbFieldType::Char, EpicsValue::String(s)) => {
+                EpicsValue::CharArray(s.as_bytes().to_vec().into())
             }
-            // `putDoubleEnum` is the same `(epicsEnum16)` cast as
-            // `putDoubleUshort`, so it takes the same `c_cast` policy.
-            DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
-                Some(i) => i as u16,
-                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::Char => {
-                // String → CharArray (for waveform FTVL=CHAR)
-                if let EpicsValue::String(s) = self {
-                    EpicsValue::CharArray(s.as_bytes().to_vec().into())
-                } else {
-                    // `Char` carries the epicsInt8's bits: C `(epicsInt8) d`.
-                    EpicsValue::Char(match self.as_int_i64() {
-                        Some(i) => i as u8,
-                        None => c_cast::f64_to_i8(self.to_f64().unwrap_or(0.0)) as u8,
-                    })
-                }
+            (DbFieldType::UChar, EpicsValue::String(s)) => {
+                EpicsValue::UCharArray(s.as_bytes().to_vec().into())
             }
-            DbFieldType::Long => EpicsValue::Long(match self.as_int_i64() {
-                Some(i) => i as i32,
-                None => c_cast::f64_to_i32(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
-            // Every integer source keeps its bits through the i64 view, signed
-            // ones sign-extending (C `getLongUInt64`/`cvt_l_uq`: -200 ->
-            // 0xffffffffffffff38); only a float takes the f64 cast.
-            DbFieldType::Int64 => EpicsValue::Int64(match self.as_int_i64() {
-                Some(i) => i,
-                None => c_cast::f64_to_i64(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::UInt64 => EpicsValue::UInt64(match self.as_int_i64() {
-                Some(i) => i as u64,
-                None => c_cast::f64_to_u64(self.to_f64().unwrap_or(0.0)),
-            }),
-            // Unsigned narrowing mirrors the signed targets: integer sources
-            // truncate off the i64 view (C/pvxs `static_cast`), float/string
-            // sources fall back to the f64 round-trip.
-            DbFieldType::UShort => EpicsValue::UShort(match self.as_int_i64() {
-                Some(i) => i as u16,
-                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::ULong => EpicsValue::ULong(match self.as_int_i64() {
-                Some(i) => i as u32,
-                None => c_cast::f64_to_u32(self.to_f64().unwrap_or(0.0)),
-            }),
-            DbFieldType::UChar => {
-                // String → UCharArray (for waveform FTVL=UCHAR), the unsigned
-                // twin of the Char target's String → CharArray path.
-                if let EpicsValue::String(s) = self {
-                    EpicsValue::UCharArray(s.as_bytes().to_vec().into())
-                } else {
-                    EpicsValue::UChar(match self.as_int_i64() {
-                        Some(i) => i as u8,
-                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
-                    })
-                }
-            }
+            _ => self
+                .num()
+                .unwrap_or_else(|| Num::Float(self.to_f64().unwrap_or(0.0)))
+                .to_field(target)
+                .unwrap_or_else(|| EpicsValue::String(format!("{self}").into())),
         }
     }
 
@@ -1137,6 +1179,9 @@ impl EpicsValue {
         // projecting the whole buffer into one slot is the long-string
         // presentation (`epics_ca_rs::server::apply_native_long_string`) and
         // never a get.
+        if let Some(v) = self.num().and_then(|n| n.to_field(target)) {
+            return Ok(v);
+        }
         if target == DbFieldType::String {
             match self {
                 Self::CharArray(bytes) => {
@@ -1538,6 +1583,44 @@ fn parse_string_to_f64(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod parse_radix_tests {
     use super::*;
+
+    /// The scalar rows' edges: a float to its own type is a copy (a
+    /// subnormal is not `c_cast`'s MIN_POSITIVE), a u64 widens unsigned to
+    /// a float but truncates to an integer, a float saturates.
+    #[test]
+    fn scalar_rows_keep_the_source_class() {
+        let sub = f32::from_bits(1);
+        let v = EpicsValue::Float(sub);
+        assert_eq!(v.convert_to(DbFieldType::Float), EpicsValue::Float(sub));
+        assert_eq!(
+            v.get_convert(DbFieldType::Float).unwrap(),
+            EpicsValue::Float(sub)
+        );
+        let u = EpicsValue::UInt64(u64::MAX);
+        assert_eq!(
+            u.convert_to(DbFieldType::Double),
+            EpicsValue::Double(u64::MAX as f64)
+        );
+        assert_eq!(u.convert_to(DbFieldType::Long), EpicsValue::Long(-1));
+        assert_eq!(
+            EpicsValue::Double(3e9).convert_to(DbFieldType::Long),
+            EpicsValue::Long(i32::MAX)
+        );
+        assert_eq!(
+            EpicsValue::Long(-200).convert_to(DbFieldType::UInt64),
+            EpicsValue::UInt64(0xffffffffffffff38)
+        );
+        assert_eq!(
+            EpicsValue::Char(0xff)
+                .get_convert(DbFieldType::Double)
+                .unwrap(),
+            EpicsValue::Double(-1.0)
+        );
+        assert_eq!(
+            EpicsValue::Short(7).convert_to(DbFieldType::String),
+            EpicsValue::String("7".into())
+        );
+    }
 
     #[test]
     fn parse_hex_to_long() {

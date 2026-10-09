@@ -26,8 +26,8 @@ async fn nvl_wraps_at_dbr_ushort() {
     // (NVL source, SELN, SEVR) — softIoc: -2.7 -> 65534 INVALID,
     // 65537 -> 1 (selects B), 3 -> 3 (selects D), 12.9 -> 12 INVALID.
     for (src, seln, val, invalid) in [
-        // (-2.7, 65534, 0.0, true) and (65537.0, 1, 20.0, false) need the wrapping
-        // f64 -> u16 narrow of 284c21cae.
+        (-2.7, 65534, 0.0, true),
+        (65537.0, 1, 20.0, false),
         (3.0, 3u16, 40.0, false),
         (12.9, 12, 40.0, true),
     ] {

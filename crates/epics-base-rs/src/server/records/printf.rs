@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{LinkReadAs, ProcessOutcome, Record};
+use crate::server::record::{InputLinkRequest, LinkReadAs, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString, SharedArray};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -62,9 +62,12 @@ pub struct PrintfRecord {
     resolved: [bool; 10],
     /// `process`'s format buffer, kept so a cycle formats without allocating.
     fmt_buf: Vec<u8>,
-    /// [`Self::slot_requests`] of `fmt`, written with it by [`Self::set_fmt`]
+    /// `fmt` compiled by [`Self::set_fmt`], its one writer, so a cycle
+    /// formats without parsing it again.
+    prog: Vec<FmtOp>,
+    /// [`Self::slot_requests`] of `prog`, written with it by [`Self::set_fmt`]
     /// so the per-cycle [`Record::input_link_request`] is a lookup.
-    requests: [LinkReadAs; 10],
+    requests: [InputLinkRequest; 10],
     /// [`Record::input_links_generation`]: moved on by every write of an
     /// `INPn` text or of the `FMT` that [`Record::input_link_request`] reads.
     links_generation: u64,
@@ -86,11 +89,33 @@ impl Default for PrintfRecord {
             len: 0,
             ivls: PvString::from("LNK"),
             resolved: [false; 10],
-            requests: [LinkReadAs::Native; 10],
+            prog: Vec::new(),
+            requests: [InputLinkRequest::NotRead; 10],
             links_generation: 0,
             fmt_buf: Vec::new(),
         }
     }
+}
+
+/// One step of a compiled FMT.
+enum FmtOp {
+    /// `fmt[start..end]` copied verbatim: literal text or the `%` of `%%`.
+    Text(usize, usize),
+    /// A directive: its `*` slots are read whatever follows, as C reads them
+    /// while parsing (`printfRecord.c:119-138`).
+    Dir(Directive, Then),
+}
+
+/// What a directive does once its `*` slots are read.
+enum Then {
+    /// Convert its own slot, read with this request.
+    Conv(LinkReadAs),
+    /// A bad directive: echo `fmt[start..end]`, each read `*` written as its
+    /// number, or IVLS when a `*` read failed (`printfRecord.c:304-307`).
+    Echo(usize, usize),
+    /// Cut off by the end of FMT: C's `if (!ch) break;` (`:164-165`) ends
+    /// formatting with nothing emitted.
+    Stop,
 }
 
 /// One parsed printf conversion directive.
@@ -198,7 +223,8 @@ impl PrintfRecord {
     }
 
     /// The request of each INP0..INP9 slot FMT consumes, per
-    /// [`Self::directive_read`]; an unconsumed slot reads native.
+    /// [`Self::directive_read`]; C's `doPrintf` never calls `dbGetLink` on
+    /// an unconsumed slot, so it is [`InputLinkRequest::NotRead`].
     ///
     /// Deliberate deviation, stated precisely: this map is computed at
     /// FETCH time under the no-failure slot pairing. When a `*` width
@@ -215,51 +241,74 @@ impl PrintfRecord {
     /// The failed-`*` directive itself emits IVLS in both
     /// implementations.
     fn set_fmt(&mut self, fmt: PvString) {
+        self.prog = Self::compile(fmt.as_bytes());
         self.fmt = fmt;
         self.requests = self.slot_requests();
         self.links_generation += 1;
     }
 
-    fn slot_requests(&self) -> [LinkReadAs; 10] {
-        let mut out = [LinkReadAs::Native; 10];
-        let bytes = self.fmt.as_bytes();
-        let mut i = 0;
+    fn slot_requests(&self) -> [InputLinkRequest; 10] {
+        let mut out = [InputLinkRequest::NotRead; 10];
         let mut slot = 0usize;
-        while i < bytes.len() && slot < out.len() {
-            if bytes[i] != b'%' {
-                i += 1;
+        for op in &self.prog {
+            let FmtOp::Dir(d, then) = op else {
                 continue;
-            }
-            if bytes.get(i + 1) == Some(&b'%') {
-                i += 2;
-                continue;
-            }
-            let (d, next) = Self::parse_directive(bytes, i);
-            i = next;
-            if d.bad {
-                continue;
-            }
+            };
             // Consumption order mirrors `apply_fmt`: `*` width, then `*`
             // precision, then the conversion's own slot.
             for star in [d.star_width, d.star_prec] {
                 if star && slot < out.len() {
-                    out[slot] = LinkReadAs::Short;
+                    out[slot] = InputLinkRequest::As(LinkReadAs::Short);
                     slot += 1;
                 }
             }
+            let Then::Conv(read) = then else {
+                continue;
+            };
             if slot >= out.len() {
                 break;
             }
-            out[slot] = Self::directive_read(&d);
+            out[slot] = InputLinkRequest::As(*read);
             slot += 1;
         }
         out
     }
 
+    fn compile(bytes: &[u8]) -> Vec<FmtOp> {
+        let mut prog = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let start = i;
+            if bytes[i] != b'%' {
+                while i < bytes.len() && bytes[i] != b'%' {
+                    i += 1;
+                }
+                prog.push(FmtOp::Text(start, i));
+            } else if bytes.get(i + 1) == Some(&b'%') {
+                prog.push(FmtOp::Text(i + 1, i + 2));
+                i += 2;
+            } else {
+                let (d, next) = Self::parse_directive(bytes, i);
+                let Some(next) = next else {
+                    prog.push(FmtOp::Dir(d, Then::Stop));
+                    break;
+                };
+                i = next;
+                let then = if d.bad {
+                    Then::Echo(start, i)
+                } else {
+                    Then::Conv(Self::directive_read(&d))
+                };
+                prog.push(FmtOp::Dir(d, then));
+            }
+        }
+        prog
+    }
+
     /// Parse one `%...` directive starting at `bytes[i]` (which is `%`).
     /// Returns the directive and the index just past the conversion
-    /// char. Consumes `*` width/precision values from `star_idx`.
-    fn parse_directive(bytes: &[u8], mut i: usize) -> (Directive, usize) {
+    /// char, `None` when FMT ends first.
+    fn parse_directive(bytes: &[u8], mut i: usize) -> (Directive, Option<usize>) {
         let mut d = Directive {
             width: None,
             star_width: false,
@@ -369,11 +418,9 @@ impl PrintfRecord {
                 d.bad = true;
                 i += 1;
             }
-            None => {
-                d.bad = true;
-            }
+            None => return (d, None),
         }
-        (d, i)
+        (d, Some(i))
     }
 
     /// C `doPrintf` into `out`, which the caller clears — the record's own
@@ -383,7 +430,6 @@ impl PrintfRecord {
         use std::io::Write;
         let result = out;
         let bytes = self.fmt.as_bytes();
-        let mut i = 0;
         let mut inp_idx = 0usize;
 
         // Consume the next input link slot, advancing the cursor (C
@@ -401,31 +447,14 @@ impl PrintfRecord {
             }
         };
 
-        while i < bytes.len() {
-            if bytes[i] != b'%' {
-                result.push(bytes[i]);
-                i += 1;
-                continue;
-            }
-            // %% escape.
-            if bytes.get(i + 1) == Some(&b'%') {
-                result.push(b'%');
-                i += 2;
-                continue;
-            }
-            let start = i;
-            let (d, next) = Self::parse_directive(bytes, i);
-            i = next;
-            if d.bad {
-                // Bad format directive: C `printfRecord.c:306-307` echoes
-                // the literal accumulated directive text (`format`) on
-                // F_BADFMT, so FMT "x=%q" yields VAL "x=%q". The bytes
-                // `[start..i]` are exactly that directive (parse_directive
-                // advances past the bad conversion char). Echo them byte
-                // for byte, as the literal-run path above does.
-                result.extend_from_slice(&bytes[start..i]);
-                continue;
-            }
+        for op in &self.prog {
+            let (d, then) = match op {
+                FmtOp::Text(start, end) => {
+                    result.extend_from_slice(&bytes[*start..*end]);
+                    continue;
+                }
+                FmtOp::Dir(d, then) => (d, then),
+            };
 
             // Track a failed link read across the directive's consumed
             // slots. C sets F_BADLNK on the first failure and emits IVLS
@@ -444,15 +473,35 @@ impl PrintfRecord {
                     }
                 }
             };
-            let width = if d.star_width {
-                star(&mut inp_idx)
-            } else {
-                d.width.unwrap_or(0) as i64
+            let star_width = d.star_width.then(|| star(&mut inp_idx));
+            let star_prec = d.star_prec.then(|| star(&mut inp_idx));
+            let read = match *then {
+                Then::Conv(read) => read,
+                Then::Stop => break,
+                Then::Echo(start, end) => {
+                    if bad_link {
+                        result.extend_from_slice(self.ivls.as_bytes());
+                        continue;
+                    }
+                    // C overwrites each `*` it read with the number
+                    // (`printfRecord.c:130-131`); a `*` it did not read
+                    // ends the directive here, so it is never one of them.
+                    let mut stars = [star_width, star_prec].into_iter().flatten();
+                    for &b in &bytes[start..end] {
+                        match (b == b'*').then(|| stars.next()).flatten() {
+                            Some(n) => {
+                                let _ = write!(result, "{n}");
+                            }
+                            None => result.push(b),
+                        }
+                    }
+                    continue;
+                }
             };
-            let precision = if d.star_prec {
-                star(&mut inp_idx).max(0) as usize
-            } else {
-                d.precision.unwrap_or(usize::MAX)
+            let width = star_width.unwrap_or(d.width.unwrap_or(0) as i64);
+            let precision = match star_prec {
+                Some(p) => p.max(0) as usize,
+                None => d.precision.unwrap_or(usize::MAX),
             };
             let (width, left_align) = if width < 0 {
                 ((-width) as usize, true)
@@ -469,7 +518,7 @@ impl PrintfRecord {
             let arg = if bad_link {
                 None
             } else {
-                take(&mut inp_idx).and_then(|v| Self::typed(v, Self::directive_read(&d)))
+                take(&mut inp_idx).and_then(|v| Self::typed(v, read))
             };
             let Some(arg) = arg else {
                 // F_BADLNK: emit the Invalid Link String once for the
@@ -1041,10 +1090,10 @@ impl Record for PrintfRecord {
     /// `%ld` of an Int64 its `epicsInt32` truncation, and a source C cannot
     /// convert (`%d` of "abc") fails the read: LINK alarm and IVLS.
     fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
-        crate::server::record::InputLinkRequest::As(match Self::inp_index(link_field) {
+        match Self::inp_index(link_field) {
             Some(idx) => self.requests[idx],
-            None => LinkReadAs::Native,
-        })
+            None => InputLinkRequest::As(LinkReadAs::Native),
+        }
     }
 
     fn input_links_generation(&self) -> Option<u64> {
@@ -1832,13 +1881,40 @@ mod tests {
         assert_eq!(val(&rec), "x=%q");
     }
 
-    /// A trailing bare `%` (no conversion char) is also a bad directive
-    /// and echoes verbatim.
+    /// A directive FMT cuts off ends formatting with nothing emitted, its
+    /// `*` still read (softIoc: `%` -> "", `abc%` -> "abc", `%5` -> "").
     #[test]
-    fn trailing_percent_echoes_verbatim() {
-        let mut rec = rec_with("v=%");
+    fn a_directive_cut_off_by_fmt_ends_the_text() {
+        for (fmt, want) in [("%", ""), ("v=%", "v="), ("abc%", "abc"), ("%5", "")] {
+            let mut rec = rec_with(fmt);
+            rec.process().unwrap();
+            assert_eq!(val(&rec), want, "{fmt}");
+            assert_eq!(rec.len, want.len() as u32 + 1, "{fmt}");
+        }
+        let mut rec = rec_with("x%*");
+        assert_eq!(
+            rec.input_link_request("INP0"),
+            InputLinkRequest::As(LinkReadAs::Short)
+        );
+        rec.set_input(0, EpicsValue::Short(5));
         rec.process().unwrap();
-        assert_eq!(val(&rec), "v=%");
+        assert_eq!(val(&rec), "x");
+    }
+
+    /// A bad directive reads its `*` and echoes it as the number, or IVLS
+    /// when that read failed (softIoc: `%*q %d` of 5, 6 -> "%5q 6").
+    #[test]
+    fn a_bad_directive_reads_its_star() {
+        let mut rec = rec_with("%*q %d");
+        rec.set_input(0, EpicsValue::Short(5));
+        rec.set_input(1, EpicsValue::Long(6));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "%5q 6");
+
+        let mut rec = rec_with("%*q %d");
+        rec.set_input(1, EpicsValue::Long(6));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "LNK 6");
     }
 
     /// LEN reports the formatted byte count INCLUDING the NUL terminator

@@ -1,0 +1,47 @@
+dbpf LSI.PROC 1
+dbpf PF.PROC 1
+dbgf LSE
+dbgf LSE.VAL$
+dbpf LSO2.VAL ""
+dbgf LSO2
+dbgf LSO2.VAL$
+dbpf LSO.VAL$ xyz
+dbgf LSO.VAL
+dbpf LSO.VAL$ longer_text_here
+dbpf SI.VAL$ hello
+dbgf SI
+dbpf LSI.VAL$ pq
+dbpf PF.VAL$ rs
+dbpf LSO.DOL$ PF
+dbgf LSO.DOL
+dbpf AI.INP$ 2.5
+dbgf AI.INP
+dbgf LSI.VAL$x
+dbgf LSI.$
+dbgf AI.RTYP$
+dbgf AI.VAL$
+dbgf SI.val
+dbpf WS '["ab","cd"]'
+dbgf WS.VAL$
+dbpf WS1 '["ab"]'
+dbgf WS1.VAL$
+dba LSI.VAL$
+dba SI.VAL$
+dba LSO.DOL$
+dba PF.VAL$
+dbtgf LSI.VAL$
+dbtgf SI.VAL$
+dbtgf LSO.DOL$
+dbtgf AI.RTYP$
+dbtgf WS.VAL$
+dbtpf SI.VAL$ abc
+dbtpf SI.VAL$ 65
+dbgf SI
+dbtpf LSI.VAL$ 66
+dbgf LSI
+dbtpf LSO.DOL$ SI
+dbtpf AI.RTYP$ x
+dbpr LSI.VAL$
+dbpf WS.VAL$ xy
+dbgf WS
+dbtr SI.VAL$

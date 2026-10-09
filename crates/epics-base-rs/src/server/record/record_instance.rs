@@ -4144,6 +4144,9 @@ impl RecordInstance {
     /// (dbAccess.c:1414) — routes through here. Alarm-only / property-only
     /// posts MUST NOT call it: they deliver nothing to a value-class
     /// subscriber, so the value is still owed.
+    ///
+    /// The deadband field is the exception: its published value is MLST/ALST,
+    /// which [`Self::deadband_post`] owns, so a post of it stores nothing.
     pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
         let walk_skip = self.walk_skips(field);
         self.record_value_post_as(field, walk_skip, value);
@@ -4151,6 +4154,9 @@ impl RecordInstance {
 
     /// [`Self::record_value_post`] with `walk_skip` = [`Self::walk_skips`]`(field)`.
     fn record_value_post_as(&mut self, field: &str, walk_skip: bool, value: EpicsValue) {
+        if field == self.record.monitor_deadband_field() {
+            return;
+        }
         if walk_skip {
             if let Some(slot) = self
                 .skipped_posted
@@ -8922,7 +8928,9 @@ impl RecordInstance {
             subs.retain(|s| !s.is_closed());
             !subs.is_empty()
         });
-        if !subscribed && !publishes_value {
+        // With no subscriber the post only feeds `record_value_post`, which
+        // stores nothing for the deadband field — a `dbPut` target's VAL.
+        if !subscribed && (!publishes_value || field == self.record.monitor_deadband_field()) {
             return;
         }
         let Some(value) = read(self) else {
@@ -12072,7 +12080,7 @@ mod skipped_posted_tests {
     /// every later cycle of every record the whole walk.
     #[test]
     fn a_skipped_field_post_leaves_the_gate_armed() {
-        for field in ["VAL", "SEVR", "STAT", "AMSG", "ACKS", "UDF"] {
+        for field in ["SEVR", "STAT", "AMSG", "ACKS", "UDF"] {
             let mut inst = calc();
             inst.record_value_post(field, EpicsValue::Long(1));
             assert!(
@@ -12081,6 +12089,17 @@ mod skipped_posted_tests {
             );
             assert_eq!(inst.posted_value(field), Some(&EpicsValue::Long(1)));
         }
+    }
+
+    /// Boundary: the deadband field. Its published value is MLST/ALST, so a
+    /// post of it — a `dbPut` to VAL with nobody watching — stores nothing.
+    #[test]
+    fn a_deadband_field_post_stores_nothing() {
+        let mut inst = calc();
+        inst.record_value_post("VAL", EpicsValue::Double(1.0));
+        inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+        assert!(inst.last_posted.is_empty() && inst.skipped_posted.is_empty());
+        assert_eq!(inst.posted_value("VAL"), None);
     }
 
     /// A monitor on a tracker field seeds its published value through the

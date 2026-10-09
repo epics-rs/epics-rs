@@ -2715,6 +2715,9 @@ impl PvDatabase {
         // init pass for the same reason C runs it after `prepareLinks`: the link
         // fields must have their final text before the graph is read.
         self.build_lock_sets();
+        // C `scanInit` (`iocInit.c:186`), whose `buildScanLists` creates the
+        // events every `SCAN = "Event"` record names.
+        self.build_event_table();
     }
 
     /// C `dbInitRecordLinks` (`dbStaticLib.c:2171-2233`), which C runs once per

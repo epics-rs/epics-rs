@@ -1,0 +1,9 @@
+record(lsi, "LSI") { field(INP, {const:"abc"}) }
+record(lsi, "LSE") { }
+record(lso, "LSO") { field(DOL, "SI") }
+record(lso, "LSO2") { }
+record(printf, "PF") { field(FMT, "abc") }
+record(stringin, "SI") { field(VAL, "abc") }
+record(ai, "AI") { }
+record(waveform, "WS") { field(FTVL, "STRING") field(NELM, "4") }
+record(waveform, "WS1") { field(FTVL, "STRING") field(NELM, "4") }

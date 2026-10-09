@@ -102,6 +102,8 @@ pub(super) struct ScanIndex {
     /// over-run count, so the counter cannot drift away from the list it
     /// counts. Only the periodic scan threads write it.
     overruns: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// C `pevent_list`: every event handle `eventNameToHandle` has created.
+    events: EventTable,
 }
 
 impl ScanIndex {
@@ -109,6 +111,7 @@ impl ScanIndex {
         Self {
             buckets: std::sync::OnceLock::new(),
             overruns: std::sync::OnceLock::new(),
+            events: EventTable::new(),
         }
     }
 
@@ -261,8 +264,26 @@ impl PvDatabase {
         let Some(rec_arc) = rec_arc else {
             return;
         };
+        // C `scanAdd` creates the record's event handle (dbScan.c:333). That
+        // allocates, so EVNT — DBF_STRING size(40) — is copied out on the
+        // stack and the handle is made once the locks are down.
+        let mut evnt = [0u8; 40];
+        let mut evnt_len = None;
         let (cur_scan, cur_phas, cur_type) = {
             let inst = rec_arc.read();
+            let bytes = inst.common.evnt.as_bytes();
+            if inst.common.scan == ScanType::Event
+                && bytes.len() <= evnt.len()
+                && self
+                    .inner
+                    .scan_index
+                    .events
+                    .built
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                evnt[..bytes.len()].copy_from_slice(bytes);
+                evnt_len = Some(bytes.len());
+            }
             (
                 inst.common.scan,
                 inst.common.phas,
@@ -274,6 +295,13 @@ impl PvDatabase {
         // before should always scan before a later-loaded record at the same
         // PHAS.
         self.add_to_scan_list(cur_scan, cur_phas, cur_type, rec_arc.load_order(), name);
+        drop(_gate);
+        drop(_record_gate);
+        if let Some(len) = evnt_len
+            && let Ok(evnt) = std::str::from_utf8(&evnt[..len])
+        {
+            self.event_name_to_handle(evnt);
+        }
     }
 
     /// Count one over-run for `scan`'s list — C `ppsl->overruns++`
@@ -328,6 +356,98 @@ impl PvDatabase {
             .iter()
             .map(|k| k.name.to_string())
             .collect()
+    }
+
+    /// C `eventNameToHandle` for a name some caller holds: creates the event
+    /// if it does not exist yet. `None` names no event.
+    pub(crate) fn event_name_to_handle(&self, name: &str) {
+        if let Some(event) = EventName::of(name) {
+            self.inner.scan_index.events.handle(event);
+        }
+    }
+
+    /// The events C's `scanpel` walks, newest first as `pevent_list` is
+    /// (`dbScan.c:530-531`), each with its `SCAN = "Event"` records in
+    /// scan-list order. An event no record scans on has an empty list.
+    pub(crate) fn event_lists(&self) -> Vec<(String, Vec<String>)> {
+        let mut events: Vec<(String, Vec<String>)> = self
+            .inner
+            .scan_index
+            .events
+            .created
+            .lock()
+            .iter()
+            .rev()
+            .map(|label| (label.to_string(), Vec::new()))
+            .collect();
+        let keys = self
+            .inner
+            .scan_index
+            .bucket(ScanType::Event.scan_list().expect("Event is a scan list"))
+            .snapshot()
+            .1;
+        for key in keys.iter() {
+            let Some(rec) = key.handle.clone().or_else(|| self.get_record(&key.name)) else {
+                continue;
+            };
+            let Some(event) = EventName::of(&rec.read().common.evnt).map(|e| e.to_string()) else {
+                continue;
+            };
+            if let Some((_, names)) = events.iter_mut().find(|(label, _)| *label == event) {
+                names.push(key.name.to_string());
+            }
+        }
+        events
+    }
+
+    /// The `iocInit` share of `pevent_list`, in C's order: `initDatabase`'s
+    /// `init_record` pass first — an event record's VAL (eventRecord.c:102)
+    /// and a calcout's OEVT (calcoutRecord.c:213) — then `buildScanLists`'
+    /// `scanAdd` of every `SCAN = "Event"` record (dbScan.c:333), each pass in
+    /// record-type then load order.
+    pub(super) fn build_event_table(&self) {
+        // Out of the map before any record lock: `update_scan_index` takes a
+        // record's lock and then the map.
+        let cells: Vec<Arc<RecordCell>> = self.inner.records.read().values().cloned().collect();
+        let mut records: Vec<(u32, u64, Arc<RecordCell>)> = cells
+            .into_iter()
+            .map(|rec| {
+                let key = super::ScanKey::new(
+                    0,
+                    rec.read().record.record_type(),
+                    rec.load_order(),
+                    "",
+                    None,
+                );
+                (key.record_type, key.load_order, rec)
+            })
+            .collect();
+        records.sort_by_key(|(record_type, load_order, _)| (*record_type, *load_order));
+        for (_, _, rec) in &records {
+            let field = match rec.read().record.record_type() {
+                "event" => "VAL",
+                "calcout" => "OEVT",
+                _ => continue,
+            };
+            let name = rec.read().resolve_field(field);
+            if let Some(crate::types::EpicsValue::String(name)) = name {
+                self.event_name_to_handle(&name.to_string());
+            }
+        }
+        for (_, _, rec) in &records {
+            let evnt = {
+                let inst = rec.read();
+                (inst.common.scan == ScanType::Event).then(|| inst.common.evnt.clone())
+            };
+            if let Some(evnt) = evnt {
+                self.event_name_to_handle(&evnt);
+            }
+        }
+        self.inner
+            .scan_index
+            .events
+            .built
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The scan key `name` would be inserted under RIGHT NOW — its live PHAS,
@@ -623,16 +743,18 @@ impl PvDatabase {
     /// integer part in `[1,255]` is normalised to its integer form so
     /// `"5"`, `" 5 "` and `"5.0"` all name the same event.
     pub async fn post_event_named(&self, event_name: &str) {
-        // C `postEvent` (`dbScan.c:536-539`), reached through
-        // `post_event`/`eventNameToHandle` — the same gate, applied before
-        // the name lookup because C applies it before touching the list.
-        if !crate::server::scan::scan_is_running() {
-            return;
-        }
         // `eventNameToHandle` returns NULL for "0"/empty — no event.
         let Some(want) = EventName::of(event_name) else {
             return;
         };
+        // The handle is created whether or not the post then runs: the event
+        // record (devEventSoft.c:82) and iocsh `postEvent`
+        // (dbIocRegister.c:478) call `eventNameToHandle` before `postEvent`.
+        self.inner.scan_index.events.handle(want);
+        // C `postEvent` (`dbScan.c:538-539`).
+        if !crate::server::scan::scan_is_running() {
+            return;
+        }
         let Some(list) = ScanType::Event.scan_list() else {
             return;
         };
@@ -670,6 +792,61 @@ impl PvDatabase {
                 visited.is_empty(),
                 "a returned process frame left its cycle marker behind"
             );
+        }
+    }
+}
+
+/// C `pevent_list` (`dbScan.c:118-121`): the event handles in creation order.
+/// A handle is never freed, so the table only grows, and its labels are C's —
+/// a numbered event is named by `%i` (`dbScan.c:517`).
+struct EventTable {
+    /// `pevent_list[1..255]`, as "created" flags: a post of a numbered event
+    /// that exists answers from here without the lock.
+    numbered: [std::sync::atomic::AtomicBool; 256],
+    /// C `event_lock` and the chain it guards, oldest first.
+    created: crate::runtime::sync::PriorityInheritanceMutex<Vec<Box<str>>>,
+    /// Set once `ioc_init` has run C's `buildScanLists` share of the table;
+    /// before it, a SCAN change is a load-time edit that pass will meet.
+    built: std::sync::atomic::AtomicBool,
+}
+
+impl EventTable {
+    fn new() -> Self {
+        Self {
+            numbered: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+            created: crate::runtime::sync::PriorityInheritanceMutex::new(Vec::new()),
+            built: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// C `eventNameToHandle`'s find-or-create (`dbScan.c:493-532`). A
+    /// numbered event that exists answers from its flag alone.
+    #[inline]
+    fn handle(&self, event: EventName<'_>) {
+        if let EventName::Number(n) = event
+            && self.numbered[n as usize].load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.create(event);
+    }
+
+    #[cold]
+    fn create(&self, event: EventName<'_>) {
+        use std::sync::atomic::Ordering;
+        let mut created = self.created.lock();
+        match event {
+            EventName::Number(n) => {
+                if !self.numbered[n as usize].load(Ordering::Relaxed) {
+                    created.push(n.to_string().into());
+                    self.numbered[n as usize].store(true, Ordering::Release);
+                }
+            }
+            EventName::Named(name) => {
+                if !created.iter().any(|c| **c == *name) {
+                    created.push(name.into());
+                }
+            }
         }
     }
 }
@@ -829,11 +1006,12 @@ pub(crate) enum EventName<'a> {
 
 impl<'a> EventName<'a> {
     pub(crate) fn of(name: &'a str) -> Option<Self> {
-        let trimmed = name.trim();
+        let trimmed = name.trim_matches(crate::runtime::stdlib::c_isspace);
         if trimmed.is_empty() {
             return None;
         }
-        if let Ok(num) = trimmed.parse::<f64>()
+        // C `epicsParseDouble`: `strtod`'s grammar, so `0x10` is event 16.
+        if let Ok(num) = crate::runtime::stdlib::epics_parse_double(trimmed)
             && (0.0..256.0).contains(&num)
         {
             // `(0.0..256.0)` holds, so the integer part fits `u8`.
@@ -1031,5 +1209,10 @@ mod tests {
         // Numeric out of [0,256) is treated literally.
         assert_eq!(of("999"), Some("999".into()));
         assert_eq!(of("256"), Some("256".into()));
+        // `strtod`'s grammar: hexadecimal, and an infinity or NaN is a name.
+        assert_eq!(EventName::of("0x10"), Some(EventName::Number(16)));
+        assert_eq!(of("0x10"), Some("16".into()));
+        assert_eq!(of("inf"), Some("inf".into()));
+        assert_eq!(of("nan"), Some("nan".into()));
     }
 }

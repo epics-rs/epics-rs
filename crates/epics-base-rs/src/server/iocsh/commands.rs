@@ -960,19 +960,14 @@ fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Ve
 /// A name with no `dbFldDes` behind it is C's record ATTRIBUTE, for which
 /// `dbGetAttributePart` synthesises a `DBF_STRING` descriptor
 /// (`dbStaticLib.c:1265-1272`); `RTYP` is the only such name this port serves.
-fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String> {
-    let (rec_name, field) = parse_pv_name(pname);
-    let field = if field.is_empty() { "VAL" } else { field };
-    let Some(rec) = ctx.db().get_record(rec_name) else {
+fn dbgf_lines(addr: &DbAddr, val: &EpicsValue) -> Vec<String> {
+    let inst = addr.rec.read();
+    let Some((_, dbr)) = addr.fld_des.map(|fd| field_addr_types(fd, Some(val))) else {
         return native_readback_lines(DbfCode::String, val);
     };
-    let inst = rec.read();
-    let Some((_, dbr)) = inst
-        .field_desc(field)
-        .map(|fd| field_addr_types(fd, Some(val)))
-    else {
-        return native_readback_lines(DbfCode::String, val);
-    };
+    if dbr == DbfCode::String {
+        return native_readback_lines(dbr, &long_string_value(&inst, val));
+    }
     if dbr != DbfCode::Enum {
         return native_readback_lines(dbr, val);
     }
@@ -981,7 +976,7 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
     // (`dbConvert.c:833-911`) by DBF class. `field_as_dbr_string` is that
     // table's single owner here, so `dbgf` and a db-link read of one field
     // cannot disagree about its text.
-    let text = inst.field_as_dbr_string(field).unwrap_or_default();
+    let text = inst.field_as_dbr_string(&addr.field).unwrap_or_default();
     native_readback_lines(DbfCode::String, &EpicsValue::String(text))
 }
 
@@ -1003,19 +998,41 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
 /// read-back then FAILED printed nothing where C prints the type header and
 /// `failed.` — `dbpf T:AI.RSET, "1"` on a `DBF_NOACCESS` field was silent on
 /// stdout against `softIoc` R7.0.10-146.
-fn dbgf_echo(ctx: &CommandContext, pname: &str) {
-    match ctx.db().get_pv(pname) {
+fn dbgf_echo(ctx: &CommandContext, addr: &DbAddr) {
+    if addr.char_view {
+        // `dbgf`'s request is `MIN(no_elements, sizeof(buffer)/field_size)`
+        // of `DBR_CHAR`, out of a `long[100]` (`dbTest.c:351`, `:371-376`).
+        match addr.char_view().and_then(|v| {
+            v.get(
+                crate::types::DbFieldType::Char,
+                v.no_elements.min(DBGF_BUFFER_BYTES),
+            )
+        }) {
+            Some(chars) => {
+                for line in printbuffer_block("CHAR", DbfCode::Char, &chars) {
+                    ctx.println(&line);
+                }
+            }
+            None => dbgf_failed(ctx, addr),
+        }
+        return;
+    }
+    match ctx.db().get_pv(&addr.pv()) {
         Ok(val) => {
-            for line in dbgf_lines(ctx, pname, &val) {
+            for line in dbgf_lines(addr, &val) {
                 ctx.println(&line);
             }
         }
         // C `dbgf` returns 0 whatever `dbGetField` returned
         // (`dbTest.c:388`): the failure is a printed line, not a failed
         // command.
-        Err(_) => dbgf_failed(ctx, pname),
+        Err(_) => dbgf_failed(ctx, addr),
     }
 }
+
+/// `sizeof(long[100])`, the buffer `dbgf` and `dbtpf` read into
+/// (`dbTest.c:351`, `:607`).
+const DBGF_BUFFER_BYTES: usize = 800;
 
 /// C `nameToAddr` (`dbTest.c:787-795`) — the one place every
 /// `dbTest.c` command reports a name it cannot resolve. C prints this
@@ -1069,24 +1086,76 @@ fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
 /// `pfldDes` together: a caller that re-looked-up the record could pick a
 /// different one than the name resolved to.
 fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
-    let (base, field) = parse_pv_name(pname);
+    let parts = DbNameParts::of(pname);
+    let field = if parts.field.is_empty() {
+        "VAL"
+    } else {
+        parts.field
+    };
+    // `dbFindFieldPart` binary-searches with `strncmp` and
+    // `dbGetAttributePart` with `strncmp` too, so `SI.val` is not a field.
     let resolved = ctx
         .db()
-        .get_record(base)
-        .filter(|_| !matches!(ctx.db().get_pv(pname), Err(CaError::ChannelNotFound(_))));
-    match resolved {
-        Some(rec) => {
-            let field = field.to_ascii_uppercase();
-            let fld_des = rec.read().field_desc(&field);
-            Some(DbAddr {
-                rec,
-                field,
-                fld_des,
-            })
-        }
-        None => {
-            print_pv_not_found(ctx, pname);
-            None
+        .get_record(parts.record)
+        .filter(|_| !field.bytes().any(|c| c.is_ascii_lowercase()))
+        .filter(|_| {
+            !matches!(
+                ctx.db().get_pv(&format!("{}.{field}", parts.record)),
+                Err(CaError::ChannelNotFound(_))
+            )
+        });
+    let addr = resolved.and_then(|rec| {
+        let fld_des = rec.read().field_desc(field);
+        let addr = DbAddr {
+            rec,
+            record: parts.record.to_string(),
+            field: field.to_string(),
+            fld_des,
+            char_view: parts.tail.starts_with('$'),
+            find_field_ok: parts.tail.is_empty()
+                || parts.tail.starts_with(|c: char| c.is_ascii_whitespace()),
+        };
+        // `dbAccess.c:697-699`: `$` on anything but a string or a link is
+        // `S_dbLib_fieldNotFound`.
+        (!addr.char_view || addr.char_view().is_some()).then_some(addr)
+    });
+    if addr.is_none() {
+        print_pv_not_found(ctx, pname);
+    }
+    addr
+}
+
+/// C `dbNameToAddr`'s reading of a name (`dbAccess.c:666-683`): the record
+/// part runs to the first `.` (`dbFindRecordPart`), the field part is the C
+/// identifier after it, empty meaning `VAL` (`dbFindFieldPart`), and the one
+/// modifier read is the single character after that, so `LSI.VAL$x` and
+/// `LSI.$` are both `VAL$` and an undotted `LSI$` is a record name.
+struct DbNameParts<'a> {
+    record: &'a str,
+    field: &'a str,
+    tail: &'a str,
+}
+
+impl<'a> DbNameParts<'a> {
+    fn of(pname: &'a str) -> Self {
+        let Some((record, rest)) = pname.split_once('.') else {
+            return Self {
+                record: pname,
+                field: "",
+                tail: "",
+            };
+        };
+        let len = match rest.bytes().next() {
+            Some(c) if c == b'_' || c.is_ascii_alphabetic() => rest
+                .bytes()
+                .position(|c| c != b'_' && !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len()),
+            _ => 0,
+        };
+        Self {
+            record,
+            field: &rest[..len],
+            tail: &rest[len..],
         }
     }
 }
@@ -1105,8 +1174,9 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
 /// where this port printed nothing and `PV 'T:AI.RSET' not found`.
 struct DbAddr {
     rec: Arc<crate::server::record::RecordCell>,
-    /// C's `pfldDes->name`: uppercased, and `VAL` when the name carried no
-    /// dot.
+    /// The record part of the name as given, alias or not.
+    record: String,
+    /// C's `pfldDes->name`: `VAL` when the name carried no field part.
     field: String,
     /// C's `paddr->pfldDes`, which is never null after `dbNameToAddr`.
     ///
@@ -1120,6 +1190,13 @@ struct DbAddr {
     /// RESOLVED — the declaration is what C resolves against — so this is a
     /// missing width, not a missing field.
     fld_des: Option<&'static FieldDesc>,
+    /// The name carried the `$` modifier, so the address is C's `DBR_CHAR`
+    /// view of the field ([`DbAddr::char_view`]).
+    char_view: bool,
+    /// `dbFindRecord` accepts the name too — nothing but white space after
+    /// the field part (`dbStaticLib.c:1856-1858`) — which is what `dbpr`
+    /// resolves with after `nameToAddr`.
+    find_field_ok: bool,
 }
 
 impl DbAddr {
@@ -1132,6 +1209,364 @@ impl DbAddr {
         match self.fld_des {
             Some(fd) => field_addr_types(fd, value),
             None => (DbfCode::NoAccess, DbfCode::NoAccess),
+        }
+    }
+
+    /// The `REC.FIELD` name [`PvDatabase::get_pv`] reads this address by.
+    ///
+    /// [`PvDatabase::get_pv`]: crate::server::database::PvDatabase::get_pv
+    fn pv(&self) -> String {
+        format!("{}.{}", self.record, self.field)
+    }
+
+    /// The field as C's `$` modifier re-types it (`dbAccess.c:682-701`), or
+    /// `None` for a field that modifier refuses.
+    fn char_view(&self) -> Option<CharView> {
+        let inst = self.rec.read();
+        let Some(desc) = self.fld_des else {
+            // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
+            return match inst.get_virtual_field(&self.field)? {
+                EpicsValue::String(s) => Some(CharView {
+                    source: CharSource::Attribute,
+                    bytes: s.as_bytes().to_vec(),
+                    count: MAX_STRING_SIZE,
+                    no_elements: MAX_STRING_SIZE,
+                    field_type: DbfCode::Char,
+                    truncate: false,
+                }),
+                _ => None,
+            };
+        };
+        let value = inst.resolve_field(&self.field);
+        if crate::types::link_class_of(desc).is_some() {
+            let text = match value {
+                Some(EpicsValue::String(s)) => s.as_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            return Some(CharView {
+                source: CharSource::Link,
+                bytes: text,
+                count: PVLINK_STRINGSZ,
+                no_elements: PVLINK_STRINGSZ,
+                field_type: desc.declared_dbf,
+                truncate: false,
+            });
+        }
+        if field_addr_types(desc, value.as_ref()).0 != DbfCode::String {
+            return None;
+        }
+        // `no_elements = field_size`, and `dbGet`'s count is
+        // `get_array_info`'s where the field is `SPC_DBADDR`.
+        let (mut bytes, count, capacity) = match value? {
+            EpicsValue::String(s) => {
+                let size = usize::from(desc.size);
+                (s.as_bytes().to_vec(), size, size)
+            }
+            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+                let sizv = long_string_sizv(&inst);
+                (b.to_vec(), long_string_len(&inst), sizv)
+            }
+            EpicsValue::StringArray(v) => {
+                let first = v.first().map(|s| s.as_bytes().to_vec());
+                (first.unwrap_or_default(), v.len(), MAX_STRING_SIZE)
+            }
+            _ => return None,
+        };
+        bytes.resize(capacity, 0);
+        Some(CharView {
+            source: CharSource::Field,
+            bytes,
+            count,
+            no_elements: capacity,
+            field_type: DbfCode::Char,
+            truncate: desc.declared_dbf == DbfCode::String,
+        })
+    }
+}
+
+/// C's `MAX_STRING_SIZE` (`epicsTypes.h:59`), the `field_size` of a
+/// `DBF_STRING` array element and of an attribute.
+const MAX_STRING_SIZE: usize = 40;
+
+/// C's `PVLINK_STRINGSZ` (`dbDefs.h:79`), the char-array length `$` gives a
+/// link field.
+const PVLINK_STRINGSZ: usize = 1024;
+
+/// lsi/lso/printf `LEN`, which their `get_array_info` reports as VAL's
+/// element count (`lsiRecord.c:154`, `lsoRecord.c:196`, `printfRecord.c:432`):
+/// 0 until VAL is first written, `strlen + 1` after.
+fn long_string_len(inst: &crate::server::record::RecordInstance) -> usize {
+    match inst.resolve_field("LEN") {
+        Some(EpicsValue::ULong(n)) => n as usize,
+        _ => 0,
+    }
+}
+
+/// lsi/lso/printf `SIZV`, the buffer their `cvt_dbaddr` serves VAL in.
+fn long_string_sizv(inst: &crate::server::record::RecordInstance) -> usize {
+    match inst.resolve_field("SIZV") {
+        Some(EpicsValue::UShort(n)) => usize::from(n),
+        Some(v) => v.to_f64().map_or(0, |n| n as usize),
+        None => 0,
+    }
+}
+
+/// A char-buffered `DBF_STRING` (lsi/lso/printf VAL) read as `DBR_STRING`
+/// with one element requested: `get_array_info`'s `LEN` decides between no
+/// element and the one string (`dbAccess.c:963-1003`).
+fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsValue) -> EpicsValue {
+    match val {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+            if long_string_len(inst) == 0 {
+                EpicsValue::StringArray(Vec::new().into())
+            } else {
+                let text: Vec<u8> = b.iter().copied().take_while(|&c| c != 0).collect();
+                EpicsValue::String(crate::types::PvString::from_bytes(text))
+            }
+        }
+        _ => val.clone(),
+    }
+}
+
+/// Where a `$` address's characters come from — `dbGet`'s three routes
+/// (`dbAccess.c:944-952`).
+#[derive(Clone, Copy, PartialEq)]
+enum CharSource {
+    /// `pfield` itself, converted element by element.
+    Field,
+    /// `getLinkValue`: the link's `dbGetString` text.
+    Link,
+    /// `getAttrValue`: the attribute's text.
+    Attribute,
+}
+
+/// C's `DBADDR` after the `$` modifier (`dbAccess.c:682-701`) and what
+/// `dbGet` / `dbPut` do with it.
+struct CharView {
+    source: CharSource,
+    /// The characters `pfield` holds, zero-padded to `no_elements`; a link's
+    /// or attribute's text.
+    bytes: Vec<u8>,
+    /// `dbGet`'s element count: `get_array_info`'s for an `SPC_DBADDR`
+    /// field, else `no_elements`.
+    count: usize,
+    /// `paddr->no_elements`: the string's `field_size`, or
+    /// `PVLINK_STRINGSZ` for a link.
+    no_elements: usize,
+    /// `paddr->field_type`: `DBF_CHAR`, or a link's own type.
+    field_type: DbfCode,
+    /// `pfldDes->field_type == DBF_STRING`, so a `DBR_CHAR` read ends at the
+    /// first NUL (`dbAccess.c:1037-1045`).
+    truncate: bool,
+}
+
+impl CharView {
+    /// `dbGet(paddr, target, …, &n_req)`: the elements read, counted as C
+    /// counts them, or `None` for a refused request type.
+    fn get(&self, target: crate::types::DbFieldType, n_req: usize) -> Option<EpicsValue> {
+        use crate::types::DbFieldType as T;
+        if n_req == 0 {
+            return Some(char_elements(target, &[]));
+        }
+        let text = |max: usize| -> Vec<u8> {
+            let end = self.bytes.len().min(max);
+            let mut t: Vec<u8> = self.bytes[..end]
+                .iter()
+                .copied()
+                .take_while(|&c| c != 0)
+                .collect();
+            t.push(0);
+            t
+        };
+        match (self.source, target) {
+            (CharSource::Field, _) => {
+                // `dbAccess.c:963`: one element is the scalar path, with no
+                // terminator rule.
+                let n = if self.count == 1 {
+                    1
+                } else {
+                    n_req.min(self.count).min(self.bytes.len())
+                };
+                let mut b = self.bytes[..n].to_vec();
+                if self.count != 1 && target == T::Char && self.truncate && n > 0 {
+                    b[n - 1] = 0;
+                    let len = b.iter().position(|&c| c == 0).unwrap_or(n);
+                    b.truncate(len + 1);
+                }
+                Some(char_elements(target, &b))
+            }
+            (_, T::String) => {
+                let mut t = text(MAX_STRING_SIZE - 1);
+                t.pop();
+                Some(EpicsValue::String(crate::types::PvString::from_bytes(t)))
+            }
+            (CharSource::Link, T::Double) => Some(EpicsValue::Double(f64::NAN)),
+            (_, T::Char | T::UChar) => Some(char_elements(target, &text(n_req - 1))),
+            _ => None,
+        }
+    }
+
+    /// `dbPutField(paddr, dbrType, …)` of `written` — `None` for one element
+    /// of `target` (`dbtpf`), else `dbpf`'s `strlen + 1` characters — as the
+    /// value the record's put path stores, or `None` where C refuses it.
+    fn put_value(&self, inst_value: Option<&EpicsValue>, written: CharWrite) -> Option<EpicsValue> {
+        use crate::types::DbFieldType as T;
+        match self.source {
+            // `dbPutField` returns `S_db_noMod` (`dbAccess.c:1254`).
+            CharSource::Attribute => None,
+            // `dbPutFieldLink` takes a string, or a char array whose last
+            // element is its NUL (`dbAccess.c:1087-1099`).
+            CharSource::Link => {
+                let text = match written {
+                    CharWrite::Chars(b) => b.split(|&c| c == 0).next().unwrap_or(&[]).to_vec(),
+                    CharWrite::One(T::String, EpicsValue::String(s)) => s.as_bytes().to_vec(),
+                    CharWrite::One(T::Char | T::UChar, v) if v.to_f64() == Some(0.0) => Vec::new(),
+                    CharWrite::One(..) => return None,
+                };
+                Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
+            }
+            CharSource::Field => {
+                let dbaddr = !matches!(inst_value, Some(EpicsValue::String(_)));
+                let chars: Vec<u8> = match written {
+                    CharWrite::Chars(b) => b,
+                    // `dbFastPutConvertRoutine` for a plain string field,
+                    // `dbPutConvertRoutine` for an `SPC_DBADDR` one.
+                    CharWrite::One(T::String, EpicsValue::String(s)) => {
+                        let text = s.as_str_lossy();
+                        let row = if dbaddr {
+                            crate::types::c_parse::put_string_element
+                        } else {
+                            crate::types::c_parse::put_string
+                        };
+                        match row("VAL", crate::types::c_parse::NumericField::Char, &text) {
+                            Ok(crate::types::c_parse::Converted::Stored(v)) => {
+                                vec![v.to_f64().map_or(0, |n| n as i64 as u8)]
+                            }
+                            Ok(crate::types::c_parse::Converted::Unchanged) => {
+                                vec![self.bytes.first().copied().unwrap_or(0)]
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                    CharWrite::One(_, v) => vec![v.to_f64().map_or(0, |n| n as i64 as u8)],
+                };
+                let n = chars.len().min(self.no_elements);
+                let mut buf = self.bytes.clone();
+                buf[..n].copy_from_slice(&chars[..n]);
+                Some(match inst_value {
+                    Some(EpicsValue::StringArray(old)) => {
+                        // waveform `put_array_info` makes NORD the count
+                        // just written.
+                        let mut elems: Vec<crate::types::PvString> = old.to_vec();
+                        elems.resize(n.max(1), crate::types::PvString::from_bytes(Vec::new()));
+                        elems.truncate(n);
+                        if let Some(first) = elems.first_mut() {
+                            *first = crate::types::PvString::from_bytes(nul_text(&buf));
+                        }
+                        EpicsValue::StringArray(elems.into())
+                    }
+                    _ => {
+                        // lsi/lso `put_array_info` terminates at the count
+                        // written (`lsiRecord.c:168-171`).
+                        if dbaddr && n < buf.len() {
+                            buf[n] = 0;
+                        }
+                        EpicsValue::String(crate::types::PvString::from_bytes(nul_text(&buf)))
+                    }
+                })
+            }
+        }
+    }
+}
+
+/// What a `$` put writes.
+enum CharWrite {
+    /// `dbpf`'s `DBR_CHAR` array, NUL included.
+    Chars(Vec<u8>),
+    /// `dbtpf`'s one element of a request type.
+    One(crate::types::DbFieldType, EpicsValue),
+}
+
+/// `dbPutField` through a `$` address: the put the record's own path makes of
+/// [`CharView::put_value`]'s result, `false` where C's status is non-zero.
+fn char_view_put(ctx: &CommandContext, addr: &DbAddr, view: &CharView, written: CharWrite) -> bool {
+    let current = addr.rec.read().resolve_field(&addr.field);
+    let Some(value) = view.put_value(current.as_ref(), written) else {
+        return false;
+    };
+    ctx.block_on(
+        ctx.db()
+            .put_record_field_from_ca_no_notify(&addr.record, &addr.field, value),
+    )
+    .is_ok()
+}
+
+/// The bytes before the first NUL.
+fn nul_text(b: &[u8]) -> Vec<u8> {
+    b.iter().copied().take_while(|&c| c != 0).collect()
+}
+
+/// `dbGetConvertRoutine[DBF_CHAR][target]` over `chars`, each an
+/// `epicsInt8`.
+fn char_elements(target: crate::types::DbFieldType, chars: &[u8]) -> EpicsValue {
+    use crate::types::DbFieldType as T;
+    let i = |c: &u8| *c as i8;
+    match target {
+        T::String => EpicsValue::StringArray(
+            chars
+                .iter()
+                .map(|c| crate::types::PvString::from_bytes(i(c).to_string().into_bytes()))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::Char => EpicsValue::CharArray(chars.to_vec().into()),
+        T::UChar => EpicsValue::UCharArray(chars.to_vec().into()),
+        T::Short => EpicsValue::ShortArray(
+            chars
+                .iter()
+                .map(|c| i16::from(i(c)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::UShort => {
+            EpicsValue::UShortArray(chars.iter().map(|c| i(c) as u16).collect::<Vec<_>>().into())
+        }
+        T::Long => EpicsValue::LongArray(
+            chars
+                .iter()
+                .map(|c| i32::from(i(c)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::ULong => {
+            EpicsValue::ULongArray(chars.iter().map(|c| i(c) as u32).collect::<Vec<_>>().into())
+        }
+        T::Int64 => EpicsValue::Int64Array(
+            chars
+                .iter()
+                .map(|c| i64::from(i(c)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::UInt64 => {
+            EpicsValue::UInt64Array(chars.iter().map(|c| i(c) as u64).collect::<Vec<_>>().into())
+        }
+        T::Float => EpicsValue::FloatArray(
+            chars
+                .iter()
+                .map(|c| f32::from(i(c)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::Double => EpicsValue::DoubleArray(
+            chars
+                .iter()
+                .map(|c| f64::from(i(c)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        T::Enum => {
+            EpicsValue::EnumArray(chars.iter().map(|c| i(c) as u16).collect::<Vec<_>>().into())
         }
     }
 }
@@ -1200,22 +1635,15 @@ fn dbget_bad_dbrtype_message(dbr: DbfCode, field_type: DbfCode) -> String {
     )
 }
 
-fn dbgf_failed(ctx: &CommandContext, pname: &str) {
-    let (rec_name, field) = parse_pv_name(pname);
-    let field = if field.is_empty() { "VAL" } else { field };
-    let (field_type, dbr, field_name) = match ctx.db().get_record(rec_name) {
-        Some(rec) => {
-            let inst = rec.read();
-            match inst.field_desc(field) {
-                Some(fd) => {
-                    let (ft, dbr) = field_addr_types(fd, None);
-                    (ft, dbr, fd.name)
-                }
-                None => (DbfCode::NoAccess, DbfCode::NoAccess, field),
-            }
+fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
+    let (field_type, dbr, field_name) = match addr.fld_des {
+        Some(fd) => {
+            let (ft, dbr) = field_addr_types(fd, None);
+            (ft, dbr, fd.name)
         }
-        None => (DbfCode::NoAccess, DbfCode::NoAccess, field),
+        None => (DbfCode::NoAccess, DbfCode::NoAccess, addr.field.as_str()),
     };
+    let rec_name = addr.record.as_str();
     crate::server::recgbl::rec_gbl_dbaddr_error(
         "Illegal Database Request Type",
         rec_name,
@@ -1253,21 +1681,32 @@ fn dbgf_failed(ctx: &CommandContext, pname: &str) {
 /// This port has no attribute table — that is the subject `dbPutAttribute` is
 /// still waiting on — so an attribute name reports not-found here.
 fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
+    let view = addr.char_view.then(|| addr.char_view()).flatten();
     let inst = addr.rec.read();
     let field = addr.field.as_str();
     let value = inst.resolve_field(field);
-    let (field_type, dbr) = addr.types(value.as_ref());
+    let (mut field_type, mut dbr) = addr.types(value.as_ref());
     // C: `no_elements = 1` (`dbAccess.c:635`), overwritten by `cvt_dbaddr`
     // with the CAPACITY for an array — `paddr->no_elements = prec->nelm`
     // (`waveformRecord.c::cvt_dbaddr`), never `NORD`. Reading the current
     // element count instead printed `No Elements: 0` for an unwritten
     // waveform where C prints its `NELM`. `field_native_count` is the same
     // NELM-first rule `CaChannel::create` already applies for `gft`/`pft`.
-    let elements = inst
+    let mut elements = inst
         .record
         .field_native_count(field)
         .or_else(|| inst.record.get_field(field).map(|v| v.count()))
         .unwrap_or(1);
+    let mut field_size = addr
+        .fld_des
+        .and_then(|fd| c_field_size(field_type, fd.size));
+    // The `$` modifier's re-typing (`dbAccess.c:682-701`).
+    if let Some(view) = view {
+        field_type = view.field_type;
+        dbr = DbfCode::Char;
+        elements = view.no_elements as _;
+        field_size = Some(1);
+    }
 
     match addr.fld_des {
         Some(fd) => ctx.println(&format!(
@@ -1287,10 +1726,7 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
         field_type as i16,
         field_type.name(),
     ));
-    match addr
-        .fld_des
-        .and_then(|fd| c_field_size(field_type, fd.size))
-    {
+    match field_size {
         Some(n) => ctx.println(&format!("    Field Size: {n}")),
         None => ctx.println("    Field Size: (none)"),
     }
@@ -1363,14 +1799,14 @@ fn cmd_dbgf() -> CommandDef {
             // `nameToAddr` cannot resolve. A field the record type DECLARES
             // resolves, and its read then fails inside `dbGetField`, which is
             // a different outcome and prints differently.
-            if name_to_addr(ctx, name).is_none() {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:366-368`).
             if !dbt_requires_ioc_init(ctx, "dbgf") {
                 return Ok(CommandOutcome::Failed);
             }
-            dbgf_echo(ctx, name);
+            dbgf_echo(ctx, &addr);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1404,16 +1840,30 @@ fn cmd_dbpf() -> CommandDef {
 
             // C resolves the name before it puts (`dbTest.c:405-406`),
             // so an unknown PV never reaches `dbPutField`; C returns -1.
-            if name_to_addr(ctx, name).is_none() {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:408-410`).
             if !dbt_requires_ioc_init(ctx, "dbpf") {
                 return Ok(CommandOutcome::Failed);
             }
 
-            let (base, field) = parse_pv_name(name);
-            let field = field.to_ascii_uppercase();
+            // `$` makes the address `DBR_CHAR` with `no_elements > 1`, so C
+            // puts `strlen + 1` characters (`dbTest.c:413-416`).
+            if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
+                let mut chars = value_str.as_bytes().to_vec();
+                chars.push(0);
+                let put_ok = char_view_put(ctx, &addr, &view, CharWrite::Chars(chars));
+                dbgf_echo(ctx, &addr);
+                return Ok(if put_ok {
+                    CommandOutcome::Continue
+                } else {
+                    CommandOutcome::Failed
+                });
+            }
+
+            let base = addr.record.as_str();
+            let field = addr.field.clone();
 
             // Try to determine the field type for proper parsing
             let dbf_type = ctx.block_on(async {
@@ -1578,7 +2028,7 @@ fn cmd_dbpf() -> CommandDef {
             // `dbPutField` returned, so the read-back is that one
             // printer rather than a second rendering, and a rejected
             // put still shows the value the record kept.
-            dbgf_echo(ctx, name);
+            dbgf_echo(ctx, &addr);
 
             if put_failed {
                 Ok(CommandOutcome::Failed)
@@ -2077,9 +2527,24 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // field the address landed on, so `dbpr T:AI.DESC` and `dbpr T:AI`
     // are the same report — but a field the record type does not declare
     // still has to fail the resolution first.
-    let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
+    let Some(DbAddr {
+        rec, find_field_ok, ..
+    }) = name_to_addr(ctx, name)
+    else {
         return false;
     };
+    // `dbpr_report` re-finds the name with `dbFindRecord` and
+    // `errMessage(status, pname)`s a refusal (`dbTest.c:1172-1176`), which for
+    // anything after the field part — `LSI.VAL$` — is `S_dbLib_recNotFound`.
+    // The file and line are ours, as at `access_commands.rs`'s `errMessage`.
+    if !find_field_ok {
+        crate::runtime::log::errlog_printf(&format!(
+            "Record Not Found filename=\"{}\" line number={}  {name}\n",
+            file!(),
+            line!()
+        ));
+        return false;
+    }
 
     // C `dbpr_report` (`dbTest.c:1156-1276`) walks the record
     // type's WHOLE field table — `dbCommon` first, then the
@@ -2529,6 +2994,10 @@ fn cmd_dbtgf() -> CommandDef {
             if !dbt_requires_ioc_init(ctx, "dbtgf") {
                 return Ok(CommandOutcome::Failed);
             }
+            if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
+                dbtgf_char_view(ctx, &addr, &view);
+                return Ok(CommandOutcome::Continue);
+            }
             // C prints `addr.dbr_field_type` here with NO `DBR_STRING`
             // substitution — that is `dbgf`'s alone — so a menu field's
             // native line reads `DBF_ENUM`. The option block below is decided
@@ -2589,6 +3058,38 @@ fn cmd_dbtgf() -> CommandDef {
     )
 }
 
+/// `dbtgf` on a `$` address: the option block for `DBF_CHAR` (or the link's
+/// type), the empty native `DBR_CHAR` read, then each request type with
+/// `MIN(no_elements, sizeof(long[400]) / element size)` elements
+/// (`dbTest.c:527-591`).
+fn dbtgf_char_view(ctx: &CommandContext, addr: &DbAddr, view: &CharView) {
+    {
+        let inst = addr.rec.read();
+        let snap = inst.snapshot_for_field(&addr.field);
+        for line in dbtgf_option_lines(&inst, view.field_type, snap.as_ref()) {
+            ctx.println(&line);
+        }
+    }
+    for line in printbuffer_lines(DbfCode::Char.name(), 0, Some(&[])) {
+        ctx.println(&line);
+    }
+    for (dbr, target) in DBTGF_REQUEST_TYPES {
+        let n_req = view
+            .no_elements
+            .min(DBTGF_BUFFER_BYTES / target.element_size());
+        let lines = match view.get(target, n_req) {
+            Some(v) => printbuffer_block(dbr, target.dbf_code(), &v),
+            None => printbuffer_lines(dbr, n_req, None),
+        };
+        for line in lines {
+            ctx.println(&line);
+        }
+    }
+}
+
+/// `sizeof(long[400])`, `dbtgf`'s read buffer (`dbTest.c:503`).
+const DBTGF_BUFFER_BYTES: usize = 3200;
+
 /// `dbtpf "pv name", "value"` — Database Test Put Field.
 ///
 /// C `dbtpf` (`dbTest.c:604-709`): put the text as every `DBR_*` type
@@ -2617,13 +3118,13 @@ fn cmd_dbtpf() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, _) = parse_pv_name(name);
-            let Some(DbAddr { field, .. }) = name_to_addr(ctx, name) else {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
             if !dbt_requires_ioc_init(ctx, "dbtpf") {
                 return Ok(CommandOutcome::Failed);
             }
+            let (base, field) = (addr.record.as_str(), addr.field.as_str());
 
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 // C parses the text ITSELF before the put, with
@@ -2656,9 +3157,34 @@ fn cmd_dbtpf() -> CommandDef {
                     ctx.println(&format!("Cvt to DBR_{dbr} failed."));
                     continue;
                 };
+                if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
+                    if !char_view_put(ctx, &addr, &view, CharWrite::One(target, value)) {
+                        ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
+                        continue;
+                    }
+                    // `MIN(no_elements, sizeof(buffer) / field_size)` of
+                    // `DBR_CHAR` (`dbTest.c:690-696`).
+                    let lines = addr
+                        .char_view()
+                        .and_then(|v| {
+                            v.get(
+                                crate::types::DbFieldType::Char,
+                                v.no_elements.min(DBGF_BUFFER_BYTES),
+                            )
+                        })
+                        .map(|v| printbuffer_block("CHAR", DbfCode::Char, &v))
+                        .unwrap_or_default();
+                    let mut lines = lines.into_iter();
+                    let head = lines.next().unwrap_or_default();
+                    ctx.println(&format!("Put as DBR_{dbr:<6} Ok, result as {head}"));
+                    for line in lines {
+                        ctx.println(&line);
+                    }
+                    continue;
+                }
                 let put: CaResult<()> = ctx.block_on(
                     ctx.db()
-                        .put_record_field_from_ca_no_notify(base, &field, value),
+                        .put_record_field_from_ca_no_notify(base, field, value),
                 );
                 if put.is_err() {
                     ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
@@ -2667,19 +3193,25 @@ fn cmd_dbtpf() -> CommandDef {
                 // C re-reads in the record's NATIVE type and prints it
                 // through the same tab buffer, whose column count
                 // restarts after the un-tabbed prefix (`dbTest.c:690-696`).
-                let readback = ctx.db().get_record(base).and_then(|r| {
-                    let inst = r.read();
-                    let snap = inst.snapshot_for_field(&field)?;
-                    let dbr = inst.field_desc(&field).map_or(DbfCode::String, |fd| {
-                        field_addr_types(fd, Some(&snap.value)).1
-                    });
-                    Some((snap, dbr))
-                });
+                let readback = {
+                    let inst = addr.rec.read();
+                    inst.snapshot_for_field(field).map(|snap| {
+                        let dbr = inst.field_desc(field).map_or(DbfCode::String, |fd| {
+                            field_addr_types(fd, Some(&snap.value)).1
+                        });
+                        let value = if dbr == DbfCode::String {
+                            long_string_value(&inst, &snap.value)
+                        } else {
+                            snap.value.clone()
+                        };
+                        (value, dbr)
+                    })
+                };
                 let lines = match &readback {
                     // C re-reads with `addr.dbr_field_type` and does NOT
                     // substitute `DBR_STRING` for an enum field the way `dbgf`
                     // does, so a `bo` read-back is `DBF_ENUM: 1`.
-                    Some((snap, dbr)) => native_readback_lines(*dbr, &snap.value),
+                    Some((value, dbr)) => native_readback_lines(*dbr, value),
                     None => Vec::new(),
                 };
                 let mut lines = lines.into_iter();
@@ -3604,10 +4136,10 @@ fn cmd_dbtr() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, _) = parse_pv_name(name);
-            let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
+            let Some(DbAddr { rec, record, .. }) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
+            let base = record.as_str();
             if !dbt_requires_ioc_init(ctx, "dbtr") {
                 return Ok(CommandOutcome::Failed);
             }
@@ -4613,10 +5145,8 @@ fn scan_lists_by_priority(ctx: &CommandContext, names: &[String]) -> [Vec<String
 /// over the event name, not a key, and an absent one prints every event.
 ///
 /// C walks `pevent_list`, the chain `eventNameToHandle` builds, so it
-/// can print an `Event "x"` header for a name that has been registered
-/// but holds no records. The port has no such chain — an event exists
-/// exactly as long as some record's `EVNT` names it — so an empty event
-/// does not appear here. Everything an event actually scans does.
+/// prints an `Event "x"` header for a name that has been registered but
+/// holds no records.
 fn cmd_scanpel() -> CommandDef {
     CommandDef::new(
         "scanpel",
@@ -4627,36 +5157,14 @@ fn cmd_scanpel() -> CommandDef {
         }],
         "scanpel [\"event name\"] — Print info for records with SCAN = \"Event\".",
         |args: &[ArgValue], ctx: &CommandContext| {
-            use crate::server::database::scan_index::EventName;
-            use crate::server::record::ScanType;
-
-            // C walks `pevent_list`, which `scanAdd` fills at `iocInit`, so
-            // before then it prints nothing and returns 0 — no refusal line.
-            if !scan_lists_exist(ctx) {
-                return Ok(CommandOutcome::Continue);
-            }
-
             let pattern = match args.first() {
                 Some(ArgValue::String(p)) if !p.is_empty() => Some(p.clone()),
                 _ => None,
             };
 
-            // Group the Event-scanned records by the event their `EVNT`
-            // names, through the same normalisation `post_event_named`
-            // routes on, so `"5"`, `" 5 "` and `"5.0"` are one event
-            // here exactly as they are one handle in C.
-            let mut by_event: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for name in ctx.block_on(ctx.db().records_for_scan(ScanType::Event)) {
-                let Some(rec) = ctx.db().get_record(&name) else {
-                    continue;
-                };
-                let Some(evnt) = EventName::of(&rec.read().common.evnt).map(|e| e.to_string())
-                else {
-                    continue;
-                };
-                by_event.entry(evnt).or_default().push(name);
-            }
+            // C walks `pevent_list` with no gate: before `iocInit` it holds
+            // only what an iocsh `postEvent` created.
+            let by_event = ctx.db().event_lists();
 
             for (event, names) in &by_event {
                 if let Some(pattern) = &pattern
@@ -8879,6 +9387,239 @@ mod tests {
         assert!(
             run_cmd(&ctx, "scanpel", &[]).contains("Event \"alarm\""),
             "so must scanpel's"
+        );
+    }
+
+    /// C `scanpel` walks `pevent_list`, newest handle first, and labels a
+    /// numeric event by its `%i` number. Oracle — softIoc 7.0.10.1-DEV on
+    /// six calcs loaded TH, TD, TF, TA, TB, T3 with EVNT `0x10`, `16`,
+    /// `0x1p4`, `alpha`, `beta`, `3`:
+    ///
+    /// ```text
+    /// epics> scanpel
+    /// Event "3"
+    ///  Priority Low
+    ///     T3
+    /// Event "beta"
+    ///  Priority Low
+    ///     TB
+    /// Event "alpha"
+    ///  Priority Low
+    ///     TA
+    /// Event "16"
+    ///  Priority Low
+    ///     TH                              TD                              TF
+    /// ```
+    #[test]
+    fn scanpel_walks_events_newest_first_like_c() {
+        use crate::server::record::ScanType;
+
+        let (db, ctx) = make_ctx();
+        let events = [
+            ("TH", "0x10"),
+            ("TD", "16"),
+            ("TF", "0x1p4"),
+            ("TA", "alpha"),
+            ("TB", "beta"),
+            ("T3", "3"),
+        ];
+        ctx.block_on(async {
+            for (name, _) in events {
+                db.add_record(name, Box::new(AiRecord::new(1.0)))
+                    .await
+                    .unwrap();
+            }
+        });
+        for (name, evnt) in events {
+            {
+                let rec = db.get_record(name).unwrap();
+                let mut w = rec.write();
+                w.common.scan = ScanType::Event;
+                w.common.evnt = evnt.to_string();
+            }
+            db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
+        }
+        ctx.block_on(db.ioc_init());
+
+        let headers: Vec<String> = run_cmd(&ctx, "scanpel", &[])
+            .lines()
+            .filter(|l| l.starts_with("Event "))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "Event \"3\"",
+                "Event \"beta\"",
+                "Event \"alpha\"",
+                "Event \"16\""
+            ]
+        );
+        let out = run_cmd(&ctx, "scanpel", &["16"]);
+        for name in ["TH", "TD", "TF"] {
+            assert!(out.contains(name), "{name} is on event 16 — got:\n{out}");
+        }
+    }
+
+    /// C `dbgf` reads a long-string VAL as `DBR_STRING` and prints it as one
+    /// string; a CHAR waveform and a `$` view of a string or link field are
+    /// char arrays, which C prints as one quoted string under `DBF_CHAR[n]`.
+    /// `$` on any other field, or on an undotted name, is not found.
+    /// Oracle — softIoc
+    /// 7.0.10.1-DEV, each record holding "abc":
+    ///
+    /// ```text
+    /// dbgf LSI      -> DBF_STRING:         "abc"
+    /// dbgf LSO      -> DBF_STRING:         "abc"
+    /// dbgf PF       -> DBF_STRING:         "abc"
+    /// dbgf WF       -> DBF_CHAR[3]:        "abc"
+    /// dbgf LSI.VAL$ -> DBF_CHAR[4]:        "abc"   (LSO, PF, SI alike)
+    /// dbgf LSO.DOL$ -> DBF_CHAR:           0 = 0x0
+    /// dbgf AI.VAL$  -> PV 'AI.VAL$' not found
+    /// dbgf LSI$     -> PV 'LSI$' not found
+    /// ```
+    #[test]
+    fn dbgf_prints_a_long_string_val_as_softioc_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lstr.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LSI\") { field(INP, {const:\"abc\"}) }\n\
+             record(lso, \"LSO\") { }\n\
+             record(printf, \"PF\") { field(FMT, \"abc\") }\n\
+             record(waveform, \"WF\") { field(NELM, \"8\") field(FTVL, \"CHAR\") field(INP, [97,98,99]) }\n\
+             record(ai, \"AI\") { }\n\
+             record(stringin, \"SI\") { field(VAL, \"abc\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["LSI.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["LSO.VAL", "abc"]);
+        run_cmd(&ctx, "dbpf", &["PF.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["WF.PROC", "1"]);
+        for (pv, want) in [
+            ("LSI", "DBF_STRING:         \"abc\"     \n"),
+            ("LSO", "DBF_STRING:         \"abc\"     \n"),
+            ("PF", "DBF_STRING:         \"abc\"     \n"),
+            ("WF", "DBF_CHAR[3]:        \"abc\"     \n"),
+            ("LSI.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("LSO.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("PF.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("SI.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("LSO.DOL$", "DBF_CHAR:           0 = 0x0   \n"),
+            ("AI.VAL$", "PV 'AI.VAL$' not found\n"),
+            ("LSI$", "PV 'LSI$' not found\n"),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// An empty long-string VAL is `get_array_info`'s zero elements, a
+    /// stringin's is one empty string. Oracle — softIoc 7.0.10.1-DEV, nothing
+    /// written:
+    ///
+    /// ```text
+    /// dbgf LSI / LSO / PF -> DBF_STRING[0]: (empty)
+    /// dbgf SI             -> DBF_STRING:         ""
+    /// dbgf LSO.VAL$       -> DBF_CHAR[0]: (empty)
+    /// dbgf SI.VAL$        -> DBF_CHAR:           0 = 0x0
+    /// ```
+    #[test]
+    fn dbgf_prints_an_empty_long_string_val_as_softioc_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LSI\") { }\n\
+             record(lso, \"LSO\") { }\n\
+             record(printf, \"PF\") { }\n\
+             record(stringin, \"SI\") { }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, want) in [
+            ("LSI", "DBF_STRING[0]: (empty)        \n"),
+            ("LSO", "DBF_STRING[0]: (empty)        \n"),
+            ("PF", "DBF_STRING[0]: (empty)        \n"),
+            ("SI", "DBF_STRING:         \"\"        \n"),
+            ("LSO.VAL$", "DBF_CHAR[0]: (empty)          \n"),
+            ("SI.VAL$", "DBF_CHAR:           0 = 0x0   \n"),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// `scanpel` walks C's event table, not the records' EVNT: an event a
+    /// calcout's OEVT names exists from `init_record`, ahead of the
+    /// `buildScanLists` events, and one an event record posts or iocsh
+    /// `postEvent` names exists from then on. Oracle — softIoc 7.0.10.1-DEV:
+    ///
+    /// ```text
+    /// record(calc, "TA")    { field(SCAN, "Event") field(EVNT, "alpha") }
+    /// record(calcout, "CO") { field(OEVT, "oev") field(CALC, "1") }
+    /// record(calc, "TB")    { field(SCAN, "Event") field(EVNT, "beta") }
+    /// record(calc, "TO")    { field(EVNT, "oev") }
+    /// record(stringin, "SP") { field(VAL, "posted") }
+    /// record(event, "EP")   { field(INP, "SP") }
+    ///
+    /// epics> scanpel                  -> beta(TB) alpha(TA) oev
+    /// epics> dbpf EP.PROC 1; scanpel  -> posted beta(TB) alpha(TA) oev
+    /// epics> postEvent shellev; scanpel -> shellev posted beta alpha oev
+    /// epics> dbpf TO.SCAN Event; scanpel -> ... oev(TO)
+    /// ```
+    #[test]
+    fn scanpel_walks_the_event_table_like_c() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evtab.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"TA\") { field(SCAN, \"Event\") field(EVNT, \"alpha\") field(CALC, \"VAL+1\") }\n\
+             record(calcout, \"CO\") { field(OEVT, \"oev\") field(CALC, \"1\") }\n\
+             record(calc, \"TB\") { field(SCAN, \"Event\") field(EVNT, \"beta\") field(CALC, \"VAL+1\") }\n\
+             record(calc, \"TO\") { field(EVNT, \"oev\") field(CALC, \"VAL+1\") }\n\
+             record(stringin, \"SP\") { field(VAL, \"posted\") }\n\
+             record(event, \"EP\") { field(INP, \"SP\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+
+        let headers = |ctx: &CommandContext| -> Vec<String> {
+            run_cmd(ctx, "scanpel", &[])
+                .lines()
+                .filter_map(|l| l.strip_prefix("Event \"")?.strip_suffix('"'))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(headers(&ctx), ["beta", "alpha", "oev"]);
+        assert!(
+            run_cmd(&ctx, "scanpel", &["oev"]).ends_with("Event \"oev\"\n"),
+            "an event no record scans on prints its header alone"
+        );
+
+        // The event record's post runs on a callback task.
+        run_cmd(&ctx, "dbpf", &["EP.PROC", "1"]);
+        for _ in 0..500 {
+            if headers(&ctx).len() == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(headers(&ctx), ["posted", "beta", "alpha", "oev"]);
+
+        run_cmd(&ctx, "postEvent", &["shellev"]);
+        assert_eq!(headers(&ctx), ["shellev", "posted", "beta", "alpha", "oev"]);
+
+        run_cmd(&ctx, "dbpf", &["TO.SCAN", "Event"]);
+        let oev = run_cmd(&ctx, "scanpel", &["oev"]);
+        assert_eq!(
+            oev,
+            format!("Event \"oev\"\n Priority Low\n    {:<28}\n", "TO")
         );
     }
 
@@ -13887,5 +14628,57 @@ Total 3 records, 2 aliases
             cmd.handler.call(&args, &ctx).is_err(),
             "dbDumpPath must reject a first argument that is not pdbbase"
         );
+    }
+    /// `REC.FIELD$` through all seven `dbTest.c` commands against softIoc
+    /// R7.0.10-146 stdout, `testdata/dollar_view/softioc.out`, which
+    /// `softIoc -d t.db < cmds.txt 2>/dev/null` printed. Two columns are
+    /// masked, each a deliberate non-match documented at its printer:
+    /// `Field Address` ([`print_db_addr`]) and `time =`
+    /// ([`dbtgf_option_lines`]). dbpr/dbtr's `Record Not Found` is errlog.
+    #[test]
+    fn dollar_view_commands_match_softioc_r7_0_10_146() {
+        let (db, ctx) = make_ctx();
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/server/iocsh/testdata/dollar_view"
+        );
+        run_cmd(&ctx, "dbLoadRecords", &[&format!("{dir}/t.db")]);
+        ctx.block_on(db.ioc_init());
+        let mut out = String::new();
+        for line in include_str!("testdata/dollar_view/cmds.txt").lines() {
+            let mut words = line.split_whitespace();
+            let cmd = words.next().unwrap();
+            // iocsh's quoting: `""` is the empty argument, `'...'` one word.
+            let args: Vec<&str> = words
+                .map(|a| {
+                    if a == "\"\"" {
+                        ""
+                    } else {
+                        a.trim_matches('\'')
+                    }
+                })
+                .collect();
+            out.push_str("epics> ");
+            out.push_str(&run_cmd(&ctx, cmd, &args));
+        }
+        let mask = |s: &str| -> String {
+            s.lines()
+                .map(|l| {
+                    if l.starts_with("time = ") {
+                        "time = <masked>".to_string()
+                    } else if let Some(i) = l.find("Record Address: ") {
+                        format!("{}Record Address: <masked>", &l[..i])
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let want = include_str!("testdata/dollar_view/softioc.out");
+        for (n, (got, want)) in mask(&out).lines().zip(mask(want).lines()).enumerate() {
+            assert_eq!(got, want, "line {}", n + 1);
+        }
+        assert_eq!(mask(&out).lines().count(), mask(want).lines().count());
     }
 }

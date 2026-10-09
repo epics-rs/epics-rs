@@ -1430,10 +1430,49 @@ mod link_cache {
         }
 
         #[cfg(debug_assertions)]
+        pub(super) fn field_at(&self, i: usize) -> &'static str {
+            self.0[i].field
+        }
+
+        #[cfg(debug_assertions)]
         pub(super) fn text_at(&self, i: usize) -> &str {
             &self.0[i].text
         }
+
+        /// The slot of each [`CycleLink`] the type declares. The slots never
+        /// move once built, so the instance settles these at construction.
+        pub(super) fn cycle_slots(&self) -> CycleLinkSlots {
+            CycleLinkSlots(CycleLink::FIELDS.map(|field| {
+                self.position(field)
+                    .and_then(|i| u8::try_from(i).ok())
+                    .unwrap_or(u8::MAX)
+            }))
+        }
+
+        /// Slot of `link`, `None` when the type does not declare it.
+        #[inline(always)]
+        pub(super) fn cycle_slot(slots: CycleLinkSlots, link: CycleLink) -> Option<usize> {
+            let i = slots.0[link as usize];
+            (i != u8::MAX).then_some(usize::from(i))
+        }
     }
+
+    /// A single link field the process cycle reads by a name its type fixes:
+    /// the closed-loop and pre-input `DOL`, sel's `NVL`, aSub's `SUBL`.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum CycleLink {
+        Dol,
+        Nvl,
+        Subl,
+    }
+
+    impl CycleLink {
+        const FIELDS: [&'static str; 3] = ["DOL", "NVL", "SUBL"];
+    }
+
+    /// [`LinkSlots`] index of each [`CycleLink`], `u8::MAX` for none.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct CycleLinkSlots([u8; 3]);
 
     #[cfg(test)]
     mod tests {
@@ -1458,11 +1497,32 @@ mod link_cache {
             assert_eq!(slots.position("OUTA"), None);
             assert_eq!(slots.position("ABCDEFGH"), None);
         }
+
+        #[test]
+        fn cycle_slots_name_the_slot_a_search_finds_or_none() {
+            let slots = LinkSlots(
+                ["OUT", "DOL", "NVL"]
+                    .map(|field| LinkSlot {
+                        key: field_key(field),
+                        field,
+                        parsed: parse("", LinkFieldType::In),
+                        #[cfg(debug_assertions)]
+                        text: String::new(),
+                    })
+                    .into(),
+            );
+            let cycle = slots.cycle_slots();
+            assert_eq!(LinkSlots::cycle_slot(cycle, CycleLink::Dol), Some(1));
+            assert_eq!(LinkSlots::cycle_slot(cycle, CycleLink::Nvl), Some(2));
+            assert_eq!(LinkSlots::cycle_slot(cycle, CycleLink::Subl), None);
+        }
     }
 }
 
 pub use link_cache::LinkCache;
-pub(crate) use link_cache::{LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks};
+pub(crate) use link_cache::{
+    CycleLink, CycleLinkSlots, LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks,
+};
 
 /// How one process cycle of one record instance runs, resolved from the
 /// instance's own link kinds and device type (where [`ProcessPlan`] holds what
@@ -2694,6 +2754,8 @@ pub struct RecordInstance {
     pub parsed_tsel: LinkCache,
     /// Every other link field's parse — see [`Self::record_link`].
     link_slots: LinkSlots,
+    /// The [`CycleLink`]s' slots in `link_slots` — see [`Self::cycle_link`].
+    cycle_links: CycleLinkSlots,
     /// `(OMSL, OIF)` menu indices, 0 for a type without the field; settled at
     /// construction and by the two put funnels, so the cycle's closed-loop
     /// DOL test reads no field by name.
@@ -3054,21 +3116,6 @@ impl MonitorPlan {
     }
 }
 
-/// C `monitor()`'s post of the deadband field, as assembled by the single owner
-/// [`RecordInstance::deadband_post`].
-pub(crate) struct DeadbandPost {
-    /// C's `monitor_mask` for this cycle. Also the mask the
-    /// [`Record::fields_posted_with_value_mask`] secondaries ride: C posts them
-    /// from INSIDE the `if (monitor_mask)` guard, with the same mask.
-    pub mask: EventMask,
-    /// The deadband field's own post — `(field, value)`. `None` when no class
-    /// fired (C's `if (monitor_mask)` skips the post) or the field does not
-    /// resolve. The name is the one [`Record::monitor_deadband_field`] already
-    /// hands out as a `&'static str`; owning a copy of it charged a malloc per
-    /// cycle for a string that is in the binary.
-    pub field: Option<(&'static str, EpicsValue)>,
-}
-
 /// A value's `DBR_STRING` form, for a source whose field metadata is NOT
 /// reachable (an external CA/PVA link, a constant, an lnkCalc result) — the
 /// fallback half of [`RecordInstance::field_as_dbr_string`], which is also the
@@ -3218,10 +3265,13 @@ pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
 /// The previous-value trackers a C `monitor()` compares against and never
 /// posts: `oraw`/`orbv` (the last RVAL/RBV) on the raw-value records, and
 /// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type,
-/// mbboDirect's `obit` (the last bits posted), and the output records' `pval`
-/// (the last VAL the OOPT test or DOL fetch compares to).
+/// mbboDirect's `obit` (the last bits posted), the output records' `pval`
+/// (the last VAL the OOPT test or DOL fetch compares to), and `afvl`, the
+/// alarm filter's accumulator `checkAlarms` stores (aiRecord.c:401).
 /// A `caput` to one still posts, through the put path.
-const MONITOR_TRACKER_FIELDS: [&str; 7] = ["ORAW", "ORBV", "MLST", "ALST", "LALM", "OBIT", "PVAL"];
+const MONITOR_TRACKER_FIELDS: [&str; 8] = [
+    "ORAW", "ORBV", "MLST", "ALST", "LALM", "OBIT", "PVAL", "AFVL",
+];
 
 /// The fields `collect_subscriber_posts`'s walk discards before it
 /// change-detects them, on every cycle of the record's life. Both the walk and
@@ -3353,11 +3403,8 @@ impl RecordInstance {
         // masks: motorRecord.cc:3476-3507 RBV, aiRecord.c VAL). A record
         // like motor deadbands its readback; its VAL then routes through
         // the change-detected loop in `collect_subscriber_posts`.
-        let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
-        if let Some((field, value)) = deadband.field {
-            snapshot.push((field.into(), value, deadband.mask));
-        }
-        self.collect_subscriber_posts(snapshot, deadband.mask, alarm_bits, include_val, marked);
+        let deadband_mask = self.deadband_post(snapshot, alarm_bits, include_val, include_archive);
+        self.collect_subscriber_posts(snapshot, deadband_mask, alarm_bits, include_val, marked);
         // C waveform/aai/aao `monitor()` posts HASH with a literal
         // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
         // 317-319), independent of the VAL post mask. `array_hash_changed`
@@ -3386,18 +3433,19 @@ impl RecordInstance {
             return CyclePlan::General;
         }
         let arm = match self.cycle_plan.1 {
-            // What the stamp does not own: SIMM is a record field a client
-            // writes, the device slot is set by init, and a continuation
-            // re-enters with PACT held.
+            // What the stamp does not own: the device slot is set by init,
+            // and a continuation re-enters with PACT held.
             CyclePlan::ConstSoftIn | CyclePlan::DbSoftIn
-                if is_continuation
-                    || self.device.is_some()
-                    || self.record.simm_cells().is_none_or(|c| c.simm != 0) =>
+                if is_continuation || self.device.is_some() =>
             {
                 CyclePlan::General
             }
             p => p,
         };
+        debug_assert!(
+            arm == CyclePlan::General || self.record.simm_cells().is_some_and(|c| c.simm == 0),
+            "SIMM changed without invalidate_plan"
+        );
         #[cfg(test)]
         {
             self.ran_arm = arm;
@@ -3414,7 +3462,10 @@ impl RecordInstance {
     #[cold]
     #[inline(never)]
     fn replan(&mut self, plan: &ProcessPlan) {
+        // SIMM is stamped: a put reaches it through `invalidate_plan_for`, and
+        // the SIML read that also writes it runs only on a General plan.
         let plain = plan.is_plain_input()
+            && self.record.simm_cells().is_some_and(|c| c.simm == 0)
             && self.common.dtyp.is_soft()
             && self.common.sscn.is_unset()
             && crate::server::recgbl::simm::is_constant(self.parsed_sdis.link())
@@ -3466,7 +3517,7 @@ impl RecordInstance {
     }
 
     /// The single owner of [`CyclePlan`] staleness: whatever the plan was
-    /// resolved from — a link text, DTYP, TSE, TSEL, SSCN — changed.
+    /// resolved from — a link text, DTYP, TSE, TSEL, SSCN, SIMM — changed.
     pub(crate) fn invalidate_plan(&mut self) {
         self.plan_rev = self.plan_rev.wrapping_add(1);
     }
@@ -3475,14 +3526,6 @@ impl RecordInstance {
     /// `TSE == -2` under a non-NO `SIMM` stamps the current time when there is
     /// no SIOL to take a stamp from, which is every output record (`siol ==
     /// NULL`). An input's SIOL stamp is applied by the simulated-input tail.
-    #[inline(always)]
-    pub(crate) fn stamp_time(&mut self, tsel: crate::server::database::TselStamp) {
-        let begun = self.common.begin_stamp();
-        self.stamp_time_begun(begun, tsel);
-    }
-
-    /// [`Self::stamp_time`] for a cycle that opened its stamp earlier
-    /// ([`TselStamp::stamp_begun`](crate::server::database::TselStamp)).
     #[inline(always)]
     pub(crate) fn stamp_time_begun(
         &mut self,
@@ -3502,7 +3545,17 @@ impl RecordInstance {
     pub(crate) fn invalidate_plan_for(&mut self, field: &str) {
         if matches!(
             field,
-            "FLNK" | "INP" | "OUT" | "DTYP" | "TSE" | "TSEL" | "SSCN" | "SDIS" | "SIML" | "SIOL"
+            "FLNK"
+                | "INP"
+                | "OUT"
+                | "DTYP"
+                | "TSE"
+                | "TSEL"
+                | "SSCN"
+                | "SDIS"
+                | "SIML"
+                | "SIOL"
+                | "SIMM"
         ) {
             self.invalidate_plan();
         }
@@ -3777,6 +3830,25 @@ impl RecordInstance {
             debug_assert!(false, "{}.{field}: not a link its type declares", self.name);
             return LinkSlots::none();
         };
+        self.slot_link(i)
+    }
+
+    /// [`Self::record_link`] for a [`CycleLink`], by the slot settled at
+    /// construction; no link when the type does not declare it.
+    #[inline(always)]
+    pub(crate) fn cycle_link(&self, link: CycleLink) -> &Arc<ParsedLink> {
+        match LinkSlots::cycle_slot(self.cycle_links, link) {
+            Some(i) => self.slot_link(i),
+            None => LinkSlots::none(),
+        }
+    }
+
+    /// Slot `i`'s parse, checked in debug builds against the text the record
+    /// holds.
+    #[inline]
+    fn slot_link(&self, i: usize) -> &Arc<ParsedLink> {
+        #[cfg(debug_assertions)]
+        let field = self.link_slots.field_at(i);
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.link_text(field).as_deref().unwrap_or(""),
@@ -3887,6 +3959,7 @@ impl RecordInstance {
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
         let link_slots = LinkSlots::of(record.as_ref());
+        let cycle_links = link_slots.cycle_slots();
         let dol_mode = (
             menu_index_of(&*record, "OMSL"),
             menu_index_of(&*record, "OIF"),
@@ -3908,6 +3981,7 @@ impl RecordInstance {
             parsed_siml: None,
             parsed_siol: None,
             link_slots,
+            cycle_links,
             dol_mode,
             selm,
             device: None,
@@ -6910,134 +6984,7 @@ impl RecordInstance {
         // those records carry no analog config, so they never reach here and
         // cannot double-raise.
         if self.common.analog_alarm.is_some() {
-            // VAL goes down in the variant the record stores it in, not
-            // flattened to `f64`: it is what picks the ladder's comparison
-            // domain, and `Int64(v) as f64` had already rounded the value
-            // before the first comparison ran.
-            let Some(input) = self.record.analog_alarm_input() else {
-                return;
-            };
-            self.evaluate_analog_alarm(input);
-        }
-    }
-
-    fn evaluate_analog_alarm(&mut self, input: super::AnalogAlarmInput) {
-        use crate::server::recgbl;
-
-        // Borrowed, not copied: the slot is disjoint from the record the
-        // filter below writes, and its last use is before the alarm commit.
-        let Some(cfg) = &self.common.analog_alarm else {
-            return;
-        };
-
-        // C `checkAlarms` returns immediately on a UDF cycle: it raises
-        // `UDF_ALARM`/`UDFS` (already done by `rec_gbl_check_udf` in
-        // `evaluate_alarms`), zeroes `AFVL` on the AFTC-capable records, and
-        // returns BEFORE the range check — so `LALM` is left untouched and
-        // `AFVL` is not filtered this cycle. The identical guard appears in
-        // every record that shares this arm (`aiRecord.c:319-323`,
-        // `aoRecord.c:383-386`, `longinRecord.c:274-278`,
-        // `longoutRecord.c:317-320`, `int64inRecord.c:267-271`,
-        // `int64outRecord.c:298-301`, `calcRecord.c:300-304`,
-        // `calcoutRecord.c:563-566`). AFTC-capable records (ai/longin/
-        // int64in/calc) carry `AFVL` and zero it (`prec->afvl = 0`); the
-        // out records (ao/longout/int64out/calcout) have no `AFVL` and just
-        // return. Running the range check here would drift `LALM` to `val`
-        // (NaN on an undefined cycle) and filter `AFVL` — both observable.
-        let super::AnalogAlarmInput {
-            val,
-            hyst,
-            lalm,
-            aftc,
-            afvl,
-        } = input;
-        if self.common.udf != 0 {
-            if afvl != 0.0 {
-                self.record.store_alarm_filter_value(0.0);
-            }
-            return;
-        }
-
-        // One rule for every ladder input: a record that DECLARES the field
-        // owns it, because `Record::put_field` absorbs the client's put before
-        // `put_common_field` ever runs, and only an undeclared field falls
-        // through to `CommonFields`. MDEL/ADEL/MLST/ALST in
-        // `check_monitor_deadbands` already read this way; HYST did not, so
-        // `int64in`/`int64out`'s `pub hyst` swallowed every put while the
-        // hysteresis compared against a permanent 0.0 — with `caget .HYST`
-        // reading the value back, which is what made it silent.
-        //
-        // `common.hyst` stays an `f64` and stays exact: after the limits moved
-        // to the declared type its only remaining readers are the
-        // `DBF_DOUBLE` records and longin/longout, and every `epicsInt32` is
-        // an `f64` exactly.
-
-        // C-style per-level hysteresis: alarm fires if val passes the level,
-        // OR if we were already at that alarm level (lalm == alev) and val
-        // hasn't retreated past the hysteresis margin.
-        //
-        // `alarm_range` is the C-style integer level: 1=Lolo, 2=Low,
-        // 3=Normal, 4=High, 5=Hihi. Required for the calc-record AFTC
-        // filter (`calcRecord.c::checkAlarms:339-381`) which filters
-        // on the range level (not on severity) and re-maps back.
-        // C's `checkAlarms` enables each level with a NONZERO test on the raw
-        // severity ordinal (`if (prec->hhsv && …)`) and passes that raw ordinal
-        // to `recGblSetSevr`; `recGblResetAlarms` then clamps the resulting
-        // *severity* to `INVALID_ALARM` while the *status* keeps the level. So an
-        // out-of-range selector (`HHSV = 4`) still fires HIHI and lands
-        // SEVR=INVALID/STAT=HIHI — reproduced by testing `!= 0` and mapping the
-        // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
-        // `Invalid`).
-        let mut alarm_range = cfg.range(val, hyst, lalm, self.common.hyst);
-
-        // C parity: the alarm-range AFTC low-pass filter
-        // (`{ai,longin,int64in,calc}Record.c::checkAlarms`) smooths the
-        // integer `alarmRange` and re-maps. Only records that carry the
-        // AFTC/AFVL fields run it; the rest answer AFTC = AFVL = 0 and so
-        // take neither arm's store.
-        if aftc > 0.0 {
-            let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
-                alarm_range,
-                aftc,
-                afvl,
-                self.common.time_last.get(),
-                self.common.time,
-            );
-            self.record.store_alarm_filter_value(new_afvl);
-            // C re-maps through the SAME `switch (alarmRange)` the ladder
-            // fell out of, so the filter changes only the range and
-            // `resolve` below answers for both.
-            alarm_range = filtered_range;
-        } else {
-            // aftc <= 0 disables the filter. C `checkAlarms`
-            // (e.g. aiRecord.c:356,401) initialises the local
-            // `afvl = 0` and unconditionally stores `prec->afvl =
-            // afvl` at the end, so a disabled filter drives AFVL to
-            // 0. Mirror that here so a stale accumulator from a prior
-            // `aftc > 0` run cannot mis-seed the filter if AFTC is
-            // re-enabled later.
-            if afvl != 0.0 {
-                self.record.store_alarm_filter_value(0.0);
-            }
-        }
-        // C re-maps the filtered range through the same table the ladder used.
-        let (new_sevr, new_stat, alev) = cfg.resolve(alarm_range);
-
-        if new_sevr != AlarmSeverity::NoAlarm {
-            // C `aiRecord.c:405-406` — the latch is armed to the THRESHOLD, and
-            // only when `recGblSetSevr` returns TRUE. A level that fires while a
-            // higher-or-equal severity is already pending (an MS input link, a
-            // SIMM alarm, a device INVALID) raises nothing, so C leaves LALM
-            // where it was; arming it there would let the next cycle's
-            // `lalm == alev && val >= alev - hyst` clause hold an alarm C has
-            // already cleared.
-            if recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr) {
-                self.record.store_analog_lalm(alev.unwrap_or(val));
-            }
-        } else {
-            // No alarm condition: reset LALM to current value. C `aiRecord.c:409`
-            // does this unconditionally — only the alarm arm is gated.
-            self.record.store_analog_lalm(val);
+            self.record.check_analog_alarms(&mut self.common);
         }
     }
 
@@ -7572,10 +7519,7 @@ impl RecordInstance {
                 let (include_val, include_archive, _) = self.value_include_classes();
                 // No alarm bits: `recGblResetAlarms` has not run on this pending
                 // pass, so the post carries only the classes MDEL/ADEL fired.
-                let deadband = self.deadband_post(EventMask::NONE, include_val, include_archive);
-                if let Some((field, value)) = deadband.field {
-                    posts.push((field.into(), value, deadband.mask));
-                }
+                self.deadband_post(&mut posts, EventMask::NONE, include_val, include_archive);
                 continue;
             }
             if self.posted_value(&name).is_none_or(|prev| prev != &val) {
@@ -7909,8 +7853,6 @@ impl RecordInstance {
     ///   the archive `DBE_LOG` — an event's VAL reaches a `DBE_LOG` archiver on
     ///   no cycle at all.
     ///
-    /// [`DeadbandPost::field`] is `None` when no class fired, i.e. when C's
-    /// `if (monitor_mask)` guard would skip the post.
     /// C `monitor()`'s VALUE / LOG gate for the primary-value post —
     /// `(include_val, include_archive)`, the single owner every processing path
     /// feeds into [`Self::deadband_post`] and [`Self::collect_subscriber_posts`].
@@ -7941,13 +7883,17 @@ impl RecordInstance {
         (classes.value, classes.archive, classes.marked)
     }
 
+    /// C `monitor()`'s post of the deadband field, into `snapshot`. Returns
+    /// C's `monitor_mask`, which the [`Record::fields_posted_with_value_mask`]
+    /// secondaries ride: C posts them inside the same `if (monitor_mask)`.
     #[inline(always)]
     pub(crate) fn deadband_post(
         &self,
+        snapshot: &mut ProcessSnapshot,
         alarm_bits: EventMask,
         include_val: bool,
         include_archive: bool,
-    ) -> DeadbandPost {
+    ) -> EventMask {
         let MonitorPlan {
             deadband_field: field,
             log_suppressed,
@@ -7972,23 +7918,31 @@ impl RecordInstance {
         // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
         // C never sends. Gating here rather than at each builder keeps the
         // single owner of the deadband post the single enforcer of the set.
-        let value = if mask.is_empty()
+        if mask.is_empty()
             || !(alarm_alone_posts_value || include_val || include_archive)
             || !self
                 .record
                 .process_posted_fields()
                 .is_none_or(|allowed| allowed.contains(&field))
         {
-            None
-        } else if field == "VAL" {
+            return mask;
+        }
+        if self.subscribers.is_empty() {
+            // `notify_from_snapshot`'s gate, taken before the read: the post
+            // has no one to deliver to, and the value is a copy (an
+            // allocation for compress, waveform and the string records).
+            snapshot.push_unwatched(mask);
+            return mask;
+        }
+        let value = if field == "VAL" {
             self.record.val()
         } else {
             self.resolve_field_upper_at(field, self.monitor_plan.deadband_desc)
         };
-        DeadbandPost {
-            mask,
-            field: value.map(|v| (field, v)),
+        if let Some(value) = value {
+            snapshot.push((field.into(), value, mask));
         }
+        mask
     }
 
     #[inline(always)]

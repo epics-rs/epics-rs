@@ -89,8 +89,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance, SoftRead,
-    SoftReading,
+    CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance,
+    SoftRead, SoftReading,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -139,15 +139,15 @@ fn scan_alarm_refusal(
         crate::server::record::AlarmSeverity::Invalid,
         msg,
     );
-    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-    // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec, &VAL,
-    // DBE_VALUE|DBE_LOG)` plus recGblResetAlarms' `val_mask = DBE_ALARM` for
-    // the fresh transition). The alarm fields carry their C per-field masks
-    // (recGbl.c:202-222): this only runs on a fresh SCAN_ALARM/INVALID raise,
-    // so sevr AND stat both moved — SEVR posts DBE_VALUE, STAT/AMSG post the
-    // shared `stat_mask` = DBE_ALARM|DBE_VALUE.
-    let stat_mask = EventMask::ALARM | EventMask::VALUE;
+    let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+    // recGblResetAlarms posts the alarm fields before the VAL post it returns
+    // `val_mask = DBE_ALARM` for, so they lead the set in its order and masks.
     let mut changed_fields = crate::server::record::ProcessSnapshot::new();
+    alarm_field_posts(&instance.common, &alarm_result).for_each(|field, mask| {
+        if let Some(value) = instance.resolve_field(field) {
+            changed_fields.push((field.into(), value, mask));
+        }
+    });
     if let Some(val) = instance.record.val() {
         changed_fields.push((
             "VAL".into(),
@@ -155,24 +155,6 @@ fn scan_alarm_refusal(
             EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
         ));
     }
-    changed_fields.push((
-        "SEVR".into(),
-        EpicsValue::Short(instance.common.sevr as i16),
-        EventMask::VALUE,
-    ));
-    changed_fields.push((
-        "STAT".into(),
-        EpicsValue::Short(instance.common.stat as i16),
-        stat_mask,
-    ));
-    // Include AMSG so subscribers reading the alarm text observe the reason
-    // alongside the SCAN_ALARM transition (C `recGbl.c:210-211` posts STAT and
-    // AMSG together when `stat_mask` is non-zero).
-    changed_fields.push((
-        "AMSG".into(),
-        EpicsValue::String(instance.common.amsg.as_str().into()),
-        stat_mask,
-    ));
     Some(changed_fields)
 }
 
@@ -765,9 +747,9 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 /// fanout/seq SELN post in `links::apply_selm_alarm` are NOT clients: they
 /// carry C's `dbAccess.c:586-593` and `fanoutRecord.c:116` masks, not
 /// `recGblResetAlarms`'.)
-/// The publication half of a process cycle: fan the snapshot out to
-/// subscribers, post the alarm fields under their individual C masks, and
-/// report which classes the cycle emitted.
+/// The publication half of a process cycle: post the alarm fields under their
+/// individual C masks, fan the snapshot out to subscribers, and report which
+/// classes the cycle emitted.
 ///
 /// Takes the guard the segment already holds. C publishes from inside
 /// `monitor()`, which runs under the same `dbScanLock` that built the values
@@ -780,15 +762,30 @@ fn publish_cycle(
     backing: crate::server::database::LinkBacking<'_>,
     alarm_posts: AlarmPosts,
 ) -> CyclePosts {
+    let posts = CyclePosts::of(snapshot).with(alarm_posts.mask());
+    // The cycle with no alarm movement makes one call and keeps nothing but
+    // `posts` live across it.
+    if alarm_posts.mask().is_empty() {
+        instance.notify_from_snapshot(snapshot, backing);
+    } else {
+        publish_alarm_cycle(instance, snapshot, backing, alarm_posts);
+    }
+    posts
+}
+
+/// C `monitor()` opens with `recGblResetAlarms`, so SEVR/STAT/AMSG/ACKS reach
+/// a client's queue ahead of the cycle's value posts.
+#[inline(never)]
+fn publish_alarm_cycle(
+    instance: &mut RecordInstance,
+    snapshot: &crate::server::record::ProcessSnapshot,
+    backing: crate::server::database::LinkBacking<'_>,
+    alarm_posts: AlarmPosts,
+) {
+    alarm_posts.for_each(|field, mask| instance.notify_field(field, mask));
     // A value-class post advances the record's already-published state
     // (`RecordInstance::record_value_post`), so this is a `&mut` operation.
     instance.notify_from_snapshot(snapshot, backing);
-    let mut posts = CyclePosts::of(snapshot);
-    alarm_posts.for_each(|field, mask| {
-        instance.notify_field(field, mask);
-        posts = posts.with(mask);
-    });
-    posts
 }
 
 pub(crate) fn alarm_field_posts(
@@ -843,6 +840,17 @@ impl AlarmPosts {
         if self.acks {
             f("ACKS", EventMask::VALUE);
         }
+    }
+
+    /// The union of every post's mask; empty exactly when nothing posts.
+    #[inline(always)]
+    pub fn mask(&self) -> crate::server::recgbl::EventMask {
+        use crate::server::recgbl::EventMask;
+        let mut m = self.stat_mask;
+        if self.sevr || self.acks {
+            m |= EventMask::VALUE;
+        }
+        m
     }
 
     /// The posts as a list, for the callers that hold them.
@@ -3122,7 +3130,7 @@ impl PvDatabase {
                 _ => String::new(),
             };
             (
-                inst.record_link("SUBL").clone(),
+                inst.cycle_link(CycleLink::Subl).clone(),
                 read_str("ONAM"),
                 read_str("SNAM"),
             )
@@ -3917,7 +3925,7 @@ impl PvDatabase {
             let dol = if plan.fetches_dol_closed_loop {
                 let (omsl, oif) = instance.dol_mode();
                 if omsl == 1 {
-                    let dol_parsed = instance.record_link("DOL").clone();
+                    let dol_parsed = instance.cycle_link(CycleLink::Dol).clone();
                     // C `!dbLinkIsConstant(&prec->dol)` gates the per-cycle
                     // DOL fetch in every OMSL record (e.g.
                     // `aoRecord.c:181`, `boRecord.c:192`,
@@ -3947,7 +3955,7 @@ impl PvDatabase {
             // its value.
             let sel_nvl_link =
                 if plan.sel_nvl && instance.record.record_type() == "sel" && instance.selm() == 0 {
-                    let link = instance.record_link("NVL").clone();
+                    let link = instance.cycle_link(CycleLink::Nvl).clone();
                     (!matches!(*link, crate::server::record::ParsedLink::None)).then_some(link)
                 } else {
                     None
@@ -3963,9 +3971,8 @@ impl PvDatabase {
             {
                 // `!dbLinkIsConstant(&prec->dol)`, from the link the put cache
                 // already parsed; a type with no DOL link has nothing to fetch.
-                let dol_is_constant = instance
-                    .declared_record_link("DOL")
-                    .is_none_or(|link| crate::server::recgbl::simm::is_constant(link));
+                let dol_is_constant =
+                    crate::server::recgbl::simm::is_constant(instance.cycle_link(CycleLink::Dol));
                 instance.record.pre_input_link_actions(dol_is_constant)
             } else {
                 crate::server::record::ProcessActions::new()

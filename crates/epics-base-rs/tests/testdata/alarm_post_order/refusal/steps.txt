@@ -1,0 +1,15 @@
+monitor T T.SEVR T.STAT T.AMSG T.ACKS
+caput T.PROC 1
+caput T.ODLY 60
+caput T.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1
+caput SRC.PROC 1

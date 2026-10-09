@@ -159,6 +159,18 @@ pub struct CharView {
 }
 
 impl CharView {
+    /// Whether pvxs re-views the channel WITHOUT `$` as this char array, so
+    /// it serves a long string and puts through `putLongString`: a link, or
+    /// a scalar string with room past `MAX_STRING_SIZE + 1`
+    /// (`ioc/channel.cpp:56-72`).
+    pub fn re_views_plain_channel(&self) -> bool {
+        match self.source {
+            CharSource::Link => true,
+            CharSource::Field => self.no_elements > MAX_STRING_SIZE + 1,
+            CharSource::Attribute => false,
+        }
+    }
+
     /// The characters `pfield` holds, zero-padded to `no_elements`; a link's
     /// or attribute's text.
     pub fn bytes(&self) -> Vec<u8> {

@@ -113,3 +113,11 @@ async fn softioc_pin(case: &str) {
 async fn ai_alarm_ladder_and_deadbands_post_as_softioc() {
     softioc_pin("alarm_deadband").await;
 }
+
+/// AFTC 1000 keeps the filtered range at Normal while AFVL moves every
+/// cycle; C's `checkAlarms` stores AFVL (aiRecord.c:401) and no `monitor()`
+/// posts it, so `X.AFVL` sees only its connect event.
+#[epics_macros_rs::epics_test]
+async fn ai_afvl_is_never_posted_by_a_cycle() {
+    softioc_pin("aftc_afvl").await;
+}

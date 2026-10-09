@@ -61,7 +61,7 @@ pub use record_instance::{
     ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{
-    PreparedCommonLink, PreparedLink, PreparedLinks, SimLink, ambient_write_origin,
+    CycleLink, PreparedCommonLink, PreparedLink, PreparedLinks, SimLink, ambient_write_origin,
     input_dset_skips_convert, value_as_dbr_string,
 };
 pub use record_trait::{

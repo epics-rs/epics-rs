@@ -2,7 +2,8 @@ use crate::error::CaResult;
 use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
-use super::alarm::AlarmLimit;
+use super::CommonFields;
+use super::alarm::{AlarmLimit, AlarmSeverity};
 use super::scan::ScanType;
 use crate::server::device_support::DsetInit;
 
@@ -931,6 +932,135 @@ pub fn monitor_deadband_classes<R: Record + ?Sized>(
         archive,
         hash_changed: false,
         marked: false,
+    }
+}
+
+/// C `checkAlarms`' analog ladder — see [`Record::check_analog_alarms`].
+#[inline]
+pub(crate) fn analog_alarm_ladder<R: Record + ?Sized>(r: &mut R, common: &mut CommonFields) {
+    use crate::server::recgbl;
+
+    // Borrowed, not copied: the slot is disjoint from the record the
+    // filter below writes, and its last use is before the alarm commit.
+    let Some(cfg) = &common.analog_alarm else {
+        return;
+    };
+    // VAL goes down in the variant the record stores it in, not
+    // flattened to `f64`: it is what picks the ladder's comparison
+    // domain, and `Int64(v) as f64` had already rounded the value
+    // before the first comparison ran.
+    let Some(input) = r.analog_alarm_input() else {
+        return;
+    };
+
+    // C `checkAlarms` returns immediately on a UDF cycle: it raises
+    // `UDF_ALARM`/`UDFS` (already done by `rec_gbl_check_udf` in
+    // `evaluate_alarms`), zeroes `AFVL` on the AFTC-capable records, and
+    // returns BEFORE the range check — so `LALM` is left untouched and
+    // `AFVL` is not filtered this cycle. The identical guard appears in
+    // every record that shares this arm (`aiRecord.c:319-323`,
+    // `aoRecord.c:383-386`, `longinRecord.c:274-278`,
+    // `longoutRecord.c:317-320`, `int64inRecord.c:267-271`,
+    // `int64outRecord.c:298-301`, `calcRecord.c:300-304`,
+    // `calcoutRecord.c:563-566`). AFTC-capable records (ai/longin/
+    // int64in/calc) carry `AFVL` and zero it (`prec->afvl = 0`); the
+    // out records (ao/longout/int64out/calcout) have no `AFVL` and just
+    // return. Running the range check here would drift `LALM` to `val`
+    // (NaN on an undefined cycle) and filter `AFVL` — both observable.
+    let AnalogAlarmInput {
+        val,
+        hyst,
+        lalm,
+        aftc,
+        afvl,
+    } = input;
+    if common.udf != 0 {
+        if afvl != 0.0 {
+            r.store_alarm_filter_value(0.0);
+        }
+        return;
+    }
+
+    // One rule for every ladder input: a record that DECLARES the field
+    // owns it, because `Record::put_field` absorbs the client's put before
+    // `put_common_field` ever runs, and only an undeclared field falls
+    // through to `CommonFields`. MDEL/ADEL/MLST/ALST in
+    // `check_monitor_deadbands` already read this way; HYST did not, so
+    // `int64in`/`int64out`'s `pub hyst` swallowed every put while the
+    // hysteresis compared against a permanent 0.0 — with `caget .HYST`
+    // reading the value back, which is what made it silent.
+    //
+    // `common.hyst` stays an `f64` and stays exact: after the limits moved
+    // to the declared type its only remaining readers are the
+    // `DBF_DOUBLE` records and longin/longout, and every `epicsInt32` is
+    // an `f64` exactly.
+
+    // C-style per-level hysteresis: alarm fires if val passes the level,
+    // OR if we were already at that alarm level (lalm == alev) and val
+    // hasn't retreated past the hysteresis margin.
+    //
+    // `alarm_range` is the C-style integer level: 1=Lolo, 2=Low,
+    // 3=Normal, 4=High, 5=Hihi. Required for the calc-record AFTC
+    // filter (`calcRecord.c::checkAlarms:339-381`) which filters
+    // on the range level (not on severity) and re-maps back.
+    // C's `checkAlarms` enables each level with a NONZERO test on the raw
+    // severity ordinal (`if (prec->hhsv && …)`) and passes that raw ordinal
+    // to `recGblSetSevr`; `recGblResetAlarms` then clamps the resulting
+    // *severity* to `INVALID_ALARM` while the *status* keeps the level. So an
+    // out-of-range selector (`HHSV = 4`) still fires HIHI and lands
+    // SEVR=INVALID/STAT=HIHI — reproduced by testing `!= 0` and mapping the
+    // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
+    // `Invalid`).
+    let mut alarm_range = cfg.range(val, hyst, lalm, common.hyst);
+
+    // C parity: the alarm-range AFTC low-pass filter
+    // (`{ai,longin,int64in,calc}Record.c::checkAlarms`) smooths the
+    // integer `alarmRange` and re-maps. Only records that carry the
+    // AFTC/AFVL fields run it; the rest answer AFTC = AFVL = 0 and so
+    // take neither arm's store.
+    if aftc > 0.0 {
+        let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
+            alarm_range,
+            aftc,
+            afvl,
+            common.time_last.get(),
+            common.time,
+        );
+        r.store_alarm_filter_value(new_afvl);
+        // C re-maps through the SAME `switch (alarmRange)` the ladder
+        // fell out of, so the filter changes only the range and
+        // `resolve` below answers for both.
+        alarm_range = filtered_range;
+    } else {
+        // aftc <= 0 disables the filter. C `checkAlarms`
+        // (e.g. aiRecord.c:356,401) initialises the local
+        // `afvl = 0` and unconditionally stores `prec->afvl =
+        // afvl` at the end, so a disabled filter drives AFVL to
+        // 0. Mirror that here so a stale accumulator from a prior
+        // `aftc > 0` run cannot mis-seed the filter if AFTC is
+        // re-enabled later.
+        if afvl != 0.0 {
+            r.store_alarm_filter_value(0.0);
+        }
+    }
+    // C re-maps the filtered range through the same table the ladder used.
+    let (new_sevr, new_stat, alev) = cfg.resolve(alarm_range);
+
+    if new_sevr != AlarmSeverity::NoAlarm {
+        // C `aiRecord.c:405-406` — the latch is armed to the THRESHOLD, and
+        // only when `recGblSetSevr` returns TRUE. A level that fires while a
+        // higher-or-equal severity is already pending (an MS input link, a
+        // SIMM alarm, a device INVALID) raises nothing, so C leaves LALM
+        // where it was; arming it there would let the next cycle's
+        // `lalm == alev && val >= alev - hyst` clause hold an alarm C has
+        // already cleared.
+        if recgbl::rec_gbl_set_sevr(common, new_stat, new_sevr) {
+            r.store_analog_lalm(alev.unwrap_or(val));
+        }
+    } else {
+        // No alarm condition: reset LALM to current value. C `aiRecord.c:409`
+        // does this unconditionally — only the alarm arm is gated.
+        r.store_analog_lalm(val);
     }
 }
 
@@ -1952,6 +2082,8 @@ pub struct ProcessSnapshot(std::mem::ManuallyDrop<SnapshotPosts>);
 struct SnapshotPosts {
     head: Option<FieldPost>,
     rest: Vec<FieldPost>,
+    /// The classes of the posts made with no subscriber to deliver to.
+    unwatched: crate::server::recgbl::EventMask,
 }
 
 impl Drop for ProcessSnapshot {
@@ -1984,7 +2116,14 @@ impl ProcessSnapshot {
         }
     }
 
-    /// Whether this cycle posted nothing at all.
+    /// A post nothing is subscribed to: it publishes `mask`, which a CP
+    /// edge reads through [`Self::published_mask`], and has no value to
+    /// deliver, so its value is never read.
+    pub fn push_unwatched(&mut self, mask: crate::server::recgbl::EventMask) {
+        self.0.unwatched |= mask;
+    }
+
+    /// Whether this cycle has no post to deliver.
     pub fn is_empty(&self) -> bool {
         self.0.head.is_none()
     }
@@ -2019,9 +2158,7 @@ impl ProcessSnapshot {
     /// means the cycle published nothing and no monitor of any class fired.
     pub fn published_mask(&self) -> crate::server::recgbl::EventMask {
         self.iter()
-            .fold(crate::server::recgbl::EventMask::NONE, |acc, (_, _, m)| {
-                acc | *m
-            })
+            .fold(self.0.unwatched, |acc, (_, _, m)| acc | *m)
     }
 }
 
@@ -4206,6 +4343,7 @@ pub trait Record: Send + Sync + 'static {
     /// name is a full name match per cell, each answered in an `EpicsValue`
     /// the ladder then converts back to the number C reads as a struct
     /// member.
+    #[inline(always)]
     fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
         let val = match val_cell(self) {
             CycleRead::Value(v) => v.ladder()?,
@@ -4236,6 +4374,14 @@ pub trait Record: Send + Sync + 'static {
         })
     }
 
+    /// C `checkAlarms`' analog ladder — HIHI/HIGH/LOW/LOLO with HYST, the
+    /// AFTC filter and the LALM latch — for a record with an analog alarm
+    /// config. Not overridden, for the reason [`Self::monitor_value_classes`]
+    /// gives: compiled per type, the cells are read and stored as members.
+    fn check_analog_alarms(&mut self, common: &mut CommonFields) {
+        analog_alarm_ladder(self, common);
+    }
+
     /// Store the AFTC filter accumulator — C's `prec->afvl = afvl`.
     fn store_alarm_filter_value(&mut self, afvl: f64) {
         let _ = self.put_cycle_cell(CycleCell::Afvl, CycleValue::Double(afvl));
@@ -4244,6 +4390,7 @@ pub trait Record: Send + Sync + 'static {
     /// Arm C's `prec->lalm` latch, coerced to the type the cell is declared
     /// with: C declares LALM with the record's VAL type, so an `epicsInt64`
     /// latch must not round through a double.
+    #[inline(always)]
     fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
         store_cycle_cell(self, CycleCell::Lalm, lalm.into());
     }

@@ -421,6 +421,7 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 /// `""` for them, and PVA then serves the `"UDF"` condition string
 /// (`iocsource.cpp:230-236`). Only `mbboDirectRecord.c:191` passes a
 /// literal (`"UDFS"`).
+#[inline]
 pub fn rec_gbl_check_udf(
     common: &mut CommonFields,
     exact_one: bool,

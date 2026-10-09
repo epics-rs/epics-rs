@@ -555,12 +555,10 @@ fn special_after_put(
         .map(|(_, value_field)| *value_field);
     if let Some(value_field) = reseed {
         crate::server::record::reseed_constant_input_link(&mut *instance.record, field);
+        // The put funnel has already installed the link parsed before the hold.
         let constant = matches!(
-            instance.record.get_field(field),
-            Some(EpicsValue::String(text)) if matches!(
-                crate::server::record::parse_link_v2(&text.as_str_lossy()).link_type(),
-                crate::server::record::LinkType::Empty | crate::server::record::LinkType::Constant
-            )
+            instance.record_link(field).link_type(),
+            crate::server::record::LinkType::Empty | crate::server::record::LinkType::Constant
         );
         if constant {
             // The mask is the C call site's, and they disagree — calcout posts

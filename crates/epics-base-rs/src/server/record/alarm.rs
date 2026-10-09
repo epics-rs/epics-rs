@@ -133,6 +133,7 @@ impl AnalogAlarmConfig {
     /// `f64` for a `DBF_DOUBLE` VAL, `i128` for `DBF_LONG`/`DBF_INT64` so
     /// `alev - hyst` cannot overflow. `hyst` `None` is a type that keeps HYST
     /// in `CommonFields`, passed as `common_hyst`.
+    #[inline(always)]
     pub(crate) fn range(
         &self,
         val: AlarmLimit,
@@ -182,6 +183,7 @@ impl AnalogAlarmConfig {
     /// C `range_stat[]` plus the severity and `alev` each range selects. C
     /// reaches this mapping twice — out of the ladder and out of the AFTC
     /// filter's `switch (alarmRange)` — so it is one table.
+    #[inline]
     pub(crate) fn resolve(&self, range: u16) -> (AlarmSeverity, u16, Option<AlarmLimit>) {
         use crate::server::recgbl::alarm_status;
         let (sev, stat, field) = match range {

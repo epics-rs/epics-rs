@@ -1,0 +1,23 @@
+X                               0 UDF INVALID
+X.SEVR                          INVALID UDF INVALID
+X.STAT                          UDF UDF INVALID
+X.AMSG                           UDF INVALID
+X.ACKS                          NO_ALARM UDF INVALID
+X.SEVR                          NO_ALARM  
+X.STAT                          NO_ALARM  
+X.AMSG                            
+X.ACKS                          NO_ALARM  
+X                               1  
+X.SEVR                          MAJOR HIHI MAJOR
+X.STAT                          HIHI HIHI MAJOR
+X.AMSG                           HIHI MAJOR
+X.ACKS                          MAJOR HIHI MAJOR
+X                               12 HIHI MAJOR
+X.SEVR                          MINOR HIGH MINOR
+X.STAT                          HIGH HIGH MINOR
+X.AMSG                           HIGH MINOR
+X                               7 HIGH MINOR
+X.SEVR                          NO_ALARM  
+X.STAT                          NO_ALARM  
+X.AMSG                            
+X                               0  

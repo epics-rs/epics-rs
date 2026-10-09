@@ -238,3 +238,29 @@ async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
     let event = b_rx.try_recv().expect("the re-seed must post B");
     assert_eq!(event.snapshot.value, EpicsValue::Double(7.0));
 }
+
+/// The value post follows the link the put left, as C's `plink->type ==
+/// CONSTANT` does: an empty link posts B as it stands, a PV link posts
+/// nothing, and a constant after the PV link posts again.
+#[epics_macros_rs::epics_test]
+async fn transform_reseed_post_follows_the_link_the_put_left() {
+    use epics_base_rs::server::records::transform::TransformRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("T", Box::new(TransformRecord::default()))
+        .await
+        .unwrap();
+    let inst = db.get_record("T").unwrap();
+    let mut b_rx = inst
+        .write()
+        .add_subscriber("B", 1, DbFieldType::Double, EventMask::VALUE.bits())
+        .unwrap();
+    for text in ["7", "", "T.A", "3"] {
+        put(&db, "T", "INPB", text).await;
+    }
+    let mut got = Vec::new();
+    while let Ok(ev) = b_rx.try_recv() {
+        got.push(ev.snapshot.value.to_f64().unwrap());
+    }
+    assert_eq!(got, [7.0, 7.0, 3.0]);
+}

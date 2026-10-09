@@ -1004,6 +1004,19 @@ fn test_hyst_alarm_hysteresis() {
     assert_eq!(instance.common.sevr, AlarmSeverity::NoAlarm);
 }
 
+/// A VAL subscriber of every class, so the cycle's VAL post carries its value.
+fn watch_val(instance: &mut RecordInstance) -> epics_base_rs::server::event_queue::EventReader {
+    use epics_base_rs::server::recgbl::EventMask;
+    instance
+        .add_subscriber(
+            "VAL",
+            1,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .unwrap()
+}
+
 #[test]
 fn test_deadband_mdel() {
     // MDEL gates the DBE_VALUE class only. ADEL=0 archives every
@@ -1015,6 +1028,8 @@ fn test_deadband_mdel() {
     rec.mdel = 5.0;
     rec.adel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
     let val_mask = |snap: &epics_base_rs::server::record::ProcessSnapshot| {
         snap.iter()
             .find(|(k, _, _)| k == "VAL")
@@ -1063,6 +1078,8 @@ fn test_deadband_mdel_zero() {
     let mut rec = AiRecord::default();
     rec.mdel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
 
     // MDEL=0 does not fire on a zero delta; the VAL post this first process
     // does carry is the born-UDF -> NO_ALARM transition (DBE_ALARM), which C
@@ -1087,6 +1104,8 @@ fn test_deadband_mdel_negative() {
     let mut rec = AiRecord::default();
     rec.mdel = -1.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1186,6 +1205,8 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0; // VAL change of 1.0 is below the value deadband.
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
     // HIGH=0.5/Major so VAL=1.0 trips a HIGH alarm — a real
     // NoAlarm -> Major SEVR transition.
     instance.common.analog_alarm = Some(analog_alarm_config(

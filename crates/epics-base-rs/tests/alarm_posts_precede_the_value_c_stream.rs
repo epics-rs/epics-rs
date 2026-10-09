@@ -1,0 +1,146 @@
+//! The order a record's posts reach the event queue, against one softIoc
+//! R7.0.10 `camonitor -tn` client watching every field (`dbEvent.c` drains
+//! that client's ring in post order). C's `monitor()` calls
+//! `recGblResetAlarms` (recGbl.c:178-224: SEVR, STAT, AMSG, then ACKS when
+//! the acknowledge rule fires) before its own VAL post, and `dbProcess`'s
+//! MAX_LOCK refusal (dbAccess.c:549-555) does the same before posting VAL.
+//!
+//! The port delivers each subscription separately, so the order is read where
+//! it is decided: a filter on every subscriber records each event as it is
+//! posted. `testdata/alarm_post_order/<case>` holds the `.db`, the
+//! `steps.txt` it was driven with and the stream softIoc served.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::recgbl::alarm_condition_string;
+use epics_base_rs::server::record::MENU_ALARM_SEVR;
+use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::types::EpicsValue;
+
+/// Render one monitor event as `camonitor -tn` prints it.
+fn camonitor_line(pv: &str, snap: &Snapshot, enums: &[String]) -> String {
+    let value = match &snap.value {
+        EpicsValue::Double(v) if v.fract() == 0.0 => format!("{}", *v as i64),
+        EpicsValue::Double(v) => format!("{v}"),
+        EpicsValue::Enum(i) => enums[*i as usize].clone(),
+        EpicsValue::String(s) => s.to_string(),
+        other => panic!("{pv}: no camonitor rendering for {other:?}"),
+    };
+    let stat = match snap.alarm.status {
+        0 => "",
+        s => alarm_condition_string(s),
+    };
+    let sevr = match snap.alarm.severity {
+        0 => "",
+        s => MENU_ALARM_SEVR[s as usize],
+    };
+    format!("{pv:<31} {value} {stat} {sevr}")
+}
+
+/// Appends each event it passes to the one stream every subscriber shares.
+struct Record {
+    pv: String,
+    enums: Vec<String>,
+    stream: Arc<Mutex<Vec<String>>>,
+}
+
+impl SubscriptionFilter for Record {
+    fn name(&self) -> &'static str {
+        "record"
+    }
+
+    fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
+        self.stream.lock().unwrap().push(camonitor_line(
+            &self.pv,
+            &event.event.snapshot,
+            &self.enums,
+        ));
+        Some(event)
+    }
+}
+
+async fn softioc_pin(case: &str) {
+    let dir = format!(
+        "{}/tests/testdata/alarm_post_order/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).unwrap();
+    let (db, _) = IocBuilder::new()
+        .db_string(&read("t.db"), &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let steps = read("steps.txt");
+    let mut lines = steps.lines();
+    let monitor = lines.next().unwrap().strip_prefix("monitor ").unwrap();
+    let stream = Arc::new(Mutex::new(Vec::new()));
+    let mut readers = Vec::new();
+    for (sid, pv) in monitor.split_whitespace().enumerate() {
+        let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
+        let cell = db.get_record(rec).unwrap();
+        let connect = db.channel_snapshot_for_field(&cell, field, false).unwrap();
+        let enums: Vec<String> = connect
+            .enums
+            .as_ref()
+            .map(|e| e.strings.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        stream
+            .lock()
+            .unwrap()
+            .push(camonitor_line(pv, &connect, &enums));
+        let mut inst = cell.write();
+        readers.push(
+            inst.add_subscriber(
+                field,
+                sid as u32,
+                connect.value.db_field_type(),
+                (EventMask::VALUE | EventMask::ALARM).bits(),
+            )
+            .unwrap(),
+        );
+        assert!(inst.attach_filter_to_last_subscriber(
+            field,
+            Arc::new(Record {
+                pv: pv.to_string(),
+                enums,
+                stream: stream.clone(),
+            }),
+        ));
+    }
+    for step in lines {
+        let mut words = step.split_whitespace();
+        assert_eq!(words.next(), Some("caput"));
+        let pv = words.next().unwrap();
+        let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
+        let value = words.next().unwrap();
+        db.put_record_field_from_ca(rec, field, EpicsValue::String(value.into()))
+            .await
+            .unwrap();
+        // Outlasts the 0.1 s ODLY the refusal case's first cycle runs.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let mut got = stream.lock().unwrap().join("\n");
+    got.push('\n');
+    assert_eq!(got, read("softioc.out"), "{case}");
+}
+
+/// X leaves UDF (ACKS follows NO_ALARM), rises to HIHI (ACKS rises to MAJOR),
+/// falls to HIGH (ACKT holds ACKS at MAJOR, so no ACKS post) and clears.
+#[epics_macros_rs::epics_test]
+async fn alarm_fields_post_ahead_of_val_in_monitor_order() {
+    softioc_pin("raise").await;
+}
+
+/// T is held active by a 60 s ODLY while SRC's FLNK reaches it eleven times;
+/// the eleventh refusal raises SCAN_ALARM and posts SEVR, STAT, AMSG, ACKS and
+/// then VAL.
+#[epics_macros_rs::epics_test]
+async fn a_max_lock_refusal_posts_its_alarm_fields_ahead_of_val() {
+    softioc_pin("refusal").await;
+}

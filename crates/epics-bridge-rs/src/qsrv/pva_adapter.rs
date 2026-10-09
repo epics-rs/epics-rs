@@ -6,7 +6,7 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
-// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the exec-backend
 // suite.
 
 use epics_pva_rs::server_native::MonitorStream;

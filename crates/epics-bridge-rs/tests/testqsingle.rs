@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(31): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(33): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -788,6 +788,39 @@ async fn channel_with_field_suffix_binds_to_field() {
         matches!(val_after, Some(EpicsValue::Double(v)) if (v - 3.125).abs() < 1e-9),
         "VAL must NOT have been overwritten, got {val_after:?}"
     );
+}
+
+/// Put 45 characters to `LS:O` of an lso with `sizv` through the bridge,
+/// return `LEN`.
+async fn lso_long_string_put_len(sizv: u16) -> f64 {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            &format!(r#"record(lso, "LS:O") {{ field(SIZV, "{sizv}") }}"#),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let ch = BridgeChannel::new(db.clone(), "LS:O").await.expect("new");
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("x".repeat(45).into())),
+    ));
+    ch.put(&put).await.expect("put string");
+    let len = db.get_record("LS:O").unwrap().read().resolve_field("LEN");
+    len.and_then(|v| v.to_f64()).expect("LEN")
+}
+
+/// pvxs re-views an lso VAL whose `SIZV` exceeds 41 as a char array
+/// (`ioc/channel.cpp:56-72`), so the PUT is `putLongString`: 45 characters
+/// store with `LEN` 46; at `SIZV` 41 it is `putScalar`'s `DBR_STRING`, 39
+/// characters and `LEN` 40 — both `softIocPVX` 1.5.3 live.
+#[tokio::test]
+async fn lso_long_string_put_fills_sizv_past_41_only() {
+    assert_eq!(lso_long_string_put_len(64).await, 46.0);
+    assert_eq!(lso_long_string_put_len(41).await, 40.0);
 }
 
 /// BR-56 parity: an `lsi` long-string record's VAL is a `DBF_CHAR` array

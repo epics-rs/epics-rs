@@ -22,3 +22,7 @@ kodex-out/
 
 # caucus session infra (worktrees, logs) — never repo content
 .caucus/
+
+# cargo target dirs used as scratch build outputs
+/dbg2/
+/rt1/

@@ -44,9 +44,9 @@ async fn plain_constant_waveform_matches_softioc_dbconstloadarray_dbconstlink_c_
         [
             EpicsValue::DoubleArray(d.to_vec().into()),
             EpicsValue::LongArray(d.iter().map(|v| *v as i32).collect()),
-            // `(epicsInt8)1000.0` is UB; the x86 softIoc stores 0xe8, the port
-            // saturates (`types::c_cast`), so E_CHAR holds 127.
-            EpicsValue::CharArray(d.iter().map(|v| *v as i8 as u8).collect()),
+            // `(epicsInt8)1000.0` is UB; the x86 softIoc stores 0xe8 and
+            // `types::c_cast` takes the same 32-bit step, so E_CHAR holds 0xe8.
+            EpicsValue::CharArray(d.iter().map(|v| *v as i32 as u8).collect()),
         ]
     };
     // (prefix, waveform elements or None for a failed load, ai VAL, ai UDF)

@@ -630,20 +630,24 @@ impl BridgeChannel {
             // `DBF_CHAR` storage — that would parse the whole string as one
             // integer and reject the PUT.
             let text = pvif::long_string_value(&raw_val);
-            if self.string_view {
-                // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through
-                // the `$` address, the one owner CA and `dbpf` put through.
-                use epics_base_rs::server::database::char_view::{CharWrite, char_view};
-                let refused = || BridgeError::PutRejected(format!("{}: no $ view", self.pv_name));
-                let rec = self
-                    .db
-                    .get_record(&self.record_name)
-                    .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
-                let view = char_view(&rec.read(), &self.field).ok_or_else(refused)?;
+            use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+            let refused = || BridgeError::PutRejected(format!("{}: no $ view", self.pv_name));
+            let rec = self
+                .db
+                .get_record(&self.record_name)
+                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+            // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through the
+            // char address — `$`, or the plain one pvxs re-views — the one
+            // owner CA and `dbpf` put through.
+            let view = char_view(&rec.read(), &self.field)
+                .filter(|v| self.string_view || v.re_views_plain_channel());
+            if let Some(view) = view {
                 let mut chars = text.as_bytes().to_vec();
                 chars.push(0);
                 view.put_value(CharWrite::Chars(chars))
                     .ok_or_else(refused)?
+            } else if self.string_view {
+                return Err(refused());
             } else if self.value_dbf == DbFieldType::Char {
                 // The field's storage IS a `DBR_CHAR` array, so this is
                 // pvxs's `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`,

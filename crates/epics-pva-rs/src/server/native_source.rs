@@ -1060,14 +1060,9 @@ impl ChannelSource for PvDatabaseSource {
                 // This PUT is non-blocking and has no receiver to await, and
                 // parking a wait-set whose receiver is dropped would occupy
                 // `RecordInstance::notify` until the record's async work ends.
-                Some(PvEntry::Record(_)) => {
-                    put_record_field(
-                        &db,
-                        &cn,
-                        put_payload_to_epics(&value)?,
-                        &PutOptions::default(),
-                    )
-                    .await
+                Some(PvEntry::Record(rec)) => {
+                    let epics = record_put_value(&rec, &cn, &value)?;
+                    put_record_field(&db, &cn, epics, &PutOptions::default()).await
                 }
                 // Name not in the database: report it rather than falling
                 // through to a write that would silently find nothing.
@@ -1121,7 +1116,7 @@ impl ChannelSource for PvDatabaseSource {
             let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
                 return self.put_value(&name, value).await;
             };
-            let epics = put_payload_to_epics(&value)?;
+            let epics = record_put_value(&rec, &cn, &value)?;
             // pvxs reads `record._options.process` / `.block` off the INIT
             // pvRequest inside `onPut` (`singlesource.cpp:347-352`) and
             // routes the write on them; this source used to write
@@ -1519,6 +1514,36 @@ fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOption
         Some(PvField::Structure(s)) => PutOptions::from_pv_request(s, &ctx.log),
         _ => PutOptions::default(),
     }
+}
+
+/// A record channel's PUT payload as the value its field's put path takes.
+/// A string put to a char-array channel — `$`, or a plain one pvxs re-views
+/// ([`CharView::re_views_plain_channel`]) — is `putLongString`,
+/// `dbPut(DBR_CHAR, str, strlen+1)` (`ioc/iocsource.cpp:511`), so it goes
+/// through [`CharView::put_value`], the one owner CA, `dbpf` and QSRV put
+/// through; the record's own `DBR_STRING` put caps it at 39 characters.
+///
+/// [`CharView::put_value`]: epics_base_rs::server::database::char_view::CharView::put_value
+/// [`CharView::re_views_plain_channel`]: epics_base_rs::server::database::char_view::CharView::re_views_plain_channel
+fn record_put_value(
+    rec: &epics_base_rs::server::record::RecordCell,
+    cn: &ChannelName,
+    value: &PvField,
+) -> Result<EpicsValue, OpError> {
+    use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+    let epics = put_payload_to_epics(value)?;
+    let EpicsValue::String(text) = &epics else {
+        return Ok(epics);
+    };
+    let view = char_view(&rec.read(), &cn.field);
+    let view = match view {
+        Some(view) if cn.string_view || view.re_views_plain_channel() => view,
+        _ => return Ok(epics),
+    };
+    let mut chars = text.as_bytes().to_vec();
+    chars.push(0);
+    view.put_value(CharWrite::Chars(chars))
+        .ok_or_else(|| OpError::failed(format!("PUT: {}: no $ view", cn.field)))
 }
 
 /// Decode a record PUT payload down to the [`EpicsValue`] the field takes.
@@ -5215,6 +5240,47 @@ ASG(PLAIN) {
                 "a description".into()
             ))),
         );
+    }
+
+    /// Put 45 characters to `LS:O.VAL` of an lso with `sizv`, return `LEN`.
+    async fn long_string_put_len(sizv: u16) -> f64 {
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                &format!(r#"record(lso, "LS:O") {{ field(SIZV, "{sizv}") }}"#),
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "LS:O.VAL",
+                PvField::Scalar(ScalarValue::String("x".repeat(45).into())),
+                make_ctx("127.0.0.1", "anon", "ca"),
+            )
+            .await
+            .expect("PUT must succeed");
+        let len = db.get_record("LS:O").unwrap().read().resolve_field("LEN");
+        len.and_then(|v| v.to_f64()).expect("LEN")
+    }
+
+    /// pvxs re-views an lso VAL whose `SIZV` exceeds 41 as a char array
+    /// (`ioc/channel.cpp:56-72`), so a string PUT is `putLongString` and 45
+    /// characters store with `LEN` 46 — `softIocPVX` 1.5.3 live.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_put_fills_sizv() {
+        assert_eq!(long_string_put_len(64).await, 46.0);
+    }
+
+    /// At `SIZV` 41 pvxs leaves VAL a `DBF_STRING` scalar, so the PUT is
+    /// `putScalar`'s `DBR_STRING` and stores 39 characters, `LEN` 40 —
+    /// `softIocPVX` 1.5.3 live.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_put_at_sizv_41_is_a_dbr_string_put() {
+        assert_eq!(long_string_put_len(41).await, 40.0);
     }
 
     /// `$` on a field that is not a string is `S_dbLib_fieldNotFound`, which

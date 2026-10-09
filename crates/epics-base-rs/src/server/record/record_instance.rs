@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -881,13 +882,43 @@ pub(crate) enum ForwardTarget {
     /// together. Resolved here, under the guard that resolved the target, so
     /// a cycle with no DB forward link reads neither.
     Db {
-        name: String,
+        name: ManuallyDrop<String>,
         putf: bool,
-        notify: Option<Arc<crate::server::record::NotifyWaitSet>>,
+        notify: ManuallyDrop<Option<Arc<crate::server::record::NotifyWaitSet>>>,
     },
     /// An external `pva://` / `ca://` PV, C `dbScanFwdLink` → the link set's
     /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger.
-    External(String),
+    External(ManuallyDrop<String>),
+}
+
+/// The owning variants hold their payload in [`ManuallyDrop`] and this `Drop`
+/// is the one place that releases it, so [`ForwardTarget::None`] — the record
+/// with no forward link, which is nearly every cycle — has no payload glue
+/// to run: its drop is the one tag test below, inlined.
+impl Drop for ForwardTarget {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !matches!(self, Self::None) {
+            self.drop_payload();
+        }
+    }
+}
+
+impl ForwardTarget {
+    #[inline(never)]
+    fn drop_payload(&mut self) {
+        // SAFETY: `drop` runs once, and nothing reads the payload afterwards.
+        unsafe {
+            match self {
+                Self::Db { name, notify, .. } => {
+                    ManuallyDrop::drop(name);
+                    ManuallyDrop::drop(notify);
+                }
+                Self::External(pv) => ManuallyDrop::drop(pv),
+                Self::None => {}
+            }
+        }
+    }
 }
 /// What C's `readValue`/`writeValue` reaches as struct members — `prec->siml`,
 /// `->siol`, `->sims`, `->sdly` — and which stage of the cycle C put the SIOL
@@ -2980,9 +3011,9 @@ impl RecordInstance {
         // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
         match self.parsed_flnk.link() {
             ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
-                name: l.target().record.clone(),
+                name: ManuallyDrop::new(l.target().record.clone()),
                 putf: self.common.putf,
-                notify: self.notify.clone(),
+                notify: ManuallyDrop::new(self.notify.clone()),
             },
             ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_)
                 if self.record.should_fire_forward_link() =>
@@ -2990,7 +3021,7 @@ impl RecordInstance {
                 self.parsed_flnk
                     .external_pv_name()
                     .map_or(ForwardTarget::None, |s| {
-                        ForwardTarget::External(s.to_string())
+                        ForwardTarget::External(ManuallyDrop::new(s.to_string()))
                     })
             }
             // Constant / Hw / Calc / None carry no forward action.

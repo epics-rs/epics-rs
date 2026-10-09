@@ -970,15 +970,14 @@ impl InputLinkTexts {
         }
     }
 
-    /// The links of a type that declares none: read, and none set.
-    pub(crate) fn read_none() -> Self {
-        Self {
-            links: &[],
-            own: &[],
-            wired: 0,
-            read: true,
-        }
-    }
+    /// The links of a type that declares none: read, and none set. A
+    /// constant, so the cycle that has none borrows it and builds nothing.
+    pub(crate) const READ_NONE: Self = Self {
+        links: &[],
+        own: &[],
+        wired: 0,
+        read: true,
+    };
 
     /// The record's own set links, as `instance` holds them now.
     pub(crate) fn read_own(instance: &RecordInstance) -> Self {
@@ -1663,7 +1662,7 @@ struct CycleCtx<'c, 'a> {
     is_continuation: bool,
     device_callback: bool,
     plan: &'c crate::server::record::record_instance::ProcessPlan,
-    input_link_texts: InputLinkTexts,
+    input_link_texts: &'c InputLinkTexts,
     link_backing: crate::server::database::link_set::LinkBacking<'c>,
 }
 
@@ -1723,8 +1722,9 @@ struct InputStage {
     links: Option<LinkInputs>,
 }
 
-/// The cycle's slot for [`SoftDbInp`], present in the arm that reads one and
-/// a zero-sized nothing in every other, so those arms carry no drop glue.
+/// The cycle's slot for the INP value [`CyclePlan::DbSoftIn`] read, present in
+/// the arm that reads one and a zero-sized nothing in every other, so those
+/// arms carry no drop glue. The slot means one thing: the value to apply.
 struct Arm<const DB_INP: bool>;
 
 trait ArmInp {
@@ -1736,66 +1736,32 @@ impl ArmInp for Arm<false> {
 }
 
 impl ArmInp for Arm<true> {
-    type Slot = Option<SoftDbInp>;
+    type Slot = Option<EpicsValue>;
 }
 
 trait SoftDbSlot {
-    fn set(&mut self, read: SoftDbInp);
-    fn take_value(&mut self) -> Option<EpicsValue>;
-    fn inherited(
-        &self,
-    ) -> Option<&(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )>;
+    fn set(&mut self, value: Option<EpicsValue>);
+    fn take(&mut self) -> Option<EpicsValue>;
 }
 
 impl SoftDbSlot for () {
     #[inline(always)]
-    fn set(&mut self, _: SoftDbInp) {}
+    fn set(&mut self, _: Option<EpicsValue>) {}
     #[inline(always)]
-    fn take_value(&mut self) -> Option<EpicsValue> {
-        None
-    }
-    #[inline(always)]
-    fn inherited(
-        &self,
-    ) -> Option<&(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )> {
+    fn take(&mut self) -> Option<EpicsValue> {
         None
     }
 }
 
-impl SoftDbSlot for Option<SoftDbInp> {
+impl SoftDbSlot for Option<EpicsValue> {
     #[inline(always)]
-    fn set(&mut self, read: SoftDbInp) {
-        *self = Some(read);
+    fn set(&mut self, value: Option<EpicsValue>) {
+        *self = value;
     }
     #[inline(always)]
-    fn take_value(&mut self) -> Option<EpicsValue> {
-        self.as_mut().and_then(|r| r.value.take())
+    fn take(&mut self) -> Option<EpicsValue> {
+        Option::take(self)
     }
-    #[inline(always)]
-    fn inherited(
-        &self,
-    ) -> Option<&(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )> {
-        self.as_ref().and_then(|r| r.inherited.as_ref())
-    }
-}
-
-/// What [`PvDatabase::soft_db_inp_read`] hands the cycle: the INP value and
-/// the severity it inherits, applied without a [`LinkInputs`] in between.
-struct SoftDbInp {
-    value: Option<EpicsValue>,
-    inherited: Option<(
-        crate::server::record::MonitorSwitch,
-        super::links::LinkAlarm,
-    )>,
 }
 
 /// The per-link results of one input stage, present only for a cycle that
@@ -3356,10 +3322,9 @@ impl PvDatabase {
         else {
             return None;
         };
-        let read = self.soft_db_inp_read(rec, instance, read_as)?;
+        let value = self.soft_db_inp_read(rec, instance, read_as)?;
         let mut stage = LinkInputs::none();
-        stage.inp_value = read.value;
-        stage.link_alarms.extend(read.inherited);
+        stage.inp_value = value;
         Some(InputStage {
             is_soft: true,
             resolved: 0,
@@ -3368,14 +3333,16 @@ impl PvDatabase {
     }
 
     /// The read of [`Self::soft_db_inp_stage`], at a request the caller
-    /// already holds, handed back as the two things the cycle applies.
+    /// already holds. The source's severity is inherited as the read
+    /// returns, as `dbGetLink` raises it, so what is handed back is the one
+    /// thing left to apply: the value, `None` for a read that failed.
     #[inline(always)]
     fn soft_db_inp_read(
         &self,
         rec: InFrame<'_>,
         instance: &mut crate::server::record::RecordInstance,
         read_as: crate::server::record::LinkReadAs,
-    ) -> Option<SoftDbInp> {
+    ) -> Option<Option<EpicsValue>> {
         if !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
             if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive)
         {
@@ -3386,19 +3353,25 @@ impl PvDatabase {
             return None;
         }
         let link = instance.parsed_inp.link();
-        let (value, alarm) = if let (
+        let (value, inherited) = if let (
             crate::server::record::LinkReadAs::Double,
             crate::server::record::ParsedLink::Db(db),
         ) = (read_as, link)
         {
             let (value, alarm) = self.read_db_link_f64_at(rec.set(), db, at);
-            (value.map(EpicsValue::Double), alarm)
+            (
+                value.map(EpicsValue::Double),
+                self.input_link_inheritance(rec, link, alarm),
+            )
         } else {
-            self.read_db_link_as_at(rec.set(), link, at, read_as)
+            let (value, alarm) = self.read_db_link_as_at(rec.set(), link, at, read_as);
+            (value, self.input_link_inheritance(rec, link, alarm))
         };
-        let inherited = self.input_link_inheritance(rec, link, alarm);
+        if let Some((ms, alarm)) = inherited {
+            super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
+        }
         instance.record.set_fetch_gate_failed(false);
-        Some(SoftDbInp { value, inherited })
+        Some(value)
     }
 
     /// `fetch_input_stage` for [`CyclePlan::ConstSoftIn`]: INP constant, no
@@ -4143,6 +4116,7 @@ impl PvDatabase {
         // at construction and the PACT test is two field reads, so splitting
         // them across two acquisitions cost the record lock twice at the top
         // of every cycle and bought nothing.
+        let read_texts;
         let (plan, active, input_link_texts, metadata, cycle_plan) = {
             let plan = guard.rec.process_plan();
             let instance = guard.hold();
@@ -4159,9 +4133,10 @@ impl PvDatabase {
                     false
                 };
             let input_link_texts = if plan.has_multi_input_links {
-                Self::read_input_link_texts(instance)
+                read_texts = Self::read_input_link_texts(instance);
+                &read_texts
             } else {
-                InputLinkTexts::read_none()
+                &InputLinkTexts::READ_NONE
             };
             // C reads a link-backed field's metadata live inside the rset,
             // under the TARGET record's lock (`dbDbLink.c:240-261`). A poster
@@ -4181,7 +4156,7 @@ impl PvDatabase {
             let metadata = if active {
                 MetadataPlan::Empty
             } else {
-                PvDatabase::plan_link_backed_metadata_for_posts(instance, &input_link_texts)
+                PvDatabase::plan_link_backed_metadata_for_posts(instance, input_link_texts)
             };
             (
                 plan,
@@ -4586,8 +4561,13 @@ impl PvDatabase {
         } else if PLAIN && !DB_INP {
             Self::plain_input_stage(guard)
         } else {
-            self.fetch_input_stage(name, guard, plan, &input_link_texts, visited)
+            self.fetch_input_stage(name, guard, plan, input_link_texts, visited)
         };
+
+        // The constant arm's stage is `plain_input_stage`: nothing read, soft,
+        // no links resolved. Said once so the reads below fold.
+        let stage_known = PLAIN && !DB_INP;
+        let stage_is_soft = stage_known || stage.is_soft;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
         let (flnk_name, process_actions, result_is_defer_output, restamps_after, posts) = 'epilogue: {
@@ -4635,8 +4615,12 @@ impl PvDatabase {
                 // never reaches here at all (`dol_info` excludes it), so this is
                 // the reader's own `default:` arm (no declared request for this
                 // source class): nothing is attempted and nothing changes.
-                let soft_db_value = soft_db.take_value();
-                let links = stage.links.as_mut();
+                let soft_db_value = soft_db.take();
+                let links = if stage_known {
+                    None
+                } else {
+                    stage.links.as_mut()
+                };
                 let dol_fetch = links
                     .as_ref()
                     .and_then(|l| l.rare.as_ref())
@@ -4719,7 +4703,7 @@ impl PvDatabase {
                             // delivered above whatever the DTYP is
                             // (`read_link_value_soft`), and a device record's
                             // own dset has already run its filter.
-                            let _ = if stage.is_soft {
+                            let _ = if stage_is_soft {
                                 instance.record.soft_input_read(Some(inp_val))
                             } else {
                                 instance.record.set_val(inp_val)
@@ -4729,7 +4713,7 @@ impl PvDatabase {
                     }
                 }
                 if !had_inp_value
-                    && stage.is_soft
+                    && stage_is_soft
                     && crate::server::recgbl::simm::is_constant(instance.parsed_inp.link())
                 {
                     // C `dbLinkIsConstant(&prec->inp)` at process. The load-once
@@ -4747,7 +4731,7 @@ impl PvDatabase {
                         soft_inp_applied = true;
                     }
                 } else if !had_inp_value
-                    && stage.is_soft
+                    && stage_is_soft
                     && matches!(
                         *instance.parsed_inp,
                         crate::server::record::ParsedLink::Db(_)
@@ -5033,11 +5017,15 @@ impl PvDatabase {
                 // the pre-process ReadDbLink reads; the framework analogue of
                 // C device support inspecting `RTN_SUCCESS(dbGetLink(...))`
                 // (`epidRecord.c:191-193`, `motorRecord.cc:3687-3698`).
-                let links = stage.links.as_ref();
+                let links = if stage_known {
+                    None
+                } else {
+                    stage.links.as_ref()
+                };
                 instance.record.set_resolved_input_links(
                     crate::server::record::ResolvedInputLinks::new(
                         input_link_texts.own(),
-                        stage.resolved,
+                        if stage_known { 0 } else { stage.resolved },
                         links.map_or(&[][..], |l| l.resolved_link_fields.as_slice()),
                     ),
                 );
@@ -5113,9 +5101,6 @@ impl PvDatabase {
                 // strict-greater test keeps it, exactly as in C where `dbGetLink`
                 // precedes the record's own `recGblSetSevr` calls.
                 for (ms, alarm) in links.map_or(&[][..], |l| l.link_alarms.as_slice()) {
-                    super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
-                }
-                if let Some((ms, alarm)) = soft_db.inherited() {
                     super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
                 }
 
@@ -5541,7 +5526,11 @@ impl PvDatabase {
                 // unless the read succeeded under C's TSE=-2 + constant-TSEL
                 // gate, so a record that is not asking for device time, or
                 // whose read failed, keeps whatever `apply_timestamp` gives it.
-                let links = stage.links.as_ref();
+                let links = if stage_known {
+                    None
+                } else {
+                    stage.links.as_ref()
+                };
                 if let Some(ts) = links.and_then(|l| l.inp_source_time) {
                     instance.common.time = ts;
                 }
@@ -8289,8 +8278,12 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             if let Some(load) = crate::server::record::load_link_ls(&text) {
                 // C's lso/lsi init tail: `if (prec->len) { … prec->udf = FALSE; }`
                 // — a link that loaded (even the number case, whose LEN is 1
-                // with an empty VAL) DEFINES the record.
-                if instance.record.apply_ls_load(load) != 0 {
+                // with an empty VAL) DEFINES the record. The load itself
+                // precedes the dset's `init_record` (lsoRecord.c:82), but the
+                // tail sits below its `if (status) return status;` gate.
+                if instance.record.apply_ls_load(load) != 0
+                    && instance.dset_init != crate::server::device_support::DsetInit::Failed
+                {
                     instance.common.udf = 0;
                 }
             }
@@ -9286,7 +9279,7 @@ mod input_link_texts_tests {
         );
         assert!(ai.record.multi_input_links().is_empty());
         assert!(!ProcessPlan::of(&*ai.record).has_multi_input_links);
-        assert!(InputLinkTexts::read_none().none_set());
+        assert!(InputLinkTexts::READ_NONE.none_set());
         assert!(InputLinkTexts::read_own(&ai).none_set());
         assert!(ProcessPlan::of(&*calc().record).has_multi_input_links);
     }
@@ -9355,5 +9348,36 @@ mod input_link_texts_tests {
             crate::server::record::ParsedLink::Db(db) => db.pvname(),
             other => panic!("expected a DB link, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ls_init_udf_tests {
+    use super::seed_constant_links;
+    use crate::server::device_support::DsetInit;
+    use crate::server::record::RecordInstance;
+    use crate::server::records::lso::LsoRecord;
+    use crate::types::EpicsValue;
+
+    fn udf_after_seed(dset_init: DsetInit) -> u8 {
+        let mut instance =
+            RecordInstance::new_boxed("L:ONE".to_string(), Box::new(LsoRecord::default()));
+        instance
+            .record
+            .put_field("DOL", EpicsValue::String("5".into()))
+            .expect("DOL takes a constant");
+        instance.common.udf = 1;
+        instance.dset_init = dset_init;
+        seed_constant_links(&mut instance);
+        instance.common.udf
+    }
+
+    /// lsoRecord.c:84-95 — the DOL load precedes the dset `init_record`, but
+    /// `udf = FALSE` sits below its `if (status) return status;`.
+    #[test]
+    fn lso_udf_clears_only_when_the_dset_init_did_not_fail() {
+        assert_eq!(udf_after_seed(DsetInit::Succeeded), 0);
+        assert_eq!(udf_after_seed(DsetInit::Absent), 0);
+        assert_eq!(udf_after_seed(DsetInit::Failed), 1);
     }
 }

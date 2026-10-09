@@ -34,7 +34,7 @@ pub use link::{
     load_link_ls, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link_field,
     parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
-pub(crate) use link::{PORTED_JSON_LINK_TYPES, json_const_value};
+pub(crate) use link::{DbLinkAnswer, PORTED_JSON_LINK_TYPES, json_const_value};
 pub(crate) use menu_choices::{EnumChoice, enum_state_choice};
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
@@ -52,13 +52,14 @@ pub use record_instance::{
     ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{
-    PreparedLink, PreparedLinks, SimLink, ambient_write_origin, value_as_dbr_string,
+    PreparedCommonLink, PreparedLink, PreparedLinks, SimLink, ambient_write_origin,
+    value_as_dbr_string,
 };
 pub use record_trait::{
-    AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink,
-    CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue, DeadbandCells,
-    DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc,
-    FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkReadAs,
+    AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
+    ConstantInitLink, CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue,
+    DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration,
+    FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkReadAs,
     MonitorDeadbandCells, OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome,
     ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, SimmCells,
     Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,

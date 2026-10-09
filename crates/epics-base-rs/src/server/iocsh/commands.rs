@@ -5613,6 +5613,7 @@ fn apply_fields_one_at_a_time(
             f.name,
             f.value.as_str_lossy(),
         )));
+        e.emit_put_report();
     }
 }
 
@@ -5911,7 +5912,12 @@ async fn install_record_defs(
                     // the data lock is not the processing-exclusion
                     // mechanism, so the per-field release is a bounded,
                     // `.await`-free window.
-                    let put = rec_arc.write().put_common_field_db_load(&name, value);
+                    let mut link =
+                        crate::server::record::PreparedCommonLink::for_put(&def.name, &name, &value);
+                    let put = rec_arc
+                        .write()
+                        .put_common_field_db_load_prepared(&name, value, &mut link);
+                    drop(link);
                     match put {
                         Ok(CommonFieldPutResult::ScanChanged {
                             old_scan,

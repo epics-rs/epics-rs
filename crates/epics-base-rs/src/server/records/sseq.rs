@@ -1358,7 +1358,7 @@ impl Record for SseqRecord {
         // DLYn/DOn/DOLn/LNKn/STRn/WAITn all have one and are accepted, so this
         // is the whole rejected-family besides ABORT-when-idle below.
         if field.eq_ignore_ascii_case("ABORTING") {
-            return Err(CaError::BadChoice("ABORTING".to_string()));
+            return Err(CaError::BadChoice("ABORTING".into()));
         }
         // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
         // outside the process cycle — a put to `ABORT` does NOT process the

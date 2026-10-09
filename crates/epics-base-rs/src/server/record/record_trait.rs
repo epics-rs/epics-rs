@@ -1130,6 +1130,29 @@ pub struct FieldMetadataOverride {
     pub alarm_limits: Option<(f64, f64, f64, f64)>,
 }
 
+/// Work a record's `special(_, true)` owes once the put's gate is down, and
+/// may not do under the hold — a spawned link-status classification, say.
+/// See [`Record::take_after_gate`].
+pub struct AfterGate(Box<dyn FnOnce(&crate::server::database::PvDatabase) + Send + Sync>);
+
+impl AfterGate {
+    pub fn new(
+        work: impl FnOnce(&crate::server::database::PvDatabase) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Box::new(work))
+    }
+
+    pub(crate) fn run(self, db: &crate::server::database::PvDatabase) {
+        (self.0)(db)
+    }
+}
+
+impl std::fmt::Debug for AfterGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterGate")
+    }
+}
+
 /// Side-effect actions that a record requests from the processing framework.
 ///
 /// Records return these from `process()` via `ProcessOutcome::actions`.
@@ -4191,6 +4214,15 @@ pub trait Record: Send + Sync + 'static {
     /// Default: none (a `special()` that writes no link).
     fn take_special_actions(&mut self) -> Vec<ProcessAction> {
         Vec::new()
+    }
+
+    /// The [`AfterGate`] work the last `special(_, true)` left, taken by the
+    /// put path beside [`Self::take_special_actions`] and run once the put's
+    /// gate drops.
+    ///
+    /// Default: none.
+    fn take_after_gate(&mut self) -> Option<AfterGate> {
+        None
     }
 
     /// A `special()`/`put_field` pass that ended on C's `prec->udf = FALSE`.

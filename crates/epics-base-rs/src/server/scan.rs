@@ -1451,6 +1451,10 @@ impl ScanScheduler {
             self.db
                 .pini_process(crate::server::record::PiniMode::Yes)
                 .await;
+            // C `dbCaRun`, which follows `initialProcess` and `scanRun`. The
+            // `IocApplication` path ran PINI in its build and runs this pass
+            // itself, after starting this owner.
+            self.db.process_cp_links_on_connect().await;
         }
         // Publish completion — `PvDatabase::wait_for_pini` subscribers
         // (anything ordering itself "after PINI") unblock here.

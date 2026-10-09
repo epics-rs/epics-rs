@@ -18,10 +18,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
-use super::link::{
-    LinkFieldType, ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_field,
-    parse_link_v2, parse_output_link_v2,
-};
+use super::link::{LinkFieldType, ParsedLink, parse_link_field, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, InputLinkRequest, LinkReadAs,
@@ -1163,8 +1160,60 @@ mod link_cache {
             &self.0
         }
 
-        pub(super) fn replace(&mut self, link: ParsedLink) {
-            self.0 = link;
+        pub(super) fn swap(&mut self, link: &mut ParsedLink) {
+            std::mem::swap(&mut self.0, link);
+        }
+    }
+
+    /// A `dbCommon` link's new text and parse, made before the record's hold
+    /// — C's `dbPutFieldLink` parses ahead of `dbScanLock` — so the hold
+    /// only swaps them in, and the old pair leaves in this value to be
+    /// dropped after the hold.
+    pub(crate) struct PreparedCommonLink {
+        pub(super) field: &'static str,
+        pub(super) text: String,
+        pub(super) parsed: ParsedLink,
+    }
+
+    impl PreparedCommonLink {
+        /// `Some` when `field` is one of the `dbCommon` link fields (and
+        /// swait's `OUTN`) and `value` a string.
+        pub(crate) fn for_put(
+            record: &str,
+            field: &str,
+            value: &crate::types::EpicsValue,
+        ) -> Option<Self> {
+            let crate::types::EpicsValue::String(text) = value else {
+                return None;
+            };
+            let (field, ftype) = [
+                ("FLNK", LinkFieldType::Fwd),
+                ("INP", LinkFieldType::In),
+                ("OUT", LinkFieldType::Out),
+                ("TSEL", LinkFieldType::In),
+                ("SDIS", LinkFieldType::In),
+                ("OUTN", LinkFieldType::Out),
+            ]
+            .into_iter()
+            .find(|(f, _)| f.eq_ignore_ascii_case(field))?;
+            let text = text.as_str_lossy().into_owned();
+            // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a CP/CPP
+            // modifier on a DBF_OUTLINK and warns once, as it parses; the
+            // discard itself is `parse_link_field`'s.
+            if field == "OUT" && crate::server::record::out_link_discards_cp(&text) {
+                tracing::warn!(
+                    target: "epics_base_rs::record",
+                    record = %record,
+                    field = "OUT",
+                    link = %text,
+                    "Discarding CP/CPP modifier in CA output link"
+                );
+            }
+            Some(PreparedCommonLink {
+                field,
+                parsed: crate::server::record::parse_link_field(&text, ftype),
+                text,
+            })
         }
     }
 
@@ -1380,7 +1429,7 @@ mod link_cache {
 }
 
 pub use link_cache::LinkCache;
-pub(crate) use link_cache::{LinkSlots, PreparedLink, PreparedLinks};
+pub(crate) use link_cache::{LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks};
 
 /// How one process cycle of one record instance runs, resolved from the
 /// instance's own link kinds and device type (where [`ProcessPlan`] holds what
@@ -3080,6 +3129,13 @@ impl RecordInstance {
     /// ([`LinkCache`] has no other way in), so the plan stamp they feed is
     /// bumped here and cannot be skipped.
     pub fn set_link_cache(&mut self, field: &str, link: ParsedLink) -> bool {
+        let mut link = link;
+        self.swap_link_cache(field, &mut link)
+    }
+
+    /// [`Self::set_link_cache`] handing the old parse back in `link`, so a
+    /// caller under the hold can drop it after.
+    fn swap_link_cache(&mut self, field: &str, link: &mut ParsedLink) -> bool {
         let slot = match field {
             "INP" => &mut self.parsed_inp,
             "OUT" => &mut self.parsed_out,
@@ -3088,7 +3144,7 @@ impl RecordInstance {
             "FLNK" => &mut self.parsed_flnk,
             _ => return false,
         };
-        slot.replace(link);
+        slot.swap(link);
         self.invalidate_plan();
         true
     }
@@ -4207,20 +4263,6 @@ impl RecordInstance {
         self.notify.is_some() || self.is_processing() || !self.notify_restart_list.is_empty()
     }
 
-    /// C `processNotifyCommon`'s FIRST defer test alone (dbNotify.c:213):
-    /// another `processNotify` owns this record, or one is already queued
-    /// behind it. [`Self::notify_put_is_owned`] folds in the PACT arm
-    /// (`:225`) as well.
-    ///
-    /// A DBF link-field put waits on ownership but NOT on PACT. A bare `sub`
-    /// with an empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122), so
-    /// a link put that waited on the PACT arm there would never be written and
-    /// `caput <sub>.INPA 0` would read back empty. Ownership carries no such
-    /// trap: the restart check drains the queue at every cycle end.
-    pub fn notify_put_has_owner(&self) -> bool {
-        self.notify.is_some() || !self.notify_restart_list.is_empty()
-    }
-
     /// C `ellSafeAdd(&precord->ppnr->restartList, &ppn->restartNode)` — the
     /// arriving put-notify joins the back of the queue, unwritten.
     ///
@@ -4239,7 +4281,7 @@ impl RecordInstance {
     /// drives the record and fires the callback, so processing here would
     /// run the cycle twice for one client request.
     ///
-    /// Ownership alone decides — NOT [`Self::notify_put_has_owner`]. A
+    /// The slot alone decides, not the restart list. A
     /// non-empty restart list stops a *fresh* arrival at the entry gate, but a
     /// replay reaching here has already been popped off that list and must
     /// take the slot with its successors still queued behind it, exactly as
@@ -5890,7 +5932,49 @@ impl RecordInstance {
         value: EpicsValue,
         bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
-        let name = name.to_ascii_uppercase();
+        let mut link = PreparedCommonLink::for_put(&self.name, name, &value);
+        if let Some(link) = &link {
+            self.check_link_assignment(link.field, &link.text, bound)?;
+        }
+        self.put_common_field_with(name, value, bound, &mut link)
+    }
+
+    /// The common-field writer for a runtime put whose `dbCommon` link text
+    /// was parsed and held to `dbCanSetLink` before the hold. The old text
+    /// and parse come back in `link`, to be dropped after the hold.
+    pub(crate) fn put_common_field_prepared(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+        link: &mut Option<PreparedCommonLink>,
+    ) -> CaResult<CommonFieldPutResult> {
+        self.put_common_field_with(name, value, MenuBound::DbPut, link)
+    }
+
+    /// [`Self::put_common_field_prepared`] for the `.db` loader's bound.
+    pub(crate) fn put_common_field_db_load_prepared(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+        link: &mut Option<PreparedCommonLink>,
+    ) -> CaResult<CommonFieldPutResult> {
+        self.put_common_field_with(name, value, MenuBound::DbLoad, link)
+    }
+
+    fn put_common_field_with(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+        bound: MenuBound,
+        link: &mut Option<PreparedCommonLink>,
+    ) -> CaResult<CommonFieldPutResult> {
+        // The put entries hand the name in uppercase already; only another
+        // spelling allocates, under the caller's hold.
+        let name: Cow<'_, str> = if name.bytes().any(|b| b.is_ascii_lowercase()) {
+            Cow::Owned(name.to_ascii_uppercase())
+        } else {
+            Cow::Borrowed(name)
+        };
         self.record.validate_put(&name, &value)?;
         self.record.special(&name, false)?;
         // The db loader hands every common field to this path as a raw
@@ -5924,12 +6008,12 @@ impl RecordInstance {
         }
         // The common fields a `CyclePlan` is resolved from. This is the funnel
         // for them, so the stamp is bumped here and not per arm.
-        self.invalidate_plan_for(name.as_str());
-        match name.as_str() {
+        self.invalidate_plan_for(&name);
+        match &*name {
             // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
             // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
             // simulation-mode owner (`rec_gbl_save_simm`).
-            "OLDSIMM" => return Err(CaError::ReadOnlyField(name)),
+            "OLDSIMM" => return Err(CaError::ReadOnlyField(name.into_owned())),
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.sevr = AlarmSeverity::from_u16(v as u16);
@@ -6047,9 +6131,9 @@ impl RecordInstance {
                 }
             }
             "FLNK" => {
-                if let EpicsValue::String(s) = value {
-                    self.common.flnk = s.as_str_lossy().into_owned();
-                    self.set_link_cache("FLNK", parse_forward_link_v2(&self.common.flnk));
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.flnk, &mut link.text);
+                    self.swap_link_cache("FLNK", &mut link.parsed);
                 }
             }
             "INP" => {
@@ -6061,51 +6145,26 @@ impl RecordInstance {
                 if !self.record.declares_inp_link() {
                     return Err(CaError::FieldNotFound("INP".to_string()));
                 }
-                if let EpicsValue::String(s) = value {
-                    self.check_link_assignment("INP", &s.as_str_lossy(), bound)?;
-                    self.common.inp = s.as_str_lossy().into_owned();
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.inp, &mut link.text);
                     if !self.record_declares_field("INP") {
-                        self.set_link_cache("INP", parse_link_v2(&self.common.inp));
+                        self.swap_link_cache("INP", &mut link.parsed);
                     }
                 }
             }
             "OUT" => {
-                if let EpicsValue::String(s) = value {
-                    let s = s.as_str_lossy();
-                    self.check_link_assignment("OUT", &s, bound)?;
-                    // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a
-                    // CP/CPP modifier on a DBF_OUTLINK and warns once, naming
-                    // the holder record, its field and the target. The discard
-                    // itself is owned by `parse_output_link_v2` below; only the
-                    // diagnostic lives here, where the record name exists and
-                    // the link text is being (re)loaded rather than re-parsed
-                    // per process cycle.
-                    if out_link_discards_cp(&s) {
-                        tracing::warn!(
-                            target: "epics_base_rs::record",
-                            record = %self.name,
-                            field = "OUT",
-                            link = %s,
-                            "Discarding CP/CPP modifier in CA output link"
-                        );
-                    }
-                    self.common.out = s.into_owned();
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.out, &mut link.text);
                     // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
                     // link processes its target only on an explicit
                     // ` PP` token (or a `.PROC` destination). A bare
-                    // OUT link is NPP — `parse_output_link_v2`
-                    // downgrades the modifier-less `ProcessPassive`
-                    // default that `parse_link_v2` would otherwise
-                    // apply.
+                    // OUT link is NPP — the `Out` parse downgrades the
+                    // modifier-less `ProcessPassive` default.
                     if !self.record_declares_field("OUT") {
-                        self.set_link_cache("OUT", parse_output_link_v2(&self.common.out));
+                        self.swap_link_cache("OUT", &mut link.parsed);
                     }
-                    // C `longoutRecord.c::special` (PR #6c573b4 part 2)
-                    // and similar OOCH-style hooks need `after=true`
-                    // to fire after the link has actually moved. The
-                    // earlier `validate_put` + `special(name, false)`
-                    // pair only covered the before-side.
-                    self.record.special(&name, true)?;
+                    // `special(OUT, true)` (longout's OOCH hook among them)
+                    // is the tail's, once the link has moved.
                 }
             }
             // Two shapes reach DTYP and both name a device support:
@@ -6142,9 +6201,9 @@ impl RecordInstance {
                 }
             }
             "TSEL" => {
-                if let EpicsValue::String(s) = value {
-                    self.common.tsel = s.as_str_lossy().into_owned();
-                    self.set_link_cache("TSEL", parse_link_v2(&self.common.tsel));
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.tsel, &mut link.text);
+                    self.swap_link_cache("TSEL", &mut link.parsed);
                 }
             }
             "UTAG" => {
@@ -6263,9 +6322,9 @@ impl RecordInstance {
                 }
             }
             "SDIS" => {
-                if let EpicsValue::String(s) = value {
-                    self.common.sdis = s.as_str_lossy().into_owned();
-                    self.set_link_cache("SDIS", parse_link_v2(&self.common.sdis));
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.sdis, &mut link.text);
+                    self.swap_link_cache("SDIS", &mut link.parsed);
                 }
             }
             "DISS" => {
@@ -6366,12 +6425,12 @@ impl RecordInstance {
                 if self.record.record_type() != "swait" {
                     // No OUTN field on any other record type — the same
                     // `S_dbLib_fieldNotFound` the catch-all below reports.
-                    return Err(self.unknown_field_error(name));
+                    return Err(self.unknown_field_error(name.into_owned()));
                 }
-                if let EpicsValue::String(s) = value {
-                    self.common.out = s.as_str_lossy().into_owned();
+                if let Some(link) = link {
+                    std::mem::swap(&mut self.common.out, &mut link.text);
                     // Bare OUT link is NPP — see the "OUT" arm.
-                    self.set_link_cache("OUT", parse_output_link_v2(&self.common.out));
+                    self.swap_link_cache("OUT", &mut link.parsed);
                 }
             }
             // C `dbNameToAddr` (dbAccess.c:660-676) resolves the field part
@@ -7232,6 +7291,20 @@ impl RecordInstance {
         posts
     }
 
+    /// C's soft input dset returns 2 ("don't convert"): `devAiSoft` and its
+    /// kin for "Soft Channel" (and async soft), never "Raw Soft Channel",
+    /// whose read lands in RVAL and must convert.
+    pub(crate) fn soft_input_skips_convert(&self) -> bool {
+        matches!(
+            self.common.dtyp.soft(),
+            Some(
+                crate::server::device_support::SoftDtyp::Plain
+                    | crate::server::device_support::SoftDtyp::Async
+            )
+        ) && !self.record.can_device_write()
+            && self.record.soft_channel_skips_convert()
+    }
+
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
     ///
@@ -7387,20 +7460,8 @@ impl RecordInstance {
         // `process_local` (`db.process_record`, e.g. QSRV group proc
         // members) would skip `do_pid()` entirely — the regression
         // d1032fe5 fixed on the `processing.rs` path only.
-        {
-            // The same "does the input dset return 2" question the
-            // `processing.rs` link path asks — Plain and Async, not Raw.
-            let is_soft = matches!(
-                self.common.dtyp.soft(),
-                Some(
-                    crate::server::device_support::SoftDtyp::Plain
-                        | crate::server::device_support::SoftDtyp::Async
-                )
-            );
-            let is_output = self.record.can_device_write();
-            if is_soft && !is_output && self.record.soft_channel_skips_convert() {
-                self.record.set_device_did_compute(true);
-            }
+        if self.soft_input_skips_convert() {
+            self.record.set_device_did_compute(true);
         }
         // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so the
         // record's process() can see it — same as the processing.rs link

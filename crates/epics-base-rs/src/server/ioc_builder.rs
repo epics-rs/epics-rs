@@ -395,6 +395,7 @@ impl IocBuilder {
             let mut common_fields = Vec::new();
             if let Err(e) = db_loader::apply_fields(&mut record, &def.fields, &mut common_fields) {
                 eprintln!("{ERL_ERROR}: Can't load record '{}': {e}", def.name);
+                e.emit_put_report();
                 failed_loads.push(load);
                 continue;
             }

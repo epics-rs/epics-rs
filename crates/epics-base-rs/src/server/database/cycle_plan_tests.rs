@@ -539,6 +539,7 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
         .expect("scenario ioc");
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
+    db.process_cp_links_on_connect().await;
     let mut readers = Vec::new();
     for name in ["T", "F", "C"] {
         let cell = db.get_record(name).unwrap();

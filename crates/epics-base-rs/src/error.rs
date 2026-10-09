@@ -42,13 +42,19 @@ pub enum CaError {
     BadField(String),
 
     /// C `S_db_badChoice` ("Illegal choice") — a `DBR_STRING` write to a
-    /// `DBF_MENU` field named neither an exact choice label nor an in-range
-    /// index (`dbConvert.c::putStringMenu:1216-1229`). C's converter returns
+    /// `DBF_MENU` or `DBF_ENUM` field named neither an exact choice label nor
+    /// an in-range index (`dbConvert.c::putStringMenu:1216-1229`). C's converter returns
     /// this from inside `dbPut`, *before* the value is stored
     /// (`dbAccess.c:1362`), so the field keeps its old value, no monitor is
     /// posted and the record is not processed.
     #[error("illegal menu choice: {0}")]
-    BadChoice(String),
+    BadChoice(ChoiceRefusal),
+
+    /// C `S_dbLib_badField` from `dbParseLink` — brace-delimited link text
+    /// `dbJLinkParse` refused (`dbStaticLib.c:2281-2283`). The field keeps
+    /// its old link.
+    #[error("invalid value: {0}")]
+    BadLink(LinkRefusal),
 
     /// C `S_db_badDbrtype` ("Illegal Database Request Type") — `dbPut`
     /// refusing a put to a DBF link field (`field_type > DBF_DEVICE`,
@@ -138,6 +144,127 @@ pub enum CaError {
     /// rsrv answers `ECA_PUTFAIL`.
     #[error("get conversion failed: {0}")]
     GetConvertFailed(String),
+}
+
+/// The payload of [`CaError::BadChoice`]. `report` is the errlog line C's
+/// converter prints with the refusal; it rides out in the error so the put
+/// entry emits it after the gate drops, never under the hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceRefusal {
+    detail: String,
+    /// The `pmessage` of C's `recGblRecordError`, until the record is named.
+    enum_from: Option<String>,
+    report: Option<String>,
+}
+
+impl ChoiceRefusal {
+    /// A refusal from `cvt_st_e` / `putStringEnum`, which report it with
+    /// `recGblRecordError(status, precord, from)` (`dbFastLinkConv.c:279`,
+    /// `dbConvert.c:1189`).
+    pub(crate) fn enum_state(detail: String, from: &str) -> Self {
+        Self {
+            enum_from: Some(from.to_string()),
+            ..detail.into()
+        }
+    }
+
+    /// Name the record C's report prints.
+    pub(crate) fn of_record(self, record_name: &str) -> Self {
+        let report = self
+            .enum_from
+            .as_ref()
+            .map(|from| format!("recGblRecordError: {from} Illegal choice PV: {record_name}\n"));
+        Self { report, ..self }
+    }
+
+    /// The errlog line still owed for this refusal, if C prints one.
+    pub fn report(&self) -> Option<&str> {
+        self.report.as_deref()
+    }
+}
+
+/// The payload of [`CaError::BadLink`]. `report` is the line `dbJLinkInit`
+/// prints while it parses (`dbJLink.c:262-268`), carried out of the hold
+/// like [`ChoiceRefusal`]'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRefusal {
+    detail: String,
+    report: Option<String>,
+}
+
+impl LinkRefusal {
+    /// A refusal C reports with exactly `detail` as its errlog line.
+    pub(crate) fn printed(detail: String) -> Self {
+        let report = Some(format!("{detail}\n"));
+        Self { detail, report }
+    }
+
+    /// The errlog line still owed for this refusal, if C prints one.
+    pub fn report(&self) -> Option<&str> {
+        self.report.as_deref()
+    }
+}
+
+impl From<String> for LinkRefusal {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            report: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LinkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl CaError {
+    /// Emit the errlog line a refused put still owes ([`ChoiceRefusal`],
+    /// [`LinkRefusal`]). Called by a put entry once its gate is down.
+    pub(crate) fn emit_put_report(&self) {
+        let line = match self {
+            CaError::BadChoice(refusal) => refusal.report(),
+            CaError::BadLink(refusal) => refusal.report(),
+            _ => None,
+        };
+        if let Some(line) = line {
+            crate::runtime::log::errlog_printf(line);
+        }
+    }
+
+    /// Move out the line [`Self::emit_put_report`] would print, for a put
+    /// whose error is handed back before its gate drops.
+    pub(crate) fn take_put_report(&mut self) -> Option<String> {
+        match self {
+            CaError::BadChoice(refusal) => refusal.report.take(),
+            CaError::BadLink(refusal) => refusal.report.take(),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for ChoiceRefusal {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            enum_from: None,
+            report: None,
+        }
+    }
+}
+
+impl From<&str> for ChoiceRefusal {
+    fn from(detail: &str) -> Self {
+        detail.to_string().into()
+    }
+}
+
+impl std::fmt::Display for ChoiceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)

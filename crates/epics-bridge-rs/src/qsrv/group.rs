@@ -1543,15 +1543,20 @@ impl GroupChannel {
     /// here). The member `grant` gates emission; `dbr_type` is the value's
     /// final field type — `convert_member_value` already typed it to the
     /// member DBF.
-    fn apply_member_value_already_locked(
+    ///
+    /// The member's put goes through `puts`, which settles it once the
+    /// caller's gate drops.
+    fn apply_member_value_already_locked<'m>(
         &self,
-        record_name: &str,
-        field_name: &str,
+        record: epics_base_rs::server::database::LockedRecord<'m>,
+        member: &'m MemberChannel,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         grant: super::provider::WriteGrant,
+        puts: &mut epics_base_rs::server::database::HeldPuts<'m>,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
+        let (record_name, field_name) = member.names();
         let pv_name = format!("{record_name}.{field_name}");
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
@@ -1567,8 +1572,7 @@ impl GroupChannel {
             let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
             match process {
                 ProcessMode::Inhibit => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    puts.put_pv(record, field_name, value).map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
                     // Group member puts never await completion — use the
@@ -1576,19 +1580,13 @@ impl GroupChannel {
                     // parked on the member record (a dropped receiver
                     // would occupy its notify slot until async
                     // processing settles).
-                    self.db
-                        .put_record_field_from_ca_no_notify_already_locked(
-                            record_name,
-                            field_name,
-                            value,
-                        )
+                    puts.put_record_field_from_ca_no_notify(record, field_name, value)
                         .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
-                    let pv = format!("{record_name}.{field_name}");
                     // Any PACT park this put releases replays on the cycle two
                     // lines down, from its tail — C's only restart owner.
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    puts.put_pv(record, field_name, value).map_err(to_err)?;
                     let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited)
@@ -1894,10 +1892,13 @@ impl GroupChannel {
             // callees (`member_is_char_array`, `member_dbf_type`) do not
             // await anything, so this whole phase runs, and can fail,
             // before any member-record gate is even requested.
+            // A written member carries its record's index in `member_records`,
+            // resolved here because the alias lookup may not run under the hold.
+            let member_records = group_member_record_names(&self.db, &self.def.channels);
             let mut writes: Vec<(
                 &MemberChannel,
                 MemberPutAction,
-                Option<epics_base_rs::types::EpicsValue>,
+                Option<(usize, epics_base_rs::types::EpicsValue)>,
             )> = Vec::new();
 
             for member in &ordered {
@@ -1922,8 +1923,15 @@ impl GroupChannel {
                         // the all-or-nothing guarantee holds.
                         let pv_field = get_nested_field(value, &member.def.field_name)
                             .expect("classifier returned Write only for a supplied field");
+                        let canonical = self
+                            .db
+                            .resolve_alias(&member.record)
+                            .unwrap_or_else(|| member.record.clone());
+                        let slot = member_records
+                            .binary_search(&canonical)
+                            .expect("group_member_record_names lists every channel's record");
                         match self.convert_member_value(member, &pv_field) {
-                            Some(v) => Some(v),
+                            Some(v) => Some((slot, v)),
                             None => {
                                 return Err(BridgeError::PutRejected(format!(
                                     "group {} PUT: member '{}' value is not convertible \
@@ -1961,49 +1969,58 @@ impl GroupChannel {
             // helper variants: this transaction already owns every
             // member-record gate, and the per-record gate is
             // not reentrant. From here to the end of this block is
-            // synchronous — zero `.await`s reached while `_many_guard`
-            // is held.
-            let member_records = group_member_record_names(&self.db, &self.def.channels);
-            let _many_guard = self.db.lock_records(&member_records);
-
-            for (member, action, val) in writes {
-                let (record_name, field_name) = member.names();
-
-                match action {
-                    MemberPutAction::ProcessOnly { .. } => {
-                        // pvxs skips `IOCSource::put` for this member and goes
-                        // straight to `doPostProcessing` (groupsource.cpp:568),
-                        // which decides whether the record actually processes.
-                        // The gate lives in one owner — never inline here.
-                        self.post_process_member_already_locked(member, opts.process)?;
+            // synchronous — zero `.await`s reached while the member
+            // gates are held.
+            // The database holds every member gate across the closure and
+            // settles each member put once they drop.
+            let applied = self.db.put_many_locked(
+                &member_records,
+                writes.len(),
+                |puts| -> BridgeResult<()> {
+                    for (member, action, val) in writes {
+                        match action {
+                            MemberPutAction::ProcessOnly { .. } => {
+                                // pvxs skips `IOCSource::put` for this member and goes
+                                // straight to `doPostProcessing` (groupsource.cpp:568),
+                                // which decides whether the record actually processes.
+                                // The gate lives in one owner — never inline here.
+                                self.post_process_member_already_locked(member, opts.process)?;
+                            }
+                            MemberPutAction::Write => {
+                                // `_already_locked` — this atomic PUT owns every
+                                // member-record gate via `lock_records`. The member's
+                                // trap grant (resolved in the per-member ACF pass)
+                                // gates `asTrapWrite` emission for this write.
+                                let (slot, epics_val) = val
+                                    .expect("classifier returned Write, so a value was converted");
+                                let record = puts
+                                    .record(slot)
+                                    .expect("slot indexes member_records, the locked set");
+                                self.apply_member_value_already_locked(
+                                    record,
+                                    member,
+                                    epics_val,
+                                    opts.process,
+                                    member_grants
+                                        .get(member.def.field_name.as_str())
+                                        .copied()
+                                        .unwrap_or_default(),
+                                    puts,
+                                )?;
+                            }
+                            MemberPutAction::Skip => continue,
+                        }
+                        // pvxs sets `didSomething` from `putGroupField` RETURNING true
+                        // — `changing || type==Proc` (groupsource.cpp:568-571) — not
+                        // from a write having landed or doPostProcessing's gate having
+                        // fired. A participating member that wrote nothing still keeps
+                        // the PUT out of "No fields changed".
+                        did_something = true;
                     }
-                    MemberPutAction::Write => {
-                        // `_already_locked` — this atomic PUT owns every
-                        // member-record gate via `lock_records`. The member's
-                        // trap grant (resolved in the per-member ACF pass)
-                        // gates `asTrapWrite` emission for this write.
-                        let epics_val =
-                            val.expect("classifier returned Write, so a value was converted");
-                        self.apply_member_value_already_locked(
-                            record_name,
-                            field_name,
-                            epics_val,
-                            opts.process,
-                            member_grants
-                                .get(member.def.field_name.as_str())
-                                .copied()
-                                .unwrap_or_default(),
-                        )?;
-                    }
-                    MemberPutAction::Skip => continue,
-                }
-                // pvxs sets `didSomething` from `putGroupField` RETURNING true
-                // — `changing || type==Proc` (groupsource.cpp:568-571) — not
-                // from a write having landed or doPostProcessing's gate having
-                // fired. A participating member that wrote nothing still keeps
-                // the PUT out of "No fields changed".
-                did_something = true;
-            }
+                    Ok(())
+                },
+            );
+            applied?;
         } else {
             // Non-atomic put: write each member individually.
             // IMPORTANT: Proc members are checked BEFORE the request-field

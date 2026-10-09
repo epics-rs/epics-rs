@@ -3483,11 +3483,10 @@ impl PvDatabase {
         {
             return None;
         }
-        let at = self.inp_addr(instance)?;
+        let (link, at) = self.inp_addr(instance)?;
         if Arc::ptr_eq(&at.rec, rec.unframed()) {
             return None;
         }
-        let link = instance.parsed_inp.link();
         let (value, alarm) = V::read(self, rec.set(), link, at, read_as);
         let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {

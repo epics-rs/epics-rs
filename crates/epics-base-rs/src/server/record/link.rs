@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, LinkRefusal};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
 use crate::types::{DbfLinkClass, EpicsValue};
 
@@ -665,34 +665,65 @@ pub struct DbLink {
     addr: DbAddrCell,
 }
 
-/// The resolved target of a [`DbLink`], stamped with the name-map revision
-/// it was resolved under and re-resolved once that moves (records and
-/// aliases can come and go after `iocInit` here, unlike C).
+/// What a [`DbLink`]'s target name answers at one name-map revision.
+pub(crate) enum DbLinkAnswer {
+    /// A local record — C's `dbAddr`.
+    Local(super::record_instance::ResolvedTarget),
+    /// A simple PV spelling the target `REC.FLD`, which shadows the field.
+    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
+    /// Neither; the by-name path decides.
+    Absent,
+}
+
+/// The settled [`DbLinkAnswer`] of a [`DbLink`], stamped with the name-map
+/// revision it was resolved under and re-resolved once that moves (records,
+/// aliases and simple PVs can come and go after `iocInit` here, unlike C).
 ///
 /// Two caches, because a link target handle never outlives its target's map
 /// entry and only the reader's `INP` is reached by the sweep that enforces
 /// it. `owned` (any link, any caller) keeps a `Weak`, so no record is held
 /// by a link no sweep reaches. `lent` ([`DbLink::lend_addr`], reachable only
-/// through `PvDatabase::inp_addr`) keeps strong handles, which
+/// through `RecordInstance::lend_inp_addr`) keeps strong handles, which
 /// [`DbLink::release_addr`] drops when the target is removed or the reader
 /// destroyed; until then it keeps every target it has published — one per
 /// retarget, not per read — since a lent one may still be borrowed.
-#[derive(Default)]
 struct DbAddrCell {
     owned: parking_lot::Mutex<Option<CachedDbAddr>>,
-    /// The name-map revision `current` answers for.
+    /// The name-map revision `current` answers for; `u64::MAX` for none.
     revision: std::sync::atomic::AtomicU64,
-    /// The newest entry of `lent`, or null.
+    /// The newest entry of `lent`, or null when the answer at `revision` is
+    /// not a local record.
     current: std::sync::atomic::AtomicPtr<super::record_instance::ResolvedTarget>,
     lent: parking_lot::Mutex<Vec<std::sync::Arc<super::record_instance::ResolvedTarget>>>,
 }
 
+impl Default for DbAddrCell {
+    fn default() -> Self {
+        Self {
+            owned: parking_lot::Mutex::new(None),
+            revision: std::sync::atomic::AtomicU64::new(NO_REVISION),
+            current: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            lent: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+const NO_REVISION: u64 = u64::MAX;
+
 struct CachedDbAddr {
-    rec: std::sync::Weak<super::record_instance::RecordCell>,
-    name: std::sync::Arc<str>,
-    put: super::record_instance::PutAddr,
-    f64_slot: Option<super::record_trait::FieldSlot>,
+    answer: CachedAnswer,
     revision: u64,
+}
+
+enum CachedAnswer {
+    Local {
+        rec: std::sync::Weak<super::record_instance::RecordCell>,
+        name: std::sync::Arc<str>,
+        put: super::record_instance::PutAddr,
+        f64_slot: Option<super::record_trait::FieldSlot>,
+    },
+    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
+    Absent,
 }
 
 impl Clone for DbAddrCell {
@@ -714,60 +745,77 @@ impl std::fmt::Debug for DbAddrCell {
 }
 
 impl DbLink {
-    /// The local target at name-map `revision`: the cached one while the
-    /// maps are at the revision it was resolved under, else `resolve`'s
-    /// answer, cached when it is a local record. A miss is asked again on
-    /// the next read, as the by-name path always did.
-    pub(crate) fn local_addr(
+    /// The answer at name-map `revision`: the cached one while the maps are
+    /// at the revision it was resolved under, else `resolve`'s, cached.
+    pub(crate) fn answer(
         &self,
         revision: u64,
-        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
-    ) -> Option<super::record_instance::ResolvedTarget> {
+        resolve: impl FnOnce() -> DbLinkAnswer,
+    ) -> DbLinkAnswer {
         if let Some(cached) = &*self.addr.owned.lock()
             && cached.revision == revision
-            && let Some(rec) = cached.rec.upgrade()
         {
-            return Some(super::record_instance::ResolvedTarget {
-                rec,
-                name: cached.name.clone(),
-                put: cached.put,
-                f64_slot: cached.f64_slot,
-            });
+            match &cached.answer {
+                CachedAnswer::Local {
+                    rec,
+                    name,
+                    put,
+                    f64_slot,
+                } => {
+                    if let Some(rec) = rec.upgrade() {
+                        return DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
+                            rec,
+                            name: name.clone(),
+                            put: *put,
+                            f64_slot: *f64_slot,
+                        });
+                    }
+                }
+                CachedAnswer::Shadowed(pv) => return DbLinkAnswer::Shadowed(pv.clone()),
+                CachedAnswer::Absent => return DbLinkAnswer::Absent,
+            }
         }
-        let target = resolve()?;
+        let answer = resolve();
+        let cached = match &answer {
+            DbLinkAnswer::Local(target) => CachedAnswer::Local {
+                rec: std::sync::Arc::downgrade(&target.rec),
+                name: target.name.clone(),
+                put: target.put,
+                f64_slot: target.f64_slot,
+            },
+            DbLinkAnswer::Shadowed(pv) => CachedAnswer::Shadowed(pv.clone()),
+            DbLinkAnswer::Absent => CachedAnswer::Absent,
+        };
         *self.addr.owned.lock() = Some(CachedDbAddr {
-            rec: std::sync::Arc::downgrade(&target.rec),
-            name: target.name.clone(),
-            put: target.put,
-            f64_slot: target.f64_slot,
+            answer: cached,
             revision,
         });
-        Some(target)
+        answer
     }
 
-    /// [`Self::local_addr`] lent instead of cloned: on a hit two loads and
-    /// a compare, no lock and no refcount — C's `dbAddr` dereference. The
-    /// handle is strong (see [`DbAddrCell`]).
+    /// The local target of [`Self::answer`], lent instead of cloned: on a
+    /// hit two loads and a compare, no lock and no refcount — C's `dbAddr`
+    /// dereference. A settled non-local answer is a hit too, so it is not
+    /// re-resolved each read. The handle is strong (see [`DbAddrCell`]).
     ///
     /// # Safety
     ///
     /// [`Self::release_addr`] must not run while the returned borrow lives.
-    /// `PvDatabase::inp_addr` guarantees it by lending only through the
-    /// reader's guard, which `release_addr`'s callers hold exclusively.
+    /// Private, so the one lender is
+    /// [`super::record_instance::RecordInstance::lend_inp_addr`],
+    /// whose `&mut` reader excludes `release_addr`'s callers.
     #[inline(always)]
-    pub(crate) unsafe fn lend_addr(
+    unsafe fn lend_addr(
         &self,
         revision: u64,
-        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
+        resolve: impl FnOnce() -> DbLinkAnswer,
     ) -> Option<&super::record_instance::ResolvedTarget> {
         use std::sync::atomic::Ordering::Acquire;
         if self.addr.revision.load(Acquire) == revision {
             let at = self.addr.current.load(Acquire);
-            if !at.is_null() {
-                // SAFETY: a non-null `current` points into `lent`, which only
-                // `release_addr` empties, and the caller excludes that.
-                return Some(unsafe { &*at });
-            }
+            // SAFETY: a non-null `current` points into `lent`, which only
+            // `release_addr` empties, and the caller excludes that.
+            return (!at.is_null()).then(|| unsafe { &*at });
         }
         // SAFETY: as above, for the entry the miss publishes.
         self.publish_lent(revision, resolve)
@@ -783,10 +831,14 @@ impl DbLink {
     fn publish_lent(
         &self,
         revision: u64,
-        resolve: impl FnOnce() -> Option<super::record_instance::ResolvedTarget>,
+        resolve: impl FnOnce() -> DbLinkAnswer,
     ) -> Option<std::sync::Arc<super::record_instance::ResolvedTarget>> {
         use std::sync::atomic::Ordering::Release;
-        let target = resolve()?;
+        let DbLinkAnswer::Local(target) = resolve() else {
+            self.addr.current.store(std::ptr::null_mut(), Release);
+            self.addr.revision.store(revision, Release);
+            return None;
+        };
         let mut lent = self.addr.lent.lock();
         let entry = match lent.last() {
             Some(last) if std::sync::Arc::ptr_eq(&last.rec, &target.rec) => last.clone(),
@@ -812,10 +864,12 @@ impl DbLink {
     /// No borrow from [`Self::lend_addr`] may be live: call it only with
     /// the reader that lends this link exclusively borrowed.
     pub(crate) unsafe fn release_addr(&self) {
+        use std::sync::atomic::Ordering::Release;
         let mut lent = self.addr.lent.lock();
-        self.addr
-            .current
-            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        self.addr.current.store(std::ptr::null_mut(), Release);
+        // A null `current` at a live revision is a settled answer, so the
+        // emptied cell must answer for none.
+        self.addr.revision.store(NO_REVISION, Release);
         lent.clear();
     }
 
@@ -1737,9 +1791,9 @@ pub enum JsonLinkParse {
     Parsed(ParsedLink),
     /// Brace-delimited and unusable. C stops the parse (`jlif_stop`), which
     /// `dbJLinkParse` turns into `S_db_badField` and `dbParseLink` into
-    /// `S_dbLib_badField` — the field never loads. The string is the
-    /// diagnostic C's `dbJLinkInit` prints.
-    Rejected(String),
+    /// `S_dbLib_badField` — the field never loads. The refusal carries the
+    /// line C's `dbJLinkInit` prints, when C prints one.
+    Rejected(LinkRefusal),
 }
 
 /// What the first map key of a brace-delimited link body is — C's `link_name`
@@ -1772,6 +1826,36 @@ fn json_link_key(s: &str) -> JsonLinkKey<'_> {
     }
 }
 
+/// The first map key of `prefix`, the text of a link up to where the parse
+/// stopped, if a whole key and its `:` precede that point.
+fn key_before(prefix: &str) -> Option<String> {
+    let normalized = crate::json5::relaxed_to_strict(prefix).ok()?;
+    let (key_raw, _) = normalized.strip_prefix('{')?.split_once(':')?;
+    let key = key_raw.trim().trim_matches('"');
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// The refusal for a link type key this port does not serve.
+fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
+    let key = key.as_ref();
+    let lower = key.to_ascii_lowercase();
+    if UNPORTED_C_JSON_LINK_TYPES.contains(&lower.as_str()) {
+        return Some(
+            format!(
+                "dbJLinkInit: Link type '{key}' is registered by epics-base but not \
+                 implemented by this port"
+            )
+            .into(),
+        );
+    }
+    if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == lower) {
+        return Some(LinkRefusal::printed(format!(
+            "dbJLinkInit: Link type '{key}' not found"
+        )));
+    }
+    None
+}
+
 /// Read a link field's text as a JSON link — the single owner of "is this a
 /// JSON link, and is it usable".
 ///
@@ -1794,27 +1878,28 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
     let normalized = match crate::json5::relaxed_to_strict(s) {
         Ok(normalized) => normalized,
         Err(e) => {
-            return JsonLinkParse::Rejected(format!("dbJLinkInit: {s} is not a JSON link — {e}"));
+            // yajl hands `dbjl_map_key` the key before it reaches the
+            // unterminated comment, so an unknown type is reported first.
+            let crate::json5::Json5Error::UnterminatedBlockComment { offset } = e;
+            if let Some(refusal) = key_before(&s[..offset]).and_then(unknown_link_type) {
+                return JsonLinkParse::Rejected(refusal);
+            }
+            return JsonLinkParse::Rejected(
+                format!("dbJLinkInit: {s} is not a JSON link — {e}").into(),
+            );
         }
     };
     let key = match json_link_key(&normalized) {
         JsonLinkKey::Named(key) => key,
         JsonLinkKey::Empty => return JsonLinkParse::Parsed(ParsedLink::None),
         JsonLinkKey::Malformed => {
-            return JsonLinkParse::Rejected(format!(
-                "dbJLinkInit: {s} is not a JSON link — no link type key"
-            ));
+            return JsonLinkParse::Rejected(
+                format!("dbJLinkInit: {s} is not a JSON link — no link type key").into(),
+            );
         }
     };
-    let lower = key.to_ascii_lowercase();
-    if UNPORTED_C_JSON_LINK_TYPES.contains(&lower.as_str()) {
-        return JsonLinkParse::Rejected(format!(
-            "dbJLinkInit: Link type '{key}' is registered by epics-base but not \
-             implemented by this port"
-        ));
-    }
-    if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == lower) {
-        return JsonLinkParse::Rejected(format!("dbJLinkInit: Link type '{key}' not found"));
+    if let Some(refusal) = unknown_link_type(key) {
+        return JsonLinkParse::Rejected(refusal);
     }
     // The body reader splits on `:` and matches barewords too, so it needs the
     // same normalized text; `s` is kept only for the diagnostics below.
@@ -1827,9 +1912,9 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
         // text asked for, and the only other outcome reachable from here is the
         // PV-name link this whole function exists to prevent, so it refuses and
         // says which type refused.
-        None => JsonLinkParse::Rejected(format!(
-            "dbJLinkInit: Link type '{key}' rejected its value in {s}"
-        )),
+        None => JsonLinkParse::Rejected(
+            format!("dbJLinkInit: Link type '{key}' rejected its value in {s}").into(),
+        ),
     }
 }
 
@@ -1838,7 +1923,7 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
 /// (`dbStaticLib.c:2281-2283` → `S_dbLib_badField`).
 pub fn check_json_link_text(text: &str) -> CaResult<()> {
     match parse_json_link(text) {
-        JsonLinkParse::Rejected(msg) => Err(CaError::InvalidValue(msg)),
+        JsonLinkParse::Rejected(refusal) => Err(CaError::BadLink(refusal)),
         JsonLinkParse::NotJson | JsonLinkParse::Parsed(_) => Ok(()),
     }
 }
@@ -3961,5 +4046,27 @@ mod json_link_tests {
                 .any(|s| s.key == "state" && s.jlif_name == "lnkStateIf"),
             "`link(state, lnkStateIf)` is `links.dbd.pod:171`"
         );
+    }
+}
+
+impl super::record_instance::RecordInstance {
+    /// The reader's own `INP` with its target lent for as long as the reader
+    /// is held — the only way to a lent target. `release_addr` runs only with
+    /// the reader exclusively borrowed (`RecordInstance::destroy`,
+    /// `release_link_targets_to`), and no other instance holds this
+    /// `Arc<DbLink>`: every `parsed_inp` is its own parse.
+    #[inline(always)]
+    pub(crate) fn lend_inp_addr(
+        &mut self,
+        revision: u64,
+        resolve: impl FnOnce(&DbLink) -> DbLinkAnswer,
+    ) -> Option<(&ParsedLink, &super::record_instance::ResolvedTarget)> {
+        let link = self.parsed_inp.link();
+        let ParsedLink::Db(db) = link else {
+            return None;
+        };
+        // SAFETY: `self` is borrowed `&mut` for the returned lifetime.
+        let at = unsafe { db.lend_addr(revision, || resolve(db)) }?;
+        Some((link, at))
     }
 }

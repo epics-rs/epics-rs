@@ -224,6 +224,10 @@ test-group = 'ca_softioc'
 #                                        the serving arm waits on the
 #                                        server's own announcement rather
 #                                        than on a clock.
+#   binary(softioc_resolves_a_ca_link) — 0 failures in 20 runs, 10 at a
+#                                        time at host load 35; each child
+#                                        serves and searches its own
+#                                        ephemeral port on 127.0.0.1.
 #   binary(interop_pvxs)               — fix-db measured 3 failures in 20
 #                                        runs with ONE test alone in the
 #                                        run on an idle host: not a
@@ -231,7 +235,7 @@ test-group = 'ca_softioc'
 #                                        would cost wall time and buy
 #                                        nothing.
 [[profile.default.overrides]]
-filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(interop_pvxs)'
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(interop_pvxs)'
 test-group = 'ioc_unthrottled'
 
 [test-groups]

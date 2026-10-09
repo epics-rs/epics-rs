@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{PreparedLink, RecordInstance};
+use crate::server::record::{AfterGate, PreparedCommonLink, PreparedLink, RecordInstance};
 use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
 
@@ -448,6 +448,30 @@ fn snam_special_after_put(
     Ok(())
 }
 
+/// Move the work a `special(_, true)` left for after the gate into the put's
+/// slot.
+fn collect_after_gate(instance: &mut RecordInstance, after: &mut Option<AfterGate>) {
+    if let Some(work) = instance.record.take_after_gate() {
+        *after = Some(work);
+    }
+}
+
+/// [`RecordInstance::put_common_field_prepared`], whose `special(_, true)`
+/// runs inside it, with the work that pass left for after the gate. `link`
+/// is the `dbCommon` link parse made before the hold, and takes the old one
+/// back.
+fn put_common(
+    instance: &mut RecordInstance,
+    field: &str,
+    value: EpicsValue,
+    link: &mut Option<PreparedCommonLink>,
+    after: &mut Option<AfterGate>,
+) -> CaResult<crate::server::record::CommonFieldPutResult> {
+    let put = instance.put_common_field_prepared(field, value, link);
+    collect_after_gate(instance, after);
+    put
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`](crate::server::record::Record::take_special_actions)).
 ///
@@ -479,8 +503,10 @@ fn special_after_put(
     field: &str,
     out: &mut Vec<crate::server::record::ProcessAction>,
     backing: crate::server::database::LinkBacking<'_>,
+    after: &mut Option<AfterGate>,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let mut status = instance.record.special(field, true);
+    collect_after_gate(instance, after);
     // The record's half above and the registry half here are ONE C function,
     // `special(paddr, 1)`, so they share the action drain, the error-path post
     // emission and the status. The record cannot do the lookup itself — the
@@ -705,6 +731,145 @@ enum PutRequest {
 /// such a field clamps to one element and writes element 0, which is what
 /// reducing the array to [`EpicsValue::first_element`] produces.
 fn dbput_request(
+    record_name: &str,
+    record: &dyn crate::server::record::Record,
+    field: &str,
+    value: EpicsValue,
+) -> CaResult<PutRequest> {
+    dbput_request_unnamed(record, field, value).map_err(|e| name_refusal(e, record_name))
+}
+
+/// The value shapes `dbPutFieldLink` takes a link's text from.
+fn is_link_text(value: &EpicsValue) -> bool {
+    matches!(value, EpicsValue::String(_) | EpicsValue::CharArray(_))
+}
+
+/// A converter's refusal names the record its C report prints.
+fn name_refusal(e: CaError, record_name: &str) -> CaError {
+    match e {
+        CaError::BadChoice(refusal) => CaError::BadChoice(refusal.of_record(record_name)),
+        e => e,
+    }
+}
+
+/// The gate an `_already_locked` put entry takes from its caller, minted by
+/// [`PvDatabase::lock_for_put`] for the record and field it puts. The entry
+/// reads its target from here, so a put cannot run or settle under a gate
+/// taken for another record; it drops the gate once the body has run and
+/// settles the put after that.
+#[must_use = "the record's gate is released as soon as this is dropped"]
+pub struct HeldRecord<'n> {
+    record: &'n str,
+    field: &'n str,
+    gate: Option<PutGate>,
+}
+
+/// The puts of one transaction made under a [`super::ManyRecordWriteGuard`]
+/// (QSRV's atomic group PUT); see [`PvDatabase::put_many_locked`].
+/// Each put's outcome goes back to the body, and what it owes past the gate
+/// stays here until the guard is down.
+pub struct HeldPuts<'a> {
+    db: &'a PvDatabase,
+    records: Vec<&'a str>,
+    owed: Vec<OwedPut<'a>>,
+}
+
+/// One record of a [`HeldPuts`] transaction's locked set, the only target its
+/// puts take, so a put to a record outside the set cannot be written.
+#[derive(Clone, Copy)]
+pub struct LockedRecord<'a>(&'a str);
+
+struct OwedPut<'a> {
+    record: &'a str,
+    field: &'a str,
+    link_text: bool,
+    ok: bool,
+    report: Option<String>,
+    after: Option<AfterGate>,
+}
+
+impl<'a> HeldPuts<'a> {
+    /// `records[index]` of the [`PvDatabase::put_many_locked`] that made this.
+    pub fn record(&self, index: usize) -> Option<LockedRecord<'a>> {
+        self.records.get(index).copied().map(LockedRecord)
+    }
+
+    /// [`PvDatabase::put_pv_already_locked`] for one member.
+    pub fn put_pv(
+        &mut self,
+        record: LockedRecord<'a>,
+        field: &'a str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        let LockedRecord(record) = record;
+        let mut after = None;
+        let put = self
+            .db
+            .put_record_pv_body(record, field, value, &mut after)
+            .unwrap_or_else(|| Err(CaError::ChannelNotFound(record.to_string())));
+        self.owe(record, field, false, put, after)
+    }
+
+    /// [`PvDatabase::put_record_field_from_ca_no_notify_already_locked`] for
+    /// one member.
+    pub fn put_record_field_from_ca_no_notify(
+        &mut self,
+        record: LockedRecord<'a>,
+        field: &'a str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        let LockedRecord(record) = record;
+        let link_text = is_link_text(&value);
+        let mut after = None;
+        let put = self
+            .db
+            .put_record_field_from_ca_body(record, field, value, NotifyRequest::None, &mut after)
+            .map(|_| ());
+        self.owe(record, field, link_text, put, after)
+    }
+
+    fn owe(
+        &mut self,
+        record: &'a str,
+        field: &'a str,
+        link_text: bool,
+        mut put: CaResult<()>,
+        after: Option<AfterGate>,
+    ) -> CaResult<()> {
+        let report = put.as_mut().err().and_then(CaError::take_put_report);
+        self.owed.push(OwedPut {
+            record,
+            field,
+            link_text,
+            ok: put.is_ok(),
+            report,
+            after,
+        });
+        put
+    }
+}
+
+/// [`PvDatabase::put_many_locked`]'s hold: dropping it, by return or by
+/// unwind, drops the gate and then settles every put made under it.
+struct SettleOnDrop<'a> {
+    gate: Option<super::ManyRecordWriteGuard>,
+    puts: HeldPuts<'a>,
+}
+
+impl Drop for SettleOnDrop<'_> {
+    fn drop(&mut self) {
+        drop(self.gate.take());
+        let db = self.puts.db;
+        for owed in self.puts.owed.drain(..) {
+            if let Some(line) = owed.report {
+                crate::runtime::log::errlog_printf(&line);
+            }
+            db.settle_put(owed.record, owed.field, owed.link_text, owed.ok, owed.after);
+        }
+    }
+}
+
+fn dbput_request_unnamed(
     record: &dyn crate::server::record::Record,
     field: &str,
     value: EpicsValue,
@@ -1282,8 +1447,11 @@ impl PvDatabase {
     /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
-        let _record_gate = self.acquire_put_gate(base, field, Some(&value));
-        self.put_pv_already_locked(name, value)
+        let held = self.lock_for_put(base, field, &value);
+        let mut after = None;
+        let put = self.put_pv_body(name, value, &mut after);
+        // The body refuses every link field, so no link text lands.
+        self.settle_held(held, false, put, after)
     }
 
     /// `put_pv` variant for a caller already holding the
@@ -1292,8 +1460,73 @@ impl PvDatabase {
     ///
     /// This is the whole `dbPut` body — the gate-held region, and it is a
     /// `fn`. See `acquire_put_gate`.
-    pub fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_pv_body(name, value)
+    pub fn put_pv_already_locked(&self, held: HeldRecord<'_>, value: EpicsValue) -> CaResult<()> {
+        let mut after = None;
+        let put = self
+            .put_record_pv_body(held.record, held.field, value, &mut after)
+            .unwrap_or_else(|| Err(CaError::ChannelNotFound(held.record.to_string())));
+        self.settle_held(held, false, put, after)
+    }
+
+    /// The gate a put of `value` to `record`.`field` takes — `dbScanLock`,
+    /// or for a DB link field also the new target's set — for a caller that
+    /// then puts through an `_already_locked` entry.
+    pub fn lock_for_put<'n>(
+        &self,
+        record: &'n str,
+        field: &'n str,
+        value: &EpicsValue,
+    ) -> HeldRecord<'n> {
+        HeldRecord {
+            record,
+            field,
+            gate: self.acquire_put_gate(record, field, Some(value)),
+        }
+    }
+
+    /// Drop `held`'s gate, then settle the put made under it.
+    fn settle_held<T>(
+        &self,
+        held: HeldRecord<'_>,
+        link_text: bool,
+        put: CaResult<T>,
+        after: Option<AfterGate>,
+    ) -> CaResult<T> {
+        let HeldRecord {
+            record,
+            field,
+            gate,
+        } = held;
+        drop(gate);
+        self.after_put_gate(record, field, link_text, put, after)
+    }
+
+    /// A transaction of puts under C `dbScanLockMany` over `records` (QSRV's
+    /// atomic group PUT). `body` runs holding every record's gate and puts
+    /// through [`HeldPuts`] to the records of `records` only; once it
+    /// returns the gate drops and every put
+    /// settles, in the order made — on an unwind out of `body` too.
+    /// `capacity` is the put count expected, so the hold allocates nothing
+    /// for the list.
+    pub fn put_many_locked<'a, S, R>(
+        &'a self,
+        records: &'a [S],
+        capacity: usize,
+        body: impl FnOnce(&mut HeldPuts<'a>) -> R,
+    ) -> R
+    where
+        S: AsRef<str>,
+    {
+        let mut held = SettleOnDrop {
+            gate: None,
+            puts: HeldPuts {
+                db: self,
+                records: records.iter().map(AsRef::as_ref).collect(),
+                owed: Vec::with_capacity(capacity),
+            },
+        };
+        held.gate = Some(self.lock_records(&held.puts.records));
+        body(&mut held.puts)
     }
 
     /// Take the L1 advisory write gate a put to `name` needs, if any.
@@ -1461,14 +1694,12 @@ impl PvDatabase {
         crate::types::dbf_link_class(guard.record.record_type(), &field_upper).is_some()
     }
 
-    fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        let (base, field) = super::parse_pv_name(name);
-        let field = field.to_ascii_uppercase();
-        // No `link_field_write` obligation: this body refuses every link
-        // field (`check_not_link_field`), so it never changes link text, and
-        // a relink on that refusal would read every record in the region —
-        // the calling frame's own among them.
-
+    pub(super) fn put_pv_body(
+        &self,
+        name: &str,
+        value: EpicsValue,
+        after: &mut Option<AfterGate>,
+    ) -> CaResult<()> {
         // Check simple PVs first. The lookup is its own statement so the
         // `!Send` directory guard is down before `pv.set(…).await` — see the
         // `simple_pvs` field doc in `database/mod.rs`.
@@ -1478,13 +1709,29 @@ impl PvDatabase {
             return Ok(());
         }
 
-        // Records — alias-aware (epics-base PR #336).
-        if let Some((canonical, rec)) = self.lookup_record(base) {
-            let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
-            return self.put_record_body(&canonical, &rec, &field, &at, value);
-        }
+        let (base, field) = super::parse_pv_name(name);
+        self.put_record_pv_body(base, field, value, after)
+            .unwrap_or_else(|| Err(CaError::ChannelNotFound(name.to_string())))
+    }
 
-        Err(CaError::ChannelNotFound(name.to_string()))
+    /// [`Self::put_pv_body`]'s record arm; `None` when `base` names no record.
+    fn put_record_pv_body(
+        &self,
+        base: &str,
+        field: &str,
+        value: EpicsValue,
+        after: &mut Option<AfterGate>,
+    ) -> Option<CaResult<()>> {
+        let field = field.to_ascii_uppercase();
+        // No `link_field_write` obligation: this body refuses every link
+        // field (`check_not_link_field`), so it never changes link text, and
+        // a relink on that refusal would read every record in the region —
+        // the calling frame's own among them.
+
+        // Records — alias-aware (epics-base PR #336).
+        let (canonical, rec) = self.lookup_record(base)?;
+        let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
+        Some(self.put_record_body(&canonical, &rec, &field, &at, value, after))
     }
 
     /// [`Self::put_pv_body`] for a record already resolved — C's `dbPut` on a
@@ -1499,6 +1746,7 @@ impl PvDatabase {
         field: &str,
         at: &crate::server::record::record_instance::PutAddr,
         value: EpicsValue,
+        after: &mut Option<AfterGate>,
     ) -> CaResult<()> {
         // The caller holds the advisory write gate (`dbScanLock`
         // analogue) for `canonical_base` — see `acquire_put_gate`.
@@ -1540,7 +1788,7 @@ impl PvDatabase {
             // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
             check_not_link_field(field, at.field.desc)?;
 
-            let request = dbput_request(&*instance.record, field, value)?;
+            let request = dbput_request(&instance.name, &*instance.record, field, value)?;
 
             // Pre-write special hook (C EPICS dbPutSpecial pass=0).
             // C `dbPut` runs it on EVERY entry path — dbPutField and
@@ -1598,12 +1846,13 @@ impl PvDatabase {
                                 field,
                                 &mut special_actions,
                                 link_backing,
+                                after,
                             )?;
                             clear_udf_on_value_put(&mut instance, field);
                             result
                         }
                         Err(CaError::FieldNotFound(_)) => {
-                            instance.put_common_field(field, value)?
+                            put_common(&mut instance, field, value, &mut None, after)?
                         }
                         // A refused store does NOT skip the pass above:
                         // C runs it either way (`dbAccess.c:1398`) and lets
@@ -1615,6 +1864,7 @@ impl PvDatabase {
                                 field,
                                 &mut special_actions,
                                 link_backing,
+                                after,
                             )?;
                             return Err(e);
                         }
@@ -1823,6 +2073,22 @@ impl PvDatabase {
         origin: u64,
     ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
+        // `put_pv_and_post_gated` refuses every link field.
+        let mut after = None;
+        let put = self
+            .put_pv_and_post_gated(name, value, origin, &mut after)
+            .await;
+        self.after_put_gate(base, field, false, put, after)
+    }
+
+    async fn put_pv_and_post_gated(
+        &self,
+        name: &str,
+        value: EpicsValue,
+        origin: u64,
+        after: &mut Option<AfterGate>,
+    ) -> CaResult<()> {
+        let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
         // Simple-PV path: PVs registered via `add_pv` (e.g. CA gateway
@@ -1886,7 +2152,7 @@ impl PvDatabase {
                 check_no_mod_in_db_put(&instance, &field, &at)?;
                 check_not_link_field(&field, at.field.desc)?;
 
-                let request = dbput_request(&*instance.record, &field, value)?;
+                let request = dbput_request(&instance.name, &*instance.record, &field, value)?;
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0) —
                 // C `dbPut` runs it on every entry path; this is the third
@@ -1929,12 +2195,13 @@ impl PvDatabase {
                                     &field,
                                     &mut special_actions,
                                     link_backing,
+                                    after,
                                 )?;
                                 clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
                             Err(CaError::FieldNotFound(_)) => {
-                                instance.put_common_field(&field, value)?
+                                put_common(&mut instance, &field, value, &mut None, after)?
                             }
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
@@ -1946,6 +2213,7 @@ impl PvDatabase {
                                     &field,
                                     &mut special_actions,
                                     link_backing,
+                                    after,
                                 )?;
                                 return Err(e);
                             }
@@ -2103,8 +2371,8 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        let _record_gate = self.acquire_put_gate(record_name, field, Some(&value));
-        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
+        let held = self.lock_for_put(record_name, field, &value);
+        self.put_record_field_from_ca_already_locked(held, value)
     }
 
     /// Variant for a caller that already owns the target
@@ -2115,11 +2383,19 @@ impl PvDatabase {
     /// dead-locking on its own `ManyRecordWriteGuard`.
     pub fn put_record_field_from_ca_already_locked(
         &self,
-        record_name: &str,
-        field: &str,
+        held: HeldRecord<'_>,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
+        let link_text = is_link_text(&value);
+        let mut after = None;
+        let put = self.put_record_field_from_ca_body(
+            held.record,
+            held.field,
+            value,
+            NotifyRequest::New,
+            &mut after,
+        );
+        self.settle_held(held, link_text, put, after)
     }
 
     /// Fire-and-forget variant — C `dbPutField` semantics: the put
@@ -2155,10 +2431,57 @@ impl PvDatabase {
         value: EpicsValue,
         origin: u64,
     ) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(record_name, field, Some(&value));
-        let _origin_scope = crate::server::record::ambient_write_origin_scope(origin);
-        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
-            .map(|_| ())
+        let held = self.lock_for_put(record_name, field, &value);
+        let scope = crate::server::record::ambient_write_origin_scope(origin);
+        self.put_no_notify_under(held, scope, value)
+    }
+
+    /// What a put owes once its gate is down: the errlog line a refused put
+    /// still carries, a written link's CP connect
+    /// ([`Self::relink_cp_link`]), the CP links reading a field only a put
+    /// posts ([`Self::dispatch_put_cp_targets`]), and the work its
+    /// `special()` left ([`AfterGate`]). `link_text` is whether the value
+    /// could be a link's text, so any other put asks no relink.
+    fn after_put_gate<T>(
+        &self,
+        record_name: &str,
+        field: &str,
+        link_text: bool,
+        put: CaResult<T>,
+        after: Option<AfterGate>,
+    ) -> CaResult<T> {
+        if let Err(e) = &put {
+            e.emit_put_report();
+        }
+        self.settle_put(record_name, field, link_text, put.is_ok(), after);
+        put
+    }
+
+    /// [`Self::after_put_gate`] past the report: what a put that `ok`
+    /// landed owes, and its `special()`'s work either way.
+    fn settle_put(
+        &self,
+        record_name: &str,
+        field: &str,
+        link_text: bool,
+        ok: bool,
+        after: Option<AfterGate>,
+    ) {
+        if ok {
+            if link_text
+                && self.get_record(record_name).is_some_and(|rec| {
+                    crate::types::dbf_link_class(rec.rdes().record_type, field).is_some()
+                })
+            {
+                self.relink_cp_link(record_name, field);
+            }
+            if let Some(field) = super::put_posted_field(field) {
+                self.dispatch_put_cp_targets(record_name, field);
+            }
+        }
+        if let Some(work) = after {
+            work.run(self);
+        }
     }
 
     /// The one router for an EXTERNAL client PUT that carries pvxs's
@@ -2316,12 +2639,33 @@ impl PvDatabase {
     /// [`Self::put_record_field_from_ca_already_locked`].
     pub fn put_record_field_from_ca_no_notify_already_locked(
         &self,
-        record_name: &str,
-        field: &str,
+        held: HeldRecord<'_>,
         value: EpicsValue,
     ) -> CaResult<()> {
-        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
-            .map(|_| ())
+        self.put_no_notify_under(held, (), value)
+    }
+
+    /// The no-notify body under `held`; `scope` ends, then the gate drops,
+    /// then the put settles.
+    fn put_no_notify_under<S>(
+        &self,
+        held: HeldRecord<'_>,
+        scope: S,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        let link_text = is_link_text(&value);
+        let mut after = None;
+        let put = self
+            .put_record_field_from_ca_body(
+                held.record,
+                held.field,
+                value,
+                NotifyRequest::None,
+                &mut after,
+            )
+            .map(|_| ());
+        drop(scope);
+        self.settle_held(held, link_text, put, after)
     }
 
     /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
@@ -2459,39 +2803,49 @@ impl PvDatabase {
         // The clients already hold their receivers; a failure here (record gone,
         // field refused) must still release them, which dropping the senders
         // does — the same completion a `dbNotifyCancel` gives the C client.
-        let _record_gate = self.acquire_put_gate(record_name, "", None);
-        let Some(rec) = self.get_record(record_name) else {
-            return;
-        };
-        let Some(queued) = rec.write().take_next_notify_restart() else {
-            return;
-        };
-        match queued {
-            crate::server::record::DeferredNotify::Put(
-                crate::server::record::DeferredNotifyPut {
-                    field,
-                    value,
-                    completion,
-                },
-            ) => {
-                let _ = self.put_record_field_from_ca_body(
-                    record_name,
-                    &field,
-                    value,
-                    NotifyRequest::Deferred(completion),
-                );
+        let held = {
+            let _record_gate = self.acquire_put_gate(record_name, "", None);
+            let Some(rec) = self.get_record(record_name) else {
+                return;
+            };
+            let Some(queued) = rec.write().take_next_notify_restart() else {
+                return;
+            };
+            match queued {
+                crate::server::record::DeferredNotify::Put(
+                    crate::server::record::DeferredNotifyPut {
+                        field,
+                        value,
+                        completion,
+                    },
+                ) => {
+                    let link_text = is_link_text(&value);
+                    let mut after = None;
+                    let put = self.put_record_field_from_ca_body(
+                        record_name,
+                        &field,
+                        value,
+                        NotifyRequest::Deferred(completion),
+                        &mut after,
+                    );
+                    (field, link_text, put, after)
+                }
+                // C `processGetRequest` on restart: `processNotifyCommon`
+                // re-enters with no `putCallback`, so the replay is the process
+                // alone. The gate is already held, so this takes the
+                // already-locked entry.
+                crate::server::record::DeferredNotify::Process { completion } => {
+                    let _ = self.install_notify_and_process_already_locked(
+                        record_name,
+                        completion,
+                        NotifyArrival::Replay,
+                    );
+                    return;
+                }
             }
-            // C `processGetRequest` on restart: `processNotifyCommon` re-enters
-            // with no `putCallback`, so the replay is the process alone. The
-            // gate is already held, so this takes the already-locked entry.
-            crate::server::record::DeferredNotify::Process { completion } => {
-                let _ = self.install_notify_and_process_already_locked(
-                    record_name,
-                    completion,
-                    NotifyArrival::Replay,
-                );
-            }
-        }
+        };
+        let (field, link_text, put, after) = held;
+        let _ = self.after_put_gate(record_name, &field, link_text, put, after);
     }
 
     /// Arm `record_name`'s wait-set around `completion` and drive one process
@@ -2637,6 +2991,7 @@ impl PvDatabase {
         field: &str,
         mut value: EpicsValue,
         notify_request: NotifyRequest,
+        after: &mut Option<AfterGate>,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
         let field = field.to_ascii_uppercase();
         let want_notify = notify_request.wants_notify();
@@ -2703,6 +3058,7 @@ impl PvDatabase {
             check_no_mod_in_db_put(&instance, &field, &at)?;
         }
         let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
+        let mut common_link = PreparedCommonLink::for_put(record_name, &field, &value);
         // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
         // relinks the record's lock set, and its parse/`dbCanSetLink` refusals
         // return before it does. Taken out below them, so a refused put never
@@ -2745,15 +3101,11 @@ impl PvDatabase {
         // (`putFieldType`) and fires the done callback IMMEDIATELY — it never
         // reaches the PACT test, never processes, never defers. So a link
         // field always takes the value even on a busy or permanently-parked
-        // record: a bare `sub` (empty `SNAM`) parks PACT=TRUE forever
-        // (subRecord.c:119-122), and parking its link-field put on a `PactExit`
-        // that never comes drops the value — `caput <sub>.INPA '0'` then reads
-        // back "" instead of C's "0". The ordinary write path below already
-        // reproduces C's link semantics for these fields (writes the value;
+        // record. The ordinary write path below already reproduces C's link
+        // semantics for these fields (writes the value;
         // `put_drives_processing_of` is false — no link field is `pp` or PROC —
-        // so it processes nothing and returns immediate completion), so the
-        // only correction the special case needs is to keep a link field OUT
-        // of the notify PACT-defer park.
+        // so it processes nothing and returns immediate completion), so a link
+        // field only skips the notify slot: no claim, no queue.
         let is_dbf_link_field = self.is_dbf_link_field(record_name, &field);
         // The claim on this record's put-notify slot, held for the rest of the
         // body. `None` for a fire-and-forget put, which parks nothing — C
@@ -2764,7 +3116,7 @@ impl PvDatabase {
             NotifyClaim<'_>,
             Option<crate::runtime::sync::oneshot::Receiver<()>>,
         )> = None;
-        if want_notify {
+        if want_notify && !is_dbf_link_field {
             let is_restart = notify_request.is_restart();
             self.cancel_unanswerable_notify(record_name);
             let mut guard = rec.write();
@@ -2772,13 +3124,6 @@ impl PvDatabase {
             // (C skips dbNotify.c:213 for it and falls straight to :225).
             let must_wait = if is_restart {
                 guard.is_processing()
-            } else if is_dbf_link_field {
-                // Ownership only — see `notify_put_has_owner`. Keeping link
-                // fields out of the whole decision (not just the PACT arm) left
-                // an owned record's link put falling through to the wait-set
-                // install below, whose only answer to an occupied slot was
-                // a refusal, deleted since along with its `CaError` variant.
-                guard.notify_put_has_owner()
             } else {
                 guard.notify_put_is_owned()
             };
@@ -2861,7 +3206,7 @@ impl PvDatabase {
                 };
                 if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write();
-                    match guard.put_common_field("PROC", value) {
+                    match put_common(&mut guard, "PROC", value, &mut None, after) {
                         Ok(_) => {
                             guard.notify_field(
                                 "PROC",
@@ -2976,7 +3321,7 @@ impl PvDatabase {
                 // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
                 // This matches C EPICS db_put_field() which converts from the CA client's type
                 // to the record field's native type.
-                let request = dbput_request(&*instance.record, &field, value)?;
+                let request = dbput_request(&instance.name, &*instance.record, &field, value)?;
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0)
                 instance.record.special(&field, false)?;
@@ -3020,6 +3365,7 @@ impl PvDatabase {
                                     &field,
                                     &mut special_actions,
                                     link_backing,
+                                    after,
                                 )?;
                                 // The clear happens BEFORE `dbProcess` runs, so
                                 // any reader between the put and the process cycle
@@ -3028,7 +3374,7 @@ impl PvDatabase {
                                 result
                             }
                             Err(CaError::FieldNotFound(_)) => {
-                                instance.put_common_field(&field, value)?
+                                put_common(&mut instance, &field, value, &mut common_link, after)?
                             }
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
@@ -3040,6 +3386,7 @@ impl PvDatabase {
                                     &field,
                                     &mut special_actions,
                                     link_backing,
+                                    after,
                                 )?;
                                 return Err(e);
                             }
@@ -3178,6 +3525,7 @@ impl PvDatabase {
                     // special record runs its after-put hook on a failed conversion.
                     if instance.record.special_commits_alarms(&field) {
                         let _ = instance.record.special(&field, true);
+                        collect_after_gate(&mut instance, after);
                         let alarm_mask = commit_special_reset_alarm(&mut instance);
                         let value_only = instance.record.value_only_change_fields();
                         for sf in instance.record.monitor_side_effect_fields(&field) {
@@ -3339,7 +3687,9 @@ impl PvDatabase {
         // ~line 677). The framework expresses this by calling
         // `set_device_did_compute(true)`.
         //
-        // This MUST be gated on `soft_channel_skips_convert()`. Output
+        // This MUST be gated on `soft_input_skips_convert()`: only a dset
+        // that returns 2 skips the convert, so Raw Soft Channel re-derives
+        // VAL from RVAL as C does. Output
         // records (mbbo/mbbo_direct/bo/ao) implement
         // `set_device_did_compute` as "skip the VAL → RVAL output
         // convert" — the OPPOSITE direction. C `mbboRecord.c::process`
@@ -3348,9 +3698,7 @@ impl PvDatabase {
         // unconditionally on every non-pact process; a CA VAL-put on an
         // output record MUST recompute RVAL/ORAW. Suppressing it there
         // left RVAL/ORAW/ORBV stale. Output records return the default
-        // `false` from `soft_channel_skips_convert()`, so this gate
-        // matches the identical gates in processing.rs (line 694) and
-        // record_instance.rs (line 1381).
+        // `false` from `soft_channel_skips_convert()`.
         if field == "VAL" {
             // Collect-then-act: clone the handle under a brief map read, drop
             // the map lock before the per-record write.
@@ -3360,7 +3708,7 @@ impl PvDatabase {
             };
             if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write();
-                if guard.record.soft_channel_skips_convert() {
+                if guard.soft_input_skips_convert() {
                     guard.record.set_device_did_compute(true);
                 }
             }
@@ -3444,7 +3792,20 @@ impl PvDatabase {
     /// write that never processes. That is exactly this body's behavior
     /// (`put_common_field`'s INP/OUT/FLNK arms, no process), so the
     /// `check_not_link_field` refusal does not apply here.
-    pub async fn put_pv_no_process(&self, name: &str, mut value: EpicsValue) -> CaResult<()> {
+    pub async fn put_pv_no_process(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        let (base, field) = super::parse_pv_name(name);
+        let link_text = is_link_text(&value);
+        let mut after = None;
+        let put = self.put_pv_no_process_gated(name, value, &mut after).await;
+        self.after_put_gate(base, field, link_text, put, after)
+    }
+
+    async fn put_pv_no_process_gated(
+        &self,
+        name: &str,
+        mut value: EpicsValue,
+        after: &mut Option<AfterGate>,
+    ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -3495,6 +3856,7 @@ impl PvDatabase {
                 check_no_mod_in_db_put(&instance, &field, &at)?;
             }
             let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
+            let mut common_link = PreparedCommonLink::for_put(base, &field, &value);
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
             // field relinks the record's lock set, inside the gate window
             // above, which holds both sets the relink moves between. Below
@@ -3550,6 +3912,9 @@ impl PvDatabase {
                 //
                 // A refused store is HELD, not returned: C runs the after pass
                 // below either way (`dbAccess.c:1398`) and lets its status win.
+                // The common writer runs that pass itself, so its result is
+                // carried instead.
+                let mut common = None;
                 let refused = match instance.record.get_field(&field).map(|v| v.db_field_type()) {
                     Some(target) => match crate::server::record::dbput_coerce_value(
                         &*instance.record,
@@ -3561,7 +3926,13 @@ impl PvDatabase {
                             match put_declared(&mut instance, &field, v.clone(), &mut link) {
                                 Ok(()) => None,
                                 Err(CaError::FieldNotFound(_)) => {
-                                    instance.put_common_field(&field, v)?;
+                                    common = Some(put_common(
+                                        &mut instance,
+                                        &field,
+                                        v,
+                                        &mut common_link,
+                                        after,
+                                    )?);
                                     None
                                 }
                                 Err(e) => Some(e),
@@ -3573,7 +3944,7 @@ impl PvDatabase {
                         Ok(crate::types::c_parse::Converted::Unchanged) => None,
                         // A convert failure is HELD like a refused store, so the
                         // unconditional after pass still runs before it returns.
-                        Err(e) => Some(e),
+                        Err(e) => Some(name_refusal(e, &instance.name)),
                     },
                     None => {
                         let value = crate::server::record::put_value_in_field_shape(
@@ -3584,7 +3955,13 @@ impl PvDatabase {
                         match put_declared(&mut instance, &field, value.clone(), &mut link) {
                             Ok(()) => None,
                             Err(CaError::FieldNotFound(_)) => {
-                                instance.put_common_field(&field, value)?;
+                                common = Some(put_common(
+                                    &mut instance,
+                                    &field,
+                                    value,
+                                    &mut common_link,
+                                    after,
+                                )?);
                                 None
                             }
                             Err(e) => Some(e),
@@ -3604,13 +3981,17 @@ impl PvDatabase {
                 // SNAM running the old routine, with the restore reporting
                 // success — the link route C takes for a DBF link field
                 // (`dbPutFieldLink`, `dbAccess.c:1174,1178`) runs the same pair.
-                let result = special_after_put(
-                    self,
-                    &mut instance,
-                    &field,
-                    &mut special_actions,
-                    link_backing,
-                )?;
+                let result = match common {
+                    Some(result) => result,
+                    None => special_after_put(
+                        self,
+                        &mut instance,
+                        &field,
+                        &mut special_actions,
+                        link_backing,
+                        after,
+                    )?,
+                };
 
                 // `if (status) goto done` (`dbAccess.c:1404`) — the refused
                 // store's status stands where the pass above did not replace
@@ -5044,7 +5425,7 @@ record(ai, "OTHER") {
         let gate = FrameGate::of_held(src.lock_record());
         let held = gate.frame(&src).write();
         for name in ["DST.FLNK", "DST.INP"] {
-            let refused = db.put_pv_already_locked(name, EpicsValue::String("OTHER".into()));
+            let refused = db.put_pv_body(name, EpicsValue::String("OTHER".into()), &mut None);
             assert!(
                 matches!(refused, Err(CaError::BadDbrType(_))),
                 "{name}: {refused:?}"
@@ -5098,7 +5479,13 @@ record(ai, "OTHER") {
         let held = gate.frame(&src).write();
         for (name, value) in refusals.clone() {
             let (record, field) = name.split_once('.').unwrap();
-            let refused = db.put_record_field_from_ca_already_locked(record, field, value);
+            let refused = db.put_record_field_from_ca_body(
+                record,
+                field,
+                value,
+                super::NotifyRequest::New,
+                &mut None,
+            );
             assert!(refused.is_err(), "{name}: {refused:?}");
         }
         drop(held);

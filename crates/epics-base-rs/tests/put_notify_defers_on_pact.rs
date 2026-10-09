@@ -360,25 +360,19 @@ async fn process_notify_onto_an_owned_record_queues_instead_of_refusing() {
     );
 }
 
-/// The same ownership arm reached by a DBF LINK-field put.
+/// A DBF LINK-field put-notify onto a record another notify owns is written
+/// and answered at once: C `dbProcessNotify` handles link fields before
+/// `processNotifyCommon` (`dbNotify.c:331-345`) and never queues them.
 ///
-/// Link fields are deliberately kept out of the PACT arm — a bare `sub` with an
-/// empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122) and a link put
-/// parked there would never be written. That exclusion used to cover the WHOLE
-/// decision, so an owned record's link put fell through to the wait-set install
-/// and got refused.
-///
-/// Boundary: owned (`notify.is_some()`) but NOT PACT — the arm the link-field
-/// exclusion must not skip.
+/// Boundary: owned (`notify.is_some()`) but NOT PACT, so only ownership could
+/// have held the put.
 #[epics_macros_rs::epics_test]
-async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refusing() {
+async fn link_field_put_notify_onto_an_owned_idle_record_is_written_at_once() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("AI1", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
 
-    // Own the record without making it PACT: this isolates the ownership arm
-    // from the PACT arm, which is exactly what the link-field rule splits.
     let (owner_tx, _owner_rx) = epics_base_rs::runtime::sync::oneshot::channel();
     {
         let rec = db.get_record("AI1").unwrap();
@@ -388,18 +382,16 @@ async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refus
         assert!(!inst.is_processing(), "owned, but idle");
     }
 
-    let queued = db
+    let put = db
         .put_record_field_from_ca("AI1", "INP", EpicsValue::String("7".into()))
         .await
-        .expect("C queues a link-field put-notify onto an owned record; no refusal arm exists")
-        .into_handle()
-        .expect("a queued put-notify is async");
-    drop(queued);
+        .unwrap();
+    assert!(put.is_sync(), "a link put-notify is answered at once");
 
-    let rec = db.get_record("AI1").unwrap();
-    assert!(
-        !matches!(rec.read().record.get_field("INP"), Some(EpicsValue::String(ref s)) if s == "7"),
-        "C holds the queued value UNWRITTEN in the restartList node until the replay"
+    assert_eq!(
+        db.get_pv("AI1.INP").unwrap(),
+        EpicsValue::String("7".into()),
+        "the link text is written at once"
     );
 }
 

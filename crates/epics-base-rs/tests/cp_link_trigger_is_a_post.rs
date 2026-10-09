@@ -112,6 +112,7 @@ async fn cp_pair(db: &PvDatabase, modifier: &str, mdel: f64) -> Arc<AtomicUsize>
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
+    db.process_cp_links_on_connect().await;
     processes
 }
 

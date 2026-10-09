@@ -1656,6 +1656,9 @@ impl BuiltIoc {
         // shell's `iocRun` runs. One caller, so the two cannot announce
         // different things.
         adopt_scan_owner(crate::server::scan::ScanOwner::start(db.clone()));
+        // C `dbCaRun` (`iocInit.c:260`): the CP/CPP links' connect-time
+        // process, after `scanRun` and before PINI=RUNNING.
+        db.process_cp_links_on_connect().await;
         // C `piniProcessHook` at `initHookAfterIocRunning` (iocInit.c:637-639)
         // — `piniProcess(menuPiniRUNNING)`; a hook consumer for the same
         // reason as the PINI=RUN pass above, run immediately after the

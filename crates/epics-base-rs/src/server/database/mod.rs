@@ -13,7 +13,7 @@ mod record_lock;
 pub(crate) mod scan_index;
 mod snapshot;
 
-pub use field_io::ProcessMode;
+pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
 pub(crate) use link_set::MetadataPlan;
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
@@ -331,6 +331,147 @@ pub struct CpTarget {
     pub passive_only: bool,
 }
 
+/// The dbCommon fields a process cycle never posts: only a put of the field
+/// posts it, so a CP/CPP link reading one fires on that put and not when its
+/// record processes (C's `caLink` monitor fires on the field's own post).
+const PUT_POSTED_FIELDS: &[&str] = &[
+    "DESC", "ASG", "SCAN", "PINI", "PHAS", "EVNT", "TSE", "TSEL", "DTYP", "DISV", "DISA", "SDIS",
+    "DISP", "ACKT", "DISS", "PRIO", "TPRO", "UDFS", "FLNK",
+];
+
+/// `field` as [`PUT_POSTED_FIELDS`] spells it, if it is one.
+pub(crate) fn put_posted_field(field: &str) -> Option<&'static str> {
+    PUT_POSTED_FIELDS
+        .iter()
+        .copied()
+        .find(|f| f.eq_ignore_ascii_case(field))
+}
+
+/// What one CP/CPP link watches: its source record, the put-posted source
+/// field it reads if it reads one ([`put_posted_field`]), and CPP's gate.
+#[derive(Clone, Debug)]
+pub(crate) struct CpSource {
+    pub(crate) record: String,
+    pub(crate) put_field: Option<&'static str>,
+    pub(crate) passive_only: bool,
+}
+
+/// The CP/CPP edges, each owned by the link that makes it: C gives every
+/// link its own `caLink`, so an edge is keyed by its holder and link field
+/// and [`Self::set_link`] replaces it — a repeated registration or a relink
+/// moves the edge, never adds a second.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CpRegistry {
+    /// Edges fired when the source processes.
+    by_source: HashMap<String, Vec<CpTarget>>,
+    /// Edges fired by a put of their source field.
+    by_put: HashMap<String, Vec<(&'static str, CpTarget)>>,
+    /// (holder, link field) → that link's edge.
+    by_link: HashMap<(String, String), CpSource>,
+    /// The connect pass has run: from here a relink connects its own link.
+    connected: bool,
+}
+
+impl CpRegistry {
+    pub(crate) fn targets(&self, source: &str) -> Option<&Vec<CpTarget>> {
+        self.by_source.get(source)
+    }
+
+    /// The edges a put of `source.field` fires.
+    pub(crate) fn put_targets<'a>(
+        &'a self,
+        source: &str,
+        field: &'static str,
+    ) -> impl Iterator<Item = &'a CpTarget> {
+        self.by_put
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(move |(f, _)| *f == field)
+            .map(|(_, t)| t)
+    }
+
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &String> {
+        self.by_source.keys()
+    }
+
+    pub(crate) fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub(crate) fn mark_connected(&mut self) {
+        self.connected = true;
+    }
+
+    /// The one writer: the link `field` of `holder` now carries `edge`, or
+    /// none.
+    pub(crate) fn set_link(&mut self, holder: &str, field: &str, edge: Option<CpSource>) {
+        let key = (holder.to_string(), field.to_string());
+        if let Some(old) = self.by_link.remove(&key) {
+            let is_old = |t: &CpTarget| t.record == holder && t.passive_only == old.passive_only;
+            match old.put_field {
+                None => {
+                    if let Some(edges) = self.by_source.get_mut(&old.record) {
+                        if let Some(i) = edges.iter().position(is_old) {
+                            edges.remove(i);
+                        }
+                        if edges.is_empty() {
+                            self.by_source.remove(&old.record);
+                        }
+                    }
+                }
+                Some(put_field) => {
+                    if let Some(edges) = self.by_put.get_mut(&old.record) {
+                        if let Some(i) =
+                            edges.iter().position(|(f, t)| *f == put_field && is_old(t))
+                        {
+                            edges.remove(i);
+                        }
+                        if edges.is_empty() {
+                            self.by_put.remove(&old.record);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(edge) = edge {
+            let target = CpTarget {
+                record: holder.to_string(),
+                passive_only: edge.passive_only,
+            };
+            match edge.put_field {
+                None => self
+                    .by_source
+                    .entry(edge.record.clone())
+                    .or_default()
+                    .push(target),
+                Some(f) => self
+                    .by_put
+                    .entry(edge.record.clone())
+                    .or_default()
+                    .push((f, target)),
+            }
+            self.by_link.insert(key, edge);
+        }
+    }
+
+    /// Every edge `name` holds or sources.
+    pub(crate) fn remove_record(&mut self, name: &str) {
+        self.by_source.remove(name);
+        self.by_put.remove(name);
+        for edges in self.by_source.values_mut() {
+            edges.retain(|e| e.record != name);
+        }
+        for edges in self.by_put.values_mut() {
+            edges.retain(|(_, e)| e.record != name);
+        }
+        self.by_source.retain(|_, edges| !edges.is_empty());
+        self.by_put.retain(|_, edges| !edges.is_empty());
+        self.by_link
+            .retain(|(holder, _), edge| holder != name && edge.record != name);
+    }
+}
+
 /// The scan index — one independently locked bucket per [`crate::server::record::ScanList`].
 ///
 /// C's shape (`dbScan.c`): `scan_list` carries its own `epicsMutexId lock`
@@ -573,11 +714,11 @@ struct PvDatabaseInner {
     /// [`CpTarget`]).
     ///
     /// Read-modify-write cell with **two writers that share no other gate**:
-    /// `register_cp_link` (`links.rs:2918`) takes no
+    /// `CpRegistry::set_link` takes no
     /// [`Self::registration_mutex`], `remove_record` (`mod.rs:2056`) does. The
     /// `RwLock`'s write exclusion was the only thing serialising them, so the
     /// [`SnapshotCell`] writer gate here is required, not defensive.
-    cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
+    cp_links: SnapshotCell<CpRegistry>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
     /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
@@ -587,10 +728,9 @@ struct PvDatabaseInner {
     /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
     /// `dbCa.c:958-962` `eventCallback` adding `CA_DBPROCESS`.
     ///
-    /// Read-modify-write cell; sole writer `register_external_cp_link`
-    /// (`links.rs:2968`) merges into an existing edge list, so concurrent
-    /// registrations need the [`SnapshotCell`] writer gate.
-    external_cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
+    /// Read-modify-write cell; sole writer `CpRegistry::set_link`, so
+    /// concurrent registrations need the [`SnapshotCell`] writer gate.
+    external_cp_links: SnapshotCell<CpRegistry>,
     /// Alias map: alternate-name → the [`AliasNode`] it names. Mirrors
     /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -1303,8 +1443,8 @@ impl PvDatabase {
                 records: RecursiveReadLock::new(HashMap::new()),
                 scan_index: scan_index::ScanIndex::new(),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
-                cp_links: SnapshotCell::new(HashMap::new()),
-                external_cp_links: SnapshotCell::new(HashMap::new()),
+                cp_links: SnapshotCell::new(CpRegistry::default()),
+                external_cp_links: SnapshotCell::new(CpRegistry::default()),
                 aliases: RecursiveReadLock::new(HashMap::new()),
                 registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
@@ -1973,16 +2113,17 @@ impl PvDatabase {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let mut out: Vec<(String, String, crate::server::record::ParsedLink)> =
-            Self::link_field_texts(&rec.read())
-                .into_iter()
-                .filter(|(_, raw, _)| !raw.is_empty())
-                .map(|(field, raw, ftype)| {
-                    let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                    (field, raw, parsed)
-                })
-                .filter(|(_, _, parsed)| !matches!(parsed, crate::server::record::ParsedLink::None))
-                .collect();
+        // The texts leave the hold before any is parsed.
+        let texts = Self::link_field_texts(&rec.read());
+        let mut out: Vec<(String, String, crate::server::record::ParsedLink)> = texts
+            .into_iter()
+            .filter(|(_, raw, _)| !raw.is_empty())
+            .map(|(field, raw, ftype)| {
+                let parsed = crate::server::record::parse_link_field(&raw, ftype);
+                (field, raw, parsed)
+            })
+            .filter(|(_, _, parsed)| !matches!(parsed, crate::server::record::ParsedLink::None))
+            .collect();
         // Apply C `dbInitLink`'s locality fallthrough once, here, so no
         // consumer re-derives it. Done after dropping the record-instance
         // guard: the locality query reads the database's record map, and
@@ -2634,7 +2775,10 @@ impl PvDatabase {
                     let empty = declared_link_type(&record_type, Some(&dtyp), &field)
                         .map_or("", DbLinkType::empty_link_text);
                     if empty != text {
-                        Self::set_link_text(&mut rec.write(), &field, empty);
+                        let after = Self::set_link_text(&name, &rec, &field, empty);
+                        if let Some(work) = after {
+                            work.run(self);
+                        }
                     }
                     continue;
                 }
@@ -2659,29 +2803,53 @@ impl PvDatabase {
     /// same split [`Self::link_field_texts`] reads it from. Only ever used to
     /// install the empty link of a declared type, so a rejected put would mean
     /// the two owners disagree about which fields are links.
-    fn set_link_text(inst: &mut RecordInstance, field: &str, text: &str) {
+    ///
+    /// Returns the work the field's `special()` left for after the hold.
+    fn set_link_text(
+        name: &str,
+        rec: &RecordCell,
+        field: &str,
+        text: &str,
+    ) -> Option<crate::server::record::AfterGate> {
         let value = EpicsValue::String(text.into());
-        let put = if inst.common_link_text(field).is_some() {
-            inst.put_common_field_db_load(field, value).map(|_| ())
-        } else {
-            match crate::server::record::PreparedLink::for_put(
-                crate::server::record::FieldDeclaration::field_list(&*inst.record),
-                field,
-                &value,
-            ) {
-                Some(link) => inst.put_link_field(link, value),
-                None => inst.put_declared_field(field, value),
-            }
-        };
-        debug_assert!(put.is_ok(), "{field} is a link field with no writer");
+        // Both parses are made before the write guard and both old ones
+        // dropped after it.
+        let mut common = crate::server::record::PreparedCommonLink::for_put(name, field, &value);
+        let declared =
+            crate::server::record::PreparedLink::for_put(rec.rdes().fields, field, &value);
+        let after = Self::set_link_text_held(&mut rec.write(), field, value, &mut common, declared);
+        drop(common);
+        after
+    }
+
+    fn set_link_text_held(
+        inst: &mut RecordInstance,
+        field: &str,
+        value: EpicsValue,
+        common: &mut Option<crate::server::record::PreparedCommonLink>,
+        declared: Option<crate::server::record::PreparedLink>,
+    ) -> Option<crate::server::record::AfterGate> {
         // C brackets every link write with the special pair — `dbPutSpecial`
         // pass 0 then pass 1 around `dbSetLink` (`dbAccess.c:1174,1178`) — and
         // pass 1 is where a record re-derives what it caches from a link's
         // text: calcout `INAV..INUV`, transform's and (a)scalcout's link
-        // tables. Neither writer above runs it, and this pass is the LAST
-        // writer of every link field's text, so without it the classification
-        // the record made at load stands against text that no longer exists.
-        let _ = inst.record.special(field, true);
+        // tables. This pass is the LAST writer of every link field's text, so
+        // without it the classification the record made at load stands against
+        // text that no longer exists. The common-field writer runs pass 1
+        // itself; the declared-field writers do not.
+        let put = if inst.common_link_text(field).is_some() {
+            inst.put_common_field_db_load_prepared(field, value, common)
+                .map(|_| ())
+        } else {
+            let put = match declared {
+                Some(link) => inst.put_link_field(link, value),
+                None => inst.put_declared_field(field, value),
+            };
+            let _ = inst.record.special(field, true);
+            put
+        };
+        debug_assert!(put.is_ok(), "{field} is a link field with no writer");
+        inst.record.take_after_gate()
     }
 
     /// **The only entry point that can serve a link-backed field's metadata.**
@@ -3099,9 +3267,12 @@ impl PvDatabase {
             if let Err(e) = instance.put_common_field_db_load(&field, value) {
                 eprintln!("put_common_field({field}) failed for {name}: {e}");
             }
+            // An unpublished record has no async context yet; its init passes
+            // classify what this load set.
+            drop(instance.record.take_after_gate());
         }
         if let Some(what) = refused {
-            return Err(CaError::BadChoice(what));
+            return Err(CaError::BadChoice(what.into()));
         }
         // `info(...)` tags land before `init_record`, so device support that
         // reads them at init sees the values.
@@ -3420,12 +3591,7 @@ impl PvDatabase {
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
         // CP lists may still reference this name).
-        self.inner.cp_links.update(|cp| {
-            cp.remove(name);
-            for targets in cp.values_mut() {
-                targets.retain(|t| t.record != name);
-            }
-        });
+        self.inner.cp_links.update(|cp| cp.remove_record(name));
 
         // 4) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
@@ -4648,7 +4814,8 @@ mod tests {
         db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
 
         // Register using the alias forms (CP edge: passive_only = false).
-        db.register_cp_link("SRC_ALIAS", "DST_ALIAS", false).await;
+        db.register_cp_link("SRC_ALIAS", "DST_ALIAS", "INP", false)
+            .await;
 
         // Lookup must succeed via the canonical source name.
         let targets = db.get_cp_targets("SRC_REAL");

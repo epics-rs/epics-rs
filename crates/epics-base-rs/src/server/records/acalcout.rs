@@ -1054,6 +1054,10 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
+    fn alarms_before_stamp(&self) -> bool {
+        true
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

@@ -1028,6 +1028,7 @@ impl ProcessPlan {
         soft_channel_skips_convert: true,
         skips_timestamp_when_undefined: false,
         restamps_time_after_completion: false,
+        alarms_before_stamp: false,
         clears_udf: true,
         soft_read_clears_udf: true,
     };
@@ -1062,6 +1063,7 @@ impl ProcessPlan {
             soft_channel_skips_convert,
             skips_timestamp_when_undefined,
             restamps_time_after_completion,
+            alarms_before_stamp,
             clears_udf,
             soft_read_clears_udf,
         } = *self;
@@ -1090,6 +1092,7 @@ impl ProcessPlan {
             && soft_channel_skips_convert == p.soft_channel_skips_convert
             && skips_timestamp_when_undefined == p.skips_timestamp_when_undefined
             && restamps_time_after_completion == p.restamps_time_after_completion
+            && alarms_before_stamp == p.alarms_before_stamp
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
     }
@@ -1147,6 +1150,7 @@ impl ProcessPlan {
             soft_channel_skips_convert: record.soft_channel_skips_convert(),
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
             restamps_time_after_completion: record.restamps_time_after_completion(),
+            alarms_before_stamp: record.alarms_before_stamp(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
         }
@@ -1585,6 +1589,7 @@ pub(crate) struct ProcessPlan {
     pub(crate) soft_channel_skips_convert: bool,
     pub(crate) skips_timestamp_when_undefined: bool,
     pub(crate) restamps_time_after_completion: bool,
+    pub(crate) alarms_before_stamp: bool,
     pub(crate) clears_udf: bool,
     pub(crate) soft_read_clears_udf: bool,
 }
@@ -7745,13 +7750,15 @@ impl RecordInstance {
         if self.record.clears_udf() {
             self.common.udf = self.record.value_is_undefined() as u8;
         }
+        // Stamped before the alarm hooks, as `process_cycle` does (C
+        // aiRecord.c:156/164).
+        self.common.time = crate::runtime::general_time::get_current();
+
         // Per-record alarm hook (C `checkAlarms()`).
         self.record.check_alarms(&mut self.common);
 
         // Evaluate alarms (accumulates into nsta/nsev)
         self.evaluate_alarms();
-
-        self.common.time = crate::runtime::general_time::get_current();
         // UDF already updated above — do not clear unconditionally.
 
         let mut snapshot = ProcessSnapshot::new();

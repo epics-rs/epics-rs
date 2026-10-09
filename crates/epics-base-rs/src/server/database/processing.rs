@@ -3324,6 +3324,17 @@ impl PvDatabase {
         }
     }
 
+    /// The SIOL half of `recGblGetTimeStampSimm` (`recGbl.c:332-346`).
+    fn siol_stamp(&self, siol: &crate::server::record::ParsedLink) -> SiolStamp {
+        if crate::server::recgbl::simm::is_constant(siol) {
+            return SiolStamp::Now;
+        }
+        match self.db_get_time_stamp_tag(siol) {
+            Some((time, utag)) => SiolStamp::From(time, utag),
+            None => SiolStamp::Keep,
+        }
+    }
+
     /// The locality half of [`Self::db_get_time_stamp_tag`], shared by every
     /// link class that names a record: `dbInitLink` (`dbLink.c:115-130`)
     /// makes a DB-style link naming a record this IOC does not hold a CA
@@ -3438,20 +3449,18 @@ impl PvDatabase {
                 Some((src_time, src_utag)) => super::TselStamp::Time(src_time, src_utag),
                 None => super::TselStamp::None,
             }
-        } else if let Some(val) = self.db_get_link_in(rec, "TSEL", &tsel_link).value() {
-            // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT,
-            // &prec->tse)` loads TSE from the link regardless of its
-            // type. The pre-fix port only read a `ParsedLink::Db`
-            // TSEL, ignoring a CA/PVA TSE source — and then over-corrected
-            // by handing back a CONSTANT TSEL's text every cycle, which C
-            // never does: `recGblGetTimeStampSimm` (`recGbl.c:315`) is
-            // wrapped in `if (!dbLinkIsConstant(plink))`, so a constant
-            // TSEL is skipped outright and TSE keeps its own value. Through the
-            // coercion owner: the conversion routine is C's, chosen by the
-            // SOURCE type (see the DISA read above).
-            super::TselStamp::Tse(val.to_dbf_i16().unwrap_or(0))
         } else {
-            super::TselStamp::None
+            use crate::server::recgbl::simm::LinkFetch;
+            // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT, &prec->tse)`
+            // loads TSE from the link regardless of its type; a CONSTANT TSEL
+            // never reaches here (`tsel_link`). The coercion is C's, chosen by
+            // the SOURCE type. A failed read is `TselStamp::Failed`, whose
+            // LINK alarm the stamp raises where C's read sits.
+            match self.db_try_get_link(rec, &tsel_link) {
+                LinkFetch::Value(val) => super::TselStamp::Tse(val.to_dbf_i16().unwrap_or(0)),
+                LinkFetch::Failed => super::TselStamp::Failed,
+                LinkFetch::NoData => super::TselStamp::None,
+            }
         }
     }
 
@@ -4671,9 +4680,23 @@ impl PvDatabase {
                     // forward link — C `process()` runs `checkAlarms`,
                     // `monitor()` and `recGblFwdLink()` regardless of the -1.
                     let tsel = self.read_tsel(rec);
+                    let siol_stamp = match plan.simm {
+                        Some(simm) => {
+                            let siol = rec
+                                .write()
+                                .sim_link_parse(
+                                    crate::server::record::SimLink::Siol,
+                                    simm.siol,
+                                    crate::server::record::LinkFieldType::In,
+                                )
+                                .clone();
+                            self.siol_stamp(&siol)
+                        }
+                        None => SiolStamp::Keep,
+                    };
                     let posts = {
                         let mut instance = rec.write();
-                        sim_process_tail(&mut instance, tsel, false, link_backing)
+                        sim_process_tail(&mut instance, tsel, siol_stamp, false, link_backing)
                     };
                     self.run_forward_link_tail(name, rec, posts, visited);
                     self.end_process_cycle(name, rec, cycle_end.take());
@@ -5622,34 +5645,18 @@ impl PvDatabase {
                     instance.common.udf = instance.record.value_is_undefined() as u8;
                 }
 
-                // Per-record alarm hook — record-type-specific STATE / COS
-                // / limit / SOFT alarms (C `checkAlarms()`). Records that
-                // have migrated their alarm logic here raise into
-                // `nsta`/`nsev`; the rest fall back to the framework's
-                // centralised `evaluate_alarms` match below.
-                {
-                    let inst = &mut *instance;
-                    inst.record.check_alarms(&mut inst.common);
-                }
-
-                // Evaluate alarms (accumulates into nsta/nsev)
-                instance.evaluate_alarms();
-
-                // Device support alarm/timestamp override
+                // C stamps before `checkAlarms` (aiRecord.c:156/164,
+                // mbbiRecord.c:166/195, aoRecord.c:192/196): the AFTC filter
+                // reads this cycle's TIME. `Record::alarms_before_stamp` names
+                // the calc-family exception.
+                //
+                // Device support timestamp override
                 if !is_soft {
-                    let (dev_alarm, dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
-                        (dev.last_alarm(), dev.last_timestamp(), dev.last_utag())
+                    let (dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
+                        (dev.last_timestamp(), dev.last_utag())
                     } else {
-                        (None, None, None)
+                        (None, None)
                     };
-                    if let Some((stat, sevr)) = dev_alarm {
-                        use crate::server::recgbl::rec_gbl_set_sevr;
-                        rec_gbl_set_sevr(
-                            &mut instance.common,
-                            stat,
-                            crate::server::record::AlarmSeverity::from_u16(sevr),
-                        );
-                    }
                     if let Some(ts) = dev_ts {
                         instance.common.time = ts;
                     }
@@ -5715,6 +5722,68 @@ impl PvDatabase {
                     // database never declared.
                 }
 
+                // Apply timestamp based on TSE. BEFORE the output stage: C
+                // `aoRecord.c:190` stamps the record before `writeValue` "so it
+                // will be up to date if any downstream records fetch it via TSEL".
+                //
+                // A `restamps_time_after_completion` record (sseq) restamps at the
+                // very END of its completion instead — C `sseqRecord.c::asyncFinish`
+                // posts VAL (`:474`) and runs `recGblFwdLink` (`:499`) BEFORE
+                // `recGblGetTimeStamp` (`:501`). Skip the pre-output restamp here so
+                // this cycle's VAL monitor carries the record's pre-update
+                // timestamp; the deferred restamp after the forward-link tail
+                // advances TIME for the BUSY post and the next cycle.
+                //
+                // mbbo/mbboDirect are a second exception: C `mbboRecord.c:210-221`
+                // takes `else if (prec->udf) goto CONTINUE`, jumping PAST this
+                // pre-output `recGblGetTimeStampSimm`. So a soft (sync) UDF
+                // mbbo/mbboDirect never stamps here; TIME stays at the epoch until
+                // VAL is defined. Only the SYNC first-pass stamp is skipped — the
+                // async-completion re-entry (`complete_async_record_inner`) stamps
+                // unconditionally, matching C's `if (pact)` re-stamp
+                // (mbboRecord.c:256-258).
+                let restamps_after = plan.restamps_time_after_completion;
+                // Either way into C's `goto CONTINUE` skips the same
+                // `recGblGetTimeStampSimm`: `else if (prec->udf)`
+                // (mbboRecord.c:210) and the failed closed-loop DOL read
+                // (mbboRecord.c:205) jump to the identical label.
+                let skips_ts_undef = plan.skips_timestamp_when_undefined
+                    && (instance.common.udf != 0 || links.is_some_and(|l| l.dol_read_failed));
+                if !plan.output_stage {
+                    apply_device_alarm(instance, is_soft);
+                }
+                let stamps_here = !restamps_after && !skips_ts_undef;
+                if stamps_here && !plan.alarms_before_stamp {
+                    let inst = &mut *instance;
+                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                }
+
+                // Per-record alarm hook — record-type-specific STATE / COS
+                // / limit / SOFT alarms (C `checkAlarms()`). Records that
+                // have migrated their alarm logic here raise into
+                // `nsta`/`nsev`; the rest fall back to the framework's
+                // centralised `evaluate_alarms` match below.
+                {
+                    let inst = &mut *instance;
+                    inst.record.check_alarms(&mut inst.common);
+                }
+
+                // Evaluate alarms (accumulates into nsta/nsev)
+                instance.evaluate_alarms();
+
+                // Device support alarm override. An output's device raises its
+                // alarm in `writeValue`, after `checkAlarms`; an input's in
+                // `readValue`, before it.
+                if plan.output_stage {
+                    apply_device_alarm(instance, is_soft);
+                }
+
+                // calcout, scalcout and acalcout stamp after `checkAlarms`.
+                if stamps_here && plan.alarms_before_stamp {
+                    let inst = &mut *instance;
+                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                }
+
                 // IVOA gate severity for a redirected SIMM output. C decides
                 // `if (prec->nsev < INVALID_ALARM)` at the `writeValue` call
                 // (aoRecord.c:197) using the severity `checkAlarms` produced —
@@ -5744,37 +5813,6 @@ impl PvDatabase {
                     );
                 }
 
-                // Apply timestamp based on TSE. BEFORE the output stage: C
-                // `aoRecord.c:190` stamps the record before `writeValue` "so it
-                // will be up to date if any downstream records fetch it via TSEL".
-                //
-                // A `restamps_time_after_completion` record (sseq) restamps at the
-                // very END of its completion instead — C `sseqRecord.c::asyncFinish`
-                // posts VAL (`:474`) and runs `recGblFwdLink` (`:499`) BEFORE
-                // `recGblGetTimeStamp` (`:501`). Skip the pre-output restamp here so
-                // this cycle's VAL monitor carries the record's pre-update
-                // timestamp; the deferred restamp after the forward-link tail
-                // advances TIME for the BUSY post and the next cycle.
-                //
-                // mbbo/mbboDirect are a second exception: C `mbboRecord.c:210-221`
-                // takes `else if (prec->udf) goto CONTINUE`, jumping PAST this
-                // pre-output `recGblGetTimeStampSimm`. So a soft (sync) UDF
-                // mbbo/mbboDirect never stamps here; TIME stays at the epoch until
-                // VAL is defined. Only the SYNC first-pass stamp is skipped — the
-                // async-completion re-entry (`complete_async_record_inner`) stamps
-                // unconditionally, matching C's `if (pact)` re-stamp
-                // (mbboRecord.c:256-258).
-                let restamps_after = plan.restamps_time_after_completion;
-                // Either way into C's `goto CONTINUE` skips the same
-                // `recGblGetTimeStampSimm`: `else if (prec->udf)`
-                // (mbboRecord.c:210) and the failed closed-loop DOL read
-                // (mbboRecord.c:205) jump to the identical label.
-                let skips_ts_undef = plan.skips_timestamp_when_undefined
-                    && (instance.common.udf != 0 || links.is_some_and(|l| l.dol_read_failed));
-                if !restamps_after && !skips_ts_undef {
-                    let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
-                }
                 // NOTE: UDF was already updated before `evaluate_alarms`
                 // above — keyed on `value_is_undefined()` so a NaN result
                 // keeps UDF true and UDF_ALARM is raised this cycle. Do
@@ -7270,6 +7308,40 @@ impl PvDatabase {
                         crate::server::record::AlarmSeverity::Invalid,
                     );
                 }
+                // Any soft flavour: the framework owns the transfer, so there
+                // is no device to take an alarm, time stamp or user tag from.
+                let is_soft = instance.common.dtyp.is_soft();
+
+                // Device support timestamp override. C device support writes
+                // `prec->utag` directly during `read()` — the event-system
+                // pulse-id path, since `epicsTimeStamp` carries no tag. Adopt the
+                // device's userTag when it supplies one; read in the same `dev`
+                // borrow as the timestamp so the time/tag pair is a single
+                // consistent device snapshot.
+                if !is_soft {
+                    let (dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
+                        (dev.last_timestamp(), dev.last_utag())
+                    } else {
+                        (None, None)
+                    };
+                    if let Some(ts) = dev_ts {
+                        instance.common.time = ts;
+                    }
+                    if let Some(utag) = dev_utag {
+                        instance.common.utag = utag;
+                    }
+                }
+
+                // Stamped before the alarm hooks, as the sync path is (C
+                // aiRecord.c:156/164), and BEFORE the output stage — C
+                // `aoRecord.c:190` stamps the record ahead of `writeValue` so a
+                // downstream TSEL fetch sees this cycle's time.
+                let alarms_first = instance.record.alarms_before_stamp();
+                if !alarms_first {
+                    let inst = &mut *instance;
+                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                }
+
                 // Per-record alarm hook (C `checkAlarms()`).
                 {
                     let inst = &mut *instance;
@@ -7278,44 +7350,13 @@ impl PvDatabase {
 
                 // Evaluate alarms
                 instance.evaluate_alarms();
-
-                // Any soft flavour: the framework owns the transfer, so there
-                // is no device to take an alarm, time stamp or user tag from.
-                let is_soft = instance.common.dtyp.is_soft();
-
-                // Device support alarm/timestamp override
-                if !is_soft {
-                    let (dev_alarm, dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
-                        (dev.last_alarm(), dev.last_timestamp(), dev.last_utag())
-                    } else {
-                        (None, None, None)
-                    };
-                    if let Some((stat, sevr)) = dev_alarm {
-                        crate::server::recgbl::rec_gbl_set_sevr(
-                            &mut instance.common,
-                            stat,
-                            crate::server::record::AlarmSeverity::from_u16(sevr),
-                        );
-                    }
-                    if let Some(ts) = dev_ts {
-                        instance.common.time = ts;
-                    }
-                    // C device support writes `prec->utag` directly during
-                    // `read()` — the event-system pulse-id path, since
-                    // `epicsTimeStamp` carries no tag. Adopt the device's
-                    // userTag when it supplies one; read in the same `dev`
-                    // borrow as the timestamp above so the time/tag pair is a
-                    // single consistent device snapshot.
-                    if let Some(utag) = dev_utag {
-                        instance.common.utag = utag;
-                    }
+                if alarms_first {
+                    let inst = &mut *instance;
+                    tsel.stamp(&inst.name, &mut inst.common, is_soft);
                 }
 
-                // BEFORE the output stage — C `aoRecord.c:190` stamps the record
-                // ahead of `writeValue` so a downstream TSEL fetch sees this
-                // cycle's time.
-                let inst = &mut *instance;
-                tsel.stamp(&inst.name, &mut inst.common, is_soft);
+                // Device support alarm override.
+                apply_device_alarm(&mut instance, is_soft);
                 // UDF was already updated before `evaluate_alarms` above.
 
                 // ---- Output stage. C `process()` performs the record's output
@@ -9053,6 +9094,7 @@ impl PvDatabase {
             // the SIOL read that stands in for the device read and before the
             // guard the store runs under.
             let tsel = self.read_tsel(rec);
+            let siol_stamp = self.siol_stamp(&siol_link);
             let mut instance = rec.write();
 
             // The other order (`mcaRecord.c:1118` then `:1129`): the read has
@@ -9171,7 +9213,7 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, tsel, fetch.is_ok(), link_backing)
+            sim_process_tail(&mut instance, tsel, siol_stamp, fetch.is_ok(), link_backing)
         };
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -9190,6 +9232,46 @@ impl PvDatabase {
         };
 
         (SimOutcome::Simulated(sim_posts), exit)
+    }
+}
+
+/// What `recGblGetTimeStampSimm`'s simulation arm (`recGbl.c:332-346`) stamps a
+/// record whose `TSE` is `epicsTimeEventDeviceTime`, read before the data
+/// guard because the source's time is another record's.
+#[derive(Clone, Copy)]
+enum SiolStamp {
+    /// A constant SIOL: `epicsTimeGetCurrent`.
+    Now,
+    /// `dbGetTimeStampTag(siol, &time, &utag)`.
+    From(std::time::SystemTime, u64),
+    /// The read failed: C errlogs and leaves `time` alone.
+    Keep,
+}
+
+impl SiolStamp {
+    fn apply(self, common: &mut crate::server::record::CommonFields) {
+        match self {
+            SiolStamp::Now => common.time = std::time::SystemTime::now(),
+            SiolStamp::From(time, utag) => {
+                common.time = time;
+                common.utag = utag;
+            }
+            SiolStamp::Keep => {}
+        }
+    }
+}
+
+/// The alarm a device support's last transfer left, raised into the record.
+fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
+    if is_soft {
+        return;
+    }
+    if let Some((stat, sevr)) = instance.device.as_ref().and_then(|d| d.last_alarm()) {
+        crate::server::recgbl::rec_gbl_set_sevr(
+            &mut instance.common,
+            stat,
+            crate::server::record::AlarmSeverity::from_u16(sevr),
+        );
     }
 }
 
@@ -9234,11 +9316,22 @@ impl PvDatabase {
 fn sim_process_tail(
     instance: &mut RecordInstance,
     tsel: super::TselStamp,
+    siol_stamp: SiolStamp,
     clear_udf: bool,
     backing: crate::server::database::LinkBacking<'_>,
 ) -> CyclePosts {
-    let inst = &mut *instance;
-    tsel.stamp(&inst.name, &mut inst.common, true);
+    let alarms_first = instance.record.alarms_before_stamp();
+    // A `.TIME` TSEL returns before the simulation arm (`recGbl.c:321`).
+    let stamp = |inst: &mut RecordInstance| {
+        let tsel_is_time = matches!(tsel, super::TselStamp::Time(..));
+        tsel.stamp(&inst.name, &mut inst.common, true);
+        if !tsel_is_time && inst.common.tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+            siol_stamp.apply(&mut inst.common);
+        }
+    };
+    if !alarms_first {
+        stamp(&mut *instance);
+    }
     // C clears UDF only on a `status == 0` SIOL read (`longinRecord.c:418`) —
     // for most records a failed read leaves the record undefined. The array
     // records are the exception: their `process()` clears UDF itself, after
@@ -9255,6 +9348,9 @@ fn sim_process_tail(
         inst.record.check_alarms(&mut inst.common);
     }
     instance.evaluate_alarms();
+    if alarms_first {
+        stamp(&mut *instance);
+    }
     let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
     let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
     publish_cycle(instance, &cycle_snapshot, backing, cycle_alarm_posts)
@@ -9360,6 +9456,21 @@ mod input_link_texts_tests {
         RecordInstance::new_boxed("C:ONE".to_string(), Box::new(CalcRecord::default()))
     }
 
+    /// INPB's text through the funnel a slotted link's put takes.
+    fn wire_inpb(instance: &mut RecordInstance) {
+        use crate::server::record::FieldDeclaration as _;
+        let text = EpicsValue::String("SRC:ONE.VAL".into());
+        let link = crate::server::record::PreparedLink::for_put(
+            instance.record.field_list(),
+            "INPB",
+            &text,
+        )
+        .expect("INPB is a slotted link");
+        instance
+            .put_link_field(link, text)
+            .expect("INPB takes a link string");
+    }
+
     /// The boundaries are READ / NOT READ and SET / UNSET, one case each way.
     /// The pair matters because a sparse list answers both with "absent", and
     /// only the read flag separates them: a reader that confuses them either
@@ -9367,9 +9478,7 @@ mod input_link_texts_tests {
     #[test]
     fn an_unread_list_sends_every_reader_to_the_record() {
         let mut instance = calc();
-        instance
-            .put_declared_field("INPB", EpicsValue::String("SRC:ONE.VAL".into()))
-            .expect("INPB takes a link string");
+        wire_inpb(&mut instance);
         let texts = InputLinkTexts::none();
         assert_eq!(
             texts
@@ -9384,9 +9493,7 @@ mod input_link_texts_tests {
     #[test]
     fn a_read_list_holds_the_set_links_and_only_those() {
         let mut instance = calc();
-        instance
-            .put_declared_field("INPB", EpicsValue::String("SRC:ONE.VAL".into()))
-            .expect("INPB takes a link string");
+        wire_inpb(&mut instance);
         let links = instance.record.multi_input_links();
         assert_eq!(links[1].0, "INPB", "slot 1 is INPB");
         let texts = InputLinkTexts::read_own(&instance);

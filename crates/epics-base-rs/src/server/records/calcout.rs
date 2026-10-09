@@ -571,6 +571,10 @@ const CALCOUT_OOPT_CHOICES: &[&str] = &[
 const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 
 impl Record for CalcoutRecord {
+    fn alarms_before_stamp(&self) -> bool {
+        true
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

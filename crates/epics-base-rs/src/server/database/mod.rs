@@ -147,6 +147,10 @@ mod tsel_stamp {
         /// Every other `TSEL` (`recGbl.c:322`): `dbGetLink(&prec->tsel,
         /// DBR_SHORT, &prec->tse, 0, 0)`.
         Tse(i16),
+        /// The `dbGetLink` of a non-`.TIME` TSEL failed: `TSE` keeps its own
+        /// value and the stamp raises `setLinkAlarm`, at the stamp point
+        /// because that is where C's read is.
+        Failed,
     }
 
     impl TselStamp {
@@ -167,6 +171,9 @@ mod tsel_stamp {
                 }
                 TselStamp::None => {}
                 TselStamp::Tse(tse) => common.tse = tse,
+                TselStamp::Failed => {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, "TSEL");
+                }
             }
             apply_timestamp(name, common, is_soft);
         }

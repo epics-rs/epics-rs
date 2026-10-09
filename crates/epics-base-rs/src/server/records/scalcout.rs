@@ -629,6 +629,10 @@ const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 
 impl Record for ScalcoutRecord {
+    fn alarms_before_stamp(&self) -> bool {
+        true
+    }
+
     /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
     /// LALM; every write to it is in `checkAlarms` (:727-750).
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}

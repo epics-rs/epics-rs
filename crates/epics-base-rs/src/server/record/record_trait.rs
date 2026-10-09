@@ -2921,6 +2921,15 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// C `process()` order of `recGblGetTimeStamp` against `checkAlarms`. Every
+    /// record stamps first (`aiRecord.c:156/164`); calcout, scalcout and
+    /// acalcout run `checkAlarms` first (`calcoutRecord.c:244/249`), so a
+    /// failed TSEL read's LINK alarm loses an equal-severity tie to the
+    /// record's own limit alarm there.
+    fn alarms_before_stamp(&self) -> bool {
+        false
+    }
+
     /// Whether this record's OUT link should be written after processing.
     /// Defaults to true. Override in calcout / longout to implement OOPT
     /// conditional output (epics-base 7.0.8).

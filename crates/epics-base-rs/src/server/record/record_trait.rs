@@ -6734,9 +6734,7 @@ mod tests {
     fn a_type_that_overrides_a_cycle_hook_says_so() {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
-            "compress" | "histogram" | "waveform" | "aai" | "aao" | "subArray" => {
-                CycleHooks::PRE_INPUT
-            }
+            "compress" | "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
             "acalcout" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
             "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,

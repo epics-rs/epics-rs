@@ -81,22 +81,18 @@ impl Default for LsoRecord {
 
 impl LsoRecord {
     pub fn new(val: &str) -> Self {
-        let v = PvString::from(val);
-        let len = if v.is_empty() {
-            0
-        } else {
-            (v.len() + 1).min(256) as u32
-        };
-        Self {
-            val: v,
-            len,
-            ..Default::default()
+        let mut rec = Self::default();
+        rec.val = truncate_bytes(PvString::from(val), rec.capacity());
+        if !rec.val.is_empty() {
+            rec.len = (rec.val.len() + 1) as u32;
         }
+        rec
     }
 
-    fn clamped(&self) -> PvString {
-        let max = (self.sizv as usize).saturating_sub(1);
-        truncate_bytes(self.val.clone(), max)
+    /// VAL's byte capacity: SIZV less the NUL. VAL never exceeds it — every
+    /// write, and a SIZV put, cuts to it.
+    fn capacity(&self) -> usize {
+        (self.sizv as usize).saturating_sub(1)
     }
 }
 
@@ -193,7 +189,7 @@ impl Record for LsoRecord {
     /// the PREVIOUS cycle. Naming VAL here is what lets the IVOA arm leave
     /// OVAL to its one meaning.
     fn output_link_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
+        Some(EpicsValue::CharArray(self.val.as_bytes().into()))
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -263,8 +259,7 @@ impl Record for LsoRecord {
     fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
         match load {
             crate::server::record::LsLoad::Text(s) => {
-                let max = (self.sizv as usize).saturating_sub(1);
-                self.val = truncate_bytes(PvString::from(s), max);
+                self.val = truncate_bytes(PvString::from(s), self.capacity());
                 self.len = (self.val.len() + 1) as u32;
             }
             // C's number case: the buffer is untouched, LEN comes out 1.
@@ -286,7 +281,12 @@ impl Record for LsoRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
+        Some(EpicsValue::CharArray(self.val.as_bytes().into()))
+    }
+
+    /// [`Self::val`]'s bytes, borrowed.
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        Some(crate::server::record::ValueView::Char(self.val.as_bytes()))
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
@@ -307,7 +307,7 @@ impl Record for LsoRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes().into())),
+            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().into())),
             "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes().into())),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "LEN" => Some(EpicsValue::ULong(self.len)),
@@ -338,7 +338,7 @@ impl Record for LsoRecord {
             "VAL" => {
                 // DBR_STRING-typed put caps at MAX_STRING_SIZE (40);
                 // DBR_CHAR long-string put is bounded only by SIZV.
-                let mut s = match value {
+                let s = match value {
                     EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
@@ -346,11 +346,7 @@ impl Record for LsoRecord {
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
-                let max = (self.sizv as usize).saturating_sub(1);
-                if s.len() > max {
-                    s = truncate_bytes(s, max);
-                }
-                self.val = s;
+                self.val = truncate_bytes(s, self.capacity());
                 self.len = (self.val.len() + 1) as u32;
             }
             "SIZV" => {
@@ -363,6 +359,12 @@ impl Record for LsoRecord {
                 };
                 // C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff].
                 self.sizv = raw.clamp(16, 0x7fff) as u16;
+                // C sizes the buffer once (SPC_NOMOD); the port takes SIZV
+                // after a .db VAL, so the cut lands here.
+                if self.val.len() > self.capacity() {
+                    self.val = truncate_bytes(std::mem::take(&mut self.val), self.capacity());
+                    self.len = (self.val.len() + 1) as u32;
+                }
             }
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {

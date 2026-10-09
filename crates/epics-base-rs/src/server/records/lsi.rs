@@ -76,24 +76,20 @@ impl Default for LsiRecord {
 
 impl LsiRecord {
     pub fn new(val: &str) -> Self {
-        let v = PvString::from(val);
+        let mut rec = Self::default();
+        rec.val = truncate_bytes(PvString::from(val), rec.capacity());
         // LEN is `strlen+1` for a non-empty value; an empty initial
         // value leaves LEN=0 (C: no value present yet).
-        let len = if v.is_empty() {
-            0
-        } else {
-            (v.len() + 1).min(256) as u32
-        };
-        Self {
-            val: v,
-            len,
-            ..Default::default()
+        if !rec.val.is_empty() {
+            rec.len = (rec.val.len() + 1) as u32;
         }
+        rec
     }
 
-    fn clamped(&self) -> PvString {
-        let max = (self.sizv as usize).saturating_sub(1);
-        truncate_bytes(self.val.clone(), max)
+    /// VAL's byte capacity: SIZV less the NUL. VAL never exceeds it — every
+    /// write, and a SIZV put, cuts to it.
+    fn capacity(&self) -> usize {
+        (self.sizv as usize).saturating_sub(1)
     }
 }
 
@@ -168,13 +164,10 @@ impl Record for LsiRecord {
     }
 
     /// `lsiRecord.c::process` has no unconditional UDF re-derive; UDF is
-    /// cleared only where a value is actually loaded — the init-time
-    /// `dbLoadLinkLS` (`lsiRecord.c:85-88`, applied by the init-seed owner)
-    /// and the soft support's sourced read (`devLsiSoft.c`,
-    /// `if (status == 0) prec->udf = FALSE`). A process cycle that sources
-    /// nothing — e.g. a `caput .UDF 1` on a Passive record with a
-    /// constant/empty INP — must keep the client's UDF put. Opt out of the
-    /// per-cycle blanket re-derive, like `stringin`/`lso`.
+    /// cleared only by the init-time `dbLoadLinkLS` when it loads a value
+    /// (`lsiRecord.c:85-89`, applied by the init-seed owner) and by the
+    /// simulated SIOL read (`:245`). `devLsiSoft.c::readLocked` never touches
+    /// UDF, so a soft INP read keeps it (see [`Self::soft_read_clears_udf`]).
     fn clears_udf(&self) -> bool {
         false
     }
@@ -214,8 +207,7 @@ impl Record for LsiRecord {
     fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
         match load {
             crate::server::record::LsLoad::Text(s) => {
-                let max = (self.sizv as usize).saturating_sub(1);
-                self.val = truncate_bytes(PvString::from(s), max);
+                self.val = truncate_bytes(PvString::from(s), self.capacity());
                 self.len = (self.val.len() + 1) as u32;
             }
             // C's number case: the buffer is untouched, LEN comes out 1.
@@ -256,16 +248,29 @@ impl Record for LsiRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
+        Some(EpicsValue::CharArray(self.val.as_bytes().into()))
     }
 
     /// [`Self::val`]'s bytes, borrowed.
     fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
-        let max = (self.sizv as usize).saturating_sub(1);
-        let bytes = self.val.as_bytes();
-        Some(crate::server::record::ValueView::Char(
-            &bytes[..bytes.len().min(max)],
-        ))
+        Some(crate::server::record::ValueView::Char(self.val.as_bytes()))
+    }
+
+    /// `devLsiSoft.c::readLocked` is `dbGetLinkLS(pinp, prec->val, prec->sizv,
+    /// &prec->len)`: the read (DBR_STRING, or a char source's bytes up to
+    /// SIZV) lands in VAL cut to SIZV, and LEN is `strlen + 1`. The read is
+    /// already VAL's text, so it skips the generic put's shape lookups and
+    /// its 40-byte DBR_STRING put cap, which C's char-source read does not have.
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        match value {
+            Some(EpicsValue::String(s)) => {
+                self.val = truncate_bytes(s, self.capacity());
+                self.len = (self.val.len() + 1) as u32;
+                Ok(())
+            }
+            Some(other) => self.set_val(other),
+            None => Ok(()),
+        }
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
@@ -286,7 +291,7 @@ impl Record for LsiRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes().into())),
+            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().into())),
             "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes().into())),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "LEN" => Some(EpicsValue::ULong(self.len)),
@@ -310,7 +315,7 @@ impl Record for LsiRecord {
                 // in C before it reaches the record — apply the same
                 // cap. A DBR_CHAR long-string put (CharArray) is only
                 // bounded by SIZV.
-                let mut s = match value {
+                let s = match value {
                     EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
@@ -318,11 +323,7 @@ impl Record for LsiRecord {
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
-                let max = (self.sizv as usize).saturating_sub(1);
-                if s.len() > max {
-                    s = truncate_bytes(s, max);
-                }
-                self.val = s;
+                self.val = truncate_bytes(s, self.capacity());
                 self.len = (self.val.len() + 1) as u32;
             }
             "SIZV" => {
@@ -335,6 +336,12 @@ impl Record for LsiRecord {
                 };
                 // C `lsiRecord.c:46-55`: SIZV clamps to [16, 0x7fff].
                 self.sizv = raw.clamp(16, 0x7fff) as u16;
+                // C sizes the buffer once (SPC_NOMOD); the port takes SIZV
+                // after a .db VAL, so the cut lands here.
+                if self.val.len() > self.capacity() {
+                    self.val = truncate_bytes(std::mem::take(&mut self.val), self.capacity());
+                    self.len = (self.val.len() + 1) as u32;
+                }
             }
             "SIMM" => {
                 if let EpicsValue::Short(v) = value {

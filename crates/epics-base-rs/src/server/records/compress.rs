@@ -952,6 +952,16 @@ impl Record for CompressRecord {
         "VAL"
     }
 
+    /// VAL is always an array, which is never undefined and has no deadband:
+    /// answered from that fact, not by linearising the ring through `val()`.
+    fn value_is_undefined(&self) -> bool {
+        false
+    }
+
+    fn monitor_deadband_value(&self) -> Option<crate::server::record::AlarmLimit> {
+        None
+    }
+
     /// C `compressRecord.c:327-343` — the INP ingest, and the one gate on it:
     ///
     /// ```c
@@ -1000,9 +1010,18 @@ impl Record for CompressRecord {
     /// `set_val`, and must NOT reset. Marking the ingest here instead of in
     /// `pre_process_actions` is what makes the mark fire for a LOADED record:
     /// the old mark rode on the dead `ReadDbLink` above.
+    ///
+    /// The read is `DBF_DOUBLE`, so a `Double`/`DoubleArray` carrier is already
+    /// in the ingest's type and goes straight into the ring; only another
+    /// carrier needs the converter, which asks `get_field("VAL")` its shape.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         self.inp_read_pending = true;
-        self.put_field_internal("VAL", value)
+        match value {
+            EpicsValue::DoubleArray(arr) => self.push_array(&arr),
+            EpicsValue::Double(v) => self.push_value(v),
+            other => return self.put_field_internal("VAL", other),
+        }
+        Ok(())
     }
 
     /// C `compressRecord.c:328-343` — the record's only alarm. A cycle that
@@ -1041,6 +1060,19 @@ mod pbuf_tests {
         assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
         // NSAM is C's DBF_ULONG (compressRecord.dbd.pod:424).
         assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::ULong(1)));
+    }
+
+    /// The overrides answer what the trait defaults derive from `val()`, which
+    /// is a `DoubleArray` whether the ring is empty, partial or full.
+    #[test]
+    fn val_shape_answers_match_the_val_derived_defaults() {
+        let mut rec = CompressRecord::new(3, 4);
+        for fill in [0.0, f64::NAN, 2.0, 3.0] {
+            assert!(matches!(rec.val(), Some(EpicsValue::DoubleArray(_))));
+            assert!(!rec.value_is_undefined());
+            assert_eq!(rec.monitor_deadband_value(), None);
+            rec.push_value(fill);
+        }
     }
 
     #[test]

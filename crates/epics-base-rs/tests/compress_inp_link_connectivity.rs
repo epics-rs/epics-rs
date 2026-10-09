@@ -187,3 +187,49 @@ async fn the_link_alarm_is_re_derived_every_cycle() {
         "and the buffer keeps what it already had — the cycle ingests nothing"
     );
 }
+
+/// The INP read lands as C's `dbGetLink(&prec->inp, DBF_DOUBLE, wptr, ...)`
+/// whatever the source carries. softIoc, one `dbpf .PROC 1` each (XS twice):
+///
+/// ```text
+/// X   (DOUBLE[16] 1..16, N to 1 Average, N=2) : 1.5 3.5 ... 15.5  NUSE=8 UDF=0 NO_ALARM
+/// XL  (LONG[4] 2 4 6 9, N to 1 Average, N=2)  : 3 7.5
+/// XS  (calc 7.5, Circular Buffer, NSAM=3)     : 7.5 7.5  NUSE=2
+/// XIF (DOUBLE[16], N to 1 High, N=4, LIFO)    : 16 12 8 4  NO_ALARM
+/// ```
+#[epics_macros_rs::epics_test]
+async fn inp_ingest_matches_softioc_for_each_source_carrier() {
+    const DB: &str = r#"
+record(waveform, "ARR") { field(NELM, "16") field(FTVL, "DOUBLE") field(INP, [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]) }
+record(waveform, "LARR") { field(NELM, "4") field(FTVL, "LONG") field(INP, [2,4,6,9]) }
+record(calc, "SC") { field(CALC, "7.5") }
+record(compress, "X") { field(INP, "ARR") field(ALG, "N to 1 Average") field(NSAM, "8") field(N, "2") }
+record(compress, "XL") { field(INP, "LARR") field(ALG, "N to 1 Average") field(NSAM, "4") field(N, "2") }
+record(compress, "XS") { field(INP, "SC") field(ALG, "Circular Buffer") field(NSAM, "3") field(N, "1") }
+record(compress, "XIF") { field(INP, "ARR") field(ALG, "N to 1 High Value") field(NSAM, "4") field(N, "4") field(BALG, "LIFO Buffer") }
+"#;
+    let db = IocBuilder::new()
+        .db_string(DB, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    for rec in ["SC", "X", "XL", "XS", "XS", "XIF"] {
+        process(&db, rec).await;
+    }
+    let val = |rec: &str| match db.get_pv(rec).unwrap() {
+        EpicsValue::DoubleArray(v) => v.to_vec(),
+        other => panic!("{rec}.VAL must be a DoubleArray, got {other:?}"),
+    };
+
+    assert_eq!(val("X"), vec![1.5, 3.5, 5.5, 7.5, 9.5, 11.5, 13.5, 15.5]);
+    assert_eq!(nuse(&db, "X").await, 8.0);
+    assert_eq!(db.get_record("X").unwrap().read().common.udf, 0);
+    assert_eq!(alarm(&db, "X").await.0, AlarmSeverity::NoAlarm);
+    assert_eq!(val("XL"), vec![3.0, 7.5]);
+    assert_eq!(val("XS"), vec![7.5, 7.5]);
+    assert_eq!(nuse(&db, "XS").await, 2.0);
+    assert_eq!(val("XIF"), vec![16.0, 12.0, 8.0, 4.0]);
+    assert_eq!(alarm(&db, "XIF").await.0, AlarmSeverity::NoAlarm);
+}

@@ -314,3 +314,59 @@ record(histogram, "H:NS") {
         EpicsValue::String("1.5".into())
     );
 }
+
+/// The SVL read is C's `dbGetLink(&prec->svl, DBR_DOUBLE, &prec->sgnl, 0, 0)`
+/// in `read_histogram` (`devHistogramSoft.c:50-54`), reached only from
+/// `readValue`'s `menuYesNoNO` arm (`histogramRecord.c:376-378`), and its
+/// status is discarded (`return 0; /*add count*/`). softIoc, after one process
+/// of each record (SRC = 3.5 above HIHI 3 / MAJOR, SIO = 0.5):
+///
+/// ```text
+/// H:LINK  VAL 0 0 0 1   NO_ALARM
+/// H:MS    VAL 0 0 0 1   MAJOR LINK       (MS carries SRC's severity)
+/// H:SIM   VAL 1 0 0 0   SGNL 0.5         (SIMM=YES reads SIOL, never SVL)
+/// H:BAD   VAL 0 1 0 0   SGNL 1.5 INVALID LINK  (failed read, still binned)
+/// ```
+#[epics_macros_rs::epics_test]
+async fn svl_read_follows_db_get_link_on_every_arm() {
+    use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+    use epics_base_rs::server::record::AlarmSeverity;
+    const DB: &str = r#"
+record(ai, "SRC") { field(VAL, "3.5") field(HIHI, "3") field(HHSV, "MAJOR") }
+record(ai, "SIO") { field(VAL, "0.5") }
+record(bo, "SW") { field(VAL, "1") }
+record(histogram, "H:LINK") { field(SVL, "SRC") field(NELM, "4") field(LLIM, "0") field(ULIM, "4") }
+record(histogram, "H:MS") { field(SVL, "SRC MS") field(NELM, "4") field(LLIM, "0") field(ULIM, "4") }
+record(histogram, "H:SIM") { field(SVL, "SRC") field(SIML, "SW") field(SIOL, "SIO") field(NELM, "4") field(LLIM, "0") field(ULIM, "4") }
+record(histogram, "H:BAD") { field(SVL, "NO:SUCH") field(SGNL, "1.5") field(NELM, "4") field(LLIM, "0") field(ULIM, "4") }
+"#;
+    let db = IocBuilder::new()
+        .db_string(DB, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    process(&db, "SRC").await;
+    for rec in ["H:LINK", "H:MS", "H:SIM", "H:BAD"] {
+        process(&db, rec).await;
+    }
+    let alarm = |rec: &str| {
+        let g = db.get_record(rec).unwrap();
+        let g = g.read();
+        (g.common.sevr, g.common.stat)
+    };
+
+    assert_eq!(bins(&db, "H:LINK").await, vec![0, 0, 0, 1]);
+    assert_eq!(alarm("H:LINK").0, AlarmSeverity::NoAlarm);
+
+    assert_eq!(bins(&db, "H:MS").await, vec![0, 0, 0, 1]);
+    assert_eq!(alarm("H:MS"), (AlarmSeverity::Major, LINK_ALARM));
+
+    assert_eq!(db.get_pv("H:SIM.SGNL").unwrap().to_f64(), Some(0.5));
+    assert_eq!(bins(&db, "H:SIM").await, vec![1, 0, 0, 0]);
+
+    assert_eq!(db.get_pv("H:BAD.SGNL").unwrap().to_f64(), Some(1.5));
+    assert_eq!(bins(&db, "H:BAD").await, vec![0, 1, 0, 0]);
+    assert_eq!(alarm("H:BAD"), (AlarmSeverity::Invalid, LINK_ALARM));
+}

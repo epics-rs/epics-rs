@@ -3,6 +3,9 @@ use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{MENU_YES_NO, Record};
 use crate::types::{EpicsValue, PvString};
 
+/// `eventRecord.dbd` `field(VAL,DBF_STRING) size(40)`.
+const MAX_STRING_SIZE: usize = 40;
+
 /// `event` record — software-event source.
 ///
 /// C parity (`eventRecord.dbd.pod:71` `field(VAL,DBF_STRING)`,
@@ -22,8 +25,9 @@ use crate::types::{EpicsValue, PvString};
 /// written).
 pub struct EventRecord {
     /// Event name to post. DBF_STRING in C (was a numeric subscript
-    /// pre-EPICS-7; a numeric string still works for back-compat).
-    pub val: String,
+    /// pre-EPICS-7; a numeric string still works for back-compat). Bytes, as
+    /// C's `char[40]` is.
+    pub val: PvString,
     /// SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
     /// the two-choice NO/YES simulation menu, served as DBR_ENUM.
     pub simm: i16,
@@ -47,7 +51,7 @@ pub struct EventRecord {
 impl Default for EventRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
+            val: PvString::new(),
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -64,9 +68,19 @@ impl EventRecord {
     /// Construct an event record that posts event name `val`.
     pub fn new(val: impl Into<String>) -> Self {
         Self {
-            val: val.into(),
+            val: PvString::from(val.into()),
             ..Default::default()
         }
+    }
+}
+
+fn put_pv_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::String(v) => {
+            *slot = v;
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
     }
 }
 
@@ -206,12 +220,31 @@ impl Record for EventRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::String(self.val.clone().into()))
+        Some(EpicsValue::String(self.val.clone()))
+    }
+
+    /// `devEventSoft.c::read_event` (76-80): the `DBR_STRING` read replaces
+    /// VAL only when it differs (`strcmp` then `strcpy`). The read is already
+    /// VAL's own type, so it skips the generic put's field-shape lookups.
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        match value {
+            Some(EpicsValue::String(mut s)) => {
+                if s.as_bytes() != self.val.as_bytes() {
+                    if s.len() >= MAX_STRING_SIZE {
+                        s = PvString::from_bytes(&s.as_bytes()[..MAX_STRING_SIZE - 1]);
+                    }
+                    self.val = s;
+                }
+                Ok(())
+            }
+            Some(other) => self.set_val(other),
+            None => Ok(()),
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -226,7 +259,7 @@ impl Record for EventRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         self.validate_put(name, &value)?;
         match name {
-            "VAL" => put_string(&mut self.val, value, name)?,
+            "VAL" => put_pv_string(&mut self.val, value, name)?,
             "SIML" => put_string(&mut self.siml, value, name)?,
             "SIOL" => put_string(&mut self.siol, value, name)?,
             "SIMM" => put_short(&mut self.simm, value, name)?,

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldMetadataOverride, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, SharedArray};
 
 /// Histogram record — counts values into buckets.
 ///
@@ -27,12 +27,14 @@ use crate::types::EpicsValue;
 /// `if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;`) — `u32::wrapping_add`,
 /// with no signed slot to reinterpret.
 pub struct HistogramRecord {
-    pub val: Vec<u32>, // Bucket counts (C epicsUInt32 — wraps at UINT_MAX)
-    pub nelm: i32,     // Number of buckets
-    pub ulim: f64,     // Upper limit
-    pub llim: f64,     // Lower limit
-    pub wdth: f64,     // Width of one bucket = (ulim-llim)/nelm
-    pub sgnl: f64,     // Signal value to bin (C: DBF_DOUBLE, special(SPC_MOD))
+    /// Bucket counts (C epicsUInt32 — wraps at UINT_MAX). Shared, so the
+    /// monitor post takes a reference to the bins instead of a copy.
+    pub val: SharedArray<u32>,
+    pub nelm: i32, // Number of buckets
+    pub ulim: f64, // Upper limit
+    pub llim: f64, // Lower limit
+    pub wdth: f64, // Width of one bucket = (ulim-llim)/nelm
+    pub sgnl: f64, // Signal value to bin (C: DBF_DOUBLE, special(SPC_MOD))
     /// C `field(SVL,DBF_INLINK)` (`histogramRecord.dbd.pod:212`) — "Signal Value
     /// Location", the record's ONLY input link. `histogramRecord` declares NO
     /// INP: its soft device support reads SVL into SGNL
@@ -96,7 +98,7 @@ impl Default for HistogramRecord {
         let ulim = 0.0;
         let llim = 0.0;
         Self {
-            val: vec![0; nelm as usize],
+            val: vec![0; nelm as usize].into(),
             nelm,
             ulim,
             llim,
@@ -129,7 +131,7 @@ impl HistogramRecord {
     pub fn new(nelm: i32, llim: f64, ulim: f64) -> Self {
         let n = nelm.max(1);
         Self {
-            val: vec![0; n as usize],
+            val: vec![0; n as usize].into(),
             nelm,
             ulim,
             llim,
@@ -179,7 +181,8 @@ impl HistogramRecord {
         let bucket = ((i - 1).max(0) as usize).min(self.val.len().saturating_sub(1));
         if bucket < self.val.len() {
             // C: if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;
-            self.val[bucket] = self.val[bucket].wrapping_add(1);
+            let bin = &mut self.val.make_mut()[bucket];
+            *bin = bin.wrapping_add(1);
             self.mcnt = self.mcnt.saturating_add(1);
         }
     }
@@ -195,7 +198,7 @@ impl HistogramRecord {
     /// port was missing: `caput HG.CMD 1` on a never-processed histogram left
     /// `UDF=1` and its UDF_ALARM standing where C reports the record defined.
     fn clear_histogram(&mut self) {
-        self.val.fill(0);
+        self.val.make_mut().fill(0);
         self.mcnt = self.mdel + 1;
         // `prec->udf = FALSE` (`:361`). UDF is common, so this is a latch the
         // after-put owner drains — see `take_udf_clear`.
@@ -229,7 +232,7 @@ impl Record for HistogramRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::PRE_INPUT
+        crate::server::record::CycleHooks::NONE
     }
 
     fn record_type(&self) -> &'static str {
@@ -527,31 +530,13 @@ impl Record for HistogramRecord {
     }
 
     /// C `devHistogramSoft.c::read_histogram` (50-54):
-    /// `dbGetLink(&prec->svl, DBR_DOUBLE, &prec->sgnl, 0, 0)` on EVERY process.
-    /// A CONSTANT (or unset) SVL is a no-op there — `dbConstGetValue` writes
-    /// nothing — and was loaded once at init instead (see [`Self::init_record`]),
-    /// so only a real link emits a fetch. Same gate as the aao's DOL.
-    ///
-    /// The value lands in SGNL through `put_field_internal`, NOT `put_field`:
-    /// `dbGetLink` writes the field's memory directly and never runs C's
-    /// `special()`, so the SPC_MOD `add_count` on a SGNL *caput* must not fire
-    /// here — `process()` performs the cycle's single bin increment
-    /// (`histogramRecord.c:218-219`).
-    fn pre_input_link_actions(
-        &mut self,
-        _dol_is_constant: bool,
-    ) -> crate::server::record::ProcessActions {
-        if crate::server::recgbl::simm::is_constant(&crate::server::record::parse_link_v2(
-            &self.svl,
-        )) {
-            return crate::server::record::ProcessActions::new();
-        }
-        crate::server::record::ProcessActions::from(vec![
-            crate::server::record::ProcessAction::ReadDbLink {
-                link_field: "SVL",
-                target_field: "SGNL",
-            },
-        ])
+    /// `dbGetLink(&prec->svl, DBR_DOUBLE, &prec->sgnl, 0, 0)` on EVERY process,
+    /// status discarded (`return 0; /*add count*/`). That is one multi-input
+    /// link: the framework's fetch skips a constant SVL (loaded once at init,
+    /// [`Self::init_record`]) and lands the value through
+    /// `put_field_internal`, which never runs the SGNL `special()` count.
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        &[("SVL", "SGNL")]
     }
 
     /// Internal (link / framework) delivery of a field value — C's
@@ -584,7 +569,7 @@ impl Record for HistogramRecord {
                 self.nelm = 1;
             }
             if self.val.len() != self.nelm as usize {
-                self.val = vec![0; self.nelm as usize];
+                self.val = vec![0; self.nelm as usize].into();
             }
             self.recompute_wdth();
             return Ok(());
@@ -636,6 +621,7 @@ impl Record for HistogramRecord {
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
         match link_field {
+            "SVL" => Some(&self.svl),
             "SIML" => Some(&self.siml),
             "SIOL" => Some(&self.siol),
             _ => None,
@@ -653,7 +639,7 @@ impl Record for HistogramRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
-            "VAL" => Some(EpicsValue::ULongArray(self.val.clone().into())),
+            "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
             // The DBF types are the `.dbd.pod`'s: NELM is DBF_USHORT (:163),
             // MDEL/MCNT are DBF_SHORT (:229,:234). The value variant is what CA
             // and PVA project the native type from, so it must agree with the
@@ -706,7 +692,12 @@ impl Record for HistogramRecord {
                 };
                 let width = self.nelm.max(1) as usize;
                 self.val.resize(width, 0);
-                for (slot, v) in self.val.iter_mut().zip(arr.into_iter().take(width)) {
+                for (slot, v) in self
+                    .val
+                    .make_mut()
+                    .iter_mut()
+                    .zip(arr.into_iter().take(width))
+                {
                     *slot = v;
                 }
                 Ok(())
@@ -856,7 +847,7 @@ impl Record for HistogramRecord {
                 Some(n) => {
                     let n = n.max(1);
                     self.nelm = n as i32;
-                    self.val = vec![0; n as usize];
+                    self.val = vec![0; n as usize].into();
                     self.recompute_wdth();
                     Ok(())
                 }
@@ -1013,7 +1004,7 @@ mod tests {
     #[test]
     fn counter_wraps_at_u32_max_no_panic() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
-        rec.val[0] = u32::MAX;
+        rec.val.make_mut()[0] = u32::MAX;
         rec.sgnl = 1.0;
         rec.add_count();
         assert_eq!(rec.val[0], 0, "epicsUInt32 counter wraps UINT_MAX -> 0");
@@ -1123,5 +1114,17 @@ mod tests {
             old.enums.as_ref().unwrap().strings,
             vec!["NO", "YES", "RAW"]
         );
+    }
+
+    /// A bin count lands in place only while no snapshot holds VAL: one taken
+    /// before the next sample keeps the counts it was taken with.
+    #[test]
+    fn a_held_val_snapshot_is_not_recounted() {
+        let mut r = HistogramRecord::new(4, 0.0, 4.0);
+        r.add_sample(2.5);
+        let held = r.val();
+        r.add_sample(2.5);
+        assert_eq!(held, Some(EpicsValue::ULongArray(vec![0, 0, 1, 0].into())));
+        assert_eq!(r.val, vec![0, 0, 2, 0]);
     }
 }

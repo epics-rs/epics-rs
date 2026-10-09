@@ -353,9 +353,6 @@ impl Record for DfanoutRecord {
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
-        if let Some(s) = self.out_slot(name) {
-            return Some(EpicsValue::String(s.to_string().into()));
-        }
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             // SELM is DBF_MENU (dfanoutRecord.dbd.pod): served as DBR_ENUM,
@@ -381,20 +378,13 @@ impl Record for DfanoutRecord {
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
-            _ => None,
+            _ => self
+                .out_slot(name)
+                .map(|s| EpicsValue::String(s.to_string().into())),
         }
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        if self.out_slot(name).is_some() {
-            return match value {
-                EpicsValue::String(s) => {
-                    *self.out_slot_mut(name).unwrap() = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into())),
-            };
-        }
         match name {
             "VAL" | "IVOV" | "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MDEL"
             | "ADEL" | "MLST" | "ALST" => {
@@ -473,7 +463,42 @@ impl Record for DfanoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            _ => Err(CaError::FieldNotFound(name.to_string())),
+            _ => match (self.out_slot_mut(name), value) {
+                (Some(slot), EpicsValue::String(s)) => {
+                    *slot = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                (Some(_), _) => Err(CaError::TypeMismatch(name.into())),
+                (None, _) => Err(CaError::FieldNotFound(name.to_string())),
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OUTn lands and reads back through the fallback arm; a non-string put
+    /// to it is a type mismatch and an unknown name is not found, as before
+    /// the named fields moved ahead of it. softIoc: `dbpf D.OUTC SINK` reads
+    /// back `SINK NPP NMS`.
+    #[test]
+    fn out_links_and_named_fields_resolve_through_one_match() {
+        let mut r = DfanoutRecord::default();
+        r.put_field("OUTC", EpicsValue::String("SINK".into()))
+            .unwrap();
+        r.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+        assert_eq!(r.get_field("OUTC"), Some(EpicsValue::String("SINK".into())));
+        assert_eq!(r.get_field("VAL"), Some(EpicsValue::Double(2.0)));
+        assert!(matches!(
+            r.put_field("OUTC", EpicsValue::Double(1.0)),
+            Err(CaError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            r.put_field("NOPE", EpicsValue::Double(1.0)),
+            Err(CaError::FieldNotFound(_))
+        ));
+        assert_eq!(r.get_field("NOPE"), None);
     }
 }

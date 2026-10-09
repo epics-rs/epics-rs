@@ -83,6 +83,7 @@ impl ProcStack {
     }
 }
 
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1546,7 +1547,7 @@ impl PvDatabase {
         let inst = guard.hold();
         inst.record.set_fetch_gate_failed(fetch_values_failed);
         if fetch_values_failed {
-            inst.suppress_subroutine_run = true;
+            inst.skip_subroutine_this_cycle();
         }
         fold.resolved
     }
@@ -1716,10 +1717,74 @@ struct InputStage {
     /// ([`crate::server::record::ResolvedInputLinks`]), so every type's
     /// report is made.
     resolved: u64,
-    /// What the link reads produced. `None` is the cycle that had nothing to
-    /// read — a stock `calc` — and costs that cycle one tag, where a struct
-    /// of empty results cost it every field's write and drop.
-    links: Option<LinkInputs>,
+    /// What the link reads produced. `Reads::None` is the cycle that had
+    /// nothing to read — a stock `calc` — and costs that cycle one tag, where
+    /// a struct of empty results cost it every field's write and drop.
+    reads: ManuallyDrop<Reads>,
+}
+
+/// What an [`InputStage`] read. `Inp` is the cycle whose only read is the soft
+/// INP, which builds no [`LinkInputs`] to hold its value.
+enum Reads {
+    None,
+    Inp(Option<EpicsValue>),
+    Links(LinkInputs),
+}
+
+/// `reads` is `ManuallyDrop` so that a stage which read nothing, the cycle
+/// most records run, drops as one inline tag compare; the glue for what a
+/// read produced is called only when there is something to free.
+impl Drop for InputStage {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !matches!(*self.reads, Reads::None) {
+            self.drop_reads();
+        }
+    }
+}
+
+impl InputStage {
+    #[cold]
+    #[inline(never)]
+    fn drop_reads(&mut self) {
+        // SAFETY: called once, from `Drop`; `reads` is not used after.
+        unsafe { ManuallyDrop::drop(&mut self.reads) }
+    }
+
+    fn links(&self) -> Option<&LinkInputs> {
+        match &*self.reads {
+            Reads::Links(links) => Some(links),
+            _ => None,
+        }
+    }
+
+    fn links_mut(&mut self) -> Option<&mut LinkInputs> {
+        match &mut *self.reads {
+            Reads::Links(links) => Some(links),
+            _ => None,
+        }
+    }
+
+    /// The links, made if the stage has none yet; an `Inp` value moves in.
+    fn links_or_none(&mut self) -> &mut LinkInputs {
+        if !matches!(*self.reads, Reads::Links(_)) {
+            let mut links = LinkInputs::none();
+            links.inp_value = self.take_inp_value();
+            *self.reads = Reads::Links(links);
+        }
+        match &mut *self.reads {
+            Reads::Links(links) => links,
+            _ => unreachable!(),
+        }
+    }
+
+    fn take_inp_value(&mut self) -> Option<EpicsValue> {
+        match &mut *self.reads {
+            Reads::Inp(value) => value.take(),
+            Reads::Links(links) => links.inp_value.take(),
+            Reads::None => None,
+        }
+    }
 }
 
 /// The cycle's slot for the INP value [`CyclePlan::DbSoftIn`] read, present in
@@ -1841,7 +1906,7 @@ impl InputStage {
         Self {
             is_soft,
             resolved,
-            links: None,
+            reads: ManuallyDrop::new(Reads::None),
         }
     }
 }
@@ -3365,12 +3430,10 @@ impl PvDatabase {
             return None;
         };
         let value = self.soft_db_inp_read::<EpicsValue>(rec, instance, read_as)?;
-        let mut stage = LinkInputs::none();
-        stage.inp_value = value;
         Some(InputStage {
             is_soft: true,
             resolved: 0,
-            links: Some(stage),
+            reads: ManuallyDrop::new(Reads::Inp(value)),
         })
     }
 
@@ -3953,7 +4016,7 @@ impl PvDatabase {
             let inst = guard.hold();
             inst.record.set_fetch_gate_failed(fetch_values_failed);
             if fetch_values_failed {
-                inst.suppress_subroutine_run = true;
+                inst.skip_subroutine_this_cycle();
             }
         }
         let resolved = fold.resolved;
@@ -4071,7 +4134,7 @@ impl PvDatabase {
         InputStage {
             is_soft,
             resolved,
-            links: Some(LinkInputs {
+            reads: ManuallyDrop::new(Reads::Links(LinkInputs {
                 inp_value,
                 inp_source_time,
                 inp_source_utag,
@@ -4094,7 +4157,7 @@ impl PvDatabase {
                         asub_dynamic,
                     })
                 }),
-            }),
+            })),
         }
     }
 
@@ -4585,12 +4648,11 @@ impl PvDatabase {
                 // so the general fall-through below may repeat it.
                 let instance = guard.hold();
                 instance.push_process_context();
-                match instance.plan_inp_as() {
-                    read_as @ crate::server::record::LinkReadAs::Double => {
-                        self.soft_db_inp_read::<f64>(rec, instance, read_as)
-                    }
-                    _ => None,
-                }
+                self.soft_db_inp_read::<f64>(
+                    rec,
+                    instance,
+                    crate::server::record::LinkReadAs::Double,
+                )
             } {
             soft_db.set(read);
             InputStage::none(true, 0)
@@ -4647,11 +4709,12 @@ impl PvDatabase {
                 // the reader's own `default:` arm (no declared request for this
                 // source class): nothing is attempted and nothing changes.
                 let soft_db_value = soft_db.take();
-                let links = if stage_known {
+                let stage_inp_value = if stage_known {
                     None
                 } else {
-                    stage.links.as_mut()
+                    stage.take_inp_value()
                 };
+                let links = if stage_known { None } else { stage.links_mut() };
                 let dol_fetch = links
                     .as_ref()
                     .and_then(|l| l.rare.as_ref())
@@ -4721,7 +4784,7 @@ impl PvDatabase {
                 };
                 let inp_value = match soft_db_value {
                     Some(v) if direct_f64.is_none() => Some(EpicsValue::Double(v)),
-                    _ => links.as_mut().and_then(|l| l.inp_value.take()),
+                    _ => stage_inp_value,
                 };
                 let had_inp_value = inp_value.is_some() || direct_f64.is_some();
                 let mut soft_inp_applied = false;
@@ -5037,8 +5100,7 @@ impl PvDatabase {
                 guard.release();
                 let pre_resolved = self.execute_read_db_links(name, rec, &pre_actions, visited);
                 stage
-                    .links
-                    .get_or_insert_with(LinkInputs::none)
+                    .links_or_none()
                     .resolved_link_fields
                     .extend(pre_resolved);
             }
@@ -5063,11 +5125,7 @@ impl PvDatabase {
                 // the pre-process ReadDbLink reads; the framework analogue of
                 // C device support inspecting `RTN_SUCCESS(dbGetLink(...))`
                 // (`epidRecord.c:191-193`, `motorRecord.cc:3687-3698`).
-                let links = if stage_known {
-                    None
-                } else {
-                    stage.links.as_ref()
-                };
+                let links = if stage_known { None } else { stage.links() };
                 instance.record.set_resolved_input_links(
                     crate::server::record::ResolvedInputLinks::new(
                         input_link_texts.own(),
@@ -5186,7 +5244,9 @@ impl PvDatabase {
                 // process() is a no-op for sub/aSub), so without this the main
                 // engine path — SCAN, event, CA-put-to-PP, FLNK — never ran the
                 // subroutine and VAL/VALA..VALU/OUTA..OUTU never updated.
-                instance.run_registered_subroutine()?;
+                if plan.runs_subroutine {
+                    instance.run_registered_subroutine()?;
+                }
 
                 // Process
                 let mut outcome = instance.record.process()?;
@@ -5572,11 +5632,7 @@ impl PvDatabase {
                 // unless the read succeeded under C's TSE=-2 + constant-TSEL
                 // gate, so a record that is not asking for device time, or
                 // whose read failed, keeps whatever `apply_timestamp` gives it.
-                let links = if stage_known {
-                    None
-                } else {
-                    stage.links.as_ref()
-                };
+                let links = if stage_known { None } else { stage.links() };
                 if let Some(ts) = links.and_then(|l| l.inp_source_time) {
                     instance.common.time = ts;
                 }

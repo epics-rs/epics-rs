@@ -7322,6 +7322,10 @@ mod tests {
             rec.val, 0x0F,
             "VAL = (raw & mask) >> SHFT, not the raw 0x3C"
         );
+        // The bits are the record's, derived once in C monitor().
+        rec.set_device_did_compute(true);
+        rec.process().unwrap();
+        rec.monitor_value_changed();
         assert_eq!(rec.bits[0], 1);
         assert_eq!(rec.bits[3], 1);
     }

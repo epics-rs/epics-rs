@@ -213,7 +213,7 @@ impl Record for StringinRecord {
         }
     }
 
-    // C `stringinRecord.c:66` copies VAL after `:63-64` returns a nonzero dset status.
+    // C `stringinRecord.c:117` copies VAL after `:112-115` returns a nonzero dset status.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {
             self.oval = self.val.clone();

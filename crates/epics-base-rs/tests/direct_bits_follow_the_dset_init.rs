@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
@@ -15,7 +15,9 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 
-struct Probe(Option<DeviceInitOutcome>);
+/// The init outcome, and the raw word a read hands `apply_raw_readback` the
+/// way asyn's `processMbbiDirect` does.
+struct Probe(Option<DeviceInitOutcome>, Option<i32>);
 
 impl DeviceSupport for Probe {
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
@@ -23,7 +25,10 @@ impl DeviceSupport for Probe {
             .ok_or_else(|| CaError::InvalidValue("probe init fails".into()))
     }
 
-    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        if let Some(raw) = self.1 {
+            record.apply_raw_readback(raw);
+        }
         Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
@@ -39,13 +44,14 @@ impl DeviceSupport for Probe {
 async fn ioc(db: &str) -> Arc<PvDatabase> {
     IocBuilder::new()
         .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-            let outcome = match ctx.dtyp {
-                "probeLive" => Some(DeviceInitOutcome::Live),
-                "probeDead" => Some(DeviceInitOutcome::dead()),
-                "probeErr" => None,
+            let (outcome, raw) = match ctx.dtyp {
+                "probeLive" => (Some(DeviceInitOutcome::Live), None),
+                "probeDead" => (Some(DeviceInitOutcome::dead()), None),
+                "probeErr" => (None, None),
+                "probeRaw" => (Some(DeviceInitOutcome::Live), Some(58)),
                 _ => return None,
             };
-            Some(Box::new(Probe(outcome)) as Box<dyn DeviceSupport>)
+            Some(Box::new(Probe(outcome, raw)) as Box<dyn DeviceSupport>)
         })
         .db_string(db, &HashMap::new())
         .unwrap()
@@ -123,4 +129,29 @@ record(mbbiDirect, "E") { field(DTYP, "probeErr") field(VAL, "5") }"#,
     assert_eq!(bits(&db, "L"), [1, 0, 1, 0]);
     assert_eq!(bits(&db, "D"), [0; 4]);
     assert_eq!(bits(&db, "E"), [0; 4]);
+}
+
+/// `mbbiDirectRecord.c:218-226` derives the bits once per process, in
+/// `monitor()`, from whatever VAL the read left. softIoc, Raw Soft Channel
+/// from a longin at 58 with NOBT 4, SHFT 2: RVAL 56, VAL 14, B0-B3 0 1 1 1.
+/// The asyn-shaped read sets RVAL and VAL and leaves the bits to process.
+#[epics_macros_rs::epics_test]
+async fn mbbi_direct_bits_follow_a_raw_read() {
+    let db = ioc(r#"record(longin, "L") { field(VAL, "58") }
+record(mbbiDirect, "RAW") { field(DTYP, "Raw Soft Channel") field(INP, "L") field(NOBT, "4") field(SHFT, "2") }
+record(mbbiDirect, "ASYN") { field(DTYP, "probeRaw") field(NOBT, "4") field(SHFT, "2") field(MASK, "60") }"#)
+    .await;
+    for name in ["RAW", "ASYN"] {
+        db.process_record_with_links(name, &mut ProcStack::new())
+            .await
+            .unwrap();
+        let rec = db.get_record(name).unwrap();
+        let num = |f| rec.read().record.get_field(f).and_then(|v| v.to_f64());
+        assert_eq!(
+            (num("RVAL"), num("VAL")),
+            (Some(56.0), Some(14.0)),
+            "{name}"
+        );
+        assert_eq!(bits(&db, name), [0, 1, 1, 1], "{name}");
+    }
 }

@@ -113,7 +113,7 @@ impl Record for BiRecord {
         "bi"
     }
 
-    // biRecord.c:57 returns a nonzero dset status before :59-61.
+    // biRecord.c:112 returns a nonzero dset status before :114-116.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {
             self.mlst = self.val;

@@ -323,14 +323,16 @@ fn test_mbbo_direct_readback_maps_raw_and_skip_convert_preserves_low_bits() {
     assert!(rec.apply_raw_readback(0x0F));
     assert_eq!(rec.rval, 0x0F, "RVAL keeps the masked (unshifted) raw");
     assert_eq!(rec.val, 3, "VAL = masked raw >> SHFT");
-    assert_eq!(rec.bits[0], 1);
-    assert_eq!(rec.bits[1], 1);
     rec.set_device_did_compute(true);
     let _ = rec.process().unwrap();
     assert_eq!(
         rec.rval, 0x0F,
         "skip_convert preserves the readback RVAL with its sub-SHFT bits"
     );
+    // C `bitsFromVAL` before monitor() (mbboDirectRecord.c:240).
+    rec.monitor_value_changed();
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[1], 1);
     // One-shot: the next normal process forward-converts, which truncates the
     // low bits: (3 << 2) & 0x0F = 0x0C — proving the gate mattered.
     let _ = rec.process().unwrap();
@@ -390,9 +392,6 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     );
     assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
     assert_eq!(rec.val, 0x0F, "VAL = masked raw >> SHFT");
-    assert_eq!(rec.bits[0], 1);
-    assert_eq!(rec.bits[3], 1);
-    assert_eq!(rec.bits[4], 0);
     // The skip_convert gate preserves the readback RVAL (incl. sub-SHFT bits a
     // forward convert would truncate) — C processMbbiDirect returns 0 from its
     // readback without re-converting.
@@ -400,6 +399,11 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     let _ = rec.process().unwrap();
     assert_eq!(rec.rval, 0x3C, "skip_convert preserves the readback RVAL");
     assert_eq!(rec.val, 0x0F);
+    // C derives the bits in monitor() (mbbiDirectRecord.c:218-226).
+    rec.monitor_value_changed();
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[3], 1);
+    assert_eq!(rec.bits[4], 0);
     // Bits outside MASK are dropped: raw 0xC0 (bits 6-7) & 0x3C = 0 → val 0.
     assert!(rec.apply_raw_readback(0xC0));
     assert_eq!(rec.rval, 0);

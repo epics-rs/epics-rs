@@ -273,7 +273,7 @@ impl Record for LsoRecord {
         self.len
     }
 
-    /// C `lsoRecord.c:47-50`, after `:43-44` returns a nonzero dset status.
+    /// C `lsoRecord.c:91-94`, after `:84-88` returns a nonzero dset status.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed && self.len != 0 {
             self.oval = self.val.clone();

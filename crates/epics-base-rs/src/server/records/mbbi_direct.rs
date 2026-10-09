@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleHooks, CyclePostMask, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::EpicsValue;
 
@@ -21,6 +21,9 @@ pub struct MbbiDirectRecord {
     pub nobt: i16,
     pub mlst: u32,
     pub bits: [u8; 32], // B0-B1F
+    /// The bits this cycle's `monitor()` changed, drained by
+    /// `take_cycle_posted_fields`.
+    bits_changed: u32,
     pub simm: i16,
     pub siml: String,
     pub siol: String,
@@ -44,6 +47,7 @@ impl Default for MbbiDirectRecord {
             nobt: 0,
             mlst: 0,
             bits: [0; 32],
+            bits_changed: 0,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -75,8 +79,8 @@ impl Record for MbbiDirectRecord {
         false
     }
 
-    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::CYCLE_POSTED
     }
 
     /// UDF belongs to the dset here, not to `process()`. C
@@ -157,12 +161,46 @@ impl Record for MbbiDirectRecord {
     /// C `mbbiDirectRecord.c:228-231` `monitor()`: `if (prec->mlst != prec->val) { events |=
     /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
     /// committed HERE, at C's position, never captured during `process()`.
+    /// `:218-226` first derives B0-B1F from VAL, against the bit each held.
     fn monitor_value_changed(&mut self) -> Option<bool> {
+        let mut bits_changed = 0;
+        for (i, b) in self.bits.iter_mut().enumerate() {
+            let new = ((self.val >> i) & 1) as u8;
+            if *b != new {
+                *b = new;
+                bits_changed |= 1 << i;
+            }
+        }
+        self.bits_changed = bits_changed;
         let changed = self.mlst != self.val;
         if changed {
             self.mlst = self.val;
         }
         Some(changed)
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let changed = std::mem::take(&mut self.bits_changed);
+        if changed == 0 {
+            return Vec::new();
+        }
+        BIT_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| changed & (1 << i) != 0)
+            .map(|(_, &name)| (name, CyclePostMask::MonitorValueLog))
+            .collect()
+    }
+
+    /// C `:221-224` posts a bit on its own change against the record's bit or
+    /// with the alarm events, never on a compare against what a client was
+    /// last sent: a Bx put is posted by `dbPut` and monitor() then restores it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &BIT_NAMES
+    }
+
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &BIT_NAMES
     }
 
     /// C `mbbiDirectRecord.c:168-169` raises UDF with the literal `INVALID_ALARM`, not
@@ -231,17 +269,6 @@ impl Record for MbbiDirectRecord {
             self.val = raw;
         }
         self.skip_convert = false;
-        // C `mbbiDirectRecord.c:218-226` monitor() re-derives every bit
-        // B0..B1F FROM VAL each cycle (`*pBn = !!(val & 1)`), whether or not
-        // the RVAL->VAL convert ran. In this INPUT record the bit fields are
-        // DERIVED from VAL — a `pp(TRUE)` Bx put processes the record but never
-        // changes VAL (Bx is not a value field), so the transient bit is
-        // overwritten by the VAL-derived bit. Re-derive UNCONDITIONALLY here
-        // (a soft-channel process sets `skip_convert`, leaving VAL untouched);
-        // gating the rebuild on the convert left a Bx put's transient bit
-        // standing, so `caput B0 1` with VAL=0 ended B0=1 instead of C's 0.
-        // Opposite direction from mbboDirect, where Bx puts DERIVE VAL.
-        self.val_to_bits();
         self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
     }
@@ -414,8 +441,9 @@ impl Record for MbbiDirectRecord {
     /// asyn device readback (asynUInt32Digital only — `asynMbbiDirectUInt32Digital`
     /// is the sole mbbiDirect dset, devAsynUInt32Digital.c:165): `processMbbiDirect`
     /// sets `pr->rval = value & mask` (devAsynUInt32Digital.c:1031) and returns 0,
-    /// so mbbiDirectRecord's `rval -> (>> SHFT) -> VAL` + bit-field convert resolves
-    /// VAL. The hook runs that convert inline and returns `true` so the framework's
+    /// so mbbiDirectRecord's `rval -> (>> SHFT) -> VAL` convert resolves VAL; the
+    /// bits are derived later in `process()`, C `monitor()`'s one derivation
+    /// (`mbbiDirectRecord.c:218-226`). The hook runs that convert inline and returns `true` so the framework's
     /// `set_device_did_compute(true)` makes `process()` skip the (identical) forward
     /// pass. Without it the raw word lands verbatim in VAL via the default `set_val`
     /// (no MASK, no SHFT, wrong bits). Device-distinct entry — the Soft Channel path
@@ -433,7 +461,6 @@ impl Record for MbbiDirectRecord {
         } else {
             masked
         };
-        self.val_to_bits();
         true
     }
 

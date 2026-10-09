@@ -253,7 +253,7 @@ impl Record for StringoutRecord {
         }
     }
 
-    // C `stringoutRecord.c:69` copies VAL after `:66-67` returns a nonzero
+    // C `stringoutRecord.c:122` copies VAL after `:117-120` returns a nonzero
     // dset status.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {

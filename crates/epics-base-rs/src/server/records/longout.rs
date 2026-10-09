@@ -234,7 +234,7 @@ impl Record for LongoutRecord {
     /// when `DRVH > DRVL` (equal limits = no clamping). Without this an
     /// operator or DOL link writing outside the window propagates the
     /// unclamped value to the OUT link / device.
-    /// C `longoutRecord.c:67-70` seeds PVAL with the trackers, after `:63-64`
+    /// C `longoutRecord.c:123-126` seeds PVAL with the trackers, after `:117-120`
     /// returns a nonzero dset status. Without it a `field(VAL,"5")` longout
     /// starts with `pval = 0`, so the first `caput LO 0` is not a transition
     /// to C but is to the port.

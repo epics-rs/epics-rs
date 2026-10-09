@@ -90,9 +90,9 @@ tracker_test!(mbbi_oraw_is_not_posted, "mbbi", &["ORAW"]);
 tracker_test!(mbbo_oraw_and_orbv_are_not_posted, "mbbo", &["ORAW", "ORBV"]);
 tracker_test!(mbbi_direct_oraw_is_not_posted, "mbbiDirect", &["ORAW"]);
 tracker_test!(
-    mbbo_direct_oraw_and_orbv_are_not_posted,
+    mbbo_direct_oraw_orbv_obit_are_not_posted,
     "mbboDirect",
-    &["ORAW", "ORBV"]
+    &["ORAW", "ORBV", "OBIT"]
 );
 tracker_test!(
     ai_mlst_alst_lalm_are_not_posted,

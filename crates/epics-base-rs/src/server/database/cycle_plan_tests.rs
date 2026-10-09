@@ -184,6 +184,25 @@ const SCENARIOS: &[Scenario] = &[
         ..BASE
     },
     Scenario {
+        name: "DB link INP, DTYP switched to Raw Soft Channel and back",
+        arms: "DDGGGDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(VAL, "1.5") }
+               record(ai, "T") { field(INP, "S NPP") field(DTYP, "Soft Channel") field(FLNK, "F")
+                field(ASLO, "2") field(AOFF, "1") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "2.7")],
+            &[("T.DTYP", "Raw Soft Channel")],
+            &[("S", "3.7")],
+            &[],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "4.7")],
+        ],
+        ..BASE
+    },
+    Scenario {
         name: "DTYP and FLNK edited at runtime",
         arms: "PPPPPPPPP",
         db: with_fixtures!(
@@ -435,6 +454,40 @@ const SCENARIOS: &[Scenario] = &[
                record(ai, "T") { field(INP, "SI MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
         ),
         steps: &[&[], &[("SI.VAL", "word")], &[], &[("SI.VAL", "7")], &[]],
+        ..BASE
+    },
+    // Their request is not `DBR_DOUBLE`, so the DB-link arm is not theirs.
+    Scenario {
+        name: "bi DB link INP",
+        arms: "GGG",
+        db: with_fixtures!(
+            r#"record(bo, "S") { field(VAL, "0") }
+               record(bi, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(OSV, "MAJOR") }"#
+        ),
+        steps: &[&[], &[("S", "1")], &[("S", "0")]],
+        ..BASE
+    },
+    Scenario {
+        name: "mbbi DB link INP",
+        arms: "GGG",
+        db: with_fixtures!(
+            r#"record(longin, "S") { field(VAL, "1") }
+               record(mbbi, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(ONST, "one") field(TWST, "two") field(TWSV, "MINOR") }"#
+        ),
+        steps: &[&[], &[("S", "2")], &[("S", "1")]],
+        ..BASE
+    },
+    Scenario {
+        name: "longin DB link INP",
+        arms: "GGGG",
+        db: with_fixtures!(
+            r#"record(longin, "S") { field(VAL, "1") field(HIHI, "5") field(HHSV, "MAJOR") }
+               record(longin, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(MDEL, "1") }"#
+        ),
+        steps: &[&[], &[("S", "9")], &[("S", "2")], &[("T.INP", "4")]],
         ..BASE
     },
 ];

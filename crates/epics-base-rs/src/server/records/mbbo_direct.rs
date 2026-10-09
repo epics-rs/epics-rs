@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
-use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{CycleHooks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 use super::mbbi_direct::BIT_NAMES;
@@ -25,6 +25,12 @@ pub struct MbboDirectRecord {
     pub shft: u16,
     pub nobt: i16,
     pub mlst: u32,
+    /// OBIT: the bits `monitor()` last posted, moved with VAL by a bit put's
+    /// `special` because `dbPut` posts that bit itself.
+    pub obit: u32,
+    /// `obit ^ val` as of this cycle's `monitor()`, drained by
+    /// `take_cycle_posted_fields`.
+    bits_changed: u32,
     pub ivoa: i16,
     pub ivov: u32,
     pub omsl: i16,
@@ -56,6 +62,8 @@ impl Default for MbboDirectRecord {
             shft: 0,
             nobt: 0,
             mlst: 0,
+            obit: 0,
+            bits_changed: 0,
             ivoa: 0,
             ivov: 0,
             omsl: 0,
@@ -120,8 +128,8 @@ impl Record for MbboDirectRecord {
         false
     }
 
-    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::CYCLE_POSTED
     }
 
     fn record_type(&self) -> &'static str {
@@ -188,8 +196,10 @@ impl Record for MbboDirectRecord {
         let bit = 1u32 << idx;
         if self.bits[idx] != 0 {
             self.val |= bit;
+            self.obit |= bit;
         } else {
             self.val &= !bit;
+            self.obit &= !bit;
         }
         self.convert();
         Ok(())
@@ -223,8 +233,9 @@ impl Record for MbboDirectRecord {
     /// the raw and set VAL to the shifted masked value, mirroring C
     /// `processMbboDirect`/`initMbboDirect` (devAsynUInt32Digital.c:1084-1090,
     /// 1058-1065). RVAL keeps the masked-but-unshifted raw; VAL is the shifted
-    /// value (no state table — Direct is the raw value). The B0..B1F bits are
-    /// re-derived from the new VAL. Returns `true` so the store reports
+    /// value (no state table — Direct is the raw value). B0..B1F are derived
+    /// by C's own `bitsFromVAL` sites, `init_record_tail` and
+    /// `monitor_value_changed`. Returns `true` so the store reports
     /// `computed` and the framework skips the forward convert (via
     /// `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
@@ -239,7 +250,6 @@ impl Record for MbboDirectRecord {
         } else {
             masked
         };
-        self.val_to_bits();
         true
     }
 
@@ -313,13 +323,44 @@ impl Record for MbboDirectRecord {
     /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
     /// committed HERE, at C's position, never captured during `process()`.
     /// `:240` re-derives the bits first, for any VAL the dset changed.
+    /// `:320-328` then posts the bits in `obit ^ val` and commits `obit = val`.
     fn monitor_value_changed(&mut self) -> Option<bool> {
         self.val_to_bits();
         let changed = self.mlst != self.val;
         if changed {
             self.mlst = self.val;
         }
+        self.bits_changed = self.obit ^ self.val;
+        self.obit = self.val;
         Some(changed)
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let changed = std::mem::take(&mut self.bits_changed);
+        if changed == 0 {
+            return Vec::new();
+        }
+        BIT_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| changed & (1 << i) != 0)
+            .map(|(_, &name)| (name, CyclePostMask::MonitorValueLog))
+            .collect()
+    }
+
+    /// C `:323` posts a bit on `bitsChanged` or an alarm event, never on a
+    /// compare against what a client was last sent: a bit put is posted by
+    /// `dbPut` and must not post again from the next `monitor()`.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &BIT_NAMES
+    }
+
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &BIT_NAMES
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -448,6 +489,7 @@ impl Record for MbboDirectRecord {
             "SHFT" => Some(EpicsValue::UShort(self.shft)),
             "NOBT" => Some(EpicsValue::Short(self.nobt)),
             "MLST" => Some(EpicsValue::Long(self.mlst as i32)),
+            "OBIT" => Some(EpicsValue::Long(self.obit as i32)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov as i32)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),

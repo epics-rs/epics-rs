@@ -115,7 +115,7 @@ async fn longin_seeds_only_after_a_successful_dset_init_and_mbbi_always() {
     }
 }
 
-/// `biRecord.c:57` returns a nonzero dset status before `:59-61` seed MLST,
+/// `biRecord.c:112` returns a nonzero dset status before `:114-116` seed MLST,
 /// LALM and ORAW.
 #[epics_macros_rs::epics_test]
 async fn bi_seeds_mlst_lalm_oraw_only_after_a_successful_dset_init() {
@@ -129,7 +129,7 @@ async fn bi_seeds_mlst_lalm_oraw_only_after_a_successful_dset_init() {
 }
 
 /// `aoRecord.c:152` returns `S_dev_badInitRet` for a dset status other than
-/// 0 or 2, before `:155` (`oval = pval = val`) and `:160-161` (ORAW, ORBV).
+/// 0 or 2, before `:156` (`oval = pval = val`) and `:160-161` (ORAW, ORBV).
 #[epics_macros_rs::epics_test]
 async fn ao_seeds_oval_pval_oraw_orbv_only_after_a_successful_dset_init() {
     let db = probe_ioc_of("ao", r#"field(VAL, "3")"#).await;
@@ -155,7 +155,7 @@ async fn ao_seeds_oval_pval_oraw_orbv_only_after_a_successful_dset_init() {
     );
 }
 
-/// `longoutRecord.c:63-64` returns a nonzero dset status before `:67-70`,
+/// `longoutRecord.c:117-120` returns a nonzero dset status before `:123-126`,
 /// which seed PVAL with the trackers.
 #[epics_macros_rs::epics_test]
 async fn longout_seeds_pval_only_after_a_successful_dset_init() {
@@ -167,7 +167,7 @@ async fn longout_seeds_pval_only_after_a_successful_dset_init() {
 }
 
 /// `lsoRecord.c:82` loads DOL before the dset runs, but the OVAL/OLEN copy
-/// sits after `:43-44`'s `if (status) return status`. softIoc with
+/// sits after `:84-88`'s `if (status) return status`. softIoc with
 /// `DOL {const:"xyz"}` reads OLEN 4.
 #[epics_macros_rs::epics_test]
 async fn lso_seeds_oval_only_after_a_successful_dset_init() {
@@ -178,7 +178,19 @@ async fn lso_seeds_oval_only_after_a_successful_dset_init() {
     assert_eq!(len, [Some(4.0); 3], "the DOL load itself is ungated");
 }
 
-/// `stringinRecord.c:66` copies VAL into OVAL after `:63-64` returns a
+/// `lsoRecord.c:84-95` sets OVAL and OLEN below the dset status check.
+/// softIoc with `DOL "5"`, a number constant that loads LEN 1 and no text,
+/// reads OLEN 1 and OVAL "".
+#[epics_macros_rs::epics_test]
+async fn lso_seeds_olen_from_a_number_dol_only_after_a_successful_dset_init() {
+    let db = probe_ioc_of("lso", r#"field(DOL, "5") field(SIZV, "40")"#).await;
+    let olen = by_outcome(&db, "lso", "OLEN").map(|v| v.and_then(|v| v.to_f64()));
+    assert_eq!(olen, [Some(1.0), Some(0.0), Some(0.0)], "lso.OLEN");
+    let oval = by_outcome(&db, "lso", "OVAL").map(|v| v.map(|v| v.to_string()));
+    assert_eq!(oval, [const { Some(String::new()) }; 3], "lso.OVAL");
+}
+
+/// `stringinRecord.c:117` copies VAL into OVAL after `:112-115` returns a
 /// nonzero dset status. softIoc with `field(VAL,"abc")` reads OVAL "abc".
 #[epics_macros_rs::epics_test]
 async fn stringin_seeds_oval_only_after_a_successful_dset_init() {
@@ -190,7 +202,7 @@ async fn stringin_seeds_oval_only_after_a_successful_dset_init() {
     );
 }
 
-/// `stringoutRecord.c:69` copies VAL into OVAL after `:66-67` returns a
+/// `stringoutRecord.c:122` copies VAL into OVAL after `:117-120` returns a
 /// nonzero dset status. softIoc with `field(VAL,"abc")` reads OVAL "abc".
 #[epics_macros_rs::epics_test]
 async fn stringout_seeds_oval_only_after_a_successful_dset_init() {

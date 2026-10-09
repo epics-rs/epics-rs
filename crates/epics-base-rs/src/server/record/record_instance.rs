@@ -987,6 +987,7 @@ impl ProcessPlan {
         reads_sell: false,
         posts_software_event: false,
         resolves_subroutine_from_link: false,
+        runs_subroutine: false,
         substitutes_input_stage_when_simulating: false,
         redecides_after_output: false,
         acts_before_process: false,
@@ -1019,6 +1020,7 @@ impl ProcessPlan {
             reads_sell,
             posts_software_event,
             resolves_subroutine_from_link,
+            runs_subroutine,
             substitutes_input_stage_when_simulating,
             redecides_after_output,
             acts_before_process,
@@ -1045,6 +1047,7 @@ impl ProcessPlan {
             && reads_sell == p.reads_sell
             && posts_software_event == p.posts_software_event
             && resolves_subroutine_from_link == p.resolves_subroutine_from_link
+            && runs_subroutine == p.runs_subroutine
             && substitutes_input_stage_when_simulating == p.substitutes_input_stage_when_simulating
             && redecides_after_output == p.redecides_after_output
             && acts_before_process == p.acts_before_process
@@ -1083,6 +1086,7 @@ impl ProcessPlan {
             resolves_subroutine_from_link: crate::server::database::resolves_subroutine_from_link(
                 rtype,
             ),
+            runs_subroutine: SubroutineKind::of(rtype).is_some(),
             // Asked of the record itself, not of a table keyed on `rtype`: the
             // type that implements the step is the one that answers whether it
             // has one, so the two cannot drift into different files.
@@ -1180,12 +1184,11 @@ pub(crate) enum CyclePlan {
     /// cycle with those answers folded in. SIMM and the device slot are not
     /// part of the stamp; [`RecordInstance::cycle_plan`] tests them per cycle.
     ConstSoftIn,
-    /// [`Self::ConstSoftIn`] with INP a non-PP DB link read at the type's
-    /// request and TSE not -2: the input stage is the in-guard slot read of
+    /// [`Self::ConstSoftIn`] with INP a non-PP DB link read as `DBR_DOUBLE`
+    /// and TSE not -2: the input stage is the in-guard slot read of
     /// `soft_db_inp_stage` when the target resolves and is not this record,
-    /// the general stage otherwise. The request the record's dset makes of
-    /// INP, which DTYP alone decides, is stamped with it
-    /// ([`RecordInstance::plan_inp_as`]).
+    /// the general stage otherwise. Any other request is General: the arm's
+    /// slot carries an `f64`, so the arm itself is the request.
     DbSoftIn,
 }
 
@@ -1228,6 +1231,9 @@ pub(crate) struct ProcessPlan {
     /// This type is `aSub`, the only one that can re-read its subroutine name
     /// from a link mid-cycle.
     pub(crate) resolves_subroutine_from_link: bool,
+    /// This type is `sub` or `aSub`, the only ones with a `do_sub`. `false`
+    /// drops [`RecordInstance::run_registered_subroutine`] from the cycle.
+    pub(crate) runs_subroutine: bool,
     /// This type's simulation block replaces the input stage rather than
     /// running alongside it — `swait` alone. `false` makes the whole
     /// `set_simulation_active` step disappear, lock included, rather than
@@ -2429,8 +2435,6 @@ pub struct RecordInstance {
     plan_rev: u32,
     /// The plan resolved at `cycle_plan.0`; stale when that is not `plan_rev`.
     cycle_plan: (u32, CyclePlan),
-    /// The request [`CyclePlan::DbSoftIn`] was stamped with; read only by that arm.
-    plan_inp_as: crate::server::record::LinkReadAs,
     /// Test knob: run every cycle as [`CyclePlan::General`], the reference a
     /// plain arm is compared against.
     #[cfg(test)]
@@ -2749,9 +2753,11 @@ pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
 
 /// The previous-value trackers a C `monitor()` compares against and never
 /// posts: `oraw`/`orbv` (the last RVAL/RBV) on the raw-value records, and
-/// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type.
+/// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type,
+/// mbboDirect's `obit` (the last bits posted), and the output records' `pval`
+/// (the last VAL the OOPT test or DOL fetch compares to).
 /// A `caput` to one still posts, through the put path.
-const MONITOR_TRACKER_FIELDS: [&str; 5] = ["ORAW", "ORBV", "MLST", "ALST", "LALM"];
+const MONITOR_TRACKER_FIELDS: [&str; 7] = ["ORAW", "ORBV", "MLST", "ALST", "LALM", "OBIT", "PVAL"];
 
 /// The fields `collect_subscriber_posts`'s walk discards before it
 /// change-detects them, on every cycle of the record's life. Both the walk and
@@ -2928,12 +2934,6 @@ impl RecordInstance {
         arm
     }
 
-    /// The INP request stamped with [`CyclePlan::DbSoftIn`].
-    #[inline(always)]
-    pub(crate) fn plan_inp_as(&self) -> crate::server::record::LinkReadAs {
-        self.plan_inp_as
-    }
-
     /// The arm the last cycle dispatched to, for the differential harness.
     #[cfg(test)]
     pub(crate) fn ran_arm(&self) -> CyclePlan {
@@ -2954,27 +2954,28 @@ impl RecordInstance {
                     LinkFieldType::In,
                 ))
             });
-        let db_request = || match self.parsed_inp.link() {
+        let reads_double = || match self.parsed_inp.link() {
             ParsedLink::Db(db)
                 if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
                     && self.common.tse != -2 =>
             {
-                match crate::server::record::InputLinkRequest::for_inp(
-                    &*self.record,
-                    self.common.dtyp.soft(),
-                ) {
-                    crate::server::record::InputLinkRequest::As(read_as) => Some(read_as),
-                    _ => None,
-                }
+                matches!(
+                    crate::server::record::InputLinkRequest::for_inp(
+                        &*self.record,
+                        self.common.dtyp.soft(),
+                    ),
+                    crate::server::record::InputLinkRequest::As(
+                        crate::server::record::LinkReadAs::Double
+                    )
+                )
             }
-            _ => None,
+            _ => false,
         };
         let arm = if !plain {
             CyclePlan::General
         } else if crate::server::recgbl::simm::is_constant(self.parsed_inp.link()) {
             CyclePlan::ConstSoftIn
-        } else if let Some(read_as) = db_request() {
-            self.plan_inp_as = read_as;
+        } else if reads_double() {
             CyclePlan::DbSoftIn
         } else {
             CyclePlan::General
@@ -3277,7 +3278,6 @@ impl RecordInstance {
             watchdog_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_rev: 1,
             cycle_plan: (0, CyclePlan::General),
-            plan_inp_as: crate::server::record::LinkReadAs::Native,
             #[cfg(test)]
             plan_forced_general: false,
             #[cfg(test)]
@@ -6327,6 +6327,12 @@ impl RecordInstance {
     /// [`Record::set_subroutine_status`], which aSub's OUT-link gate reads. The
     /// delivery is factored out of the body below so a future early return
     /// cannot skip it: the body returns the status, this wrapper publishes it.
+    /// Arm the one-shot skip of this cycle's `do_sub`. Only a type that has
+    /// one, so the flag is never left set on a record that never reads it.
+    pub(crate) fn skip_subroutine_this_cycle(&mut self) {
+        self.suppress_subroutine_run |= self.monitor_plan.subroutine_kind.is_some();
+    }
+
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
         let outcome = self.run_subroutine_body();
         // A subroutine that errored out has no C counterpart (a C subroutine
@@ -6359,10 +6365,9 @@ impl RecordInstance {
             return Ok(SUBROUTINE_STATUS_SKIPPED);
         }
 
-        // Every record type reaches this call on the process path, but only
-        // `sub` and `aSub` have a `do_sub` in their rset at all. For all the
-        // others "no subroutine is bound" is their permanent normal state, not
-        // an unresolved SNAM, so they must not take `do_sub`'s bad-sub exit.
+        // Only `sub` and `aSub` have a `do_sub` in their rset at all, and only
+        // they are called (`ProcessPlan::runs_subroutine`); a type without one
+        // must not take `do_sub`'s bad-sub exit.
         let Some(kind) = self.monitor_plan.subroutine_kind else {
             return Ok(SUBROUTINE_STATUS_SKIPPED);
         };
@@ -6596,6 +6601,12 @@ impl RecordInstance {
         } else {
             self.record.alarm_cycle_monitored_fields()
         };
+        let alarm_fanout_mask =
+            if !alarm_fanout.is_empty() && self.record.alarm_cycle_posts_value_log() {
+                aux_mask
+            } else {
+                alarm_bits
+            };
         let force_fields = self.record.force_posted_fields();
         let log_swept = self.record.log_swept_fields();
         // C change-detects nothing about these fields; only the record's own
@@ -6680,7 +6691,7 @@ impl RecordInstance {
                 // C motor `monitor()` (motorRecord.cc:3456-3646) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
                 // observes the alarm moment on any of them.
-                snapshot.push((field.clone().into(), val.clone(), alarm_bits));
+                snapshot.push((field.clone().into(), val.clone(), alarm_fanout_mask));
             }
             // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
             // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
@@ -10772,6 +10783,30 @@ mod pact_exit_tests {
         let (tx, _rx) = crate::runtime::sync::oneshot::channel();
         inst.queue_notify_put(DeferredNotify::Process { completion: tx });
         assert!(inst.leave_pact().restart_pending());
+    }
+}
+
+#[cfg(test)]
+mod subroutine_gate_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+    use crate::server::records::asub_record::ASubRecord;
+    use crate::server::records::sub_record::SubRecord;
+
+    /// The boundary of `ProcessPlan::runs_subroutine`: the cycle calls the
+    /// subroutine runner exactly for the types that have a `do_sub`, and the
+    /// skip flag is armed exactly for them, so a type the cycle never asks
+    /// cannot carry a flag nothing clears.
+    #[test]
+    fn the_subroutine_runner_and_its_skip_flag_belong_to_sub_and_asub_alone() {
+        let mut ai = RecordInstance::new("G:AI".to_string(), AiRecord::new(0.0));
+        let mut sub = RecordInstance::new("G:SUB".to_string(), SubRecord::default());
+        let mut asub = RecordInstance::new("G:ASUB".to_string(), ASubRecord::default());
+        for (inst, has) in [(&mut ai, false), (&mut sub, true), (&mut asub, true)] {
+            assert_eq!(ProcessPlan::of(&*inst.record).runs_subroutine, has);
+            inst.skip_subroutine_this_cycle();
+            assert_eq!(inst.suppress_subroutine_run, has);
+        }
     }
 }
 

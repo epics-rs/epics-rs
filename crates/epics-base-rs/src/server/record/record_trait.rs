@@ -3077,6 +3077,15 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether [`Self::alarm_cycle_monitored_fields`] post with
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` rather than `monitor_mask` alone.
+    /// C `mbboDirectRecord.c:323-326` posts every bit with
+    /// `events|DBE_VALUE|DBE_LOG` once `events & ~(DBE_VALUE|DBE_LOG)`, so a
+    /// `DBE_VALUE` subscriber sees the alarm moment too.
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        false
+    }
+
     /// Fields the record's C `monitor()` re-posts with `DBE_VAL_LOG` on
     /// every cycle that recomputed them, even when the value did not
     /// change — the analogue of an unconditional `MARK(field)` in C.
@@ -6161,7 +6170,7 @@ mod tests {
             "compress" | "histogram" | "waveform" | "aai" | "aao" | "subArray" => {
                 CycleHooks::PRE_INPUT
             }
-            "acalcout" => CycleHooks::CYCLE_POSTED,
+            "acalcout" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
             "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,
             _ => CycleHooks::NONE,

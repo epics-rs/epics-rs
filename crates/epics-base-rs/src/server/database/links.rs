@@ -181,12 +181,55 @@ pub(crate) const LNK_LINK_FIELDS: [&str; 16] = [
     "LNKC", "LNKD", "LNKE", "LNKF",
 ];
 
+const SELL: &[&str] = &["SELL"];
+
+/// Every link a cycle reads through [`RecordInstance::record_link`], by
+/// record type. A field with no slot would read as no link, so the load
+/// refuses it ([`check_record_links`]) and the cycle keeps no check.
+const RECORD_LINK_USES: &[(&str, &[&[&str]])] = &[
+    ("fanout", &[&LNK_LINK_FIELDS, SELL]),
+    ("dfanout", &[&DFANOUT_LINK_FIELDS, SELL]),
+    ("seq", &[&DOL_LINK_FIELDS, &LNK_LINK_FIELDS, SELL]),
+];
+
+/// Refuse a record whose type reads a field through `record_link` that is
+/// not one of its slotted links, naming the field.
+pub(super) fn check_record_links(instance: &RecordInstance) -> crate::error::CaResult<()> {
+    check_record_links_in(instance, RECORD_LINK_USES)
+}
+
+fn check_record_links_in(
+    instance: &RecordInstance,
+    uses: &[(&str, &[&[&str]])],
+) -> crate::error::CaResult<()> {
+    let rtype = instance.record.record_type();
+    let fields = uses
+        .iter()
+        .filter(|(t, _)| *t == rtype)
+        .flat_map(|(_, f)| f.iter().copied().flatten());
+    for field in fields {
+        if !instance.has_link_slot(field) {
+            return Err(crate::error::CaError::DbLoadFailed(format!(
+                "{}: {rtype}.{field} is read as a link but is not a link the type declares",
+                instance.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// seq desired-output link fields, index-aligned with `MultiOut::Seq`
 /// (`seqRecord.c:86` — DOL0..DOLF). The names C's `dbLinkFieldName` yields
 /// for the `setLinkAlarm` AMSG of a failed group read.
 pub(crate) const DOL_LINK_FIELDS: [&str; 16] = [
     "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9", "DOLA", "DOLB",
     "DOLC", "DOLD", "DOLE", "DOLF",
+];
+
+/// seq DOn value-storage fields (`linkGrp.dov`), index-aligned with DOLn.
+const SEQ_DO_FIELDS: [&str; 16] = [
+    "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB", "DOC",
+    "DOD", "DOE", "DOF",
 ];
 
 /// Alarm state from a link source, used for MS/NMS propagation.
@@ -409,13 +452,15 @@ impl ProcessTargetGate {
     }
 }
 
-/// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
+/// One selected `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
 #[derive(Clone, Debug)]
 pub(crate) struct SeqGroup {
-    /// DOLn input link string (empty when unset).
-    pub dol: String,
-    /// LNKn output link string (empty when unset).
-    pub lnk: String,
+    /// The group's index, 0..F.
+    pub idx: usize,
+    /// DOLn's parse, from the record's link cache.
+    pub dol: Arc<crate::server::record::ParsedLink>,
+    /// LNKn's parse, from the record's link cache.
+    pub lnk: Arc<crate::server::record::ParsedLink>,
     /// DLYn per-group delay in seconds.
     pub dly: f64,
     /// DOn value-storage field (`linkGrp.dov`) — used when DOLn is
@@ -432,13 +477,17 @@ pub(crate) struct SeqGroup {
 /// PACT machine (C `sseqRecord.c::processCallback`) — not via this
 /// all-at-once dispatch.
 pub(crate) enum MultiOut {
-    /// fanout — 16 forward-link strings (LNK0..LNKF).
-    Fanout(Vec<String>),
-    /// dfanout — 16 output-link strings (OUTA..OUTP).
-    Dfanout(Vec<String>),
-    /// seq — 16 link groups (0..F).
+    /// fanout — the parse of each selected forward link (LNK0..LNKF).
+    Fanout(SelectedLinks),
+    /// dfanout — the parse of each selected output link (OUTA..OUTP).
+    Dfanout(SelectedLinks),
+    /// seq — the selected link groups, in selection order.
     Seq(Vec<SeqGroup>),
 }
+
+/// The cached parse of each link a SELM selection picked, by link index; the
+/// rest stay `None`, so the cycle reads no link it does not drive.
+pub(crate) type SelectedLinks = [Option<Arc<crate::server::record::ParsedLink>>; 16];
 
 impl MultiOut {
     /// Number of link slots — the `count` passed to the SELM selector.
@@ -446,9 +495,23 @@ impl MultiOut {
         match self {
             MultiOut::Fanout(v) => v.len(),
             MultiOut::Dfanout(v) => v.len(),
-            MultiOut::Seq(v) => v.len(),
+            MultiOut::Seq(_) => LNK_LINK_FIELDS.len(),
         }
     }
+}
+
+/// The parse of each link in `fields` that `indices` selects, through the
+/// record's link cache ([`RecordInstance::record_link`]).
+fn selected_links(
+    instance: &RecordInstance,
+    fields: &[&'static str; 16],
+    indices: &[usize],
+) -> SelectedLinks {
+    let mut links: SelectedLinks = Default::default();
+    for &i in indices {
+        links[i] = Some(instance.record_link(fields[i]).clone());
+    }
+    links
 }
 
 /// Record types whose multi-output link groups are dispatched by
@@ -614,15 +677,6 @@ enum TargetValue {
     External,
 }
 
-/// What [`PvDatabase::read_field_of`] found at a resolved address.
-enum FieldRead {
-    /// A simple PV registered under the field's own spelling shadows it.
-    Shadow(EpicsValue),
-    /// The record's field — `None` when it resolves but does not read — and
-    /// the record's committed alarm when the link inherits it.
-    Field(Option<EpicsValue>, Option<LinkAlarm>),
-}
-
 pub(super) enum LinkTarget {
     /// A record in this IOC — C's `dbDbLink` arm, with the cell it addresses.
     Local(Arc<RecordCell>),
@@ -682,22 +736,22 @@ impl PvDatabase {
         &self,
         db: &crate::server::record::DbLink,
     ) -> Option<crate::server::record::record_instance::ResolvedTarget> {
-        match self.link_target(&db.target().record) {
-            LinkTarget::Local(rec) => {
-                let field = crate::server::record::record_instance::FieldAddr::resolve_in(
-                    &rec,
-                    &db.target().field,
-                );
-                Some(crate::server::record::record_instance::ResolvedTarget {
-                    f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
-                        .then(|| super::field_io::double_slot(field))
-                        .flatten(),
-                    rec,
-                    field,
-                })
-            }
-            LinkTarget::LocalNotRecord | LinkTarget::External => None,
+        // A simple PV spelling the target shadows it (`shadow_of`), so the
+        // link keeps no address and goes by name, as `put_pv` and `get_pv` do.
+        if self.shadowing_pv(db).is_some() {
+            return None;
         }
+        let (name, rec) = self.lookup_record(&db.target().record)?;
+        let field =
+            crate::server::record::record_instance::FieldAddr::resolve_in(&rec, &db.target().field);
+        Some(crate::server::record::record_instance::ResolvedTarget {
+            f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
+                .then(|| super::field_io::double_slot(field))
+                .flatten(),
+            rec,
+            name,
+            field,
+        })
     }
 
     /// [`Self::link_target`] for a DB link, through its cached address.
@@ -739,6 +793,9 @@ impl PvDatabase {
     fn read_db_target_by_name(&self, db: &crate::server::record::DbLink) -> TargetValue {
         let target = db.target();
         match self.link_target(&target.record) {
+            LinkTarget::Local(_) if let Some(v) = self.shadow_of(db) => {
+                TargetValue::NoRecord(Some(v))
+            }
             LinkTarget::Local(rec) => {
                 let addr = crate::server::record::record_instance::FieldAddr::resolve(
                     rec.rdes(),
@@ -762,10 +819,8 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
         addr: crate::server::record::record_instance::FieldAddr,
     ) -> TargetValue {
-        match self.read_field_of(rec, db, addr) {
-            FieldRead::Shadow(value) => TargetValue::NoRecord(Some(value)),
-            FieldRead::Field(value, alarm) => TargetValue::Record(value, SourceId::of(rec), alarm),
-        }
+        let (value, alarm) = self.read_field_of(rec, db, addr);
+        TargetValue::Record(value, SourceId::of(rec), alarm)
     }
 
     /// The read through a cached target, packed as the caller consumes it:
@@ -780,10 +835,8 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        // A shadowed target has no address (`resolve_db_link`).
         let target = db.target();
-        if let Some(v) = self.shadow_of(db) {
-            return (Some(filtered_read(target, v)), None);
-        }
         // Built in the shape it is returned in, and filtered in place: each
         // repack of the value on the way up is a copy the optimiser keeps.
         let instance = match held {
@@ -805,10 +858,9 @@ impl PvDatabase {
         (value, alarm)
     }
 
-    /// The read itself: `rec`'s field at `addr`, with the alarm the record
-    /// held under the same lock hold — or the simple PV that shadows the
-    /// spelling. The one frame both [`Self::read_db_target`] and the cached
-    /// link read go through, each packing the answer for its own caller.
+    /// The read itself: `rec`'s field at `addr` — `None` when it resolves but
+    /// does not read — with the alarm the record held under the same lock
+    /// hold.
     ///
     /// The alarm is taken only for an `MS`/`MSS`/`MSI` link: C's
     /// `recGblInheritSevrMsg(pvlOptNMS)` is a `break`, so an NMS read has no
@@ -819,12 +871,9 @@ impl PvDatabase {
         rec: &RecordCell,
         db: &crate::server::record::DbLink,
         addr: crate::server::record::record_instance::FieldAddr,
-    ) -> FieldRead {
-        if let Some(v) = self.shadow_of(db) {
-            return FieldRead::Shadow(v);
-        }
+    ) -> (Option<EpicsValue>, Option<LinkAlarm>) {
         let instance = rec.read();
-        FieldRead::Field(
+        (
             self.read_field_at(&instance, &db.target().field, addr),
             (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
                 .then(|| LinkAlarm::committed(&instance.common)),
@@ -840,13 +889,19 @@ impl PvDatabase {
     /// where the two names are the same string, needs no `simple_pvs` lock.
     #[inline(always)]
     fn shadow_of(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
+        Some(self.shadowing_pv(db)?.get())
+    }
+
+    fn shadowing_pv(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<Arc<crate::server::pv::ProcessVariable>> {
         if db.target_is_val() {
             return None;
         }
         let target = db.target();
         let pv_name = local_name(&target.record, &target.field);
-        let pv = self.inner.simple_pvs.lock().get(&pv_name).cloned()?;
-        Some(pv.get())
+        self.inner.simple_pvs.lock().get(&pv_name).cloned()
     }
 
     /// Read a `Db`-variant link's value honoring C `dbInitLink`'s
@@ -2045,13 +2100,12 @@ impl PvDatabase {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
         }
-        let record = &db.target().record;
-        if let Some(src) = self.db_link_addr(db).map(|at| at.rec) {
-            let is_passive = src.read().common.scan == crate::server::record::ScanType::Passive;
+        if let Some(at) = self.db_link_addr(db) {
+            let is_passive = at.rec.read().common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
                 // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
-                let _ = self.process_record_with_links_recursive(record, visited);
+                let _ = self.process_record_with_links_recursive_at(&at.name, &at.rec, visited);
             }
         }
     }
@@ -2161,15 +2215,28 @@ impl PvDatabase {
     /// (`dbAccess.c:536-556`). Gating the call here would skip that count.
     pub(crate) fn process_target(
         &self,
-        target_name: &str,
+        link: &crate::server::record::DbLink,
         gate: ProcessTargetGate,
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
         visited: &mut ProcStack,
     ) {
-        let Some(target_rec) = self.get_record(target_name) else {
-            return;
-        };
+        if let Some(at) = self.db_link_addr(link) {
+            self.process_target_at(&at, gate, src_putf, src_notify, visited);
+        }
+    }
+
+    /// [`Self::process_target`] for a target a link has already resolved —
+    /// the `dbAddr`'s `precord` C's `processTarget` is handed.
+    pub(crate) fn process_target_at(
+        &self,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        gate: ProcessTargetGate,
+        src_putf: bool,
+        src_notify: Option<&Arc<NotifyWaitSet>>,
+        visited: &mut ProcStack,
+    ) {
+        let target_rec = &at.rec;
         {
             let mut tg = target_rec.write();
             // The gate. A target that does not pass it never reaches
@@ -2183,7 +2250,7 @@ impl PvDatabase {
             if !pact {
                 tg.common.putf = src_putf;
                 tg.join_put_notify(src_notify);
-            } else if src_putf && !visited.holds(&target_rec) {
+            } else if src_putf && !visited.holds(target_rec) {
                 tg.common.rpro = 1;
                 tg.common.putf = false;
             }
@@ -2193,7 +2260,7 @@ impl PvDatabase {
         // `dbProcess(pdst)` is: an active target is refused inside
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there.
-        let _ = self.process_record_with_links_recursive(target_name, visited);
+        let _ = self.process_record_with_links_recursive_at(&at.name, target_rec, visited);
     }
 
     /// Write a value through a DbLink, optionally processing the target if PP and Passive.
@@ -2228,7 +2295,9 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) -> bool {
         let target = link.target();
-        let target_name = local_pv_name(target);
+        // C `dbDbPutValue` puts through the link's `dbAddr`; the cached
+        // address is that, so the write hashes and allocates no name.
+        let addr = self.db_link_addr(link);
         // C `dbInitLink` locality (`dbLink.c:118-130`): a target record
         // not present in this IOC is a CA link, so its write is routed
         // through the external put path (`dbCaPutLink`), not a local
@@ -2237,7 +2306,7 @@ impl PvDatabase {
         // (dbDbLink.c:372-393), which `dbCaPutLink` performs none of —
         // so a non-local target returns right after the remote write.
         // OUTPUT-side twin of the `read_db_link_value` locality fallback.
-        if !self.has_name_no_resolve(&target.record) {
+        if addr.is_none() && !self.has_name_no_resolve(&target.record) {
             let external = link.pvname();
             if let Err(e) = self.write_external_pv(&external, value, src.notify) {
                 eprintln!("OUT-link write to external PV '{external}' failed: {e}");
@@ -2258,7 +2327,12 @@ impl PvDatabase {
         // tail (`recGblFwdLink` → `dbNotifyCompletion`), so a target whose park
         // this releases replays on its next cycle and an NPP link — `gate` is
         // `None` below — leaves it parked, exactly as C does.
-        let put_result = self.put_pv_already_locked(&target_name, value);
+        let put_result = match &addr {
+            Some(at) => {
+                self.put_record_body(&at.name, &at.rec, &target.field, at.field.desc, value)
+            }
+            None => self.put_pv_already_locked(&local_pv_name(target), value),
+        };
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
         // record's alarm into the destination via `recGblInheritSevrMsg`,
@@ -2275,7 +2349,7 @@ impl PvDatabase {
         // later independent scan otherwise. NMS (the common case) skips
         // the dest lookup/lock entirely.
         if link.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize {
-            if let Some(at) = self.db_link_addr(link) {
+            if let Some(at) = &addr {
                 let mut tg = at.rec.write();
                 inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
             }
@@ -2320,7 +2394,11 @@ impl PvDatabase {
             // Through the single `processTarget` owner, which holds the gate.
             // Alias-aware: `process_target` resolves the name, as
             // `process_record_with_links` does at entry.
-            self.process_target(&target.record, gate, src.putf, src.notify, visited);
+            // A target that is no local record has no address and nothing
+            // to process, as `process_target`'s lookup would find.
+            if let Some(at) = &addr {
+                self.process_target_at(at, gate, src.putf, src.notify, visited);
+            }
         }
         // Successful local write (C `dbPutLink` status 0).
         false
@@ -2962,14 +3040,6 @@ impl PvDatabase {
         crate::server::database::filters::sync::db_state_registry().get_or_create(name)
     }
 
-    /// Read a record String field, defaulting to empty.
-    fn field_str(instance: &RecordInstance, field: &str) -> String {
-        match instance.record.get_field(field) {
-            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-            _ => String::new(),
-        }
-    }
-
     /// Read a record numeric field as `i16`, defaulting to 0.
     fn field_i16(instance: &RecordInstance, field: &str) -> i16 {
         instance
@@ -3054,32 +3124,33 @@ impl PvDatabase {
     /// `sseq` reads its own SELL→SELN in `SseqRecord::pre_input_link_actions`
     /// (the async machine owns the whole cycle), so it is not handled here.
     pub(crate) fn read_sell_into_seln(&self, rec: InFrame<'_>, phase: SellPhase) {
-        let sell = {
+        let parsed = {
             let instance = rec.read();
             let record_type = instance.record.record_type();
             if !reads_sell(record_type) {
                 return;
             }
-            match (record_type, phase) {
+            let reads = match (record_type, phase) {
                 ("dfanout", SellPhase::BeforeAlarms) | ("fanout", SellPhase::OutputDispatch) => {
-                    Some(Self::field_str(&instance, "SELL"))
+                    true
                 }
                 // seqSELM_All == 0 (seqRecord.dbd menu(seqSELM) order
                 // All/Specified/Mask).
-                ("seq", SellPhase::OutputDispatch) if Self::field_i16(&instance, "SELM") != 0 => {
-                    Some(Self::field_str(&instance, "SELL"))
-                }
-                _ => None,
+                ("seq", SellPhase::OutputDispatch) => Self::field_i16(&instance, "SELM") != 0,
+                _ => false,
+            };
+            if !reads {
+                return;
             }
+            // C reads SELL via `dbGetLink` for any link type; the pre-fix port
+            // only read a `ParsedLink::Db` SELL, so a SELL sourced over CA/PVA
+            // or given as a constant never updated SELN.
+            let parsed = instance.record_link(SELL[0]);
+            if matches!(**parsed, crate::server::record::ParsedLink::None) {
+                return;
+            }
+            parsed.clone()
         };
-        let Some(sell) = sell else { return };
-        if sell.is_empty() {
-            return;
-        }
-        // C reads SELL via `dbGetLink` for any link type; the pre-fix port only
-        // read a `ParsedLink::Db` SELL, so a SELL sourced over CA/PVA or given
-        // as a constant never updated SELN.
-        let parsed = crate::server::record::parse_link_v2(&sell);
         // Through the one classifier: a CONSTANT SELL delivers NOTHING here
         // (`dbConstGetValue`) — its value reached SELN once, at init
         // (`fanoutRecord.c:88`, `dfanoutRecord.c:102`, `seqRecord.c:121`
@@ -3177,10 +3248,6 @@ impl PvDatabase {
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (fanoutRecord.c:39): 16 forward links
                     // LNK0..LNKF. LNK0 is the natural first slot.
-                    let links: Vec<String> = LNK_LINK_FIELDS
-                        .iter()
-                        .map(|f| Self::field_str(&instance, f))
-                        .collect();
                     // SELM resolution with OFFS/SHFT bias (fanoutRecord.c).
                     let sel = select_link_indices_ex(
                         SelmKind::FanoutSeq,
@@ -3188,8 +3255,12 @@ impl PvDatabase {
                         seln,
                         offs,
                         shft,
-                        links.len(),
+                        LNK_LINK_FIELDS.len(),
                     );
+                    // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
+                    // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
+                    // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
+                    let links = selected_links(&instance, &LNK_LINK_FIELDS, &sel.indices);
                     Some((sel, MultiOut::Fanout(links), None))
                 }
                 "dfanout" => {
@@ -3220,14 +3291,17 @@ impl PvDatabase {
                         // for a dfanout reached in the forward-link tail.
                         MultiOutPhase::ForwardLink => return MultiOutDispatch::default(),
                     };
-                    let links: Vec<String> = DFANOUT_LINK_FIELDS
-                        .iter()
-                        .map(|f| Self::field_str(&instance, f))
-                        .collect();
                     // dfanout Specified is 1-based; Mask has no SHFT
                     // (dfanoutRecord.c:308-339).
-                    let sel =
-                        select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0, links.len());
+                    let sel = select_link_indices_ex(
+                        SelmKind::Dfanout,
+                        selm,
+                        seln,
+                        0,
+                        0,
+                        DFANOUT_LINK_FIELDS.len(),
+                    );
+                    let links = selected_links(&instance, &DFANOUT_LINK_FIELDS, &sel.indices);
                     Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {
@@ -3237,23 +3311,25 @@ impl PvDatabase {
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (seqRecord.c:86): 16 link groups 0..F,
                     // each DOLn / DOn (value storage) / DLYn / LNKn.
-                    let dol_names = [
-                        "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
-                        "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF",
-                    ];
-                    let lnk_names = LNK_LINK_FIELDS;
                     let dly_names = [
                         "DLY0", "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8",
                         "DLY9", "DLYA", "DLYB", "DLYC", "DLYD", "DLYE", "DLYF",
                     ];
-                    let do_names = [
-                        "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9",
-                        "DOA", "DOB", "DOC", "DOD", "DOE", "DOF",
-                    ];
-                    let groups: Vec<SeqGroup> = (0..16)
-                        .map(|i| SeqGroup {
-                            dol: Self::field_str(&instance, dol_names[i]),
-                            lnk: Self::field_str(&instance, lnk_names[i]),
+                    let sel = select_link_indices_ex(
+                        SelmKind::FanoutSeq,
+                        selm,
+                        seln,
+                        offs,
+                        shft,
+                        LNK_LINK_FIELDS.len(),
+                    );
+                    let groups: Vec<SeqGroup> = sel
+                        .indices
+                        .iter()
+                        .map(|&i| SeqGroup {
+                            idx: i,
+                            dol: instance.record_link(DOL_LINK_FIELDS[i]).clone(),
+                            lnk: instance.record_link(LNK_LINK_FIELDS[i]).clone(),
                             dly: instance
                                 .record
                                 .get_field(dly_names[i])
@@ -3261,19 +3337,11 @@ impl PvDatabase {
                                 .unwrap_or(0.0),
                             dov: instance
                                 .record
-                                .get_field(do_names[i])
+                                .get_field(SEQ_DO_FIELDS[i])
                                 .and_then(|v| v.to_f64())
                                 .unwrap_or(0.0),
                         })
                         .collect();
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        groups.len(),
-                    );
                     Some((sel, MultiOut::Seq(groups), None))
                 }
                 _ => None,
@@ -3314,15 +3382,7 @@ impl PvDatabase {
         match payload {
             MultiOut::Fanout(links) => {
                 for idx in indices {
-                    let link_str = &links[idx];
-                    if link_str.is_empty() {
-                        continue;
-                    }
-                    // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
-                    // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
-                    // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
-                    let parsed = crate::server::record::parse_forward_link_v2(link_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
+                    if let Some(crate::server::record::ParsedLink::Db(db)) = links[idx].as_deref() {
                         // C `fanoutRecord.c:110/121/138` dispatches each
                         // selected LNKn via `dbScanFwdLink` →
                         // `dbDbScanFwdLink` → `dbScanPassive`
@@ -3337,7 +3397,7 @@ impl PvDatabase {
                         // like the explicit FLNK path — so this goes
                         // through the same single owner.
                         self.process_target(
-                            &db.target().record,
+                            db,
                             ProcessTargetGate::ScanPassive,
                             src_putf,
                             src_notify.as_ref(),
@@ -3349,8 +3409,10 @@ impl PvDatabase {
             MultiOut::Dfanout(links) => {
                 if let Some(ref val) = val {
                     for idx in indices {
-                        let link_str = &links[idx];
-                        if link_str.is_empty() {
+                        let Some(parsed) = links[idx].as_deref() else {
+                            continue;
+                        };
+                        if matches!(parsed, crate::server::record::ParsedLink::None) {
                             continue;
                         }
                         // C `dfanoutRecord.c:323` drives each OUTn via
@@ -3367,7 +3429,6 @@ impl PvDatabase {
                         // (uniform NoProcess default) +
                         // `write_db_link_value` (write-path target
                         // processing), so no per-call downgrade is needed.
-                        let parsed = crate::server::record::parse_output_link_v2(link_str);
                         // Through the put owner, so a failed OUTn raises the
                         // record's LINK_ALARM/INVALID from inside the put (C
                         // `dbPutLink`'s `setLinkAlarm`) — an external
@@ -3379,7 +3440,7 @@ impl PvDatabase {
                         // (and is subsumed by) the put's INVALID.
                         if self.write_out_link_value(
                             rec,
-                            &parsed,
+                            parsed,
                             val.clone(),
                             OutLinkSrc {
                                 field: DFANOUT_LINK_FIELDS[idx],
@@ -3402,13 +3463,8 @@ impl PvDatabase {
                 // it, even though nothing is driven. C builds this list into
                 // `pcb->grps[]` inside `process()` (`seqRecord.c:182-193`); the
                 // callback chain then walks it by `pcb->index`.
-                let active: Vec<usize> = indices
-                    .into_iter()
-                    .filter(|&i| {
-                        Self::seq_link_is_real(&groups[i].lnk)
-                            || Self::seq_link_is_real(&groups[i].dol)
-                    })
-                    .collect();
+                let mut active = groups;
+                active.retain(|g| Self::seq_link_is_real(&g.lnk) || Self::seq_link_is_real(&g.dol));
                 // C `seqRecord.c:189-196`: an empty group list is the ONLY
                 // synchronous exit — `if (!i) return asyncFinish(prec)`. With
                 // one or more groups, `process` sets `prec->pact = TRUE`
@@ -3444,8 +3500,8 @@ impl PvDatabase {
                     let db = self.clone();
                     let rec = Arc::clone(rec.unframed());
                     crate::runtime::task::spawn_background(prio, async move {
-                        for idx in active {
-                            let dly = groups[idx].dly;
+                        for grp in &active {
+                            let dly = grp.dly;
                             if dly > 0.0 {
                                 crate::runtime::task::sleep_background(
                                     crate::runtime::time::duration_from_secs(dly),
@@ -3458,7 +3514,7 @@ impl PvDatabase {
                                 // `:274`) — held for this group alone.
                                 let mut visited = crate::server::database::ProcStack::new();
                                 db.with_frame(&rec, |frame| {
-                                    db.seq_group_step(frame, &rec_name, &groups, idx, &mut visited)
+                                    db.seq_group_step(frame, &rec_name, grp, &mut visited)
                                 });
                             }
                         }
@@ -3509,12 +3565,12 @@ impl PvDatabase {
 
     /// C `dbLinkIsConstant` negated — a real link is a DB/CA/PVA PV
     /// reference, not an empty or numeric-literal field.
-    fn seq_link_is_real(s: &str) -> bool {
-        !s.is_empty()
-            && !matches!(
-                crate::server::record::parse_link_v2(s),
-                crate::server::record::ParsedLink::Constant(_)
-            )
+    fn seq_link_is_real(link: &crate::server::record::ParsedLink) -> bool {
+        !matches!(
+            link,
+            crate::server::record::ParsedLink::None
+                | crate::server::record::ParsedLink::Constant(_)
+        )
     }
 
     /// One `seq` link group — C `processCallback`'s body
@@ -3531,17 +3587,10 @@ impl PvDatabase {
         &self,
         rec: InFrame<'_>,
         rec_name: &str,
-        groups: &[SeqGroup],
-        idx: usize,
+        grp: &SeqGroup,
         visited: &mut ProcStack,
     ) {
-        // DOn value-storage field names (`linkGrp.dov`), index-aligned with
-        // the LNKn/DOLn groups.
-        const DO_NAMES: [&str; 16] = [
-            "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB",
-            "DOC", "DOD", "DOE", "DOF",
-        ];
-        let grp = &groups[idx];
+        let idx = grp.idx;
         let lnk_real = Self::seq_link_is_real(&grp.lnk);
         let dol_real = Self::seq_link_is_real(&grp.dol);
         // C `seqRecord.c:259` `dbGetLink(&dol, DBR_DOUBLE, &dov)`: read DOLn
@@ -3550,8 +3599,7 @@ impl PvDatabase {
         // DOLn raises `setLinkAlarm` (LINK/INVALID, AMSG `field DOL0`) on the
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
-            let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited)
+            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, visited)
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)
@@ -3584,13 +3632,12 @@ impl PvDatabase {
                     LinkAlarm::pending(&guard.common),
                 )
             };
-            let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
             // Through the put owner: a failed LNKn `dbPutLink` raises the seq
             // record's LINK_ALARM/INVALID from inside the put (C
             // `dbLink.c:444-446`).
             self.write_out_link_value(
                 rec,
-                &lnk_parsed,
+                &grp.lnk,
                 EpicsValue::Double(new_dov),
                 OutLinkSrc {
                     putf: src_putf,
@@ -3608,7 +3655,7 @@ impl PvDatabase {
         if new_dov != grp.dov {
             let _ = self.post_fields(
                 rec_name,
-                vec![(DO_NAMES[idx].to_string(), EpicsValue::Double(new_dov))],
+                vec![(SEQ_DO_FIELDS[idx].to_string(), EpicsValue::Double(new_dov))],
             );
         }
     }
@@ -5170,8 +5217,8 @@ mod no_reactor_gate_tests {
 
 impl crate::server::record::record_instance::LinkTargetResolver for PvDatabase {
     fn name_revision(&self) -> u64 {
-        // Two monotonic counters, so their sum changes whenever either does.
-        self.inner.records.revision() + self.inner.aliases.revision()
+        // Monotonic counters, so their sum changes whenever any does.
+        self.inner.records.revision() + self.inner.aliases.revision() + self.simple_pvs_revision()
     }
 
     fn local_target(
@@ -5643,5 +5690,30 @@ mod db_link_addr_tests {
             read(&db, &parse_link_v2("C.A")),
             Some(EpicsValue::Double(2.5))
         );
+    }
+}
+
+#[cfg(test)]
+mod record_link_uses_tests {
+    use super::*;
+
+    fn instance(rtype: &str) -> RecordInstance {
+        let record = crate::server::db_loader::create_record(rtype).unwrap();
+        RecordInstance::new_boxed("R".into(), record)
+    }
+
+    #[test]
+    fn every_record_link_use_names_a_slotted_link() {
+        for (rtype, _) in RECORD_LINK_USES {
+            check_record_links(&instance(rtype)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_type_reading_a_non_link_through_record_link_fails_to_load() {
+        let err = check_record_links_in(&instance("fanout"), &[("fanout", &[&["SELM"]])])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fanout.SELM"), "{err}");
     }
 }

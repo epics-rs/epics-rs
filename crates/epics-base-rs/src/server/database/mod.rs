@@ -513,6 +513,11 @@ struct PvDatabaseInner {
     /// re-open it.
     simple_pvs:
         crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
+    /// Moved by every `simple_pvs` insert and remove, after it, through
+    /// [`PvDatabase::insert_simple_pv`] / [`PvDatabase::take_simple_pv`]: a
+    /// simple PV spelled `REC.FLD` shadows that field, so a cached link
+    /// address must not outlive one appearing.
+    simple_pvs_revision: std::sync::atomic::AtomicU64,
     /// Wake-up for servers holding channels on this database: something was
     /// removed, re-check what you serve. Carries no name — the receiver
     /// tests the target it already holds
@@ -1286,6 +1291,7 @@ impl PvDatabase {
         Self {
             inner: Arc::new(PvDatabaseInner {
                 simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
+                simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
                 pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
                 external_resolver: ArcSwapOption::empty(),
                 breakpoints: ArcSwapOption::empty(),
@@ -2172,11 +2178,32 @@ impl PvDatabase {
     /// cross-namespace check is atomic with the insert and the lock
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
+    fn insert_simple_pv(&self, name: String, pv: Arc<ProcessVariable>) {
+        self.inner.simple_pvs.lock().insert(name, pv);
+        self.inner
+            .simple_pvs_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn take_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
+        let removed = self.inner.simple_pvs.lock().remove(name);
+        self.inner
+            .simple_pvs_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        removed
+    }
+
+    pub(crate) fn simple_pvs_revision(&self) -> u64 {
+        self.inner
+            .simple_pvs_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
         let _gate = self.lock_registration("add_pv");
         self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
+        self.insert_simple_pv(name.to_string(), pv);
         Ok(())
     }
 
@@ -2244,7 +2271,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
+        self.insert_simple_pv(name.to_string(), pv);
         Ok(())
     }
 
@@ -2263,7 +2290,7 @@ impl PvDatabase {
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        let removed = self.inner.simple_pvs.lock().remove(name);
+        let removed = self.take_simple_pv(name);
         if let Some(pv) = &removed {
             // Removal IS destruction: this funnel is `destroy`'s only
             // caller, so a PV cannot leave the directory while a server
@@ -2287,7 +2314,7 @@ impl PvDatabase {
         let _gate = self.lock_registration("add_simple_pv");
         self.check_name_free(&pv.name)?;
         let name = pv.name.clone();
-        self.inner.simple_pvs.lock().insert(name, Arc::new(pv));
+        self.insert_simple_pv(name, Arc::new(pv));
         Ok(())
     }
 
@@ -2637,7 +2664,14 @@ impl PvDatabase {
         let put = if inst.common_link_text(field).is_some() {
             inst.put_common_field_db_load(field, value).map(|_| ())
         } else {
-            inst.put_declared_field(field, value)
+            match crate::server::record::PreparedLink::for_put(
+                crate::server::record::FieldDeclaration::field_list(&*inst.record),
+                field,
+                &value,
+            ) {
+                Some(link) => inst.put_link_field(link, value),
+                None => inst.put_declared_field(field, value),
+            }
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");
         // C brackets every link write with the special pair — `dbPutSpecial`
@@ -2974,6 +3008,7 @@ impl PvDatabase {
         let gate = self.lock_registration("add_loaded_record");
         self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
+        links::check_record_links(&instance)?;
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
         // (asyn TRACE callback, sseq WAITn) without owning the database.

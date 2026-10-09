@@ -882,7 +882,7 @@ pub(crate) enum ForwardTarget {
     /// together. Resolved here, under the guard that resolved the target, so
     /// a cycle with no DB forward link reads neither.
     Db {
-        name: ManuallyDrop<String>,
+        link: ManuallyDrop<Arc<crate::server::record::DbLink>>,
         putf: bool,
         notify: ManuallyDrop<Option<Arc<crate::server::record::NotifyWaitSet>>>,
     },
@@ -910,8 +910,8 @@ impl ForwardTarget {
         // SAFETY: `drop` runs once, and nothing reads the payload afterwards.
         unsafe {
             match self {
-                Self::Db { name, notify, .. } => {
-                    ManuallyDrop::drop(name);
+                Self::Db { link, notify, .. } => {
+                    ManuallyDrop::drop(link);
                     ManuallyDrop::drop(notify);
                 }
                 Self::External(pv) => ManuallyDrop::drop(pv),
@@ -1138,7 +1138,8 @@ pub(crate) struct UdfAlarm {
 }
 
 mod link_cache {
-    use crate::server::record::ParsedLink;
+    use crate::server::record::{LinkFieldType, ParsedLink};
+    use std::sync::{Arc, LazyLock};
 
     /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
     /// replaceable only from `record_instance` — through
@@ -1167,9 +1168,212 @@ mod link_cache {
             &self.0
         }
     }
+
+    /// The parse of every link field the record TYPE declares (`OUTA`…,
+    /// `LNK1`…, `DOL`, `SVL`, `SELL`), C's `struct link` as `dbInitLink`
+    /// leaves it: made when the instance is built from the loaded record and
+    /// replaced by a [`PreparedLink`] on each put of the field, as C's
+    /// `dbPutFieldLink` re-parses. Never filled by a read, so a reader needs
+    /// only `&self` and the record's read lock.
+    #[derive(Debug, Default)]
+    pub(crate) struct LinkSlots(Vec<LinkSlot>);
+
+    #[derive(Debug)]
+    struct LinkSlot {
+        /// [`field_key`] of `field`: the scan compares one word per entry.
+        key: u64,
+        field: &'static str,
+        parsed: Arc<ParsedLink>,
+        /// The text parsed, for the debug check that no writer went around
+        /// the put funnel.
+        #[cfg(debug_assertions)]
+        text: String,
+    }
+
+    /// The first eight bytes of a field name, zero-padded: with the length, a
+    /// name of eight bytes or fewer IS its key, and a longer one is also
+    /// compared by name on a key match.
+    #[inline(always)]
+    fn field_key(field: &str) -> u64 {
+        let mut b = [0u8; 8];
+        let n = field.len().min(8);
+        b[..n].copy_from_slice(&field.as_bytes()[..n]);
+        u64::from_le_bytes(b)
+    }
+
+    /// An unset link — most declared links — shares one allocation.
+    static NONE: LazyLock<Arc<ParsedLink>> = LazyLock::new(|| Arc::new(ParsedLink::None));
+
+    fn parse(text: &str, ftype: LinkFieldType) -> Arc<ParsedLink> {
+        match crate::server::record::parse_link_field(text, ftype) {
+            ParsedLink::None => NONE.clone(),
+            parsed => Arc::new(parsed),
+        }
+    }
+
+    /// The parser's link type for `d` when it is a link with a slot: every
+    /// link the type declares but the `dbCommon` five, which have their
+    /// [`LinkCache`]s.
+    fn slot_type(d: &crate::server::record::FieldDesc) -> Option<LinkFieldType> {
+        if matches!(d.name, "INP" | "OUT" | "TSEL" | "SDIS" | "FLNK") {
+            return None;
+        }
+        crate::types::link_class_of(d).map(LinkFieldType::for_class)
+    }
+
+    /// A slotted link's new parse, made before the record's hold is taken —
+    /// C's `dbPutFieldLink` parses ahead of `dbScanLock` — so the hold only
+    /// moves it in ([`super::RecordInstance::put_link_field`]).
+    pub(crate) struct PreparedLink {
+        field: &'static str,
+        parsed: Arc<ParsedLink>,
+        #[cfg(debug_assertions)]
+        text: String,
+    }
+
+    impl PreparedLink {
+        /// `Some` when `field` of `rec` is a slotted link and `value` the
+        /// string a record stores a link's text from; any other put leaves
+        /// the slots, and a non-string one costs no lookup.
+        pub(crate) fn for_put(
+            fields: &'static [crate::server::record::FieldDesc],
+            field: &str,
+            value: &crate::types::EpicsValue,
+        ) -> Option<Self> {
+            let crate::types::EpicsValue::String(text) = value else {
+                return None;
+            };
+            let desc = super::field_desc_in(fields, field)?;
+            let ftype = slot_type(desc)?;
+            let text = text.as_str_lossy();
+            Some(PreparedLink {
+                field: desc.name,
+                parsed: parse(&text, ftype),
+                #[cfg(debug_assertions)]
+                text: text.into_owned(),
+            })
+        }
+
+        pub(crate) fn field(&self) -> &'static str {
+            self.field
+        }
+    }
+
+    /// [`PreparedLink`]s for a batch of puts stored under one hold.
+    pub(crate) struct PreparedLinks(Vec<PreparedLink>);
+
+    impl PreparedLinks {
+        pub(crate) fn for_puts<'a>(
+            rec: &super::RecordCell,
+            puts: impl IntoIterator<Item = (&'a str, &'a crate::types::EpicsValue)>,
+        ) -> Self {
+            PreparedLinks(
+                puts.into_iter()
+                    .filter_map(|(field, value)| {
+                        PreparedLink::for_put(rec.rdes().fields, field, value)
+                    })
+                    .collect(),
+            )
+        }
+
+        /// The first prepared parse of `field`, in batch order.
+        pub(crate) fn take(&mut self, field: &str) -> Option<PreparedLink> {
+            let i = self
+                .0
+                .iter()
+                .position(|l| l.field.eq_ignore_ascii_case(field))?;
+            Some(self.0.remove(i))
+        }
+    }
+
+    impl LinkSlots {
+        /// Every link field `record`'s type declares that has a slot.
+        pub(super) fn of(record: &dyn crate::server::record::Record) -> Self {
+            let fields = crate::server::record::declared_field_table(record.record_type())
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|d| Some((d.name, slot_type(d)?)));
+            let mut slots = LinkSlots::default();
+            for (field, ftype) in fields {
+                let text = super::link_text_of(record, field).unwrap_or_default();
+                slots.0.push(LinkSlot {
+                    key: field_key(field),
+                    field,
+                    parsed: parse(&text, ftype),
+                    #[cfg(debug_assertions)]
+                    text,
+                });
+            }
+            slots
+        }
+
+        /// Move `link` into its slot; the parse was made outside the hold.
+        pub(super) fn install(&mut self, link: PreparedLink) {
+            let Some(i) = self.position(link.field) else {
+                debug_assert!(false, "{}: PreparedLink without a slot", link.field);
+                return;
+            };
+            let slot = &mut self.0[i];
+            slot.parsed = link.parsed;
+            #[cfg(debug_assertions)]
+            {
+                slot.text = link.text;
+            }
+        }
+
+        #[inline(always)]
+        pub(super) fn position(&self, field: &str) -> Option<usize> {
+            let key = field_key(field);
+            self.0.iter().position(|e| {
+                e.key == key
+                    && e.field.len() == field.len()
+                    && (field.len() <= 8 || e.field == field)
+            })
+        }
+
+        pub(super) fn at(&self, i: usize) -> &Arc<ParsedLink> {
+            &self.0[i].parsed
+        }
+
+        /// What a field with no slot reads as: no link.
+        pub(super) fn none() -> &'static Arc<ParsedLink> {
+            &NONE
+        }
+
+        #[cfg(debug_assertions)]
+        pub(super) fn text_at(&self, i: usize) -> &str {
+            &self.0[i].text
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn slots_tell_apart_names_that_share_an_eight_byte_prefix() {
+            let slots = LinkSlots(
+                ["ABCDEFGH1", "ABCDEFGH2", "OUT"]
+                    .map(|field| LinkSlot {
+                        key: field_key(field),
+                        field,
+                        parsed: parse("", LinkFieldType::In),
+                        #[cfg(debug_assertions)]
+                        text: String::new(),
+                    })
+                    .into(),
+            );
+            assert_eq!(slots.position("ABCDEFGH1"), Some(0));
+            assert_eq!(slots.position("ABCDEFGH2"), Some(1));
+            assert_eq!(slots.position("OUT"), Some(2));
+            assert_eq!(slots.position("OUTA"), None);
+            assert_eq!(slots.position("ABCDEFGH"), None);
+        }
+    }
 }
 
 pub use link_cache::LinkCache;
+pub(crate) use link_cache::{LinkSlots, PreparedLink, PreparedLinks};
 
 /// How one process cycle of one record instance runs, resolved from the
 /// instance's own link kinds and device type (where [`ProcessPlan`] holds what
@@ -2201,6 +2405,8 @@ fn link_text_of(record: &dyn Record, field: &str) -> Option<String> {
 #[derive(Clone)]
 pub(crate) struct ResolvedTarget {
     pub(crate) rec: Arc<RecordCell>,
+    /// The record's canonical name — the link may name an alias.
+    pub(crate) name: Arc<str>,
     pub(crate) field: FieldAddr,
     /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
     /// addresses an unfiltered `VAL` the record serves as `DBF_DOUBLE`.
@@ -2252,6 +2458,8 @@ pub struct RecordInstance {
     pub parsed_flnk: LinkCache,
     pub parsed_sdis: LinkCache,
     pub parsed_tsel: LinkCache,
+    /// Every other link field's parse — see [`Self::record_link`].
+    link_slots: LinkSlots,
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
@@ -3006,6 +3214,7 @@ impl RecordInstance {
     /// withheld `post_write_fields`.
     pub(crate) fn put_internal_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.invalidate_plan_for(field);
+        self.debug_assert_not_slotted(field, &value);
         self.record.put_field_internal(field, value)
     }
 
@@ -3014,7 +3223,47 @@ impl RecordInstance {
     /// type's own link text (SIML, SIOL) is changed only through here.
     pub(crate) fn put_declared_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.invalidate_plan_for(field);
+        self.debug_assert_not_slotted(field, &value);
         self.record.put_field(field, value)
+    }
+
+    /// [`Self::put_declared_field`] for a link with a slot: the slot takes
+    /// `link`, parsed before the hold, only once the record stored the text.
+    pub(crate) fn put_link_field(&mut self, link: PreparedLink, value: EpicsValue) -> CaResult<()> {
+        let field = link.field();
+        self.invalidate_plan_for(field);
+        self.record.put_field(field, value)?;
+        self.link_slots.install(link);
+        Ok(())
+    }
+
+    /// [`Self::put_internal_field`] for one put of a batch whose link parses
+    /// were made before the hold.
+    pub(crate) fn put_internal_field_of(
+        &mut self,
+        field: &str,
+        value: EpicsValue,
+        links: &mut PreparedLinks,
+    ) -> CaResult<()> {
+        let Some(link) = links.take(field) else {
+            return self.put_internal_field(field, value);
+        };
+        let field = link.field();
+        self.invalidate_plan_for(field);
+        self.record.put_field_internal(field, value)?;
+        self.link_slots.install(link);
+        Ok(())
+    }
+
+    /// A slotted link's text comes in through [`Self::put_link_field`]
+    /// alone, or its slot goes stale.
+    #[inline(always)]
+    fn debug_assert_not_slotted(&self, field: &str, value: &EpicsValue) {
+        debug_assert!(
+            !matches!(value, EpicsValue::String(_)) || self.link_slots.position(field).is_none(),
+            "{}.{field}: a link put must go through put_link_field",
+            self.name
+        );
     }
 
     /// This cycle's forward link, resolved from the two things C's
@@ -3034,7 +3283,7 @@ impl RecordInstance {
         // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
         match self.parsed_flnk.link() {
             ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
-                name: ManuallyDrop::new(l.target().record.clone()),
+                link: ManuallyDrop::new(l.clone()),
                 putf: self.common.putf,
                 notify: ManuallyDrop::new(self.notify.clone()),
             },
@@ -3153,6 +3402,37 @@ impl RecordInstance {
         }
     }
 
+    /// Whether `field` is a link with a slot — the load's check that a
+    /// [`Self::record_link`] consumer names one.
+    pub(crate) fn has_link_slot(&self, field: &str) -> bool {
+        self.link_slots.position(field).is_some()
+    }
+
+    /// The parse of record-type link field `field` as the record holds it —
+    /// [`LinkSlots`], made at load and on each put, so a cycle borrows it
+    /// under the read lock and does no parse. A DB link's target address is
+    /// the parse's own ([`PvDatabase::db_link_addr`]), so a cycle reading
+    /// through this does no name work. Not for the `dbCommon` links, which
+    /// have their [`LinkCache`]s.
+    ///
+    /// [`PvDatabase::db_link_addr`]: crate::server::database::PvDatabase
+    #[inline]
+    pub(crate) fn record_link(&self, field: &str) -> &Arc<ParsedLink> {
+        let Some(i) = self.link_slots.position(field) else {
+            debug_assert!(false, "{}.{field}: not a link its type declares", self.name);
+            return LinkSlots::none();
+        };
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.link_text(field).as_deref().unwrap_or(""),
+            self.link_slots.text_at(i),
+            "{}.{field}: link text changed without a put through \
+             put_declared_field",
+            self.name
+        );
+        self.link_slots.at(i)
+    }
+
     /// The text of a link field, `None` when the link is unset.
     ///
     /// A declared link is unset far more often than set — a `calc` declares 21
@@ -3243,6 +3523,7 @@ impl RecordInstance {
         let mut common = CommonFields::default();
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
+        let link_slots = LinkSlots::of(record.as_ref());
 
         Self {
             destroyed: false,
@@ -3258,6 +3539,7 @@ impl RecordInstance {
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
             parsed_siml: None,
             parsed_siol: None,
+            link_slots,
             device: None,
             subroutine: None,
             init_subroutines: None,
@@ -3599,8 +3881,8 @@ impl RecordInstance {
     ///
     /// A field with no declaration at all — a virtual field (`RTYP`, `TIME`) —
     /// has no `dbFldDes` in C either, so it is not property-class.
-    pub(crate) fn field_posts_property(&self, field: &str) -> bool {
-        self.field_desc(field).is_some_and(|d| d.prop)
+    fn field_posts_property(desc: Option<&'static FieldDesc>) -> bool {
+        desc.is_some_and(|d| d.prop)
     }
 
     /// Hook called by the database after a field is written. If the field is a
@@ -3644,8 +3926,20 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) {
         let upper = field.to_ascii_uppercase();
-        let cache_source = is_metadata_cache_source(&upper);
-        let posts_property = self.field_posts_property(&upper);
+        self.notify_field_written_if_changed_at(&upper, self.field_desc(&upper), prev, backing);
+    }
+
+    /// [`Self::notify_field_written_if_changed`] for an upper-case `field`
+    /// whose declaration the caller resolved — a `dbPut` body's.
+    pub(crate) fn notify_field_written_if_changed_at(
+        &mut self,
+        upper: &str,
+        desc: Option<&'static FieldDesc>,
+        prev: Option<&EpicsValue>,
+        backing: LinkBacking<'_>,
+    ) {
+        let cache_source = is_metadata_cache_source(upper);
+        let posts_property = Self::field_posts_property(desc);
         if !cache_source && !posts_property {
             return;
         }
@@ -3657,7 +3951,7 @@ impl RecordInstance {
         // compared `None` to `None`, reported "unchanged", and posted neither
         // the `DBE_PROPERTY` C sends for a `prop(YES)` field nor the cache
         // invalidation the metadata it feeds depends on.
-        let now = self.resolve_field_stored(&upper);
+        let now = self.resolve_field_stored_at(upper, desc);
         if prev == now.as_ref() {
             return;
         }
@@ -3753,10 +4047,15 @@ impl RecordInstance {
     ///
     /// `field` may be any case.
     pub fn is_no_mod(&self, field: &str) -> bool {
+        self.is_no_mod_at(field, self.field_desc(field))
+    }
+
+    /// [`Self::is_no_mod`] with `desc` = [`Self::field_desc`]`(field)`.
+    pub(crate) fn is_no_mod_at(&self, field: &str, desc: Option<&'static FieldDesc>) -> bool {
         if DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field)) {
             return true;
         }
-        if self.field_desc(field).is_some_and(|f| f.read_only) {
+        if desc.is_some_and(|f| f.read_only) {
             return true;
         }
         self.record.field_no_mod(field)
@@ -4101,7 +4400,7 @@ impl RecordInstance {
         desc: Option<&'static FieldDesc>,
     ) -> Option<EpicsValue> {
         let value = self.resolve_field_stored_at(name, desc)?;
-        Some(self.as_a_reader_sees(name, value))
+        Some(Self::as_a_reader_sees(desc, value))
     }
 
     /// [`Self::resolve_field`] without the reader's view — what the field
@@ -4175,16 +4474,14 @@ impl RecordInstance {
     /// C `dbGet`'s link arm applied to one resolved field: a link field reads
     /// as [`render_link_field`], everything else as itself.
     ///
-    /// The class lookup is behind the string test because only a string-valued
-    /// field can be a link, and the numeric fields a processing cycle reads
-    /// (`HASH`, `SIMM`, `SDLY`) must not pay for a declaration scan.
+    /// The class is read off `desc`, the declaration the caller resolved the
+    /// field with, so a string read pays no second scan for it.
     #[inline]
-    fn as_a_reader_sees(&self, upper_field: &str, value: EpicsValue) -> EpicsValue {
+    fn as_a_reader_sees(desc: Option<&'static FieldDesc>, value: EpicsValue) -> EpicsValue {
         let EpicsValue::String(ref text) = value else {
             return value;
         };
-        let Some(class) = crate::types::dbf_link_class(self.record.record_type(), upper_field)
-        else {
+        let Some(class) = desc.and_then(crate::types::link_class_of) else {
             return value;
         };
         EpicsValue::String(

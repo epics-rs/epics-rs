@@ -187,13 +187,13 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
             .put_field("DLY0", EpicsValue::Double(0.30))
             .unwrap();
         inst.record
-            .put_field("DOL0", EpicsValue::String("7.0".into()))
-            .unwrap();
-        inst.record
             .put_field("DO0", EpicsValue::Double(7.0))
             .unwrap();
-        inst.record
-            .put_field("LNK0", EpicsValue::String("H6:SEQTGT".into()))
+    }
+    // Link text goes through the put funnel, which keeps the parsed link.
+    for (field, text) in [("DOL0", "7.0"), ("LNK0", "H6:SEQTGT")] {
+        db.put_record_field_from_ca("H6:SEQ", field, EpicsValue::String(text.into()))
+            .await
             .unwrap();
     }
 
@@ -331,13 +331,13 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         let mut inst = rec.write();
         // DLY0 stays 0.0 — the case under test.
         inst.record
-            .put_field("DOL0", EpicsValue::String("5.0".into()))
-            .unwrap();
-        inst.record
             .put_field("DO0", EpicsValue::Double(5.0))
             .unwrap();
-        inst.record
-            .put_field("LNK0", EpicsValue::String("UI81:TGT".into()))
+    }
+    // Link text goes through the put funnel, which keeps the parsed link.
+    for (field, text) in [("DOL0", "5.0"), ("LNK0", "UI81:TGT")] {
+        db.put_record_field_from_ca("UI81:SEQ", field, EpicsValue::String(text.into()))
+            .await
             .unwrap();
     }
 

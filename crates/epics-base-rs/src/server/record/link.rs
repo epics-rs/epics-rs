@@ -689,6 +689,7 @@ struct DbAddrCell {
 
 struct CachedDbAddr {
     rec: std::sync::Weak<super::record_instance::RecordCell>,
+    name: std::sync::Arc<str>,
     field: super::record_instance::FieldAddr,
     f64_slot: Option<super::record_trait::FieldSlot>,
     revision: u64,
@@ -728,6 +729,7 @@ impl DbLink {
         {
             return Some(super::record_instance::ResolvedTarget {
                 rec,
+                name: cached.name.clone(),
                 field: cached.field,
                 f64_slot: cached.f64_slot,
             });
@@ -735,6 +737,7 @@ impl DbLink {
         let target = resolve()?;
         *self.addr.owned.lock() = Some(CachedDbAddr {
             rec: std::sync::Arc::downgrade(&target.rec),
+            name: target.name.clone(),
             field: target.field,
             f64_slot: target.f64_slot,
             revision,

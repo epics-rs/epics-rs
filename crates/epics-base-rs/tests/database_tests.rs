@@ -5615,13 +5615,9 @@ async fn test_fanout_specified() {
         tgt.init_record(0).unwrap();
         db.add_record(name, Box::new(tgt)).await.unwrap();
     }
-    if let Some(rec) = db.get_record("FANOUT") {
-        let mut inst = rec.write();
-        inst.record
-            .put_field("LNK1", EpicsValue::String("T1".into()))
-            .unwrap();
-        inst.record
-            .put_field("LNK2", EpicsValue::String("T2".into()))
+    for (field, target) in [("LNK1", "T1"), ("LNK2", "T2")] {
+        db.put_record_field_from_ca("FANOUT", field, EpicsValue::String(target.into()))
+            .await
             .unwrap();
     }
     let mut visited = epics_base_rs::server::database::ProcStack::new();

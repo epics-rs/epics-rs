@@ -2280,6 +2280,28 @@ impl PvDatabase {
         self.run_process_frame(ProcessTarget::Name(name), visited, false, false, false)
     }
 
+    /// [`Self::process_record_with_links_recursive`] for a target already
+    /// resolved — a link's address, whose `name` is the canonical one.
+    pub(crate) fn process_record_with_links_recursive_at(
+        &self,
+        name: &str,
+        rec: &Arc<RecordCell>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        debug_assert_eq!(
+            crate::server::record::record_instance::live_borrows::count(),
+            0,
+            "a frame dispatched a FLNK/OUT/CP target with a record borrow live"
+        );
+        self.run_process_frame(
+            ProcessTarget::Resolved(name, rec),
+            visited,
+            false,
+            false,
+            false,
+        )
+    }
+
     /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
     ///
     /// Used by `ProcessAction::ReprocessAfter` timer fires: the spawned
@@ -2608,10 +2630,14 @@ impl PvDatabase {
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
         let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
         let link_backing = link_backing.as_link_backing();
+        let mut links = crate::server::record::PreparedLinks::for_puts(
+            &rec,
+            post.writes.iter().map(|(f, v)| (f.as_str(), v)),
+        );
         let mut inst = rec.write();
         let mut written = Vec::with_capacity(post.writes.len());
         for (field, value) in post.writes {
-            inst.put_internal_field(&field, value)?;
+            inst.put_internal_field_of(&field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must invalidate
             // the cache before the monitor snapshot below is built, or the
             // property event would carry the pre-change enum choices.
@@ -2649,10 +2675,14 @@ impl PvDatabase {
         // from `DOLn`. Resolved before the write guard, as everywhere.
         let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
         let link_backing = link_backing.as_link_backing();
+        let mut links = crate::server::record::PreparedLinks::for_puts(
+            &rec,
+            fields.iter().map(|(f, v)| (f.as_str(), v)),
+        );
         let mut inst = rec.write();
         let mut posted = Vec::with_capacity(fields.len());
         for (field, value) in fields {
-            inst.put_internal_field(&field, value)?;
+            inst.put_internal_field_of(&field, value, &mut links)?;
             // Snapshot-cache contract: a metadata-class write must
             // invalidate the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
@@ -6563,10 +6593,10 @@ impl PvDatabase {
         // one resolution `RecordInstance::forward_target` made under the
         // monitor segment's guard, so the tail re-reads nothing.
         match flnk {
-            crate::server::record::record_instance::ForwardTarget::Db { name, putf, notify } => {
+            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
                 guard.release();
                 self.process_target(
-                    name,
+                    link,
                     super::links::ProcessTargetGate::ScanPassive,
                     *putf,
                     notify.as_ref(),
@@ -7496,9 +7526,9 @@ impl PvDatabase {
         // `dbScanPassive` for a DB target, → lset `scanForward` for an
         // external one).
         match &flnk_name {
-            crate::server::record::record_instance::ForwardTarget::Db { name, putf, notify } => {
+            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
                 self.process_target(
-                    name,
+                    link,
                     super::links::ProcessTargetGate::ScanPassive,
                     *putf,
                     notify.as_ref(),
@@ -7651,11 +7681,8 @@ impl PvDatabase {
     /// [`Self::process_record_with_links_body`]. Deciding PACT a second time
     /// here is what let this path diverge from that owner.
     fn process_one_cp_target(&self, target: &super::CpTarget, visited: &mut ProcStack) {
-        let target_rec = {
-            let records = self.inner.records.read();
-            records.get(target.record.as_str()).cloned()
-        };
-        let skip = match target_rec {
+        let target_rec = self.lookup_record(&target.record);
+        let skip = match &target_rec {
             // CPP gate (`dbCa.c:823-828`, `:958-962`, `:1032-1037`): a CPP link adds
             // `CA_DBPROCESS` only when the link-holder's SCAN is Passive. A
             // non-Passive target is reached by its own periodic/event scan, so
@@ -7666,8 +7693,8 @@ impl PvDatabase {
             // targets — only the record directly receiving the dbPut reports
             // PUTF=1 to dbNotify/onChange observers, so we deliberately do NOT
             // set PUTF here.
-            Some(t) => {
-                if visited.holds(&t) {
+            Some((_, t)) => {
+                if visited.holds(t) {
                     return;
                 }
                 let tg = t.read();
@@ -7680,7 +7707,10 @@ impl PvDatabase {
         }
         // recursive CP-target fan-out within one chain —
         // gate already held by the foreign entry record.
-        let _ = self.process_record_with_links_recursive(&target.record, visited);
+        let _ = match &target_rec {
+            Some((name, rec)) => self.process_record_with_links_recursive_at(name, rec, visited),
+            None => self.process_record_with_links_recursive(&target.record, visited),
+        };
     }
 
     /// Process every holder of an EXTERNAL CP/CPP link to `external_pv` —

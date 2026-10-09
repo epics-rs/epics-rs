@@ -51,7 +51,9 @@ pub use record_instance::{
     ProcessCompletion, RecordCell, RecordInstance, RecordMut, RecordRef,
     ambient_write_origin_scope,
 };
-pub(crate) use record_instance::{SimLink, ambient_write_origin, value_as_dbr_string};
+pub(crate) use record_instance::{
+    PreparedLink, PreparedLinks, SimLink, ambient_write_origin, value_as_dbr_string,
+};
 pub use record_trait::{
     AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult, ConstantInitLink,
     CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue, DeadbandCells,

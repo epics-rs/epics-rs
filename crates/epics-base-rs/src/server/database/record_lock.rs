@@ -2891,9 +2891,17 @@ mod tests {
             [1],
             "the arm read the record once, under the frame's single hold"
         );
+        // Both armed ticks (`add_record`'s and this one) take the set from a
+        // callback thread, so whether it is locked says nothing about the
+        // frame. This thread's own take is fresh only if the frame let go.
         let set = rec.lock_record().set();
-        assert!(!set.is_locked(), "the frame released the set");
-        assert_eq!(set.depth.load(Ordering::Relaxed), 0);
-        assert_eq!(set.owner.load(Ordering::Acquire), 0);
+        let hold = rec.lock_record().acquire();
+        assert_eq!(set.owner.load(Ordering::Acquire), thread_key());
+        assert_eq!(
+            set.depth.load(Ordering::Relaxed),
+            1,
+            "the frame released the set"
+        );
+        drop(hold);
     }
 }

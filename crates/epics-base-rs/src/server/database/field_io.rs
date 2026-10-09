@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{PreparedLink, RecordInstance};
 use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
 
@@ -80,11 +81,39 @@ fn check_put_disabled(
 /// [`PvDatabase::put_alarm_ack_from_ca`].
 ///
 /// `field` must already be upper-cased.
-fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -> CaResult<()> {
-    if instance.is_no_mod(field) {
+fn check_no_mod(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+    desc: Option<&'static crate::server::record::FieldDesc>,
+) -> CaResult<()> {
+    if instance.is_no_mod_at(field, desc) {
         return Err(CaError::ReadOnlyField(field.to_string()));
     }
     Ok(())
+}
+
+/// `field`'s declaration from the cell's record type — the table the type
+/// resolved once, not [`Record::field_list`](crate::server::record::Record)'s
+/// per-call type match.
+fn field_desc_at(
+    rec: &crate::server::record::RecordCell,
+    field: &str,
+) -> Option<&'static crate::server::record::FieldDesc> {
+    crate::server::record::record_instance::field_desc_in(rec.rdes().fields, field)
+}
+
+/// The declared-field store of a body that can write a link's text: a
+/// slotted link takes the parse its caller made before the hold.
+fn put_declared(
+    instance: &mut RecordInstance,
+    field: &str,
+    value: EpicsValue,
+    link: &mut Option<PreparedLink>,
+) -> CaResult<()> {
+    match link.take() {
+        Some(link) => instance.put_link_field(link, value),
+        None => instance.put_declared_field(field, value),
+    }
 }
 
 /// [`check_no_mod`] as `dbPut` runs it — the refusal that also SPEAKS.
@@ -116,8 +145,9 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
 fn check_no_mod_in_db_put(
     instance: &crate::server::record::RecordInstance,
     field: &str,
+    desc: Option<&'static crate::server::record::FieldDesc>,
 ) -> CaResult<()> {
-    check_no_mod(instance, field).inspect_err(|_| {
+    check_no_mod(instance, field, desc).inspect_err(|_| {
         crate::server::recgbl::rec_gbl_dbaddr_error(
             "Attempt to modify noMod field",
             &instance.name,
@@ -141,10 +171,10 @@ fn check_no_mod_in_db_put(
 ///
 /// `field` must already be upper-cased.
 fn check_not_link_field(
-    instance: &crate::server::record::RecordInstance,
     field: &str,
+    desc: Option<&'static crate::server::record::FieldDesc>,
 ) -> CaResult<()> {
-    if crate::types::dbf_link_class(instance.record.record_type(), field).is_some() {
+    if desc.and_then(crate::types::link_class_of).is_some() {
         return Err(CaError::BadDbrType(format!(
             "dbPut: {field} is a link field; only dbPutField changes link fields"
         )));
@@ -1390,7 +1420,7 @@ impl PvDatabase {
         // (iocsource.cpp:365-369), so a read-only field on a DISP=1 record
         // reports S_db_noMod, not S_db_putDisabled; the two errors carry
         // different wire text.
-        check_no_mod(&instance, &field_upper)?;
+        check_no_mod(&instance, &field_upper, instance.field_desc(&field_upper))?;
         // DISP=1 blocks a put to any field except DISP itself — the shared
         // gate owner, identical to the one the CA route crosses.
         check_put_disabled(&instance, &field_upper)?;
@@ -1456,228 +1486,245 @@ impl PvDatabase {
         }
 
         // Records — alias-aware (epics-base PR #336).
-        if let Some(rec) = self.get_record(base) {
-            // `base` may be an alias; resolve to the canonical record
-            // name so scan-index updates target the right entry.
-            let canonical_base: String =
-                self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            // The caller holds the advisory write gate (`dbScanLock`
-            // analogue) for `canonical_base` — see `acquire_put_gate`.
-            // It is held to the `return Ok(())` below, and that is the point:
-            // C's `dbScanLock` covers `dbPut` *including*
-            // `dbPutSpecial(paddr, 1)` and the scan-list move, so the tails
-            // below are inside the exclusion window in C and must be inside it
-            // here. Shrinking the window to end at the value write would
-            // re-open exactly the interleaving `lock_records` exists to close
-            // (`record_lock.rs`, "Rust port").
-            // Scoped guard: everything the put commits happens under this
-            // write guard, which ends (releasing the `!Send` parking_lot
-            // guard) before the tails below, which re-enter the database.
-            // Yields the owned outputs those tails consume. Note this is the
-            // record's DATA lock coming down, not the advisory gate above.
-            use crate::server::record::CommonFieldPutResult;
-            // C reads a link-backed field's metadata live inside the rset,
-            // under the TARGET record's lock; every poster below holds THIS
-            // record's lock and cannot reach for a second one. Resolved here,
-            // where no record lock is held, and handed down as a borrowed
-            // value that dies with this body — so a `caput CALC.A` carries the
-            // metadata `INPA`'s target has NOW, not what it had when the
-            // source last processed. Empty after one read lock for every
-            // record type but calc, calcout, sub, aSub and seq.
-            let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
-            let link_backing = link_backing.as_link_backing();
-            let (common_result, special_actions) = {
-                let mut instance = rec.write();
-
-                // C `dbPut` refuses an SPC_NOMOD / SPC_ATTRIBUTE field before it
-                // converts anything (`dbAccess.c:1330-1332`). `put_pv` IS the
-                // `dbPut` analogue — it sits below `dbPutLink`, so this is what
-                // stops a record's OUT link from truncating a waveform's NELM.
-                // The refusal is returned to the caller; `write_out_link_value`
-                // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
-                check_no_mod_in_db_put(&instance, &field)?;
-
-                // C `dbPut` refuses a link-field target the same way, before
-                // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
-                check_not_link_field(&instance, &field)?;
-
-                let request = dbput_request(&*instance.record, &field, value)?;
-
-                // Pre-write special hook (C EPICS dbPutSpecial pass=0).
-                // C `dbPut` runs it on EVERY entry path — dbPutField and
-                // dbPutLink alike (dbAccess.c) — so the OUT-link route
-                // through this body must call it too (motor's drive-field
-                // DMOV blink, motorRecord.cc:2591-2620, fires on put-links
-                // in C). A non-zero status aborts the put like C.
-                instance.record.special(&field, false)?;
-
-                // Capture the pre-put value so the metadata-cache
-                // invalidation (and the downstream `DBE_PROPERTY`
-                // emission) can be skipped when the put is a no-op —
-                // epics-base faac1df1.
-                let prev_value = instance.resolve_field_stored(&field);
-                let old_nord = array_nord_before_put(&instance, &field);
-
-                // Link writes the record's `special()` makes itself (C runs them
-                // inside `dbPut`); executed below, once the record lock is released.
-                let mut special_actions = Vec::new();
-
-                // put_pv is C EPICS dbPut: write value + special/on_put, clear
-                // UDF on a value-field put, and post the field's DBE_VALUE|
-                // DBE_LOG monitor per `dbPut`'s tail (dbAccess.c:1408-1418).
-                // Does NOT trigger processing (that is `dbPutField`'s pp gate,
-                // this port's `put_record_field_from_ca`), so — exactly like a
-                // bare C `dbPut` — a pp(TRUE) value field's post stays
-                // suppressed and its stale UDF *alarm* stands until a process
-                // cycle recomputes stat/sevr.
-                let common_result = match request {
-                    // C `dbAccess.c:1362` converted zero elements — nothing is
-                    // stored and the put is accepted. `alarm` is the scalar arm's
-                    // `:1371` only.
-                    PutRequest::StoreNothing { alarm } => {
-                        if alarm {
-                            set_empty_request_alarm(&mut instance);
-                        }
-                        clear_udf_on_value_put(&mut instance, &field);
-                        CommonFieldPutResult::NoChange
-                    }
-                    PutRequest::Write(value) => {
-                        special_before_put(&mut instance, &field);
-                        match instance.put_declared_field(&field, value.clone()) {
-                            Ok(()) => {
-                                instance.record.on_put(&field);
-                                // C `dbPut` (dbAccess.c:1399-1405) keeps the value
-                                // it already stored but RETURNS the after-put
-                                // `dbPutSpecial(paddr, 1)` status, skipping the
-                                // field's monitor post and (in `dbPutField`) the
-                                // `pp(TRUE)` process. `calcRecord::special` uses
-                                // that to refuse an uncompilable CALC with
-                                // S_db_badField, so the status must not be dropped.
-                                let result = special_after_put(
-                                    self,
-                                    &mut instance,
-                                    &field,
-                                    &mut special_actions,
-                                    link_backing,
-                                )?;
-                                clear_udf_on_value_put(&mut instance, &field);
-                                result
-                            }
-                            Err(CaError::FieldNotFound(_)) => {
-                                instance.put_common_field(&field, value)?
-                            }
-                            // A refused store does NOT skip the pass above:
-                            // C runs it either way (`dbAccess.c:1398`) and lets
-                            // its status win, then `goto done` — the `return`.
-                            Err(e) => {
-                                special_after_put(
-                                    self,
-                                    &mut instance,
-                                    &field,
-                                    &mut special_actions,
-                                    link_backing,
-                                )?;
-                                return Err(e);
-                            }
-                        }
-                    }
-                };
-
-                // C `dbPut` runs `dbPutSpecial(paddr, 1)` regardless of caller entry
-                // path, so a put via this internal route commits/writes the same
-                // `special()`-driven alarm the CA route does. State only — unlike
-                // the CA path these commit the alarm without the STAT/SEVR posts
-                // (C's bare `dbPut` runs no `monitor()`, so it posts no alarm
-                // transition either).
-                //
-                // compress SPC_RESET: `monitor()`'s `recGblResetAlarms` commits the
-                // born-UDF alarm (compressRecord.c:103).
-                if instance.record.special_commits_alarms(&field) {
-                    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-                }
-                // histogram SGNL SPC_MOD: `add_count` raises the inverted-limits
-                // alarm (histogramRecord.c:329-334). The port routes it through
-                // `nsta`/`nsev` (CBUG-F12 refused), so this monitor-less special
-                // path must commit it — check then reset — for the SOFT/INVALID to
-                // be observable, matching the process path.
-                if instance.record.special_checks_alarms(&field) {
-                    let inst = &mut *instance;
-                    inst.record.check_alarms(&mut inst.common);
-                    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
-                }
-
-                // Invalidate metadata cache only if the metadata-class
-                // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
-
-                // C `dbPut:1408-1413`'s field-monitor post, through the one owner
-                // (`dbput_post_put_field`, shared with the CA route). `put_pv`
-                // is the `dbPutLink` route's `dbPut` and the internal driver-put
-                // entry, and C posts DBE_VALUE|DBE_LOG from *every* `dbPut` —
-                // an NPP OUT link writing a calc's A, an autosave restore, a
-                // status pusher, all post immediately. Pre-fix this body posted
-                // nothing at all, so camonitor on anything written via `put_pv`
-                // went silent forever.
-                dbput_post_put_field(&mut instance, &field, link_backing);
-
-                // C's `put_array_info` is likewise reached from every `dbPut` —
-                // an OUT link that shortens a waveform posts NORD in C even when
-                // the link is NPP and the target never processes, and the
-                // value-field post above is suppressed for a waveform (VAL is
-                // `pp(TRUE)`); NORD has no such second path.
-                post_array_info(&mut instance, &old_nord, 0, link_backing);
-
-                (common_result, special_actions)
-            };
-            // No put-notify is armed here: C's restart owner is the cycle
-            // tail (`end_process_cycle`), never the `pact = FALSE` store.
-            // The record DATA lock is now down (scope ended above) before the
-            // scan-index update and the `special()` link writes below, which
-            // re-enter the database (they can process their target). The
-            // advisory gate is still held — see its comment above.
-
-            // Update scan index if SCAN or PHAS changed. Synchronous as of
-            // step 4, so this half of the tail adds no suspension point to the
-            // gate-held window; C reaches `scanDelete`/`scanAdd` from inside
-            // `dbScanLock` the same way.
-            match common_result {
-                CommonFieldPutResult::ScanChanged {
-                    old_scan,
-                    new_scan,
-                    phas,
-                } => {
-                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas);
-                }
-                CommonFieldPutResult::PhasChanged {
-                    scan: s,
-                    old_phas,
-                    new_phas,
-                } => {
-                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas);
-                }
-                CommonFieldPutResult::NoChange => {}
-            }
-
-            // C `dbPut` runs `dbPutSpecial(paddr, 1)` to completion — the
-            // `dbPutLink` calls a `special()` makes included — before it returns
-            // to `dbPutField`. This is the last statement of the `dbPut`
-            // analogue, so it is that point.
-            self.run_special_actions(&canonical_base, &rec, special_actions);
-
-            // mirror the CA-write path's ASG-field notifier so
-            // restore scripts / autosave / admin tools that go via
-            // `put_pv` (not `put_record_field_from_ca`) also trigger
-            // per-client `reeval_access_rights`. C `dbAccess.c::
-            // dbPutSpecial` invokes the SPC_AS callback from dbPut
-            // regardless of caller entry path.
-            if field == "ASG" {
-                crate::server::access_security::notify_asg_field_changed();
-            }
-
-            return Ok(());
+        if let Some((canonical, rec)) = self.lookup_record(base) {
+            let desc = field_desc_at(&rec, &field);
+            return self.put_record_body(&canonical, &rec, &field, desc, value);
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// [`Self::put_pv_body`] for a record already resolved — C's `dbPut` on a
+    /// `dbAddr`, which `dbDbPutValue` reaches with no name work. `field` is
+    /// upper-case; `canonical` is `rec`'s registered name, taken before
+    /// the hold so the body allocates none under it. The gate contract is
+    /// `put_pv_already_locked`'s.
+    pub(super) fn put_record_body(
+        &self,
+        canonical: &str,
+        rec: &std::sync::Arc<crate::server::record::RecordCell>,
+        field: &str,
+        desc: Option<&'static crate::server::record::FieldDesc>,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        // The caller holds the advisory write gate (`dbScanLock`
+        // analogue) for `canonical_base` — see `acquire_put_gate`.
+        // It is held to the `return Ok(())` below, and that is the point:
+        // C's `dbScanLock` covers `dbPut` *including*
+        // `dbPutSpecial(paddr, 1)` and the scan-list move, so the tails
+        // below are inside the exclusion window in C and must be inside it
+        // here. Shrinking the window to end at the value write would
+        // re-open exactly the interleaving `lock_records` exists to close
+        // (`record_lock.rs`, "Rust port").
+        // Scoped guard: everything the put commits happens under this
+        // write guard, which ends (releasing the `!Send` parking_lot
+        // guard) before the tails below, which re-enter the database.
+        // Yields the owned outputs those tails consume. Note this is the
+        // record's DATA lock coming down, not the advisory gate above.
+        use crate::server::record::CommonFieldPutResult;
+        // C reads a link-backed field's metadata live inside the rset,
+        // under the TARGET record's lock; every poster below holds THIS
+        // record's lock and cannot reach for a second one. Resolved here,
+        // where no record lock is held, and handed down as a borrowed
+        // value that dies with this body — so a `caput CALC.A` carries the
+        // metadata `INPA`'s target has NOW, not what it had when the
+        // source last processed. Empty after one read lock for every
+        // record type but calc, calcout, sub, aSub and seq.
+        let link_backing = self.resolve_link_backed_metadata_for_posts(rec);
+        let link_backing = link_backing.as_link_backing();
+        let (common_result, special_actions) = {
+            let mut instance = rec.write();
+
+            // C `dbPut` refuses an SPC_NOMOD / SPC_ATTRIBUTE field before it
+            // converts anything (`dbAccess.c:1330-1332`). `put_pv` IS the
+            // `dbPut` analogue — it sits below `dbPutLink`, so this is what
+            // stops a record's OUT link from truncating a waveform's NELM.
+            // The refusal is returned to the caller; `write_out_link_value`
+            // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
+            check_no_mod_in_db_put(&instance, field, desc)?;
+
+            // C `dbPut` refuses a link-field target the same way, before
+            // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
+            check_not_link_field(field, desc)?;
+
+            let request = dbput_request(&*instance.record, field, value)?;
+
+            // Pre-write special hook (C EPICS dbPutSpecial pass=0).
+            // C `dbPut` runs it on EVERY entry path — dbPutField and
+            // dbPutLink alike (dbAccess.c) — so the OUT-link route
+            // through this body must call it too (motor's drive-field
+            // DMOV blink, motorRecord.cc:2591-2620, fires on put-links
+            // in C). A non-zero status aborts the put like C.
+            instance.record.special(field, false)?;
+
+            // Capture the pre-put value so the metadata-cache
+            // invalidation (and the downstream `DBE_PROPERTY`
+            // emission) can be skipped when the put is a no-op —
+            // epics-base faac1df1.
+            let prev_value = instance.resolve_field_stored_at(field, desc);
+            let old_nord = array_nord_before_put(&instance, field);
+
+            // Link writes the record's `special()` makes itself (C runs them
+            // inside `dbPut`); executed below, once the record lock is released.
+            let mut special_actions = Vec::new();
+
+            // put_pv is C EPICS dbPut: write value + special/on_put, clear
+            // UDF on a value-field put, and post the field's DBE_VALUE|
+            // DBE_LOG monitor per `dbPut`'s tail (dbAccess.c:1408-1418).
+            // Does NOT trigger processing (that is `dbPutField`'s pp gate,
+            // this port's `put_record_field_from_ca`), so — exactly like a
+            // bare C `dbPut` — a pp(TRUE) value field's post stays
+            // suppressed and its stale UDF *alarm* stands until a process
+            // cycle recomputes stat/sevr.
+            let common_result = match request {
+                // C `dbAccess.c:1362` converted zero elements — nothing is
+                // stored and the put is accepted. `alarm` is the scalar arm's
+                // `:1371` only.
+                PutRequest::StoreNothing { alarm } => {
+                    if alarm {
+                        set_empty_request_alarm(&mut instance);
+                    }
+                    clear_udf_on_value_put(&mut instance, field);
+                    CommonFieldPutResult::NoChange
+                }
+                PutRequest::Write(value) => {
+                    special_before_put(&mut instance, field);
+                    match instance.put_declared_field(field, value.clone()) {
+                        Ok(()) => {
+                            instance.record.on_put(field);
+                            // C `dbPut` (dbAccess.c:1399-1405) keeps the value
+                            // it already stored but RETURNS the after-put
+                            // `dbPutSpecial(paddr, 1)` status, skipping the
+                            // field's monitor post and (in `dbPutField`) the
+                            // `pp(TRUE)` process. `calcRecord::special` uses
+                            // that to refuse an uncompilable CALC with
+                            // S_db_badField, so the status must not be dropped.
+                            let result = special_after_put(
+                                self,
+                                &mut instance,
+                                field,
+                                &mut special_actions,
+                                link_backing,
+                            )?;
+                            clear_udf_on_value_put(&mut instance, field);
+                            result
+                        }
+                        Err(CaError::FieldNotFound(_)) => {
+                            instance.put_common_field(field, value)?
+                        }
+                        // A refused store does NOT skip the pass above:
+                        // C runs it either way (`dbAccess.c:1398`) and lets
+                        // its status win, then `goto done` — the `return`.
+                        Err(e) => {
+                            special_after_put(
+                                self,
+                                &mut instance,
+                                field,
+                                &mut special_actions,
+                                link_backing,
+                            )?;
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+
+            // C `dbPut` runs `dbPutSpecial(paddr, 1)` regardless of caller entry
+            // path, so a put via this internal route commits/writes the same
+            // `special()`-driven alarm the CA route does. State only — unlike
+            // the CA path these commit the alarm without the STAT/SEVR posts
+            // (C's bare `dbPut` runs no `monitor()`, so it posts no alarm
+            // transition either).
+            //
+            // compress SPC_RESET: `monitor()`'s `recGblResetAlarms` commits the
+            // born-UDF alarm (compressRecord.c:103).
+            if instance.record.special_commits_alarms(field) {
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+            }
+            // histogram SGNL SPC_MOD: `add_count` raises the inverted-limits
+            // alarm (histogramRecord.c:329-334). The port routes it through
+            // `nsta`/`nsev` (CBUG-F12 refused), so this monitor-less special
+            // path must commit it — check then reset — for the SOFT/INVALID to
+            // be observable, matching the process path.
+            if instance.record.special_checks_alarms(field) {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
+            }
+
+            // Invalidate metadata cache only if the metadata-class
+            // field's value actually changed (faac1df1).
+            instance.notify_field_written_if_changed_at(
+                field,
+                desc,
+                prev_value.as_ref(),
+                link_backing,
+            );
+
+            // C `dbPut:1408-1413`'s field-monitor post, through the one owner
+            // (`dbput_post_put_field`, shared with the CA route). `put_pv`
+            // is the `dbPutLink` route's `dbPut` and the internal driver-put
+            // entry, and C posts DBE_VALUE|DBE_LOG from *every* `dbPut` —
+            // an NPP OUT link writing a calc's A, an autosave restore, a
+            // status pusher, all post immediately. Pre-fix this body posted
+            // nothing at all, so camonitor on anything written via `put_pv`
+            // went silent forever.
+            dbput_post_put_field(&mut instance, field, link_backing);
+
+            // C's `put_array_info` is likewise reached from every `dbPut` —
+            // an OUT link that shortens a waveform posts NORD in C even when
+            // the link is NPP and the target never processes, and the
+            // value-field post above is suppressed for a waveform (VAL is
+            // `pp(TRUE)`); NORD has no such second path.
+            post_array_info(&mut instance, &old_nord, 0, link_backing);
+
+            (common_result, special_actions)
+        };
+        // No put-notify is armed here: C's restart owner is the cycle
+        // tail (`end_process_cycle`), never the `pact = FALSE` store.
+        // The record DATA lock is now down (scope ended above) before the
+        // scan-index update and the `special()` link writes below, which
+        // re-enter the database (they can process their target). The
+        // advisory gate is still held — see its comment above.
+
+        // Update scan index if SCAN or PHAS changed. Synchronous as of
+        // step 4, so this half of the tail adds no suspension point to the
+        // gate-held window; C reaches `scanDelete`/`scanAdd` from inside
+        // `dbScanLock` the same way.
+        match common_result {
+            CommonFieldPutResult::ScanChanged {
+                old_scan,
+                new_scan,
+                phas,
+            } => {
+                self.update_scan_index(canonical, old_scan, new_scan, phas, phas);
+            }
+            CommonFieldPutResult::PhasChanged {
+                scan: s,
+                old_phas,
+                new_phas,
+            } => {
+                self.update_scan_index(canonical, s, s, old_phas, new_phas);
+            }
+            CommonFieldPutResult::NoChange => {}
+        }
+
+        // C `dbPut` runs `dbPutSpecial(paddr, 1)` to completion — the
+        // `dbPutLink` calls a `special()` makes included — before it returns
+        // to `dbPutField`. This is the last statement of the `dbPut`
+        // analogue, so it is that point.
+        self.run_special_actions(canonical, rec, special_actions);
+
+        // mirror the CA-write path's ASG-field notifier so
+        // restore scripts / autosave / admin tools that go via
+        // `put_pv` (not `put_record_field_from_ca`) also trigger
+        // per-client `reeval_access_rights`. C `dbAccess.c::
+        // dbPutSpecial` invokes the SPC_AS callback from dbPut
+        // regardless of caller entry path.
+        if field == "ASG" {
+            crate::server::access_security::notify_asg_field_changed();
+        }
+        Ok(())
     }
 
     /// Write a value and post monitor events if changed.
@@ -1842,8 +1889,9 @@ impl PvDatabase {
 
                 // Same `dbPut` gate as `put_pv` — this is the third `dbPut` body
                 // (value + monitor post), and C has ONE.
-                check_no_mod_in_db_put(&instance, &field)?;
-                check_not_link_field(&instance, &field)?;
+                let desc = field_desc_at(&rec, &field);
+                check_no_mod_in_db_put(&instance, &field, desc)?;
+                check_not_link_field(&field, desc)?;
 
                 let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -1852,7 +1900,7 @@ impl PvDatabase {
                 // `dbPut` body and must match the other two.
                 instance.record.special(&field, false)?;
 
-                let old_value = instance.resolve_field_stored(&field);
+                let old_value = instance.resolve_field_stored_at(&field, desc);
                 let old_stat = instance.common.stat;
                 let old_sevr = instance.common.sevr;
                 let old_nord = array_nord_before_put(&instance, &field);
@@ -1915,7 +1963,12 @@ impl PvDatabase {
                 // Invalidate metadata cache only if a metadata-class
                 // field actually changed value (faac1df1 — DBE_PROPERTY
                 // fires on real changes, not no-op writes).
-                instance.notify_field_written_if_changed(&field, old_value.as_ref(), link_backing);
+                instance.notify_field_written_if_changed_at(
+                    &field,
+                    desc,
+                    old_value.as_ref(),
+                    link_backing,
+                );
 
                 // Post monitor events if value or alarm changed. Read
                 // through the SAME reader the pre-value came from: a field
@@ -2653,8 +2706,9 @@ impl PvDatabase {
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route
             // ([`check_no_mod_in_db_put`]).
-            check_no_mod_in_db_put(&instance, &field)?;
+            check_no_mod_in_db_put(&instance, &field, instance.field_desc(&field))?;
         }
+        let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
         // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
         // relinks the record's lock set, and its parse/`dbCanSetLink` refusals
         // return before it does. Taken out below them, so a refused put never
@@ -2957,7 +3011,7 @@ impl PvDatabase {
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        match instance.put_declared_field(&field, value.clone()) {
+                        match put_declared(&mut instance, &field, value.clone(), &mut link) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
                                 // C returns the after-put special() status from
@@ -3438,8 +3492,9 @@ impl PvDatabase {
                 // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
                 // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
                 // IPTR) restorable, and dbCommon's with them.
-                check_no_mod_in_db_put(&instance, &field)?;
+                check_no_mod_in_db_put(&instance, &field, instance.field_desc(&field))?;
             }
+            let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
             // field relinks the record's lock set, inside the gate window
             // above, which holds both sets the relink moves between. Below
@@ -3503,7 +3558,7 @@ impl PvDatabase {
                         value,
                     ) {
                         Ok(crate::types::c_parse::Converted::Stored(v)) => {
-                            match instance.put_declared_field(&field, v.clone()) {
+                            match put_declared(&mut instance, &field, v.clone(), &mut link) {
                                 Ok(()) => None,
                                 Err(CaError::FieldNotFound(_)) => {
                                     instance.put_common_field(&field, v)?;
@@ -3526,7 +3581,7 @@ impl PvDatabase {
                             &field,
                             value,
                         );
-                        match instance.put_declared_field(&field, value.clone()) {
+                        match put_declared(&mut instance, &field, value.clone(), &mut link) {
                             Ok(()) => None,
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?;

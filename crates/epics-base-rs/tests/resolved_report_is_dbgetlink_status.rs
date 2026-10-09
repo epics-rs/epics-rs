@@ -97,7 +97,10 @@ impl Record for LinkProbe {
 }
 
 static LINK_PROBE_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("LNK", epics_base_rs::types::DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Inlink,
+        ..FieldDesc::new("LNK", epics_base_rs::types::DbFieldType::String, false)
+    },
     FieldDesc::new("VAL", epics_base_rs::types::DbFieldType::Double, false),
 ];
 
@@ -110,6 +113,9 @@ async fn cycle(lnk: &str) -> (bool, f64, AlarmSeverity) {
 /// [`cycle`] with the probe reading `LNK` on the path `via_multi_input` picks.
 async fn cycle_via(lnk: &str, via_multi_input: bool) -> (bool, f64, AlarmSeverity) {
     let db = PvDatabase::new();
+    // The registry `LinkSlots::of` reads: `add_record` takes an instance and
+    // no factory, so nothing else declares the probe's `LNK` a link.
+    epics_base_rs::server::record::register_declared_fields("link_probe", LINK_PROBE_FIELDS);
     db.add_record(
         "SRC",
         Box::new(LinkProbe {

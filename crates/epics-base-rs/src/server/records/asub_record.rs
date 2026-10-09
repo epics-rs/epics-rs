@@ -101,8 +101,9 @@ pub struct ASubRecord {
     pub oval: i32,
     pub snam: PvString,
     pub inam: PvString,
-    /// Input links `INPA..INPU`.
-    pub inp: [String; NUM_ARGS],
+    /// Input links `INPA..INPU`. Private with `fta`: [`Self::put_field`] is
+    /// their one writer, and it moves `links_generation`.
+    inp: [String; NUM_ARGS],
     /// Input values `A..U` — native typed via `fta`.
     pub a: [EpicsValue; NUM_ARGS],
     /// Output values `VALA..VALU` — native typed via `ftva`.
@@ -110,7 +111,7 @@ pub struct ASubRecord {
     /// Output links `OUTA..OUTU`.
     pub out: [String; NUM_ARGS],
     /// Input element-type menu `FTA..FTU` (`menuFtype`).
-    pub fta: [i16; NUM_ARGS],
+    fta: [i16; NUM_ARGS],
     /// Output element-type menu `FTVA..FTVU` (`menuFtype`).
     pub ftva: [i16; NUM_ARGS],
     /// Input max-element counts `NOA..NOU`.
@@ -157,6 +158,9 @@ pub struct ASubRecord {
     /// that has never processed starts non-zero — no outputs before the first
     /// successful `do_sub`.
     sub_status: i64,
+    /// [`Record::input_links_generation`]: moved on by every write of an
+    /// `INPx` text or of the `FTx` that [`Record::input_link_request`] reads.
+    links_generation: u64,
 }
 
 /// `OUTA..OUTU` -> `VALA..VALU`, the pairs C's push loop walks
@@ -202,6 +206,7 @@ impl Default for ASubRecord {
             // Never processed: C's `status` is only 0 after a `do_sub` that
             // returned 0, so nothing is driven out before then.
             sub_status: SUBROUTINE_NOT_RUN,
+            links_generation: 0,
         }
     }
 }
@@ -611,6 +616,7 @@ impl Record for ASubRecord {
                 };
                 if prefix == "INP" {
                     self.inp[idx] = s;
+                    self.links_generation += 1;
                 } else {
                     self.out[idx] = s;
                 }
@@ -648,6 +654,7 @@ impl Record for ASubRecord {
                     // re-deriving the cell here is that allocation.
                     "FT" => {
                         self.fta[idx] = channel_ftype(v as i16).index();
+                        self.links_generation += 1;
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
                         self.nea[idx] = self.noa[idx].max(1);
                     }
@@ -815,6 +822,10 @@ impl Record for ASubRecord {
         false
     }
 
+    fn input_links_generation(&self) -> Option<u64> {
+        Some(self.links_generation)
+    }
+
     fn input_link_read_as_from_source(
         &self,
         _link_field: &str,
@@ -916,6 +927,46 @@ mod tests {
         );
         // NEC tracks elements used.
         assert_eq!(rec.get_field("NEC"), Some(EpicsValue::Long(3)));
+    }
+
+    /// The contract of [`Record::input_links_generation`]: while it stands
+    /// still, no `INPx` text and no `input_link_request` answer has moved.
+    #[test]
+    fn the_links_generation_moves_with_every_text_and_request() {
+        let answers = |rec: &ASubRecord| {
+            rec.multi_input_links()
+                .iter()
+                .map(|&(link, _)| {
+                    (
+                        rec.link_text_ref(link).map(str::to_owned),
+                        rec.input_link_request(link),
+                        rec.input_link_failure_is_inert(link),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut rec = ASubRecord::default();
+        let steps: [(&str, EpicsValue); 8] = [
+            ("INPA", EpicsValue::String("SRC".into())),
+            ("FTA", EpicsValue::Short(0)),
+            ("NOA", EpicsValue::Long(4)),
+            ("A", EpicsValue::String("x".into())),
+            ("FTVB", EpicsValue::Short(0)),
+            ("OUTB", EpicsValue::String("DST".into())),
+            ("FTA", EpicsValue::Short(10)),
+            ("INPU", EpicsValue::String("".into())),
+        ];
+        let mut moved = 0;
+        for (field, value) in steps {
+            let (before, generation) = (answers(&rec), rec.input_links_generation());
+            rec.put_field(field, value).unwrap();
+            if rec.input_links_generation() == generation {
+                assert_eq!(answers(&rec), before, "{field} changed an answer in place");
+            } else {
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, 4, "every INPx and FTx put moves the generation");
     }
 
     /// FTx/NOx declare the input cell — C `initFields` (aSubRecord.c:176-198)

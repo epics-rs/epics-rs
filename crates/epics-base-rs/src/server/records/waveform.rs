@@ -750,6 +750,30 @@ impl Record for WaveformRecord {
         false
     }
 
+    /// The served `VAL` of [`Self::get_field`], borrowed. A `STRING` FTVL has
+    /// no view and falls back to the clone.
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        use crate::server::record::ValueView;
+        fn served<T>(a: &[T], n: usize) -> &[T] {
+            &a[..n.min(a.len())]
+        }
+        let n = self.served_element_count();
+        Some(match &self.val {
+            EpicsValue::DoubleArray(a) => ValueView::Double(served(a, n)),
+            EpicsValue::FloatArray(a) => ValueView::Float(served(a, n)),
+            EpicsValue::LongArray(a) => ValueView::Long(served(a, n)),
+            EpicsValue::ULongArray(a) => ValueView::ULong(served(a, n)),
+            EpicsValue::Int64Array(a) => ValueView::Int64(served(a, n)),
+            EpicsValue::UInt64Array(a) => ValueView::UInt64(served(a, n)),
+            EpicsValue::ShortArray(a) => ValueView::Short(served(a, n)),
+            EpicsValue::UShortArray(a) => ValueView::UShort(served(a, n)),
+            EpicsValue::CharArray(a) => ValueView::Char(served(a, n)),
+            EpicsValue::UCharArray(a) => ValueView::UChar(served(a, n)),
+            EpicsValue::EnumArray(a) => ValueView::Enum(served(a, n)),
+            _ => return None,
+        })
+    }
+
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::PRE_INPUT
     }
@@ -2246,6 +2270,54 @@ mod array_kind_tests {
     /// into VAL with NORD set to the actual copied length. Source
     /// shorter than INDX → NORD=0. INDX+NELM > source.len → only
     /// available tail is copied, rest zero-padded to NELM.
+    /// The lent VAL is the one `get_field` serves, NORD-capped and empty while
+    /// undefined, for every numeric FTVL.
+    #[test]
+    fn monitor_value_view_lends_the_served_val() {
+        use crate::server::record::ValueView;
+        fn owned(view: ValueView<'_>) -> EpicsValue {
+            match view {
+                ValueView::Double(a) => EpicsValue::DoubleArray(a.to_vec().into()),
+                ValueView::Float(a) => EpicsValue::FloatArray(a.to_vec().into()),
+                ValueView::Long(a) => EpicsValue::LongArray(a.to_vec().into()),
+                ValueView::ULong(a) => EpicsValue::ULongArray(a.to_vec().into()),
+                ValueView::Int64(a) => EpicsValue::Int64Array(a.to_vec().into()),
+                ValueView::UInt64(a) => EpicsValue::UInt64Array(a.to_vec().into()),
+                ValueView::Short(a) => EpicsValue::ShortArray(a.to_vec().into()),
+                ValueView::UShort(a) => EpicsValue::UShortArray(a.to_vec().into()),
+                ValueView::Char(a) => EpicsValue::CharArray(a.to_vec().into()),
+                ValueView::UChar(a) => EpicsValue::UCharArray(a.to_vec().into()),
+                ValueView::Enum(a) => EpicsValue::EnumArray(a.to_vec().into()),
+                ValueView::Scalar(v) => v.into(),
+            }
+        }
+        for ty in [
+            DbFieldType::Double,
+            DbFieldType::Float,
+            DbFieldType::Long,
+            DbFieldType::ULong,
+            DbFieldType::Int64,
+            DbFieldType::UInt64,
+            DbFieldType::Short,
+            DbFieldType::UShort,
+            DbFieldType::Char,
+            DbFieldType::UChar,
+            DbFieldType::Enum,
+        ] {
+            let mut r = WaveformRecord::new(4, ty);
+            for source in [None, Some(vec![3.0, 1.0, 2.0])] {
+                if let Some(source) = source {
+                    r.set_val(EpicsValue::DoubleArray(source.into())).unwrap();
+                }
+                let view = r.monitor_value_view().expect("numeric FTVL lends VAL");
+                assert_eq!(Some(owned(view)), r.get_field("VAL"), "{ty:?}");
+                assert_eq!(r.monitor_deadband_value(), None, "{ty:?}");
+            }
+        }
+        let string = WaveformRecord::new(4, DbFieldType::String);
+        assert!(string.monitor_value_view().is_none());
+    }
+
     #[test]
     fn subarray_slices_input_at_indx_with_nelm_take() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);

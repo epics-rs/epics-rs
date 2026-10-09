@@ -636,9 +636,11 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
         }
     }
     // One-shot, armed by any reason and cleared only by its owner
-    // (`run_registered_subroutine`): OR-ed in, so a failed `fetch_values`
-    // that armed it before this hook still skips the run.
-    instance.suppress_subroutine_run |= ds.skip_run;
+    // (`run_registered_subroutine`): armed, never cleared here, so a failed
+    // `fetch_values` that armed it before this hook still skips the run.
+    if ds.skip_run {
+        instance.skip_subroutine_this_cycle();
+    }
 }
 
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
@@ -1879,6 +1881,16 @@ struct LinkInputs {
     inp_source_utag: Option<u64>,
     inp_link_remote_time: Option<(i64, i32, u64)>,
     resolved_link_fields: Vec<&'static str>,
+    /// The `sel` NVL read as the index `SELN` takes (C `dbGetLink(&nvl,
+    /// DBR_USHORT, &seln)`), kept apart from [`RareInputs`] so a `sel` cycle
+    /// does not allocate one for a `u16`.
+    sel_seln: Option<u16>,
+    /// The closed-loop DOL read, with its OIF; `None` when the cycle read no
+    /// DOL. Inline, since every `ao`/`bo`/`dfanout` cycle carries one.
+    dol_fetch: Option<crate::server::recgbl::simm::LinkFetch>,
+    dol_oif: i16,
+    /// C's `if (status)` on the DOL read — kept past `dol_fetch`'s `take`.
+    dol_read_failed: bool,
     link_alarms: Vec<(
         crate::server::record::MonitorSwitch,
         super::links::LinkAlarm,
@@ -1891,10 +1903,6 @@ struct LinkInputs {
 
 /// See [`LinkInputs::rare`].
 struct RareInputs {
-    dol_info: Option<(crate::server::record::ParsedLink, i16)>,
-    dol_fetch: Option<crate::server::recgbl::simm::LinkFetch>,
-    dol_read_failed: bool,
-    sel_nvl_value: Option<EpicsValue>,
     string_input_values: Vec<(String, EpicsValue)>,
     asub_dynamic: Option<AsubDynamicSub>,
 }
@@ -1921,6 +1929,10 @@ impl LinkInputs {
             inp_source_utag: None,
             inp_link_remote_time: None,
             rare: None,
+            sel_seln: None,
+            dol_fetch: None,
+            dol_oif: 0,
+            dol_read_failed: false,
             resolved_link_fields: Vec::new(),
             link_alarms: Vec::new(),
         }
@@ -3568,18 +3580,7 @@ impl PvDatabase {
                     .and_then(|v| v.to_menu_index())
                     .unwrap_or(0);
                 if omsl == 1 {
-                    let dol_parsed = instance
-                        .record
-                        .get_field("DOL")
-                        .and_then(|v| {
-                            if let EpicsValue::String(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|s| crate::server::record::parse_link_v2(s.as_str_lossy().as_ref()))
-                        .unwrap_or(crate::server::record::ParsedLink::None);
+                    let dol_parsed = instance.record_link("DOL").clone();
                     // C `!dbLinkIsConstant(&prec->dol)` gates the per-cycle
                     // DOL fetch in every OMSL record (e.g.
                     // `aoRecord.c:181`, `boRecord.c:192`,
@@ -3589,7 +3590,7 @@ impl PvDatabase {
                     // VAL is not clobbered every cycle. Only a real
                     // (DB/CA/PVA) link is fetched here. The per-record init
                     // application lives in each record's `init_record`.
-                    if matches!(dol_parsed, crate::server::record::ParsedLink::Constant(_)) {
+                    if matches!(*dol_parsed, crate::server::record::ParsedLink::Constant(_)) {
                         None
                     } else {
                         Some((dol_parsed, oif))
@@ -3597,6 +3598,22 @@ impl PvDatabase {
                 } else {
                     None
                 }
+            } else {
+                None
+            };
+
+            // C reads NVL ONLY in `Specified` mode: the `dbGetLink(&nvl,
+            // ...)` at `selRecord.c:423` sits inside `if (prec->selm ==
+            // selSELM_Specified)` and the all-inputs loop below it never
+            // touches the link. So in High/Low/Median a dead NVL processes
+            // no PP source and raises no `setLinkAlarm`, and SELN keeps
+            // its value.
+            let sel_nvl_link = if plan.sel_nvl
+                && instance.record.record_type() == "sel"
+                && matches!(instance.record.get_field("SELM"), Some(EpicsValue::Enum(0)))
+            {
+                let link = instance.record_link("NVL").clone();
+                (!matches!(*link, crate::server::record::ParsedLink::None)).then_some(link)
             } else {
                 None
             };
@@ -3671,18 +3688,25 @@ impl PvDatabase {
                     wants_source_time,
                     dol,
                     pre_input_actions,
+                    sel_nvl_link,
                 ))
             }
         };
-        let (inp, inp_request, is_soft, wants_source_time, dol_info, pre_input_actions) =
-            match shape {
-                Ok(general) => general,
-                Err(is_soft) => {
-                    let resolved =
-                        self.fetch_own_native_inputs(guard, plan, input_link_texts, visited);
-                    return InputStage::none(is_soft, resolved);
-                }
-            };
+        let (
+            inp,
+            inp_request,
+            is_soft,
+            wants_source_time,
+            dol_info,
+            pre_input_actions,
+            sel_nvl_link,
+        ) = match shape {
+            Ok(general) => general,
+            Err(is_soft) => {
+                let resolved = self.fetch_own_native_inputs(guard, plan, input_link_texts, visited);
+                return InputStage::none(is_soft, resolved);
+            }
+        };
         // The reads between here and the multi-input loop — pre-input
         // actions, INP, DOL, NVL — go through the by-name link readers, which
         // take the record's lock themselves; the loop takes the guard back.
@@ -3715,11 +3739,16 @@ impl PvDatabase {
         // post monitors and fire the forward link, every cycle, with no alarm.
         let mut pre_input_resolved: Vec<&'static str> = Vec::new();
         {
-            if !pre_input_actions.is_empty() {
+            let is_read = |a: &crate::server::record::ProcessAction| {
+                matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
+            };
+            if !pre_input_actions.is_empty() && pre_input_actions.iter().all(is_read) {
+                // Nothing to split off: the list is its own `reads`.
+                pre_input_resolved =
+                    self.execute_read_db_links(name, rec, &pre_input_actions, visited);
+            } else if !pre_input_actions.is_empty() {
                 let (reads, others): (Vec<_>, Vec<_>) =
-                    pre_input_actions.into_iter().partition(|a| {
-                        matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
-                    });
+                    pre_input_actions.into_iter().partition(is_read);
                 if !reads.is_empty() {
                     pre_input_resolved = self.execute_read_db_links(name, rec, &reads, visited);
                 }
@@ -3885,41 +3914,13 @@ impl PvDatabase {
         let sel_nvl_value: Option<EpicsValue> = if !plan.sel_nvl {
             None
         } else {
-            // Extract the NVL link spec under a scoped read guard, releasing it
-            // (the parking_lot guard is !Send) before the async input fetch.
-            let nvl_str = {
-                let instance = rec.read();
-                // C reads NVL ONLY in `Specified` mode: the `dbGetLink(&nvl,
-                // ...)` at `selRecord.c:423` sits inside `if (prec->selm ==
-                // selSELM_Specified)` and the all-inputs loop below it never
-                // touches the link. So in High/Low/Median a dead NVL processes
-                // no PP source and raises no `setLinkAlarm`, and SELN keeps
-                // its value.
-                if instance.record.record_type() == "sel"
-                    && matches!(instance.record.get_field("SELM"), Some(EpicsValue::Enum(0)))
-                {
-                    instance
-                        .record
-                        .get_field("NVL")
-                        .and_then(|v| {
-                            if let EpicsValue::String(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Default::default()
+            match sel_nvl_link {
+                Some(parsed) => {
+                    let fetch = self.db_get_input_link_in(rec, "NVL", &parsed, visited);
+                    sel_nvl_read_failed = !fetch.is_ok();
+                    fetch.value()
                 }
-            };
-            if !nvl_str.is_empty() {
-                let parsed = crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
-                let fetch = self.db_get_input_link_in(rec, "NVL", &parsed, visited);
-                sel_nvl_read_failed = !fetch.is_ok();
-                fetch.value()
-            } else {
-                None
+                None => None,
             }
         };
         // Selector index for `select_input_links`: the freshly-resolved NVL
@@ -3927,6 +3928,22 @@ impl PvDatabase {
         // record's current SELN).
         let sel_selector: Option<u16> = sel_nvl_value
             .as_ref()
+            .and_then(|v| v.get_convert_f64())
+            .map(|f| f as u16);
+        // What the cycle applies to SELN. SELN is DBF_USHORT
+        // (selRecord.dbd.pod:295), an unsigned 0..65535 index: the native
+        // unsigned value is carried so a link value in 32768..65535 is not
+        // lost to f64->i16 saturation. C reads NVL with `dbGetLink(...,
+        // DBR_USHORT, &pse->seln, 0, 0)` (selRecord.c), a one-element
+        // destination, so an array-valued source contributes its element 0.
+        let sel_seln: Option<u16> = sel_nvl_value
+            .and_then(|v| {
+                if v.is_array() {
+                    v.first_element()
+                } else {
+                    Some(v)
+                }
+            })
             .and_then(|v| v.get_convert_f64())
             .map(|f| f as u16);
 
@@ -4169,19 +4186,13 @@ impl PvDatabase {
                 inp_source_utag,
                 inp_link_remote_time,
                 resolved_link_fields,
+                sel_seln,
+                dol_oif: dol_info.as_ref().map_or(0, |(_, oif)| *oif),
+                dol_fetch,
+                dol_read_failed,
                 link_alarms,
-                rare: (dol_info.is_some()
-                    || dol_fetch.is_some()
-                    || dol_read_failed
-                    || sel_nvl_value.is_some()
-                    || !string_input_values.is_empty()
-                    || asub_dynamic.is_some())
-                .then(|| {
+                rare: (!string_input_values.is_empty() || asub_dynamic.is_some()).then(|| {
                     Box::new(RareInputs {
-                        dol_info,
-                        dol_fetch,
-                        dol_read_failed,
-                        sel_nvl_value,
                         string_input_values,
                         asub_dynamic,
                     })
@@ -4744,25 +4755,15 @@ impl PvDatabase {
                     stage.take_inp_value()
                 };
                 let links = if stage_known { None } else { stage.links_mut() };
-                let dol_fetch = links
-                    .as_ref()
-                    .and_then(|l| l.rare.as_ref())
-                    .and_then(|r| r.dol_fetch.as_ref());
+                let dol_fetch = links.as_ref().and_then(|l| l.dol_fetch.as_ref());
                 if let Some(crate::server::recgbl::simm::LinkFetch::Failed) = dol_fetch {
                     instance.record.closed_loop_dol_read_failed();
                 }
                 let mut links = links;
-                if let Some(crate::server::recgbl::simm::LinkFetch::Value(dol_val)) = links
-                    .as_mut()
-                    .and_then(|l| l.rare.as_mut())
-                    .and_then(|r| r.dol_fetch.take())
+                if let Some(crate::server::recgbl::simm::LinkFetch::Value(dol_val)) =
+                    links.as_mut().and_then(|l| l.dol_fetch.take())
                 {
-                    let oif = links
-                        .as_ref()
-                        .and_then(|l| l.rare.as_ref())
-                        .and_then(|r| r.dol_info.as_ref())
-                        .map(|(_, oif)| *oif)
-                        .unwrap_or(0);
+                    let oif = links.as_ref().map_or(0, |l| l.dol_oif);
                     if oif == 1 {
                         // Incremental: C `fetch_value` (aoRecord.c:447-455) sets
                         // `prec->val = prec->pval` first ("don't allow dbputs to
@@ -4943,40 +4944,12 @@ impl PvDatabase {
                 // AA..LL never populated and the record calculated on an empty
                 // array. The view is `get_convert_f64`, C's DBR_DOUBLE get row,
                 // not `to_f64`: the two disagree on an empty DBF_STRING source.
-                let (sel_nvl_value, string_input_values) = match links.and_then(|l| l.rare.as_mut())
-                {
-                    Some(r) => (
-                        r.sel_nvl_value.take(),
-                        Some(std::mem::take(&mut r.string_input_values)),
-                    ),
-                    None => (None, None),
-                };
-
-                // The set_resolved_input_links report is deferred until after
-                // the pre-process ReadDbLink reads below, so the record sees
-                // ONE per-cycle resolution list covering both fetch paths —
-                // records reset per-cycle resolution state in that hook, so
-                // it must not run twice with partial lists.
-
-                // Apply sel NVL -> SELN. SELN is DBF_USHORT (selRecord.dbd.pod:295),
-                // an unsigned 0..65535 index. Carry the native unsigned value so a
-                // link value in 32768..65535 is not lost to f64->i16 saturation
-                // before it reaches the field's put.
-                if let Some(nvl_val) = sel_nvl_value {
-                    // Same one-element-destination rule as the multi-input loop
-                    // above: C reads NVL with `dbGetLink(..., DBR_USHORT, &pse->seln,
-                    // 0, 0)` (selRecord.c), so an array-valued source contributes its
-                    // element 0 rather than being dropped by `to_f64`.
-                    let scalar = if nvl_val.is_array() {
-                        nvl_val.first_element()
-                    } else {
-                        Some(nvl_val)
-                    };
-                    if let Some(f) = scalar.and_then(|v| v.get_convert_f64()) {
-                        let _ = instance
-                            .record
-                            .put_field("SELN", EpicsValue::UShort(f as u16));
-                    }
+                let string_input_values = links
+                    .as_deref_mut()
+                    .and_then(|l| l.rare.as_mut())
+                    .map(|r| std::mem::take(&mut r.string_input_values));
+                if let Some(seln) = links.as_deref().and_then(|l| l.sel_seln) {
+                    let _ = instance.record.put_field("SELN", EpicsValue::UShort(seln));
                 }
 
                 // Apply the string-input values (scalcout INAA..INLL -> AA..LL),
@@ -5761,9 +5734,7 @@ impl PvDatabase {
                 // (mbboRecord.c:210) and the failed closed-loop DOL read
                 // (mbboRecord.c:205) jump to the identical label.
                 let skips_ts_undef = plan.skips_timestamp_when_undefined
-                    && (instance.common.udf != 0
-                        || links
-                            .is_some_and(|l| l.rare.as_ref().is_some_and(|r| r.dol_read_failed)));
+                    && (instance.common.udf != 0 || links.is_some_and(|l| l.dol_read_failed));
                 if !restamps_after && !skips_ts_undef {
                     let inst = &mut *instance;
                     tsel.stamp(&inst.name, &mut inst.common, is_soft);
@@ -6051,10 +6022,10 @@ impl PvDatabase {
                         None
                     } else {
                         let can_dev_write = instance.record.can_device_write();
-                        // The soft OUT-link value THIS DTYP's dset would put — VAL/OVAL for
-                        // "Soft Channel", RVAL for "Raw Soft Channel". `None` = not a soft
-                        // output dset. See `RecordInstance::soft_output_value`.
-                        let soft_out = instance.soft_output_value();
+                        // Whether this DTYP is a soft output dset; its value (VAL/OVAL for
+                        // "Soft Channel", RVAL for "Raw Soft Channel") is built below, only
+                        // for a writable OUT link. See `RecordInstance::soft_output_value`.
+                        let soft_out = instance.has_soft_output();
                         let record_should_output = instance.record.should_output();
                         if !can_dev_write {
                             // Non-output records (calcout, etc.) may still have a
@@ -6066,7 +6037,7 @@ impl PvDatabase {
                             } else {
                                 None
                             }
-                        } else if let Some(out_val) = soft_out {
+                        } else if soft_out {
                             if !record_should_output {
                                 // epics-base 7.0.8 OOPT: gate the soft OUT-link
                                 // write on the record's `should_output()`. For
@@ -6075,7 +6046,11 @@ impl PvDatabase {
                                 // write without disturbing alarms / monitors.
                                 None
                             } else if instance.parsed_out.is_writable_out_link() {
-                                out_val.map(|v| (instance.parsed_out.clone(), v))
+                                // Built only for an OUT link that will take it.
+                                instance
+                                    .soft_output_value()
+                                    .flatten()
+                                    .map(|v| (instance.parsed_out.clone(), v))
                             } else {
                                 None
                             }
@@ -6754,26 +6729,13 @@ impl PvDatabase {
         target_field: &'static str,
         visited: &mut ProcStack,
     ) -> bool {
-        let link_str = {
-            let instance = rec.read();
-            instance
-                .record
-                .get_field(link_field)
-                .and_then(|v| {
-                    if let EpicsValue::String(s) = v {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default()
-        };
+        // The instance's parsed link for this field, parsed once per put.
         // An empty link IS a CONSTANT link in C (`dbConstLink.c`'s lset with a
         // NULL string), and `dbConstGetValue` returns 0 for it.
-        if link_str.is_empty() {
+        let parsed = rec.read().record_link(link_field).clone();
+        if matches!(*parsed, crate::server::record::ParsedLink::None) {
             return true;
         }
-        let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
         // The source's DBF class + element count (C `dbGetLinkDBFtype` /
         // `dbGetNelements` — the same lset accessors the OUT side asks of a
         // destination), resolved with NO record lock held: a self-referencing

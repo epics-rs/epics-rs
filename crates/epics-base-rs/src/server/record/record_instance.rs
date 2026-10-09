@@ -2775,7 +2775,7 @@ pub struct RecordInstance {
     /// on `!status`, so the subroutine is skipped. Set by the resolution
     /// apply, consumed (and cleared) by [`Self::run_registered_subroutine`];
     /// `false` for every record without a pending bad re-resolution.
-    pub(crate) suppress_subroutine_run: bool,
+    suppress_subroutine_run: bool,
     /// Generation counter for ReprocessAfter timer cancellation.
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
@@ -3950,6 +3950,13 @@ impl RecordInstance {
     /// `DTYP("Async Soft Channel")` output record write nothing at all —
     /// measured on `pva2pva/testApp/testpvalink.db:30-35`, whose `longout`
     /// drives a pva OUT link that never fired.
+    /// Whether this DTYP is a soft output dset at all — the question
+    /// [`Self::soft_output_value`] answers `Some`/`None` to, asked without
+    /// building the value.
+    pub(crate) fn has_soft_output(&self) -> bool {
+        self.common.dtyp.soft().is_some()
+    }
+
     pub fn soft_output_value(&self) -> Option<Option<EpicsValue>> {
         use crate::server::device_support::SoftDtyp;
         match self.common.dtyp.soft()? {

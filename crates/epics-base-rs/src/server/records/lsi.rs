@@ -255,6 +255,15 @@ impl Record for LsiRecord {
         Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
     }
 
+    /// [`Self::val`]'s bytes, borrowed.
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        let max = (self.sizv as usize).saturating_sub(1);
+        let bytes = self.val.as_bytes();
+        Some(crate::server::record::ValueView::Char(
+            &bytes[..bytes.len().min(max)],
+        ))
+    }
+
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
         match link_field {
             "SIML" => Some(&self.siml),

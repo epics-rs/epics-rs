@@ -132,6 +132,36 @@ async fn real_svl_link_is_read_into_sgnl_and_binned_once_per_process() {
     assert_eq!(bins(&db, "H:LINK").await, vec![1, 0, 0, 1]);
 }
 
+/// The parsed SVL is cached per put: re-pointing the link at runtime reads the
+/// new source on the next process, and clearing it reads nothing.
+#[epics_macros_rs::epics_test]
+async fn a_runtime_svl_put_repoints_the_cached_link() {
+    let db = build().await;
+    db.put_pv("SRC", EpicsValue::Double(3.5)).await.unwrap();
+    process(&db, "H:LINK").await;
+    assert_eq!(bins(&db, "H:LINK").await, vec![0, 0, 0, 1]);
+
+    db.put_record_field_from_ca("H:LINK", "SVL", EpicsValue::String("H:CONST.SGNL".into()))
+        .await
+        .unwrap();
+    db.put_pv("H:CONST.SGNL", EpicsValue::Double(0.5))
+        .await
+        .ok();
+    process(&db, "H:LINK").await;
+    assert_eq!(
+        db.get_pv("H:LINK.SGNL").unwrap().to_f64(),
+        db.get_pv("H:CONST.SGNL").unwrap().to_f64(),
+        "the next process reads the new source"
+    );
+
+    db.put_record_field_from_ca("H:LINK", "SVL", EpicsValue::String("".into()))
+        .await
+        .unwrap();
+    db.put_pv("H:LINK.SGNL", EpicsValue::Double(1.5)).await.ok();
+    process(&db, "H:LINK").await;
+    assert_eq!(db.get_pv("H:LINK.SGNL").unwrap().to_f64(), Some(1.5));
+}
+
 /// The SGNL `special()` path is unchanged: a caput to SGNL counts the sample
 /// itself (`histogramRecord.c:334`, SPC_MOD → `add_count`) and SGNL is not
 /// `pp(TRUE)`, so no process runs and the sample is counted exactly once.

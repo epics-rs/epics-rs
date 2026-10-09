@@ -3711,15 +3711,18 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
-    /// The generation of this record's [`Self::multi_input_links`] texts: a
-    /// count that moves on EVERY write of any of them, so a parse validated
-    /// against the texts at generation `g` is still the parse of those texts
-    /// while the record answers `g`. A type answers `Some` only when its link
-    /// texts have ONE writer that counts — `calc`'s `set_inp_link`, behind
-    /// private fields — and the count is then what C's `dbPutSpecial` on a
-    /// `DBF_INLINK` gives `dbDbInitLink`: the moment the link changed. `None`
-    /// (the default) validates every parse against the text itself, byte for
-    /// byte, on every read.
+    /// The generation of this record's [`Self::multi_input_links`]: a count
+    /// that moves on EVERY write of any of their texts, and on every write
+    /// that can change what [`Self::input_link_request`] or
+    /// [`Self::input_link_failure_is_inert`] answers for any of them. While
+    /// the record answers `g`, a parse validated at `g` is still the parse of
+    /// the text, and those two answers read at `g` are still the answers.
+    /// A type answers `Some` only when all of those fields have ONE writer
+    /// that counts, behind private fields — `calc`'s `set_inp_link`, aSub's
+    /// `put_field` of `INPx`/`FTx` — and the count is then what C's
+    /// `dbPutSpecial` on a `DBF_INLINK` gives `dbDbInitLink`: the moment the
+    /// link changed. `None` (the default) validates every parse against the
+    /// text itself, byte for byte, and asks both answers again, on every read.
     fn input_links_generation(&self) -> Option<u64> {
         None
     }
@@ -4518,6 +4521,11 @@ pub trait Record: Send + Sync + 'static {
             CycleRead::Value(v) => return v.is_nan(),
             CycleRead::Absent => return true,
             CycleRead::ByName => {}
+        }
+        match self.monitor_value_view() {
+            Some(ValueView::Scalar(v)) => return v.is_nan(),
+            Some(_) => return false,
+            None => {}
         }
         match self.val() {
             Some(EpicsValue::Double(v)) => v.is_nan(),
@@ -6604,6 +6612,60 @@ mod tests {
             );
             assert!(!r.value_is_undefined(), "{record_type} value_is_undefined");
         }
+    }
+
+    /// A lent value is the one [`Record::val`] would copy, and the queries that
+    /// read it answer as they would from the copy.
+    #[test]
+    fn a_lent_value_is_what_val_would_copy() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        fn owned(view: ValueView<'_>) -> EpicsValue {
+            match view {
+                ValueView::Scalar(v) => v.into(),
+                ValueView::Double(a) => EpicsValue::DoubleArray(a.to_vec().into()),
+                ValueView::Float(a) => EpicsValue::FloatArray(a.to_vec().into()),
+                ValueView::Long(a) => EpicsValue::LongArray(a.to_vec().into()),
+                ValueView::ULong(a) => EpicsValue::ULongArray(a.to_vec().into()),
+                ValueView::Int64(a) => EpicsValue::Int64Array(a.to_vec().into()),
+                ValueView::UInt64(a) => EpicsValue::UInt64Array(a.to_vec().into()),
+                ValueView::Short(a) => EpicsValue::ShortArray(a.to_vec().into()),
+                ValueView::UShort(a) => EpicsValue::UShortArray(a.to_vec().into()),
+                ValueView::Char(a) => EpicsValue::CharArray(a.to_vec().into()),
+                ValueView::UChar(a) => EpicsValue::UCharArray(a.to_vec().into()),
+                ValueView::Enum(a) => EpicsValue::EnumArray(a.to_vec().into()),
+            }
+        }
+        // The last step lowers SIZV under a VAL already stored, so the lent
+        // value has to apply the cap `val` applies.
+        let steps = [
+            ("VAL", EpicsValue::String("41".into())),
+            ("VAL", EpicsValue::CharArray(vec![b'x'; 100].into())),
+            ("SIZV", EpicsValue::UShort(16)),
+        ];
+        let mut lent = Vec::new();
+        for record_type in RECORD_TYPES {
+            let Ok(mut r) = crate::server::db_loader::create_record(record_type) else {
+                continue;
+            };
+            for (field, value) in &steps {
+                let _ = r.put_field(field, value.clone());
+                let r = &*r;
+                let Some(view) = r.monitor_value_view() else {
+                    continue;
+                };
+                lent.push(*record_type);
+                let val = r.val();
+                assert_eq!(Some(owned(view)), val, "{record_type} after {field}");
+                let undefined = match &val {
+                    Some(EpicsValue::Double(v)) => v.is_nan(),
+                    Some(EpicsValue::Float(v)) => v.is_nan(),
+                    Some(_) => false,
+                    None => true,
+                };
+                assert_eq!(r.value_is_undefined(), undefined, "{record_type}");
+            }
+        }
+        assert!(lent.contains(&"lsi"), "lsi lends VAL");
     }
 
     /// [`CycleValue`] stands in for the scalar `EpicsValue` arms, so each of

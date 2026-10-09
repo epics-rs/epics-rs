@@ -385,30 +385,18 @@ impl Record for ASubRecord {
         false
     }
 
-    /// `aSubRecord.c:414`: VAL posts `DBE_VALUE | DBE_LOG` on `val != oval`,
-    /// so both deadbands are 0 against the one OVAL cell.
-    fn monitor_deadband_cells(
-        &self,
-        _last_posted: [f64; 2],
-    ) -> Option<crate::server::record::MonitorDeadbandCells> {
-        Some(crate::server::record::MonitorDeadbandCells::Long(
-            crate::server::record::DeadbandCells {
-                val: self.val,
-                mdel: 0,
-                adel: 0,
-                mlst: self.oval,
-                alst: self.oval,
-            },
-        ))
+    /// `aSubRecord.c:414-417`: `if (prec->val != prec->oval) { db_post_events(...);
+    /// prec->oval = prec->val; }`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.val != self.oval;
+        if changed {
+            self.oval = self.val;
+        }
+        Some(changed)
     }
 
-    fn store_monitor_last_posted(
-        &mut self,
-        _val: crate::server::record::AlarmLimit,
-        _mlst: bool,
-        _alst: bool,
-    ) {
-        self.oval = self.val;
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
     }
 
     fn record_type(&self) -> &'static str {

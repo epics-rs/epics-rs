@@ -408,28 +408,21 @@ impl Record for AoRecord {
         )]
     }
 
-    /// C `aoRecord.c:156,160-161` — the derived half of the init tail, run
-    /// right after the constant load: `oval = pval = val`, then
-    /// `oraw = rval; orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5
-    /// at init.
-    fn init_record_tail(&mut self) {
-        self.oval = self.val;
-        self.pval = self.val;
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
-    }
-
-    /// C `aoRecord.c:157-159` — `mlst = alst = lalm = val`, all three, which is
-    /// what the framework default would do anyway; spelled out because the
-    /// derived half above is this record's own. A dset status other than 0 or
-    /// 2 returns `S_dev_badInitRet` before it (`aoRecord.c:152`).
+    /// C `aoRecord.c:155-161`: `oval = pval = val`, the deadband trackers,
+    /// then `oraw = rval; orbv = rbv` — all after `:152` returns
+    /// `S_dev_badInitRet` for a dset status other than 0 or 2. softIoc with
+    /// `field(DOL,"5")` reports OVAL=5 at init.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init == crate::server::device_support::DsetInit::Failed {
             return;
         }
+        self.oval = self.val;
+        self.pval = self.val;
         self.mlst = self.val;
         self.alst = self.val;
         self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):

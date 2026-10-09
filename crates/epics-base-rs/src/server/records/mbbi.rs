@@ -360,10 +360,11 @@ impl Record for MbbiRecord {
         crate::server::record::CycleHooks::NONE
     }
 
-    /// `mbbiRecord.c:133-137` keeps the dset status for the return and seeds
-    /// regardless of it.
+    /// `mbbiRecord.c:133-140` keeps the dset status for the return and seeds
+    /// regardless of it, after the dset init has loaded RVAL.
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         crate::server::record::seed_trackers_from_val(self);
+        self.oraw = self.rval;
     }
 
     /// UDF belongs to the dset here, not to `process()`. C
@@ -552,9 +553,6 @@ impl Record for MbbiRecord {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
         }
         Ok(())
     }

@@ -113,14 +113,13 @@ impl Record for BiRecord {
         "bi"
     }
 
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // Initialize tracking fields from current val
+    // biRecord.c:57 returns a nonzero dset status before :59-61.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
             self.mlst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
         }
-        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

@@ -131,8 +131,9 @@ pub fn reseed_constant_input_link<R: Record + ?Sized>(
 /// A choice type loads as `DBF_USHORT`. `None` is a non-zero status: the
 /// destination is not touched.
 ///
-/// A JSON array constant (`[…]`) is `dbPutConvertJSON` in C and stays with
-/// the link's own parsed value.
+/// A JSON array constant (`[…]`) is `dbPutConvertJSON` at `nReq = 1`
+/// instead: element 0 in the destination's type, a string refused unless that
+/// is `DBF_STRING`, and `[]` a success that writes nothing.
 pub(crate) fn constant_load_scalar(
     constant: &super::ConstantLink,
     dbr_type: DbFieldType,
@@ -142,13 +143,17 @@ pub(crate) fn constant_load_scalar(
     if text.is_empty() {
         return None;
     }
-    if text.starts_with('[') && text.ends_with(']') {
-        return Some(Converted::Stored(constant.value().clone()));
-    }
     let dbr_type = match dbr_type {
         DbFieldType::Enum => DbFieldType::UShort,
         t => t,
     };
+    if text.starts_with('[') && text.ends_with(']') {
+        let loaded = crate::server::db_convert_json::db_put_convert_json(text, dbr_type, 1).ok()?;
+        return Some(match loaded.first_element() {
+            Some(value) => Converted::Stored(value),
+            None => Converted::Unchanged,
+        });
+    }
     match NumericField::of(dbr_type) {
         Some(row) => c_parse::put_string("INP", row, text).ok(),
         // `cvt_st_st`: the text itself; the field's own put applies the

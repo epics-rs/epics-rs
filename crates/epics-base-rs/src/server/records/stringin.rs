@@ -213,6 +213,13 @@ impl Record for StringinRecord {
         }
     }
 
+    // C `stringinRecord.c:66` copies VAL after `:63-64` returns a nonzero dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            self.oval = self.val.clone();
+        }
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {

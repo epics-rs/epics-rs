@@ -778,8 +778,23 @@ struct Context {
     depth: i32,
     target: DbFieldType,
     elems: usize,
+    /// `dbrSize - 1`, the cut the string callback applies.
+    string_capacity: usize,
+    numbers: Numbers,
     tokens: Vec<Token>,
     refusal: Option<String>,
+}
+
+/// Which number slot the callback table fills. yajl hands a number to
+/// `yajl_number` raw when that slot is set and only otherwise parses it for
+/// `yajl_integer` / `yajl_double` (`yajl_parser.c:305-355`), so under
+/// `dblsj_callbacks` no number can overflow — it is refused as text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbers {
+    /// `dbcj_callbacks`: `dbcj_integer`, `dbcj_double`.
+    Parsed,
+    /// `dblsj_callbacks`: `dblsj_number`.
+    Refused,
 }
 
 impl Context {
@@ -837,11 +852,21 @@ impl Context {
         self.store(Token::Double(value))
     }
 
+    /// `dblsj_number` (`:65-69`).
+    fn number(&mut self, text: &[u8]) -> bool {
+        let shown = String::from_utf8_lossy(text);
+        self.refuse(format!(
+            "dbLSConvertJSON: Numeric value {shown} provided, string expected\n"
+        ))
+    }
+
     /// `dbcj_string` (`:71-93`): a string is legal ONLY into a `DBF_STRING`
     /// buffer. The comment at `:75-77` is why — nothing here knows a
     /// `DBF_CHAR` field's width, so `dbpf` never reaches this function for one
     /// (it sends the raw bytes instead). The type test precedes the capacity
     /// guard, so a string past the end still refuses the whole put.
+    /// `dblsj_string` (`:95-108`) is this body at `dbrType = DBF_STRING`,
+    /// `elems = 1`.
     fn string(&mut self, bytes: &[u8]) -> bool {
         if self.target != DbFieldType::String {
             let shown = String::from_utf8_lossy(bytes);
@@ -849,7 +874,7 @@ impl Context {
                 "dbConvertJSON: String \"{shown}\" provided, numeric value expected\n"
             ));
         }
-        let len = bytes.len().min(DBR_STRING_CAPACITY);
+        let len = bytes.len().min(self.string_capacity);
         self.store(Token::Text(PvString::from_bytes(&bytes[..len])))
     }
 }
@@ -936,6 +961,9 @@ impl Parser {
                         Tok::LeftBracket => {
                             push_array = true;
                             self.ctx.start_array()
+                        }
+                        Tok::Integer | Tok::Double if self.ctx.numbers == Numbers::Refused => {
+                            self.ctx.number(&buf)
                         }
                         Tok::Integer => match parse_integer(&buf) {
                             Ok(value) => self.ctx.integer(value),
@@ -1156,6 +1184,8 @@ pub fn db_put_convert_json(
         depth: 0,
         target,
         elems: capacity,
+        string_capacity: DBR_STRING_CAPACITY,
+        numbers: Numbers::Parsed,
         tokens: Vec::new(),
         refusal: None,
     });
@@ -1186,6 +1216,38 @@ pub fn db_put_convert_json(
         }
         .convert_to(target),
     )
+}
+
+/// C `dbLSConvertJSON` (`dbConvertJSON.c:191-236`) — what a CONSTANT link
+/// loads into a long string (`dbConstLoadLS`, `dbConstLink.c:178-191`).
+///
+/// `Ok(Some)` is the first string; `Ok(None)` is a parse that ended with no
+/// string callback (`[]`, or a bare number still pending because C never calls
+/// `yajl_complete_parse`), where C's `*plen = pdest - pdest + 1` is 1. Any
+/// number, null, bool, map or nested array before the end is `Err`. The
+/// `SIZV - 1` cut is the record's ([`crate::server::record::LsLoad::Text`]).
+pub fn db_ls_convert_json(json: &str) -> Result<Option<PvString>, ConvertJsonError> {
+    let txt = json.as_bytes();
+    let mut parser = Parser::new(Context {
+        depth: 0,
+        target: DbFieldType::String,
+        elems: 1,
+        string_capacity: usize::MAX,
+        numbers: Numbers::Refused,
+        tokens: Vec::new(),
+        refusal: None,
+    });
+    if parser.do_parse(txt) != Status::Ok {
+        return Err(ConvertJsonError {
+            refusal: parser.ctx.refusal.take(),
+            diagnostic: format!("dbLSConvertJSON: {}", parser.render_error(txt)),
+        });
+    }
+    // `dblsj_number` stores nothing, so the one token is a string.
+    Ok(parser.ctx.tokens.into_iter().find_map(|t| match t {
+        Token::Text(s) => Some(s),
+        Token::Int(_) | Token::Double(_) => None,
+    }))
 }
 
 #[cfg(test)]

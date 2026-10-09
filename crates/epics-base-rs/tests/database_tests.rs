@@ -8326,11 +8326,12 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     assert!(matches!(rec.get_field("VAL"), Some(EpicsValue::Long(8))));
 
     // Sibling case: VAL was set explicitly (UDF=false). bits should
-    // be derived from VAL.
+    // be derived from VAL, by the init tail (`mbboDirectRecord.c:142-143`).
     let mut rec2 = MbboDirectRecord::default();
     rec2.put_field("VAL", EpicsValue::Long(0b0101)).unwrap();
     let mut udf2 = false;
     rec2.post_init_finalize_undef(&mut udf2).unwrap();
+    rec2.init_record_tail();
     assert!(!udf2, "UDF stays cleared");
     assert!(matches!(rec2.get_field("VAL"), Some(EpicsValue::Long(5))));
     // bits[0] and bits[2] should reflect VAL=5 (binary 0101). B0..B1F are

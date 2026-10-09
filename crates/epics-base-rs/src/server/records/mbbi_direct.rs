@@ -91,11 +91,17 @@ impl Record for MbbiDirectRecord {
         false
     }
 
-    /// C `mbbiDirectRecord.c:128` — `prec->mlst = prec->val`, the whole of this
-    /// record's init tail. MLST is `special(SPC_NOMOD)` so it has no `put_field`
-    /// arm for the trait default to go through; the record seeds its own cell.
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
+    /// C `mbbiDirectRecord.c:128-129` seeds MLST and ORAW after the dset init
+    /// has loaded VAL/RVAL, whatever its status, and derives B0-B1F from VAL
+    /// only on a dset `init_record` that returned 0 (`:115-124`). MLST is
+    /// `special(SPC_NOMOD)` so it has no `put_field` arm for the trait default
+    /// to go through.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init == crate::server::device_support::DsetInit::Succeeded {
+            self.val_to_bits();
+        }
         self.mlst = self.val;
+        self.oraw = self.rval;
     }
 
     fn record_type(&self) -> &'static str {
@@ -181,9 +187,6 @@ impl Record for MbbiDirectRecord {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.mlst = self.val;
-            self.oraw = self.rval;
-            self.val_to_bits();
         }
         Ok(())
     }
@@ -298,15 +301,12 @@ impl Record for MbbiDirectRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => {
-                match value {
-                    EpicsValue::Long(v) => self.val = v as u32,
-                    EpicsValue::Short(v) => self.val = v as u32,
-                    EpicsValue::Char(v) => self.val = v as u32,
-                    _ => return Err(CaError::TypeMismatch("VAL".into())),
-                }
-                self.val_to_bits();
-            }
+            "VAL" => match value {
+                EpicsValue::Long(v) => self.val = v as u32,
+                EpicsValue::Short(v) => self.val = v as u32,
+                EpicsValue::Char(v) => self.val = v as u32,
+                _ => return Err(CaError::TypeMismatch("VAL".into())),
+            },
             // RVAL/MASK are DBF_ULONG: accept the native ULong and tolerate
             // the legacy signed Long (device support / autosave).
             "RVAL" => {

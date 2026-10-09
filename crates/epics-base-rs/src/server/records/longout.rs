@@ -234,15 +234,15 @@ impl Record for LongoutRecord {
     /// when `DRVH > DRVL` (equal limits = no clamping). Without this an
     /// operator or DOL link writing outside the window propagates the
     /// unclamped value to the OUT link / device.
-    /// C `longoutRecord.c:126` — `init_record` seeds PVAL from the loaded VAL,
-    /// alongside the MLST/ALST/LALM seed [`Record::seed_deadband_tracking`]
-    /// owns. Without it a `field(VAL,"5")` longout starts with `pval = 0`, so
-    /// the first `caput LO 0` is not a transition to C but is to the port.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+    /// C `longoutRecord.c:67-70` seeds PVAL with the trackers, after `:63-64`
+    /// returns a nonzero dset status. Without it a `field(VAL,"5")` longout
+    /// starts with `pval = 0`, so the first `caput LO 0` is not a transition
+    /// to C but is to the port.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            crate::server::record::seed_trackers_from_val(self);
             self.pval = self.val;
         }
-        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

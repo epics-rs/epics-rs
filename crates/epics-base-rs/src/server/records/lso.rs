@@ -258,7 +258,8 @@ impl Record for LsoRecord {
         Some("DOL")
     }
 
-    /// The `dbLoadLinkLS` sink plus C's init tail (`lsoRecord.c:92-95`).
+    /// The `dbLoadLinkLS` sink (`lsoRecord.c:82`). The OVAL copy is not part
+    /// of it: C makes that copy after the dset status return.
     fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
         match load {
             crate::server::record::LsLoad::Text(s) => {
@@ -269,9 +270,15 @@ impl Record for LsoRecord {
             // C's number case: the buffer is untouched, LEN comes out 1.
             crate::server::record::LsLoad::LenOnly => self.len = 1,
         }
-        self.oval = self.val.clone();
-        self.olen = self.len;
         self.len
+    }
+
+    /// C `lsoRecord.c:47-50`, after `:43-44` returns a nonzero dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed && self.len != 0 {
+            self.oval = self.val.clone();
+            self.olen = self.len;
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

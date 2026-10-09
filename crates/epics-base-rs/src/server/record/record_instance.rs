@@ -2542,6 +2542,8 @@ const SUBROUTINE_STATUS_ERROR: i64 = -3;
 pub(crate) struct MonitorPlan {
     /// [`Record::process_posts_value_monitor`].
     pub(crate) posts_value_monitor: bool,
+    /// [`Record::alarm_alone_posts_value`].
+    pub(crate) alarm_alone_posts_value: bool,
     /// [`Record::uses_monitor_deadband`].
     pub(crate) uses_deadband: bool,
     /// [`Record::has_array_monitor_post`].
@@ -2568,6 +2570,7 @@ impl MonitorPlan {
         let deadband_field = record.monitor_deadband_field();
         Self {
             posts_value_monitor: record.process_posts_value_monitor(),
+            alarm_alone_posts_value: record.alarm_alone_posts_value(),
             uses_deadband: record.uses_monitor_deadband(),
             array_monitor_post: record.has_array_monitor_post(),
             deadband_field,
@@ -2749,6 +2752,25 @@ pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
 /// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type.
 /// A `caput` to one still posts, through the put path.
 const MONITOR_TRACKER_FIELDS: [&str; 5] = ["ORAW", "ORBV", "MLST", "ALST", "LALM"];
+
+/// The fields `collect_subscriber_posts`'s walk discards before it
+/// change-detects them, on every cycle of the record's life. Both the walk and
+/// [`RecordInstance::walk_skips`] (which keeps these fields out of
+/// `last_posted`) ask here, so the gate and the walk cannot disagree.
+///
+/// The deadband field and SEVR/STAT/AMSG/ACKS are posted by the caller with
+/// their own C masks (recGbl.c:202-222); a change-detected copy would
+/// double-post. No C `monitor()` posts UDF or a [`MONITOR_TRACKER_FIELDS`]
+/// entry at all. [`Record::event_posted_fields`] post from their own event
+/// path. A `caput` to any of them still posts, through the put path.
+#[inline(always)]
+fn walk_skip_term(field: &str, deadband_field: &str, event_posted: &[&str]) -> bool {
+    field == deadband_field
+        || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field)
+        || field == "UDF"
+        || MONITOR_TRACKER_FIELDS.contains(&field)
+        || event_posted.contains(&field)
+}
 
 impl RecordInstance {
     pub fn new(name: String, record: impl Record) -> Self {
@@ -3512,17 +3534,18 @@ impl RecordInstance {
     }
 
     /// Whether `collect_subscriber_posts`'s walk discards `field` before it
-    /// change-detects it, for every cycle of this record's life. The terms are
-    /// the walk's own leading `continue` terms, and they answer from
-    /// `&'static` record metadata alone, so the answer cannot change under a
-    /// field once it has been stored. `Record::process_posted_fields` is not
-    /// here: it is an allow list whose membership turns over as the record
-    /// publishes, so it stays a per-cycle term in the walk.
+    /// change-detects it, for every cycle of this record's life
+    /// ([`walk_skip_term`]). The terms answer from `&'static` record metadata
+    /// alone, so the answer cannot change under a field once it has been
+    /// stored. `Record::process_posted_fields` is not here: it is an allow
+    /// list whose membership turns over as the record publishes, so it stays a
+    /// per-cycle term in the walk.
     fn walk_skips(&self, field: &str) -> bool {
-        field == self.record.monitor_deadband_field()
-            || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field)
-            || field == "UDF"
-            || self.record.event_posted_fields().contains(&field)
+        walk_skip_term(
+            field,
+            self.record.monitor_deadband_field(),
+            self.record.event_posted_fields(),
+        )
     }
 
     /// SINGLE OWNER of `last_posted`: record that `value` has been published
@@ -6598,22 +6621,9 @@ impl RecordInstance {
                 .filter(|field| !self.subscribers.contains_key(*field)),
         );
         for field in tracked {
-            // These four terms can only fire on a SUBSCRIBED field now:
-            // `skipped_posted`, not `last_posted`, holds what they reject.
-            if field == deadband_field
-                // SEVR/STAT/AMSG/ACKS are posted by `recGblResetAlarms` itself,
-                // each with its own C mask (recGbl.c:202-222) — the caller emits
-                // them from `alarm_field_posts`. A second, change-detected copy
-                // here would double-post with a mask C never uses for them
-                // (`alarm_bits | DBE_VALUE | DBE_LOG` instead of C's DBE_VALUE
-                // on ACKS). UDF is excluded for the opposite reason: NO C
-                // `monitor()` posts it at all, so a processing cycle that
-                // redefines VAL must emit no `.UDF` event (a caput to `.UDF`
-                // still posts, through the generic put path).
-                || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field.as_str())
-                || field == "UDF"
-                || MONITOR_TRACKER_FIELDS.contains(&field.as_str())
-                || event_posted.contains(&field.as_str())
+            // `walk_skip_term` can only fire on a SUBSCRIBED field now:
+            // `skipped_posted`, not `last_posted`, holds what it rejects.
+            if walk_skip_term(field, deadband_field, event_posted)
                 || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
                 continue;
@@ -7161,6 +7171,7 @@ impl RecordInstance {
         let MonitorPlan {
             deadband_field: field,
             log_suppressed,
+            alarm_alone_posts_value,
             ..
         } = self.monitor_plan;
 
@@ -7182,6 +7193,7 @@ impl RecordInstance {
         // C never sends. Gating here rather than at each builder keeps the
         // single owner of the deadband post the single enforcer of the set.
         let value = if mask.is_empty()
+            || !(alarm_alone_posts_value || include_val || include_archive)
             || !self
                 .record
                 .process_posted_fields()
@@ -10544,8 +10556,8 @@ mod check_deadband_tests {
     }
 
     /// No "nothing posted yet" state: the first cycle compares VAL against
-    /// the seed like every other cycle, whether the type carries MLST/ALST
-    /// (ai) or keeps them in `CommonFields` at 0 (aSub).
+    /// the seed like every other cycle, whether the type deadbands against
+    /// MLST/ALST (ai) or change-tests against OVAL at 0 (aSub).
     #[test]
     fn first_cycle_val_equal_to_the_seed_does_not_post() {
         use super::RecordInstance;
@@ -10553,11 +10565,11 @@ mod check_deadband_tests {
         use crate::server::records::asub_record::ASubRecord;
 
         let mut asub = RecordInstance::new("A".into(), ASubRecord::default());
-        assert_eq!(asub.check_deadband_ext(), (false, false));
+        assert_eq!(asub.value_include_classes(), (false, false));
         let mut moved = ASubRecord::default();
         moved.val = 2;
         let mut asub = RecordInstance::new("A".into(), moved);
-        assert_eq!(asub.check_deadband_ext(), (true, true));
+        assert_eq!(asub.value_include_classes(), (true, true));
 
         let mut seeded = AiRecord::default();
         (seeded.val, seeded.mlst, seeded.alst) = (5.0, 5.0, 5.0);
@@ -11278,6 +11290,57 @@ mod skipped_posted_tests {
                 "{field} reached the walk's input"
             );
             assert_eq!(inst.posted_value(field), Some(&EpicsValue::Long(1)));
+        }
+    }
+
+    /// A monitor on a tracker field seeds its published value through the
+    /// owner; that seed must not land in `last_posted`, or the walk runs every
+    /// cycle after the monitor goes away. (A `caput` is refused: SPC_NOMOD.)
+    #[epics_macros_rs::epics_test]
+    async fn a_tracker_field_monitor_leaves_the_gate_armed() {
+        use crate::server::database::ProcStack;
+        use crate::server::ioc_builder::IocBuilder;
+        let (db, _) = IocBuilder::new()
+            .db_string(
+                r#"record(calc, "C") { field(CALC, "A+1") }
+                   record(ao, "O") { field(VAL, "1") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .expect("db")
+            .build()
+            .await
+            .expect("ioc");
+        for (rec, field) in [
+            ("C", "MLST"),
+            ("C", "ALST"),
+            ("C", "LALM"),
+            ("O", "MLST"),
+            ("O", "ALST"),
+            ("O", "LALM"),
+            ("O", "ORAW"),
+            ("O", "ORBV"),
+        ] {
+            {
+                let inst = db.get_record(rec).unwrap();
+                let mut inst = inst.write();
+                let _rx = inst
+                    .add_subscriber(field, 1, DbFieldType::Double, EventMask::VALUE.bits())
+                    .expect("subscriber");
+                inst.remove_subscriber(1);
+            }
+            db.process_record_with_links(rec, &mut ProcStack::new())
+                .await
+                .unwrap();
+            let inst = db.get_record(rec).unwrap();
+            let inst = inst.read();
+            // ao's own cycle posts RVAL, so only calc's gate stays armed.
+            assert!(
+                !inst.last_posted.contains_key(field)
+                    && (rec != "C" || inst.last_posted.is_empty()),
+                "{rec}.{field} reached the walk's input: {:?}",
+                inst.last_posted
+            );
+            assert!(inst.posted_value(field).is_some(), "{rec}.{field}");
         }
     }
 

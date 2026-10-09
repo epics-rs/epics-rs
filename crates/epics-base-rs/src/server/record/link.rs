@@ -1579,7 +1579,7 @@ pub enum LsLoad {
     /// parse ends: NO callback fires, the destination buffer is untouched, and
     /// `*plen = pdest - pdest + 1` makes `LEN = 1`. That is what defines an
     /// `lso` with `field(DOL,"5")` while leaving `VAL` empty (softIoc: VAL "",
-    /// LEN 1, UDF 0).
+    /// LEN 1, UDF 0). An empty `[]` ends the same way.
     LenOnly,
 }
 
@@ -1614,10 +1614,17 @@ pub fn load_link_ls(text: &str) -> Option<LsLoad> {
         let value = json_const_value(&normalized)?;
         return json_string_value(value).map(LsLoad::Text);
     }
-    // Plain link: `loadLS` exists only on the CONSTANT lset, and a plain link is
-    // CONSTANT iff `epicsParseDouble` accepts it — i.e. iff it is a number, the
-    // one case `dbLSConvertJSON` leaves the buffer untouched.
-    parse_c_double(s).map(|_| LsLoad::LenOnly)
+    // Plain link: `loadLS` exists only on the CONSTANT lset (a number or a
+    // `[…]`, `dbStaticLib.c:2346-2356`), which hands the text to
+    // `dbLSConvertJSON` whatever it is.
+    let bracketed = s.starts_with('[') && s.ends_with(']');
+    if !bracketed && parse_c_double(s).is_none() {
+        return None;
+    }
+    match crate::server::db_convert_json::db_ls_convert_json(s).ok()? {
+        Some(text) => Some(LsLoad::Text(text.as_str_lossy().into_owned())),
+        None => Some(LsLoad::LenOnly),
+    }
 }
 
 /// The raw (un-dequoted) value text of a `{const: …}` JSON link, or `None` when
@@ -1635,19 +1642,20 @@ pub(crate) fn json_const_value(s: &str) -> Option<&str> {
 /// The JSON string a `{const:…}` link carries, DECODED — `"hi"` and the
 /// string-array shorthand `["hi", …]` (C `ac40`, whose `loadLS` takes element 0).
 /// A numeric value is not a string: `lnkConst_loadLS`'s `default` arm returns
-/// `S_db_badField`, so nothing is loaded and LEN stays 0.
+/// `S_db_badField`, so nothing is loaded and LEN stays 0 — and so does an empty
+/// `[]` (`a0`).
 ///
 /// The decode is yajl's, not this function's: a `{…}` value's escapes are
 /// translated by `dbJLinkParse` → yajl, never by the `.db` lexer
-/// ([`decode_json_string_token`]).
+/// ([`decode_json_string_token`]). An array goes through the same yajl scan,
+/// because a comma inside an element (`["a,b"]`) is not a separator.
 fn json_string_value(value: &str) -> Option<String> {
     let v = value.trim();
-    let first = if let Some(rest) = v.strip_prefix('[') {
-        rest.trim_start().split(',').next()?.trim()
-    } else {
-        v
-    };
-    decode_json_string_token(first)
+    if v.starts_with('[') {
+        let first = crate::server::db_convert_json::db_ls_convert_json(v).ok()??;
+        return Some(first.as_str_lossy().into_owned());
+    }
+    decode_json_string_token(v)
 }
 
 /// One `link(<key>, <jlif>)` declaration, which is a PAIR: C's `linkSup` node
@@ -2649,7 +2657,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     //
     // — a never-connected CA link, so the record stays UDF=1. Only the EMPTY
     // text is an unset CONSTANT link. The string constant a long-string record
-    // takes is the JSON `{const:"hello"}` handled above ([`load_link_ls`]).
+    // takes is `{const:"hello"}` or a bare `["hello"]` ([`load_link_ls`]).
 
     // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
     //

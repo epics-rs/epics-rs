@@ -43,8 +43,8 @@ async fn oval_is_val_only_past_the_snam_lookup() {
         assert_eq!(oval(&db, name), Some(EpicsValue::Long(want)), "{name}.OVAL");
         let rec = db.get_record(name).unwrap();
         assert_eq!(
-            rec.write().check_deadband_ext(),
-            (posts, posts),
+            rec.write().record.monitor_value_changed(),
+            Some(posts),
             "{name}: VAL 3 against OVAL {want}"
         );
     }
@@ -58,7 +58,7 @@ async fn a_posted_val_advances_oval() {
         .record
         .put_field("VAL", EpicsValue::Long(4))
         .unwrap();
-    assert_eq!(rec.write().check_deadband_ext(), (true, true));
+    assert_eq!(rec.write().record.monitor_value_changed(), Some(true));
     assert_eq!(oval(&db, "OK"), Some(EpicsValue::Long(4)));
 
     // The subroutine puts 3 back; that is a change against OVAL 4.

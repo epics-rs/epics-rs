@@ -2933,6 +2933,14 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether an alarm transition alone posts the deadband field. C
+    /// `monitor()` posts VAL inside `if (monitor_mask)` for every type but
+    /// aSub, whose guard is `if (prec->val != prec->oval)` (`aSubRecord.c:414`):
+    /// there the alarm bits ride a changed VAL and never post it alone.
+    fn alarm_alone_posts_value(&self) -> bool {
+        true
+    }
+
     /// Per-record VALUE/LOG monitor gate for record types that post a
     /// monitor *only when the value actually changed* — and have no
     /// MDEL/ADEL deadband to express that.
@@ -6231,16 +6239,11 @@ mod tests {
                     .and_then(CycleValue::from_epics)
                     .unwrap_or(CycleValue::Double(absent))
             };
-            // aSub keeps C's one `oval` for both (`aSubRecord.c:414`).
-            let (mlst, alst) = match *record_type {
-                "aSub" => ("OVAL", "OVAL"),
-                _ => ("MLST", "ALST"),
-            };
             let raw = [
                 cell("MDEL", 0.0),
                 cell("ADEL", 0.0),
-                cell(mlst, last_posted[0]),
-                cell(alst, last_posted[1]),
+                cell("MLST", last_posted[0]),
+                cell("ALST", last_posted[1]),
             ];
             let want = r
                 .val()

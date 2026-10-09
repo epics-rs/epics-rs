@@ -96,7 +96,10 @@ fn seed_deadband_tracking_seeds_trackers_and_derives_nothing() {
     ao.put_field("VAL", EpicsValue::Double(2.5)).unwrap();
     ao.seed_deadband_tracking(DsetInit::Succeeded);
     assert_eq!(cell(&*ao, "ALST"), 2.5, "aoRecord.c:158");
-    assert_eq!(cell(&*ao, "OVAL"), 0.0, "OVAL is aoRecord.c:156");
+    // OVAL/PVAL are previous-value cells like MLST, and ao's tail has no
+    // convert: all of it sits behind aoRecord.c:152's status return.
+    assert_eq!(cell(&*ao, "OVAL"), 2.5, "aoRecord.c:155");
+    assert_eq!(cell(&*ao, "RVAL"), 0.0, "ao converts nothing at init");
 
     let mut md = create_record("mbboDirect").unwrap();
     md.put_field("VAL", EpicsValue::Long(5)).unwrap();

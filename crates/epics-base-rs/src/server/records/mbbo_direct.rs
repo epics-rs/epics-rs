@@ -172,13 +172,26 @@ impl Record for MbboDirectRecord {
     /// `caput M.B3 1` on a closed-loop record moved VAL until the next process
     /// cycle overwrote it, which is the confusion C is refusing to allow.
     ///
-    /// Only the pass-0 arm is a refusal. The pass-1 arm (`:271-291`, the bit
-    /// into VAL plus OBIT and `convert`) is the framework's `put_field` +
-    /// `bits_to_val`, which is why this hook has nothing to do when `after`.
+    /// The pass-1 arm (`:271-291`) folds the one bit written into VAL and
+    /// converts. It is here and not in `put_field` because a `.db` load
+    /// stores B0-B1F with no special, so VAL keeps what the file set.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if !after && self.omsl == 1 && BIT_NAMES.contains(&field) {
-            return Err(CaError::ReadOnlyField(field.to_string()));
+        let Some(idx) = BIT_NAMES.iter().position(|&n| n == field) else {
+            return Ok(());
+        };
+        if !after {
+            if self.omsl == 1 {
+                return Err(CaError::ReadOnlyField(field.to_string()));
+            }
+            return Ok(());
         }
+        let bit = 1u32 << idx;
+        if self.bits[idx] != 0 {
+            self.val |= bit;
+        } else {
+            self.val &= !bit;
+        }
+        self.convert();
         Ok(())
     }
 
@@ -299,7 +312,9 @@ impl Record for MbboDirectRecord {
     /// C `mbboDirectRecord.c:311-314` `monitor()`: `if (prec->mlst != prec->val) { events |=
     /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
     /// committed HERE, at C's position, never captured during `process()`.
+    /// `:240` re-derives the bits first, for any VAL the dset changed.
     fn monitor_value_changed(&mut self) -> Option<bool> {
+        self.val_to_bits();
         let changed = self.mlst != self.val;
         if changed {
             self.mlst = self.val;
@@ -384,6 +399,8 @@ impl Record for MbboDirectRecord {
         // when a failed closed-loop DOL read took C's `goto CONTINUE`
         // (`closed_loop_dol_read_failed`).
         if !self.skip_convert {
+            // `mbboDirectRecord.c:196-198`.
+            self.val_to_bits();
             self.convert();
         }
         self.skip_convert = false;
@@ -457,15 +474,12 @@ impl Record for MbboDirectRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => {
-                match value {
-                    EpicsValue::Long(v) => self.val = v as u32,
-                    EpicsValue::Short(v) => self.val = v as u32,
-                    EpicsValue::Char(v) => self.val = v as u32,
-                    _ => return Err(CaError::TypeMismatch("VAL".into())),
-                }
-                self.val_to_bits();
-            }
+            "VAL" => match value {
+                EpicsValue::Long(v) => self.val = v as u32,
+                EpicsValue::Short(v) => self.val = v as u32,
+                EpicsValue::Char(v) => self.val = v as u32,
+                _ => return Err(CaError::TypeMismatch("VAL".into())),
+            },
             // RVAL/RBV/MASK are DBF_ULONG: accept the native ULong and
             // tolerate the legacy signed Long (device support / autosave).
             "RVAL" => {
@@ -586,7 +600,6 @@ impl Record for MbboDirectRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;
-                    self.bits_to_val();
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }

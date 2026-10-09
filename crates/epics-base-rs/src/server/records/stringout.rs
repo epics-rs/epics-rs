@@ -253,6 +253,14 @@ impl Record for StringoutRecord {
         }
     }
 
+    // C `stringoutRecord.c:69` copies VAL after `:66-67` returns a nonzero
+    // dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            self.oval = self.val.clone();
+        }
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             // C truncates VAL/OVAL/IVOV copies at MAX_STRING_SIZE (40).

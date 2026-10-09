@@ -629,11 +629,10 @@ impl PvDatabase {
         if !crate::server::scan::scan_is_running() {
             return;
         }
-        let want = normalize_event_name(event_name);
-        if want.is_empty() {
-            // `eventNameToHandle` returns NULL for "0"/empty — no event.
+        // `eventNameToHandle` returns NULL for "0"/empty — no event.
+        let Some(want) = EventName::of(event_name) else {
             return;
-        }
+        };
         let Some(list) = ScanType::Event.scan_list() else {
             return;
         };
@@ -663,8 +662,7 @@ impl PvDatabase {
                     None => continue,
                 },
             };
-            let evnt = rec.read().common.evnt.clone();
-            if normalize_event_name(&evnt) != want {
+            if EventName::of(&rec.read().common.evnt) != Some(want) {
                 continue;
             }
             let _ = self.process_record_with_links_resolved(name, rec, &mut visited);
@@ -815,38 +813,53 @@ impl ScanCursor<'_> {
     }
 }
 
-/// Normalise an EPICS event name for routing comparison.
-///
-/// Mirrors `dbScan.c::eventNameToHandle` (`dbScan.c:469-533`):
+/// The event an EPICS event name resolves to, borrowed from the name —
+/// C `eventNameToHandle`'s identity (`dbScan.c:469-533`):
 /// * leading/trailing whitespace is stripped;
-/// * a string that parses as a number with an integer part in
-///   `[1,255]` is canonicalised to that integer's decimal form
-///   (so numeric events from calc records match symbolic "5");
-/// * `"0"` (and anything that resolves to event 0) becomes empty —
-///   C's `eventNameToHandle` returns NULL for event 0.
-pub(crate) fn normalize_event_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Ok(num) = trimmed.parse::<f64>() {
-        if num >= 0.0 && num < 256.0 {
-            let int = num as i64;
-            if int < 1 {
-                // event 0 → no event
-                return String::new();
-            }
-            return int.to_string();
+/// * a string that parses as a number with an integer part in `[1,255]` is
+///   that event number (so `"5"`, `" 5 "` and `"5.0"` from a calc record name
+///   one event);
+/// * anything that resolves to event 0, and an empty name, is no event —
+///   C's `eventNameToHandle` returns NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventName<'a> {
+    Number(u8),
+    Named(&'a str),
+}
+
+impl<'a> EventName<'a> {
+    pub(crate) fn of(name: &'a str) -> Option<Self> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
         }
-        // Numeric but outside [0,256): fall through to literal match.
+        if let Ok(num) = trimmed.parse::<f64>()
+            && (0.0..256.0).contains(&num)
+        {
+            // `(0.0..256.0)` holds, so the integer part fits `u8`.
+            return match num as u8 {
+                0 => None,
+                n => Some(Self::Number(n)),
+            };
+        }
+        // Numeric but outside [0,256): matched literally.
+        Some(Self::Named(trimmed))
     }
-    trimmed.to_string()
+}
+
+impl std::fmt::Display for EventName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number(n) => write!(f, "{n}"),
+            Self::Named(s) => f.write_str(s),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::EventName;
     use super::PvDatabase;
-    use super::normalize_event_name;
     use crate::server::record::ScanType;
 
     /// The cycle guard belongs to the frame that inserted it, and a frame
@@ -1001,18 +1014,22 @@ mod tests {
 
     #[test]
     fn event_name_numeric_normalisation() {
+        let of = |n| EventName::of(n).map(|e| e.to_string());
         // Whitespace trimmed, numeric forms canonicalised.
-        assert_eq!(normalize_event_name(" 5 "), "5");
-        assert_eq!(normalize_event_name("5.0"), "5");
-        assert_eq!(normalize_event_name("5"), "5");
+        assert_eq!(EventName::of(" 5 "), Some(EventName::Number(5)));
+        assert_eq!(EventName::of("5.0"), Some(EventName::Number(5)));
+        assert_eq!(of("5"), Some("5".into()));
+        assert_eq!(EventName::of("255.9"), Some(EventName::Number(255)));
         // Event 0 / empty → no event.
-        assert_eq!(normalize_event_name("0"), "");
-        assert_eq!(normalize_event_name(""), "");
-        assert_eq!(normalize_event_name("   "), "");
+        assert_eq!(of("0"), None);
+        assert_eq!(of("0.5"), None);
+        assert_eq!(of(""), None);
+        assert_eq!(of("   "), None);
         // Symbolic name preserved.
-        assert_eq!(normalize_event_name("myEvent"), "myEvent");
-        assert_eq!(normalize_event_name(" myEvent "), "myEvent");
+        assert_eq!(of("myEvent"), Some("myEvent".into()));
+        assert_eq!(of(" myEvent "), Some("myEvent".into()));
         // Numeric out of [0,256) is treated literally.
-        assert_eq!(normalize_event_name("999"), "999");
+        assert_eq!(of("999"), Some("999".into()));
+        assert_eq!(of("256"), Some("256".into()));
     }
 }

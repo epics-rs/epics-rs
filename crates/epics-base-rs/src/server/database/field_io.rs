@@ -81,25 +81,11 @@ fn check_put_disabled(
 /// [`PvDatabase::put_alarm_ack_from_ca`].
 ///
 /// `field` must already be upper-cased.
-fn check_no_mod(
-    instance: &crate::server::record::RecordInstance,
-    field: &str,
-    desc: Option<&'static crate::server::record::FieldDesc>,
-) -> CaResult<()> {
-    if instance.is_no_mod_at(field, desc) {
+fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -> CaResult<()> {
+    if instance.is_no_mod(field) {
         return Err(CaError::ReadOnlyField(field.to_string()));
     }
     Ok(())
-}
-
-/// `field`'s declaration from the cell's record type — the table the type
-/// resolved once, not [`Record::field_list`](crate::server::record::Record)'s
-/// per-call type match.
-fn field_desc_at(
-    rec: &crate::server::record::RecordCell,
-    field: &str,
-) -> Option<&'static crate::server::record::FieldDesc> {
-    crate::server::record::record_instance::field_desc_in(rec.rdes().fields, field)
 }
 
 /// The declared-field store of a body that can write a link's text: a
@@ -145,9 +131,14 @@ fn put_declared(
 fn check_no_mod_in_db_put(
     instance: &crate::server::record::RecordInstance,
     field: &str,
-    desc: Option<&'static crate::server::record::FieldDesc>,
+    at: &crate::server::record::record_instance::PutAddr,
 ) -> CaResult<()> {
-    check_no_mod(instance, field, desc).inspect_err(|_| {
+    let checked = if instance.is_no_mod_at(field, at) {
+        Err(CaError::ReadOnlyField(field.to_string()))
+    } else {
+        Ok(())
+    };
+    checked.inspect_err(|_| {
         crate::server::recgbl::rec_gbl_dbaddr_error(
             "Attempt to modify noMod field",
             &instance.name,
@@ -1080,6 +1071,7 @@ fn post_array_info(
 fn dbput_post_put_field(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
+    at: &crate::server::record::record_instance::PutAddr,
     backing: crate::server::database::LinkBacking<'_>,
 ) {
     let suppress = field == instance.record.primary_field()
@@ -1090,8 +1082,9 @@ fn dbput_post_put_field(
             .any(|f| f.eq_ignore_ascii_case(field));
     if !suppress {
         instance.cleanup_subscribers();
-        instance.notify_field_backed(
+        instance.notify_field_at(
             field,
+            at,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
             backing,
         );
@@ -1420,7 +1413,7 @@ impl PvDatabase {
         // (iocsource.cpp:365-369), so a read-only field on a DISP=1 record
         // reports S_db_noMod, not S_db_putDisabled; the two errors carry
         // different wire text.
-        check_no_mod(&instance, &field_upper, instance.field_desc(&field_upper))?;
+        check_no_mod(&instance, &field_upper)?;
         // DISP=1 blocks a put to any field except DISP itself — the shared
         // gate owner, identical to the one the CA route crosses.
         check_put_disabled(&instance, &field_upper)?;
@@ -1487,8 +1480,8 @@ impl PvDatabase {
 
         // Records — alias-aware (epics-base PR #336).
         if let Some((canonical, rec)) = self.lookup_record(base) {
-            let desc = field_desc_at(&rec, &field);
-            return self.put_record_body(&canonical, &rec, &field, desc, value);
+            let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
+            return self.put_record_body(&canonical, &rec, &field, &at, value);
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
@@ -1504,7 +1497,7 @@ impl PvDatabase {
         canonical: &str,
         rec: &std::sync::Arc<crate::server::record::RecordCell>,
         field: &str,
-        desc: Option<&'static crate::server::record::FieldDesc>,
+        at: &crate::server::record::record_instance::PutAddr,
         value: EpicsValue,
     ) -> CaResult<()> {
         // The caller holds the advisory write gate (`dbScanLock`
@@ -1541,11 +1534,11 @@ impl PvDatabase {
             // stops a record's OUT link from truncating a waveform's NELM.
             // The refusal is returned to the caller; `write_out_link_value`
             // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
-            check_no_mod_in_db_put(&instance, field, desc)?;
+            check_no_mod_in_db_put(&instance, field, at)?;
 
             // C `dbPut` refuses a link-field target the same way, before
             // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
-            check_not_link_field(field, desc)?;
+            check_not_link_field(field, at.field.desc)?;
 
             let request = dbput_request(&*instance.record, field, value)?;
 
@@ -1561,7 +1554,7 @@ impl PvDatabase {
             // invalidation (and the downstream `DBE_PROPERTY`
             // emission) can be skipped when the put is a no-op —
             // epics-base faac1df1.
-            let prev_value = instance.resolve_field_stored_at(field, desc);
+            let prev_value = instance.resolve_field_stored_at(field, at.field.desc);
             let old_nord = array_nord_before_put(&instance, field);
 
             // Link writes the record's `special()` makes itself (C runs them
@@ -1656,7 +1649,7 @@ impl PvDatabase {
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed_at(
                 field,
-                desc,
+                at,
                 prev_value.as_ref(),
                 link_backing,
             );
@@ -1669,7 +1662,7 @@ impl PvDatabase {
             // status pusher, all post immediately. Pre-fix this body posted
             // nothing at all, so camonitor on anything written via `put_pv`
             // went silent forever.
-            dbput_post_put_field(&mut instance, field, link_backing);
+            dbput_post_put_field(&mut instance, field, at, link_backing);
 
             // C's `put_array_info` is likewise reached from every `dbPut` —
             // an OUT link that shortens a waveform posts NORD in C even when
@@ -1885,13 +1878,13 @@ impl PvDatabase {
             let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
             let link_backing = link_backing.as_link_backing();
             let (common_result, special_actions) = {
+                let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
                 let mut instance = rec.write();
 
                 // Same `dbPut` gate as `put_pv` — this is the third `dbPut` body
                 // (value + monitor post), and C has ONE.
-                let desc = field_desc_at(&rec, &field);
-                check_no_mod_in_db_put(&instance, &field, desc)?;
-                check_not_link_field(&field, desc)?;
+                check_no_mod_in_db_put(&instance, &field, &at)?;
+                check_not_link_field(&field, at.field.desc)?;
 
                 let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -1900,7 +1893,7 @@ impl PvDatabase {
                 // `dbPut` body and must match the other two.
                 instance.record.special(&field, false)?;
 
-                let old_value = instance.resolve_field_stored_at(&field, desc);
+                let old_value = instance.resolve_field_stored_at(&field, at.field.desc);
                 let old_stat = instance.common.stat;
                 let old_sevr = instance.common.sevr;
                 let old_nord = array_nord_before_put(&instance, &field);
@@ -1965,7 +1958,7 @@ impl PvDatabase {
                 // fires on real changes, not no-op writes).
                 instance.notify_field_written_if_changed_at(
                     &field,
-                    desc,
+                    &at,
                     old_value.as_ref(),
                     link_backing,
                 );
@@ -1976,7 +1969,7 @@ impl PvDatabase {
                 // ladder, DESC) is `None` to `Record::get_field` alone, and
                 // `Some` != `None` made every unchanged put to it restamp
                 // the record and post.
-                let new_value = instance.resolve_field_stored(&field);
+                let new_value = instance.resolve_field_stored_at(&field, at.field.desc);
                 let value_changed = old_value != new_value;
                 let alarm_changed =
                     old_stat != instance.common.stat || old_sevr != instance.common.sevr;
@@ -2654,6 +2647,7 @@ impl PvDatabase {
         let rec = self
             .get_record(record_name)
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
+        let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
         // Normalise to the canonical name for the rest of this
         // function — every subsequent call (PACT/LCNT lookup,
         // `process_record_with_links`, `update_scan_index`) uses the
@@ -2706,7 +2700,7 @@ impl PvDatabase {
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route
             // ([`check_no_mod_in_db_put`]).
-            check_no_mod_in_db_put(&instance, &field, instance.field_desc(&field))?;
+            check_no_mod_in_db_put(&instance, &field, &at)?;
         }
         let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
         // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
@@ -2989,7 +2983,7 @@ impl PvDatabase {
                 special_before_put(&mut instance, &field);
 
                 // Capture pre-put value for faac1df1 idempotent-write suppression.
-                let prev_value = instance.resolve_field_stored(&field);
+                let prev_value = instance.resolve_field_stored_at(&field, at.field.desc);
                 let old_nord = array_nord_before_put(&instance, &field);
 
                 // Try record-specific field first; fall back to common on FieldNotFound.
@@ -3069,7 +3063,12 @@ impl PvDatabase {
 
                 // Invalidate metadata cache only if the metadata-class
                 // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
+                instance.notify_field_written_if_changed_at(
+                    &field,
+                    &at,
+                    prev_value.as_ref(),
+                    link_backing,
+                );
 
                 // `putf` is neither set nor cleared anywhere in this block: C's
                 // `dbPut` does not touch it. It is raised in `put_driven_process`
@@ -3087,7 +3086,7 @@ impl PvDatabase {
                 // (ACKT/ACKS have no arm here: they are SPC_NOMOD, refused by
                 // the gate above. Alarm acknowledgement arrives as a DBR
                 // request type, through [`Self::put_alarm_ack_from_ca`].)
-                dbput_post_put_field(&mut instance, &field, link_backing);
+                dbput_post_put_field(&mut instance, &field, &at, link_backing);
 
                 // The NORD post, through the one owner — C reaches `put_array_info`
                 // from `dbPut`, so the CA route posts it exactly like the internal
@@ -3457,6 +3456,7 @@ impl PvDatabase {
 
         // Records — alias-aware (epics-base PR #336).
         if let Some(rec) = self.get_record(base) {
+            let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
             // `put_pv_no_process` is a public record-write API
             // (autosave restore). It must take the advisory write gate
             // (`dbScanLock` analogue) so an autosave restore cannot
@@ -3492,7 +3492,7 @@ impl PvDatabase {
                 // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
                 // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
                 // IPTR) restorable, and dbCommon's with them.
-                check_no_mod_in_db_put(&instance, &field, instance.field_desc(&field))?;
+                check_no_mod_in_db_put(&instance, &field, &at)?;
             }
             let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
@@ -3532,7 +3532,7 @@ impl PvDatabase {
                 instance.record.special(&field, false)?;
                 special_before_put(&mut instance, &field);
 
-                let prev_value = instance.resolve_field_stored(&field);
+                let prev_value = instance.resolve_field_stored_at(&field, at.field.desc);
                 // C's `reboot_restore` writes through `dbPutField` → `dbPut`,
                 // which renders the request in the destination field's shape
                 // AND THEN runs the `dbPutConvertRoutine` type row
@@ -3625,7 +3625,12 @@ impl PvDatabase {
                 clear_udf_on_value_put(&mut instance, &field);
                 // Invalidate metadata cache only if the metadata-class
                 // field actually changed (faac1df1).
-                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
+                instance.notify_field_written_if_changed_at(
+                    &field,
+                    &at,
+                    prev_value.as_ref(),
+                    link_backing,
+                );
                 // The drain of the posts the after pass queued — `special()`
                 // and its post are ONE step, so a mark cannot outlive the put
                 // that made it and be emitted by some later cycle.

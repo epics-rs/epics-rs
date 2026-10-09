@@ -3031,7 +3031,12 @@ pub trait Record: Send + Sync + 'static {
         match val_cell(self) {
             CycleRead::Value(v) => Some(v.alarm_limit()),
             CycleRead::Absent => None,
-            CycleRead::ByName => self.val().as_ref().and_then(AlarmLimit::from_stored),
+            // An array has no deadband; lent, it answers that without a copy.
+            CycleRead::ByName => match self.monitor_value_view() {
+                Some(ValueView::Scalar(v)) => Some(v.alarm_limit()),
+                Some(_) => None,
+                None => self.val().as_ref().and_then(AlarmLimit::from_stored),
+            },
         }
     }
 
@@ -5337,6 +5342,13 @@ pub trait Record: Send + Sync + 'static {
     fn skips_timestamp_when_undefined(&self) -> bool {
         false
     }
+
+    /// The value [`Self::val`] answers, lent instead of cloned — what C
+    /// `monitor()` reads in place. `None`: the type does not lend it, and the
+    /// framework asks [`Self::val`].
+    fn monitor_value_view(&self) -> Option<ValueView<'_>> {
+        None
+    }
 }
 
 /// The body of [`Record::put_field_internal`] — the framework's internal write
@@ -6906,6 +6918,24 @@ impl CycleValue {
             other => AlarmLimit::Double(other.to_f64()),
         }
     }
+}
+
+/// A stored value, borrowed: a scalar by value, an array by slice. See
+/// [`Record::monitor_value_view`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ValueView<'a> {
+    Scalar(CycleValue),
+    Double(&'a [f64]),
+    Float(&'a [f32]),
+    Long(&'a [i32]),
+    ULong(&'a [u32]),
+    Int64(&'a [i64]),
+    UInt64(&'a [u64]),
+    Short(&'a [i16]),
+    UShort(&'a [u16]),
+    Char(&'a [u8]),
+    UChar(&'a [u8]),
+    Enum(&'a [u16]),
 }
 
 impl From<CycleValue> for EpicsValue {

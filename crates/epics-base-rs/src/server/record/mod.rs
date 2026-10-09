@@ -61,7 +61,7 @@ pub use record_trait::{
     FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkReadAs,
     MonitorDeadbandCells, OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome,
     ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, SimmCells,
-    Special, SubroutineFn, ValuePostGate, arg_letter_offset, arg_link_field,
+    Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
     calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
     input_link_slots_of, link_value_in_field_shape, put_field_internal_default,
     put_value_in_field_shape, seed_input_links,

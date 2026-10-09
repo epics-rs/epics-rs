@@ -1229,10 +1229,10 @@ impl PvDatabase {
         // A field the target hands out a slot for is read as the `f64` the
         // numeric funnel would make of it; any other goes by name and
         // through the funnel.
-        let value = match at.field.slot {
+        let value = match at.put.field.slot {
             Some(slot) => instance.record.get_slot_f64(slot).map(Ok),
             None => self
-                .read_field_at(&instance, field, at.field)
+                .read_field_at(&instance, field, at.put.field)
                 .map(|value| value.into_double()),
         };
         let alarm = inherits.then(|| LinkAlarm::committed(&instance.common));
@@ -6275,6 +6275,7 @@ impl PvDatabase {
                 // `LNKn` are `DBF_FWDLINK` (dbScanFwdLink), driving no value.
                 let dispatched = if plan.multi_output_dispatch {
                     self.dispatch_multi_output(
+                        name,
                         rec,
                         super::links::MultiOutPhase::Output { skip_out },
                         visited,
@@ -6569,8 +6570,12 @@ impl PvDatabase {
         // skips them here (`multi_out_phase_of`).
         if src.plan.multi_output_dispatch {
             guard.release();
-            let _ =
-                self.dispatch_multi_output(rec, super::links::MultiOutPhase::ForwardLink, visited);
+            let _ = self.dispatch_multi_output(
+                name,
+                rec,
+                super::links::MultiOutPhase::ForwardLink,
+                visited,
+            );
         }
 
         // 4.55. event record: post the named software event.
@@ -7508,8 +7513,12 @@ impl PvDatabase {
         // re-dispatching them here would drive every LNKn twice.
         let plan = rec.process_plan();
         if plan.multi_output_dispatch {
-            let _ =
-                self.dispatch_multi_output(rec, super::links::MultiOutPhase::ForwardLink, visited);
+            let _ = self.dispatch_multi_output(
+                &canonical,
+                rec,
+                super::links::MultiOutPhase::ForwardLink,
+                visited,
+            );
         }
 
         // event record: post the named software event.

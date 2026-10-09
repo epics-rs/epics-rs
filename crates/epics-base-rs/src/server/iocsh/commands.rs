@@ -4627,7 +4627,7 @@ fn cmd_scanpel() -> CommandDef {
         }],
         "scanpel [\"event name\"] — Print info for records with SCAN = \"Event\".",
         |args: &[ArgValue], ctx: &CommandContext| {
-            use crate::server::database::scan_index::normalize_event_name;
+            use crate::server::database::scan_index::EventName;
             use crate::server::record::ScanType;
 
             // C walks `pevent_list`, which `scanAdd` fills at `iocInit`, so
@@ -4651,10 +4651,10 @@ fn cmd_scanpel() -> CommandDef {
                 let Some(rec) = ctx.db().get_record(&name) else {
                     continue;
                 };
-                let evnt = normalize_event_name(&rec.read().common.evnt);
-                if evnt.is_empty() {
+                let Some(evnt) = EventName::of(&rec.read().common.evnt).map(|e| e.to_string())
+                else {
                     continue;
-                }
+                };
                 by_event.entry(evnt).or_default().push(name);
             }
 

@@ -742,15 +742,15 @@ impl PvDatabase {
             return None;
         }
         let (name, rec) = self.lookup_record(&db.target().record)?;
-        let field =
-            crate::server::record::record_instance::FieldAddr::resolve_in(&rec, &db.target().field);
+        let put =
+            crate::server::record::record_instance::PutAddr::resolve_in(&rec, &db.target().field);
         Some(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
-                .then(|| super::field_io::double_slot(field))
+                .then(|| super::field_io::double_slot(put.field))
                 .flatten(),
             rec,
             name,
-            field,
+            put,
         })
     }
 
@@ -784,7 +784,7 @@ impl PvDatabase {
     /// the verbatim `pv_link.pvname`) and the local name never has it.
     fn read_db_target(&self, db: &crate::server::record::DbLink) -> TargetValue {
         match self.db_link_addr(db) {
-            Some(at) => self.target_value_of(&at.rec, db, at.field),
+            Some(at) => self.target_value_of(&at.rec, db, at.put.field),
             None => self.read_db_target_by_name(db),
         }
     }
@@ -843,7 +843,7 @@ impl PvDatabase {
             Some(set) => at.rec.read_in(set),
             None => at.rec.read(),
         };
-        let mut value = self.read_field_at(&instance, &target.field, at.field);
+        let mut value = self.read_field_at(&instance, &target.field, at.put.field);
         let alarm =
             (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
                 SourceAlarm::local(
@@ -2328,9 +2328,7 @@ impl PvDatabase {
         // this releases replays on its next cycle and an NPP link — `gate` is
         // `None` below — leaves it parked, exactly as C does.
         let put_result = match &addr {
-            Some(at) => {
-                self.put_record_body(&at.name, &at.rec, &target.field, at.field.desc, value)
-            }
+            Some(at) => self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value),
             None => self.put_pv_already_locked(&local_pv_name(target), value),
         };
 
@@ -3187,8 +3185,10 @@ impl PvDatabase {
     /// for the caller to fold into `nsev` before the alarm commit. The
     /// [`MultiOutPhase::ForwardLink`] phase returns `None`: a fanout raises
     /// its range alarm directly into the already-committed SEVR.
+    /// `name` is the record's canonical name, the frame's.
     pub(crate) fn dispatch_multi_output(
         &self,
+        name: &str,
         rec: InFrame<'_>,
         phase: MultiOutPhase,
         visited: &mut ProcStack,
@@ -3491,7 +3491,7 @@ impl PvDatabase {
                 // `callbackSetPriority(prec->prio, &pcb->callback)` — so the
                 // band is taken here, under the same write lock that sets PACT.
                 if !active.is_empty() {
-                    let rec_name = rec.read().name.clone();
+                    let rec_name = name.to_owned();
                     let prio = {
                         let instance = rec.write();
                         instance.enter_pact();
@@ -5493,7 +5493,7 @@ mod db_link_addr_tests {
             assert_eq!(
                 link.target_is_val()
                     && link.target().json_suffix.is_none()
-                    && crate::server::database::field_io::double_slot(at.field).is_some(),
+                    && crate::server::database::field_io::double_slot(at.put.field).is_some(),
                 slot_path,
                 "{text}"
             );

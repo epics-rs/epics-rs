@@ -135,11 +135,18 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) ->
 ///
 /// [`FieldDesc::unreadable`]: super::FieldDesc::unreadable
 ///
-/// Read only through [`RecordInstance::is_no_mod`].
+/// Read only through [`declared_no_mod`].
 const DBCOMMON_NOMOD: &[&str] = &[
     "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
     "PUTF", "RPRO", "TIME", "UTAG",
 ];
+
+/// The static sources of [`RecordInstance::is_no_mod`]: the dbCommon
+/// `SPC_NOMOD` set, then the type's declaration `desc` of `field`.
+fn declared_no_mod(field: &str, desc: Option<&'static FieldDesc>) -> bool {
+    DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field))
+        || desc.is_some_and(|f| f.read_only)
+}
 
 /// Is `field` (already uppercased) a `dbCommon` `DBF_NOACCESS` internal —
 /// a name C resolves but never serves?
@@ -1612,6 +1619,10 @@ pub struct RecordCell {
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
     /// of the record.
     plan: ProcessPlan,
+    /// The record's own terms of [`walk_skip_term`], so a [`PutAddr`]
+    /// resolves without a borrow of the record. `&'static` answers the record
+    /// never changes ([`RecordInstance::walk_skips`]).
+    walk_terms: (&'static str, &'static [&'static str]),
     /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
     /// the database load sequence: the scan index's secondary sort key, and
     /// the order every whole-database walk visits.
@@ -1699,6 +1710,45 @@ impl FieldAddr {
     }
 }
 
+/// A `dbPut` target: the [`FieldAddr`] plus the per-field answers `dbPut`
+/// asks on every put, settled with the address so a put asks none by name.
+#[derive(Clone, Copy)]
+pub(crate) struct PutAddr {
+    pub(crate) field: FieldAddr,
+    /// The declaration's half of [`RecordInstance::is_no_mod`].
+    no_mod: bool,
+    /// [`is_metadata_cache_source`].
+    cache_source: bool,
+    /// [`walk_skip_term`]: a published value is kept in `skipped_posted`.
+    walk_skip: bool,
+}
+
+impl PutAddr {
+    /// `field` is upper-case already. Takes no lock, as
+    /// [`FieldAddr::resolve_in`].
+    pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
+        let addr = FieldAddr::resolve_in(rec, field);
+        let (deadband_field, event_posted) = rec.walk_terms;
+        PutAddr {
+            no_mod: declared_no_mod(field, addr.desc),
+            cache_source: is_metadata_cache_source(field),
+            walk_skip: walk_skip_term(field, deadband_field, event_posted),
+            field: addr,
+        }
+    }
+}
+
+/// A `last_posted` entry: the value last published to the field, and the
+/// field's declaration, settled when the field was first published so the
+/// monitor walk reads it without a name scan. `upper`: the key is already
+/// upper-case, as [`RecordInstance::resolve_field_upper_at`] needs.
+#[derive(Debug)]
+struct Published {
+    value: EpicsValue,
+    desc: Option<&'static FieldDesc>,
+    upper: bool,
+}
+
 /// Whether `record_type`'s `.dbd` declares `field` — C `dbFindField` on the
 /// type's declared list, which `pvNameLookup` (`dbChannel.c:311-329`) asks
 /// before it falls through to the attribute table.
@@ -1741,6 +1791,10 @@ impl RecordCell {
                 .map(|(_, vf)| instance.record.field_slot(vf))
                 .collect(),
             plan: ProcessPlan::of(&*instance.record),
+            walk_terms: (
+                instance.record.monitor_deadband_field(),
+                instance.record.event_posted_fields(),
+            ),
             load_order,
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
@@ -2407,7 +2461,8 @@ pub(crate) struct ResolvedTarget {
     pub(crate) rec: Arc<RecordCell>,
     /// The record's canonical name — the link may name an alias.
     pub(crate) name: Arc<str>,
-    pub(crate) field: FieldAddr,
+    /// The field, with the answers a `dbPut` through the link asks.
+    pub(crate) put: PutAddr,
     /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
     /// addresses an unfiltered `VAL` the record serves as `DBF_DOUBLE`.
     pub(crate) f64_slot: Option<super::record_trait::FieldSlot>,
@@ -2548,7 +2603,7 @@ pub struct RecordInstance {
     /// [`RecordInstance::posted_value`] and every poster —
     /// [`RecordInstance::notify_field_with_origin`] included — advances it
     /// through the owner.
-    last_posted: HashMap<String, EpicsValue>,
+    last_posted: HashMap<String, Published>,
     /// Published values for the fields [`Self::collect_subscriber_posts`]'s
     /// change-detection walk SKIPS whatever happens — the deadband field, the
     /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
@@ -2762,12 +2817,21 @@ pub(crate) struct MonitorPlan {
     pub(crate) array_monitor_post: bool,
     /// [`Record::monitor_deadband_field`].
     pub(crate) deadband_field: &'static str,
+    /// `deadband_field`'s declaration, so the post reads a non-VAL deadband
+    /// field without a name scan.
+    pub(crate) deadband_desc: Option<&'static FieldDesc>,
     /// The deadband field is in [`Record::value_only_change_fields`] or
     /// [`Record::fields_posted_with_monitor_mask`]: C posts it without
     /// `DBE_LOG`.
     pub(crate) log_suppressed: bool,
     /// [`Record::fields_posted_with_value_mask`].
     pub(crate) value_masked: &'static [(&'static str, crate::server::record::ValuePostGate)],
+    /// `value_masked` holds a [`ValuePostGate::OnChangeForced`] field — the
+    /// only reader of [`Record::take_secondary_value_mask`], so a type without
+    /// one is never asked for it.
+    ///
+    /// [`ValuePostGate::OnChangeForced`]: crate::server::record::ValuePostGate::OnChangeForced
+    pub(crate) forced_secondary: bool,
     /// The change-detected aux fields' mask resolver.
     pub(crate) aux_post: AuxPostMask,
     /// [`Record::cycle_hooks`].
@@ -2786,11 +2850,18 @@ impl MonitorPlan {
             uses_deadband: record.uses_monitor_deadband(),
             array_monitor_post: record.has_array_monitor_post(),
             deadband_field,
+            deadband_desc: field_desc_of(record, deadband_field),
             log_suppressed: record.value_only_change_fields().contains(&deadband_field)
                 || record
                     .fields_posted_with_monitor_mask()
                     .contains(&deadband_field),
             value_masked: record.fields_posted_with_value_mask(),
+            forced_secondary: record
+                .fields_posted_with_value_mask()
+                .iter()
+                .any(|(_, gate)| {
+                    matches!(gate, crate::server::record::ValuePostGate::OnChangeForced)
+                }),
             aux_post: AuxPostMask::of(record),
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
@@ -3806,8 +3877,8 @@ impl RecordInstance {
     /// subscribers, or `None` when the framework has never published one.
     /// The read side of the `last_posted` contract — see the field's docs.
     pub(crate) fn posted_value(&self, field: &str) -> Option<&EpicsValue> {
-        if let Some(value) = self.last_posted.get(field) {
-            return Some(value);
+        if let Some(published) = self.last_posted.get(field) {
+            return Some(&published.value);
         }
         self.skipped_posted
             .iter()
@@ -3841,7 +3912,13 @@ impl RecordInstance {
     /// posts MUST NOT call it: they deliver nothing to a value-class
     /// subscriber, so the value is still owed.
     pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
-        if self.walk_skips(field) {
+        let walk_skip = self.walk_skips(field);
+        self.record_value_post_as(field, walk_skip, value);
+    }
+
+    /// [`Self::record_value_post`] with `walk_skip` = [`Self::walk_skips`]`(field)`.
+    fn record_value_post_as(&mut self, field: &str, walk_skip: bool, value: EpicsValue) {
+        if walk_skip {
             if let Some(slot) = self
                 .skipped_posted
                 .iter_mut()
@@ -3854,9 +3931,14 @@ impl RecordInstance {
             return;
         }
         if let Some(slot) = self.last_posted.get_mut(field) {
-            *slot = value;
+            slot.value = value;
         } else {
-            self.last_posted.insert(field.to_string(), value);
+            let published = Published {
+                value,
+                desc: self.field_desc(field),
+                upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
+            };
+            self.last_posted.insert(field.to_string(), published);
         }
     }
 
@@ -3881,7 +3963,7 @@ impl RecordInstance {
     ///
     /// A field with no declaration at all — a virtual field (`RTYP`, `TIME`) —
     /// has no `dbFldDes` in C either, so it is not property-class.
-    fn field_posts_property(desc: Option<&'static FieldDesc>) -> bool {
+    pub(crate) fn field_posts_property(desc: Option<&'static FieldDesc>) -> bool {
         desc.is_some_and(|d| d.prop)
     }
 
@@ -3926,19 +4008,37 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) {
         let upper = field.to_ascii_uppercase();
-        self.notify_field_written_if_changed_at(&upper, self.field_desc(&upper), prev, backing);
+        let desc = self.field_desc(&upper);
+        self.written_if_changed(
+            &upper,
+            is_metadata_cache_source(&upper),
+            desc,
+            prev,
+            backing,
+        );
     }
 
-    /// [`Self::notify_field_written_if_changed`] for an upper-case `field`
-    /// whose declaration the caller resolved — a `dbPut` body's.
+    /// [`Self::notify_field_written_if_changed`] for a settled put target;
+    /// `field` is upper-case.
     pub(crate) fn notify_field_written_if_changed_at(
         &mut self,
+        field: &str,
+        at: &PutAddr,
+        prev: Option<&EpicsValue>,
+        backing: LinkBacking<'_>,
+    ) {
+        self.written_if_changed(field, at.cache_source, at.field.desc, prev, backing);
+    }
+
+    /// `desc` is `upper`'s declaration ([`Self::field_desc`]).
+    fn written_if_changed(
+        &mut self,
         upper: &str,
+        cache_source: bool,
         desc: Option<&'static FieldDesc>,
         prev: Option<&EpicsValue>,
         backing: LinkBacking<'_>,
     ) {
-        let cache_source = is_metadata_cache_source(upper);
         let posts_property = Self::field_posts_property(desc);
         if !cache_source && !posts_property {
             return;
@@ -4047,18 +4147,12 @@ impl RecordInstance {
     ///
     /// `field` may be any case.
     pub fn is_no_mod(&self, field: &str) -> bool {
-        self.is_no_mod_at(field, self.field_desc(field))
+        declared_no_mod(field, self.field_desc(field)) || self.record.field_no_mod(field)
     }
 
-    /// [`Self::is_no_mod`] with `desc` = [`Self::field_desc`]`(field)`.
-    pub(crate) fn is_no_mod_at(&self, field: &str, desc: Option<&'static FieldDesc>) -> bool {
-        if DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field)) {
-            return true;
-        }
-        if desc.is_some_and(|f| f.read_only) {
-            return true;
-        }
-        self.record.field_no_mod(field)
+    /// [`Self::is_no_mod`] for a settled put target.
+    pub(crate) fn is_no_mod_at(&self, field: &str, at: &PutAddr) -> bool {
+        at.no_mod || self.record.field_no_mod(field)
     }
 
     /// Check if the record is currently processing (PACT equivalent).
@@ -6809,12 +6903,26 @@ impl RecordInstance {
         alarm_bits: EventMask,
         include_val: bool,
     ) {
-        use crate::server::record::{CyclePostMask, ValuePostGate, value_gate};
+        use crate::server::record::{CycleHooks, CyclePostMask, ValuePostGate, value_gate};
+
+        let hooks = self.monitor_plan.hooks;
+        // C's `if (monitor_mask)` is shut and the type holds no one-shot post
+        // state, so there is nothing to take, no old copy to advance and — with
+        // nothing subscribed or published — no field for the walk to reach.
+        // Every input is the plan or state the record already holds; the
+        // record itself is not asked.
+        if deadband_mask.is_empty()
+            && !self.monitor_plan.forced_secondary
+            && !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::FIRST_MONITOR))
+            && self.subscribers.is_empty()
+            && self.last_posted.is_empty()
+        {
+            return;
+        }
 
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let hooks = self.monitor_plan.hooks;
-        let mut cycle_posted = if hooks.has(crate::server::record::CycleHooks::CYCLE_POSTED) {
+        let mut cycle_posted = if hooks.has(CycleHooks::CYCLE_POSTED) {
             self.record.take_cycle_posted_fields()
         } else {
             Vec::new()
@@ -6822,7 +6930,7 @@ impl RecordInstance {
         // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
         // iocInit's per-cycle drain must not be able to eat. Merged here so
         // both reach the same branch with the same mask mapping.
-        if hooks.has(crate::server::record::CycleHooks::FIRST_MONITOR) {
+        if hooks.has(CycleHooks::FIRST_MONITOR) {
             let first_cycle = self.record.take_first_monitor_cycle();
             if !first_cycle.is_empty() {
                 cycle_posted.extend(first_cycle);
@@ -6832,8 +6940,13 @@ impl RecordInstance {
         // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
         // `OnChangeForced` fields sit behind, which the record may open on a
         // cycle where VAL's own mask is shut. TAKEn, like `cycle_posted`, so
-        // this loop may run only once per cycle.
-        let secondary_guard = deadband_mask | self.record.take_secondary_value_mask();
+        // this loop may run only once per cycle. Only an `OnChangeForced` gate
+        // reads the widening, so a type without one has nothing to take.
+        let secondary_guard = if self.monitor_plan.forced_secondary {
+            deadband_mask | self.record.take_secondary_value_mask()
+        } else {
+            deadband_mask
+        };
 
         // C aoRecord.c:536-549: the secondary block runs once per cycle, from
         // inside `if (monitor_mask)`, and each field's own `oraw != rval` test
@@ -6923,12 +7036,19 @@ impl RecordInstance {
         // the next subscriber's move-start 0 compared equal and was dropped.
         // A field with no entry has never been published; `add_subscriber`
         // seeds it from the value the subscriber is handed.
-        let tracked = self.subscribers.keys().chain(
-            self.last_posted
-                .keys()
-                .filter(|field| !self.subscribers.contains_key(*field)),
-        );
-        for field in tracked {
+        // Published fields first, read from the entry the iterator hands over;
+        // only a subscribed field never published costs a probe.
+        let tracked = self
+            .last_posted
+            .iter()
+            .map(|(field, published)| (field, Some(published)))
+            .chain(
+                self.subscribers
+                    .keys()
+                    .filter(|field| !self.last_posted.contains_key(*field))
+                    .map(|field| (field, None)),
+            );
+        for (field, published) in tracked {
             // `walk_skip_term` can only fire on a SUBSCRIBED field now:
             // `skipped_posted`, not `last_posted`, holds what it rejects.
             if walk_skip_term(field, deadband_field, event_posted)
@@ -6936,12 +7056,16 @@ impl RecordInstance {
             {
                 continue;
             }
-            let Some(val) = self.resolve_field(field) else {
+            let read = match published {
+                Some(p) if p.upper => self.resolve_field_upper_at(field, p.desc),
+                _ => self.resolve_field(field),
+            };
+            let Some(val) = read else {
                 continue;
             };
-            let changed = match self.posted_value(field) {
+            let changed = match published.map(|p| &p.value) {
                 Some(prev) => prev != &val,
-                None => true,
+                None => self.posted_value(field).is_none_or(|prev| prev != &val),
             };
             if let Some(gate) = value_gate(value_masked, field) {
                 // C posts this secondary value field with VAL's own monitor_mask,
@@ -7511,7 +7635,7 @@ impl RecordInstance {
         } else if field == "VAL" {
             self.record.val()
         } else {
-            self.resolve_field(field)
+            self.resolve_field_upper_at(field, self.monitor_plan.deadband_desc)
         };
         DeadbandPost {
             mask,
@@ -8478,6 +8602,47 @@ impl RecordInstance {
         origin: u64,
         backing: LinkBacking<'_>,
     ) {
+        self.post_field(
+            field,
+            mask,
+            origin,
+            backing,
+            |inst| inst.resolve_field(field),
+            |inst| inst.walk_skips(field),
+        );
+    }
+
+    /// [`Self::notify_field_backed`] for a settled put target; `field` is
+    /// upper-case.
+    pub(crate) fn notify_field_at(
+        &mut self,
+        field: &str,
+        at: &PutAddr,
+        mask: crate::server::recgbl::EventMask,
+        backing: LinkBacking<'_>,
+    ) {
+        self.post_field(
+            field,
+            mask,
+            0,
+            backing,
+            |inst| inst.resolve_field_upper_at(field, at.field.desc),
+            |_| at.walk_skip,
+        );
+    }
+
+    /// The body of [`Self::notify_field_with_origin`], with the field's read
+    /// and its [`Self::walk_skips`] answer supplied by the entry.
+    #[inline(always)]
+    fn post_field(
+        &mut self,
+        field: &str,
+        mask: crate::server::recgbl::EventMask,
+        origin: u64,
+        backing: LinkBacking<'_>,
+        read: impl FnOnce(&Self) -> Option<EpicsValue>,
+        walk_skip: impl FnOnce(&Self) -> bool,
+    ) {
         use crate::server::database::filters::FilteredMonitorEvent;
         // A poster that carries no origin of its own inherits the ambient
         // one (0 outside any scope): this is how every post inside an
@@ -8502,13 +8667,14 @@ impl RecordInstance {
         if subs.is_none() && !publishes_value {
             return;
         }
-        let Some(value) = self.resolve_field(field) else {
+        let Some(value) = read(self) else {
             return;
         };
         // With no subscriber the post is value-class (the return above), and
         // the value goes straight to the owner.
         let Some(subs) = subs else {
-            self.record_value_post(field, value);
+            let walk_skip = walk_skip(self);
+            self.record_value_post_as(field, walk_skip, value);
             return;
         };
         let posted = publishes_value.then(|| value.clone());
@@ -8565,7 +8731,8 @@ impl RecordInstance {
         // advanced by the cycle that ran, so the post, not the delivery, is
         // what counts.
         if let Some(value) = posted {
-            self.record_value_post(field, value);
+            let walk_skip = walk_skip(self);
+            self.record_value_post_as(field, walk_skip, value);
         }
     }
 

@@ -537,7 +537,10 @@ impl Record for HistogramRecord {
     /// `special()`, so the SPC_MOD `add_count` on a SGNL *caput* must not fire
     /// here — `process()` performs the cycle's single bin increment
     /// (`histogramRecord.c:218-219`).
-    fn pre_input_link_actions(&mut self) -> crate::server::record::ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        _dol_is_constant: bool,
+    ) -> crate::server::record::ProcessActions {
         if crate::server::recgbl::simm::is_constant(&crate::server::record::parse_link_v2(
             &self.svl,
         )) {

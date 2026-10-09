@@ -530,6 +530,15 @@ pub enum LinkReadAs {
     /// (`sseqRecord.c:682-686`: `n_elements` clamped to the record's 40-byte
     /// `s` buffer, then `strcmp`/`atof` read it as a C string).
     CharArrayAsString { max_elements: usize },
+    /// C `dbGetLink(..., dbr, buf, 0, &n)` with `nRequest = n_request > 1`
+    /// (`aSubRecord.c:283-284`): an array source delivers its first
+    /// `n_request` elements converted to `dbr`, a scalar source its one value
+    /// converted at `dbr` (no `f64` step), so the request settles without
+    /// the source's element count.
+    Array {
+        dbr: crate::types::DbFieldType,
+        n_request: usize,
+    },
 }
 
 impl LinkReadAs {
@@ -550,7 +559,7 @@ impl LinkReadAs {
             Self::Int64 => T::Int64,
             Self::UInt64 => T::UInt64,
             Self::Enum { .. } => T::Enum,
-            Self::Native | Self::CharArrayAsString { .. } => return None,
+            Self::Native | Self::CharArrayAsString { .. } | Self::Array { .. } => return None,
         })
     }
 }
@@ -5190,7 +5199,7 @@ pub trait Record: Send + Sync + 'static {
     /// framework executes the returned actions (currently `WriteDbLink`
     /// and `ReadDbLink`) and then performs the input-link fetch.
     /// Default returns empty.
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
         ProcessActions::new()
     }
 
@@ -6332,7 +6341,7 @@ mod tests {
             let hooks = r.cycle_hooks();
             assert_eq!(hooks, expected(record_type), "{record_type} cycle_hooks");
             if !hooks.has(CycleHooks::PRE_INPUT) {
-                assert!(r.pre_input_link_actions().is_empty(), "{record_type}");
+                assert!(r.pre_input_link_actions(true).is_empty(), "{record_type}");
             }
             if !hooks.has(CycleHooks::CYCLE_POSTED) {
                 assert!(r.take_cycle_posted_fields().is_empty(), "{record_type}");

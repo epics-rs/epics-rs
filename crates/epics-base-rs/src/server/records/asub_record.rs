@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs, OutTarget,
-    ProcessOutcome, Record,
+    FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs, ProcessOutcome,
+    Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -159,7 +159,7 @@ pub struct ASubRecord {
     /// successful `do_sub`.
     sub_status: i64,
     /// [`Record::input_links_generation`]: moved on by every write of an
-    /// `INPx` text or of the `FTx` that [`Record::input_link_request`] reads.
+    /// `INPx` text or of the `FTx`/`NOx` that [`Record::input_link_request`] reads.
     links_generation: u64,
 }
 
@@ -259,6 +259,24 @@ fn parse_channel(name: &str) -> Option<(&'static str, usize)> {
 /// aSubRecord.c:186-187).
 fn channel_ftype(ft: i16) -> Ftype {
     Ftype::from_index(ft).unwrap_or(Ftype::Char)
+}
+
+/// The `dbGetLink` request naming a channel's FTx.
+fn ftype_read(ftype: Ftype) -> LinkReadAs {
+    match ftype {
+        Ftype::String => LinkReadAs::String,
+        Ftype::Char => LinkReadAs::Char,
+        Ftype::UChar => LinkReadAs::UChar,
+        Ftype::Short => LinkReadAs::Short,
+        Ftype::UShort => LinkReadAs::UShort,
+        Ftype::Long => LinkReadAs::Long,
+        Ftype::ULong => LinkReadAs::ULong,
+        Ftype::Int64 => LinkReadAs::Int64,
+        Ftype::UInt64 => LinkReadAs::UInt64,
+        Ftype::Float => LinkReadAs::Float,
+        Ftype::Double => LinkReadAs::Double,
+        Ftype::Enum => LinkReadAs::Enum,
+    }
 }
 
 /// A channel cell as C `initFields` allocates it (aSubRecord.c:176-198,
@@ -660,6 +678,7 @@ impl Record for ASubRecord {
                     }
                     "NO" => {
                         self.noa[idx] = v.max(1);
+                        self.links_generation += 1;
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
                         self.nea[idx] = self.noa[idx];
                     }
@@ -793,28 +812,25 @@ impl Record for ASubRecord {
         InputFetchPolicy::AbortOnFirstFailure
     }
 
-    /// C `fetch_values` asks `dbGetLink` for the channel's declared FTx
-    /// (`dbGetLink(plink, (&prec->fta)[i], ...)`, aSubRecord.c:283-284), so a
-    /// STRING channel reading a scalar source receives its DBR_STRING form —
-    /// an ENUM/MENU source delivers its state label, a numeric source its
-    /// text — which the store must not funnel through a numeric conversion.
-    /// A STRING channel with an ARRAY source keeps the native read: the
-    /// whole array reaches the FTx-typed cell, whose put boundary converts
-    /// it element-wise to strings (C's per-element `DBR_STRING` conversion
-    /// of `nRequest = NOx` elements). Every non-STRING FTx likewise reads
-    /// native — the cell is FTx-typed, so the put boundary's element-wise
-    /// coercion is C's `dbGet` conversion into the FTx buffer.
+    /// C `fetch_values` asks `dbGetLink` for the channel's declared FTx with
+    /// `nRequest = NOx` (`aSubRecord.c:283-284`). One element is the scalar
+    /// request; a wider channel is the array one, which converts whatever
+    /// the source is, so no read resolves the source first.
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
-        let string_channel = parse_channel(link_field)
+        let Some(idx) = parse_channel(link_field)
             .filter(|(prefix, _)| *prefix == "INP")
-            .is_some_and(|(_, idx)| channel_ftype(self.fta[idx]) == Ftype::String);
-        // Only a STRING channel's read depends on whether the source is a
-        // scalar; every other FTx reads native whatever the source is.
-        if string_channel {
-            InputLinkRequest::FromSource
-        } else {
-            InputLinkRequest::As(LinkReadAs::Native)
-        }
+            .map(|(_, idx)| idx)
+        else {
+            return InputLinkRequest::As(LinkReadAs::Native);
+        };
+        let read = ftype_read(channel_ftype(self.fta[idx]));
+        InputLinkRequest::As(match (self.noa[idx], read.dbr_type()) {
+            (n, Some(dbr)) if n > 1 => LinkReadAs::Array {
+                dbr,
+                n_request: n as usize,
+            },
+            _ => read,
+        })
     }
 
     /// `FTA..FTU` are fields, so the request above is the instance's.
@@ -824,18 +840,6 @@ impl Record for ASubRecord {
 
     fn input_links_generation(&self) -> Option<u64> {
         Some(self.links_generation)
-    }
-
-    fn input_link_read_as_from_source(
-        &self,
-        _link_field: &str,
-        source: &OutTarget,
-    ) -> Option<LinkReadAs> {
-        if source.element_count <= 1 {
-            Some(LinkReadAs::String)
-        } else {
-            Some(LinkReadAs::Native)
-        }
     }
 
     /// The cycle status from the framework's single `do_sub` owner. Stored
@@ -966,7 +970,7 @@ mod tests {
                 moved += 1;
             }
         }
-        assert_eq!(moved, 4, "every INPx and FTx put moves the generation");
+        assert_eq!(moved, 5, "every INPx, FTx and NOx put moves the generation");
     }
 
     /// FTx/NOx declare the input cell — C `initFields` (aSubRecord.c:176-198)
@@ -1125,41 +1129,31 @@ mod tests {
         );
     }
 
-    /// C `fetch_values` requests the channel's FTx from `dbGetLink`
-    /// (aSubRecord.c:283-284): a STRING channel with a scalar source reads
-    /// DBR_STRING; an array source and every non-STRING channel read native
-    /// (the FTx-typed cell converts at its put boundary).
+    /// C `fetch_values` requests the channel's FTx from `dbGetLink` with
+    /// `nRequest = NOx` (aSubRecord.c:283-284): every channel settles from its
+    /// own FTx/NOx, whatever its source is.
     #[test]
-    fn string_channels_read_scalar_links_as_strings() {
+    fn every_channel_reads_at_its_ftx_and_nox_source_unasked() {
         let mut rec = ASubRecord::default();
         rec.put_field("FTC", EpicsValue::Short(0)).unwrap(); // STRING
-        let scalar = OutTarget {
-            element_count: 1,
-            ..OutTarget::UNRESOLVED
-        };
         assert_eq!(
             rec.input_link_request("INPC"),
-            InputLinkRequest::FromSource,
-            "a STRING channel's read depends on whether the source is scalar"
+            InputLinkRequest::As(LinkReadAs::String)
         );
+        rec.put_field("NOC", EpicsValue::Long(16)).unwrap();
         assert_eq!(
-            rec.input_link_read_as_from_source("INPC", &scalar),
-            Some(LinkReadAs::String)
+            rec.input_link_request("INPC"),
+            InputLinkRequest::As(LinkReadAs::Array {
+                dbr: crate::types::DbFieldType::String,
+                n_request: 16
+            })
         );
-        let array = OutTarget {
-            element_count: 8,
-            ..OutTarget::UNRESOLVED
-        };
-        assert_eq!(
-            rec.input_link_read_as_from_source("INPC", &array),
-            Some(LinkReadAs::Native)
-        );
-        // The other two settle WITHOUT the source, so the framework never
-        // resolves the target for them — that is the whole point of the split.
+        // A one-element numeric channel settles WITHOUT the source, so the
+        // framework never resolves the target for it.
         assert_eq!(
             rec.input_link_request("INPA"),
-            InputLinkRequest::As(LinkReadAs::Native),
-            "a DOUBLE channel reads native, source unasked"
+            InputLinkRequest::As(LinkReadAs::Double),
+            "a DOUBLE channel reads DBR_DOUBLE, source unasked"
         );
         assert_eq!(
             rec.input_link_request("SUBL"),

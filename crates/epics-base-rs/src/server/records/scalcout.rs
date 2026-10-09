@@ -1394,7 +1394,7 @@ impl Record for ScalcoutRecord {
     /// input-link fetch; `pre_process_actions` runs after it and would record
     /// this cycle's own values. The two re-entry flags are C's `pact == TRUE`
     /// arms (`:421-439`), which reach neither loop.
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
         if !self.awaiting_out && self.dlya != 1 {
             self.pa = self.num_vals;
             for (dst, src) in self.prev_str_vals.iter_mut().zip(self.str_vals.iter()) {

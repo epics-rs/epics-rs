@@ -978,6 +978,26 @@ impl SimmBlock {
     }
 }
 
+/// C's "input dset returns 2" for a soft input: the DTYP is Plain or Async
+/// (never Raw), the record is not an output, and its type skips the convert.
+/// A macro, not a fn: the process cycle's `run_process_frame` grew 10
+/// instr/cycle on ai and ao when this was a call, whatever the inlining.
+/// The cycle (plan answer) and
+/// [`RecordInstance::soft_input_skips_convert`] share this one test.
+macro_rules! input_dset_skips_convert {
+    ($dtyp_returns_2:expr, $is_output:expr, $record_skips_convert:expr) => {
+        $dtyp_returns_2 && !$is_output && $record_skips_convert
+    };
+}
+pub(crate) use input_dset_skips_convert;
+
+fn menu_index_of(record: &dyn Record, field: &str) -> i16 {
+    record
+        .get_field(field)
+        .and_then(|v| v.to_menu_index())
+        .unwrap_or(0)
+}
+
 impl ProcessPlan {
     /// The type-static half of [`CyclePlan::ConstSoftIn`]: the `ai`/`bi`
     /// shape with no simulation block, which the arm's per-cycle SIMM test
@@ -2656,6 +2676,12 @@ pub struct RecordInstance {
     pub parsed_tsel: LinkCache,
     /// Every other link field's parse — see [`Self::record_link`].
     link_slots: LinkSlots,
+    /// `(OMSL, OIF)` menu indices, 0 for a type without the field; settled at
+    /// construction and by the two put funnels, so the cycle's closed-loop
+    /// DOL test reads no field by name.
+    dol_mode: (i16, i16),
+    /// `SELM` menu index (sel), kept the same way for the NVL gate.
+    selm: i16,
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
@@ -3434,7 +3460,9 @@ impl RecordInstance {
     pub(crate) fn put_internal_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.invalidate_plan_for(field);
         self.debug_assert_not_slotted(field, &value);
-        self.record.put_field_internal(field, value)
+        let put = self.record.put_field_internal(field, value);
+        self.refresh_dol_mode(field);
+        put
     }
 
     /// The funnel for a put of a field the record TYPE declares (as opposed
@@ -3443,7 +3471,9 @@ impl RecordInstance {
     pub(crate) fn put_declared_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.invalidate_plan_for(field);
         self.debug_assert_not_slotted(field, &value);
-        self.record.put_field(field, value)
+        let put = self.record.put_field(field, value);
+        self.refresh_dol_mode(field);
+        put
     }
 
     /// [`Self::put_declared_field`] for a link with a slot: the slot takes
@@ -3483,6 +3513,28 @@ impl RecordInstance {
             "{}.{field}: a link put must go through put_link_field",
             self.name
         );
+    }
+
+    /// Re-read `(OMSL, OIF)` after a put of either.
+    fn refresh_dol_mode(&mut self, field: &str) {
+        match field {
+            "OMSL" => self.dol_mode.0 = menu_index_of(&*self.record, "OMSL"),
+            "OIF" => self.dol_mode.1 = menu_index_of(&*self.record, "OIF"),
+            "SELM" => self.selm = menu_index_of(&*self.record, "SELM"),
+            _ => {}
+        }
+    }
+
+    /// `(OMSL, OIF)` as the cycle's closed-loop DOL test reads them.
+    #[inline(always)]
+    pub(crate) fn dol_mode(&self) -> (i16, i16) {
+        self.dol_mode
+    }
+
+    /// `SELM` as the cycle's NVL gate reads it.
+    #[inline(always)]
+    pub(crate) fn selm(&self) -> i16 {
+        self.selm
     }
 
     /// This cycle's forward link, resolved from the two things C's
@@ -3652,6 +3704,14 @@ impl RecordInstance {
         self.link_slots.at(i)
     }
 
+    /// [`Self::record_link`] for a field the type may not declare: `None`
+    /// when it is not one of this type's links.
+    pub(crate) fn declared_record_link(&self, field: &str) -> Option<&Arc<ParsedLink>> {
+        self.link_slots
+            .position(field)
+            .map(|i| self.link_slots.at(i))
+    }
+
     /// The text of a link field, `None` when the link is unset.
     ///
     /// A declared link is unset far more often than set — a `calc` declares 21
@@ -3743,6 +3803,11 @@ impl RecordInstance {
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
         let link_slots = LinkSlots::of(record.as_ref());
+        let dol_mode = (
+            menu_index_of(&*record, "OMSL"),
+            menu_index_of(&*record, "OIF"),
+        );
+        let selm = menu_index_of(&*record, "SELM");
 
         Self {
             destroyed: false,
@@ -3759,6 +3824,8 @@ impl RecordInstance {
             parsed_siml: None,
             parsed_siol: None,
             link_slots,
+            dol_mode,
+            selm,
             device: None,
             subroutine: None,
             init_subroutines: None,
@@ -7410,30 +7477,11 @@ impl RecordInstance {
     /// kin for "Soft Channel" (and async soft), never "Raw Soft Channel",
     /// whose read lands in RVAL and must convert.
     pub(crate) fn soft_input_skips_convert(&self) -> bool {
-        Self::input_dset_skips_convert(
-            self.common.dtyp.soft(),
+        input_dset_skips_convert!(
+            self.common.dtyp.skips_input_convert(),
             self.record.can_device_write(),
-            self.record.soft_channel_skips_convert(),
+            self.record.soft_channel_skips_convert()
         )
-    }
-
-    /// [`Self::soft_input_skips_convert`] over answers the caller already
-    /// holds, so the process cycle (which reads `soft_channel_skips_convert`
-    /// from its [`ProcessPlan`]) and the put path share the one predicate.
-    #[inline(always)]
-    pub(crate) fn input_dset_skips_convert(
-        soft: Option<crate::server::device_support::SoftDtyp>,
-        is_output: bool,
-        record_skips_convert: bool,
-    ) -> bool {
-        matches!(
-            soft,
-            Some(
-                crate::server::device_support::SoftDtyp::Plain
-                    | crate::server::device_support::SoftDtyp::Async
-            )
-        ) && !is_output
-            && record_skips_convert
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.

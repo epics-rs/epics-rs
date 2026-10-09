@@ -1249,7 +1249,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     // The TRIG write is a pre-input-link action emitted by the record,
     // gated on the callback DSET (DTYP "Async Soft Channel").
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
-    let pre = rec.pre_input_link_actions();
+    let pre = rec.pre_input_link_actions(true);
     assert!(
         pre.iter().any(|a| matches!(
             a,
@@ -1292,7 +1292,7 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        rec.pre_input_link_actions(true).is_empty(),
         "non-callback DSET must not drive the TRIG link"
     );
 }
@@ -1313,7 +1313,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 
     // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
     // PID compute is deferred to the re-process pass.
-    let actions = rec.pre_input_link_actions();
+    let actions = rec.pre_input_link_actions(true);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -1335,7 +1335,7 @@ fn test_ca_trig_link_deferred_second_pass() {
     // `if (!pepid->pact)` skips the whole trigger block, so nothing is
     // re-fired and the PID runs.
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        rec.pre_input_link_actions(true).is_empty(),
         "second pass must not re-trigger"
     );
 }
@@ -1626,7 +1626,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
     // --- Trigger pass: pre_input_link_actions fires the CA trigger ---
-    let actions1 = rec.pre_input_link_actions();
+    let actions1 = rec.pre_input_link_actions(true);
     assert!(
         actions1.iter().any(|a| matches!(
             a,
@@ -1658,7 +1658,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 
     // --- Reprocess (callback) pass: the trigger block is skipped ---
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        rec.pre_input_link_actions(true).is_empty(),
         "reprocess pass must not re-trigger"
     );
     rec.set_device_did_compute(false);

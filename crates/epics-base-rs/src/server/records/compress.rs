@@ -975,7 +975,10 @@ impl Record for CompressRecord {
     /// That field was a second, always-empty INP: the action never fired for a
     /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers
     /// the link text. It is gone; INP has one source.
-    fn pre_input_link_actions(&mut self) -> crate::server::record::ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        _dol_is_constant: bool,
+    ) -> crate::server::record::ProcessActions {
         // The per-cycle ingest/emit facts, cleared before the framework's input
         // stage can set them. If no value arrives (link not connected, or a
         // failed read), both stay false: `check_alarms` raises LINK/INVALID and

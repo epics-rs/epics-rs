@@ -53,7 +53,7 @@ pub use record_instance::{
 };
 pub(crate) use record_instance::{
     PreparedCommonLink, PreparedLink, PreparedLinks, SimLink, ambient_write_origin,
-    value_as_dbr_string,
+    input_dset_skips_convert, value_as_dbr_string,
 };
 pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,

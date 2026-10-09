@@ -49,4 +49,17 @@ async fn a_runtime_nvl_put_repoints_the_selector() {
         .unwrap();
     cycle(&db).await;
     assert_eq!(db.get_pv("SEL").unwrap(), EpicsValue::Double(20.0));
+
+    // Low mode picks the minimum (A), where Specified with NVL=N1 picks B;
+    // putting Specified back re-enables the NVL read.
+    db.put_record_field_from_ca("SEL", "SELM", EpicsValue::Enum(2))
+        .await
+        .unwrap();
+    cycle(&db).await;
+    assert_eq!(db.get_pv("SEL").unwrap(), EpicsValue::Double(10.0));
+    db.put_record_field_from_ca("SEL", "SELM", EpicsValue::Enum(0))
+        .await
+        .unwrap();
+    cycle(&db).await;
+    assert_eq!(db.get_pv("SEL").unwrap(), EpicsValue::Double(20.0));
 }

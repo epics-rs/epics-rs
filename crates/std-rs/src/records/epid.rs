@@ -1155,7 +1155,7 @@ impl Record for EpidRecord {
     /// on the callback pass. `ca_trig` is that `pact`, and the
     /// `AwaitingCallback` arm below is C's `!pepid->pact` guard: on the
     /// callback pass the trigger block is skipped entirely.
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
         if !self.is_async_callback_dtyp() {
             return ProcessActions::new();
         }

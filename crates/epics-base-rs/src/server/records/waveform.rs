@@ -114,7 +114,9 @@ pub struct WaveformRecord {
     /// aao-only: desired-output-location input link. Pulled into VAL each
     /// process cycle when `omsl == closed_loop` and the link is a real
     /// (non-constant) link (C `aaoRecord.c::fetchValue` `dbGetLink`, 366).
-    pub dol: String,
+    /// Whether it is a constant is the framework's to say, from the link it
+    /// parsed once ([`Record::pre_input_link_actions`]'s argument).
+    dol: String,
     /// Did `init_record` pass 1 load a constant closed-loop DOL into the
     /// buffer? C `fetchValue(prec, 1)` sets `prec->udf = FALSE` on success
     /// (aaoRecord.c:371-374); UDF lives in the common fields, which
@@ -474,6 +476,11 @@ impl WaveformRecord {
     /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
     /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`. Also what device
     /// support that wipes the array (`nord = 0` + `memset(bptr, 0, ...)`) calls.
+    /// The aao DOL text, and whether it is a constant.
+    pub fn set_dol(&mut self, dol: String) {
+        self.dol = dol;
+    }
+
     pub fn reallocate_val(&mut self) {
         self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
@@ -728,22 +735,6 @@ impl WaveformRecord {
 /// `menu_choices.rs:61`). When `aao.omsl == closed_loop` the record sources
 /// VAL from DOL each cycle (C `aaoRecord.c::fetchValue`).
 const MENU_OMSL_CLOSED_LOOP: i16 = 1;
-
-/// C `dbLinkIsConstant(&prec->dol)`: is the aao DOL a constant rather than a
-/// fetchable link? Used to gate the process-time fetch (`!isConst`), so a
-/// constant is never re-applied per cycle over a client caput.
-///
-/// The classification is [`parse_link_v2`]'s alone — C's own
-/// `dbParseLink` (`dbStaticLib.c:2346-2357`) is the single classifier, and it
-/// calls a link constant iff the text is empty, parses whole as a double, or
-/// is bracketed (`[1, 2, 3]`). This helper used to ALSO accept a
-/// whitespace-separated numeric list (`"1 2 3"`) as a constant array; C does
-/// not — `epicsParseDouble` rejects the trailing garbage, so C makes that a
-/// PV_LINK to a record named `1`. An empty/unset link is constant
-/// (`dbLink.c:220`, whose `lset` is `dbConst_lset`).
-fn dol_is_constant(dol: &str) -> bool {
-    crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
-}
 
 impl Record for WaveformRecord {
     fn acts_before_process(&self) -> bool {
@@ -1432,7 +1423,7 @@ impl Record for WaveformRecord {
             },
             "DOL" if matches!(self.kind, ArrayKind::Aao) => match value {
                 EpicsValue::String(s) => {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.set_dol(s.as_str_lossy().into_owned());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -1457,14 +1448,14 @@ impl Record for WaveformRecord {
     /// Residual: the init-time constant-array load (`dbLoadLinkArray`, C's
     /// `init && isConst` arm) is not applied here — it belongs to
     /// `init_record`, not to the per-cycle hook.
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(&mut self, dol_is_constant: bool) -> ProcessActions {
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return ProcessActions::new();
         }
         // C `!dbLinkIsConstant(&prec->dol)`: only a real (DB/CA/PVA) link is
         // fetched at process time; a constant (scalar, array literal, or
         // empty) is not re-applied each cycle.
-        if dol_is_constant(&self.dol) {
+        if dol_is_constant {
             return ProcessActions::new();
         }
         // The cycle now depends on this fetch — `set_resolved_input_links`
@@ -1682,6 +1673,14 @@ impl Record for WaveformRecord {
 
 #[cfg(test)]
 mod array_kind_tests {
+    /// C `dbLinkIsConstant(&prec->dol)` as the framework answers it for the
+    /// hook: [`parse_link_v2`]'s classification alone (C's `dbParseLink`,
+    /// `dbStaticLib.c:2346-2357`) — empty, a whole double, or bracketed is
+    /// constant; `1 2 3` is a PV_LINK to a record named `1`.
+    fn dol_is_constant(dol: &str) -> bool {
+        crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
+    }
+
     use super::*;
     use crate::server::record::FieldDeclaration;
     use crate::types::SharedArray;
@@ -2011,9 +2010,9 @@ mod array_kind_tests {
     fn aao_closed_loop_real_link_emits_read_db_link() {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.omsl = MENU_OMSL_CLOSED_LOOP;
-        aao.dol = "srcWaveform.VAL".to_string();
+        aao.set_dol("srcWaveform.VAL".to_string());
         assert_eq!(
-            &*aao.pre_input_link_actions(),
+            &*aao.pre_input_link_actions(dol_is_constant(&aao.dol)),
             &[ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
@@ -2022,8 +2021,11 @@ mod array_kind_tests {
 
         // A bare record name parses to a DB link too (parse_link_v2), so it
         // also arms the fetch.
-        aao.dol = "srcWaveform".to_string();
-        assert_eq!(aao.pre_input_link_actions().len(), 1);
+        aao.set_dol("srcWaveform".to_string());
+        assert_eq!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol)).len(),
+            1
+        );
     }
 
     /// C gates the process-time fetch on `!dbLinkIsConstant`: a constant DOL
@@ -2038,17 +2040,51 @@ mod array_kind_tests {
         // Constant array literal. NOT `1 2 3`: `epicsParseDouble` rejects the
         // trailing text, so C parses that as a PV_LINK to a record named `1`
         // (`dbStaticLib.c:2346-2357`).
-        aao.dol = "[1,2,3]".to_string();
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("[1,2,3]".to_string());
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                .is_empty()
+        );
 
-        aao.dol = "42".to_string(); // constant scalar literal
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("42".to_string()); // constant scalar literal
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                .is_empty()
+        );
 
-        aao.dol = String::new(); // unset
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol(String::new()); // unset
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                .is_empty()
+        );
 
-        aao.dol = "   ".to_string(); // whitespace-only
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("   ".to_string()); // whitespace-only
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                .is_empty()
+        );
+    }
+
+    /// A DOL put re-decides whether the cycle fetches, each way.
+    #[test]
+    fn a_dol_put_moves_the_fetch_gate_both_ways() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.omsl = MENU_OMSL_CLOSED_LOOP;
+        for (dol, fetches) in [
+            ("[1,2,3]", false),
+            ("SRC", true),
+            ("[5]", false),
+            ("SRC", true),
+        ] {
+            aao.put_field("DOL", EpicsValue::String(dol.into()))
+                .unwrap();
+            assert_eq!(
+                !aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                    .is_empty(),
+                fetches,
+                "DOL {dol}"
+            );
+        }
     }
 
     /// Supervisory mode (the default) never fetches DOL, even with a real
@@ -2059,16 +2095,19 @@ mod array_kind_tests {
     fn supervisory_and_non_aao_kinds_emit_nothing() {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.omsl = 0; // supervisory
-        aao.dol = "srcWaveform.VAL".to_string();
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("srcWaveform.VAL".to_string());
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                .is_empty()
+        );
 
         for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::SubArray] {
             let mut r = WaveformRecord::with_kind(kind);
             // Force the would-be fetch state; the kind gate must still win.
             r.omsl = MENU_OMSL_CLOSED_LOOP;
-            r.dol = "srcWaveform.VAL".to_string();
+            r.set_dol("srcWaveform.VAL".to_string());
             assert!(
-                r.pre_input_link_actions().is_empty(),
+                r.pre_input_link_actions(dol_is_constant(&r.dol)).is_empty(),
                 "{kind:?} has no OMSL/DOL and must not fetch"
             );
         }

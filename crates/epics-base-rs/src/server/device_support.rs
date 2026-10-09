@@ -82,6 +82,9 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
 pub struct Dtyp {
     name: String,
     soft: Option<SoftDtyp>,
+    /// `soft` is `Plain` or `Async`: the classes whose input dset returns 2.
+    /// Stored with the class so the process cycle tests one byte.
+    skips_input_convert: bool,
 }
 
 impl Dtyp {
@@ -89,7 +92,12 @@ impl Dtyp {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let soft = classify_soft(&name);
-        Self { name, soft }
+        let skips_input_convert = matches!(soft, Some(SoftDtyp::Plain | SoftDtyp::Async));
+        Self {
+            name,
+            soft,
+            skips_input_convert,
+        }
     }
 
     /// The DTYP text, as a client put it or the `.db` declared it.
@@ -101,6 +109,13 @@ impl Dtyp {
     /// taken when the name was set.
     pub fn soft(&self) -> Option<SoftDtyp> {
         self.soft
+    }
+
+    /// `Plain` or `Async` soft channel — the input dset returns 2, never
+    /// "Raw Soft Channel".
+    #[inline(always)]
+    pub fn skips_input_convert(&self) -> bool {
+        self.skips_input_convert
     }
 
     /// [`is_soft_dtyp`] for a DTYP that already carries its class.

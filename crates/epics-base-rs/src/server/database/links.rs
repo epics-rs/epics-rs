@@ -1119,6 +1119,28 @@ impl PvDatabase {
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
+            LinkReadAs::Array { dbr, n_request } => self.array_read_of(link, dbr, n_request, value),
+        }
+    }
+
+    /// [`LinkReadAs::Array`]: an array source keeps its first `n_request`
+    /// elements, each converted to `dbr`; a scalar source converts as the
+    /// matching scalar request does.
+    fn array_read_of(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        dbr: DbFieldType,
+        n_request: usize,
+        mut value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        if value.is_array() {
+            value.truncate(n_request);
+            return value.get_convert(dbr).ok();
+        }
+        match dbr {
+            DbFieldType::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
+            DbFieldType::Enum => self.enum_read_of(link, value),
+            _ => value.get_convert(dbr).ok(),
         }
     }
 

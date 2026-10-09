@@ -1255,7 +1255,7 @@ impl Record for SseqRecord {
         Ok(outcome)
     }
 
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
         // C `process` (sseqRecord.c:315-317) reads `SELL` into `SELN` before
         // building the selection mask, and only when `SELM != All`. This is
         // the earliest hook (it runs before the selection is resolved), and

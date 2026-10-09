@@ -1736,31 +1736,73 @@ impl ArmInp for Arm<false> {
 }
 
 impl ArmInp for Arm<true> {
-    type Slot = Option<EpicsValue>;
+    type Slot = Option<f64>;
 }
 
 trait SoftDbSlot {
-    fn set(&mut self, value: Option<EpicsValue>);
-    fn take(&mut self) -> Option<EpicsValue>;
+    fn set(&mut self, value: Option<f64>);
+    fn take(&mut self) -> Option<f64>;
 }
 
 impl SoftDbSlot for () {
     #[inline(always)]
-    fn set(&mut self, _: Option<EpicsValue>) {}
+    fn set(&mut self, _: Option<f64>) {}
     #[inline(always)]
-    fn take(&mut self) -> Option<EpicsValue> {
+    fn take(&mut self) -> Option<f64> {
         None
     }
 }
 
-impl SoftDbSlot for Option<EpicsValue> {
+impl SoftDbSlot for Option<f64> {
     #[inline(always)]
-    fn set(&mut self, value: Option<EpicsValue>) {
+    fn set(&mut self, value: Option<f64>) {
         *self = value;
     }
     #[inline(always)]
-    fn take(&mut self) -> Option<EpicsValue> {
+    fn take(&mut self) -> Option<f64> {
         Option::take(self)
+    }
+}
+
+/// What a soft DB-link INP read hands back: the source value at the type the
+/// dset asked for. `f64` is the `DBR_DOUBLE` request, which reaches the record
+/// bare; [`EpicsValue`] is every other request.
+trait SoftDbValue: Sized {
+    fn read(
+        db: &PvDatabase,
+        held: &crate::server::database::SetGuard,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> (Option<Self>, Option<super::links::SourceAlarm>);
+}
+
+impl SoftDbValue for f64 {
+    #[inline(always)]
+    fn read(
+        db: &PvDatabase,
+        held: &crate::server::database::SetGuard,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        _: crate::server::record::LinkReadAs,
+    ) -> (Option<f64>, Option<super::links::SourceAlarm>) {
+        match link {
+            crate::server::record::ParsedLink::Db(d) => db.read_db_link_f64_at(held, d, at),
+            _ => (None, None),
+        }
+    }
+}
+
+impl SoftDbValue for EpicsValue {
+    #[inline(always)]
+    fn read(
+        db: &PvDatabase,
+        held: &crate::server::database::SetGuard,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> (Option<EpicsValue>, Option<super::links::SourceAlarm>) {
+        db.read_db_link_as_at(held, link, at, read_as)
     }
 }
 
@@ -3322,7 +3364,7 @@ impl PvDatabase {
         else {
             return None;
         };
-        let value = self.soft_db_inp_read(rec, instance, read_as)?;
+        let value = self.soft_db_inp_read::<EpicsValue>(rec, instance, read_as)?;
         let mut stage = LinkInputs::none();
         stage.inp_value = value;
         Some(InputStage {
@@ -3337,12 +3379,12 @@ impl PvDatabase {
     /// returns, as `dbGetLink` raises it, so what is handed back is the one
     /// thing left to apply: the value, `None` for a read that failed.
     #[inline(always)]
-    fn soft_db_inp_read(
+    fn soft_db_inp_read<V: SoftDbValue>(
         &self,
         rec: InFrame<'_>,
         instance: &mut crate::server::record::RecordInstance,
         read_as: crate::server::record::LinkReadAs,
-    ) -> Option<Option<EpicsValue>> {
+    ) -> Option<Option<V>> {
         if !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
             if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive)
         {
@@ -3353,20 +3395,8 @@ impl PvDatabase {
             return None;
         }
         let link = instance.parsed_inp.link();
-        let (value, inherited) = if let (
-            crate::server::record::LinkReadAs::Double,
-            crate::server::record::ParsedLink::Db(db),
-        ) = (read_as, link)
-        {
-            let (value, alarm) = self.read_db_link_f64_at(rec.set(), db, at);
-            (
-                value.map(EpicsValue::Double),
-                self.input_link_inheritance(rec, link, alarm),
-            )
-        } else {
-            let (value, alarm) = self.read_db_link_as_at(rec.set(), link, at, read_as);
-            (value, self.input_link_inheritance(rec, link, alarm))
-        };
+        let (value, alarm) = V::read(self, rec.set(), link, at, read_as);
+        let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {
             super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
         }
@@ -4083,6 +4113,7 @@ impl PvDatabase {
     /// (`dbAccess.c:611-628`, `dbNotify.c:252-264`); every deferred step here
     /// does the same — it stages work on a queue or spawns a task and returns.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn process_record_with_links_body(
         &self,
         name: &str,
@@ -4554,7 +4585,12 @@ impl PvDatabase {
                 // so the general fall-through below may repeat it.
                 let instance = guard.hold();
                 instance.push_process_context();
-                self.soft_db_inp_read(rec, instance, instance.plan_inp_as())
+                match instance.plan_inp_as() {
+                    read_as @ crate::server::record::LinkReadAs::Double => {
+                        self.soft_db_inp_read::<f64>(rec, instance, read_as)
+                    }
+                    _ => None,
+                }
             } {
             soft_db.set(read);
             InputStage::none(true, 0)
@@ -4580,14 +4616,9 @@ impl PvDatabase {
             // claimed by the `processing` gate meanwhile — the signed-off
             // momentary release, uniform with the async paths that already
             // release the data lock across link I/O here).
-            let (
-                pre_actions,
-                deferred_device_actions,
-                is_soft,
-                device_did_compute,
-                read_produced_no_value,
-                device_read_computed,
-            ) = {
+            let mut pre_actions;
+            let mut deferred_device_actions: Option<Vec<_>>;
+            let (is_soft, device_did_compute, read_produced_no_value, device_read_computed) = {
                 let instance = guard.hold();
                 // One discriminant for "this cycle sourced no value", set by
                 // either source: a failed soft-INP read, and a device support
@@ -4675,12 +4706,29 @@ impl PvDatabase {
                 // that dset exists is the record type's answer, given by
                 // `Record::raw_soft_input` returning `Some` — the dset table, not a
                 // separate boolean that could disagree with it.
-                let inp_value = match soft_db_value {
-                    Some(value) => Some(value),
-                    None => links.as_mut().and_then(|l| l.inp_value.take()),
+                //
+                // The `DBR_DOUBLE` read of a soft DB link reaches a soft-channel
+                // record bare (`soft_input_read_f64`); only the Raw dset, which
+                // owns `raw_soft_input(EpicsValue)`, takes it wrapped.
+                let direct_f64 = match soft_db_value {
+                    Some(v)
+                        if instance.common.dtyp.soft()
+                            != Some(crate::server::device_support::SoftDtyp::Raw) =>
+                    {
+                        Some(v)
+                    }
+                    _ => None,
                 };
-                let had_inp_value = inp_value.is_some();
+                let inp_value = match soft_db_value {
+                    Some(v) if direct_f64.is_none() => Some(EpicsValue::Double(v)),
+                    _ => links.as_mut().and_then(|l| l.inp_value.take()),
+                };
+                let had_inp_value = inp_value.is_some() || direct_f64.is_some();
                 let mut soft_inp_applied = false;
+                if let Some(v) = direct_f64 {
+                    let _ = instance.record.soft_input_read_f64(v);
+                    soft_inp_applied = true;
+                }
                 if let Some(inp_val) = inp_value {
                     let raw = if instance.common.dtyp.soft()
                         == Some(crate::server::device_support::SoftDtyp::Raw)
@@ -4953,14 +5001,14 @@ impl PvDatabase {
                 // Pre-process actions: execute ReadDbLink from device support and
                 // record's pre_process_actions() BEFORE process() so the values
                 // are immediately available. Matches C dbGetLink() semantics.
-                let mut pre_actions = if plan.acts_before_process {
+                pre_actions = if plan.acts_before_process {
                     instance.record.pre_process_actions()
                 } else {
                     crate::server::record::ProcessActions::new()
                 };
                 // Also collect ReadDbLink from device actions; the rest wait
                 // for the record body and join its own actions after it.
-                let mut deferred_device_actions: Option<Vec<_>> = None;
+                deferred_device_actions = None;
                 if let Some(device_actions) = device_actions {
                     for action in device_actions {
                         if matches!(
@@ -4976,8 +5024,6 @@ impl PvDatabase {
                     }
                 }
                 (
-                    pre_actions,
-                    deferred_device_actions,
                     is_soft,
                     device_did_compute,
                     read_produced_no_value,

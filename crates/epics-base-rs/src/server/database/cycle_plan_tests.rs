@@ -339,6 +339,104 @@ const SCENARIOS: &[Scenario] = &[
         ],
         ..BASE
     },
+    Scenario {
+        name: "D arm, link severity MSS, source MAJOR then INVALID then clear",
+        arms: "DDDDDDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(INP, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") field(HSV, "MINOR") field(HIGH, "3") }
+               record(ai, "T") { field(INP, "S MSS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S.PROC", "1")],
+            &[("S.INP", "9"), ("S.PROC", "1")],
+            &[("S.INP", "4"), ("S.PROC", "1")],
+            &[("S.INP", "NoSuch"), ("S.PROC", "1")],
+            &[("S.INP", "2"), ("S.PROC", "1")],
+            &[("S.INP", "1"), ("S.PROC", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "D arm, link severity MSI, source MAJOR then INVALID then clear",
+        arms: "DDDDDDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(INP, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") field(HSV, "MINOR") field(HIGH, "3") }
+               record(ai, "T") { field(INP, "S MSI") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S.PROC", "1")],
+            &[("S.INP", "9"), ("S.PROC", "1")],
+            &[("S.INP", "4"), ("S.PROC", "1")],
+            &[("S.INP", "NoSuch"), ("S.PROC", "1")],
+            &[("S.INP", "2"), ("S.PROC", "1")],
+            &[("S.INP", "1"), ("S.PROC", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "D arm, link severity NMS, source MAJOR then INVALID then clear",
+        arms: "DDDDDDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(INP, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") field(HSV, "MINOR") field(HIGH, "3") }
+               record(ai, "T") { field(INP, "S NMS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S.PROC", "1")],
+            &[("S.INP", "9"), ("S.PROC", "1")],
+            &[("S.INP", "4"), ("S.PROC", "1")],
+            &[("S.INP", "NoSuch"), ("S.PROC", "1")],
+            &[("S.INP", "2"), ("S.PROC", "1")],
+            &[("S.INP", "1"), ("S.PROC", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "D arm, MS with source HIHI and the target's own HIHI",
+        arms: "DDDDDDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(INP, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") field(HSV, "MINOR") field(HIGH, "3") }
+               record(ai, "T") { field(INP, "S MS") field(DTYP, "Soft Channel") field(FLNK, "F") field(HIHI, "5") field(HHSV, "MINOR") field(HIGH, "2") field(HSV, "MINOR") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S.PROC", "1")],
+            &[("S.INP", "9"), ("S.PROC", "1")],
+            &[("S.INP", "4"), ("S.PROC", "1")],
+            &[("S.INP", "NoSuch"), ("S.PROC", "1")],
+            &[("S.INP", "2"), ("S.PROC", "1")],
+            &[("S.INP", "1"), ("S.PROC", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "D arm, AMSG passes through MS and clears on the next good cycle",
+        arms: "DDDDD",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(INP, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") field(HSV, "MINOR") field(HIGH, "3") }
+               record(ai, "T") { field(INP, "S MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S.INP", "NoSuch"), ("S.PROC", "1")],
+            &[],
+            &[("S.INP", "2"), ("S.PROC", "1")],
+            &[],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "D arm, failed conversion from a string source",
+        arms: "DDDDD",
+        db: with_fixtures!(
+            r#"record(stringin, "SI") { field(VAL, "3.5") }
+               record(ai, "T") { field(INP, "SI MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[&[], &[("SI.VAL", "word")], &[], &[("SI.VAL", "7")], &[]],
+        ..BASE
+    },
 ];
 
 /// Fields posted to a monitor: the type's own plus the `dbCommon` ones a cycle
@@ -422,7 +520,9 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
                     EpicsValue::String((*v).into())
                 }
                 Some("SSCN") => EpicsValue::Enum(v.parse().expect("index")),
-                Some("VAL") if pv.starts_with("W.") => EpicsValue::String((*v).into()),
+                Some("VAL") if pv.starts_with("W.") || pv.starts_with("SI.") => {
+                    EpicsValue::String((*v).into())
+                }
                 _ => EpicsValue::Double(v.parse().expect("number")),
             };
             // A refused put is part of what both runs must agree on. Link
@@ -567,4 +667,51 @@ async fn a_runtime_siml_put_leaves_the_plain_arm() {
     let t = t.read();
     assert_eq!(t.record.get_field("SIMM"), Some(EpicsValue::Short(1)));
     assert_eq!(t.record.get_field("VAL"), Some(EpicsValue::Double(42.0)));
+}
+
+/// The D-arm severity scenarios above compare against General, whose soft DB
+/// read shares `soft_db_inp_read`; these pin C's `recGblInheritSevrMsg` table
+/// itself (`dbDbLink.c:228-232`) on the D arm.
+#[epics_macros_rs::epics_test]
+async fn the_d_arm_inherits_link_severity_as_c_does() {
+    use crate::server::record::AlarmSeverity::{Invalid, Major, NoAlarm};
+    // (mode, source MAJOR -> T, source INVALID -> T)
+    let table = [
+        ("NMS", NoAlarm, NoAlarm),
+        ("MS", Major, Invalid),
+        ("MSS", Major, Invalid),
+        ("MSI", NoAlarm, Invalid),
+    ];
+    for (mode, at_major, at_invalid) in table {
+        let src = format!(
+            r#"record(ai, "S") {{ field(VAL, "1") field(DTYP, "Soft Channel") field(HIHI, "5") field(HHSV, "MAJOR") }}
+               record(ai, "T") {{ field(INP, "S {mode}") field(DTYP, "Soft Channel") }}"#
+        );
+        let (db, _) = IocBuilder::new()
+            .db_string(&src, &HashMap::new())
+            .expect("db")
+            .build()
+            .await
+            .expect("ioc");
+        let mut visited = super::ProcStack::new();
+        for (s_inp, want) in [("9", at_major), ("NoSuch", at_invalid)] {
+            if s_inp == "9" {
+                db.put_pv("S", EpicsValue::Double(9.0)).await.unwrap();
+            } else {
+                db.put_record_field_from_ca("S", "INP", EpicsValue::String(s_inp.into()))
+                    .await
+                    .unwrap();
+            }
+            db.process_record_with_links("S", &mut visited)
+                .await
+                .unwrap();
+            db.process_record_with_links("T", &mut visited)
+                .await
+                .unwrap();
+            let t = db.get_record("T").unwrap();
+            let t = t.read();
+            assert_eq!(t.ran_arm(), CyclePlan::DbSoftIn, "{mode} S.INP={s_inp}");
+            assert_eq!(t.common.sevr, want, "{mode} S.INP={s_inp}");
+        }
+    }
 }

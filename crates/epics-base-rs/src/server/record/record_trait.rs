@@ -2614,6 +2614,13 @@ pub trait Record: Send + Sync + 'static {
         }
     }
 
+    /// [`Self::soft_input_read`] for a `DBR_DOUBLE` reading, handed over
+    /// without the [`EpicsValue`] wrapper. A record whose soft read filters
+    /// its input overrides this with the direct path.
+    fn soft_input_read_f64(&mut self, value: f64) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Double(value)))
+    }
+
     /// The `dbrType` the record type's `soft` INPUT dset hands its INP
     /// `dbGetLink` — `devAiSoft` asks `DBR_DOUBLE`, `devAiSoftRaw` `DBR_LONG`.
     /// The request is the dset's, not the record's: one record type reads INP

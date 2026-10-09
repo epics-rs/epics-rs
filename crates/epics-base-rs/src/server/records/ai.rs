@@ -745,6 +745,17 @@ impl Record for AiRecord {
         Ok(())
     }
 
+    fn soft_input_read_f64(&mut self, value: f64) -> CaResult<()> {
+        let previous = self.val;
+        let history = self.soft_history;
+        self.val = value;
+        if self.smoo != 0.0 && history == SoftReadHistory::Prior && previous.is_finite() {
+            self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
+        }
+        self.soft_history = SoftReadHistory::Prior;
+        Ok(())
+    }
+
     /// `devAiSoft.c:57` and `devAiSoftCallback.c:64` read INP as `DBR_DOUBLE`,
     /// `devAiSoftRaw.c:50` as `DBR_LONG`.
     fn soft_input_request(
@@ -805,6 +816,29 @@ mod tests {
 
     /// `set_val`'s typed `DOUBLE` store must land what the generic internal
     /// delivery lands, and every other shape must still reach that owner.
+    /// The bare entry point and the wrapped one are one read, at every SMOO
+    /// boundary and history state (`a_reading_at_smoo_zero_is_history_for_the_filter`).
+    #[test]
+    fn soft_input_read_f64_is_the_wrapped_read() {
+        for smoo in [0.0, 0.5] {
+            for reading in [2.5, f64::NAN, f64::INFINITY] {
+                let (mut bare, mut wrapped) = (AiRecord::new(1.0), AiRecord::new(1.0));
+                bare.smoo = smoo;
+                wrapped.smoo = smoo;
+                for _ in 0..3 {
+                    bare.soft_input_read_f64(reading).unwrap();
+                    wrapped
+                        .soft_input_read(Some(EpicsValue::Double(reading)))
+                        .unwrap();
+                    assert_eq!(bare.val.to_bits(), wrapped.val.to_bits());
+                    assert!(bare.soft_history == wrapped.soft_history);
+                }
+                bare.soft_input_read(None).unwrap();
+                wrapped.soft_input_read(None).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn set_val_lands_what_internal_delivery_lands() {
         for value in [

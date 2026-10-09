@@ -24,6 +24,14 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
     "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV",
 ];
 
+/// The value field a link's `special()` posts, by link index (INPA..INPU, OUT):
+/// C `pvalue = &prec->a + lnkIndex` (calcoutRecord.c:370), whose slot past `U`
+/// is `OVAL`.
+const CALCOUT_LINK_VALUE_FIELDS: [&str; 22] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "OVAL",
+];
+
 /// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
 /// `get_precision` serves for `ODLY`, the output-delay field.
 static CALCOUT_ODLY_PRECISION: AtomicI32 = AtomicI32::new(2);
@@ -212,9 +220,12 @@ pub struct CalcoutRecord {
     in_status: [i16; 21],
     out_status: i16,
     // The common OUT-link text as `init_links` saw it at load, for the init
-    // classification. A runtime OUT put is classified from the record's own
-    // OUT (`post_put_link_status`), so this is never read after load.
+    // classification; a runtime OUT put classifies nothing.
     out: crate::server::record::SparseText,
+    // The link index (0..=21, INPA..INPU then OUT) whose put `special()` just
+    // marked Constant, owing C's two `DBE_VALUE` posts (calcoutRecord.c:377,404).
+    // One slot, so a mark no put path drains is overwritten, never queued.
+    link_put_post: Option<u8>,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
     async_ctx: Option<(String, AsyncDbHandle)>,
@@ -331,6 +342,7 @@ impl Default for CalcoutRecord {
             in_status: [LINK_CON; 21],
             out_status: LINK_CON,
             out: crate::server::record::SparseText::default(),
+            link_put_post: None,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
         }
@@ -526,15 +538,15 @@ impl CalcoutRecord {
         }
     }
 
-    /// The status field of a link `special()` handles — C's `plinkValid =
-    /// &prec->inav + lnkIndex` (calcoutRecord.c:371) over INPA..INPU and OUT,
-    /// whose status follows INUV.
-    fn link_status_field(name: &str) -> Option<&'static str> {
+    /// C's `lnkIndex = fieldIndex - calcoutRecordINPA` (calcoutRecord.c:368)
+    /// for the 22 link fields `special()` handles: INPA..INPU are 0..=20 and
+    /// OUT, which follows INPU in the record, is 21.
+    fn link_index(name: &str) -> Option<usize> {
         if name == "OUT" {
-            return Some("OUTV");
+            return Some(21);
         }
         match name.strip_prefix("INP")?.as_bytes() {
-            [c @ b'A'..=b'U'] => Some(CALCOUT_INAV_FIELDS[(c - b'A') as usize]),
+            [c @ b'A'..=b'U'] => Some((c - b'A') as usize),
             _ => None,
         }
     }
@@ -544,8 +556,8 @@ impl CalcoutRecord {
     /// `INAV`..`INUV`/`OUTV` diagnostics, mirroring C
     /// `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) and the
     /// `checkLinksCallback` re-poll. Runs at record init only
-    /// (`set_async_context`, `init_links`); a link put is
-    /// [`Self::post_put_link_status`]'s. No-op without an async context.
+    /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
+    /// which C answers without classifying. No-op without an async context.
     fn refresh_link_status(&self) {
         let mut links: Vec<(&'static str, String, LinkRole)> = self
             .input_links()
@@ -559,39 +571,6 @@ impl CalcoutRecord {
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE,
-        );
-    }
-
-    /// The status post a put to the link behind `put` owes (C
-    /// `calcoutRecord.c:404`). OUT is read back from the record: it is a
-    /// common field, and `self.out` holds its load-time text only.
-    fn post_put_link_status(&self, put: &'static str) {
-        use crate::server::records::link_status::{LinkSlot, LinkText};
-        let mut links: Vec<LinkSlot> = self
-            .input_links()
-            .into_iter()
-            .enumerate()
-            .map(|(i, link)| LinkSlot {
-                status_field: CALCOUT_INAV_FIELDS[i],
-                text: LinkText::Held(link),
-                role: LinkRole::Input,
-                held: self.in_status[i],
-                value_field: None,
-            })
-            .collect();
-        links.push(LinkSlot {
-            status_field: "OUTV",
-            text: LinkText::Common("OUT"),
-            role: LinkRole::Output,
-            held: self.out_status,
-            value_field: Some("OVAL"),
-        });
-        crate::server::records::link_status::post_link_put_status(
-            self.async_ctx.as_ref(),
-            &self.link_gen,
-            links,
-            put,
             crate::server::recgbl::EventMask::VALUE,
         );
     }
@@ -1471,16 +1450,6 @@ impl Record for CalcoutRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
-    /// C `calcoutRecord.c::special` (367-378) — a runtime put to INPA..INPU that
-    /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
-    /// DBF_DOUBLE, pvalue)`, posts the value field with `DBE_VALUE` and sets
-    /// `INAV = CON`. Declared here, run by the put path's one
-    /// `special(field, true)` owner — see `Record::special_reseed_input_links`.
-    /// Every calcout input is a DBF_DOUBLE scalar, so the whole table re-seeds.
-    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
-        self.multi_input_links()
-    }
-
     /// The 21 `INPA..INPU` texts read straight off the record's own fields, not
     /// through the default body's 21 name matches on `link_text_ref`.
     /// See [`Record::set_input_link_slots`].
@@ -1599,6 +1568,10 @@ impl Record for CalcoutRecord {
         // applied), so capture it here, once the framework has resolved it,
         // and classify so a passive never-processed record already shows OUTV.
         self.out.set(&common.out);
+        // A load-time `special()` marked posts nobody could watch; this full
+        // classification supersedes them, so the first runtime put must not
+        // drain them.
+        self.link_put_post = None;
         self.refresh_link_status();
     }
 
@@ -1629,14 +1602,38 @@ impl Record for CalcoutRecord {
             }
             _ => {}
         }
-        // A put to INPA..INPU or OUT re-classifies that link and posts its
-        // status (calcoutRecord.c:366-405). The value field a constant INPx
-        // loads is posted by the framework's re-seed
-        // (`special_reseed_input_links`); OUT's OVAL by the status task.
-        if let Some(status_field) = Self::link_status_field(field) {
-            self.post_put_link_status(status_field);
+        // C `calcoutRecord.c:366-405`. `dbPutFieldLink` runs this pass before
+        // `dbAddLink` (dbAccess.c:1181-1208), so the link has no `lset` yet and
+        // `dbLinkIsConstant` holds for EVERY put: the status reads Constant
+        // whatever the target, and `recGblInitConstantLink` loads nothing.
+        // Bumping the generation drops any classification still in flight.
+        if let Some(idx) = Self::link_index(field) {
+            match self.in_status.get_mut(idx) {
+                Some(status) => *status = LINK_CON,
+                None => self.out_status = LINK_CON,
+            }
+            self.link_gen.next();
+            self.link_put_post = Some(idx as u8);
         }
         Ok(())
+    }
+
+    /// The link put's value and status posts, both a literal `DBE_VALUE`
+    /// (calcoutRecord.c:377,404). calcout declares no `CYCLE_POSTED` hook, so
+    /// only the put path drains this.
+    fn take_cycle_posted_fields(
+        &mut self,
+    ) -> Vec<(&'static str, crate::server::record::CyclePostMask)> {
+        use crate::server::record::CyclePostMask;
+        let Some(idx) = self.link_put_post.take() else {
+            return Vec::new();
+        };
+        let idx = idx as usize;
+        let status = CALCOUT_INAV_FIELDS.get(idx).copied().unwrap_or("OUTV");
+        vec![
+            (CALCOUT_LINK_VALUE_FIELDS[idx], CyclePostMask::Value),
+            (status, CyclePostMask::Value),
+        ]
     }
 
     /// C posts the validity field explicitly from `special()`
@@ -1719,13 +1716,13 @@ mod link_status_tests {
 
     // Boundary: C's `lnkIndex` covers INPA..INPU and OUT, nothing else.
     #[test]
-    fn link_status_field_boundaries() {
-        assert_eq!(CalcoutRecord::link_status_field("INPA"), Some("INAV"));
-        assert_eq!(CalcoutRecord::link_status_field("INPU"), Some("INUV"));
-        assert_eq!(CalcoutRecord::link_status_field("OUT"), Some("OUTV"));
-        assert_eq!(CalcoutRecord::link_status_field("INPV"), None); // past U
-        assert_eq!(CalcoutRecord::link_status_field("INAV"), None); // status
-        assert_eq!(CalcoutRecord::link_status_field("CALC"), None);
+    fn link_index_boundaries() {
+        assert_eq!(CalcoutRecord::link_index("INPA"), Some(0));
+        assert_eq!(CalcoutRecord::link_index("INPU"), Some(20));
+        assert_eq!(CalcoutRecord::link_index("OUT"), Some(21));
+        assert_eq!(CalcoutRecord::link_index("INPV"), None); // past U
+        assert_eq!(CalcoutRecord::link_index("INAV"), None); // status, not link
+        assert_eq!(CalcoutRecord::link_index("CALC"), None);
     }
 
     // Every INAV..INUV and OUTV serves the menu(calcoutINAV) labels; the

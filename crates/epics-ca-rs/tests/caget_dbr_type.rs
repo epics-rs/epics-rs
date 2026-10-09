@@ -383,7 +383,9 @@ async fn long_string_count_clamp_trims_char_array() {
         .await
         .expect("connect to long-string channel");
 
-    // count=3 must trim the 40-element char array to 3 bytes "hel".
+    // count=3 reads "he" and its NUL: `dbGet` writes the NUL at
+    // `nRequest - 1` for a DBF_STRING field (`dbAccess.c:1040-1044`);
+    // softIoc R7.0.10 answers `caget -d DBR_CHAR -# 3 SI.VAL$` with 104 101 0.
     let snap = ch
         .get_with_dbr_type(DBR_CHAR, 3)
         .await
@@ -401,10 +403,7 @@ async fn long_string_count_clamp_trims_char_array() {
         "`caget -# 3 PV.VAL$` must return 3 bytes; got {}",
         bytes.len()
     );
-    assert_eq!(
-        bytes, b"hel",
-        "trimmed content must be first 3 chars of string"
-    );
+    assert_eq!(bytes, b"he\0", "the NUL lands at element nRequest - 1");
 }
 
 /// A long-string *record* field accessed plainly (no `$`) must advertise

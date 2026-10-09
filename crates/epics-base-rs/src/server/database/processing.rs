@@ -374,13 +374,12 @@ impl AsyncDbHandle {
     pub(crate) fn post_fields_with_mask_if(
         &self,
         name: &str,
-        repost: Option<&str>,
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
     ) -> CaResult<Vec<String>> {
         match self.db() {
-            Some(db) => db.post_fields_with_mask_if(name, repost, fields, mask, current),
+            Some(db) => db.post_fields_with_mask_if(name, fields, mask, current),
             None => Ok(Vec::new()),
         }
     }
@@ -2783,18 +2782,16 @@ impl PvDatabase {
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) -> CaResult<Vec<String>> {
-        self.post_fields_with_mask_if(name, None, fields, mask, || true)
+        self.post_fields_with_mask_if(name, fields, mask, || true)
     }
 
     /// [`Self::post_fields_with_mask`], asking `current` under the record
     /// write lock and posting nothing when it says no. A check made before
     /// the lock is taken can be overtaken by a put that holds it; asked under
-    /// the lock, it sees every put that ran before this post. `repost` is a
-    /// field posted first at the value it holds.
+    /// the lock, it sees every put that ran before this post.
     pub(crate) fn post_fields_with_mask_if(
         &self,
         name: &str,
-        repost: Option<&str>,
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
         current: impl FnOnce() -> bool,
@@ -2816,9 +2813,6 @@ impl PvDatabase {
         let mut inst = rec.write();
         if !current() {
             return Ok(Vec::new());
-        }
-        if let Some(field) = repost {
-            inst.notify_field_backed(field, mask, link_backing);
         }
         let mut posted = Vec::with_capacity(fields.len());
         for (field, value) in fields {

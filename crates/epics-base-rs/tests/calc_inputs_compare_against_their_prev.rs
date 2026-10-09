@@ -12,7 +12,7 @@
 //! caput CA.PROC 1               (settles HIGH MINOR)
 //! caput CA.B 6        ->  CA.B 6  CA.VAL 6  CA.B 6
 //! caput CA.PROC 1     ->  nothing
-//! caput CN.INPA SRC   ->  (softIoc: CN.A 5, the R19-1 departure; here nothing)
+//! caput CN.INPA SRC   ->  CN.A 5
 //! caput CN.PROC 1     ->  CN.VAL 3  CN.A 3
 //! ```
 //!
@@ -119,7 +119,11 @@ async fn a_repointed_input_posts_on_the_udf_clearing_cycle() {
     let mut a = subscribe(&db, "CN", "A");
 
     caput(&db, "CN", "INPA", "SRC").await;
-    assert_eq!(drain(&mut a), Vec::new(), "caput CN.INPA SRC");
+    assert_eq!(
+        drain(&mut a),
+        vec![EpicsValue::Double(5.0)],
+        "caput CN.INPA SRC"
+    );
     caput(&db, "CN", "PROC", "1").await;
     assert_eq!(
         drain(&mut a),

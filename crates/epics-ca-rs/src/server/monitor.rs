@@ -153,7 +153,7 @@ pub(crate) fn send_event(
         } else {
             ls_snap = {
                 let mut s = (*event.snapshot).clone();
-                super::apply_long_string_mode(&mut s, long_string_mode);
+                super::apply_long_string_mode(&mut s, long_string_mode, data_count);
                 s
             };
             &ls_snap

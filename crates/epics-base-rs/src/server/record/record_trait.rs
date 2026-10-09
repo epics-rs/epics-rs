@@ -868,6 +868,85 @@ impl AuxPostMask {
     }
 }
 
+/// The per-type monitor-plan bits [`Record::monitor_value_classes`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct MonitorValueGate {
+    /// [`Record::uses_monitor_deadband`].
+    pub uses_deadband: bool,
+    /// [`Record::has_array_monitor_post`].
+    pub array_monitor_post: bool,
+}
+
+/// [`Record::monitor_value_classes`]' answer: the classes the deadband
+/// field's post carries, and whether an array record's `HASH` moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorValueClasses {
+    /// `DBE_VALUE`.
+    pub value: bool,
+    /// `DBE_LOG`.
+    pub archive: bool,
+    /// See [`ArrayMonitorPost::hash_changed`].
+    pub hash_changed: bool,
+}
+
+impl MonitorValueClasses {
+    /// A type with no change gate and no deadband: binary records post always.
+    pub const ALWAYS: Self = Self {
+        value: true,
+        archive: true,
+        hash_changed: false,
+    };
+}
+
+/// The deadband half of [`Record::monitor_value_classes`]: the array rule
+/// where the type has one, else MDEL/ADEL against MLST/ALST.
+#[inline]
+pub fn monitor_deadband_classes<R: Record + ?Sized>(
+    r: &mut R,
+    array_monitor_post: bool,
+    last_posted: &mut [f64; 2],
+) -> MonitorValueClasses {
+    if array_monitor_post && let Some(post) = r.array_monitor_post() {
+        return MonitorValueClasses {
+            value: post.post_value,
+            archive: post.post_archive,
+            hash_changed: post.hash_changed,
+        };
+    }
+    // A value the deadband cannot compare posts unconditionally.
+    let Some(cells) = r.monitor_deadband_cells(*last_posted) else {
+        return MonitorValueClasses::ALWAYS;
+    };
+    let (value, archive) = cells.crossed();
+    if value || archive {
+        commit_last_posted(r, cells.val(), value, archive, last_posted);
+    }
+    MonitorValueClasses {
+        value,
+        archive,
+        hash_changed: false,
+    }
+}
+
+/// C `monitor()`'s `prec->mlst = prec->val` / `prec->alst = prec->val`,
+/// out of line so the no-crossing cycle runs without a frame.
+#[inline(never)]
+fn commit_last_posted<R: Record + ?Sized>(
+    r: &mut R,
+    val: AlarmLimit,
+    value: bool,
+    archive: bool,
+    last_posted: &mut [f64; 2],
+) {
+    r.store_monitor_last_posted(val, value, archive);
+    if archive {
+        last_posted[1] = val.as_f64();
+    }
+    if value {
+        last_posted[0] = val.as_f64();
+    }
+}
+
 /// Outcome of a record's array-style monitor decision, returned by
 /// [`Record::array_monitor_post`] (C waveform/aai/aao `monitor()`,
 /// waveformRecord.c:291-326).
@@ -3191,7 +3270,7 @@ pub trait Record: Send + Sync + 'static {
     /// uniform rule that removes the ordering from each record's concern.
     ///
     /// Called exactly once per completed cycle, from
-    /// `RecordInstance::value_include_classes`, which
+    /// [`Self::monitor_value_classes`], which
     /// the three cycle owners — the sync epilogue, the async completion, and
     /// the SIMM tail — reach on mutually exclusive paths.
     fn monitor_value_changed(&mut self) -> Option<bool> {
@@ -3219,6 +3298,35 @@ pub trait Record: Send + Sync + 'static {
     /// default `(false, false)`, which leaves the change gate unchanged.
     fn monitor_always_post(&self) -> (bool, bool) {
         (false, false)
+    }
+
+    /// C `monitor()`'s VALUE / LOG decision for the deadband field, asked
+    /// once per cycle: [`Self::monitor_value_changed`], else the
+    /// [`Self::array_monitor_post`] rule, else the MDEL/ADEL deadband, with
+    /// MLST/ALST committed where it crossed. `last_posted` is the instance's
+    /// own `[MLST, ALST]`, read for a type without the cells and always
+    /// written on a crossing.
+    ///
+    /// Not overridden: it is the default body that matters, compiled per
+    /// type so the hooks a type leaves at their default fold away and the
+    /// cells are read as struct members, as C reads them.
+    fn monitor_value_classes(
+        &mut self,
+        gate: MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> MonitorValueClasses {
+        if let Some(changed) = self.monitor_value_changed() {
+            let (val_always, archive_always) = self.monitor_always_post();
+            return MonitorValueClasses {
+                value: changed || val_always,
+                archive: changed || archive_always,
+                hash_changed: false,
+            };
+        }
+        if !gate.uses_deadband {
+            return MonitorValueClasses::ALWAYS;
+        }
+        monitor_deadband_classes(self, gate.array_monitor_post, last_posted)
     }
 
     /// The value the MDEL/ADEL deadband is evaluated against.
@@ -3613,7 +3721,7 @@ pub trait Record: Send + Sync + 'static {
     /// the stored `HASH`, updates it, and reports whether `DBE_VALUE` /
     /// `DBE_LOG` should be on the VAL post this cycle and whether the hash
     /// changed (so the owner posts `HASH` with `DBE_VALUE`). Called by
-    /// `check_deadband_ext` (the single owner of the VAL-mask decision).
+    /// [`monitor_deadband_classes`] (the single owner of the VAL-mask decision).
     ///
     /// The hook is the VAL mask, not the MPST/APST rule specifically: any
     /// record whose C `monitor()` decides the mask by its own rule implements
@@ -4045,6 +4153,7 @@ pub trait Record: Send + Sync + 'static {
     /// converted to whatever the cell holds. Same one-question reason as
     /// [`Self::monitor_deadband_cells`] — this is four more vtable calls
     /// otherwise.
+    #[inline(always)]
     fn store_monitor_last_posted(&mut self, val: AlarmLimit, mlst: bool, alst: bool) {
         for (cell, store) in [(CycleCell::Alst, alst), (CycleCell::Mlst, mlst)] {
             if store {
@@ -4820,8 +4929,7 @@ pub trait Record: Send + Sync + 'static {
     /// C `special()` RE-SEEDS on a runtime put to the link field —
     /// `recGblInitConstantLink(plink, DBF_DOUBLE, pvalue)` +
     /// `db_post_events(prec, pvalue, DBE_VALUE)` + `INAV = CON`
-    /// (`calcoutRecord.c:373-378`, `sCalcoutRecord.c:513-518`,
-    /// `aCalcoutRecord.c:533-538`).
+    /// (`sCalcoutRecord.c:513-518`, `aCalcoutRecord.c:533-538`).
     ///
     /// Without it a constant link is load-once dead state: `caput CO.INPB 7`
     /// stores the link text, the link layer then delivers nothing at process
@@ -4838,7 +4946,11 @@ pub trait Record: Send + Sync + 'static {
     /// Default: EMPTY — and that is the correct answer for every record whose C
     /// `special()` does NOT re-seed. `recGblInitConstantLink` appears inside a
     /// `special()` body in exactly FOUR record types across base and synApps
-    /// calc — calcout, sCalcout, aCalcout, transform. Everywhere else (calc,
+    /// calc — calcout, sCalcout, aCalcout, transform. calcout keeps the default:
+    /// `dbPutFieldLink` runs its `special()` before `dbAddLink`
+    /// (`dbAccess.c:1181-1208`), so the load finds no `lset` and seeds
+    /// nothing, and calcout posts the value field and `INxV` from its own
+    /// `special`. Everywhere else (calc,
     /// sub, sel, aSub, seq, fanout, dfanout, swait, sseq, ao/bo/longout/…) it is
     /// called only from `init_record`, so those records seed once and never
     /// again, and they inherit this empty default.
@@ -7257,6 +7369,7 @@ fn val_cell<R: Record + ?Sized>(r: &R) -> CycleRead {
 }
 
 /// C's `prec->cell = value`, in the carrier the cell is stored in.
+#[inline(always)]
 fn store_cycle_cell<R: Record + ?Sized>(r: &mut R, cell: CycleCell, value: CycleValue) {
     let _ = match r.cycle_cell(cell) {
         CycleRead::Value(held) => r.put_cycle_cell(cell, value.convert_as(held)),
@@ -7574,7 +7687,7 @@ impl MonitorDeadbandCells {
 
     /// Whether VAL crossed `(MDEL, ADEL)`. The integer arms are C's
     /// `mdel < 0 || DELTA(mlst, val) > (epicsUInt64) mdel`.
-    #[inline]
+    #[inline(always)]
     pub fn crossed(&self) -> (bool, bool) {
         fn delta_crossed(delta: u64, deadband: i64) -> bool {
             deadband < 0 || delta > deadband as u64

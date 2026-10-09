@@ -1145,7 +1145,24 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// pvxs `onCreate`: the channel can be built. `AI.VAL$` passes the
+    /// search below and is refused here, as `dbChannelCreate` refuses `$` on
+    /// a field that is neither a string nor a link.
     fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        let name = name.to_string();
+        async move {
+            if pva_pvs.read().contains_key(&name) {
+                return true;
+            }
+            provider.channel_creatable(&name).await
+        }
+    }
+
+    /// pvxs `onSearch`: `dbChannelTest`, which resolves the record and field
+    /// and ignores what follows them (`singlesource.cpp:466-473`).
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
@@ -2047,13 +2064,40 @@ mod tests {
         use epics_base_rs::server::database::PvDatabase;
         use epics_pva_rs::server_native::ChannelSource;
         let db = Arc::new(PvDatabase::new());
-        db.add_pv("TEST:X", epics_base_rs::types::EpicsValue::Double(1.0))
-            .await
-            .unwrap();
+        db.add_record(
+            "TEST:X",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
         let store = QsrvPvStore::new(crate::test_reactor(), provider);
         assert!(store.has_pv("TEST:X").await);
         assert!(!store.has_pv("NOT:THERE").await);
+    }
+
+    /// pvxs answers the search for `AI.VAL$` (`dbChannelTest` resolves
+    /// `AI.VAL`) and refuses the create; softIocPVX R7.0.10 prints
+    /// `refuses channel to 'AI.VAL$' : Refused to create Channel`.
+    #[tokio::test]
+    async fn a_dollar_on_a_double_is_searched_and_refused_at_create() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        use epics_pva_rs::server_native::ChannelSource;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("SI", Box::new(StringinRecord::new("x")))
+            .await
+            .unwrap();
+        let store = QsrvPvStore::new(crate::test_reactor(), Arc::new(BridgeProvider::new(db)));
+        assert!(store.searchable("AI.VAL$").await);
+        assert!(!store.has_pv("AI.VAL$").await);
+        assert!(store.searchable("SI.VAL$").await);
+        assert!(store.has_pv("SI.VAL$").await);
+        assert!(!store.searchable("AI.NOSUCH$").await);
     }
 
     /// Top-level `UnionArray` PV: when the producer hands the canonical

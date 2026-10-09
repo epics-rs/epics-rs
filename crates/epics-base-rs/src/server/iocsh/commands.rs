@@ -4,6 +4,9 @@ use super::registry::*;
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
 use crate::runtime::mac_lib::macro_defn_pairs;
+use crate::server::database::char_view::{
+    CharView, CharWrite, char_view, field_addr_types, long_string_len,
+};
 use crate::server::database::filters::sync::DbState;
 use crate::server::database::{DbNode, RecordLoad, parse_pv_name};
 use crate::server::db_loader;
@@ -694,45 +697,6 @@ impl TabBuffer {
     }
 }
 
-/// C `dbEntryToAddr`'s two type words for one field (`dbAccess.c:627-649`):
-/// `paddr->field_type`, the `DBF_*` token the `.dbd` declared except on a
-/// `special(SPC_DBADDR)` row where the record's `cvt_dbaddr` overwrites it,
-/// and `paddr->dbr_field_type`, that token through `mapDBFToDBR`.
-///
-/// **The single owner of "what type is this field read and labelled as".**
-/// Every `dbTest.c` command that prints a `DBF_<T>:` header — `dbgf`, `dbpf`,
-/// `dbtgf`, `dbtpf` — and `dba`, which prints both words, asks here, so the
-/// answer cannot be read off the [`EpicsValue`] the record happens to hold.
-/// It cannot be, in either direction: `DBF_ENUM`, `DBF_MENU` and `DBF_DEVICE`
-/// all collapse onto one served variant and one `mapDBFToDBR` code, so the
-/// variant cannot name the token, while a `DBF_MENU` index is stored in a
-/// short and the variant names the wrong code entirely. Reading it off the
-/// value is what made `dbgf REC.PRIO` answer `DBF_SHORT: 0 = 0x0` where C
-/// answers `DBF_STRING: "LOW"`.
-///
-/// The one place the stored value IS the answer is a
-/// [`runtime_typed`](FieldDesc::runtime_typed) row, where C's `cvt_dbaddr`
-/// re-types the address from the record's own state — `waveform.VAL` to `FTVL`
-/// (`waveformRecord.c::cvt_dbaddr`), `mbbo.VAL` down to `DBF_USHORT` when no
-/// state string is defined (`mbboRecord.c::cvt_dbaddr`) — and the port's
-/// answer to that same question is the variant the record holds. `value` is
-/// therefore consulted for those rows and only those; `None` leaves the
-/// declaration standing, which is what a caller with no value in hand wants.
-fn field_addr_types(fd: &FieldDesc, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
-    let field_type = match value {
-        Some(v) if fd.runtime_typed => v.db_field_type().dbf_code(),
-        // C tests `paddr->special`, which `dbEntryToAddr` has just copied from
-        // `pflddes->special` (`dbAccess.c:638-641`) — the DECLARED code, not
-        // the one `cvt_dbaddr` then raises. `lsi.VAL` is the case in hand: it
-        // declares `SPC_DBADDR` and resolves to `SPC_MOD`, so reading the
-        // resolved code skipped the arm and labelled it `DBF_NOACCESS` where C
-        // says `DBF_STRING` (`lsiRecord.c::cvt_dbaddr`).
-        _ if fd.declared_special == Special::DbAddr => fd.dbf_type.dbf_code(),
-        _ => fd.declared_dbf,
-    };
-    (field_type, field_type.dbr_code())
-}
-
 /// C's `printBuffer` label and the port's served type for one DBR code — the
 /// inverse of [`DbfCode::dbr_code`]'s codomain, resolved through the one table
 /// that already pairs the two ([`DBTGF_REQUEST_TYPES`], C's `dbr[]` at
@@ -1221,93 +1185,10 @@ impl DbAddr {
 
     /// The field as C's `$` modifier re-types it (`dbAccess.c:682-701`), or
     /// `None` for a field that modifier refuses.
+    /// The field as C's `$` modifier re-types it, or `None` for a field that
+    /// modifier refuses — see [`char_view`].
     fn char_view(&self) -> Option<CharView> {
-        let inst = self.rec.read();
-        let Some(desc) = self.fld_des else {
-            // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
-            return match inst.get_virtual_field(&self.field)? {
-                EpicsValue::String(s) => Some(CharView {
-                    source: CharSource::Attribute,
-                    bytes: s.as_bytes().to_vec(),
-                    count: MAX_STRING_SIZE,
-                    no_elements: MAX_STRING_SIZE,
-                    field_type: DbfCode::Char,
-                    truncate: false,
-                }),
-                _ => None,
-            };
-        };
-        let value = inst.resolve_field(&self.field);
-        if crate::types::link_class_of(desc).is_some() {
-            let text = match value {
-                Some(EpicsValue::String(s)) => s.as_bytes().to_vec(),
-                _ => Vec::new(),
-            };
-            return Some(CharView {
-                source: CharSource::Link,
-                bytes: text,
-                count: PVLINK_STRINGSZ,
-                no_elements: PVLINK_STRINGSZ,
-                field_type: desc.declared_dbf,
-                truncate: false,
-            });
-        }
-        if field_addr_types(desc, value.as_ref()).0 != DbfCode::String {
-            return None;
-        }
-        // `no_elements = field_size`, and `dbGet`'s count is
-        // `get_array_info`'s where the field is `SPC_DBADDR`.
-        let (mut bytes, count, capacity) = match value? {
-            EpicsValue::String(s) => {
-                let size = usize::from(desc.size);
-                (s.as_bytes().to_vec(), size, size)
-            }
-            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
-                let sizv = long_string_sizv(&inst);
-                (b.to_vec(), long_string_len(&inst), sizv)
-            }
-            EpicsValue::StringArray(v) => {
-                let first = v.first().map(|s| s.as_bytes().to_vec());
-                (first.unwrap_or_default(), v.len(), MAX_STRING_SIZE)
-            }
-            _ => return None,
-        };
-        bytes.resize(capacity, 0);
-        Some(CharView {
-            source: CharSource::Field,
-            bytes,
-            count,
-            no_elements: capacity,
-            field_type: DbfCode::Char,
-            truncate: desc.declared_dbf == DbfCode::String,
-        })
-    }
-}
-
-/// C's `MAX_STRING_SIZE` (`epicsTypes.h:59`), the `field_size` of a
-/// `DBF_STRING` array element and of an attribute.
-const MAX_STRING_SIZE: usize = 40;
-
-/// C's `PVLINK_STRINGSZ` (`dbDefs.h:79`), the char-array length `$` gives a
-/// link field.
-const PVLINK_STRINGSZ: usize = 1024;
-
-/// lsi/lso/printf `LEN`, which their `get_array_info` reports as VAL's
-/// element count (`lsiRecord.c:154`, `lsoRecord.c:196`, `printfRecord.c:432`):
-/// 0 until VAL is first written, `strlen + 1` after.
-fn long_string_len(inst: &crate::server::record::RecordInstance) -> usize {
-    match inst.resolve_field("LEN") {
-        Some(EpicsValue::ULong(n)) => n as usize,
-        _ => 0,
-    }
-}
-
-/// lsi/lso/printf `SIZV`, the buffer their `cvt_dbaddr` serves VAL in.
-fn long_string_sizv(inst: &crate::server::record::RecordInstance) -> usize {
-    match inst.resolve_field("SIZV") {
-        Some(EpicsValue::UShort(n)) => usize::from(n),
-        Some(v) => v.to_f64().map_or(0, |n| n as usize),
-        None => 0,
+        char_view(&self.rec.read(), &self.field)
     }
 }
 
@@ -1328,170 +1209,10 @@ fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsVa
     }
 }
 
-/// Where a `$` address's characters come from — `dbGet`'s three routes
-/// (`dbAccess.c:944-952`).
-#[derive(Clone, Copy, PartialEq)]
-enum CharSource {
-    /// `pfield` itself, converted element by element.
-    Field,
-    /// `getLinkValue`: the link's `dbGetString` text.
-    Link,
-    /// `getAttrValue`: the attribute's text.
-    Attribute,
-}
-
-/// C's `DBADDR` after the `$` modifier (`dbAccess.c:682-701`) and what
-/// `dbGet` / `dbPut` do with it.
-struct CharView {
-    source: CharSource,
-    /// The characters `pfield` holds, zero-padded to `no_elements`; a link's
-    /// or attribute's text.
-    bytes: Vec<u8>,
-    /// `dbGet`'s element count: `get_array_info`'s for an `SPC_DBADDR`
-    /// field, else `no_elements`.
-    count: usize,
-    /// `paddr->no_elements`: the string's `field_size`, or
-    /// `PVLINK_STRINGSZ` for a link.
-    no_elements: usize,
-    /// `paddr->field_type`: `DBF_CHAR`, or a link's own type.
-    field_type: DbfCode,
-    /// `pfldDes->field_type == DBF_STRING`, so a `DBR_CHAR` read ends at the
-    /// first NUL (`dbAccess.c:1037-1045`).
-    truncate: bool,
-}
-
-impl CharView {
-    /// `dbGet(paddr, target, …, &n_req)`: the elements read, counted as C
-    /// counts them, or `None` for a refused request type.
-    fn get(&self, target: crate::types::DbFieldType, n_req: usize) -> Option<EpicsValue> {
-        use crate::types::DbFieldType as T;
-        if n_req == 0 {
-            return Some(char_elements(target, &[]));
-        }
-        let text = |max: usize| -> Vec<u8> {
-            let end = self.bytes.len().min(max);
-            let mut t: Vec<u8> = self.bytes[..end]
-                .iter()
-                .copied()
-                .take_while(|&c| c != 0)
-                .collect();
-            t.push(0);
-            t
-        };
-        match (self.source, target) {
-            (CharSource::Field, _) => {
-                // `dbAccess.c:963`: one element is the scalar path, with no
-                // terminator rule.
-                let n = if self.count == 1 {
-                    1
-                } else {
-                    n_req.min(self.count).min(self.bytes.len())
-                };
-                let mut b = self.bytes[..n].to_vec();
-                if self.count != 1 && target == T::Char && self.truncate && n > 0 {
-                    b[n - 1] = 0;
-                    let len = b.iter().position(|&c| c == 0).unwrap_or(n);
-                    b.truncate(len + 1);
-                }
-                Some(char_elements(target, &b))
-            }
-            (_, T::String) => {
-                let mut t = text(MAX_STRING_SIZE - 1);
-                t.pop();
-                Some(EpicsValue::String(crate::types::PvString::from_bytes(t)))
-            }
-            (CharSource::Link, T::Double) => Some(EpicsValue::Double(f64::NAN)),
-            (_, T::Char | T::UChar) => Some(char_elements(target, &text(n_req - 1))),
-            _ => None,
-        }
-    }
-
-    /// `dbPutField(paddr, dbrType, …)` of `written` — `None` for one element
-    /// of `target` (`dbtpf`), else `dbpf`'s `strlen + 1` characters — as the
-    /// value the record's put path stores, or `None` where C refuses it.
-    fn put_value(&self, inst_value: Option<&EpicsValue>, written: CharWrite) -> Option<EpicsValue> {
-        use crate::types::DbFieldType as T;
-        match self.source {
-            // `dbPutField` returns `S_db_noMod` (`dbAccess.c:1254`).
-            CharSource::Attribute => None,
-            // `dbPutFieldLink` takes a string, or a char array whose last
-            // element is its NUL (`dbAccess.c:1087-1099`).
-            CharSource::Link => {
-                let text = match written {
-                    CharWrite::Chars(b) => b.split(|&c| c == 0).next().unwrap_or(&[]).to_vec(),
-                    CharWrite::One(T::String, EpicsValue::String(s)) => s.as_bytes().to_vec(),
-                    CharWrite::One(T::Char | T::UChar, v) if v.to_f64() == Some(0.0) => Vec::new(),
-                    CharWrite::One(..) => return None,
-                };
-                Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
-            }
-            CharSource::Field => {
-                let dbaddr = !matches!(inst_value, Some(EpicsValue::String(_)));
-                let chars: Vec<u8> = match written {
-                    CharWrite::Chars(b) => b,
-                    // `dbFastPutConvertRoutine` for a plain string field,
-                    // `dbPutConvertRoutine` for an `SPC_DBADDR` one.
-                    CharWrite::One(T::String, EpicsValue::String(s)) => {
-                        let text = s.as_str_lossy();
-                        let row = if dbaddr {
-                            crate::types::c_parse::put_string_element
-                        } else {
-                            crate::types::c_parse::put_string
-                        };
-                        match row("VAL", crate::types::c_parse::NumericField::Char, &text) {
-                            Ok(crate::types::c_parse::Converted::Stored(v)) => {
-                                vec![v.to_f64().map_or(0, |n| n as i64 as u8)]
-                            }
-                            Ok(crate::types::c_parse::Converted::Unchanged) => {
-                                vec![self.bytes.first().copied().unwrap_or(0)]
-                            }
-                            Err(_) => return None,
-                        }
-                    }
-                    CharWrite::One(_, v) => vec![v.to_f64().map_or(0, |n| n as i64 as u8)],
-                };
-                let n = chars.len().min(self.no_elements);
-                let mut buf = self.bytes.clone();
-                buf[..n].copy_from_slice(&chars[..n]);
-                Some(match inst_value {
-                    Some(EpicsValue::StringArray(old)) => {
-                        // waveform `put_array_info` makes NORD the count
-                        // just written.
-                        let mut elems: Vec<crate::types::PvString> = old.to_vec();
-                        elems.resize(n.max(1), crate::types::PvString::from_bytes(Vec::new()));
-                        elems.truncate(n);
-                        if let Some(first) = elems.first_mut() {
-                            *first = crate::types::PvString::from_bytes(nul_text(&buf));
-                        }
-                        EpicsValue::StringArray(elems.into())
-                    }
-                    _ => {
-                        // lsi/lso `put_array_info` terminates at the count
-                        // written (`lsiRecord.c:168-171`).
-                        if dbaddr && n < buf.len() {
-                            buf[n] = 0;
-                        }
-                        EpicsValue::String(crate::types::PvString::from_bytes(nul_text(&buf)))
-                    }
-                })
-            }
-        }
-    }
-}
-
-/// What a `$` put writes.
-enum CharWrite {
-    /// `dbpf`'s `DBR_CHAR` array, NUL included.
-    Chars(Vec<u8>),
-    /// `dbtpf`'s one element of a request type.
-    One(crate::types::DbFieldType, EpicsValue),
-}
-
 /// `dbPutField` through a `$` address: the put the record's own path makes of
 /// [`CharView::put_value`]'s result, `false` where C's status is non-zero.
 fn char_view_put(ctx: &CommandContext, addr: &DbAddr, view: &CharView, written: CharWrite) -> bool {
-    let current = addr.rec.read().resolve_field(&addr.field);
-    let Some(value) = view.put_value(current.as_ref(), written) else {
+    let Some(value) = view.put_value(written) else {
         return false;
     };
     ctx.block_on(
@@ -1499,76 +1220,6 @@ fn char_view_put(ctx: &CommandContext, addr: &DbAddr, view: &CharView, written: 
             .put_record_field_from_ca_no_notify(&addr.record, &addr.field, value),
     )
     .is_ok()
-}
-
-/// The bytes before the first NUL.
-fn nul_text(b: &[u8]) -> Vec<u8> {
-    b.iter().copied().take_while(|&c| c != 0).collect()
-}
-
-/// `dbGetConvertRoutine[DBF_CHAR][target]` over `chars`, each an
-/// `epicsInt8`.
-fn char_elements(target: crate::types::DbFieldType, chars: &[u8]) -> EpicsValue {
-    use crate::types::DbFieldType as T;
-    let i = |c: &u8| *c as i8;
-    match target {
-        T::String => EpicsValue::StringArray(
-            chars
-                .iter()
-                .map(|c| crate::types::PvString::from_bytes(i(c).to_string().into_bytes()))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::Char => EpicsValue::CharArray(chars.to_vec().into()),
-        T::UChar => EpicsValue::UCharArray(chars.to_vec().into()),
-        T::Short => EpicsValue::ShortArray(
-            chars
-                .iter()
-                .map(|c| i16::from(i(c)))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::UShort => {
-            EpicsValue::UShortArray(chars.iter().map(|c| i(c) as u16).collect::<Vec<_>>().into())
-        }
-        T::Long => EpicsValue::LongArray(
-            chars
-                .iter()
-                .map(|c| i32::from(i(c)))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::ULong => {
-            EpicsValue::ULongArray(chars.iter().map(|c| i(c) as u32).collect::<Vec<_>>().into())
-        }
-        T::Int64 => EpicsValue::Int64Array(
-            chars
-                .iter()
-                .map(|c| i64::from(i(c)))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::UInt64 => {
-            EpicsValue::UInt64Array(chars.iter().map(|c| i(c) as u64).collect::<Vec<_>>().into())
-        }
-        T::Float => EpicsValue::FloatArray(
-            chars
-                .iter()
-                .map(|c| f32::from(i(c)))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::Double => EpicsValue::DoubleArray(
-            chars
-                .iter()
-                .map(|c| f64::from(i(c)))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        T::Enum => {
-            EpicsValue::EnumArray(chars.iter().map(|c| i(c) as u16).collect::<Vec<_>>().into())
-        }
-    }
 }
 
 /// The byte width of one element of `code`, as C's `dbFldDes.size` carries
@@ -3158,7 +2809,7 @@ fn cmd_dbtpf() -> CommandDef {
                     continue;
                 };
                 if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
-                    if !char_view_put(ctx, &addr, &view, CharWrite::One(target, value)) {
+                    if !char_view_put(ctx, &addr, &view, CharWrite::Elements(target, value)) {
                         ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
                         continue;
                     }
@@ -9550,6 +9201,45 @@ mod tests {
             ("SI.VAL$", "DBF_CHAR:           0 = 0x0   \n"),
         ] {
             assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// A `$` put on a long-string VAL is bounded by SIZV, not by a
+    /// `DBR_STRING`'s 40. Oracle — softIoc R7.0.10, SIZV 50:
+    ///
+    /// ```text
+    /// dbpf LI.VAL$ <39|40|41|49 chars> -> LEN 40|41|42|50, VAL all of them
+    /// ```
+    #[test]
+    fn dbpf_dollar_stores_a_long_string_past_40() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lsizv.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LI\") { field(SIZV, \"50\") }\n\
+             record(lso, \"LO\") { field(SIZV, \"50\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let text: String = ('a'..='z').chain('A'..='Z').collect();
+        for rec in ["LI", "LO"] {
+            for n in [39, 40, 41, 49] {
+                run_cmd(&ctx, "dbpf", &[&format!("{rec}.VAL$"), &text[..n]]);
+                let inst = db.get_record(rec).unwrap();
+                let inst = inst.read();
+                assert_eq!(
+                    inst.resolve_field("LEN"),
+                    Some(EpicsValue::ULong(n as u32 + 1)),
+                    "{rec}.LEN after a {n}-char dbpf"
+                );
+                assert_eq!(
+                    inst.resolve_field("VAL"),
+                    Some(EpicsValue::CharArray(text.as_bytes()[..n].to_vec().into())),
+                    "{rec}.VAL after a {n}-char dbpf"
+                );
+            }
         }
     }
 

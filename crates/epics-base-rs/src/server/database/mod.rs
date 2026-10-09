@@ -1,4 +1,5 @@
 pub(crate) mod breakpoint;
+pub mod char_view;
 #[cfg(test)]
 mod cycle_plan_tests;
 pub mod db_access;

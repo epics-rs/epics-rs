@@ -1867,11 +1867,14 @@ impl PutAddr {
 /// field's declaration, settled when the field was first published so the
 /// monitor walk reads it without a name scan. `upper`: the key is already
 /// upper-case, as [`RecordInstance::resolve_field_upper_at`] needs.
+/// `prev_bit`: the field's bit in [`Record::prev_compared_inputs`], settled
+/// with the entry so the walk never searches that list.
 #[derive(Debug)]
 struct Published {
     value: EpicsValue,
     desc: Option<&'static FieldDesc>,
     upper: bool,
+    prev_bit: Option<u8>,
 }
 
 /// Whether `record_type`'s `.dbd` declares `field` — C `dbFindField` on the
@@ -2983,10 +2986,8 @@ pub(crate) struct MonitorPlan {
     pub(crate) posts_value_monitor: bool,
     /// [`Record::alarm_alone_posts_value`].
     pub(crate) alarm_alone_posts_value: bool,
-    /// [`Record::uses_monitor_deadband`].
-    pub(crate) uses_deadband: bool,
-    /// [`Record::has_array_monitor_post`].
-    pub(crate) array_monitor_post: bool,
+    /// [`Record::uses_monitor_deadband`] and [`Record::has_array_monitor_post`].
+    pub(crate) value_gate: crate::server::record::MonitorValueGate,
     /// [`Record::monitor_deadband_field`].
     pub(crate) deadband_field: &'static str,
     /// `deadband_field`'s declaration, so the post reads a non-VAL deadband
@@ -3019,8 +3020,10 @@ impl MonitorPlan {
         Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
-            uses_deadband: record.uses_monitor_deadband(),
-            array_monitor_post: record.has_array_monitor_post(),
+            value_gate: crate::server::record::MonitorValueGate {
+                uses_deadband: record.uses_monitor_deadband(),
+                array_monitor_post: record.has_array_monitor_post(),
+            },
             deadband_field,
             deadband_desc: field_desc_of(record, deadband_field),
             log_suppressed: record.value_only_change_fields().contains(&deadband_field)
@@ -4134,6 +4137,14 @@ impl RecordInstance {
         )
     }
 
+    fn prev_compared_bit(&self, field: &str) -> Option<u8> {
+        let names = self.record.prev_compared_inputs().0;
+        names
+            .iter()
+            .position(|name| *name == field)
+            .map(|bit| bit as u8)
+    }
+
     /// SINGLE OWNER of `last_posted`: record that `value` has been published
     /// to `field`'s `DBE_VALUE`/`DBE_LOG` subscribers, so no later cycle
     /// change-detects and re-publishes it.
@@ -4176,6 +4187,7 @@ impl RecordInstance {
                 value,
                 desc: self.field_desc(field),
                 upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
+                prev_bit: self.prev_compared_bit(field),
             };
             self.last_posted.insert(field.to_string(), published);
         }
@@ -4872,30 +4884,16 @@ impl RecordInstance {
         EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
     }
 
-    /// Resolve a field for EPICS `$` long-string (character-array) access.
-    ///
-    /// The `$` channel-name modifier (C `dbChannel.c:486-505`) re-views a
-    /// field as a `DBR_CHAR` array: a `DBF_STRING` field becomes a char
-    /// array of `field_size` elements, a link field a char array of
-    /// `PVLINK_STRINGSZ`, and every other field type is rejected with
-    /// `S_dbLib_fieldNotFound`. pvxs serves that char view as a
-    /// `form = "String"` long-string `NTScalar` — it reads the `DBR_CHAR`
-    /// bytes and NUL-terminates them back into a string
-    /// (`ioc/iocsource.cpp:133-136`, `ioc/channel.cpp:62-74`).
-    ///
-    /// Both `DBF_STRING` fields and link fields resolve to an
-    /// [`EpicsValue::String`] in this database (a link resolves to its
-    /// textual form, see [`Self::get_common_field`]), so a field is
-    /// `$`-eligible exactly when it resolves to a string value. Returns
-    /// that string value for an eligible field, or `None` for a field the
-    /// `$` modifier cannot view as a char array (the
-    /// `S_dbLib_fieldNotFound` case) — the single owner of the
-    /// dbChannel `$`-eligibility rule for the channel-resolution layer.
+    /// Resolve a field for EPICS `$` long-string (character-array) access:
+    /// the text C's `DBR_CHAR` view of it holds, or `None` where `$` is
+    /// `S_dbLib_fieldNotFound`. Eligibility is
+    /// [`char_view`](crate::server::database::char_view::char_view)'s, the
+    /// one owner of the `$` rule, so a long-string record's `VAL` (a CHAR
+    /// carrier here, `DBF_STRING` to C) takes the modifier like any string.
     pub fn resolve_string_view_field(&self, name: &str) -> Option<EpicsValue> {
-        match self.resolve_field(name)? {
-            v @ EpicsValue::String(_) => Some(v),
-            _ => None,
-        }
+        let mut text = crate::server::database::char_view::char_view(self, name)?.bytes();
+        text.truncate(text.iter().position(|&c| c == 0).unwrap_or(text.len()));
+        Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
     }
 
     /// Choice table for a field served as `DBR_ENUM` from a `DBF_MENU`:
@@ -7282,7 +7280,7 @@ impl RecordInstance {
         let marked_only = self.record.fields_posted_only_when_marked();
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
-        let (prev_compared, prev_changed) = self.record.prev_compared_inputs();
+        let prev_changed = self.record.prev_compared_inputs().1;
 
         // The walk covers every field whose published value is tracked — each
         // subscribed field, and each field a post has already published — not
@@ -7321,7 +7319,13 @@ impl RecordInstance {
             let Some(val) = read else {
                 continue;
             };
-            let changed = match prev_compared.iter().position(|name| *name == field) {
+            // A subscribed field is published when it is added, so the name
+            // search runs only for one never posted since.
+            let prev_bit = match published {
+                Some(p) => p.prev_bit,
+                None => self.prev_compared_bit(field),
+            };
+            let changed = match prev_bit {
                 Some(bit) => prev_changed & (1 << bit) != 0,
                 None => match published.map(|p| &p.value) {
                     Some(prev) => prev != &val,
@@ -7833,27 +7837,17 @@ impl RecordInstance {
         if !self.monitor_plan.posts_value_monitor {
             return (false, false);
         }
-        match self.record.monitor_value_changed() {
-            // lsi/lso post VALUE|LOG only when the string actually changed (C
-            // `lsiRecord.c`/`lsoRecord.c` monitor: `len != olen || memcmp(oval,
-            // val, len)`); they have no MDEL/ADEL deadband to express that, so
-            // the gate is explicit. The MPST/APST `menuPost` "Always" override
-            // OR-adds DBE_VALUE / DBE_LOG even on an unchanged cycle (C monitor:
-            // `if (mpst == menuPost_Always) events |= DBE_VALUE; if (apst ==
-            // menuPost_Always) events |= DBE_LOG;`).
-            Some(changed) => {
-                let (val_always, archive_always) = self.record.monitor_always_post();
-                (changed || val_always, changed || archive_always)
-            }
-            None => {
-                if self.monitor_plan.uses_deadband {
-                    self.check_deadband_ext()
-                } else {
-                    // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
-                    (true, true)
-                }
-            }
-        }
+        // lsi/lso and the binary records gate on their own change test (C
+        // `lsiRecord.c`/`lsoRecord.c` monitor: `len != olen || memcmp(oval,
+        // val, len)`), OR-ing in the MPST/APST `menuPost` "Always" override;
+        // a type with neither a change test nor a deadband posts always.
+        let mut last_posted = [self.common.mlst, self.common.alst];
+        let classes = self
+            .record
+            .monitor_value_classes(self.monitor_plan.value_gate, &mut last_posted);
+        [self.common.mlst, self.common.alst] = last_posted;
+        self.array_hash_changed = classes.hash_changed;
+        (classes.value, classes.archive)
     }
 
     #[inline(always)]
@@ -7908,51 +7902,17 @@ impl RecordInstance {
 
     #[inline(always)]
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
-        // C waveform/aai/aao `monitor()` (waveformRecord.c:291-326) replaces
-        // the analog MDEL/ADEL deadband with the MPST/APST "Always vs On
-        // Change" mechanism: the record hashes its array content and posts
-        // `DBE_VALUE`/`DBE_LOG` either always or only when the hash changed,
-        // and posts `HASH` (`DBE_VALUE`) on a hash change. The record owns
-        // the hash compute + `HASH` update; `array_hash_changed` carries the
-        // event to the snapshot builders, which post `HASH` (the field is
-        // excluded from the generic change-detection loop via
-        // `event_posted_fields`).
-        if self.monitor_plan.array_monitor_post
-            && let Some(post) = self.record.array_monitor_post()
-        {
-            self.array_hash_changed = post.hash_changed;
-            return (post.post_value, post.post_archive);
-        }
-        self.array_hash_changed = false;
-
-        // The deadband is evaluated against `monitor_deadband_value()`,
-        // not `val()` directly: a record whose monitored quantity is
-        // not its primary value (e.g. the motor record, VAL=setpoint /
-        // RBV=readback — C `monitor()` deadbands RBV) overrides that
-        // hook. Default is `val()`, so other records are unaffected.
-        // The operands in one ask — see `Record::monitor_deadband_cells`. A
-        // type that carries no MLST/ALST cell holds them in `CommonFields`.
-        let Some(cells) = self
-            .record
-            .monitor_deadband_cells([self.common.mlst, self.common.alst])
-        else {
-            return (true, true);
-        };
-        let (monitor_trigger, archive_trigger) = cells.crossed();
-
-        if monitor_trigger || archive_trigger {
-            let val = cells.val();
-            self.record
-                .store_monitor_last_posted(val, monitor_trigger, archive_trigger);
-            if archive_trigger {
-                self.common.alst = val.as_f64();
-            }
-            if monitor_trigger {
-                self.common.mlst = val.as_f64();
-            }
-        }
-
-        (monitor_trigger, archive_trigger)
+        // The deadband is evaluated against `monitor_deadband_value()`, not
+        // `val()` directly: the motor record deadbands RBV, its readback.
+        let mut last_posted = [self.common.mlst, self.common.alst];
+        let classes = crate::server::record::monitor_deadband_classes(
+            &mut *self.record,
+            self.monitor_plan.value_gate.array_monitor_post,
+            &mut last_posted,
+        );
+        [self.common.mlst, self.common.alst] = last_posted;
+        self.array_hash_changed = classes.hash_changed;
+        (classes.value, classes.archive)
     }
 
     /// Build a Snapshot for a given value, populated with the record's display

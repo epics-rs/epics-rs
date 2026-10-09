@@ -49,26 +49,24 @@ use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
-/// Convert a `$`-channel snapshot value from `EpicsValue::String` to
-/// `EpicsValue::CharArray` of exactly `MAX_STRING_SIZE` (= 40) elements,
-/// matching C `dbChannel.c:489` which sets `no_elements = field_size` (= 40)
-/// and `dbr_field_type = DBR_CHAR`.  The string bytes are written first,
-/// followed by a NUL terminator, and the remainder zero-padded to 40.
-/// `DBF_STRING` guarantees `strlen <= 39`, so the string always fits.
-/// Non-string values pass through unchanged.
-pub(super) fn apply_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::EpicsValue;
-    const MAX_STRING_SIZE: usize = 40;
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::String(s) => {
-            let mut b = s.into_bytes();
-            b.push(0); // NUL terminator
-            b.resize(MAX_STRING_SIZE, 0); // zero-pad to field_size
-            EpicsValue::CharArray(b.into())
-        }
-        other => other,
+/// A `$` channel's delivery: the value as `dbGet` reads it through the
+/// `DBR_CHAR` address, see
+/// [`posted_char_view`](epics_base_rs::server::database::char_view::posted_char_view).
+/// `requested_count` is `dbGet`'s `nRequest` (0 for autosize); the wire
+/// pads to a fixed request count, as C `read_reply` does.
+pub(super) fn apply_long_string(
+    snap: &mut epics_base_rs::server::snapshot::Snapshot,
+    no_elements: u32,
+    nul_at_count: bool,
+    requested_count: u32,
+) {
+    let n = match requested_count {
+        0 => no_elements,
+        r => r.min(no_elements),
     };
+    let v = std::mem::replace(&mut snap.value, epics_base_rs::types::EpicsValue::Long(0));
+    snap.value =
+        epics_base_rs::server::database::char_view::posted_char_view(v, n as usize, nul_at_count);
 }
 
 /// Convert a long-string *record* field's snapshot value from
@@ -104,10 +102,13 @@ pub(super) fn apply_native_long_string(snap: &mut epics_base_rs::server::snapsho
 pub(super) enum LongStringMode {
     /// Ordinary field: deliver the value verbatim.
     Plain,
-    /// Client appended `$`: a `DBF_STRING` field is delivered as a
-    /// `DBR_CHAR` array of `MAX_STRING_SIZE` (= 40), per the C
-    /// `dbChannel.c` long-string convention. See [`apply_long_string`].
-    DollarChar,
+    /// Client appended `$`: the field is delivered as C's `DBR_CHAR`
+    /// address of it, `no_elements` long (`dbAccess.c:682-701`). See
+    /// [`apply_long_string`].
+    DollarChar {
+        no_elements: u32,
+        nul_at_count: bool,
+    },
     /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
     /// printf VAL): C `cvt_dbaddr` presents it as a scalar `DBF_STRING`,
     /// so the CHAR-array carrier is decoded to a scalar string before
@@ -120,9 +121,13 @@ pub(super) enum LongStringMode {
 pub(super) fn apply_long_string_mode(
     snap: &mut epics_base_rs::server::snapshot::Snapshot,
     mode: LongStringMode,
+    requested_count: u32,
 ) {
     match mode {
-        LongStringMode::DollarChar => apply_long_string(snap),
+        LongStringMode::DollarChar {
+            no_elements,
+            nul_at_count,
+        } => apply_long_string(snap, no_elements, nul_at_count, requested_count),
         LongStringMode::NativeString => apply_native_long_string(snap),
         LongStringMode::Plain => {}
     }

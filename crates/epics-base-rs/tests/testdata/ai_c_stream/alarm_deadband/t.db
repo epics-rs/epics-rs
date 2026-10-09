@@ -1,0 +1,17 @@
+record(ao, "SRC") {
+    field(VAL, "0")
+}
+record(ai, "X") {
+    field(INP, "SRC CP")
+    field(MDEL, "1")
+    field(ADEL, "3")
+    field(HIHI, "10")
+    field(HIGH, "5")
+    field(LOW, "-5")
+    field(LOLO, "-10")
+    field(HHSV, "MAJOR")
+    field(HSV, "MINOR")
+    field(LSV, "MINOR")
+    field(LLSV, "MAJOR")
+    field(HYST, "1")
+}

@@ -1665,3 +1665,34 @@ async fn a_one_character_long_string_stays_a_long_string() {
         &PvField::Scalar(ScalarValue::String("yz".into()))
     );
 }
+
+/// A PVA put to `$` is pvxs's `putLongString`, `dbPut(DBR_CHAR, str,
+/// strlen+1)`: SIZV bounds it, not `DBR_STRING`'s 40. softIoc R7.0.10 with
+/// `lsi` SIZV 50 stores 45 characters and LEN 46.
+#[tokio::test]
+async fn a_dollar_put_is_bounded_by_sizv_not_40() {
+    let db = Arc::new(PvDatabase::new());
+    let li = LsiRecord {
+        sizv: 50,
+        ..Default::default()
+    };
+    db.add_record("TEST:li", Box::new(li)).await.unwrap();
+    let ch = BridgeChannel::new(db.clone(), "TEST:li.VAL$")
+        .await
+        .expect("new");
+    let text: String = ('a'..='z').chain('A'..='S').collect();
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String(text.as_str().into())),
+    ));
+    ch.put(&put).await.expect("`$` put");
+    assert_eq!(
+        db.get_pv("TEST:li.LEN").expect("LEN"),
+        EpicsValue::ULong(46)
+    );
+    assert_eq!(
+        extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::String(text.as_str().into()))
+    );
+}

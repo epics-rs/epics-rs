@@ -61,19 +61,7 @@ impl LinkStatusToken {
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) {
-        self.post_after(handle, name, None, fields, mask);
-    }
-
-    /// [`Self::post`], first posting `repost` at the value it holds.
-    fn post_after(
-        self,
-        handle: &AsyncDbHandle,
-        name: &str,
-        repost: Option<&str>,
-        fields: Vec<(String, EpicsValue)>,
-        mask: crate::server::recgbl::EventMask,
-    ) {
-        let _ = handle.post_fields_with_mask_if(name, repost, fields, mask, || {
+        let _ = handle.post_fields_with_mask_if(name, fields, mask, || {
             self.generation.0.load(Ordering::SeqCst) == self.token
         });
     }
@@ -205,10 +193,13 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
 }
 
 /// Classify a record's links and publish the resulting connection-status menu
-/// fields — the shared body of C's `init_record` link loop and its `special()`
-/// re-classification (`calcoutRecord.c:160-189`, `transformRecord.c:444-473`
-/// and `:709-742`, `sCalcoutRecord.c:254-288` and `:508-569`,
-/// `aCalcoutRecord.c:209-243` and `:528-569`).
+/// fields — the shared body of C's `init_record` link loop and the synApps
+/// records' `special()` re-classification (`calcoutRecord.c:160-189`,
+/// `transformRecord.c:444-473` and `:709-742`, `sCalcoutRecord.c:254-288` and
+/// `:508-569`, `aCalcoutRecord.c:209-243` and `:528-569`). Base calcout's
+/// `special()` is not one: it asks `dbLinkIsConstant` before `dbAddLink` has
+/// set the `lset` (dbAccess.c:1181-1208), so a runtime put reads Constant
+/// whatever the target and nothing is classified.
 ///
 /// `links` pairs each status FIELD with the link string it describes and that
 /// link's [`LinkRole`]. Every caller passes its complete set, so a refresh is
@@ -258,84 +249,9 @@ pub fn post_link_status(
                 (field.to_string(), EpicsValue::Enum(status as u16))
             })
             .collect();
-        token.post(&handle, &name, fields, mask);
-    });
-}
-
-/// Where [`post_link_put_status`] reads a link's text from.
-pub enum LinkText {
-    /// The record's own field, snapshotted by the caller.
-    Held(String),
-    /// A `dbCommon` link field (calcout's `OUT`): the record never sees its
-    /// text, so the classification reads it back once the put has landed.
-    Common(&'static str),
-}
-
-/// One link of a record, as [`post_link_put_status`] classifies it: its status
-/// field, its text, its role and the status the record held when the put ran.
-/// `value_field` is C's `pvalue` when the record's framework re-seed does not
-/// post it (calcout's OUT → OVAL); `None` for an input.
-pub struct LinkSlot {
-    pub status_field: &'static str,
-    pub text: LinkText,
-    pub role: LinkRole,
-    pub held: i16,
-    pub value_field: Option<&'static str>,
-}
-
-/// The re-classification a put to ONE link owes — C's `special()` arm, which
-/// classifies the link just written and posts its status field alone
-/// (`calcoutRecord.c:366-405`).
-///
-/// It classifies every link, not just `put`, and posts `put`'s status plus any
-/// other whose verdict differs from `held`: the [`LinkStatusGen`] gate drops a
-/// superseded task whole, and the link THAT task owed is still unposted, which
-/// is exactly a verdict that differs from what the record holds. An untouched
-/// link agrees with `held` and posts nothing.
-pub fn post_link_put_status(
-    ctx: Option<&(String, AsyncDbHandle)>,
-    generation: &LinkStatusGen,
-    links: Vec<LinkSlot>,
-    put: &'static str,
-    mask: crate::server::recgbl::EventMask,
-) {
-    let Some((name, handle)) = ctx else {
-        return;
-    };
-    let name = name.clone();
-    let handle = handle.clone();
-    let token = generation.next();
-    let sched = handle.clone();
-    let init_key = name.clone();
-    sched.schedule_record_init(&init_key, async move {
-        let mut fields: Vec<(String, EpicsValue)> = Vec::new();
-        let mut repost = None;
-        for slot in links {
-            let text = match slot.text {
-                LinkText::Held(text) => text,
-                LinkText::Common(field) => {
-                    match handle.read_link_value(&format!("{name}.{field}")).await {
-                        Some(EpicsValue::String(text)) => text.to_string(),
-                        _ => String::new(),
-                    }
-                }
-            };
-            let (status, _ft) = classify_link(&handle, &text, slot.role);
-            // C posts `pvalue` for a link left constant, before its status
-            // (calcoutRecord.c:376).
-            if slot.status_field == put && status == LINK_CON {
-                repost = slot.value_field;
-            }
-            if slot.status_field == put || status != slot.held {
-                fields.push((
-                    slot.status_field.to_string(),
-                    EpicsValue::Enum(status as u16),
-                ));
-            }
-        }
         #[cfg(test)]
         tests::hold_before_post().await;
-        token.post_after(&handle, &name, repost, fields, mask);
+        token.post(&handle, &name, fields, mask);
     });
 }
 
@@ -389,38 +305,49 @@ mod tests {
     use crate::server::database::PvDatabase;
     use crate::server::recgbl::EventMask;
     use crate::server::records::ai::AiRecord;
-    use crate::server::records::calcout::CalcoutRecord;
+    use crate::server::records::scalcout::ScalcoutRecord;
     use crate::types::{DbFieldType, EpicsValue};
 
-    /// `(arrived, release)` for the next classification task to reach its
-    /// post: it signals `arrived` and parks until `release` fires.
-    static HOLD: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>> = Mutex::new(None);
+    /// `(arrived, release, resumed)` for the next classification task to
+    /// reach its post: it signals `arrived`, parks until `release` fires, and
+    /// signals `resumed` on its way to the post.
+    type Hold = (
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    );
+    static HOLD: Mutex<Option<Hold>> = Mutex::new(None);
 
     pub(super) async fn hold_before_post() {
         let hold = HOLD.lock().unwrap().take();
-        if let Some((arrived, release)) = hold {
+        if let Some((arrived, release, resumed)) = hold {
             let _ = arrived.send(());
             let _ = release.await;
+            let _ = resumed.send(());
         }
     }
 
-    /// Boundary of the generation gate: put 1's task has classified INPA and is
-    /// parked at its post while put 2 issues the next token. It must post
-    /// nothing, and put 2's task posts INAV because its verdict differs from
-    /// what the record holds — so INAV posts once. Without the gate it posts
-    /// twice.
+    /// Boundary of the generation gate: put 1 (`INPA SRC`) has classified
+    /// Local and is released while the test holds SC's write lock, so it
+    /// reaches its post — and, were the token checked before the lock, its
+    /// check — before put 2 (`INPA ""`) issues the next token under that same
+    /// lock. Only put 2's whole Constant classification may post; a check
+    /// outside the lock also posts the stale Local, in either order.
     #[epics_macros_rs::epics_test]
     async fn a_superseded_link_put_still_posts_its_status() {
         let db = PvDatabase::new();
         db.add_record("SRC", Box::new(AiRecord::new(3.0)))
             .await
             .unwrap();
-        db.add_record("CO", Box::new(CalcoutRecord::default()))
+        db.add_record("SC", Box::new(ScalcoutRecord::new()))
             .await
             .unwrap();
         db.ioc_init().await;
+        // SC's init classification is spawned and may still be in flight; it
+        // must not be the task the hold catches.
+        crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
-        let rec = db.get_record("CO").unwrap();
+        let rec = db.get_record("SC").unwrap();
         let mut rx: Vec<_> = ["INAV", "INBV", "INCV"]
             .iter()
             .map(|f| {
@@ -432,19 +359,28 @@ mod tests {
 
         let (arrived_tx, arrived) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
-        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx));
-        let put = |field: &str| {
-            db.put_record_field_from_ca_already_locked(
-                "CO",
-                field,
-                EpicsValue::String("SRC".into()),
-            )
-            .unwrap()
-        };
-        put("INPA");
+        let (resumed_tx, resumed) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
+        let src = EpicsValue::String("SRC".into());
+        let held = db.lock_for_put("SC", "INPA", &src);
+        db.put_record_field_from_ca_already_locked(held, src)
+            .unwrap();
         arrived.await.expect("put 1's task reached its post");
-        put("INPB");
-        release.send(()).unwrap();
+        {
+            let mut guard = rec.write();
+            release.send(()).unwrap();
+            resumed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("put 1's task resumed");
+            // The few instructions from the hold to the post's lock.
+            std::thread::sleep(Duration::from_millis(50));
+            // Put 2, as the put path runs it under the record's hold.
+            guard
+                .record
+                .put_field("INPA", EpicsValue::String("".into()))
+                .unwrap();
+            guard.record.special("INPA", true).unwrap();
+        }
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let mut drain = |i: usize| {
@@ -454,9 +390,9 @@ mod tests {
             }
             got
         };
-        let local = vec![EpicsValue::Enum(super::LINK_LOC as u16)];
-        assert_eq!(drain(0), local, "INAV");
-        assert_eq!(drain(1), local, "INBV");
-        assert_eq!(drain(2), Vec::new(), "INCV");
+        let constant = vec![EpicsValue::Enum(super::LINK_CON as u16)];
+        assert_eq!(drain(0), constant, "INAV");
+        assert_eq!(drain(1), constant, "INBV");
+        assert_eq!(drain(2), constant, "INCV");
     }
 }

@@ -630,7 +630,21 @@ impl BridgeChannel {
             // `DBF_CHAR` storage — that would parse the whole string as one
             // integer and reject the PUT.
             let text = pvif::long_string_value(&raw_val);
-            if self.value_dbf == DbFieldType::Char {
+            if self.string_view {
+                // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through
+                // the `$` address, the one owner CA and `dbpf` put through.
+                use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+                let refused = || BridgeError::PutRejected(format!("{}: no $ view", self.pv_name));
+                let rec = self
+                    .db
+                    .get_record(&self.record_name)
+                    .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+                let view = char_view(&rec.read(), &self.field).ok_or_else(refused)?;
+                let mut chars = text.as_bytes().to_vec();
+                chars.push(0);
+                view.put_value(CharWrite::Chars(chars))
+                    .ok_or_else(refused)?
+            } else if self.value_dbf == DbFieldType::Char {
                 // The field's storage IS a `DBR_CHAR` array, so this is
                 // pvxs's `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`,
                 // i.e. the bytes plus the NUL. Writing the char image (not
@@ -640,9 +654,6 @@ impl BridgeChannel {
                 // which is capped at MAX_STRING_SIZE.
                 pvif::long_string_put_image(&text)
             } else {
-                // String-backed storage (a `$` view of a DBF_STRING or link
-                // field): the record's own String put is the equivalent of
-                // C's re-viewed put.
                 EpicsValue::String(text)
             }
         } else {

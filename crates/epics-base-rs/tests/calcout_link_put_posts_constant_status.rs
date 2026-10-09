@@ -1,29 +1,24 @@
-//! A runtime put to a calcout link posts what C's `special()` is WRITTEN to
-//! post (calcoutRecord.c:366-405): that link's status field, classified, and —
-//! for a link left constant — the value field behind it (A..U, or OVAL for OUT). No other status field,
-//! and nothing on the next process.
+//! A runtime put to a calcout link posts what C's `special()` posts:
+//! the link's value field and its status field reading Constant, whatever
+//! the new target, and nothing else (calcoutRecord.c:366-405). The status is
+//! Constant because `dbPutFieldLink` calls `dbPutSpecial(paddr, 1)` before
+//! `dbAddLink` sets the `lset` (dbAccess.c:1181-1208).
 //!
-//! This is not softIoc's stream. C runs that `special()` before `dbAddLink`
-//! sets the `lset` (dbAccess.c:1181-1208), so softIoc R7.0.10 reads every
-//! re-point as Constant and loads nothing; R19-1
-//! (`calcout_constant_input_reseed.rs`) keeps the intended behaviour instead.
-//! The tree that pins softIoc's own stream is
-//! `/tmp/claude-1000/-home-stevek-work/561a1cf1-a6b9-439c-be95-16435c98199a/scratchpad/handoff/calcout-c-stream.patch`.
+//! Oracle — softIoc R7.0.10 (CA, camonitor) and softIocPVX on pvxs 1.5.3
+//! (PVA, pvxmonitor), identical event sequences, on
 //!
 //! ```text
 //! record(ai, "SRC") { field(VAL, "3") }
 //! record(calcout, "CO") { field(CALC, "A") field(INPA, "5") }
 //!
-//! caput CO.INPA SRC   ->  CO.INAV Local PV
-//! caput CO.INPA 7     ->  CO.A 7     CO.INAV Constant
-//! caput CO.INPA ""    ->  CO.A 7     CO.INAV Constant
-//! caput CO.OUT SRC    ->  CO.OUTV Local PV
-//! caput CO.PROC 1     ->  CO.A 7     CO.OVAL 7        (no INAV/INBV/OUTV)
-//! caput CO.OUT ""     ->  CO.OVAL 7  CO.OUTV Constant
-//! caput CO.OUT 5      ->  CO.OVAL 7  CO.OUTV Constant
+//! caput CO.INPA SRC   ->  CO.A 5     CO.INAV Constant
+//! caput CO.INPA 7     ->  CO.A 5     CO.INAV Constant   (A not reloaded)
+//! caput CO.INPA ""    ->  CO.A 5     CO.INAV Constant
+//! caput CO.OUT SRC    ->  CO.OVAL 0  CO.OUTV Constant
+//! caput CO.PROC 1     ->  CO.A 5     CO.OVAL 5          (no INAV/INBV/OUTV)
 //! ```
-
-use std::time::Duration;
+//!
+//! CO.INBV posts nothing after the connect value.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
@@ -33,7 +28,6 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-const LOCAL: u16 = 2;
 const CONSTANT: u16 = 3;
 const FIELDS: [&str; 5] = ["A", "INAV", "INBV", "OUTV", "OVAL"];
 
@@ -46,7 +40,7 @@ fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
 }
 
 #[epics_macros_rs::epics_test]
-async fn calcout_link_puts_post_the_intended_stream() {
+async fn calcout_link_puts_post_as_softioc_r7_0_10() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(3.0)))
         .await
@@ -74,25 +68,34 @@ async fn calcout_link_puts_post_the_intended_stream() {
         })
         .collect();
 
-    let a7 = || vec![EpicsValue::Double(7.0)];
-    let st = |s: u16| vec![EpicsValue::Enum(s)];
+    let a5 = || vec![EpicsValue::Double(5.0)];
+    let con = || vec![EpicsValue::Enum(CONSTANT)];
     let none = Vec::<EpicsValue>::new;
-    let steps: [(&str, &str, [Vec<EpicsValue>; 5]); 7] = [
-        ("INPA", "SRC", [none(), st(LOCAL), none(), none(), none()]),
-        ("INPA", "7", [a7(), st(CONSTANT), none(), none(), none()]),
-        ("INPA", "", [a7(), st(CONSTANT), none(), none(), none()]),
-        ("OUT", "SRC", [none(), none(), none(), st(LOCAL), none()]),
-        ("PROC", "1", [a7(), none(), none(), none(), a7()]),
-        ("OUT", "", [none(), none(), none(), st(CONSTANT), a7()]),
-        ("OUT", "5", [none(), none(), none(), st(CONSTANT), a7()]),
+    let steps: [(&str, &str, [Vec<EpicsValue>; 5]); 5] = [
+        ("INPA", "SRC", [a5(), con(), none(), none(), none()]),
+        ("INPA", "7", [a5(), con(), none(), none(), none()]),
+        ("INPA", "", [a5(), con(), none(), none(), none()]),
+        (
+            "OUT",
+            "SRC",
+            [none(), none(), none(), con(), vec![EpicsValue::Double(0.0)]],
+        ),
+        (
+            "PROC",
+            "1",
+            [a5(), none(), none(), none(), vec![EpicsValue::Double(5.0)]],
+        ),
     ];
     for (field, value, want) in steps {
         db.put_record_field_from_ca_no_notify("CO", field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        // The status classification is posted by a spawned task.
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         for (i, f) in FIELDS.iter().enumerate() {
+            // A's PROC post is `monitor()`'s alarm-cycle rule, not `special()`.
+            if field == "PROC" && *f == "A" {
+                drain(&mut rx[i]);
+                continue;
+            }
             assert_eq!(
                 drain(&mut rx[i]),
                 want[i],

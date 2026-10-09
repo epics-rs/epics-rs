@@ -1443,6 +1443,20 @@ impl ChannelProvider for BridgeProvider {
 }
 
 impl BridgeProvider {
+    /// Whether [`Self::create_channel_with_creds`] would build `name`, asked
+    /// of the same constructor without serving a client.
+    pub async fn channel_creatable(&self, name: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.servable_group(name).await.is_some() {
+            return true;
+        }
+        let parsed = epics_base_rs::server::database::filters::parse_channel_name(name);
+        self.db.has_name(&parsed.record_path).await
+            && BridgeChannel::new(self.db.clone(), name).await.is_ok()
+    }
+
     /// Create a channel with explicit user/host (method defaults to empty).
     ///
     /// Used by the PVA server when it knows the connecting client's

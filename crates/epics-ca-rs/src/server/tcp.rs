@@ -646,8 +646,8 @@ struct ChannelEntry {
     /// long-string boundary conversion this channel applies on every
     /// GET/monitor delivery (and the matching native-type override set
     /// at channel-create time). `DollarChar` = client appended `$` to a
-    /// `DBF_STRING` field (C `dbChannel.c:486-505`): delivered as a
-    /// `DBR_CHAR[40]` array. `NativeString` = plain access to a
+    /// string or link field (C `dbAccess.c:682-701`): delivered as a
+    /// `DBR_CHAR` array. `NativeString` = plain access to a
     /// long-string *record* field (lsi/lso VAL & OVAL, printf VAL),
     /// which C `cvt_dbaddr` presents as a scalar `DBF_STRING`. `Plain`
     /// for every other channel.
@@ -3022,12 +3022,8 @@ pub(crate) async fn dispatch_message(
                         // else at `:500-503` and gets S_dbLib_fieldNotFound
                         // (CREATE_CH_FAIL). When it is a
                         // string C overrides the channel to DBF_CHAR with
-                        // `no_elements = field_size` (= 40). This must match the
-                        // RecordField arm below, because the channel stores
-                        // its `LongStringMode` and every delivery path runs
-                        // `apply_long_string` to convert the value to CHAR[40];
-                        // advertising the native DBR_STRING/1 here would
-                        // mis-size the client buffer against the delivered data.
+                        // `no_elements = field_size` (= 40), as the RecordField
+                        // arm below does through `char_view`.
                         if long_string && !matches!(value, EpicsValue::String(_)) {
                             let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                             fail.cid = client_cid;
@@ -3035,7 +3031,14 @@ pub(crate) async fn dispatch_message(
                             return Ok(());
                         }
                         let (dbr_type_val, element_count, mode) = if long_string {
-                            (DbFieldType::Char, 40u32, LongStringMode::DollarChar)
+                            (
+                                DbFieldType::Char,
+                                40u32,
+                                LongStringMode::DollarChar {
+                                    no_elements: 40,
+                                    nul_at_count: true,
+                                },
+                            )
                         } else {
                             (
                                 value.dbr_type(),
@@ -3060,55 +3063,70 @@ pub(crate) async fn dispatch_message(
                         let value = instance.client_field_value(&field);
                         match value {
                             Some(v) => {
-                                // `$` long-string — C dbChannel.c:486-505
-                                // accepts DBF_STRING (EpicsValue::String) and
-                                // link fields (`:494-499`, which the port has
-                                // no client-visible equivalent of); every other
-                                // field type falls to the else at `:500-503`
-                                // and gets S_dbLib_fieldNotFound
-                                // (CREATE_CH_FAIL parity).
-                                if long_string && !matches!(v, EpicsValue::String(_)) {
-                                    let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                                    fail.cid = client_cid;
-                                    writer.push(fail.to_bytes().to_vec());
-                                    return Ok(());
-                                }
-                                // override type and count for `$` channels.
-                                // C sets `paddr->field_type = DBF_CHAR`,
-                                // `paddr->dbr_field_type = DBR_CHAR`, and
-                                // `paddr->no_elements = paddr->field_size` (= 40).
-                                let (dbr_type_val, element_count, mode) = if long_string {
-                                    (DbFieldType::Char, 40u32, LongStringMode::DollarChar)
-                                } else if instance
-                                    .record
-                                    .long_string_fields()
-                                    .contains(&field.as_str())
-                                {
-                                    // Long-string *record* field (lsi/lso VAL &
-                                    // OVAL, printf VAL). C `cvt_dbaddr` presents
-                                    // it as a scalar `DBF_STRING` with
-                                    // `no_elements = 1` (lsiRecord.c:141-143,
-                                    // lsoRecord.c:183-185, printfRecord.c:415-417);
-                                    // the full long value is reachable only via
-                                    // the `$` modifier (handled above). The record
-                                    // stores the value as a CHAR-array carrier, so
-                                    // every delivery path decodes it to a scalar
-                                    // string with `apply_native_long_string`.
-                                    (DbFieldType::String, 1u32, LongStringMode::NativeString)
-                                } else if let Some(native) =
-                                    instance.record.field_native_count(&field)
-                                {
-                                    // C `cvt_dbaddr` fixes a channel's no_elements at
-                                    // the field's buffer capacity, distinct from the
-                                    // current value length `get_array_info` reports
-                                    // (waveform VAL→NELM serving NORD; asyn BOUT→OMAX /
-                                    // BINP→IMAX serving the transferred byte count). The
-                                    // client sizes its buffer to the capacity even
-                                    // though a GET returns fewer elements.
-                                    (v.dbr_type(), native, LongStringMode::Plain)
+                                // `$` — C `dbNameToAddr` (dbAccess.c:682-701)
+                                // re-types a string or link field as a
+                                // DBR_CHAR array and refuses every other type
+                                // (S_dbLib_fieldNotFound, CREATE_CH_FAIL). The
+                                // shared owner answers both, with C's
+                                // `no_elements` (lsi/lso/printf SIZV, a link's
+                                // PVLINK_STRINGSZ).
+                                let dollar = if long_string {
+                                    match epics_base_rs::server::database::char_view::char_view(
+                                        &instance, &field,
+                                    ) {
+                                        Some(view) => {
+                                            Some((view.no_elements as u32, view.nul_at_count()))
+                                        }
+                                        None => {
+                                            let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                                            fail.cid = client_cid;
+                                            writer.push(fail.to_bytes().to_vec());
+                                            return Ok(());
+                                        }
+                                    }
                                 } else {
-                                    (v.dbr_type(), v.count() as u32, LongStringMode::Plain)
+                                    None
                                 };
+                                let (dbr_type_val, element_count, mode) =
+                                    if let Some((no_elements, nul_at_count)) = dollar {
+                                        (
+                                            DbFieldType::Char,
+                                            no_elements,
+                                            LongStringMode::DollarChar {
+                                                no_elements,
+                                                nul_at_count,
+                                            },
+                                        )
+                                    } else if instance
+                                        .record
+                                        .long_string_fields()
+                                        .contains(&field.as_str())
+                                    {
+                                        // Long-string *record* field (lsi/lso VAL &
+                                        // OVAL, printf VAL). C `cvt_dbaddr` presents
+                                        // it as a scalar `DBF_STRING` with
+                                        // `no_elements = 1` (lsiRecord.c:141-143,
+                                        // lsoRecord.c:183-185, printfRecord.c:415-417);
+                                        // the full long value is reachable only via
+                                        // the `$` modifier (handled above). The record
+                                        // stores the value as a CHAR-array carrier, so
+                                        // every delivery path decodes it to a scalar
+                                        // string with `apply_native_long_string`.
+                                        (DbFieldType::String, 1u32, LongStringMode::NativeString)
+                                    } else if let Some(native) =
+                                        instance.record.field_native_count(&field)
+                                    {
+                                        // C `cvt_dbaddr` fixes a channel's no_elements at
+                                        // the field's buffer capacity, distinct from the
+                                        // current value length `get_array_info` reports
+                                        // (waveform VAL→NELM serving NORD; asyn BOUT→OMAX /
+                                        // BINP→IMAX serving the transferred byte count). The
+                                        // client sizes its buffer to the capacity even
+                                        // though a GET returns fewer elements.
+                                        (v.dbr_type(), native, LongStringMode::Plain)
+                                    } else {
+                                        (v.dbr_type(), v.count() as u32, LongStringMode::Plain)
+                                    };
                                 (
                                     dbr_type_val,
                                     element_count,
@@ -3545,7 +3563,7 @@ pub(crate) async fn dispatch_message(
             // `NativeString` is the inverse — a long-string record field
             // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
             // string so plain access ships one DBR_STRING (C cvt_dbaddr).
-            super::apply_long_string_mode(&mut snapshot, entry.long_string_mode);
+            super::apply_long_string_mode(&mut snapshot, entry.long_string_mode, requested_count);
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
                 snapshot.value.truncate(requested_count as usize);
@@ -4171,6 +4189,23 @@ enum PutPlan {
     /// carries a value for a compound buffer and none for the metadata-only
     /// types.
     Refuse { logged_value: Option<EpicsValue> },
+}
+
+/// What a put through a `$` channel stores: the decoded chars (or one element
+/// of another type) through C's DBR_CHAR address of `field`, or C's refusal.
+fn dollar_put_value(
+    record: &epics_base_rs::server::record::RecordCell,
+    field: &str,
+    value: EpicsValue,
+) -> CaResult<EpicsValue> {
+    use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+    let refused = || epics_base_rs::error::CaError::PutDisabled(field.to_string());
+    let view = char_view(&record.read(), field).ok_or_else(refused)?;
+    let written = match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => CharWrite::Chars(b.to_vec()),
+        v => CharWrite::Elements(v.db_field_type(), v),
+    };
+    view.put_value(written).ok_or_else(refused)
 }
 
 /// The shared synchronous head of `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY`.
@@ -4856,21 +4891,34 @@ pub(crate) async fn serve_write_head(
                 }
                 ChannelTarget::RecordField { record, field } => {
                     let name = record.read().name.clone();
-                    if is_notify {
-                        db.put_record_field_from_ca(&name, field, new_value).await
-                    } else {
-                        // C `write_action` (`rsrv/camessage.c:781-789`)
-                        // routes CA_PROTO_WRITE through `dbPutField` —
-                        // no putNotify is ever built. Parking a wait-set
-                        // whose receiver this fire-and-forget arm drops
-                        // would occupy the record's notify slot until
-                        // any async processing it starts settles (a
-                        // motor's whole motion), failing every
-                        // legitimate WRITE_NOTIFY on the record with
-                        // ECA_PUTCBINPROG in the meantime.
-                        db.put_record_field_from_ca_no_notify(&name, field, new_value)
-                            .await
-                            .map(|()| ProcessCompletion::Sync)
+                    // A `$` channel writes through C's DBR_CHAR address of the
+                    // field: the shared owner turns the chars into what that
+                    // `dbPutField` stores, or refuses as C does.
+                    let new_value = match entry.long_string_mode {
+                        LongStringMode::DollarChar { .. } => {
+                            dollar_put_value(record, field, new_value)
+                        }
+                        _ => Ok(new_value),
+                    };
+                    match new_value {
+                        Err(e) => Err(e),
+                        Ok(new_value) if is_notify => {
+                            db.put_record_field_from_ca(&name, field, new_value).await
+                        }
+                        Ok(new_value) => {
+                            // C `write_action` (`rsrv/camessage.c:781-789`)
+                            // routes CA_PROTO_WRITE through `dbPutField` —
+                            // no putNotify is ever built. Parking a wait-set
+                            // whose receiver this fire-and-forget arm drops
+                            // would occupy the record's notify slot until
+                            // any async processing it starts settles (a
+                            // motor's whole motion), failing every
+                            // legitimate WRITE_NOTIFY on the record with
+                            // ECA_PUTCBINPROG in the meantime.
+                            db.put_record_field_from_ca_no_notify(&name, field, new_value)
+                                .await
+                                .map(|()| ProcessCompletion::Sync)
+                        }
                     }
                 }
             };
@@ -5676,7 +5724,11 @@ pub(crate) async fn register_subscription(
                             // long-string boundary conversion
                             // (`$` → CHAR[40], or native record field
                             // → scalar DBR_STRING); no-op otherwise.
-                            super::apply_long_string_mode(&mut snap, long_string_mode);
+                            super::apply_long_string_mode(
+                                &mut snap,
+                                long_string_mode,
+                                requested_count,
+                            );
                             // the initial event honours
                             // the EVENT_ADD request count for
                             // BOTH directions —
@@ -5862,7 +5914,11 @@ pub(crate) async fn register_subscription(
                                     // long-string boundary conversion
                                     // (`$` → CHAR[40], or native record
                                     // field → scalar DBR_STRING).
-                                    super::apply_long_string_mode(&mut snap, long_string_mode);
+                                    super::apply_long_string_mode(
+                                        &mut snap,
+                                        long_string_mode,
+                                        requested_count,
+                                    );
                                     Some(snap)
                                 }
                                 None => None,
@@ -6073,6 +6129,7 @@ pub(crate) async fn register_subscription(
                             super::apply_long_string_mode(
                                 std::sync::Arc::make_mut(&mut event.snapshot),
                                 long_string_mode,
+                                requested_count,
                             );
                         }
                         // Header space reserved up front, payload encoded
@@ -6986,7 +7043,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                     }
                     // long-string boundary conversion (`$` → CHAR[40], or
                     // native record field → scalar DBR_STRING).
-                    super::apply_long_string_mode(&mut snap, sub_long_string_mode);
+                    super::apply_long_string_mode(&mut snap, sub_long_string_mode, data_count);
                     send_monitor_snapshot(
                         writer,
                         sub_id_val,

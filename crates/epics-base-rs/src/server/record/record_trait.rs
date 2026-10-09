@@ -2961,6 +2961,15 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// Whether a failed INP read under `"Raw Soft Channel"` skips the
+    /// record's RVAL -> VAL convert. `devAiSoftRaw`, `devBiSoftRaw` and
+    /// `devMbbiSoftRaw` return the `dbGetLink` status, so `if (status == 0)
+    /// convert()` is not reached; `devMbbiDirectSoftRaw` ignores it and
+    /// returns 0, so its convert runs on the unchanged RVAL.
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        false
+    }
+
     /// The `DTYP="Raw Soft Channel"` OUTPUT dset — C's four `devXxxSoftRaw.c`
     /// write supports: the value `write_xxx()` puts to the OUT link.
     ///
@@ -6272,7 +6281,7 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
 /// [`crate::types::codec`]'s GET side spells out: C hands the `long` to
 /// `cvtDoubleToString`'s `epicsUInt16` parameter and the conversion
 /// reinterprets it.
-fn put_string_precision<R: Record + ?Sized>(record: &R) -> u16 {
+pub(crate) fn put_string_precision<R: Record + ?Sized>(record: &R) -> u16 {
     match record.record_type() {
         "histogram" => 6,
         "asyn" => 0,

@@ -324,3 +324,14 @@ async fn a_string_simple_pv_shadowing_the_field_is_a_failed_read() {
     assert_eq!(sevr, AlarmSeverity::Invalid, "LINK alarm on the reader");
     assert!(*gated.lock().unwrap(), "the fetch reports the failed read");
 }
+
+/// A `DBR_DOUBLE` request lands a DOUBLE source as read (sign of zero and
+/// all) and still converts any other class to a double.
+#[epics_macros_rs::epics_test]
+async fn a_double_requested_as_double_lands_as_read() {
+    let (v, sevr) = read(EpicsValue::Double(-0.0), "src_f64", LinkReadAs::Double).await;
+    assert!(matches!(v, Some(EpicsValue::Double(d)) if d == 0.0 && d.is_sign_negative()));
+    assert_eq!(sevr, AlarmSeverity::NoAlarm);
+    let (v, _) = read(EpicsValue::Int64(7), "src_i64", LinkReadAs::Double).await;
+    assert_eq!(v, Some(EpicsValue::Double(7.0)));
+}

@@ -701,12 +701,14 @@ impl WaveformRecord {
         // are a read that returned 0 — so the remembered failure is over.
         self.inp_read_failed = false;
         let len = self.val.count() as i32;
-        let n_request = n_request.clamp(0, len);
-        let indx = self.indx;
+        let n_request = i64::from(n_request.clamp(0, len));
+        // C's `prec->indx` is `epicsUInt32` in a `long` expression: an INDX
+        // that was never clamped (the init load) is read unsigned.
+        let indx = i64::from(self.indx as u32);
         let mut ecount = n_request - indx;
         if ecount > 0 {
-            if ecount > self.nelm {
-                ecount = self.nelm;
+            if ecount > i64::from(self.nelm as u32) {
+                ecount = i64::from(self.nelm as u32);
             }
             let start = indx as usize;
             let end = start + ecount as usize;
@@ -742,7 +744,7 @@ impl WaveformRecord {
         } else {
             ecount = 0;
         }
-        self.nord = ecount;
+        self.nord = ecount as i32;
     }
 
     /// C `devSASoft.c::read_sa`'s load half (97-119): ask the INP for
@@ -757,8 +759,11 @@ impl WaveformRecord {
     /// elements, and a SCALAR source is one element at `bptr[0]` with
     /// `nRequest = 1`.
     fn sa_load_and_subset(&mut self, source: EpicsValue) -> CaResult<()> {
-        self.sa_clamp_bounds();
-        let n_request = self.indx.saturating_add(self.nelm).min(self.malm.max(1));
+        // No clamp here: this is `devSASoft`'s `init_record` too, which C
+        // runs on the unclamped INDX/NELM. The process-time clamp
+        // (`readValue`) is `pre_input_link_actions`.
+        let n_request = (i64::from(self.indx as u32) + i64::from(self.nelm as u32))
+            .min(i64::from(self.malm.max(1))) as i32;
         let mut src = source.convert_to(self.ftvl_element_type());
         src.truncate(n_request as usize);
         let loaded = src.count() as i32;
@@ -1466,6 +1471,12 @@ impl Record for WaveformRecord {
     /// `init && isConst` arm) is not applied here — it belongs to
     /// `init_record`, not to the per-cycle hook.
     fn pre_input_link_actions(&mut self, dol_is_constant: bool) -> ProcessActions {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            // C `readValue`: NELM/INDX are clamped before `read_sa`, on every
+            // process and never at init.
+            self.sa_clamp_bounds();
+            return ProcessActions::new();
+        }
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return ProcessActions::new();
         }
@@ -1596,7 +1607,6 @@ impl Record for WaveformRecord {
             None => {
                 // `S_db_badField` — the INP is empty: nRequest = NORD, subset
                 // the buffer the client wrote.
-                self.sa_clamp_bounds();
                 let n_request = self.nord;
                 self.sa_subset(n_request);
             }

@@ -1135,6 +1135,13 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         if value.is_array() {
             value.truncate(n_request);
+            if dbr == DbFieldType::String
+                && let crate::server::record::ParsedLink::Db(db) = link
+                && let Some(at) = self.db_link_addr(db)
+                && let Some(rendered) = at.rec.read().dbr_string_at_precision(&value)
+            {
+                return Some(rendered);
+            }
             return value.get_convert(dbr).ok();
         }
         match dbr {

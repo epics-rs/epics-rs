@@ -98,6 +98,12 @@ pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0) as i16,
     };
+    resolve_sim_mode_at(simm, record)
+}
+
+/// [`resolve_sim_mode`] for a caller that already holds SIMM.
+#[inline(always)]
+pub fn resolve_sim_mode_at(simm: i16, record: &dyn crate::server::record::Record) -> SimMode {
     // The record's own SIMM menu decides which indices are legal, and only
     // index 2 asks — NO and YES are legal in both menus, so the steady cycle
     // does not look the menu up. Every record that declares SIMM declares its

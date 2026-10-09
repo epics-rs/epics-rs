@@ -169,6 +169,10 @@ impl Record for BiRecord {
         true
     }
 
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        true
+    }
+
     /// `bi` has an `RVAL → VAL` `convert()` step. A `Soft Channel` `bi`
     /// must skip it — C `devBiSoft.c` `read_bi` returns 2.
     fn soft_channel_skips_convert(&self) -> bool {

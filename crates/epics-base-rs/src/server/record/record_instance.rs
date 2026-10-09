@@ -1029,6 +1029,7 @@ impl ProcessPlan {
         skips_timestamp_when_undefined: false,
         restamps_time_after_completion: false,
         alarms_before_stamp: false,
+        stamps_before_alarms: true,
         clears_udf: true,
         soft_read_clears_udf: true,
     };
@@ -1064,6 +1065,7 @@ impl ProcessPlan {
             skips_timestamp_when_undefined,
             restamps_time_after_completion,
             alarms_before_stamp,
+            stamps_before_alarms,
             clears_udf,
             soft_read_clears_udf,
         } = *self;
@@ -1093,6 +1095,7 @@ impl ProcessPlan {
             && skips_timestamp_when_undefined == p.skips_timestamp_when_undefined
             && restamps_time_after_completion == p.restamps_time_after_completion
             && alarms_before_stamp == p.alarms_before_stamp
+            && stamps_before_alarms == p.stamps_before_alarms
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
     }
@@ -1151,6 +1154,8 @@ impl ProcessPlan {
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
             restamps_time_after_completion: record.restamps_time_after_completion(),
             alarms_before_stamp: record.alarms_before_stamp(),
+            stamps_before_alarms: !record.alarms_before_stamp()
+                && !record.restamps_time_after_completion(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
         }
@@ -1590,6 +1595,10 @@ pub(crate) struct ProcessPlan {
     pub(crate) skips_timestamp_when_undefined: bool,
     pub(crate) restamps_time_after_completion: bool,
     pub(crate) alarms_before_stamp: bool,
+    /// The cycle stamps before `checkAlarms`: neither `alarms_before_stamp`
+    /// nor `restamps_time_after_completion`. One test where the cycle once
+    /// tested the latter alone.
+    pub(crate) stamps_before_alarms: bool,
     pub(crate) clears_udf: bool,
     pub(crate) soft_read_clears_udf: bool,
 }
@@ -2592,11 +2601,11 @@ impl SimLink {
     }
 }
 
-/// The parse of one SIM-block link (`SIML` / `SIOL`), keyed on the text it
-/// was parsed from — C's `DBLINK` as `dbInitLink` left it. Text-keyed like
-/// [`ParsedInputLink`] rather than committed at a write owner, because the
-/// text has no single writer: every SIMM-declaring type stores it in its own
-/// struct and `mca` leaves it in the instance's override store.
+/// The parse of one SIM-block link (`SIML` / `SIOL`) — C's `DBLINK` as
+/// `dbInitLink` left it. `invalidate_plan_for` empties the slot on a put of
+/// the field and [`RecordInstance::sim_link_parse`] refills it, so the cycle
+/// pays a slot test; `text` is what the parse was made from, for the debug
+/// check that no put bypassed the funnel.
 pub(crate) struct SimLinkParse {
     text: String,
     parsed: Arc<ParsedLink>,
@@ -3452,6 +3461,31 @@ impl RecordInstance {
         self.plan_rev = self.plan_rev.wrapping_add(1);
     }
 
+    /// C `recGblGetTimeStampSimm(prec, prec->simm, siol)` for this record:
+    /// `TSE == -2` under a non-NO `SIMM` stamps the current time when there is
+    /// no SIOL to take a stamp from, which is every output record (`siol ==
+    /// NULL`). An input's SIOL stamp is applied by the simulated-input tail.
+    #[inline(always)]
+    pub(crate) fn stamp_time(&mut self, tsel: crate::server::database::TselStamp) {
+        let begun = self.common.begin_stamp();
+        self.stamp_time_begun(begun, tsel);
+    }
+
+    /// [`Self::stamp_time`] for a cycle that opened its stamp earlier
+    /// ([`TselStamp::stamp_begun`](crate::server::database::TselStamp)).
+    #[inline(always)]
+    pub(crate) fn stamp_time_begun(
+        &mut self,
+        begun: crate::server::record::StampBegun,
+        tsel: crate::server::database::TselStamp,
+    ) {
+        let record = &self.record;
+        tsel.stamp_begun(begun, &self.name, &mut self.common, || {
+            !record.simulation_substitutes_input_stage()
+                && record.simm_value().is_some_and(|simm| simm != 0)
+        });
+    }
+
     /// [`Self::invalidate_plan`] when `field` is one the plan reads. Both
     /// field-put funnels — the common one and [`Self::put_declared_field`] —
     /// ask it, so the list of such fields has one home.
@@ -3461,6 +3495,13 @@ impl RecordInstance {
             "FLNK" | "INP" | "OUT" | "DTYP" | "TSE" | "TSEL" | "SSCN" | "SDIS" | "SIML" | "SIOL"
         ) {
             self.invalidate_plan();
+        }
+        // The SIM-block parse is keyed on put, not on a per-cycle text
+        // compare: every write of the text is a funnel call.
+        match field {
+            "SIML" => self.parsed_siml = None,
+            "SIOL" => self.parsed_siol = None,
+            _ => {}
         }
     }
 
@@ -3484,6 +3525,16 @@ impl RecordInstance {
         let put = self.record.put_field(field, value);
         self.refresh_dol_mode(field);
         put
+    }
+
+    /// A `.db` field merged onto this installed record by a second
+    /// `record(...)` block: the slot-aware funnel for a link, the declared
+    /// funnel for anything else.
+    pub(crate) fn put_merged_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        match PreparedLink::for_put(self.record.field_list(), field, &value) {
+            Some(link) => self.put_link_field(link, value),
+            None => self.put_declared_field(field, value),
+        }
     }
 
     /// [`Self::put_declared_field`] for a link with a slot: the slot takes
@@ -3606,12 +3657,10 @@ impl RecordInstance {
         }
     }
 
-    /// The parse of SIM-block link `field` (`"SIML"` or `"SIOL"`) for the
-    /// text the record holds now: the cached one when its text is that text
-    /// byte for byte, otherwise a fresh parse committed to the cache. C
-    /// parses the link once at `dbInitLink` and again on each put of the
-    /// field; this parses once per distinct text the field has held, so a
-    /// re-put of the same text costs the compare and no parse.
+    /// The parse of SIM-block link `which` (`SIML` or `SIOL`): the cached
+    /// one while the slot is full, a fresh parse of the text the record holds
+    /// when a put (`invalidate_plan_for`) emptied it. C parses the link at
+    /// `dbInitLink` and again on each put of the field, same text or not.
     ///
     /// `desc` is the field's declaration from the type's `SimmBlock`, for
     /// the owned fallback: a type that lends the text through
@@ -3627,17 +3676,33 @@ impl RecordInstance {
         desc: Option<&'static FieldDesc>,
         ftype: LinkFieldType,
     ) -> &Arc<ParsedLink> {
-        // The steady cycle: the type lends the text and the slot holds its
-        // parse. Everything else is `sim_link_refresh`.
-        let hit = match (
-            self.record.link_text_ref(which.field()),
-            self.sim_slot_ref(which),
-        ) {
-            (Some(text), Some(entry)) => entry.text == text,
-            _ => false,
-        };
-        if !hit {
+        // The steady cycle: the slot holds the parse of the text last put
+        // (`invalidate_plan_for` empties it on a SIML/SIOL put).
+        if self.sim_slot_ref(which).is_none() {
             self.sim_link_refresh(which, desc, ftype);
+        }
+        #[cfg(debug_assertions)]
+        if let Some(entry) = self.sim_slot_ref(which) {
+            let stored;
+            let text: &str = match self.record.link_text_ref(which.field()) {
+                Some(text) => text,
+                // A type that lends no text (`mca`) keeps it in the override
+                // store; the same chain `sim_link_refresh` reads.
+                None => {
+                    stored = match self.resolve_field_stored_at(which.field(), desc) {
+                        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                        _ => String::new(),
+                    };
+                    &stored
+                }
+            };
+            debug_assert_eq!(
+                entry.text,
+                text,
+                "{}.{}: link text changed without a funnel put",
+                self.name,
+                which.field()
+            );
         }
         match self.sim_slot_ref(which) {
             Some(entry) => &entry.parsed,
@@ -3653,8 +3718,7 @@ impl RecordInstance {
         }
     }
 
-    /// The miss and the unlent-text paths of [`Self::sim_link_parse`]: read
-    /// the text, compare it with the cached one and reparse when it differs.
+    /// The miss path of [`Self::sim_link_parse`]: read the text and parse it.
     #[inline(never)]
     fn sim_link_refresh(
         &mut self,
@@ -5141,7 +5205,20 @@ impl RecordInstance {
         {
             return Some(form.render(idx));
         }
+        if let Some(EpicsValue::String(s)) = self.dbr_string_at_precision(&value) {
+            return Some(s);
+        }
         value_as_dbr_string(&value)
+    }
+
+    /// A float/double `value` read from this record as `DBR_STRING`: C's
+    /// `getDoubleString` renders at the SOURCE record's precision. `None`
+    /// for every other type, which carries none.
+    pub(crate) fn dbr_string_at_precision(&self, value: &EpicsValue) -> Option<EpicsValue> {
+        crate::types::codec::dbr_string_at_precision(
+            value,
+            super::record_trait::put_string_precision(&*self.record),
+        )
     }
 
     /// The field's declaration — its `dbFldDes`, in C's terms.
@@ -10974,8 +11051,7 @@ mod metadata_cache_tests {
     }
 
     fn put_siol(inst: &mut RecordInstance, text: &str) {
-        inst.record
-            .put_field("SIOL", EpicsValue::String(text.into()))
+        inst.put_merged_field("SIOL", EpicsValue::String(text.into()))
             .expect("ai.SIOL put");
     }
 
@@ -11002,10 +11078,10 @@ mod metadata_cache_tests {
         assert_eq!(db_link(&first).pvname(), "SRC");
     }
 
-    /// A put of a new text is caught at the next read; a re-put of the same
-    /// text is not reparsed.
+    /// Each put of SIOL, same text or new, is parsed at the next read, as C
+    /// re-parses on every put; a read with no put between reuses the parse.
     #[test]
-    fn sim_link_parse_reparses_on_text_change_only() {
+    fn sim_link_parse_reparses_on_each_put_only() {
         let mut inst = ai_instance();
         put_siol(&mut inst, "SRC.VAL");
         let desc = siol_desc(&inst);
@@ -11022,7 +11098,12 @@ mod metadata_cache_tests {
         let reput = inst
             .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
             .clone();
-        assert!(Arc::ptr_eq(&changed, &reput));
+        assert!(!Arc::ptr_eq(&changed, &reput));
+        assert_eq!(db_link(&reput).pvname(), "OTHER");
+        let again = inst
+            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
+            .clone();
+        assert!(Arc::ptr_eq(&reput, &again));
     }
 
     /// SIOL's CP survives as `DBF_INLINK` and is discarded as `DBF_OUTLINK`.
@@ -11067,6 +11148,23 @@ mod metadata_cache_tests {
             .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
             .clone();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// The debug check reads an override-store SIOL too: a text changed
+    /// behind the funnel is caught on a type that lends none.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "link text changed without a funnel put")]
+    fn sim_link_parse_debug_check_covers_the_override_store() {
+        use crate::server::records::dfanout::DfanoutRecord;
+        let desc = siol_desc(&ai_instance());
+        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        inst.declared_overrides
+            .insert("SIOL".into(), EpicsValue::String("OVR.VAL".into()));
+        inst.sim_link_parse(SimLink::Siol, desc, LinkFieldType::In);
+        inst.declared_overrides
+            .insert("SIOL".into(), EpicsValue::String("OTHER.VAL".into()));
+        inst.sim_link_parse(SimLink::Siol, desc, LinkFieldType::In);
     }
 }
 

@@ -461,10 +461,17 @@ pub fn get_time_stamp(
         // TSE that does not go through `epicsTimeGetEvent`.
         return Some(device_time);
     }
-    // Every other TSE is one C call — `epicsTimeGetEvent(&prec->time,
-    // prec->tse)` — including 0 and -1, which it dispatches itself. `None`
-    // is C's non-zero status: `prec->time` keeps its old value and
-    // `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
+    event_time(tse)
+}
+
+/// `get_time_stamp` for a `tse` already known not to be `-2`.
+///
+/// Every such TSE is one C call — `epicsTimeGetEvent(&prec->time,
+/// prec->tse)` — including 0 and -1, which it dispatches itself. `None`
+/// is C's non-zero status: `prec->time` keeps its old value and
+/// `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
+#[inline]
+pub(crate) fn event_time(tse: i16) -> Option<std::time::SystemTime> {
     crate::runtime::general_time::get_event(tse as i32)
 }
 

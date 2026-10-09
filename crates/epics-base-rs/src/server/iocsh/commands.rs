@@ -5753,8 +5753,8 @@ fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) 
 /// and the value. C's two remaining slots, `pdbentry->message` and
 /// `errSymLookup(status)`, are produced inside `db_loader` and reach here as a
 /// single `CaError` blob, so the port's own text stands in for both.
-fn apply_fields_one_at_a_time(
-    record: &mut Box<dyn crate::server::record::Record>,
+fn apply_fields_one_at_a_time<T: db_loader::LoadTarget + ?Sized>(
+    record: &mut T,
     record_name: &str,
     fields: &[db_loader::DbFieldDef],
     common_fields: &mut Vec<(String, EpicsValue)>,
@@ -5954,7 +5954,7 @@ async fn install_record_defs(
                 {
                     let mut inst = rec_arc.write();
                     apply_fields_one_at_a_time(
-                        &mut inst.record,
+                        &mut *inst,
                         &def.name,
                         &def.fields,
                         &mut common_fields,

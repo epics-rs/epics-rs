@@ -156,12 +156,20 @@ mod tsel_stamp {
 
     impl TselStamp {
         /// C `recGblGetTimeStampSimm`'s body: store what `TSEL` yielded, then
-        /// resolve `TSE`→`TIME`. `is_soft` indicates a Soft Channel device
-        /// type.
+        /// resolve `TSE`→`TIME`. `simm_set` answers C's `simm != menuSimmNO`
+        /// and is called only on the `TSE == -2` arm, so a record that never
+        /// uses device time pays nothing for it: with no SIOL to take a stamp
+        /// from (`siol == NULL`, every output record) a simulating `SIMM`
+        /// stamps the current time (`recGbl.c:331-342`).
         #[inline(always)]
-        pub(crate) fn stamp(self, name: &str, common: &mut CommonFields, is_soft: bool) {
+        pub(crate) fn stamp(
+            self,
+            name: &str,
+            common: &mut CommonFields,
+            simm_set: impl FnOnce() -> bool,
+        ) {
             let begun = common.begin_stamp();
-            self.stamp_begun(begun, name, common, is_soft);
+            self.stamp_begun(begun, name, common, simm_set);
         }
 
         /// [`Self::stamp`] for a cycle that opened its stamp earlier, so a
@@ -173,7 +181,7 @@ mod tsel_stamp {
             _begun: crate::server::record::StampBegun,
             name: &str,
             common: &mut CommonFields,
-            is_soft: bool,
+            simm_set: impl FnOnce() -> bool,
         ) {
             match self {
                 TselStamp::Time(time, utag) => {
@@ -191,12 +199,14 @@ mod tsel_stamp {
                     crate::server::recgbl::rec_gbl_set_link_alarm(common, "TSEL");
                 }
             }
-            apply_timestamp(name, common, is_soft);
+            if common.tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+                return device_time(common, simm_set);
+            }
+            apply_timestamp(name, common);
         }
     }
 
-    /// Apply timestamp to a record based on its TSE field.
-    /// `is_soft` indicates a Soft Channel device type.
+    /// Apply timestamp to a record based on its TSE field, `TSE != -2`.
     ///
     /// The second half of C `recGblGetTimeStampSimm` (recGbl.c:324-342). The
     /// TSE constants are defined in `epicsTime.h:102-104`:
@@ -217,15 +227,22 @@ mod tsel_stamp {
     /// into `precord->time` and errlogs, so a misconfigured record holds its
     /// stale stamp rather than timestamping as if healthy.
     #[inline]
-    fn apply_timestamp(name: &str, common: &mut CommonFields, _is_soft: bool) {
-        // Single owner of TSE -> TIME resolution; device support that must
-        // format the record's resolved time during `read()` routes through the
-        // same helper so the two never drift (see `recgbl::get_time_stamp`).
-        // For TSE=-2 the helper returns `common.time` unchanged, preserving the
-        // device-time "leave it alone" semantics.
-        match crate::server::recgbl::get_time_stamp(common.tse, common.time) {
+    fn apply_timestamp(name: &str, common: &mut CommonFields) {
+        // `stamp` has taken `TSE == -2` already, so this is `get_time_stamp`'s
+        // other arm; the two share `recgbl::event_time` and cannot drift.
+        match crate::server::recgbl::event_time(common.tse) {
             Some(t) => common.time = t,
             None => tse_failed(name, common.tse),
+        }
+    }
+
+    /// `TSE == -2`: device support already wrote `time`; only a simulating
+    /// `SIMM` replaces it.
+    #[cold]
+    #[inline(never)]
+    fn device_time(common: &mut CommonFields, simm_set: impl FnOnce() -> bool) {
+        if simm_set() {
+            common.time = SystemTime::now();
         }
     }
 
@@ -4184,7 +4201,7 @@ mod tests {
         common.tse = -1;
         common.time = stale;
 
-        TselStamp::None.stamp("REC", &mut common, false);
+        TselStamp::None.stamp("REC", &mut common, || false);
 
         // BestTime must have run unconditionally — `common.time` is
         // no longer the stale sentinel.
@@ -4209,7 +4226,7 @@ mod tests {
         common.tse = -2;
         common.time = device_time;
 
-        TselStamp::None.stamp("REC", &mut common, false);
+        TselStamp::None.stamp("REC", &mut common, || false);
 
         assert_eq!(
             common.time, device_time,
@@ -4263,7 +4280,7 @@ mod tests {
         common.tse = -3;
         common.time = stale;
 
-        TselStamp::None.stamp("X", &mut common, false);
+        TselStamp::None.stamp("X", &mut common, || false);
 
         assert_eq!(
             common.time, stale,

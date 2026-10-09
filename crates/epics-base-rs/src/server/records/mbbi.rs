@@ -650,6 +650,10 @@ impl Record for MbbiRecord {
         self.skip_convert = did;
     }
 
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        true
+    }
+
     /// `mbbi` has an `RVAL → VAL` `convert()` step. A `Soft Channel`
     /// `mbbi` must skip it — C `devMbbiSoft.c` `read_mbbi` returns 2.
     fn soft_channel_skips_convert(&self) -> bool {

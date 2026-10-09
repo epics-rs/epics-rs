@@ -683,6 +683,10 @@ impl Record for AiRecord {
         self.bpt_table = None;
     }
 
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        true
+    }
+
     /// `ai` has an `RVAL → VAL` `convert()` step (raw → engineering
     /// units). A `Soft Channel` `ai` must skip it — C `devAiSoft.c`
     /// `read_ai` returns 2 ("don't convert").

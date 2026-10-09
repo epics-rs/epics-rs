@@ -3086,14 +3086,44 @@ fn lax_numeric(declared: DbfCode, field: &str, value: &str) -> Option<EpicsValue
     db_load_numeric_value(declared, field, value).ok().flatten()
 }
 
-pub fn apply_fields(
-    record: &mut Box<dyn Record>,
+/// What a `.db` field is loaded into: a record not yet installed, or an
+/// installed instance a second `record(...)` block merges onto. The write is
+/// the target's own, so an installed instance's put funnel runs for every
+/// merged field and no caller can reach the bare `&mut dyn Record`.
+pub trait LoadTarget {
+    fn record(&self) -> &dyn Record;
+    fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()>;
+}
+
+impl LoadTarget for Box<dyn Record> {
+    fn record(&self) -> &dyn Record {
+        self.as_ref()
+    }
+
+    fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_field(field, value)
+    }
+}
+
+impl LoadTarget for crate::server::record::RecordInstance {
+    fn record(&self) -> &dyn Record {
+        self.record.as_ref()
+    }
+
+    fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_merged_field(field, value)
+    }
+}
+
+pub fn apply_fields<T: LoadTarget + ?Sized>(
+    target: &mut T,
     fields: &[DbFieldDef],
     common_fields: &mut Vec<(String, EpicsValue)>,
 ) -> CaResult<()> {
-    check_link_syntax(record.record_type(), fields)?;
+    check_link_syntax(target.record().record_type(), fields)?;
 
     for DbFieldDef { name, value, .. } in fields {
+        let record = target.record();
         let upper_name = name.to_uppercase();
         // Menu labels, numbers and link text are ASCII by construction; only a
         // DBF_STRING can carry a byte outside it, and that one goes to
@@ -3111,10 +3141,8 @@ pub fn apply_fields(
         // `.dbd`-generated table first, the record's hand table only where the
         // `.dbd` does not reach. Reading it off `field_list()` alone left an
         // `aSub`'s `field(FTA,"LONG")` with no `menu()` to resolve against.
-        let spec = crate::server::record::record_instance::field_desc_of(
-            record.as_ref(),
-            upper_name.as_str(),
-        );
+        let spec =
+            crate::server::record::record_instance::field_desc_of(record, upper_name.as_str());
 
         // C `dbPutString` switches on the DECLARED field type, and a
         // `DBF_NOACCESS` field is refused outright — `dbStaticLib.c:2646-2650`:
@@ -3188,7 +3216,7 @@ pub fn apply_fields(
                     ))
                 })?
             };
-            record.put_field(&upper_name, parsed)?;
+            target.put_loaded_field(&upper_name, parsed)?;
             // A record type may declare INP/OUT in its own `field_list`,
             // mirroring its C `.dbd` (`scalerRecord`, `motorRecord`,
             // `acalcout`, …). The value is then stored by the record — but in

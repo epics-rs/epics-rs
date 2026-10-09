@@ -650,6 +650,10 @@ impl Record for MbbiRecord {
         self.skip_convert = did;
     }
 
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        true
+    }
+
     fn raw_soft_read_failure_skips_convert(&self) -> bool {
         true
     }

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleHooks, CyclePostMask, CycleRead, CycleValue};
+use crate::server::record::{
+    CycleCell, CycleHooks, CycleMarks, CyclePostMask, CycleRead, CycleValue, uniform_post_table,
+};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::EpicsValue;
 
@@ -34,6 +36,9 @@ pub struct MbbiDirectRecord {
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
+    /// DTYP is `Raw Soft Channel`, whose `read_mbbi` returns 0 even when
+    /// `dbGetLink` failed (`devMbbiDirectSoftRaw.c:58-65`).
+    raw_soft_dset: bool,
 }
 
 impl Default for MbbiDirectRecord {
@@ -55,6 +60,7 @@ impl Default for MbbiDirectRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
+            raw_soft_dset: false,
         }
     }
 }
@@ -91,8 +97,18 @@ impl Record for MbbiDirectRecord {
     /// That is not a hole: the C dset that returns 2 writes `prec->udf`
     /// itself first — `devMbbiDirectSoft.c:55-60` — which the port states as
     /// `DeviceUdf::Defined`.
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        true
+    }
+
     fn rederives_udf_on_computed_read(&self) -> bool {
         false
+    }
+
+    /// The Raw dset's status 0 on a dead INP reaches `:163`'s
+    /// `prec->udf = FALSE`; every other dset's failure misses it.
+    fn derives_udf_on_read_failure(&self) -> bool {
+        self.raw_soft_dset
     }
 
     /// C `mbbiDirectRecord.c:128-129` seeds MLST and ORAW after the dset init
@@ -148,7 +164,8 @@ impl Record for MbbiDirectRecord {
     /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
     /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
-        if soft == crate::server::device_support::SoftDtyp::Raw {
+        self.raw_soft_dset = soft == crate::server::device_support::SoftDtyp::Raw;
+        if self.raw_soft_dset {
             self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
         }
     }
@@ -185,17 +202,10 @@ impl Record for MbbiDirectRecord {
         Some(changed)
     }
 
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        let changed = std::mem::take(&mut self.bits_changed);
-        if changed == 0 {
-            return Vec::new();
-        }
-        BIT_NAMES
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| changed & (1 << i) != 0)
-            .map(|(_, &name)| (name, CyclePostMask::MonitorValueLog))
-            .collect()
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static BIT_POSTS: [(&str, CyclePostMask); 32] =
+            uniform_post_table(&BIT_NAMES, CyclePostMask::MonitorValueLog);
+        CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u64)
     }
 
     /// C `:221-224` posts a bit on its own change against the record's bit or

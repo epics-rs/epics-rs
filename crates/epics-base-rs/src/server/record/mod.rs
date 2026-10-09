@@ -30,7 +30,7 @@ pub(crate) use contributed_dbd::{
 pub use declared_field_registry::{
     declared_field, declared_field_table, declared_fields, register_declared_fields,
 };
-pub use device_menu_registry::{DeviceMenu, register_device_menu};
+pub use device_menu_registry::register_device_menu;
 pub(crate) use device_menu_registry::{
     contributed_device_menu, contributed_device_rows, merged_device_menu,
 };
@@ -66,16 +66,16 @@ pub(crate) use record_instance::{
 };
 pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
-    ConstantInitLink, CycleCell, CycleHooks, CycleList, CyclePostMask, CycleRead, CycleValue,
-    DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration,
-    FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy, InputLinkRequest, LinkReadAs,
-    MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate, OutTarget, ProcessAction,
-    ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record,
-    RecordProcessResult, ResolvedInputLinks, SimmCells, Special, SubroutineFn, ValuePostGate,
-    ValueView, arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field,
-    coerce_put_value, dbput_coerce_value, input_link_slots_of, link_value_in_field_shape,
-    monitor_deadband_classes, put_field_internal_default, put_value_in_field_shape,
-    seed_input_links,
+    ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
+    CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME,
+    FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
+    InputLinkRequest, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate,
+    OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot,
+    RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, SimmCells, Special,
+    SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
+    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
+    put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{
     SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, seed_trackers_from_val, value_gate,

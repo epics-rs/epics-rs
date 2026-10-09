@@ -700,14 +700,12 @@ fn cmd_db_dump_device() -> CommandDef {
                 let declared = crate::server::record::dbd_generated::device_link_types(record_type)
                     .unwrap_or_default()
                     .iter()
-                    .map(|&(choice, link_type)| (choice, Some(link_type)));
+                    .copied();
                 let contributed = crate::server::record::contributed_device_rows(record_type);
                 ctx.println(&format!("recordtype({record_type})"));
                 for (choice, link_type) in declared.chain(contributed) {
                     ctx.println(&format!("\tchoice:    {choice}"));
-                    if let Some(link_type) = link_type {
-                        ctx.println(&format!("\tlink_type: {}", c_link_type_number(link_type)));
-                    }
+                    ctx.println(&format!("\tlink_type: {}", c_link_type_number(link_type)));
                 }
                 if wanted.is_some() {
                     break;

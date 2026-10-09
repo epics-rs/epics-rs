@@ -371,6 +371,10 @@ pub struct ConstantInitLink {
     /// `field(DOL,"5")` leaves a bo at VAL=1, not 5. The only seed whose stored
     /// value differs from the loaded one.
     pub normalize_bool: bool,
+    /// `Some((dbr, nRequest))` for a `dbLoadLinkArray(plink, dbr, pbuffer,
+    /// &n)` seed instead of `recGblInitConstantLink` — aSub's INPA..U
+    /// (`aSubRecord.c:128-137`), which load into the FTx buffer by NOx.
+    pub array: Option<(crate::types::DbFieldType, usize)>,
 }
 
 impl ConstantInitLink {
@@ -381,6 +385,7 @@ impl ConstantInitLink {
             target_field,
             clears_udf: false,
             normalize_bool: false,
+            array: None,
         }
     }
 
@@ -391,6 +396,23 @@ impl ConstantInitLink {
             target_field,
             clears_udf: true,
             normalize_bool: false,
+            array: None,
+        }
+    }
+
+    /// aSub's INPx→x seed: `dbLoadLinkArray` of `nreq` `dbr` elements.
+    pub const fn load_array(
+        link_field: &'static str,
+        target_field: &'static str,
+        dbr: crate::types::DbFieldType,
+        nreq: usize,
+    ) -> Self {
+        Self {
+            link_field,
+            target_field,
+            clears_udf: false,
+            normalize_bool: false,
+            array: Some((dbr, nreq)),
         }
     }
 
@@ -402,6 +424,7 @@ impl ConstantInitLink {
             target_field,
             clears_udf: true,
             normalize_bool: true,
+            array: None,
         }
     }
 }
@@ -776,6 +799,63 @@ pub enum CyclePostMask {
     /// `monitor_mask | DBE_VALUE | DBE_LOG` — C's usual `monitor()` shape
     /// (aCalcout `monitor()`, `aCalcoutRecord.c:1034`).
     MonitorValueLog,
+}
+
+/// One take's marks: a bit per entry of the record type's static post table,
+/// so a take under the record hold allocates nothing. Iterates in table
+/// order, which is the order two marks of one field are posted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleMarks {
+    table: &'static [(&'static str, CyclePostMask)],
+    bits: u64,
+}
+
+impl CycleMarks {
+    pub const NONE: Self = Self {
+        table: &[],
+        bits: 0,
+    };
+
+    /// Bit `i` of `bits` marks `table[i]`.
+    pub fn of(table: &'static [(&'static str, CyclePostMask)], bits: u64) -> Self {
+        debug_assert!(
+            table.len() >= u64::BITS as usize || bits >> table.len() == 0,
+            "a mark past the end of its post table"
+        );
+        Self { table, bits }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+}
+
+impl Iterator for CycleMarks {
+    type Item = (&'static str, CyclePostMask);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bits == 0 {
+            return None;
+        }
+        let i = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
+        Some(self.table[i])
+    }
+}
+
+/// A [`CycleMarks`] table posting each of `names` with `mask`.
+pub const fn uniform_post_table<const N: usize>(
+    names: &[&'static str],
+    mask: CyclePostMask,
+) -> [(&'static str, CyclePostMask); N] {
+    assert!(names.len() == N && N <= u64::BITS as usize);
+    let mut table = [("", mask); N];
+    let mut i = 0;
+    while i < N {
+        table[i] = (names[i], mask);
+        i += 1;
+    }
+    table
 }
 
 /// The [`ValuePostGate`] a record declared for `field`, or `None` when `field`
@@ -3105,6 +3185,15 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// Whether the `"Async Soft Channel"` dset's `read_xxx` on a link its
+    /// `add_record` refused returns 2 — `devBiSoftCallback.c:169` and the
+    /// mbbi/mbbiDirect twins — so `if (status == 0) prec->udf = ...` is not
+    /// reached and UDF stands. ai returns 2 too but folds it to 0 first;
+    /// longin, int64in and stringin return 0.
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        false
+    }
+
     /// Whether a failed INP read under `"Raw Soft Channel"` skips the
     /// record's RVAL -> VAL convert. `devAiSoftRaw`, `devBiSoftRaw` and
     /// `devMbbiSoftRaw` return the `dbGetLink` status, so `if (status == 0)
@@ -3311,6 +3400,15 @@ pub trait Record: Send + Sync + 'static {
     /// the base `seq`, whose `seqRecord.c:224` restamps BEFORE the `:229` VAL
     /// post) stamps before the value post.
     fn restamps_time_after_completion(&self) -> bool {
+        false
+    }
+
+    /// Whether this output's `recGblGetTimeStampSimm(prec, prec->simm, NULL)`
+    /// runs AFTER `writeValue` — only `lsoRecord.c:154`; every other output
+    /// stamps before it (`aoRecord.c:192`, ...). `writeValue` is where
+    /// `recGblGetSimm` reads SIML, so the stamp sees the previous cycle's
+    /// SIMM unless this is true, and this cycle's when it is.
+    fn stamps_after_write(&self) -> bool {
         false
     }
 
@@ -3636,9 +3734,9 @@ pub trait Record: Send + Sync + 'static {
     /// clears whatever state it answered from — C's `pcalc->newm = 0` (`:1036`)
     /// is part of the same step.
     ///
-    /// Default: empty — and `Vec::new()` does not allocate.
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        Vec::new()
+    /// Default: empty.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::NONE
     }
 
     /// Fields this record posts on its FIRST monitor cycle whether or not they
@@ -3657,8 +3755,8 @@ pub trait Record: Send + Sync + 'static {
     /// the record clears what it answered from.
     ///
     /// Default: empty.
-    fn take_first_monitor_cycle(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        Vec::new()
+    fn take_first_monitor_cycle(&mut self) -> CycleMarks {
+        CycleMarks::NONE
     }
 
     /// Fields whose ONLY post path is the record's own per-cycle mark — C never
@@ -5272,6 +5370,23 @@ pub trait Record: Send + Sync + 'static {
     /// no-ops and the simulated record is frozen. It overrides.
     fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
         self.set_val(value)
+    }
+
+    /// Whether the record has an SVAL, the SIOL read buffer — the field's
+    /// existence, asked without copying its value.
+    fn has_sval(&self) -> bool {
+        self.get_field("SVAL").is_some()
+    }
+
+    /// C `readValue`'s `prec->val = prec->sval` (`longinRecord.c:417`): land
+    /// the SVAL buffer where a simulated read lands, in place. The default
+    /// reads the field and goes through [`Self::land_simulated_value`]; a
+    /// record whose value is not a scalar copy overrides it.
+    fn land_sval(&mut self) -> CaResult<()> {
+        match self.get_field("SVAL") {
+            Some(sval) => self.land_simulated_value(sval),
+            None => Ok(()),
+        }
     }
 
     /// Whether the record's C `switch (prec->simm)` carries a `default:` arm

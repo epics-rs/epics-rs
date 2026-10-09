@@ -59,7 +59,8 @@ fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> 
     value.convert_to(target)
 }
 
-/// C `recGblInitConstantLink(plink, DBF_x, pvalue)` for ONE link → field pair.
+/// C `recGblInitConstantLink(plink, DBF_x, pvalue)` for ONE link → field pair,
+/// or `dbLoadLinkArray` for a seed that carries an array request.
 ///
 /// Returns the value that landed in `seed.target_field`, or `None` when the
 /// link is not constant (C returns FALSE and touches nothing) or the put failed.
@@ -76,6 +77,16 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
     let ParsedLink::Constant(constant) = &parsed else {
         return None;
     };
+    if let Some((dbr, nreq)) = seed.array {
+        // A failed or zero-element load leaves the buffer and its count
+        // alone (`if (n > 0) nea = n`).
+        let value = constant.load_array(dbr, nreq).ok()?;
+        if value.count() == 0 {
+            return None;
+        }
+        record.put_field(seed.target_field, value.clone()).ok()?;
+        return Some(value);
+    }
     let raw = constant.text();
     let value = constant.value().clone();
     // C loads into the target field's own DBF type

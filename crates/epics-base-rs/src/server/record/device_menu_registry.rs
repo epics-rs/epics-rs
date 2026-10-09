@@ -27,50 +27,10 @@ use std::sync::{OnceLock, RwLock};
 
 use super::DbLinkType;
 
-/// One contributed device menu: the `device()` lines a downstream crate's
-/// `.dbd` declares for a record type, or bare choice names when no `.dbd`
-/// declares them and so no link type is known.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DeviceMenu {
-    /// `(choice, link_type)` per `device()` line — a generated
-    /// `device_link_types()` table.
-    Declared(&'static [(&'static str, DbLinkType)]),
-    /// Choice names alone; `dbDumpDevice` prints no `link_type` for them.
-    Undeclared(&'static [&'static str]),
-}
-
-impl DeviceMenu {
-    fn rows(self) -> Box<dyn Iterator<Item = (&'static str, Option<DbLinkType>)>> {
-        match self {
-            DeviceMenu::Declared(rows) => Box::new(rows.iter().map(|&(n, lt)| (n, Some(lt)))),
-            DeviceMenu::Undeclared(names) => Box::new(names.iter().map(|&n| (n, None))),
-        }
-    }
-}
-
-impl From<&'static [(&'static str, DbLinkType)]> for DeviceMenu {
-    fn from(rows: &'static [(&'static str, DbLinkType)]) -> Self {
-        DeviceMenu::Declared(rows)
-    }
-}
-
-impl<const N: usize> From<&'static [(&'static str, DbLinkType); N]> for DeviceMenu {
-    fn from(rows: &'static [(&'static str, DbLinkType); N]) -> Self {
-        DeviceMenu::Declared(rows)
-    }
-}
-
-impl From<&'static [&'static str]> for DeviceMenu {
-    fn from(names: &'static [&'static str]) -> Self {
-        DeviceMenu::Undeclared(names)
-    }
-}
-
-impl<const N: usize> From<&'static [&'static str; N]> for DeviceMenu {
-    fn from(names: &'static [&'static str; N]) -> Self {
-        DeviceMenu::Undeclared(names)
-    }
-}
+/// One contributed device menu: the `(choice, link_type)` `device()` lines a
+/// downstream crate's `.dbd` declares for a record type — a generated
+/// `device_link_types()` table.
+type DeviceMenu = &'static [(&'static str, DbLinkType)];
 
 /// The contributed menus, keyed by record type, one entry per contributing
 /// crate in registration order. Kept as a list (rather than a flattened
@@ -86,7 +46,7 @@ fn registry() -> &'static RwLock<HashMap<String, Vec<DeviceMenu>>> {
 /// Contribute a device-support DTYP menu for `record_type` — the choices a
 /// downstream crate's device support adds to that record type's `DTYP` list,
 /// in the crate's `.dbd` declaration order. Pass the generated
-/// `device_link_types(record_type)` table so `dbDumpDevice` can print each
+/// `device_link_types(record_type)` table; `dbDumpDevice` prints each
 /// choice's `link_type`.
 ///
 /// The choices are appended AFTER base's declared menu and after any menu
@@ -94,8 +54,7 @@ fn registry() -> &'static RwLock<HashMap<String, Vec<DeviceMenu>>> {
 /// concatenation. Registering a menu already present for this record type
 /// (by content) is a no-op, so wiring the same support twice in one process is
 /// safe.
-pub fn register_device_menu(record_type: &str, menu: impl Into<DeviceMenu>) {
-    let menu = menu.into();
+pub fn register_device_menu(record_type: &str, menu: &'static [(&'static str, DbLinkType)]) {
     let mut map = registry()
         .write()
         .expect("device-menu registry lock poisoned");
@@ -106,16 +65,14 @@ pub fn register_device_menu(record_type: &str, menu: impl Into<DeviceMenu>) {
 }
 
 /// The contributed `(choice, link_type)` rows for `record_type`, flattened in
-/// registration order; the link type is `None` for an undeclared menu.
-pub(crate) fn contributed_device_rows(
-    record_type: &str,
-) -> Vec<(&'static str, Option<DbLinkType>)> {
+/// registration order.
+pub(crate) fn contributed_device_rows(record_type: &str) -> Vec<(&'static str, DbLinkType)> {
     match CONTRIBUTED.get() {
         Some(lock) => lock
             .read()
             .expect("device-menu registry lock poisoned")
             .get(record_type)
-            .map(|list| list.iter().flat_map(|menu| menu.rows()).collect())
+            .map(|list| list.iter().flat_map(|menu| menu.iter().copied()).collect())
             .unwrap_or_default(),
         None => Vec::new(),
     }
@@ -162,7 +119,10 @@ mod tests {
     fn register_is_idempotent_per_slice() {
         // A record type name no other test touches, so the process-global
         // registry cannot cross-contaminate this assertion.
-        static M: &[&str] = &["devA", "devB"];
+        static M: &[(&str, DbLinkType)] = &[
+            ("devA", DbLinkType::Constant),
+            ("devB", DbLinkType::Constant),
+        ];
         assert!(contributed_device_menu("regtest_idem").is_empty());
         register_device_menu("regtest_idem", M);
         register_device_menu("regtest_idem", M);
@@ -176,8 +136,9 @@ mod tests {
     /// two crates each adding device support to the same type.
     #[test]
     fn distinct_contributions_concatenate() {
-        static A: &[&str] = &["a1"];
-        static B: &[&str] = &["b1", "b2"];
+        static A: &[(&str, DbLinkType)] = &[("a1", DbLinkType::Constant)];
+        static B: &[(&str, DbLinkType)] =
+            &[("b1", DbLinkType::Constant), ("b2", DbLinkType::Constant)];
         register_device_menu("regtest_concat", A);
         register_device_menu("regtest_concat", B);
         assert_eq!(

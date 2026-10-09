@@ -11240,7 +11240,13 @@ record(bo, "$(P)_calc_ctrl") {{
         use crate::server::record::register_device_menu;
         // A record-type name + DTYP name no other test touches (the registry is
         // process-global and append-only).
-        register_device_menu("ai", &["Dbpf Contributed Probe"]);
+        register_device_menu(
+            "ai",
+            &[(
+                "Dbpf Contributed Probe",
+                crate::server::record::DbLinkType::Constant,
+            )],
+        );
 
         let (db, ctx) = make_ctx();
         ctx.block_on(async {

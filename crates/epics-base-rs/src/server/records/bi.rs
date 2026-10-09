@@ -169,6 +169,10 @@ impl Record for BiRecord {
         true
     }
 
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        true
+    }
+
     fn raw_soft_read_failure_skips_convert(&self) -> bool {
         true
     }

@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    CyclePostMask, FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest, LinkReadAs,
-    MonitorValueClasses, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldMetadataOverride, Ftype, InputFetchPolicy, InputLinkRequest,
+    LinkReadAs, MonitorValueClasses, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -43,22 +43,20 @@ const LFLG_IGNORE: i16 = 0;
 /// The output-array fields whose monitor posting `EFLG` gates: `VALA..VALU`
 /// (the output values) and `NEVA..NEVU` (their element counts). C
 /// `aSubRecord.c::monitor` posts `vala[i]` and `neva[i]` together inside the
-/// `EFLG` switch. Leaked once for the `'static` lifetime the posting hooks
-/// require (mirrors `multi_input_links`).
+/// `EFLG` switch. Channel `i` is entries `2i` (`VALx`) and `2i + 1` (`NEVx`).
+const OUTPUT_EVENT_FIELDS: [&str; 2 * NUM_ARGS] = [
+    "VALA", "NEVA", "VALB", "NEVB", "VALC", "NEVC", "VALD", "NEVD", "VALE", "NEVE", "VALF", "NEVF",
+    "VALG", "NEVG", "VALH", "NEVH", "VALI", "NEVI", "VALJ", "NEVJ", "VALK", "NEVK", "VALL", "NEVL",
+    "VALM", "NEVM", "VALN", "NEVN", "VALO", "NEVO", "VALP", "NEVP", "VALQ", "NEVQ", "VALR", "NEVR",
+    "VALS", "NEVS", "VALT", "NEVT", "VALU", "NEVU",
+];
+
+/// `monitor()`'s output posts, `monitor_mask|DBE_VALUE|DBE_LOG` each.
+static OUTPUT_EVENT_POSTS: [(&str, CyclePostMask); 2 * NUM_ARGS] =
+    crate::server::record::uniform_post_table(&OUTPUT_EVENT_FIELDS, CyclePostMask::MonitorValueLog);
+
 fn asub_output_event_fields() -> &'static [&'static str] {
-    use std::sync::OnceLock;
-    static FIELDS: OnceLock<Vec<&'static str>> = OnceLock::new();
-    FIELDS.get_or_init(|| {
-        SUFFIX
-            .iter()
-            .flat_map(|&c| {
-                [
-                    Box::leak(format!("VAL{c}").into_boxed_str()) as &'static str,
-                    Box::leak(format!("NEV{c}").into_boxed_str()) as &'static str,
-                ]
-            })
-            .collect()
-    })
+    &OUTPUT_EVENT_FIELDS
 }
 
 /// The CLOSED set of fields a process cycle of an aSub may post, under
@@ -427,6 +425,15 @@ fn channel_is_scalar(v: &EpicsValue) -> bool {
     }
 }
 
+/// C's `memcpy` into `OVLx` (`aSubRecord.c:434`): a string lands in the
+/// buffer `dst` already owns; an array clone only shares the buffer.
+fn copy_output(dst: &mut EpicsValue, src: &EpicsValue) {
+    match (dst, src) {
+        (EpicsValue::String(d), EpicsValue::String(s)) => d.clone_from(s),
+        (d, s) => *d = s.clone(),
+    }
+}
+
 impl ASubRecord {
     /// [`Record::monitor_value_classes`] on a cycle with a `VALx`/`NEVx`
     /// written since the last one: out of line, so a clean cycle takes no
@@ -446,7 +453,7 @@ impl ASubRecord {
             dirty &= dirty - 1;
             let nev = self.neva[i];
             if nev != self.onva[i] || !same_prefix(&self.ovla[i], &self.vala[i], nev) {
-                self.ovla[i] = self.vala[i].clone();
+                copy_output(&mut self.ovla[i], &self.vala[i]);
                 self.val_marks |= 1 << i;
                 if nev != self.onva[i] {
                     self.onva[i] = nev;
@@ -458,20 +465,15 @@ impl ASubRecord {
     }
 
     #[inline(never)]
-    fn take_output_marks(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+    fn take_output_marks(&mut self) -> CycleMarks {
         let val_marks = std::mem::take(&mut self.val_marks);
         let nev_marks = std::mem::take(&mut self.nev_marks);
-        let fields = asub_output_event_fields();
-        let mut marks = Vec::new();
+        let mut bits = 0u64;
         for i in 0..NUM_ARGS {
-            if val_marks & 1 << i != 0 {
-                marks.push((fields[2 * i], CyclePostMask::MonitorValueLog));
-            }
-            if nev_marks & 1 << i != 0 {
-                marks.push((fields[2 * i + 1], CyclePostMask::MonitorValueLog));
-            }
+            bits |= u64::from(val_marks >> i & 1) << (2 * i);
+            bits |= u64::from(nev_marks >> i & 1) << (2 * i + 1);
         }
-        marks
+        CycleMarks::of(&OUTPUT_EVENT_POSTS, bits)
     }
 }
 
@@ -559,9 +561,9 @@ impl Record for ASubRecord {
         Some(changed)
     }
 
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         if self.val_marks == 0 {
-            return Vec::new();
+            return CycleMarks::NONE;
         }
         self.take_output_marks()
     }
@@ -952,14 +954,25 @@ impl Record for ASubRecord {
 
     /// C `aSubRecord.c:126-136`: `recGblInitConstantLink(&prec->subl,
     /// DBF_STRING, prec->snam)` followed by the `dbLoadLinkArray` loop over
-    /// INPA..INPU. Both are init-only: at process `dbGetLink` on a constant
-    /// delivers nothing, so SNAM and A..U keep what was seeded (or what a
-    /// client later put).
+    /// INPA..INPU with the FTx type and `n = NOx`. Both are init-only: at
+    /// process `dbGetLink` on a constant delivers nothing, so SNAM and A..U
+    /// keep what was seeded (or what a client later put).
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        let mut seeds = vec![crate::server::record::ConstantInitLink::new("SUBL", "SNAM")];
-        seeds.extend(crate::server::record::seed_input_links(
-            self.multi_input_links(),
-        ));
+        use crate::server::record::ConstantInitLink;
+        let mut seeds = vec![ConstantInitLink::new("SUBL", "SNAM")];
+        seeds.extend(
+            self.multi_input_links()
+                .iter()
+                .enumerate()
+                .map(|(i, (link, value))| {
+                    ConstantInitLink::load_array(
+                        link,
+                        value,
+                        channel_ftype(self.fta[i]).element_type(),
+                        self.noa[i].max(0) as usize,
+                    )
+                }),
+        );
         seeds
     }
 
@@ -1087,6 +1100,27 @@ mod tests {
         );
         rec.set_subroutine_status(-1);
         assert!(rec.multi_output_links().is_empty());
+    }
+
+    /// An ON CHANGE string output lands in the `OVLx` buffer it already
+    /// holds, as C's `memcpy` into `povl` does: no allocation per cycle.
+    #[test]
+    fn changed_string_output_reuses_the_ovl_buffer() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTVA", EpicsValue::Short(0)).unwrap(); // STRING
+        let ovl_ptr = |rec: &ASubRecord| match &rec.ovla[0] {
+            EpicsValue::String(s) => s.as_bytes().as_ptr(),
+            other => panic!("OVLA is {other:?}"),
+        };
+        rec.put_field("VALA", EpicsValue::String("first".into()))
+            .unwrap();
+        assert!(rec.mark_changed_outputs());
+        let first = ovl_ptr(&rec);
+        rec.put_field("VALA", EpicsValue::String("other".into()))
+            .unwrap();
+        assert!(rec.mark_changed_outputs());
+        assert_eq!(ovl_ptr(&rec), first);
+        assert_eq!(rec.ovla[0], EpicsValue::String("other".into()));
     }
 
     /// input/output channels M..U exist (C `NUM_ARGS == 21`).

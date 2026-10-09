@@ -1619,19 +1619,27 @@ impl Record for CalcoutRecord {
     /// The link put's value and status posts, both a literal `DBE_VALUE`
     /// (calcoutRecord.c:377,404). calcout declares no `CYCLE_POSTED` hook, so
     /// only the put path drains this.
-    fn take_cycle_posted_fields(
-        &mut self,
-    ) -> Vec<(&'static str, crate::server::record::CyclePostMask)> {
-        use crate::server::record::CyclePostMask;
-        let Some(idx) = self.link_put_post.take() else {
-            return Vec::new();
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        /// Link `i`'s value then status at `2i`, `2i + 1`; OUT's status is OUTV.
+        static LINK_PUT_POSTS: [(&str, CyclePostMask); 2 * CALCOUT_LINK_VALUE_FIELDS.len()] = {
+            let mut table = [("", CyclePostMask::Value); 2 * CALCOUT_LINK_VALUE_FIELDS.len()];
+            let mut i = 0;
+            while i < CALCOUT_LINK_VALUE_FIELDS.len() {
+                table[2 * i].0 = CALCOUT_LINK_VALUE_FIELDS[i];
+                table[2 * i + 1].0 = if i < CALCOUT_INAV_FIELDS.len() {
+                    CALCOUT_INAV_FIELDS[i]
+                } else {
+                    "OUTV"
+                };
+                i += 1;
+            }
+            table
         };
-        let idx = idx as usize;
-        let status = CALCOUT_INAV_FIELDS.get(idx).copied().unwrap_or("OUTV");
-        vec![
-            (CALCOUT_LINK_VALUE_FIELDS[idx], CyclePostMask::Value),
-            (status, CyclePostMask::Value),
-        ]
+        match self.link_put_post.take() {
+            Some(idx) => CycleMarks::of(&LINK_PUT_POSTS, 0b11 << (2 * idx as usize)),
+            None => CycleMarks::NONE,
+        }
     }
 
     /// C posts the validity field explicitly from `special()`

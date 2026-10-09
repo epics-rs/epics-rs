@@ -101,7 +101,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
 use crate::types::{EpicsValue, PvString};
@@ -2414,14 +2414,39 @@ impl Record for AcalcoutRecord {
     /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
     /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
     /// hook TAKES.
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        /// NUSE then AMEM, one entry per mask (`CyclePostMask` order), then
+        /// each array's AMASK and NEWM post.
+        static POSTS: [(&str, CyclePostMask); 6 + 2 * ARR_NAMES.len()] = {
+            use CyclePostMask::{MonitorValueLog, Value, ValueLog};
+            let mut table = [("NUSE", Value); 6 + 2 * ARR_NAMES.len()];
+            table[1] = ("NUSE", ValueLog);
+            table[2] = ("NUSE", MonitorValueLog);
+            table[3] = ("AMEM", Value);
+            table[4] = ("AMEM", ValueLog);
+            table[5] = ("AMEM", MonitorValueLog);
+            let mut i = 0;
+            while i < ARR_NAMES.len() {
+                table[6 + 2 * i] = (ARR_NAMES[i], ValueLog);
+                table[7 + 2 * i] = (ARR_NAMES[i], MonitorValueLog);
+                i += 1;
+            }
+            table
+        };
+        fn slot(mask: CyclePostMask) -> u32 {
+            match mask {
+                CyclePostMask::Value => 0,
+                CyclePostMask::ValueLog => 1,
+                CyclePostMask::MonitorValueLog => 2,
+            }
+        }
         let (amask, newm) = (self.amask, self.newm);
         self.newm = 0;
-        let mut marks = Vec::new();
+        let mut bits = 0u64;
         // C's NUSE clamp post, with the mask of whichever C site made it. Marked
         // by `clamp_nuse`, the only site that can clamp.
         if let Some(mask) = self.nuse_post_pending.take() {
-            marks.push(("NUSE", mask));
+            bits |= 1 << slot(mask);
         }
         // C's `db_post_events(pcalc, &pcalc->amem, ...)`, marked by whichever
         // `ArrayMem` operation made it — `monitor()`'s tail with the cycle's
@@ -2429,24 +2454,19 @@ impl Record for AcalcoutRecord {
         // DBE_VALUE|DBE_LOG. The put path has no process cycle behind it, so
         // without the mark that post has no carrier at all.
         if let Some(mask) = self.mem.take_post() {
-            marks.push(("AMEM", mask));
+            bits |= 1 << (3 + slot(mask));
         }
-        for (i, name) in ARR_NAMES.iter().enumerate() {
-            let bit = 1u32 << i;
+        for i in 0..ARR_NAMES.len() {
             // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
             // alarm bits are not in scope there.
-            if amask & bit != 0 {
-                marks.push((*name, CyclePostMask::ValueLog));
-            }
+            bits |= u64::from(amask >> i & 1) << (6 + 2 * i);
             // C `monitor()` (`:1034`) runs after, with `monitor_mask` folded in.
             // An array the expression STORED into and whose input link ALSO
             // delivered a change is in both masks, and C posts it from both
             // loops — two events, two masks.
-            if newm & bit != 0 {
-                marks.push((*name, CyclePostMask::MonitorValueLog));
-            }
+            bits |= u64::from(newm >> i & 1) << (7 + 2 * i);
         }
-        marks
+        CycleMarks::of(&POSTS, bits)
     }
 
     /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
@@ -2860,9 +2880,7 @@ mod tests {
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
         assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
         assert!(
-            !rec.take_cycle_posted_fields()
-                .iter()
-                .any(|(f, _)| *f == "AMEM"),
+            !rec.take_cycle_posted_fields().any(|(f, _)| f == "AMEM"),
             "amem == pmem, so monitor() posts nothing (:1044)"
         );
     }
@@ -2969,7 +2987,7 @@ mod tests {
             "pmem = amem, right there (:699)"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("AMEM", CyclePostMask::ValueLog)],
             "C's literal DBE_VALUE|DBE_LOG (:698)"
         );
@@ -2982,9 +3000,7 @@ mod tests {
             "the second put finds it allocated"
         );
         assert!(
-            !rec.take_cycle_posted_fields()
-                .iter()
-                .any(|(f, _)| *f == "AMEM"),
+            !rec.take_cycle_posted_fields().any(|(f, _)| f == "AMEM"),
             "and posts nothing"
         );
     }
@@ -3113,7 +3129,7 @@ mod tests {
             "and the clamped value stays"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::Value)],
             "posted with C's literal DBE_VALUE (:497)"
         );
@@ -3149,7 +3165,7 @@ mod tests {
 
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::ValueLog)],
             "C's init post is DBE_VALUE|DBE_LOG (:189)"
         );

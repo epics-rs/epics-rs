@@ -88,6 +88,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
+use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
     CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance,
     SoftRead, SoftReading,
@@ -101,62 +102,6 @@ use super::{FrameGate, InFrame, MetadataPlan, PvDatabase};
 /// most 39 bytes plus the NUL, which is what `epicsSnprintf(..., STRING_SIZE-1,
 /// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
 const STRING_FIELD_MAX_LEN: usize = 39;
-
-/// **The single owner of "this record's processing cycle was refused."**
-///
-/// C publishes a refused cycle exactly once, in `dbProcess`'s `MAX_LOCK`
-/// branch (`dbAccess.c:544-556`):
-///
-/// ```c
-/// recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM, "Async in progress");
-/// monitor_mask = recGblResetAlarms(precord);
-/// monitor_mask |= DBE_VALUE|DBE_LOG;
-/// db_post_events(precord, ((char *)precord) + pdbFldDes->offset, monitor_mask);
-/// ```
-///
-/// so a refusal is never a silent success: the record carries SCAN_ALARM /
-/// INVALID with the reason in `AMSG`, and the transition is posted. The one
-/// refusal the port can make, C's `MAX_LOCK` re-entry, routes through here;
-/// like C, the port has no link-depth bound.
-///
-/// Returns the post set for the caller to hand to `notify_from_snapshot` after
-/// releasing the write guard, or `None` when the record already carries this
-/// refusal — C's `if (precord->stat == SCAN_ALARM) goto all_done`, which is
-/// what keeps a repeatedly refused record from re-posting every cycle.
-fn scan_alarm_refusal(
-    instance: &mut RecordInstance,
-    msg: &str,
-) -> Option<crate::server::record::ProcessSnapshot> {
-    use crate::server::recgbl::EventMask;
-    if instance.common.stat == crate::server::recgbl::alarm_status::SCAN_ALARM
-        && instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid
-    {
-        return None;
-    }
-    crate::server::recgbl::rec_gbl_set_sevr_msg(
-        &mut instance.common,
-        crate::server::recgbl::alarm_status::SCAN_ALARM,
-        crate::server::record::AlarmSeverity::Invalid,
-        msg,
-    );
-    let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-    // recGblResetAlarms posts the alarm fields before the VAL post it returns
-    // `val_mask = DBE_ALARM` for, so they lead the set in its order and masks.
-    let mut changed_fields = crate::server::record::ProcessSnapshot::new();
-    alarm_field_posts(&instance.common, &alarm_result).for_each(|field, mask| {
-        if let Some(value) = instance.resolve_field(field) {
-            changed_fields.push((field.into(), value, mask));
-        }
-    });
-    if let Some(val) = instance.record.val() {
-        changed_fields.push((
-            "VAL".into(),
-            val,
-            EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-        ));
-    }
-    Some(changed_fields)
-}
 
 /// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
 fn truncate_string_field(s: PvString) -> PvString {
@@ -3293,7 +3238,6 @@ impl PvDatabase {
     /// [`Self::process_entry_prelude`] for the synchronous half. Two tests,
     /// one arm — both call this, so neither can decline more quietly than C.
     fn count_refused_active_entry(&self, rec: InFrame<'_>) {
-        const MAX_LOCK: i16 = 10;
         let mut instance = rec.write();
 
         // C `dbAccess.c:539-541` — when TPRO is set on a record whose PACT is
@@ -3310,21 +3254,7 @@ impl PvDatabase {
             );
         }
 
-        // C `dbAccess.c:544-546`:
-        //   if ((precord->stat == SCAN_ALARM) ||
-        //       (precord->lcnt++ < MAX_LOCK) ||
-        //       (precord->sevr >= INVALID_ALARM)) goto all_done;
-        // The increment is in the test, so it happens on every refusal.
-        let already_invalid = instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid;
-        let already_scan_alarm =
-            instance.common.stat == crate::server::recgbl::alarm_status::SCAN_ALARM;
-        let lcnt_before = instance.common.lcnt;
-        instance.common.lcnt = lcnt_before.saturating_add(1);
-        if already_scan_alarm || lcnt_before < MAX_LOCK || already_invalid {
-            return;
-        }
-
-        let snapshot = scan_alarm_refusal(&mut instance, "Async in progress");
+        let snapshot = instance.max_lock_refusal();
         drop(instance);
         if let Some(snapshot) = snapshot {
             // Between the write guard's drop and the read guard's take: the one
@@ -3546,7 +3476,7 @@ impl PvDatabase {
                 };
                 crate::runtime::log::errlog_printf(&format!(
                     "recGblGetTimeStampSimm: dbGetTimeStamp (sim mode) failed, {}.SIOL = {pvname}\n",
-                    rec.read().name
+                    rec.unframed().name()
                 ));
                 SiolStamp::Keep
             }
@@ -5147,6 +5077,15 @@ impl PvDatabase {
                 }
                 if !had_inp_value
                     && stage_is_soft
+                    && instance.common.dtyp.link_refused()
+                    && instance.record.refused_async_read_keeps_udf()
+                {
+                    // `read_xxx` returned 2 with no `udf = FALSE`: no value was
+                    // sourced, so the status-gated UDF assignment is skipped.
+                    read_produced_no_value = true;
+                }
+                if !had_inp_value
+                    && stage_is_soft
                     && crate::server::recgbl::simm::is_constant(instance.parsed_inp.link())
                 {
                     // C `dbLinkIsConstant(&prec->inp)` at process. The load-once
@@ -6004,7 +5943,11 @@ impl PvDatabase {
                 // was set before the device time landed.
                 let stamp_late = if plan.stamps_before_alarms {
                     if !skips_ts_undef {
-                        instance.stamp_time_begun(begun, tsel);
+                        instance.stamp_time_begun(
+                            begun,
+                            tsel,
+                            plan.stamp_sees_previous_simm(StampPass::First),
+                        );
                     }
                     None
                 } else {
@@ -6033,7 +5976,11 @@ impl PvDatabase {
                 // calcout, scalcout and acalcout stamp after `checkAlarms`; none
                 // skips the stamp or restamps after completion.
                 if let (true, Some(begun)) = (plan.alarms_before_stamp, stamp_late) {
-                    instance.stamp_time_begun(begun, tsel);
+                    instance.stamp_time_begun(
+                        begun,
+                        tsel,
+                        plan.stamp_sees_previous_simm(StampPass::First),
+                    );
                 }
 
                 // IVOA gate severity for a redirected SIMM output. C decides
@@ -7595,7 +7542,12 @@ impl PvDatabase {
                 let stamp_late = if instance.record.alarms_before_stamp() {
                     Some(begun)
                 } else {
-                    instance.stamp_time_begun(begun, tsel);
+                    instance.stamp_time_begun(
+                        begun,
+                        tsel,
+                        rec.process_plan()
+                            .stamp_sees_previous_simm(StampPass::Completion),
+                    );
                     None
                 };
 
@@ -7608,7 +7560,12 @@ impl PvDatabase {
                 // Evaluate alarms
                 instance.evaluate_alarms();
                 if let Some(begun) = stamp_late {
-                    instance.stamp_time_begun(begun, tsel);
+                    instance.stamp_time_begun(
+                        begun,
+                        tsel,
+                        rec.process_plan()
+                            .stamp_sees_previous_simm(StampPass::Completion),
+                    );
                 }
 
                 // Device support alarm override.
@@ -8539,6 +8496,7 @@ impl PvDatabase {
         {
             let mut instance = rec.write();
             instance.rec_gbl_save_simm();
+            instance.simm_before_siml_read = instance.record.simm_value().map(|v| v as i16);
         }
         // `dbTryGetLink`: a CONSTANT (or unset) SIML delivers NOTHING here —
         // its value was loaded into SIMM once, at init (`rec_gbl_init_simm`).
@@ -9446,30 +9404,44 @@ impl PvDatabase {
             // caput REC.SVAL 42` work (R12-61): the unset SIOL delivers no
             // data (status 0), and C's `val = sval` then publishes the SVAL
             // the operator wrote.
-            let has_sval = instance.record.get_field("SVAL").is_some();
-            let landed: Option<EpicsValue> = match &fetch {
+            let has_sval = instance.record.has_sval();
+            let fetch_ok = fetch.is_ok();
+            // `Some(v)` is a value that goes straight to the landing (no SVAL);
+            // `Sval` is one already in SVAL, copied to the landing below.
+            enum Fetched {
+                Direct(EpicsValue),
+                Sval,
+                None,
+            }
+            let landed = match fetch {
                 crate::server::recgbl::simm::LinkFetch::Value(v) => {
                     if has_sval {
                         // `put_field_internal` is the DBR-coercion owner
                         // (C `dbGetLink(DBF_<sval>)`).
-                        let _ = instance.record.put_field_internal("SVAL", v.clone());
-                        instance.record.get_field("SVAL")
+                        let _ = instance.record.put_field_internal("SVAL", v);
+                        Fetched::Sval
                     } else {
-                        Some(v.clone())
+                        Fetched::Direct(v)
                     }
                 }
-                crate::server::recgbl::simm::LinkFetch::NoData => {
-                    if has_sval {
-                        instance.record.get_field("SVAL")
-                    } else {
-                        None
-                    }
-                }
-                crate::server::recgbl::simm::LinkFetch::Failed => None,
+                crate::server::recgbl::simm::LinkFetch::NoData if has_sval => Fetched::Sval,
+                crate::server::recgbl::simm::LinkFetch::NoData
+                | crate::server::recgbl::simm::LinkFetch::Failed => Fetched::None,
             };
 
-            if let Some(siol_val) = landed {
-                let target_supports_raw = raw_mode && instance.record.get_field("RVAL").is_some();
+            let target_supports_raw = !matches!(landed, Fetched::None)
+                && raw_mode
+                && instance.record.get_field("RVAL").is_some();
+            let raw_value = match landed {
+                Fetched::Direct(v) => Some(v),
+                Fetched::Sval if target_supports_raw => instance.record.get_field("SVAL"),
+                Fetched::Sval => {
+                    let _ = instance.record.land_sval();
+                    None
+                }
+                Fetched::None => None,
+            };
+            if let Some(siol_val) = raw_value {
                 if target_supports_raw {
                     // PR #ac92e3e follow-up: SIMM=RAW on records
                     // with RVAL (ai/ao/etc.) writes the raw value
@@ -9543,7 +9515,7 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, tsel, siol_stamp, fetch.is_ok(), link_backing)
+            sim_process_tail(&mut instance, tsel, siol_stamp, fetch_ok, link_backing)
         };
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -9652,13 +9624,11 @@ fn sim_process_tail(
     backing: crate::server::database::LinkBacking<'_>,
 ) -> CyclePosts {
     let alarms_first = instance.record.alarms_before_stamp();
-    // A `.TIME` TSEL returns before the simulation arm (`recGbl.c:321`).
+    // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
+    // (`recGbl.c:321`) and for any TSE but device time.
     let stamp = |inst: &mut RecordInstance| {
-        let tsel_is_time = matches!(tsel, super::TselStamp::Time(..));
         tsel.stamp(&inst.name, &mut inst.common, || false);
-        if !tsel_is_time && inst.common.tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
-            siol_stamp.apply(&mut inst.common);
-        }
+        siol_stamp.apply(&mut inst.common);
     };
     if !alarms_first {
         stamp(&mut *instance);

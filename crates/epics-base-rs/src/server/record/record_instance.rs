@@ -1030,6 +1030,7 @@ impl ProcessPlan {
         restamps_time_after_completion: false,
         alarms_before_stamp: false,
         stamps_before_alarms: true,
+        stamps_before_siml_read: false,
         clears_udf: true,
         soft_read_clears_udf: true,
     };
@@ -1066,6 +1067,7 @@ impl ProcessPlan {
             restamps_time_after_completion,
             alarms_before_stamp,
             stamps_before_alarms,
+            stamps_before_siml_read,
             clears_udf,
             soft_read_clears_udf,
         } = *self;
@@ -1096,6 +1098,7 @@ impl ProcessPlan {
             && restamps_time_after_completion == p.restamps_time_after_completion
             && alarms_before_stamp == p.alarms_before_stamp
             && stamps_before_alarms == p.stamps_before_alarms
+            && stamps_before_siml_read == p.stamps_before_siml_read
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
     }
@@ -1108,6 +1111,15 @@ impl ProcessPlan {
         let simm = field_desc_of(record, "SIMM")
             .is_some()
             .then(|| SimmBlock::of(record));
+        let output_stage = record.can_device_write()
+            || field_desc_of(record, "OUT").is_some()
+            || field_desc_of(record, "OEVT").is_some()
+            || crate::server::database::multi_output_dispatch_owned(rtype)
+            || record.declares_multi_output_links()
+            // An INPUT type's simulation substitutes its read and
+            // returns before the body; only an output type's SIOL write
+            // reaches this stage.
+            || simm.is_some_and(|block| !block.is_input);
         ProcessPlan {
             dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
             simm,
@@ -1140,15 +1152,7 @@ impl ProcessPlan {
             ) && record.declares_multi_output_links(),
             has_multi_input_links: !record.multi_input_links().is_empty(),
             narrows_input_links: record.narrows_input_links(),
-            output_stage: record.can_device_write()
-                || field_desc_of(record, "OUT").is_some()
-                || field_desc_of(record, "OEVT").is_some()
-                || crate::server::database::multi_output_dispatch_owned(rtype)
-                || record.declares_multi_output_links()
-                // An INPUT type's simulation substitutes its read and
-                // returns before the body; only an output type's SIOL write
-                // reaches this stage.
-                || simm.is_some_and(|block| !block.is_input),
+            output_stage,
             fetches_dol_closed_loop: record.fetches_dol_closed_loop(),
             soft_channel_skips_convert: record.soft_channel_skips_convert(),
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
@@ -1156,6 +1160,7 @@ impl ProcessPlan {
             alarms_before_stamp: record.alarms_before_stamp(),
             stamps_before_alarms: !record.alarms_before_stamp()
                 && !record.restamps_time_after_completion(),
+            stamps_before_siml_read: output_stage && !record.stamps_after_write(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
         }
@@ -1660,8 +1665,31 @@ pub(crate) struct ProcessPlan {
     /// nor `restamps_time_after_completion`. One test where the cycle once
     /// tested the latter alone.
     pub(crate) stamps_before_alarms: bool,
+    /// An output whose `recGblGetTimeStampSimm(prec, prec->simm, NULL)` runs
+    /// before `writeValue` reads SIML, so it sees the previous cycle's SIMM
+    /// ([`Record::stamps_after_write`] is the one exception).
+    pub(crate) stamps_before_siml_read: bool,
     pub(crate) clears_udf: bool,
     pub(crate) soft_read_clears_udf: bool,
+}
+
+/// Which pass of `process()` a stamp belongs to. The completion pass is the
+/// re-entry with `pact` set: `writeValue` returns before `recGblGetSimm`, so
+/// its `recGblGetTimeStampSimm` (`aoRecord.c:228`, `lsoRecord.c:154`) sees the
+/// SIMM the first pass left.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StampPass {
+    First,
+    Completion,
+}
+
+impl ProcessPlan {
+    /// Whether this pass's output stamp sees the SIMM from before the cycle's
+    /// SIML read ([`Self::stamps_before_siml_read`]); never the completion.
+    #[inline(always)]
+    pub(crate) fn stamp_sees_previous_simm(&self, pass: StampPass) -> bool {
+        pass == StampPass::First && self.stamps_before_siml_read
+    }
 }
 
 /// How many record borrows this thread holds, in builds with debug
@@ -1756,6 +1784,9 @@ pub struct RecordCell {
     /// a borrow of the record because a cell's type never changes. What a
     /// link target's field address ([`FieldAddr`]) is resolved against.
     rdes: RecordDesc,
+    /// C `dbCommon::name`, fixed at construction like `rdes`, so a message
+    /// naming the record is built with no borrow of it held.
+    name: std::sync::Arc<str>,
     /// [`Record::field_slot`] for each entry of `rdes.fields`, asked once
     /// here so a link resolving its target's address needs no lock.
     slots: Box<[Option<super::record_trait::FieldSlot>]>,
@@ -1938,11 +1969,14 @@ impl PutAddr {
 /// monitor walk reads it without a name scan. `upper`: the key is already
 /// upper-case, as [`RecordInstance::resolve_field_upper_at`] needs.
 /// `prev_bit`: the field's bit in [`Record::prev_compared_inputs`], settled
-/// with the entry so the walk never searches that list.
+/// with the entry so the walk never searches that list. `name`: the declared
+/// name when it is the key exactly, so a post borrows it instead of copying
+/// the key.
 #[derive(Debug)]
 struct Published {
     value: EpicsValue,
     desc: Option<&'static FieldDesc>,
+    name: Option<&'static str>,
     upper: bool,
     prev_bit: Option<u8>,
 }
@@ -1976,6 +2010,7 @@ impl RecordCell {
             cp_edges_revision: std::sync::atomic::AtomicU64::new(0),
             cp_edges: std::sync::atomic::AtomicBool::new(false),
             rdes: RecordDesc::of(&*instance.record),
+            name: instance.name.as_str().into(),
             slots: instance
                 .record
                 .field_list()
@@ -2027,6 +2062,11 @@ impl RecordCell {
     /// The record type's declaration — C `precord->rdes`.
     pub(crate) fn rdes(&self) -> &RecordDesc {
         &self.rdes
+    }
+
+    /// The record's name — C `precord->name` — without taking its lock set.
+    pub(crate) fn name(&self) -> &std::sync::Arc<str> {
+        &self.name
     }
 
     /// [`Record::field_slot`] for `field` (upper-case), answered from the
@@ -2747,6 +2787,10 @@ pub struct RecordInstance {
     /// read by [`Self::sim_link_parse`], the one writer. `None` until a
     /// SIMM-declaring record's first cycle; never set on any other type.
     parsed_siml: Option<SimLinkParse>,
+    /// SIMM as it stood before this cycle's SIML read (`rec_gbl_get_simm`), for
+    /// an output's stamp, which C takes before `writeValue` reads SIML. `None`
+    /// while no SIML read has run since the SIML was last put.
+    pub(crate) simm_before_siml_read: Option<i16>,
     parsed_siol: Option<SimLinkParse>,
     pub parsed_out: LinkCache,
     pub parsed_flnk: LinkCache,
@@ -3531,11 +3575,15 @@ impl RecordInstance {
         &mut self,
         begun: crate::server::record::StampBegun,
         tsel: crate::server::database::TselStamp,
+        output_before_siml: bool,
     ) {
         let record = &self.record;
+        let before_siml = self.simm_before_siml_read.filter(|_| output_before_siml);
         tsel.stamp_begun(begun, &self.name, &mut self.common, || {
             !record.simulation_substitutes_input_stage()
-                && record.simm_value().is_some_and(|simm| simm != 0)
+                && before_siml
+                    .or_else(|| record.simm_value())
+                    .is_some_and(|simm| simm != 0)
         });
     }
 
@@ -3562,7 +3610,10 @@ impl RecordInstance {
         // The SIM-block parse is keyed on put, not on a per-cycle text
         // compare: every write of the text is a funnel call.
         match field {
-            "SIML" => self.parsed_siml = None,
+            "SIML" => {
+                self.parsed_siml = None;
+                self.simm_before_siml_read = None;
+            }
             "SIOL" => self.parsed_siol = None,
             _ => {}
         }
@@ -3979,6 +4030,7 @@ impl RecordInstance {
             parsed_tsel: LinkCache::none(),
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
             parsed_siml: None,
+            simm_before_siml_read: None,
             parsed_siol: None,
             link_slots,
             cycle_links,
@@ -4331,9 +4383,11 @@ impl RecordInstance {
         if let Some(slot) = self.last_posted.get_mut(field) {
             slot.value = value;
         } else {
+            let desc = self.field_desc(field);
             let published = Published {
                 value,
-                desc: self.field_desc(field),
+                desc,
+                name: desc.map(|d| d.name).filter(|name| *name == field),
                 upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
                 prev_bit: self.prev_compared_bit(field),
             };
@@ -7193,7 +7247,9 @@ impl RecordInstance {
         include_val: bool,
         marked: bool,
     ) {
-        use crate::server::record::{CycleHooks, CyclePostMask, ValuePostGate, value_gate};
+        use crate::server::record::{
+            CycleHooks, CycleMarks, CyclePostMask, ValuePostGate, value_gate,
+        };
 
         let hooks = self.monitor_plan.hooks;
         // C's `if (monitor_mask)` is shut and the type holds no one-shot post
@@ -7213,20 +7269,21 @@ impl RecordInstance {
 
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let mut cycle_posted = if marked || hooks.has(CycleHooks::CYCLE_POSTED) {
+        let cycle_marks = if marked || hooks.has(CycleHooks::CYCLE_POSTED) {
             self.record.take_cycle_posted_fields()
         } else {
-            Vec::new()
+            CycleMarks::NONE
         };
         // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
-        // iocInit's per-cycle drain must not be able to eat. Merged here so
-        // both reach the same branch with the same mask mapping.
-        if hooks.has(CycleHooks::FIRST_MONITOR) {
-            let first_cycle = self.record.take_first_monitor_cycle();
-            if !first_cycle.is_empty() {
-                cycle_posted.extend(first_cycle);
-            }
-        }
+        // iocInit's per-cycle drain must not be able to eat. Read beside the
+        // per-cycle marks so both reach the same branch with the same mask
+        // mapping.
+        let first_marks = if hooks.has(CycleHooks::FIRST_MONITOR) {
+            self.record.take_first_monitor_cycle()
+        } else {
+            CycleMarks::NONE
+        };
+        let cycle_posted = || cycle_marks.chain(first_marks);
         let value_masked = self.monitor_plan.value_masked;
         // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
         // `OnChangeForced` fields sit behind, which the record may open on a
@@ -7355,6 +7412,12 @@ impl RecordInstance {
             let Some(val) = read else {
                 continue;
             };
+            // Only a field never published, or one keyed off its declared
+            // spelling, copies its name into a post.
+            let name = || match published.and_then(|p| p.name) {
+                Some(name) => Cow::Borrowed(name),
+                None => Cow::Owned(field.clone()),
+            };
             // A subscribed field is published when it is added, so the name
             // search runs only for one never posted since.
             let prev_bit = match published {
@@ -7384,36 +7447,36 @@ impl RecordInstance {
                     ValuePostGate::OnChange | ValuePostGate::OnChangeForced => false,
                 };
                 if post {
-                    snapshot.push((field.clone().into(), val.clone(), deadband_mask));
+                    snapshot.push((name(), val.clone(), deadband_mask));
                 }
             } else if changed && !marked_only.contains(&field.as_str()) {
                 snapshot.push((
-                    field.clone().into(),
+                    name(),
                     val.clone(),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
             } else if force_fields.contains(&field.as_str()) {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                snapshot.push((field.clone().into(), val.clone(), aux_mask));
-            } else if cycle_posted.iter().any(|(name, _)| *name == field) {
+                snapshot.push((name(), val.clone(), aux_mask));
+            } else if cycle_posted().any(|(name, _)| name == field) {
                 // One event per MARK, each with the mask of the C call site that
                 // made it (`CyclePostMask`) — a field marked twice (aCalcout's
                 // AMASK `afterCalc` post AND its NEWM `monitor()` post) is posted
                 // twice, exactly as C posts it from both loops.
-                for (_, cycle_mask) in cycle_posted.iter().filter(|(name, _)| *name == field) {
+                for (_, cycle_mask) in cycle_posted().filter(|(name, _)| *name == field) {
                     let mask = match cycle_mask {
                         CyclePostMask::Value => EventMask::VALUE,
                         CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
                         CyclePostMask::MonitorValueLog => aux_mask,
                     };
-                    snapshot.push((field.clone().into(), val.clone(), mask));
+                    snapshot.push((name(), val.clone(), mask));
                 }
             } else if alarm_fanout.contains(&field.as_str()) {
                 // C motor `monitor()` (motorRecord.cc:3456-3646) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
                 // observes the alarm moment on any of them.
-                snapshot.push((field.clone().into(), val.clone(), alarm_fanout_mask));
+                snapshot.push((name(), val.clone(), alarm_fanout_mask));
             }
             // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
             // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
@@ -7444,7 +7507,7 @@ impl RecordInstance {
             // path is separately served by the change post (C's `updateCounts()`
             // DBE_VALUE at `:582`).
             if log_swept.contains(&field.as_str()) {
-                snapshot.push((field.clone().into(), val, EventMask::LOG | alarm_bits));
+                snapshot.push((name(), val, EventMask::LOG | alarm_bits));
             }
         }
         // A guarded secondary post lands whether or not the field has a
@@ -7541,6 +7604,52 @@ impl RecordInstance {
         )
     }
 
+    /// **The single owner of a refused re-entry** — C `dbProcess`'s
+    /// `MAX_LOCK` branch (`dbAccess.c:544-555`), whole: the `lcnt` count,
+    /// the once-only SCAN_ALARM/INVALID "Async in progress" raise and its
+    /// posts, which `recGblResetAlarms` makes for SEVR, STAT, AMSG and ACKS
+    /// before the VAL post it returns `DBE_ALARM` for.
+    ///
+    /// Returns the posts for the caller to deliver after its write guard is
+    /// gone, or `None` where C goes to `all_done` without a post.
+    pub(crate) fn max_lock_refusal(&mut self) -> Option<ProcessSnapshot> {
+        use crate::server::recgbl::{self, EventMask};
+        const MAX_LOCK: i16 = 10;
+
+        // The increment is in C's test, so every refused entry counts.
+        let lcnt = self.common.lcnt;
+        self.common.lcnt = lcnt.saturating_add(1);
+        if self.common.stat == recgbl::alarm_status::SCAN_ALARM
+            || lcnt < MAX_LOCK
+            || self.common.sevr >= AlarmSeverity::Invalid
+        {
+            return None;
+        }
+        recgbl::rec_gbl_set_sevr_msg(
+            &mut self.common,
+            recgbl::alarm_status::SCAN_ALARM,
+            AlarmSeverity::Invalid,
+            "Async in progress",
+        );
+        let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
+        let mut posts = ProcessSnapshot::new();
+        crate::server::database::alarm_field_posts(&self.common, &alarm_result).for_each(
+            |field, mask| {
+                if let Some(value) = self.resolve_field(field) {
+                    posts.push((field.into(), value, mask));
+                }
+            },
+        );
+        if let Some(val) = self.record.val() {
+            posts.push((
+                "VAL".into(),
+                val,
+                EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+            ));
+        }
+        Some(posts)
+    }
+
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
     ///
@@ -7559,77 +7668,9 @@ impl RecordInstance {
         ProcessSnapshot,
         Vec<(&'static str, crate::server::recgbl::EventMask)>,
     )> {
-        use crate::server::recgbl::{self, EventMask};
-        const LCNT_ALARM_THRESHOLD: i16 = 10;
-
         if self.pact.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            // C `dbProcess` PACT-active guard (dbAccess.c:544-557):
-            //
-            //   if ((precord->stat == SCAN_ALARM) ||
-            //       (precord->lcnt++ < MAX_LOCK) ||
-            //       (precord->sevr >= INVALID_ALARM)) goto all_done;
-            //   recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM,
-            //                    "Async in progress");
-            //
-            // The alarm fires EXACTLY ONCE — on the attempt whose
-            // pre-increment lcnt equals MAX_LOCK — and is then blocked
-            // by the stat == SCAN_ALARM / sevr >= INVALID bails, the
-            // same shape as the link path
-            // (`process_record_with_links_inner`). The pre-fix guard
-            // here used post-increment `lcnt >= threshold` with no
-            // already-raised bail, so every reentrant attempt past the
-            // threshold re-posted the unchanged SEVR/STAT/VAL (and the
-            // first fire came one attempt early); it also wrote
-            // sevr/stat directly, skipping `recGblSetSevrMsg` +
-            // `recGblResetAlarms` — losing the "Async in progress"
-            // AMSG and the acks bookkeeping the reset performs.
-            let already_scan_alarm = self.common.stat == recgbl::alarm_status::SCAN_ALARM;
-            let already_invalid = self.common.sevr >= AlarmSeverity::Invalid;
-            let lcnt_before = self.common.lcnt;
-            self.common.lcnt = lcnt_before.saturating_add(1);
-            if already_scan_alarm || lcnt_before < LCNT_ALARM_THRESHOLD || already_invalid {
-                return Ok((ProcessSnapshot::new(), Vec::new()));
-            }
-            recgbl::rec_gbl_set_sevr_msg(
-                &mut self.common,
-                recgbl::alarm_status::SCAN_ALARM,
-                AlarmSeverity::Invalid,
-                "Async in progress",
-            );
-            let _ = recgbl::rec_gbl_reset_alarms(&mut self.common);
-            // Per-field C masks (recGbl.c:202-222): this guard only
-            // runs on a fresh SCAN_ALARM/INVALID raise, so sevr AND
-            // stat both moved — SEVR posts DBE_VALUE, STAT/AMSG post
-            // the shared `stat_mask` = DBE_ALARM|DBE_VALUE, VAL posts
-            // DBE_VALUE|DBE_LOG plus `val_mask` = DBE_ALARM.
-            let stat_mask = EventMask::ALARM | EventMask::VALUE;
-            let mut changed_fields = crate::server::record::ProcessSnapshot::new();
-            if let Some(val) = self.record.val() {
-                changed_fields.push((
-                    "VAL".into(),
-                    val,
-                    EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-                ));
-            }
-            changed_fields.push((
-                "SEVR".into(),
-                EpicsValue::Short(self.common.sevr as i16),
-                EventMask::VALUE,
-            ));
-            changed_fields.push((
-                "STAT".into(),
-                EpicsValue::Short(self.common.stat as i16),
-                stat_mask,
-            ));
-            // AMSG carries "Async in progress" alongside the STAT
-            // transition (C recGbl.c posts STAT and AMSG together
-            // when any alarm field moved).
-            changed_fields.push((
-                "AMSG".into(),
-                EpicsValue::String(self.common.amsg.as_str().into()),
-                stat_mask,
-            ));
-            return Ok((changed_fields, Vec::new()));
+            let posts = self.max_lock_refusal().unwrap_or_default();
+            return Ok((posts, Vec::new()));
         }
         self.common.lcnt = 0;
         // RAII guard that resets `self.pact` to false on drop — both for the
@@ -9314,7 +9355,13 @@ mod device_menu_marking_tests {
     #[test]
     fn a_registered_device_menu_merges_after_the_base_declared_choices() {
         // The list asyn's generated `dbd_generated::DEVICE_MENU_MBBO` carries.
-        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        static ASYN_MBBO: &[(&str, crate::server::record::DbLinkType)] = &[
+            ("asynInt32", crate::server::record::DbLinkType::Constant),
+            (
+                "asynUInt32Digital",
+                crate::server::record::DbLinkType::Constant,
+            ),
+        ];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
         let mut inst = RecordInstance::new("X".into(), MbboRecord::default());
@@ -9350,7 +9397,13 @@ mod device_menu_marking_tests {
     /// process.
     #[test]
     fn calc_stays_none_after_asyn_menus_are_registered() {
-        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        static ASYN_MBBO: &[(&str, crate::server::record::DbLinkType)] = &[
+            ("asynInt32", crate::server::record::DbLinkType::Constant),
+            (
+                "asynUInt32Digital",
+                crate::server::record::DbLinkType::Constant,
+            ),
+        ];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
         let inst = RecordInstance::new("X".into(), CalcRecord::default());
@@ -12214,5 +12267,52 @@ mod skipped_posted_tests {
             .expect("SEVR subscriber");
         assert!(inst.last_posted.is_empty());
         assert!(inst.posted_value("SEVR").is_some());
+    }
+}
+
+#[cfg(test)]
+mod walk_post_name_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::records::ai::AiRecord;
+    use crate::types::DbFieldType;
+
+    /// The walk's posts for one ai cycle with `key` subscribed and HOPR, a
+    /// change-detected field, moved since.
+    fn hopr_posts(key: &str) -> Vec<Cow<'static, str>> {
+        let mut inst = RecordInstance::new("AI:NAME".to_string(), AiRecord::default());
+        let _rx = inst
+            .add_subscriber(key, 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("subscriber");
+        inst.record
+            .put_field("HOPR", EpicsValue::Double(7.0))
+            .unwrap();
+        let mut snapshot = ProcessSnapshot::new();
+        inst.collect_subscriber_posts(
+            &mut snapshot,
+            EventMask::VALUE,
+            EventMask::NONE,
+            true,
+            false,
+        );
+        snapshot.iter().map(|(field, _, _)| field.clone()).collect()
+    }
+
+    /// A field keyed by its declared spelling posts that `&'static` name, so
+    /// the post copies nothing under the record lock.
+    #[test]
+    fn a_declared_field_posts_its_static_name() {
+        assert!(matches!(hopr_posts("HOPR")[..], [Cow::Borrowed("HOPR")]));
+    }
+
+    /// Any other spelling posts as keyed: delivery looks the subscriber up
+    /// by that key.
+    #[test]
+    fn another_spelling_posts_as_keyed() {
+        let posts = hopr_posts("hopr");
+        assert!(
+            matches!(&posts[..], [Cow::Owned(name)] if name == "hopr"),
+            "{posts:?}"
+        );
     }
 }

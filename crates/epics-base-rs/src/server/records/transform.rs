@@ -1084,15 +1084,13 @@ impl Record for TransformRecord {
     /// has processed sees what C shows it, nothing. The mask is C's own
     /// `monitor_mask = DBE_VALUE|DBE_LOG` (`:794`), which overwrites
     /// `recGblResetAlarms`'s: no alarm bit reaches these posts.
-    fn take_first_monitor_cycle(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        if self.first_calc_posted {
-            return Vec::new();
+    fn take_first_monitor_cycle(&mut self) -> crate::server::record::CycleMarks {
+        static CHANNEL_POSTS: [(&str, CyclePostMask); CHANNEL_FIELDS.len()] =
+            crate::server::record::uniform_post_table(CHANNEL_FIELDS, CyclePostMask::ValueLog);
+        if std::mem::replace(&mut self.first_calc_posted, true) {
+            return crate::server::record::CycleMarks::NONE;
         }
-        self.first_calc_posted = true;
-        CHANNEL_FIELDS
-            .iter()
-            .map(|f| (*f, CyclePostMask::ValueLog))
-            .collect()
+        crate::server::record::CycleMarks::of(&CHANNEL_POSTS, (1 << CHANNEL_POSTS.len()) - 1)
     }
 
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every

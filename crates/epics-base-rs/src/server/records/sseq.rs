@@ -7,8 +7,8 @@ use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions, ProcessOutcome,
-    Record, RecordProcessResult, parse_link_v2,
+    CycleMarks, CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions,
+    ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -53,6 +53,21 @@ const DO_FIELDS: [&str; NUM_STEPS] = [
 const STR_FIELDS: [&str; NUM_STEPS] = [
     "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
 ];
+/// The posts [`SseqRecord::mark_value_write`] can owe: step `i`'s written
+/// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
+/// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`.
+static VALUE_WRITE_POSTS: [(&str, CyclePostMask); 4 * NUM_STEPS] = {
+    let mut table = [("", CyclePostMask::Value); 4 * NUM_STEPS];
+    let mut i = 0;
+    while i < NUM_STEPS {
+        table[4 * i] = (DO_FIELDS[i], CyclePostMask::ValueLog);
+        table[4 * i + 1] = (STR_FIELDS[i], CyclePostMask::Value);
+        table[4 * i + 2] = (STR_FIELDS[i], CyclePostMask::ValueLog);
+        table[4 * i + 3] = (DO_FIELDS[i], CyclePostMask::Value);
+        i += 1;
+    }
+    table
+};
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -380,7 +395,8 @@ pub struct SseqRecord {
     /// the C `db_post_events` call site that made it (see `mark_value_write`).
     /// Drained by [`Record::take_cycle_posted_fields`] — on a put by the put
     /// path, on a process cycle by the monitor loop.
-    pending_posts: Vec<(&'static str, CyclePostMask)>,
+    /// A bit per [`VALUE_WRITE_POSTS`] entry.
+    pending_posts: u64,
     /// Monotonic generation guarding `refresh_link_status`. Each refresh
     /// classifies a *snapshot* of the `DOLn`/`LNKn`/`WAITn` link state
     /// off-thread; a later refresh (a `special()` `DOLn`/`LNKn` re-point)
@@ -416,7 +432,7 @@ impl Default for SseqRecord {
             seq_wake: None,
             async_ctx: None,
             callback_priority: crate::runtime::task::CallbackPriority::Low,
-            pending_posts: Vec::new(),
+            pending_posts: 0,
             link_gen: LinkStatusGen::default(),
         }
     }
@@ -450,25 +466,15 @@ impl SseqRecord {
     /// the DERIVED view alone; on a `processCallback` link read there is no put
     /// path, so the record owes BOTH.
     fn mark_value_write(&mut self, i: usize, wrote: StepView, w: StepWrite, posts_direct: bool) {
-        let (direct, direct_changed, derived, derived_changed) = match wrote {
-            StepView::Numeric => (
-                DO_FIELDS[i],
-                w.numeric_changed,
-                STR_FIELDS[i],
-                w.string_changed,
-            ),
-            StepView::String => (
-                STR_FIELDS[i],
-                w.string_changed,
-                DO_FIELDS[i],
-                w.numeric_changed,
-            ),
+        let (direct, direct_changed, derived_changed) = match wrote {
+            StepView::Numeric => (4 * i, w.numeric_changed, w.string_changed),
+            StepView::String => (4 * i + 2, w.string_changed, w.numeric_changed),
         };
         if posts_direct && direct_changed {
-            self.pending_posts.push((direct, CyclePostMask::ValueLog));
+            self.pending_posts |= 1 << direct;
         }
         if derived_changed {
-            self.pending_posts.push((derived, CyclePostMask::Value));
+            self.pending_posts |= 1 << (direct + 1);
         }
     }
 
@@ -1256,8 +1262,8 @@ impl Record for SseqRecord {
 
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
     /// (`mark_value_write`), with that C call site's mask and comparison.
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        std::mem::take(&mut self.pending_posts)
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(&VALUE_WRITE_POSTS, std::mem::take(&mut self.pending_posts))
     }
 
     /// C change-detects neither view of a step's value pair; see
@@ -2421,7 +2427,7 @@ mod tests {
 
         rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("STR1", CyclePostMask::Value)],
             "a DOn put posts only the DERIVED STRn (dbPut posts DOn itself)"
         );
@@ -2435,7 +2441,7 @@ mod tests {
         rec.put_field("STRA", EpicsValue::String("5".into()))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("DOA", CyclePostMask::Value)],
             "a STRn put posts only the derived DOn = atof(s)"
         );
@@ -2456,7 +2462,7 @@ mod tests {
         rec.put_field_internal("DO1", EpicsValue::Double(3.7))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![
                 ("DO1", CyclePostMask::ValueLog),
                 ("STR1", CyclePostMask::Value)
@@ -2467,7 +2473,7 @@ mod tests {
         rec.put_field_internal("DO2", EpicsValue::String("abc".into()))
             .unwrap();
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
             vec![("STR2", CyclePostMask::ValueLog)],
             "string arm: s with DBE_VALUE|DBE_LOG; dov stayed 0.0 (atof(\"abc\")), \
              and C posts it only `if (d != plinkGroup->dov)`"

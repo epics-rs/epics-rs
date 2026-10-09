@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
@@ -63,7 +64,16 @@ impl SubscriptionFilter for Record {
     }
 }
 
-async fn softioc_pin(case: &str) {
+/// How a case reaches the stream softIoc served: every step of `steps.txt`,
+/// or its first `steps` steps and then `record` refused in place through
+/// `RecordInstance::process_local` while PACT is held, as the FLNK steps
+/// refuse it in softIoc.
+enum Drive {
+    Steps,
+    LocalRefusal { steps: usize, record: &'static str },
+}
+
+async fn softioc_pin(case: &str, drive: Drive) {
     let dir = format!(
         "{}/tests/testdata/alarm_post_order/{case}",
         env!("CARGO_MANIFEST_DIR")
@@ -113,7 +123,11 @@ async fn softioc_pin(case: &str) {
             }),
         ));
     }
-    for step in lines {
+    let steps = match drive {
+        Drive::Steps => usize::MAX,
+        Drive::LocalRefusal { steps, .. } => steps,
+    };
+    for step in lines.take(steps) {
         let mut words = step.split_whitespace();
         assert_eq!(words.next(), Some("caput"));
         let pv = words.next().unwrap();
@@ -125,6 +139,19 @@ async fn softioc_pin(case: &str) {
         // Outlasts the 0.1 s ODLY the refusal case's first cycle runs.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    if let Drive::LocalRefusal { record, .. } = drive {
+        let cell = db.get_record(record).unwrap();
+        let mut inst = cell.write();
+        inst.enter_pact();
+        // C `dbProcess` refuses MAX_LOCK = 10 entries silently and raises on
+        // the eleventh.
+        for _ in 0..10 {
+            assert!(inst.process_local().unwrap().0.is_empty());
+        }
+        let (posts, alarm_posts) = inst.process_local().unwrap();
+        assert!(alarm_posts.is_empty());
+        inst.notify_from_snapshot(&posts, LinkBacking::none());
+    }
     let mut got = stream.lock().unwrap().join("\n");
     got.push('\n');
     assert_eq!(got, read("softioc.out"), "{case}");
@@ -134,7 +161,7 @@ async fn softioc_pin(case: &str) {
 /// falls to HIGH (ACKT holds ACKS at MAJOR, so no ACKS post) and clears.
 #[epics_macros_rs::epics_test]
 async fn alarm_fields_post_ahead_of_val_in_monitor_order() {
-    softioc_pin("raise").await;
+    softioc_pin("raise", Drive::Steps).await;
 }
 
 /// T is held active by a 60 s ODLY while SRC's FLNK reaches it eleven times;
@@ -142,5 +169,19 @@ async fn alarm_fields_post_ahead_of_val_in_monitor_order() {
 /// then VAL.
 #[epics_macros_rs::epics_test]
 async fn a_max_lock_refusal_posts_its_alarm_fields_ahead_of_val() {
-    softioc_pin("refusal").await;
+    softioc_pin("refusal", Drive::Steps).await;
+}
+
+/// The same refusal reached through `process_local`: it posts what softIoc
+/// served, in the same order, ACKS included.
+#[epics_macros_rs::epics_test]
+async fn a_process_local_refusal_posts_as_the_scan_refusal_does() {
+    softioc_pin(
+        "refusal",
+        Drive::LocalRefusal {
+            steps: 1,
+            record: "T",
+        },
+    )
+    .await;
 }

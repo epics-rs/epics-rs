@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleMarks, CyclePostMask, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -25,10 +25,10 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
 ///
 /// Monitor wiring: `VAL` posts via the framework's value-change gate
 /// ([`Record::monitor_value_changed`]) — the record has no MDEL/ADEL
-/// deadband, matching C's pure `oval != val` test. `WFLG` is a subscribed
-/// auxiliary field, so the framework's generic change-detection loop posts
-/// it on change with the same `DBE_VALUE | DBE_LOG` mask. `OVAL`/`OFLG`
-/// mirror C's post-`monitor()` tracker state for a `caget`.
+/// deadband, matching C's pure `oval != val` test. `WFLG` posts on C's own
+/// `oflg != wflg`, not on a compare against what a client was last sent: a
+/// `dbpf WFLG 1` is posted by `dbPut` and again by the `monitor()` it
+/// processes. `OVAL`/`OFLG` mirror C's post-`monitor()` tracker state.
 ///
 /// **Deprecated** in upstream EPICS, but still part of the base record set.
 pub struct PermissiveRecord {
@@ -44,6 +44,9 @@ pub struct PermissiveRecord {
     pub oflg: u16,
     /// `LABL` — "Button Label" (`DBF_STRING`, `size(20)`, `pp(TRUE)`).
     pub labl: PvString,
+    /// The last `monitor()` found `oflg != wflg`; only it sets this, so a
+    /// put-path drain cannot post C's monitor-time WFLG.
+    wflg_marked: bool,
 }
 
 impl Default for PermissiveRecord {
@@ -54,6 +57,7 @@ impl Default for PermissiveRecord {
             wflg: 0,
             oflg: 0,
             labl: PvString::new(),
+            wflg_marked: false,
         }
     }
 }
@@ -71,13 +75,7 @@ impl Record for PermissiveRecord {
         "permissive"
     }
 
-    /// C `permissiveRecord.c::monitor` (lines 90-117): post `VAL` when
-    /// `oval != val` and `WFLG` when `oflg != wflg`, then copy the new
-    /// values into `OVAL`/`OFLG`. The change is captured here (before the
-    /// `oval` copy) so the framework's VAL-post gate reads the C result;
-    /// `WFLG` posts through the generic subscribed-field loop.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.oflg = self.wflg;
         Ok(ProcessOutcome::complete())
     }
 
@@ -90,13 +88,47 @@ impl Record for PermissiveRecord {
     /// C `permissiveRecord.c:107-110` `monitor()` posts VAL on the `oval !=
     /// val` it snapshotted at `:100-103`, and the copy `prec->oval = val`
     /// at `:105` is UNCONDITIONAL. Compared and committed HERE, at C's
-    /// position. (`oflg` is copied in the same C function; the port still
-    /// rolls it in `process()`, because WFLG posts through the generic
-    /// subscribed-field loop rather than through this gate.)
+    /// position.
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         self.oval = self.val;
         Some(changed)
+    }
+
+    /// C's `oflg != wflg` (`:111`) is the WFLG mark, compared and committed
+    /// (`:106`) beside `oval`. Unmarked, `wflg_marked` is already false: the
+    /// take that `marked` guarantees clears it.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let changed = self.monitor_value_changed() == Some(true);
+        let classes = crate::server::record::MonitorValueClasses {
+            value: changed,
+            archive: changed,
+            hash_changed: false,
+            marked: false,
+        };
+        if self.oflg == self.wflg {
+            return classes;
+        }
+        self.oflg = self.wflg;
+        self.wflg_marked = true;
+        crate::server::record::MonitorValueClasses {
+            marked: true,
+            ..classes
+        }
+    }
+
+    /// `permissiveRecord.c:111-114`: `monitor_mask|DBE_VALUE|DBE_LOG`.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static WFLG_POST: [(&str, CyclePostMask); 1] = [("WFLG", CyclePostMask::MonitorValueLog)];
+        CycleMarks::of(&WFLG_POST, std::mem::take(&mut self.wflg_marked) as u64)
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["WFLG"]
     }
 
     /// The `recGblResetAlarms` mask rides the `oval != val` post only.
@@ -170,17 +202,22 @@ mod tests {
     use crate::server::record::RecordInstance;
 
     /// A cycle copies VAL into OVAL and WFLG into OFLG, mirroring C
-    /// `monitor()`'s tracker update (`permissiveRecord.c:105-106`). OVAL is
-    /// committed by `monitor_value_changed`, which IS that function; OFLG
-    /// still rolls in `process()` because WFLG posts through the generic
-    /// subscribed-field loop.
+    /// `monitor()`'s tracker update (`permissiveRecord.c:105-106`): OVAL in
+    /// `monitor_value_classes`.
     #[test]
     fn process_copies_trackers() {
         let mut rec = PermissiveRecord::default();
         rec.put_field("VAL", EpicsValue::UShort(1)).unwrap();
         rec.put_field("WFLG", EpicsValue::UShort(1)).unwrap();
         rec.process().unwrap();
-        rec.monitor_value_changed();
+        let mut last_posted = [0.0; 2];
+        let gate = crate::server::record::MonitorValueGate {
+            uses_deadband: false,
+            array_monitor_post: false,
+        };
+        let classes = rec.monitor_value_classes(gate, &mut last_posted);
+        assert!(classes.marked);
+        rec.take_cycle_posted_fields();
         assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::UShort(1)));
         assert_eq!(rec.get_field("OFLG"), Some(EpicsValue::UShort(1)));
     }

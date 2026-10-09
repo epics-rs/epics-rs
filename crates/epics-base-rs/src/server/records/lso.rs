@@ -216,6 +216,10 @@ impl Record for LsoRecord {
         Some(changed)
     }
 
+    fn stamps_after_write(&self) -> bool {
+        true
+    }
+
     /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if (!dbGetLinkLS(...)) prec->udf =
     /// FALSE;`); with no closed-loop fetch this cycle, `udf` is left

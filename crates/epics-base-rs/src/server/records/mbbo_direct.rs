@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
-use crate::server::record::{CycleHooks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{
+    CycleHooks, CycleMarks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record, uniform_post_table,
+};
 use crate::types::EpicsValue;
 
 use super::mbbi_direct::BIT_NAMES;
@@ -332,17 +334,10 @@ impl Record for MbboDirectRecord {
         Some(changed)
     }
 
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        let changed = std::mem::take(&mut self.bits_changed);
-        if changed == 0 {
-            return Vec::new();
-        }
-        BIT_NAMES
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| changed & (1 << i) != 0)
-            .map(|(_, &name)| (name, CyclePostMask::MonitorValueLog))
-            .collect()
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static BIT_POSTS: [(&str, CyclePostMask); 32] =
+            uniform_post_table(&BIT_NAMES, CyclePostMask::MonitorValueLog);
+        CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u64)
     }
 
     /// C `:323` posts a bit on `bitsChanged` or an alarm event, never on a

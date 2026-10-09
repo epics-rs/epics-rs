@@ -221,6 +221,18 @@ impl Record for StringinRecord {
         false
     }
 
+    fn has_sval(&self) -> bool {
+        true
+    }
+
+    /// C `strcpy(prec->val, prec->sval)` (`stringinRecord.c:213`); SVAL is
+    /// already cut at the C buffer size, so the copy is exact and allocates
+    /// nothing once VAL has the capacity.
+    fn land_sval(&mut self) -> CaResult<()> {
+        self.val.clone_from(&self.sval);
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone())),

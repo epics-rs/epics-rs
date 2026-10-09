@@ -24,8 +24,20 @@ use std::fmt;
 /// UTF-8. Backs `EpicsValue::String`/`StringArray` and (in `epics-pva-rs`)
 /// `ScalarValue::String`/`TypedScalarArray::String`. See the module docs for
 /// why this is a byte newtype rather than `String`.
-#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PvString(Vec<u8>);
+
+impl Clone for PvString {
+    fn clone(&self) -> Self {
+        PvString(self.0.clone())
+    }
+
+    // The derive's `clone_from` is `*self = source.clone()`, a fresh buffer
+    // per copy; a record field copied every cycle keeps its own instead.
+    fn clone_from(&mut self, source: &Self) {
+        self.0.clone_from(&source.0);
+    }
+}
 
 impl PvString {
     /// An empty wire string.
@@ -179,6 +191,15 @@ impl fmt::Debug for PvString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_from_copies_into_the_buffer_it_has_stringinrecord_178() {
+        let mut oval = PvString::from("previous value");
+        let buf = oval.as_bytes().as_ptr();
+        oval.clone_from(&PvString::from("next"));
+        assert_eq!(oval, "next");
+        assert_eq!(oval.as_bytes().as_ptr(), buf);
+    }
 
     #[test]
     fn round_trips_non_utf8_bytes() {

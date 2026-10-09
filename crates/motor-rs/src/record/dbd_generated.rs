@@ -2736,6 +2736,9 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
 /// [`MOTOR_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MOTOR_NOACCESS: &[&str] = &["CBAK"];
 
+/// `recordtype(motor)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MOTOR_DBADDR: &[&str] = &[];
+
 /// `recordtype(motor)` — C's `papFldDes` order, all 176 declarations
 /// including the internals [`MOTOR_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -2773,6 +2776,15 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
 pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
     Some(match record_type {
         "motor" => MOTOR_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "motor" => MOTOR_DBADDR,
         _ => return None,
     })
 }

@@ -1221,6 +1221,9 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
 /// [`EPID_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static EPID_NOACCESS: &[&str] = &[];
 
+/// `recordtype(epid)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static EPID_DBADDR: &[&str] = &[];
+
 /// `recordtype(epid)` — C's `papFldDes` order, all 99 declarations
 /// including the internals [`EPID_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -1664,6 +1667,9 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
 /// [`THROTTLE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static THROTTLE_NOACCESS: &[&str] = &["RPVT"];
 
+/// `recordtype(throttle)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static THROTTLE_DBADDR: &[&str] = &[];
+
 /// `recordtype(throttle)` — C's `papFldDes` order, all 70 declarations
 /// including the internals [`THROTTLE_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -1764,6 +1770,9 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
 /// [`TIMESTAMP_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static TIMESTAMP_NOACCESS: &[&str] = &[];
 
+/// `recordtype(timestamp)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static TIMESTAMP_DBADDR: &[&str] = &[];
+
 /// `recordtype(timestamp)` — C's `papFldDes` order, all 52 declarations
 /// including the internals [`TIMESTAMP_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -1795,6 +1804,17 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
         "epid" => EPID_NOACCESS,
         "throttle" => THROTTLE_NOACCESS,
         "timestamp" => TIMESTAMP_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "epid" => EPID_DBADDR,
+        "throttle" => THROTTLE_DBADDR,
+        "timestamp" => TIMESTAMP_DBADDR,
         _ => return None,
     })
 }

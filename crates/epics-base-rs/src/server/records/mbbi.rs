@@ -214,27 +214,6 @@ impl MbbiRecord {
         65535
     }
 
-    /// The mask `devMbbiSoftRaw::read_mbbi` ANDs the raw word with.
-    ///
-    /// C builds it in the dset's `init_record` (`devMbbiSoftRaw.c:44-49`):
-    /// `if (prec->nobt == 0) prec->mask = 0xffffffff;` — which OVERRIDES an
-    /// explicitly configured MASK — `prec->mask <<= prec->shft;`. The record's
-    /// own `init_record` has already set `mask = (1 << nobt) - 1` when MASK was
-    /// left at 0 (`mbbiRecord.c:154-155`).
-    ///
-    /// C stores the shifted mask back into the MASK *field*; the port applies
-    /// the shift here instead and leaves MASK as the record declared it, because
-    /// the record's `process()` reads MASK on the (shared) device-readback path
-    /// where it must stay unshifted.
-    fn raw_soft_mask(&self) -> u32 {
-        let base = if self.nobt == 0 {
-            0xffff_ffff
-        } else {
-            self.mask
-        };
-        base.checked_shl(u32::from(self.shft)).unwrap_or(0)
-    }
-
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
     fn state_severities(&self) -> [i16; 16] {
         [
@@ -450,6 +429,13 @@ impl Record for MbbiRecord {
         Ok(())
     }
 
+    /// The Plain dset's `DBR_USHORT` read: VAL is that state index.
+    fn soft_input_read_u16(&mut self, value: u16) -> CaResult<()> {
+        self.val = value;
+        self.async_buffer = value;
+        Ok(())
+    }
+
     /// `dbPutFieldLink` rebinds the dset on every INP put (`del_record`, then
     /// `add_record`'s fresh calloc'd devPvt, `dbAccess.c:1158-1197`), so the
     /// Async buffer restarts at 0; a DTYP put alone rebinds nothing.
@@ -481,13 +467,20 @@ impl Record for MbbiRecord {
     /// `prec->rval &= prec->mask` (`:74`, unconditional in MASK — unlike `bi`,
     /// whose dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → state-index convert then runs.
+    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        if soft == crate::server::device_support::SoftDtyp::Raw {
+            self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
+        }
+    }
+
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
         self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
             Ok(rval) => rval,
             Err(e) => return Some(Err(e)),
         };
         if entry == RawSoftEntry::Read {
-            self.rval &= self.raw_soft_mask();
+            self.rval &= self.mask;
         }
         Some(Ok(()))
     }
@@ -718,7 +711,7 @@ impl Record for MbbiRecord {
             self.aftc,
             self.afvl,
             common.time,
-            crate::runtime::general_time::get_current(),
+            crate::runtime::general_time::get_current,
         );
         self.afvl = new_afvl;
         let sev = AlarmSeverity::from_u16(filtered);

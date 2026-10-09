@@ -6471,6 +6471,9 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
 /// [`MCA_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MCA_NOACCESS: &[&str] = &["BPTR", "PBG", "PSTATUS"];
 
+/// `recordtype(mca)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MCA_DBADDR: &[&str] = &["VAL", "BG"];
+
 /// `recordtype(mca)` — C's `papFldDes` order, all 368 declarations
 /// including the internals [`MCA_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -6526,6 +6529,15 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
 pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
     Some(match record_type {
         "mca" => MCA_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "mca" => MCA_DBADDR,
         _ => return None,
     })
 }

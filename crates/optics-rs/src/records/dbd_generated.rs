@@ -3687,6 +3687,9 @@ pub static TABLE_FIELDS: &[FieldDesc] = &[
 /// [`TABLE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static TABLE_NOACCESS: &[&str] = &[];
 
+/// `recordtype(table)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static TABLE_DBADDR: &[&str] = &["PP0", "PP1", "PP2", "PPO0", "PPO1", "PPO2", "A", "B"];
+
 /// `recordtype(table)` — C's `papFldDes` order, all 226 declarations
 /// including the internals [`TABLE_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -3728,6 +3731,15 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
 pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
     Some(match record_type {
         "table" => TABLE_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "table" => TABLE_DBADDR,
         _ => return None,
     })
 }

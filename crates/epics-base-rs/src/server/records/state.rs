@@ -112,7 +112,7 @@ impl Record for StateRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }

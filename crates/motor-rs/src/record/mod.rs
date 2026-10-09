@@ -405,6 +405,10 @@ impl Record for MotorRecord {
         dbd_generated::MOTOR_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::MOTOR_DBADDR)
+    }
+
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::MOTOR_NOACCESS
     }

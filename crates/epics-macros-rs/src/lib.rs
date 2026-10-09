@@ -792,8 +792,37 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // A soft reading at VAL's own carrier is the `put_field` arm the wrapped
+    // read reaches through `put_field_internal`, which converts nothing for a
+    // value already of the stored type.
+    let soft_input_entry_method = match cycle_cells
+        .iter()
+        .find(|(epics_name, _, _)| *epics_name == "VAL")
+        .and_then(|(_, _, member)| *member)
+        .filter(|fi| !fi.read_only)
+        .and_then(|fi| cycle_carrier(&fi.dbf_type))
+        .and_then(|carrier| {
+            SOFT_INPUT_ENTRIES
+                .iter()
+                .find(|(c, _, _)| carrier == c)
+                .map(|&(_, entry, ty)| (carrier, entry, ty))
+        }) {
+        Some((carrier, entry, ty)) => {
+            let record = quote!(#krate::server::record);
+            let entry = proc_macro2::Ident::new(entry, proc_macro2::Span::call_site());
+            let ty = proc_macro2::Ident::new(ty, proc_macro2::Span::call_site());
+            quote! {
+                fn #entry(&mut self, value: #ty) -> #krate::error::CaResult<()> {
+                    self.put_cycle_cell(#record::CycleCell::Val, #record::CycleValue::#carrier(value))
+                }
+            }
+        }
+        None => quote! {},
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
+            #soft_input_entry_method
             #constant_init_method
             #init_method
             #value_monitor_method
@@ -988,6 +1017,14 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
 
 /// The `CycleValue` variant a scan-cycle cell of `dbf_type` is read in, or
 /// `None` for a type that is not a number.
+/// The scan-cycle carriers that have a typed soft dset entry
+/// (`Record::soft_input_read_*`), with that entry and its argument type.
+const SOFT_INPUT_ENTRIES: &[(&str, &str, &str)] = &[
+    ("Double", "soft_input_read_f64", "f64"),
+    ("Long", "soft_input_read_i32", "i32"),
+    ("Int64", "soft_input_read_i64", "i64"),
+];
+
 fn cycle_carrier(dbf_type: &str) -> Option<proc_macro2::Ident> {
     matches!(
         dbf_type,

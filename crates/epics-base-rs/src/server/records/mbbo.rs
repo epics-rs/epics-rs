@@ -455,24 +455,18 @@ impl Record for MbboRecord {
         false
     }
 
+    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        if soft == crate::server::device_support::SoftDtyp::Raw {
+            self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
+        }
+    }
+
     /// C `devMbboSoftRaw::write_mbbo` (`devMbboSoftRaw.c:40-46`):
     /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
-    /// 1)` — the RAW word, not the state index `devMbboSoft` writes. The dset's
-    /// `init_record` built the mask: `if (nobt == 0) mask = 0xffffffff;` (which
-    /// overrides a configured MASK) then `mask <<= shft`.
-    /// C `devMbboSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
-    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`. The dset's
-    /// `init_record` (62-67) is what makes MASK usable — `if (nobt == 0) mask =
-    /// 0xffffffff; mask <<= shft` — so the shifted mask is computed here rather
-    /// than written back into the MASK field (see the commit note).
+    /// 1)` — the RAW word, not the state index `devMbboSoft` writes.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
-        let base = if self.nobt == 0 {
-            0xffff_ffff
-        } else {
-            self.mask
-        };
-        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
-        Some(EpicsValue::ULong(self.rval & mask))
+        Some(EpicsValue::ULong(self.rval & self.mask))
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):

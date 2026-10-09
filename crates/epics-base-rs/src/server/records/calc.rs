@@ -322,6 +322,20 @@ fn prev_index(name: &str) -> Option<usize> {
 }
 
 impl Record for CalcRecord {
+    /// C `monitor()` posts every input A..U when the alarm moved, changed or
+    /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:418-420).
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+            "R", "S", "T", "U",
+        ]
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

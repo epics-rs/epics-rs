@@ -6935,6 +6935,9 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
 /// [`SCALER_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SCALER_NOACCESS: &[&str] = &["RPVT"];
 
+/// `recordtype(scaler)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SCALER_DBADDR: &[&str] = &[];
+
 /// `recordtype(scaler)` — C's `papFldDes` order, all 390 declarations
 /// including the internals [`SCALER_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -6988,6 +6991,15 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
 pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
     Some(match record_type {
         "scaler" => SCALER_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "scaler" => SCALER_DBADDR,
         _ => return None,
     })
 }

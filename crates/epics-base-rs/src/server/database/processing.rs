@@ -89,7 +89,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance,
+    InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance, SoftRead,
+    SoftReading,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -1756,10 +1757,13 @@ struct InputStage {
 }
 
 /// What an [`InputStage`] read. `Inp` is the cycle whose only read is the soft
-/// INP, which builds no [`LinkInputs`] to hold its value.
+/// INP, which builds no [`LinkInputs`] to hold its value; `Typed` is that read
+/// at a [`SoftRead`] request, which owns nothing. `Inp` leads so that
+/// `None` and `Typed` take the last niches and the drop test is one compare.
 enum Reads {
-    None,
     Inp(Option<EpicsValue>),
+    None,
+    Typed(Option<SoftReading>),
     Links(LinkInputs),
 }
 
@@ -1769,7 +1773,7 @@ enum Reads {
 impl Drop for InputStage {
     #[inline(always)]
     fn drop(&mut self) {
-        if !matches!(*self.reads, Reads::None) {
+        if !matches!(*self.reads, Reads::None | Reads::Typed(_)) {
             self.drop_reads();
         }
     }
@@ -1813,10 +1817,28 @@ impl InputStage {
     fn take_inp_value(&mut self) -> Option<EpicsValue> {
         match &mut *self.reads {
             Reads::Inp(value) => value.take(),
+            Reads::Typed(reading) => reading.take().map(SoftReading::into_value),
             Reads::Links(links) => links.inp_value.take(),
             Reads::None => None,
         }
     }
+
+    /// The soft INP read, in the shape it was read in.
+    fn take_inp(&mut self) -> Option<InpRead> {
+        match &mut *self.reads {
+            Reads::Typed(reading) => reading.take().map(InpRead::Typed),
+            Reads::Inp(value) => value.take().map(InpRead::Value),
+            Reads::Links(links) => links.inp_value.take().map(InpRead::Value),
+            Reads::None => None,
+        }
+    }
+}
+
+/// A soft INP read to apply: bare at a [`SoftRead`] request, wrapped at any
+/// other.
+enum InpRead {
+    Typed(SoftReading),
+    Value(EpicsValue),
 }
 
 /// The cycle's slot for the INP value [`CyclePlan::DbSoftIn`] read, present in
@@ -1862,26 +1884,31 @@ impl SoftDbSlot for Option<f64> {
 }
 
 /// What a soft DB-link INP read hands back: the source value at the type the
-/// dset asked for. `f64` is the `DBR_DOUBLE` request, which reaches the record
-/// bare; [`EpicsValue`] is every other request.
+/// dset asked for. `f64` is the arm whose request is `DBR_DOUBLE`, and
+/// [`SoftReading`] any [`SoftRead`] request, both reaching the record bare;
+/// [`EpicsValue`] is every other request.
 trait SoftDbValue: Sized {
+    /// The request the value is read at.
+    type Request: Copy;
     fn read(
         db: &PvDatabase,
         held: &crate::server::database::SetGuard,
         link: &crate::server::record::ParsedLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
-        read_as: crate::server::record::LinkReadAs,
+        request: Self::Request,
     ) -> (Option<Self>, Option<super::links::SourceAlarm>);
 }
 
 impl SoftDbValue for f64 {
+    type Request = ();
+
     #[inline(always)]
     fn read(
         db: &PvDatabase,
         held: &crate::server::database::SetGuard,
         link: &crate::server::record::ParsedLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
-        _: crate::server::record::LinkReadAs,
+        _: (),
     ) -> (Option<f64>, Option<super::links::SourceAlarm>) {
         match link {
             crate::server::record::ParsedLink::Db(d) => db.read_db_link_f64_at(held, d, at),
@@ -1890,7 +1917,39 @@ impl SoftDbValue for f64 {
     }
 }
 
+impl SoftDbValue for SoftReading {
+    type Request = SoftRead;
+
+    /// A `DBF_DOUBLE` VAL slot converts from its `f64`; every other source
+    /// takes the link layer's conversion at the same request.
+    #[inline(always)]
+    fn read(
+        db: &PvDatabase,
+        held: &crate::server::database::SetGuard,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        read: SoftRead,
+    ) -> (Option<SoftReading>, Option<super::links::SourceAlarm>) {
+        let crate::server::record::ParsedLink::Db(d) = link else {
+            return (None, None);
+        };
+        if read == SoftRead::Double || at.f64_slot.is_some() {
+            let (value, alarm) = db.read_db_link_f64_at(held, d, at);
+            return (value.map(|v| read.reading_of_f64(v)), alarm);
+        }
+        match db.read_db_link_as_at(held, link, at, read.read_as()) {
+            (Some(value), alarm) => match read.reading_of(&value) {
+                Some(reading) => (Some(reading), alarm),
+                None => (None, None),
+            },
+            _ => (None, None),
+        }
+    }
+}
+
 impl SoftDbValue for EpicsValue {
+    type Request = crate::server::record::LinkReadAs;
+
     #[inline(always)]
     fn read(
         db: &PvDatabase,
@@ -3513,11 +3572,23 @@ impl PvDatabase {
         else {
             return None;
         };
-        let value = self.soft_db_inp_read::<EpicsValue>(rec, instance, read_as)?;
+        // The Raw dset's read lands in RVAL through `raw_soft_input`, which
+        // takes the value wrapped.
+        let typed = SoftRead::of(read_as).filter(|_| {
+            instance.common.dtyp.soft() != Some(crate::server::device_support::SoftDtyp::Raw)
+        });
+        // Forced General is the oracle the differential harness compares
+        // against: the wrapped read every request took before.
+        #[cfg(test)]
+        let typed = typed.filter(|_| !instance.plan_forced_general);
+        let reads = match typed {
+            Some(read) => Reads::Typed(self.soft_db_inp_read::<SoftReading>(rec, instance, read)?),
+            None => Reads::Inp(self.soft_db_inp_read::<EpicsValue>(rec, instance, read_as)?),
+        };
         Some(InputStage {
             is_soft: true,
             resolved: 0,
-            reads: ManuallyDrop::new(Reads::Inp(value)),
+            reads: ManuallyDrop::new(reads),
         })
     }
 
@@ -3530,7 +3601,7 @@ impl PvDatabase {
         &self,
         rec: InFrame<'_>,
         instance: &mut crate::server::record::RecordInstance,
-        read_as: crate::server::record::LinkReadAs,
+        request: V::Request,
     ) -> Option<Option<V>> {
         if !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
             if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive)
@@ -3541,7 +3612,7 @@ impl PvDatabase {
         if Arc::ptr_eq(&at.rec, rec.unframed()) {
             return None;
         }
-        let (value, alarm) = V::read(self, rec.set(), link, at, read_as);
+        let (value, alarm) = V::read(self, rec.set(), link, at, request);
         let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {
             super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
@@ -4750,11 +4821,7 @@ impl PvDatabase {
                 // so the general fall-through below may repeat it.
                 let instance = guard.hold();
                 instance.push_process_context();
-                self.soft_db_inp_read::<f64>(
-                    rec,
-                    instance,
-                    crate::server::record::LinkReadAs::Double,
-                )
+                self.soft_db_inp_read::<f64>(rec, instance, ())
             } {
             soft_db.set(read);
             InputStage::none(true, 0)
@@ -4810,11 +4877,12 @@ impl PvDatabase {
                 // never reaches here at all (`dol_info` excludes it), so this is
                 // the reader's own `default:` arm (no declared request for this
                 // source class): nothing is attempted and nothing changes.
-                let soft_db_value = soft_db.take();
-                let stage_inp_value = if stage_known {
-                    None
-                } else {
-                    stage.take_inp_value()
+                // The DB-link arm's stamp excludes the Raw dset, so its
+                // `DBR_DOUBLE` reading reaches the record bare.
+                let inp = match soft_db.take() {
+                    Some(v) => Some(InpRead::Typed(SoftReading::Double(v))),
+                    None if stage_known => None,
+                    None => stage.take_inp(),
                 };
                 let links = if stage_known { None } else { stage.links_mut() };
                 let dol_fetch = links.as_ref().and_then(|l| l.dol_fetch.as_ref());
@@ -4862,28 +4930,20 @@ impl PvDatabase {
                 // `Record::raw_soft_input` returning `Some` — the dset table, not a
                 // separate boolean that could disagree with it.
                 //
-                // The `DBR_DOUBLE` read of a soft DB link reaches a soft-channel
-                // record bare (`soft_input_read_f64`); only the Raw dset, which
-                // owns `raw_soft_input(EpicsValue)`, takes it wrapped.
-                let direct_f64 = match soft_db_value {
-                    Some(v)
-                        if instance.common.dtyp.soft()
-                            != Some(crate::server::device_support::SoftDtyp::Raw) =>
-                    {
-                        Some(v)
-                    }
-                    _ => None,
-                };
-                let inp_value = match soft_db_value {
-                    Some(v) if direct_f64.is_none() => Some(EpicsValue::Double(v)),
-                    _ => stage_inp_value,
-                };
-                let had_inp_value = inp_value.is_some() || direct_f64.is_some();
+                // A typed reading reaches the soft dset bare: neither the
+                // DB-link arm nor `soft_db_inp_stage` takes one for the Raw dset,
+                // which owns `raw_soft_input(EpicsValue)`.
+                let had_inp_value = inp.is_some();
                 let mut soft_inp_applied = false;
-                if let Some(v) = direct_f64 {
-                    let _ = instance.record.soft_input_read_f64(v);
-                    soft_inp_applied = true;
-                }
+                let inp_value = match inp {
+                    Some(InpRead::Typed(reading)) => {
+                        let _ = reading.apply(&mut *instance.record);
+                        soft_inp_applied = true;
+                        None
+                    }
+                    Some(InpRead::Value(value)) => Some(value),
+                    None => None,
+                };
                 if let Some(inp_val) = inp_value {
                     let raw = if instance.common.dtyp.soft()
                         == Some(crate::server::device_support::SoftDtyp::Raw)

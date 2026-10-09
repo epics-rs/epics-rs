@@ -738,6 +738,10 @@ impl Record for ThrottleRecord {
         dbd_generated::THROTTLE_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::THROTTLE_DBADDR)
+    }
+
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::THROTTLE_NOACCESS
     }

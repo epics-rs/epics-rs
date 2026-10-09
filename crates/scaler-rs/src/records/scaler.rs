@@ -1327,6 +1327,10 @@ impl Record for ScalerRecord {
         dbd_generated::SCALER_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::SCALER_DBADDR)
+    }
+
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::SCALER_NOACCESS
     }

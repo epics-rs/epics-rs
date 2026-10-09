@@ -167,9 +167,40 @@ impl SelRecord {
             self.l,
         ]
     }
+
+    /// `A`..`L`, the fields `put_field` stores a number into.
+    fn var_mut(&mut self, name: &str) -> Option<&mut f64> {
+        Some(match name.as_bytes() {
+            b"A" => &mut self.a,
+            b"B" => &mut self.b,
+            b"C" => &mut self.c,
+            b"D" => &mut self.d,
+            b"E" => &mut self.e,
+            b"F" => &mut self.f,
+            b"G" => &mut self.g,
+            b"H" => &mut self.h,
+            b"I" => &mut self.i,
+            b"J" => &mut self.j,
+            b"K" => &mut self.k,
+            b"L" => &mut self.l,
+            _ => return None,
+        })
+    }
 }
 
 impl Record for SelRecord {
+    /// What `put_field` stores for `A`..`L`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match self.var_mut(field) {
+            Some(var) => {
+                *var = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

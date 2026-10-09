@@ -39,6 +39,15 @@ pub(crate) fn raw_soft_rval_i32(record: &str, value: &EpicsValue) -> CaResult<i3
     }
 }
 
+/// The MASK the multibit `devXxxSoftRaw::init_record` leaves
+/// (`devMbbiSoftRaw.c:45-48` and its three twins): NOBT 0 overrides a
+/// configured MASK, then `mask <<= shft`. C stores it back into MASK, so a
+/// later client put to MASK is used as written.
+pub(crate) fn raw_soft_dset_mask(mask: u32, nobt_is_zero: bool, shft: u16) -> u32 {
+    let base = if nobt_is_zero { u32::MAX } else { mask };
+    base.checked_shl(u32::from(shft)).unwrap_or(0)
+}
+
 /// [`raw_soft_rval`] for the dsets whose `RVAL` is `epicsUInt32` (bi, mbbi,
 /// mbbiDirect).
 pub(crate) fn raw_soft_rval_u32(record: &str, value: &EpicsValue) -> CaResult<u32> {

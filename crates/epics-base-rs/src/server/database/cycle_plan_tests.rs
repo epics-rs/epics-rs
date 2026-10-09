@@ -456,6 +456,195 @@ const SCENARIOS: &[Scenario] = &[
         steps: &[&[], &[("SI.VAL", "word")], &[], &[("SI.VAL", "7")], &[]],
         ..BASE
     },
+    Scenario {
+        name: "longin INP from an ai, DTYP switched to Raw Soft Channel and back",
+        arms: "GGGGGGGGG",
+        db: with_fixtures!(
+            r#"record(ai, "S") { field(VAL, "1.5") }
+               record(longin, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(HIHI, "3") field(HHSV, "MAJOR") field(MDEL, "1") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "2.7")],
+            &[("S", "-3e9")],
+            &[("S", "3e9")],
+            &[("T.DTYP", "Raw Soft Channel")],
+            &[("S", "3.7")],
+            &[],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "4.7")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "longin INP from a calc VAL slot, values past i32",
+        arms: "GGGGGG",
+        db: with_fixtures!(
+            r#"record(calc, "S") { field(VAL, "1.5") }
+               record(longin, "T") { field(INP, "S NPP") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "2.7")],
+            &[("S", "-2.7")],
+            &[("S", "-3e9")],
+            &[("S", "3e9")],
+            &[("S", "1e300")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "longin INP from a string source, failed conversion",
+        arms: "GGGGG",
+        db: with_fixtures!(
+            r#"record(stringin, "SI") { field(VAL, "12") }
+               record(longin, "T") { field(INP, "SI MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[&[], &[("SI.VAL", "word")], &[], &[("SI.VAL", "7")], &[]],
+        ..BASE
+    },
+    Scenario {
+        name: "bi INP from a calc VAL slot, DTYP switched to Raw and Async and back",
+        arms: "GGGGGGGGGGGG",
+        db: with_fixtures!(
+            r#"record(calc, "S") { field(VAL, "1") }
+               record(bi, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(OSV, "MAJOR") field(MASK, "6") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "0")],
+            &[("S", "2.7")],
+            &[("S", "-1")],
+            &[("S", "70000")],
+            &[("T.DTYP", "Raw Soft Channel")],
+            &[("S", "7")],
+            &[("T.DTYP", "Async Soft Channel")],
+            &[("S", "1")],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "1e300")],
+            &[("S", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "mbbi INP from a calc VAL slot, DTYP switched to Raw and Async and back",
+        arms: "GGGGGGGGGGG",
+        db: with_fixtures!(
+            r#"record(calc, "S") { field(VAL, "1") }
+               record(mbbi, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(ONST, "one") field(TWST, "two") field(TWSV, "MINOR")
+                field(ONVL, "1") field(TWVL, "2") field(UNSV, "MAJOR") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "2.7")],
+            &[("S", "-1")],
+            &[("S", "70000")],
+            &[("T.DTYP", "Raw Soft Channel")],
+            &[("S", "2")],
+            &[("T.DTYP", "Async Soft Channel")],
+            &[("S", "1")],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "1e300")],
+            &[("S", "2")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "mbbi INP from a string source, failed conversion",
+        arms: "GGGGG",
+        db: with_fixtures!(
+            r#"record(stringin, "SI") { field(VAL, "2") }
+               record(mbbi, "T") { field(INP, "SI MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(TWST, "two") field(TWSV, "MINOR") }"#
+        ),
+        steps: &[&[], &[("SI.VAL", "word")], &[], &[("SI.VAL", "1")], &[]],
+        ..BASE
+    },
+    Scenario {
+        name: "mbbiDirect INP from a calc VAL slot, DTYP switched to Raw and Async and back",
+        arms: "GGGGGGGGGGGG",
+        db: with_fixtures!(
+            r#"record(calc, "S") { field(VAL, "5") }
+               record(mbbiDirect, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(NOBT, "4") field(SHFT, "1") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "6.7")],
+            &[("S", "-1")],
+            &[("S", "3e9")],
+            &[("S", "5e9")],
+            &[("T.DTYP", "Raw Soft Channel")],
+            &[("S", "12")],
+            &[("T.DTYP", "Async Soft Channel")],
+            &[("S", "9")],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "1e300")],
+            &[("S", "3")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "mbbiDirect INP from a longin and a string source",
+        arms: "GGGGGG",
+        db: with_fixtures!(
+            r#"record(longin, "L") { field(VAL, "-2") }
+               record(stringin, "SI") { field(VAL, "12") }
+               record(mbbiDirect, "T") { field(INP, "L MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("L", "7")],
+            &[("T.INP", "SI MS")],
+            &[("SI.VAL", "word")],
+            &[("SI.VAL", "4000000000")],
+            &[],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "int64in INP from a calc VAL slot, DTYP switched to Async and back",
+        arms: "GGGGGGGGGG",
+        db: with_fixtures!(
+            r#"record(calc, "S") { field(VAL, "1.5") }
+               record(int64in, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")
+                field(FLNK, "F") field(HIHI, "3") field(HHSV, "MAJOR") field(MDEL, "1") }"#
+        ),
+        steps: &[
+            &[],
+            &[("S", "2.7")],
+            &[("S", "-3e9")],
+            &[("S", "1e19")],
+            &[("S", "-1e300")],
+            &[("T.DTYP", "Async Soft Channel")],
+            &[("S", "4.7")],
+            &[("T.DTYP", "Soft Channel")],
+            &[("S", "5e15")],
+            &[("S", "1")],
+        ],
+        ..BASE
+    },
+    Scenario {
+        name: "int64in INP from a longin and a string source",
+        arms: "GGGGGG",
+        db: with_fixtures!(
+            r#"record(longin, "L") { field(VAL, "-2") }
+               record(stringin, "SI") { field(VAL, "12") }
+               record(int64in, "T") { field(INP, "L MS") field(DTYP, "Soft Channel") field(FLNK, "F") }"#
+        ),
+        steps: &[
+            &[],
+            &[("L", "7")],
+            &[("T.INP", "SI MS")],
+            &[("SI.VAL", "word")],
+            &[("SI.VAL", "9000000000000")],
+            &[],
+        ],
+        ..BASE
+    },
     // Their request is not `DBR_DOUBLE`, so the DB-link arm is not theirs.
     Scenario {
         name: "bi DB link INP",

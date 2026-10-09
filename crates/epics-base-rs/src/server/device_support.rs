@@ -770,6 +770,9 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
 /// No-op for a record that has no device attached — C reaches this line only
 /// past `if (!pdset) return S_dev_noDSET`.
 pub fn init_device_support(instance: &mut RecordInstance) {
+    if let Some(soft) = instance.common.dtyp.soft() {
+        instance.record.init_soft_dset(soft);
+    }
     let Some(mut dev) = instance.device.take() else {
         instance.dset_init = DsetInit::Succeeded;
         return;

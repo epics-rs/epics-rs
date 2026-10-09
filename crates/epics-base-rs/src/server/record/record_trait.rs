@@ -564,6 +564,106 @@ impl LinkReadAs {
     }
 }
 
+/// The scalar requests a soft dset's INP read can be taken at without an
+/// [`EpicsValue`], each the [`LinkReadAs`] of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftRead {
+    Double,
+    Long,
+    UShort,
+    ULong,
+    Int64,
+}
+
+impl SoftRead {
+    pub(crate) fn of(read_as: LinkReadAs) -> Option<Self> {
+        match read_as {
+            LinkReadAs::Double => Some(Self::Double),
+            LinkReadAs::Long => Some(Self::Long),
+            LinkReadAs::UShort => Some(Self::UShort),
+            LinkReadAs::ULong => Some(Self::ULong),
+            LinkReadAs::Int64 => Some(Self::Int64),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn read_as(self) -> LinkReadAs {
+        match self {
+            Self::Double => LinkReadAs::Double,
+            Self::Long => LinkReadAs::Long,
+            Self::UShort => LinkReadAs::UShort,
+            Self::ULong => LinkReadAs::ULong,
+            Self::Int64 => LinkReadAs::Int64,
+        }
+    }
+
+    /// The reading of a `DBF_DOUBLE` source: C's integer cast, the row
+    /// [`EpicsValue::get_convert`] takes for a non-integer source.
+    pub(crate) fn reading_of_f64(self, v: f64) -> SoftReading {
+        match self {
+            Self::Double => SoftReading::Double(v),
+            Self::Long => SoftReading::Long(crate::types::c_cast::f64_to_i32(v)),
+            Self::UShort => SoftReading::UShort(crate::types::c_cast::f64_to_u16(v)),
+            Self::ULong => SoftReading::ULong(crate::types::c_cast::f64_to_u32(v)),
+            Self::Int64 => SoftReading::Int64(crate::types::c_cast::f64_to_i64(v)),
+        }
+    }
+
+    /// The reading of a value already converted at [`Self::read_as`]; `None`
+    /// for a value of any other shape.
+    pub(crate) fn reading_of(self, value: &EpicsValue) -> Option<SoftReading> {
+        match (self, value) {
+            (Self::Double, EpicsValue::Double(v)) => Some(SoftReading::Double(*v)),
+            (Self::Long, EpicsValue::Long(v)) => Some(SoftReading::Long(*v)),
+            (Self::UShort, EpicsValue::UShort(v)) => Some(SoftReading::UShort(*v)),
+            (Self::ULong, EpicsValue::ULong(v)) => Some(SoftReading::ULong(*v)),
+            (Self::Int64, EpicsValue::Int64(v)) => Some(SoftReading::Int64(*v)),
+            _ => None,
+        }
+    }
+}
+
+/// A soft dset's INP read at one of the [`SoftRead`] requests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SoftReading {
+    /// `DBR_DOUBLE`.
+    Double(f64),
+    /// `DBR_LONG`.
+    Long(i32),
+    /// `DBR_USHORT`.
+    UShort(u16),
+    /// `DBR_ULONG`.
+    ULong(u32),
+    /// `DBR_INT64`.
+    Int64(i64),
+}
+
+impl SoftReading {
+    /// The same reading as the link layer delivers it to
+    /// [`Record::soft_input_read`].
+    pub(crate) fn into_value(self) -> EpicsValue {
+        match self {
+            Self::Double(v) => EpicsValue::Double(v),
+            Self::Long(v) => EpicsValue::Long(v),
+            Self::UShort(v) => EpicsValue::UShort(v),
+            Self::ULong(v) => EpicsValue::ULong(v),
+            Self::Int64(v) => EpicsValue::Int64(v),
+        }
+    }
+
+    /// The record's soft dset entry for this request.
+    #[inline(always)]
+    pub(crate) fn apply(self, record: &mut dyn Record) -> CaResult<()> {
+        match self {
+            Self::Double(v) => record.soft_input_read_f64(v),
+            Self::Long(v) => record.soft_input_read_i32(v),
+            Self::UShort(v) => record.soft_input_read_u16(v),
+            Self::ULong(v) => record.soft_input_read_u32(v),
+            Self::Int64(v) => record.soft_input_read_i64(v),
+        }
+    }
+}
+
 /// A record's per-link `dbGetLink` request, asked BEFORE the link's source is
 /// resolved.
 ///
@@ -2060,6 +2160,13 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
     }
 
     fn field_is_dbaddr(&self, field: &str) -> bool {
+        // Every put asks this; a scan of the whole table cost ~690
+        // instructions on a calc target.
+        if let Some(names) = super::dbd_generated::record_dbaddr_fields(self.record_type())
+            .or_else(|| self.declared_dbaddr_fields())
+        {
+            return names.iter().any(|n| n.eq_ignore_ascii_case(field));
+        }
         self.field_list()
             .iter()
             .any(|d| d.name.eq_ignore_ascii_case(field) && d.special == Special::DbAddr)
@@ -2230,6 +2337,13 @@ pub trait Record: Send + Sync + 'static {
     /// `record_noaccess_fields` entry here, next to its `declared_fields`.
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// The analogue of [`Record::declared_fields`] for
+    /// [`FieldDeclaration::field_is_dbaddr`]: a downstream crate's generated
+    /// `<T>_DBADDR`. `None` leaves a hand-written type to the field-table walk.
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        None
     }
 
     /// Does this record type implement `name` in its own `get_field` /
@@ -2658,6 +2772,14 @@ pub trait Record: Send + Sync + 'static {
         let _ = loaded;
     }
 
+    /// The soft dset's own `init_record` for a record whose DTYP names one —
+    /// the state it leaves in the record's fields, input and output alike.
+    /// Called once, from [`crate::server::device_support::init_device_support`],
+    /// after the record's pass-0 init (C's order). Default: no such state.
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        let _ = soft;
+    }
+
     /// The plain `DTYP="Soft Channel"` INPUT dset body — C's `devXxxSoft.c`
     /// (and `devXxxSoftCallback.c`) `read_xxx`, handed the outcome of its own
     /// `dbGetLink(&prec->inp, ...)` once per process cycle.
@@ -2685,6 +2807,30 @@ pub trait Record: Send + Sync + 'static {
     /// its input overrides this with the direct path.
     fn soft_input_read_f64(&mut self, value: f64) -> CaResult<()> {
         self.soft_input_read(Some(EpicsValue::Double(value)))
+    }
+
+    /// [`Self::soft_input_read`] for a `DBR_LONG` reading. An override stores
+    /// exactly what the wrapped read stores.
+    fn soft_input_read_i32(&mut self, value: i32) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Long(value)))
+    }
+
+    /// [`Self::soft_input_read`] for a `DBR_USHORT` reading. An override
+    /// stores exactly what the wrapped read stores.
+    fn soft_input_read_u16(&mut self, value: u16) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::UShort(value)))
+    }
+
+    /// [`Self::soft_input_read`] for a `DBR_ULONG` reading. An override
+    /// stores exactly what the wrapped read stores.
+    fn soft_input_read_u32(&mut self, value: u32) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::ULong(value)))
+    }
+
+    /// [`Self::soft_input_read`] for a `DBR_INT64` reading. An override
+    /// stores exactly what the wrapped read stores.
+    fn soft_input_read_i64(&mut self, value: i64) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Int64(value)))
     }
 
     /// The `dbrType` the record type's `soft` INPUT dset hands its INP
@@ -5565,8 +5711,13 @@ pub fn link_value_in_field_shape<R: Record + ?Sized>(
     field: &str,
     value: EpicsValue,
 ) -> EpicsValue {
+    // The scalar arm reshapes only an array, so a scalar never asks the
+    // destination's shape.
+    if !value.is_array() {
+        return value;
+    }
     match StoredShape::of(record, field).renders(&value) {
-        Some(false) if value.is_array() => value.first_element().unwrap_or(value),
+        Some(false) => value.first_element().unwrap_or(value),
         _ => value,
     }
 }
@@ -6207,6 +6358,91 @@ mod tests {
         }
     }
 
+    /// The generated `SPC_DBADDR` list answers the table walk: C's declared
+    /// special (asyn's `ERRS` is resolved to `NoMod` but declared `SPC_DBADDR`,
+    /// `asynRecord.dbd:622-624`), plus the long-string fields whose
+    /// `cvt_dbaddr` overwrites it. A type only another crate can create is
+    /// pinned on its generated table alone.
+    #[test]
+    fn the_dbaddr_list_is_what_the_field_table_walk_answers() {
+        use crate::server::record::dbd_generated::{
+            RECORD_TYPES, record_dbaddr_fields, record_fields,
+        };
+
+        let mut seen_long_string = 0;
+        let mut table_only = Vec::new();
+        for record_type in RECORD_TYPES {
+            let listed = record_dbaddr_fields(record_type).unwrap();
+            let Ok(probe) = crate::server::db_loader::create_record(record_type) else {
+                for desc in record_fields(record_type).unwrap() {
+                    assert_eq!(
+                        listed.contains(&desc.name),
+                        desc.declared_special == Special::DbAddr,
+                        "{record_type}.{}",
+                        desc.name
+                    );
+                }
+                table_only.push(*record_type);
+                continue;
+            };
+            let walk = |field: &str| {
+                probe.field_list().iter().any(|d| {
+                    d.name.eq_ignore_ascii_case(field) && d.declared_special == Special::DbAddr
+                }) || probe
+                    .long_string_fields()
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(field))
+            };
+            seen_long_string += probe.long_string_fields().len();
+            for desc in probe.field_list() {
+                assert_eq!(
+                    listed.contains(&desc.name),
+                    walk(desc.name),
+                    "{record_type}.{}",
+                    desc.name
+                );
+                assert_eq!(
+                    probe.field_is_dbaddr(&desc.name.to_ascii_lowercase()),
+                    walk(desc.name),
+                    "{record_type}.{} asked in lower case",
+                    desc.name
+                );
+            }
+        }
+        assert_eq!(
+            seen_long_string, 5,
+            "lsi/lso VAL+OVAL and printf VAL reached"
+        );
+        assert!(table_only.contains(&"asyn"), "asyn pinned on its table");
+        assert_eq!(
+            record_dbaddr_fields("asyn").unwrap(),
+            ["BOUT", "BINP", "ERRS"]
+        );
+    }
+
+    /// A type base's `.dbd` set does not cover answers `field_is_dbaddr` from
+    /// its own generated list, not the field-table walk.
+    #[test]
+    fn a_downstream_dbaddr_list_answers_field_is_dbaddr() {
+        struct Downstream;
+        impl Record for Downstream {
+            fn record_type(&self) -> &'static str {
+                "downstream"
+            }
+            fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+                Some(&["BUF"])
+            }
+            fn get_field(&self, _: &str) -> Option<EpicsValue> {
+                None
+            }
+            fn put_field(&mut self, _: &str, _: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+        }
+        assert!(Downstream.field_is_dbaddr("buf"));
+        assert!(!Downstream.field_is_dbaddr("VAL"));
+    }
+
     /// A type that reads its own link texts to answer
     /// [`Record::set_input_link_slots`] must give the answer the default body's
     /// name walk would, or the cycle fetches the wrong set of input links —
@@ -6724,6 +6960,48 @@ mod tests {
                 "{record_type} monitor_deadband_value"
             );
             assert!(!r.value_is_undefined(), "{record_type} value_is_undefined");
+        }
+    }
+
+    /// A type's direct multi-input store lands what the by-name default does,
+    /// in every value field it declares.
+    #[test]
+    fn a_multi_input_store_is_what_put_field_internal_stores() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        // `swait` is module-owned, so base's registry does not build it.
+        let make = |record_type: &str| -> Option<Box<dyn Record>> {
+            match record_type {
+                "swait" => Some(Box::new(
+                    crate::server::records::swait::SwaitRecord::default(),
+                )),
+                _ => crate::server::db_loader::create_record(record_type).ok(),
+            }
+        };
+        let mut reached = Vec::new();
+        for record_type in RECORD_TYPES {
+            let Some(probe) = make(record_type) else {
+                continue;
+            };
+            for &(_, field) in probe.multi_input_links() {
+                reached.push(*record_type);
+                for value in [1.5, -0.0, f64::NAN, 1e300] {
+                    let mut direct = make(record_type).unwrap();
+                    let mut by_name = make(record_type).unwrap();
+                    let direct_ok = direct.put_multi_input_f64(field, value).is_ok();
+                    let by_name_ok = by_name
+                        .put_field_internal(field, EpicsValue::Double(value))
+                        .is_ok();
+                    assert_eq!(direct_ok, by_name_ok, "{record_type}.{field}");
+                    assert_eq!(
+                        format!("{:?}", direct.get_field(field)),
+                        format!("{:?}", by_name.get_field(field)),
+                        "{record_type}.{field} <- {value}"
+                    );
+                }
+            }
+        }
+        for record_type in ["sel", "calcout", "swait"] {
+            assert!(reached.contains(&record_type), "{record_type} not reached");
         }
     }
 

@@ -3203,6 +3203,10 @@ impl Record for TableRecord {
         dbd_generated::TABLE_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::TABLE_DBADDR)
+    }
+
     /// C `tableRecord.c` posts every record-internal change with a literal
     /// `DBE_VALUE` (no `DBE_LOG`); see `TABLE_VALUE_ONLY_FIELDS`.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
@@ -3363,6 +3367,27 @@ impl Record for TableRecord {
 #[allow(clippy::excessive_precision, clippy::needless_range_loop)]
 mod tests {
     use super::*;
+
+    /// `field_is_dbaddr` answers from the generated `SPC_DBADDR` list, which
+    /// is the `.dbd`'s declared special on every field.
+    #[test]
+    fn the_dbaddr_list_is_the_generated_one() {
+        use epics_base_rs::server::record::{FieldDeclaration, Special};
+
+        let rec = TableRecord::new();
+        assert!(std::ptr::eq(
+            rec.declared_dbaddr_fields().unwrap(),
+            dbd_generated::record_dbaddr_fields("table").unwrap()
+        ));
+        for desc in rec.field_list() {
+            assert_eq!(
+                rec.field_is_dbaddr(desc.name),
+                desc.declared_special == Special::DbAddr,
+                "{}",
+                desc.name
+            );
+        }
+    }
 
     /// Helper: create a table record with SRI geometry and typical dimensions.
     fn make_sri_table() -> TableRecord {

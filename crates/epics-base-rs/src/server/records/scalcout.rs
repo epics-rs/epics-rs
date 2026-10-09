@@ -355,7 +355,7 @@ impl ScalcoutRecord {
         if self.dopt != 1 {
             // Use CALC result.
             self.oval = self.val;
-            self.osv = self.sval.clone();
+            self.osv.clone_from(&self.sval);
             return;
         }
         // Use OCAL. C `:768` calls sCalcPerform on ORPC unconditionally on this
@@ -422,7 +422,7 @@ impl ScalcoutRecord {
     /// that reaches `monitor()`. The ODLY-scheduling cycle is not one of them: C
     /// `return(0)`s at `:407`, so PSVL lags SVAL for the length of the delay.
     fn sync_psvl(&mut self) {
-        self.psvl = self.sval.clone();
+        self.psvl.clone_from(&self.sval);
     }
 
     /// C `sCalcoutRecord.c::special:463-471` (and the same two lines in

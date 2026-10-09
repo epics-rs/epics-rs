@@ -5962,6 +5962,13 @@ pub static A_SUB_NOACCESS: &[&str] = &[
     "OVLK", "OVLL", "OVLM", "OVLN", "OVLO", "OVLP", "OVLQ", "OVLR", "OVLS", "OVLT", "OVLU",
 ];
 
+/// `recordtype(aSub)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static A_SUB_DBADDR: &[&str] = &[
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "VALA", "VALB", "VALC", "VALD", "VALE", "VALF", "VALG", "VALH", "VALI", "VALJ",
+    "VALK", "VALL", "VALM", "VALN", "VALO", "VALP", "VALQ", "VALR", "VALS", "VALT", "VALU",
+];
+
 /// `recordtype(aSub)` — C's `papFldDes` order, all 312 declarations
 /// including the internals [`A_SUB_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -6382,6 +6389,9 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
 /// `recordtype(aai)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AAI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static AAI_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+
+/// `recordtype(aai)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static AAI_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(aai)` — C's `papFldDes` order, all 69 declarations
 /// including the internals [`AAI_FIELDS`] drops. The index into this is
@@ -6823,6 +6833,9 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
 /// `recordtype(aao)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AAO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static AAO_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+
+/// `recordtype(aao)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static AAO_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(aao)` — C's `papFldDes` order, all 71 declarations
 /// including the internals [`AAO_FIELDS`] drops. The index into this is
@@ -9499,6 +9512,11 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
 /// [`ACALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static ACALCOUT_NOACCESS: &[&str] = &["RPVT", "PAVL", "PAA", "POAV", "RPCL", "ORPC"];
 
+/// `recordtype(acalcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static ACALCOUT_DBADDR: &[&str] = &[
+    "AVAL", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL", "OAV",
+];
+
 /// `recordtype(acalcout)` — C's `papFldDes` order, all 186 declarations
 /// including the internals [`ACALCOUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -10387,6 +10405,9 @@ pub static AI_FIELDS: &[FieldDesc] = &[
 /// `recordtype(ai)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static AI_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
+
+/// `recordtype(ai)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static AI_DBADDR: &[&str] = &[];
 
 /// `recordtype(ai)` — C's `papFldDes` order, all 93 declarations
 /// including the internals [`AI_FIELDS`] drops. The index into this is
@@ -11449,6 +11470,9 @@ pub static AO_FIELDS: &[FieldDesc] = &[
 /// `recordtype(ao)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static AO_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
+
+/// `recordtype(ao)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static AO_DBADDR: &[&str] = &[];
 
 /// `recordtype(ao)` — C's `papFldDes` order, all 102 declarations
 /// including the internals [`AO_FIELDS`] drops. The index into this is
@@ -12996,6 +13020,9 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
 /// [`ASYN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static ASYN_NOACCESS: &[&str] = &["OPTR", "IPTR"];
 
+/// `recordtype(asyn)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static ASYN_DBADDR: &[&str] = &["BOUT", "BINP", "ERRS"];
+
 /// `recordtype(asyn)` — C's `papFldDes` order, all 126 declarations
 /// including the internals [`ASYN_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -13461,6 +13488,9 @@ pub static BI_FIELDS: &[FieldDesc] = &[
 /// `recordtype(bi)` — the `DBF_NOACCESS` internal names dropped from
 /// [`BI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static BI_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(bi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static BI_DBADDR: &[&str] = &[];
 
 /// `recordtype(bi)` — C's `papFldDes` order, all 71 declarations
 /// including the internals [`BI_FIELDS`] drops. The index into this is
@@ -14003,6 +14033,9 @@ pub static BO_FIELDS: &[FieldDesc] = &[
 /// [`BO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static BO_NOACCESS: &[&str] = &["RPVT", "WDPT", "SIMPVT"];
 
+/// `recordtype(bo)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static BO_DBADDR: &[&str] = &[];
+
 /// `recordtype(bo)` — C's `papFldDes` order, all 77 declarations
 /// including the internals [`BO_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -14503,6 +14536,9 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
 /// `recordtype(busy)` — the `DBF_NOACCESS` internal names dropped from
 /// [`BUSY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static BUSY_NOACCESS: &[&str] = &["RPVT", "WDPT"];
+
+/// `recordtype(busy)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static BUSY_DBADDR: &[&str] = &[];
 
 /// `recordtype(busy)` — C's `papFldDes` order, all 74 declarations
 /// including the internals [`BUSY_FIELDS`] drops. The index into this is
@@ -16224,6 +16260,9 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
 /// `recordtype(calc)` — the `DBF_NOACCESS` internal names dropped from
 /// [`CALC_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static CALC_NOACCESS: &[&str] = &["RPCL"];
+
+/// `recordtype(calc)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static CALC_DBADDR: &[&str] = &[];
 
 /// `recordtype(calc)` — C's `papFldDes` order, all 134 declarations
 /// including the internals [`CALC_FIELDS`] drops. The index into this is
@@ -18630,6 +18669,9 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
 /// [`CALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static CALCOUT_NOACCESS: &[&str] = &["RPVT", "EPVT", "RPCL", "ORPC"];
 
+/// `recordtype(calcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static CALCOUT_DBADDR: &[&str] = &[];
+
 /// `recordtype(calcout)` — C's `papFldDes` order, all 171 declarations
 /// including the internals [`CALCOUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -19058,6 +19100,9 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
 /// `recordtype(compress)` — the `DBF_NOACCESS` internal names dropped from
 /// [`COMPRESS_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static COMPRESS_NOACCESS: &[&str] = &["BPTR", "SPTR", "WPTR"];
+
+/// `recordtype(compress)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static COMPRESS_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(compress)` — C's `papFldDes` order, all 71 declarations
 /// including the internals [`COMPRESS_FIELDS`] drops. The index into this is
@@ -19919,6 +19964,9 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
 /// [`DFANOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static DFANOUT_NOACCESS: &[&str] = &[];
 
+/// `recordtype(dfanout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static DFANOUT_DBADDR: &[&str] = &[];
+
 /// `recordtype(dfanout)` — C's `papFldDes` order, all 90 declarations
 /// including the internals [`DFANOUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -20140,6 +20188,9 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
 /// `recordtype(event)` — the `DBF_NOACCESS` internal names dropped from
 /// [`EVENT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static EVENT_NOACCESS: &[&str] = &["EPVT", "SIMPVT"];
+
+/// `recordtype(event)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static EVENT_DBADDR: &[&str] = &[];
 
 /// `recordtype(event)` — C's `papFldDes` order, all 60 declarations
 /// including the internals [`EVENT_FIELDS`] drops. The index into this is
@@ -20600,6 +20651,9 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
 /// `recordtype(fanout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`FANOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static FANOUT_NOACCESS: &[&str] = &[];
+
+/// `recordtype(fanout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static FANOUT_DBADDR: &[&str] = &[];
 
 /// `recordtype(fanout)` — C's `papFldDes` order, all 70 declarations
 /// including the internals [`FANOUT_FIELDS`] drops. The index into this is
@@ -21081,6 +21135,9 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
 /// `recordtype(histogram)` — the `DBF_NOACCESS` internal names dropped from
 /// [`HISTOGRAM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static HISTOGRAM_NOACCESS: &[&str] = &["BPTR", "WDOG", "SIMPVT"];
+
+/// `recordtype(histogram)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static HISTOGRAM_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(histogram)` — C's `papFldDes` order, all 74 declarations
 /// including the internals [`HISTOGRAM_FIELDS`] drops. The index into this is
@@ -21682,6 +21739,9 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
 /// `recordtype(int64in)` — the `DBF_NOACCESS` internal names dropped from
 /// [`INT64IN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static INT64IN_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(int64in)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static INT64IN_DBADDR: &[&str] = &[];
 
 /// `recordtype(int64in)` — C's `papFldDes` order, all 78 declarations
 /// including the internals [`INT64IN_FIELDS`] drops. The index into this is
@@ -22344,6 +22404,9 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
 /// [`INT64OUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static INT64OUT_NOACCESS: &[&str] = &["SIMPVT"];
 
+/// `recordtype(int64out)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static INT64OUT_DBADDR: &[&str] = &[];
+
 /// `recordtype(int64out)` — C's `papFldDes` order, all 81 declarations
 /// including the internals [`INT64OUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -22944,6 +23007,9 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
 /// `recordtype(longin)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LONGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static LONGIN_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(longin)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static LONGIN_DBADDR: &[&str] = &[];
 
 /// `recordtype(longin)` — C's `papFldDes` order, all 78 declarations
 /// including the internals [`LONGIN_FIELDS`] drops. The index into this is
@@ -23666,6 +23732,9 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
 /// [`LONGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static LONGOUT_NOACCESS: &[&str] = &["SIMPVT", "OUTPVT"];
 
+/// `recordtype(longout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static LONGOUT_DBADDR: &[&str] = &[];
+
 /// `recordtype(longout)` — C's `papFldDes` order, all 85 declarations
 /// including the internals [`LONGOUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -23989,6 +24058,9 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
 /// `recordtype(lsi)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LSI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static LSI_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(lsi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static LSI_DBADDR: &[&str] = &["VAL", "OVAL"];
 
 /// `recordtype(lsi)` — C's `papFldDes` order, all 64 declarations
 /// including the internals [`LSI_FIELDS`] drops. The index into this is
@@ -24391,6 +24463,9 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
 /// `recordtype(lso)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LSO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static LSO_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(lso)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static LSO_DBADDR: &[&str] = &["VAL", "OVAL"];
 
 /// `recordtype(lso)` — C's `papFldDes` order, all 68 declarations
 /// including the internals [`LSO_FIELDS`] drops. The index into this is
@@ -25812,6 +25887,9 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
 /// [`MBBI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MBBI_NOACCESS: &[&str] = &["SIMPVT"];
 
+/// `recordtype(mbbi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MBBI_DBADDR: &[&str] = &[];
+
 /// `recordtype(mbbi)` — C's `papFldDes` order, all 119 declarations
 /// including the internals [`MBBI_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -26796,6 +26874,9 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
 /// `recordtype(mbbiDirect)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MBBI_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MBBI_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(mbbiDirect)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MBBI_DIRECT_DBADDR: &[&str] = &[];
 
 /// `recordtype(mbbiDirect)` — C's `papFldDes` order, all 97 declarations
 /// including the internals [`MBBI_DIRECT_FIELDS`] drops. The index into this is
@@ -28280,6 +28361,9 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
 /// [`MBBO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MBBO_NOACCESS: &[&str] = &["SIMPVT"];
 
+/// `recordtype(mbbo)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MBBO_DBADDR: &[&str] = &["VAL"];
+
 /// `recordtype(mbbo)` — C's `papFldDes` order, all 122 declarations
 /// including the internals [`MBBO_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -29385,6 +29469,9 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
 /// [`MBBO_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static MBBO_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
 
+/// `recordtype(mbboDirect)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MBBO_DIRECT_DBADDR: &[&str] = &[];
+
 /// `recordtype(mbboDirect)` — C's `papFldDes` order, all 103 declarations
 /// including the internals [`MBBO_DIRECT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -29507,6 +29594,9 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
 /// `recordtype(permissive)` — the `DBF_NOACCESS` internal names dropped from
 /// [`PERMISSIVE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static PERMISSIVE_NOACCESS: &[&str] = &[];
+
+/// `recordtype(permissive)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static PERMISSIVE_DBADDR: &[&str] = &[];
 
 /// `recordtype(permissive)` — C's `papFldDes` order, all 53 declarations
 /// including the internals [`PERMISSIVE_FIELDS`] drops. The index into this is
@@ -29847,6 +29937,9 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
 /// `recordtype(printf)` — the `DBF_NOACCESS` internal names dropped from
 /// [`PRINTF_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static PRINTF_NOACCESS: &[&str] = &[];
+
+/// `recordtype(printf)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static PRINTF_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(printf)` — C's `papFldDes` order, all 64 declarations
 /// including the internals [`PRINTF_FIELDS`] drops. The index into this is
@@ -32620,6 +32713,11 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
 /// [`SCALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SCALCOUT_NOACCESS: &[&str] = &["RPVT", "STRS", "RPCL", "ORPC"];
 
+/// `recordtype(scalcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SCALCOUT_DBADDR: &[&str] = &[
+    "PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL",
+];
+
 /// `recordtype(scalcout)` — C's `papFldDes` order, all 189 declarations
 /// including the internals [`SCALCOUT_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -33828,6 +33926,9 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
 /// `recordtype(sel)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SEL_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SEL_NOACCESS: &[&str] = &[];
+
+/// `recordtype(sel)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SEL_DBADDR: &[&str] = &[];
 
 /// `recordtype(sel)` — C's `papFldDes` order, all 107 declarations
 /// including the internals [`SEL_FIELDS`] drops. The index into this is
@@ -35291,6 +35392,9 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
 /// `recordtype(seq)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SEQ_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SEQ_NOACCESS: &[&str] = &[];
+
+/// `recordtype(seq)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SEQ_DBADDR: &[&str] = &[];
 
 /// `recordtype(seq)` — C's `papFldDes` order, all 120 declarations
 /// including the internals [`SEQ_FIELDS`] drops. The index into this is
@@ -38077,6 +38181,9 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
 /// [`SSEQ_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SSEQ_NOACCESS: &[&str] = &[];
 
+/// `recordtype(sseq)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SSEQ_DBADDR: &[&str] = &[];
+
 /// `recordtype(sseq)` — C's `papFldDes` order, all 186 declarations
 /// including the internals [`SSEQ_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -38146,6 +38253,9 @@ pub static STATE_FIELDS: &[FieldDesc] = &[
 /// `recordtype(state)` — the `DBF_NOACCESS` internal names dropped from
 /// [`STATE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static STATE_NOACCESS: &[&str] = &[];
+
+/// `recordtype(state)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static STATE_DBADDR: &[&str] = &[];
 
 /// `recordtype(state)` — C's `papFldDes` order, all 50 declarations
 /// including the internals [`STATE_FIELDS`] drops. The index into this is
@@ -38425,6 +38535,9 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
 /// `recordtype(stringin)` — the `DBF_NOACCESS` internal names dropped from
 /// [`STRINGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static STRINGIN_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(stringin)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static STRINGIN_DBADDR: &[&str] = &[];
 
 /// `recordtype(stringin)` — C's `papFldDes` order, all 62 declarations
 /// including the internals [`STRINGIN_FIELDS`] drops. The index into this is
@@ -38765,6 +38878,9 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
 /// `recordtype(stringout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`STRINGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static STRINGOUT_NOACCESS: &[&str] = &["SIMPVT"];
+
+/// `recordtype(stringout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static STRINGOUT_DBADDR: &[&str] = &[];
 
 /// `recordtype(stringout)` — C's `papFldDes` order, all 65 declarations
 /// including the internals [`STRINGOUT_FIELDS`] drops. The index into this is
@@ -40486,6 +40602,9 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
 /// [`SUB_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SUB_NOACCESS: &[&str] = &["SADR"];
 
+/// `recordtype(sub)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SUB_DBADDR: &[&str] = &[];
+
 /// `recordtype(sub)` — C's `papFldDes` order, all 134 declarations
 /// including the internals [`SUB_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -40751,6 +40870,9 @@ pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
 /// `recordtype(subArray)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SUB_ARRAY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SUB_ARRAY_NOACCESS: &[&str] = &["BPTR"];
+
+/// `recordtype(subArray)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SUB_ARRAY_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(subArray)` — C's `papFldDes` order, all 61 declarations
 /// including the internals [`SUB_ARRAY_FIELDS`] drops. The index into this is
@@ -42511,6 +42633,9 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
 /// `recordtype(swait)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SWAIT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static SWAIT_NOACCESS: &[&str] = &["CBST", "RPCL"];
+
+/// `recordtype(swait)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SWAIT_DBADDR: &[&str] = &[];
 
 /// `recordtype(swait)` — C's `papFldDes` order, all 137 declarations
 /// including the internals [`SWAIT_FIELDS`] drops. The index into this is
@@ -45560,6 +45685,9 @@ pub static TRANSFORM_NOACCESS: &[&str] = &[
     "RPCL", "RPCM", "RPCN", "RPCO", "RPCP",
 ];
 
+/// `recordtype(transform)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static TRANSFORM_DBADDR: &[&str] = &[];
+
 /// `recordtype(transform)` — C's `papFldDes` order, all 216 declarations
 /// including the internals [`TRANSFORM_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -46012,6 +46140,9 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
 /// `recordtype(waveform)` — the `DBF_NOACCESS` internal names dropped from
 /// [`WAVEFORM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static WAVEFORM_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+
+/// `recordtype(waveform)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static WAVEFORM_DBADDR: &[&str] = &["VAL"];
 
 /// `recordtype(waveform)` — C's `papFldDes` order, all 71 declarations
 /// including the internals [`WAVEFORM_FIELDS`] drops. The index into this is
@@ -47323,6 +47454,55 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
         "swait" => SWAIT_NOACCESS,
         "transform" => TRANSFORM_NOACCESS,
         "waveform" => WAVEFORM_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "aSub" => A_SUB_DBADDR,
+        "aai" => AAI_DBADDR,
+        "aao" => AAO_DBADDR,
+        "acalcout" => ACALCOUT_DBADDR,
+        "ai" => AI_DBADDR,
+        "ao" => AO_DBADDR,
+        "asyn" => ASYN_DBADDR,
+        "bi" => BI_DBADDR,
+        "bo" => BO_DBADDR,
+        "busy" => BUSY_DBADDR,
+        "calc" => CALC_DBADDR,
+        "calcout" => CALCOUT_DBADDR,
+        "compress" => COMPRESS_DBADDR,
+        "dfanout" => DFANOUT_DBADDR,
+        "event" => EVENT_DBADDR,
+        "fanout" => FANOUT_DBADDR,
+        "histogram" => HISTOGRAM_DBADDR,
+        "int64in" => INT64IN_DBADDR,
+        "int64out" => INT64OUT_DBADDR,
+        "longin" => LONGIN_DBADDR,
+        "longout" => LONGOUT_DBADDR,
+        "lsi" => LSI_DBADDR,
+        "lso" => LSO_DBADDR,
+        "mbbi" => MBBI_DBADDR,
+        "mbbiDirect" => MBBI_DIRECT_DBADDR,
+        "mbbo" => MBBO_DBADDR,
+        "mbboDirect" => MBBO_DIRECT_DBADDR,
+        "permissive" => PERMISSIVE_DBADDR,
+        "printf" => PRINTF_DBADDR,
+        "scalcout" => SCALCOUT_DBADDR,
+        "sel" => SEL_DBADDR,
+        "seq" => SEQ_DBADDR,
+        "sseq" => SSEQ_DBADDR,
+        "state" => STATE_DBADDR,
+        "stringin" => STRINGIN_DBADDR,
+        "stringout" => STRINGOUT_DBADDR,
+        "sub" => SUB_DBADDR,
+        "subArray" => SUB_ARRAY_DBADDR,
+        "swait" => SWAIT_DBADDR,
+        "transform" => TRANSFORM_DBADDR,
+        "waveform" => WAVEFORM_DBADDR,
         _ => return None,
     })
 }

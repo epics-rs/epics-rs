@@ -1473,7 +1473,7 @@ pub(crate) enum CyclePlan {
     /// part of the stamp; [`RecordInstance::cycle_plan`] tests them per cycle.
     ConstSoftIn,
     /// [`Self::ConstSoftIn`] with INP a non-PP DB link read as `DBR_DOUBLE`
-    /// and TSE not -2: the input stage is the in-guard slot read of
+    /// by a dset that is not Raw, and TSE not -2: the input stage is the in-guard slot read of
     /// `soft_db_inp_stage` when the target resolves and is not this record,
     /// the general stage otherwise. Any other request is General: the arm's
     /// slot carries an `f64`, so the arm itself is the request.
@@ -3415,7 +3415,9 @@ impl RecordInstance {
         let reads_double = || match self.parsed_inp.link() {
             ParsedLink::Db(db)
                 if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
-                    && self.common.tse != -2 =>
+                    && self.common.tse != -2
+                    && self.common.dtyp.soft()
+                        != Some(crate::server::device_support::SoftDtyp::Raw) =>
             {
                 matches!(
                     crate::server::record::InputLinkRequest::for_inp(
@@ -6899,13 +6901,12 @@ impl RecordInstance {
         // AFTC/AFVL fields run it; the rest answer AFTC = AFVL = 0 and so
         // take neither arm's store.
         if aftc > 0.0 {
-            let now = crate::runtime::general_time::get_current();
             let (filtered_range, new_afvl) = crate::server::records::alarm_filter::aftc_filter(
                 alarm_range,
                 aftc,
                 afvl,
                 self.common.time,
-                now,
+                crate::runtime::general_time::get_current,
             );
             self.record.store_alarm_filter_value(new_afvl);
             // C re-maps through the SAME `switch (alarmRange)` the ladder
@@ -11103,7 +11104,7 @@ mod aftc_filter_tests {
     #[test]
     fn disabled_when_aftc_le_zero() {
         // aftc=0 means filter disabled — pass-through.
-        let (out, afvl) = aftc_filter(2, 0.0, 0.0, at(0.0), at(1.0));
+        let (out, afvl) = aftc_filter(2, 0.0, 0.0, at(0.0), || at(1.0));
         assert_eq!(out, 2);
         assert_eq!(afvl, 0.0);
     }
@@ -11112,7 +11113,7 @@ mod aftc_filter_tests {
     fn initial_sample_seeds_state_unchanged_alarm() {
         // afvl=0 means first sample after enable — alarm passes through
         // and accumulator seeds with the raw severity.
-        let (out, afvl) = aftc_filter(2, 3.0, 0.0, at(0.0), at(0.5));
+        let (out, afvl) = aftc_filter(2, 3.0, 0.0, at(0.0), || at(0.5));
         assert_eq!(out, 2);
         assert_eq!(afvl, 2.0);
     }
@@ -11125,7 +11126,7 @@ mod aftc_filter_tests {
         // accumulator crosses the threshold.
         // Seed with afvl=0.01 (tiny prior, simulating "almost no alarm
         // yet"); the filter must keep alarm at 0 after one short tick.
-        let (out, afvl) = aftc_filter(2, 3.0, 0.01, at(0.0), at(0.1));
+        let (out, afvl) = aftc_filter(2, 3.0, 0.01, at(0.0), || at(0.1));
         assert_eq!(out, 0, "filter should suppress alarm rise on a 0.1s tick");
         assert!(afvl > 0.0 && afvl < 2.0);
     }
@@ -11133,7 +11134,7 @@ mod aftc_filter_tests {
     #[test]
     fn dt_zero_is_no_op() {
         // Two evaluations at the same instant produce no filter advance.
-        let (out, afvl) = aftc_filter(2, 3.0, 1.5, at(0.0), at(0.0));
+        let (out, afvl) = aftc_filter(2, 3.0, 1.5, at(0.0), || at(0.0));
         assert_eq!(out, 1); // floor(|1.5|) = 1
         assert_eq!(afvl, 1.5);
     }
@@ -11148,7 +11149,7 @@ mod aftc_filter_tests {
         let mut alarm = 0;
         for i in 1..=100 {
             let now = at(i as f64 * 0.05);
-            let (out, new_afvl) = aftc_filter(2, aftc, afvl, last, now);
+            let (out, new_afvl) = aftc_filter(2, aftc, afvl, last, || now);
             alarm = out;
             afvl = new_afvl;
             last = now;

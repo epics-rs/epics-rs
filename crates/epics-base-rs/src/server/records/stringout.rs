@@ -154,7 +154,7 @@ impl Record for StringoutRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }
@@ -257,7 +257,7 @@ impl Record for StringoutRecord {
     // dset status.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
     }
 

@@ -45,12 +45,15 @@ use std::time::SystemTime;
 /// range, `afvl < 0` toward a higher one. `THRESHOLD = 0.6321` (≈ 1−1/e)
 /// is defined per record (`aiRecord.c:47`, `longinRecord.c:45`,
 /// `int64inRecord.c:44`, `mbbiRecord.c:44`).
+///
+/// `time_now` is called only by the smoothing arm: C reads no clock in
+/// `checkAlarms`, so a disabled or seeding filter must not either.
 pub fn aftc_filter(
     raw_alarm: u16,
     aftc: f64,
     afvl_in: f64,
     time_last: SystemTime,
-    time_now: SystemTime,
+    time_now: impl FnOnce() -> SystemTime,
 ) -> (u16, f64) {
     // C `aiRecord.c:47` — `#define THRESHOLD 0.6321` (≈ 1 - 1/e).
     const THRESHOLD: f64 = 0.6321;
@@ -70,7 +73,7 @@ pub fn aftc_filter(
     // C `aiRecord.c:364-377` — exponential smoothing of the integer
     // range with a signed contribution and a fold-back on the fractional
     // part.
-    let dt = time_now
+    let dt = time_now()
         .duration_since(time_last)
         .unwrap_or_default()
         .as_secs_f64();
@@ -89,4 +92,30 @@ pub fn aftc_filter(
     // `alarmRange = abs((int)floor(afvl));`
     let alarm = afvl.floor().abs() as u16;
     (alarm, afvl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aftc_filter;
+    use std::time::SystemTime;
+
+    fn no_clock() -> SystemTime {
+        panic!("the clock was read")
+    }
+
+    #[test]
+    fn a_disabled_or_seeding_filter_reads_no_clock_mbbirecord_c_319() {
+        assert_eq!(
+            aftc_filter(2, 0.0, 1.5, SystemTime::UNIX_EPOCH, no_clock),
+            (2, 0.0)
+        );
+        assert_eq!(
+            aftc_filter(2, -1.0, 0.0, SystemTime::UNIX_EPOCH, no_clock),
+            (2, 0.0)
+        );
+        assert_eq!(
+            aftc_filter(2, 3.0, 0.0, SystemTime::UNIX_EPOCH, no_clock),
+            (2, 2.0)
+        );
+    }
 }

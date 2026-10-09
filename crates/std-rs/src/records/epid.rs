@@ -1081,6 +1081,10 @@ impl Record for EpidRecord {
         dbd_generated::EPID_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::EPID_DBADDR)
+    }
+
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::EPID_NOACCESS
     }

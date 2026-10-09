@@ -135,25 +135,31 @@ impl Record for MbbiDirectRecord {
         crate::server::record::InputLinkRequest::As(crate::server::record::LinkReadAs::ULong)
     }
 
+    /// The Plain and Async dsets' `DBR_ULONG` read lands in VAL bit for bit.
+    fn soft_input_read_u32(&mut self, value: u32) -> CaResult<()> {
+        self.val = value;
+        Ok(())
+    }
+
     /// C `devMbbiDirectSoftRaw` — `recGblInitConstantLink(&prec->inp,
     /// DBF_ULONG, &prec->rval)` at init (`devMbbiDirectSoftRaw.c:42`, unmasked),
     /// and per read `dbGetLink(&prec->inp, DBR_ULONG, &prec->rval, 0, 0)` then
     /// `prec->rval &= prec->mask` (`:60-61`). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
+    /// `devXxxSoftRaw::init_record`'s mask (see [`super::raw_soft_dset_mask`]).
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        if soft == crate::server::device_support::SoftDtyp::Raw {
+            self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
+        }
+    }
+
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
         self.rval = match super::raw_soft_rval_u32("mbbiDirect", &value) {
             Ok(rval) => rval,
             Err(e) => return Some(Err(e)),
         };
         if entry == RawSoftEntry::Read {
-            // The dset's init builds the mask: `if (nobt == 0) mask =
-            // 0xffffffff;` (overriding a configured MASK) then `mask <<= shft`.
-            let base = if self.nobt == 0 {
-                0xffff_ffff
-            } else {
-                self.mask
-            };
-            self.rval &= base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+            self.rval &= self.mask;
         }
         Some(Ok(()))
     }

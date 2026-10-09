@@ -438,6 +438,13 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
     None
 }
 
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    let _ = record_type;
+    None
+}
+
 /// Every field a record type declares, in C's `papFldDes` order — the order
 /// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`
 /// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`

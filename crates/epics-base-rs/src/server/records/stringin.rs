@@ -90,6 +90,19 @@ impl Record for StringinRecord {
         })
     }
 
+    /// `devSiSoft.c:53` reads straight into VAL: the `putStringString` row
+    /// `set_val` reaches for a String, without its field lookups.
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        match value {
+            Some(EpicsValue::String(s)) => {
+                self.val = truncate_string(s);
+                Ok(())
+            }
+            Some(value) => self.set_val(value),
+            None => Ok(()),
+        }
+    }
+
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
     /// two-choice NO/YES simulation menu. `MPST`/`APST` are
     /// `menu(stringinPOST)` (`stringinRecord.dbd.pod:21-24,95-107`), whose
@@ -121,7 +134,7 @@ impl Record for StringinRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }
@@ -198,6 +211,12 @@ impl Record for StringinRecord {
         Some(EpicsValue::String(self.val.clone()))
     }
 
+    /// A string VAL is never undefined by value; the default asks [`Self::val`]
+    /// for a copy to say so.
+    fn value_is_undefined(&self) -> bool {
+        false
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone())),
@@ -216,7 +235,7 @@ impl Record for StringinRecord {
     // C `stringinRecord.c:117` copies VAL after `:112-115` returns a nonzero dset status.
     fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
         if dset_init != crate::server::device_support::DsetInit::Failed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
     }
 
@@ -303,6 +322,28 @@ mod tests {
         rec.put_field("VAL", EpicsValue::String(long.into()))
             .unwrap();
         assert_eq!(rec.val.len(), 39, "VAL capped at MAX_STRING_SIZE-1");
+    }
+
+    /// The soft read stores what `set_val` stores, at every length either
+    /// side of the 39-byte cap and for raw bytes.
+    #[test]
+    fn soft_input_read_stores_what_set_val_stores() {
+        let texts: [&[u8]; 6] = [
+            b"",
+            b"train",
+            &[b'a'; 39],
+            &[b'b'; 40],
+            &[b'c'; 45],
+            &[0xff, 0x00, 0x80],
+        ];
+        for text in texts {
+            let value = EpicsValue::String(PvString::from_bytes(text.to_vec()));
+            let mut read = StringinRecord::new("old");
+            read.soft_input_read(Some(value.clone())).unwrap();
+            let mut put = StringinRecord::new("old");
+            put.set_val(value).unwrap();
+            assert_eq!(read.val, put.val, "{text:?}");
+        }
     }
 
     /// A 39-char string is kept whole.

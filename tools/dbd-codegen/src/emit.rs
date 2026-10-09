@@ -532,6 +532,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     let mut record_consts: Vec<(String, String)> = Vec::new();
     let mut noaccess_consts: Vec<(String, String)> = Vec::new();
     let mut decl_consts: Vec<(String, String)> = Vec::new();
+    let mut dbaddr_consts: Vec<(String, String)> = Vec::new();
     let mut no_prompt: Vec<(String, usize)> = Vec::new();
     for rec in input.records {
         let konst = fields_const(&rec.name);
@@ -592,6 +593,26 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         }
         out.push_str("];\n\n");
         noaccess_consts.push((rec.name.clone(), na_konst));
+
+        // The `.dbd`'s own `special(SPC_DBADDR)` rows — `pdbFldDes->special`,
+        // which `cvt_dbaddr` cannot overwrite — so a put asks a list of a few
+        // names rather than every row of `{konst}`.
+        let da_konst = format!("{}_DBADDR", konst.trim_end_matches("_FIELDS"));
+        writeln!(
+            out,
+            "/// `recordtype({})` — the fields its `.dbd` declares `special(SPC_DBADDR)`.",
+            rec.name
+        )
+        .unwrap();
+        writeln!(out, "pub static {da_konst}: &[&str] = &[").unwrap();
+        for f in own
+            .iter()
+            .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
+        {
+            writeln!(out, "    {},", rust_str(&f.name)).unwrap();
+        }
+        out.push_str("];\n\n");
+        dbaddr_consts.push((rec.name.clone(), da_konst));
 
         // C's `papFldDes` — EVERY declaration in `.dbd` order with dbCommon
         // spliced at the `include`, internals included. It is a different list
@@ -757,6 +778,18 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         noaccess_consts
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
+
+    out.push_str(
+        "/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or\n\
+         /// `None` for a type no vendored `.dbd` declares.\n\
+         pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {\n",
+    );
+    emit_str_lookup(
+        &mut out,
+        "record_type",
+        dbaddr_consts.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     );
     out.push_str("}\n\n");
 

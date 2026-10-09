@@ -9246,6 +9246,25 @@ mod tests {
         assert_eq!(rec.field_native_count("BINP"), Some(512));
     }
 
+    /// `asynRecord.dbd` declares `SPC_DBADDR` on BOUT, BINP and the
+    /// `DBF_NOACCESS` ERRS (`:227`, `:284`, `:624`); ERRS's capacity is
+    /// `ERR_SIZE` (`asynRecord.c:958`).
+    #[test]
+    fn the_spc_dbaddr_fields_are_bout_binp_and_errs() {
+        use epics_base_rs::server::record::Record;
+
+        let rec = AsynRecord::default();
+        for desc in rec.field_list() {
+            assert_eq!(
+                rec.field_is_dbaddr(desc.name),
+                ["BOUT", "BINP", "ERRS"].contains(&desc.name),
+                "{}",
+                desc.name
+            );
+        }
+        assert_eq!(rec.field_native_count("ERRS"), Some(ERR_SIZE as u32));
+    }
+
     /// R8-54: C `performOctetIO` writes the clamped transfer sizes back into
     /// the record — `nowt = omax` (asynRecord.c:1499) and `nrrd = inlen`
     /// (:1513) — and `monitor()` POST_IF_NEWs them (:1020,1022), so the fields

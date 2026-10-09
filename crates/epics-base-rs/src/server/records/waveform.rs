@@ -340,6 +340,52 @@ impl WaveformRecord {
         }
     }
 
+    /// A put to VAL, by any route: a client's, a link's or the INP read's.
+    fn put_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // A DBR_STRING source is C's `putString<FTVL>` row
+        // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
+        // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
+        // non-zero status aborts the whole `dbPut` so the field keeps
+        // its old value. A scalar string is `nRequest == 1`, so it
+        // lands as ONE element.
+        //
+        // Measured on the compiled softIoc, `caput` then `caget`:
+        // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
+        // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
+        // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
+        // so neither does this branch. Treating a string as the
+        // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
+        // 0 for every other FTVL — was a special case at one boundary
+        // that C does not have anywhere: the byte carry is what a
+        // client asking DBR_CHAR gets (`caput -S`), which arrives here
+        // already as a `CharArray` and is untouched by this branch.
+        let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
+            (EpicsValue::String(s), Some(numeric)) => {
+                // The ARRAY row, `put_string_element`: VAL is
+                // `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
+                // even a one-element string put to `putString*`, which
+                // — alone among the four conversion rows — has no
+                // empty-string carve-out. `caput WF ""` is refused.
+                match c_parse::put_string_element("VAL", numeric, &s.as_str_lossy())? {
+                    c_parse::Converted::Stored(v) => v,
+                    // C skipped the element store, so the buffer keeps
+                    // the element it held and the put still succeeds.
+                    c_parse::Converted::Unchanged => return Ok(()),
+                }
+            }
+            // FTVL=STRING is `putStringString`, a text copy, not a
+            // parse — `NumericField::of` reports None for it.
+            _ => value,
+        };
+        // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`
+        // — a put to VAL re-establishes the buffer, so the remembered
+        // read failure no longer describes it. (Reachable without a
+        // process only through an NPP link put; subArray's VAL is
+        // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
+        self.inp_read_failed = false;
+        self.land_val_in_buffer(value)
+    }
+
     /// Land a VAL source in the FTVL-typed buffer — the single owner of the
     /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of at
     /// most [`Self::val_capacity`] elements on every path, by construction.
@@ -369,7 +415,15 @@ impl WaveformRecord {
     /// `dbFastConvert` into `bptr`.
     fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
         let cap = self.val_capacity();
-        let converted = value.convert_to(self.ftvl_element_type());
+        let target = self.ftvl_element_type();
+        // `convert_to` borrows, so a source already at FTVL's type would be
+        // cloned only to drop the original; move it instead. The NTEnum
+        // carrier reports `Enum` but must still collapse in `convert_to`.
+        let converted = match value {
+            EpicsValue::EnumWithChoices { .. } => value.convert_to(target),
+            v if v.db_field_type() == target => v,
+            v => v.convert_to(target),
+        };
         // NORD is capped at the capacity (C bounds every request to the
         // allocated element count). The buffer the record holds is at least
         // NORD long and at most the capacity; the CA channel element count
@@ -473,14 +527,14 @@ impl WaveformRecord {
         }
     }
 
-    /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
-    /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`. Also what device
-    /// support that wipes the array (`nord = 0` + `memset(bptr, 0, ...)`) calls.
     /// The aao DOL text, and whether it is a constant.
     pub fn set_dol(&mut self, dol: String) {
         self.dol = dol;
     }
 
+    /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
+    /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`. Also what device
+    /// support that wipes the array (`nord = 0` + `memset(bptr, 0, ...)`) calls.
     pub fn reallocate_val(&mut self) {
         self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
@@ -739,6 +793,12 @@ const MENU_OMSL_CLOSED_LOOP: i16 = 1;
 impl Record for WaveformRecord {
     fn acts_before_process(&self) -> bool {
         false
+    }
+
+    /// No kind has an `OVAL`: the served `VAL`, read directly rather than
+    /// through the default's two by-name asks.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        Some(self.val.head(self.served_element_count()))
     }
 
     /// The served `VAL` of [`Self::get_field`], borrowed. A `STRING` FTVL has
@@ -1167,50 +1227,7 @@ impl Record for WaveformRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => {
-                // A DBR_STRING source is C's `putString<FTVL>` row
-                // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
-                // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
-                // non-zero status aborts the whole `dbPut` so the field keeps
-                // its old value. A scalar string is `nRequest == 1`, so it
-                // lands as ONE element.
-                //
-                // Measured on the compiled softIoc, `caput` then `caget`:
-                // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
-                // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
-                // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
-                // so neither does this branch. Treating a string as the
-                // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
-                // 0 for every other FTVL — was a special case at one boundary
-                // that C does not have anywhere: the byte carry is what a
-                // client asking DBR_CHAR gets (`caput -S`), which arrives here
-                // already as a `CharArray` and is untouched by this branch.
-                let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
-                    (EpicsValue::String(s), Some(numeric)) => {
-                        // The ARRAY row, `put_string_element`: VAL is
-                        // `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
-                        // even a one-element string put to `putString*`, which
-                        // — alone among the four conversion rows — has no
-                        // empty-string carve-out. `caput WF ""` is refused.
-                        match c_parse::put_string_element(name, numeric, &s.as_str_lossy())? {
-                            c_parse::Converted::Stored(v) => v,
-                            // C skipped the element store, so the buffer keeps
-                            // the element it held and the put still succeeds.
-                            c_parse::Converted::Unchanged => return Ok(()),
-                        }
-                    }
-                    // FTVL=STRING is `putStringString`, a text copy, not a
-                    // parse — `NumericField::of` reports None for it.
-                    _ => value,
-                };
-                // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`
-                // — a put to VAL re-establishes the buffer, so the remembered
-                // read failure no longer describes it. (Reachable without a
-                // process only through an NPP link put; subArray's VAL is
-                // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
-                self.inp_read_failed = false;
-                self.land_val_in_buffer(value)
-            }
+            "VAL" => self.put_val(value),
             "NELM" => {
                 let Some(n) = count_put(&value) else {
                     return Err(CaError::InvalidValue(format!(
@@ -1529,18 +1546,9 @@ impl Record for WaveformRecord {
         if matches!(self.kind, ArrayKind::SubArray) {
             return self.sa_load_and_subset(value);
         }
-        match self.put_field("VAL", value.clone()) {
-            Ok(()) => Ok(()),
-            Err(CaError::TypeMismatch(_)) => {
-                let target = self
-                    .get_field("VAL")
-                    .map(|v| v.db_field_type())
-                    .unwrap_or(DbFieldType::Double);
-                let coerced = value.convert_to(target);
-                self.put_field("VAL", coerced)
-            }
-            Err(e) => Err(e),
-        }
+        // No `TypeMismatch` retry: VAL's put already converts to the FTVL
+        // element type, which is the type a retry would convert to.
+        self.put_val(value)
     }
 
     /// C `devSASoft.c::read_sa` (92-123), the CONSTANT-INP arm — subArray is
@@ -2355,6 +2363,64 @@ mod array_kind_tests {
         }
         let string = WaveformRecord::new(4, DbFieldType::String);
         assert!(string.monitor_value_view().is_none());
+    }
+
+    /// pvxs `pvaGetValue` (`pvalink_lset.cpp:330-360`): an NTEnum lands as
+    /// its index in every non-string FTVL, its label in `FTVL=STRING`, and a
+    /// source already at FTVL's type lands as it is.
+    #[test]
+    fn an_ntenum_carrier_lands_as_index_or_label_pvalink_lset_330() {
+        let carrier = || EpicsValue::EnumWithChoices {
+            index: 1,
+            choices: vec!["off".into(), "on".into()],
+        };
+        for (ftvl, landed) in [
+            (DbFieldType::Enum, EpicsValue::EnumArray(vec![1].into())),
+            (
+                DbFieldType::Double,
+                EpicsValue::DoubleArray(vec![1.0].into()),
+            ),
+            (
+                DbFieldType::String,
+                EpicsValue::StringArray(vec!["on".into()].into()),
+            ),
+        ] {
+            let mut r = WaveformRecord::new(4, ftvl);
+            r.set_val(carrier()).unwrap();
+            assert_eq!(r.get_field("VAL"), Some(landed), "{ftvl:?}");
+            assert_eq!(r.nord, 1);
+        }
+        let mut r = WaveformRecord::new(4, DbFieldType::Double);
+        r.set_val(EpicsValue::DoubleArray(vec![2.0, 3.0].into()))
+            .unwrap();
+        assert_eq!(
+            r.get_field("VAL"),
+            Some(EpicsValue::DoubleArray(vec![2.0, 3.0].into()))
+        );
+        assert_eq!(r.nord, 2);
+    }
+
+    /// What goes out is the default body's answer — no `OVAL`, then the
+    /// served `VAL` — for every kind, before and after a value lands.
+    #[test]
+    fn output_link_value_is_the_served_val() {
+        for kind in [
+            ArrayKind::Waveform,
+            ArrayKind::Aai,
+            ArrayKind::Aao,
+            ArrayKind::SubArray,
+        ] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.set_ftvl(Ftype::Double);
+            r.put_field("NELM", EpicsValue::Long(4)).unwrap();
+            for source in [None, Some(vec![3.0, 1.0])] {
+                if let Some(source) = source {
+                    r.set_val(EpicsValue::DoubleArray(source.into())).unwrap();
+                }
+                assert_eq!(r.get_field("OVAL"), None, "{kind:?}");
+                assert_eq!(r.output_link_value(), r.get_field("VAL"), "{kind:?}");
+            }
+        }
     }
 
     #[test]

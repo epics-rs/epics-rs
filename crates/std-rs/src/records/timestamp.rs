@@ -253,6 +253,10 @@ impl Record for TimestampRecord {
         dbd_generated::TIMESTAMP_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::TIMESTAMP_DBADDR)
+    }
+
     /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
     /// owns `dbCommon.tse`; this hook captures it so `process()` can
     /// take the device-time branch.
@@ -294,7 +298,7 @@ impl Record for TimestampRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }

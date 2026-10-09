@@ -567,6 +567,10 @@ impl Record for McaRecord {
         dbd_generated::MCA_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::MCA_DBADDR)
+    }
+
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::MCA_NOACCESS
     }
@@ -981,6 +985,27 @@ mod tests {
             table,
             dbd_generated::record_fields("mca").unwrap()
         ));
+    }
+
+    /// `field_is_dbaddr` answers from the generated `SPC_DBADDR` list, which
+    /// is the `.dbd`'s declared special on every field.
+    #[test]
+    fn the_dbaddr_list_is_the_generated_one() {
+        use epics_base_rs::server::record::{Record, Special};
+
+        let rec = McaRecord::default();
+        assert!(std::ptr::eq(
+            rec.declared_dbaddr_fields().unwrap(),
+            dbd_generated::record_dbaddr_fields("mca").unwrap()
+        ));
+        for desc in rec.field_list() {
+            assert_eq!(
+                rec.field_is_dbaddr(desc.name),
+                desc.declared_special == Special::DbAddr,
+                "{}",
+                desc.name
+            );
+        }
     }
 
     /// The `.dbd` declares 320 fields; `dbCommon` is declared once, by base, so

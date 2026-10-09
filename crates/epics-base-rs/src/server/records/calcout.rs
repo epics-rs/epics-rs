@@ -575,6 +575,60 @@ impl Record for CalcoutRecord {
         true
     }
 
+    /// C posts these only from `checkLinks` (`calcoutRecord.c:404`, `:752`,
+    /// `:757`), which the port's link-status refresh owns.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        &[
+            "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV",
+            "INLV", "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV", "OUTV",
+        ]
+    }
+
+    /// What `put_field` stores for `A`..`U`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        let var = match field.as_bytes() {
+            b"A" => &mut self.a,
+            b"B" => &mut self.b,
+            b"C" => &mut self.c,
+            b"D" => &mut self.d,
+            b"E" => &mut self.e,
+            b"F" => &mut self.f,
+            b"G" => &mut self.g,
+            b"H" => &mut self.h,
+            b"I" => &mut self.i,
+            b"J" => &mut self.j,
+            b"K" => &mut self.k,
+            b"L" => &mut self.l,
+            b"M" => &mut self.m,
+            b"N" => &mut self.n,
+            b"O" => &mut self.o,
+            b"P" => &mut self.p,
+            b"Q" => &mut self.q,
+            b"R" => &mut self.r,
+            b"S" => &mut self.s,
+            b"T" => &mut self.t,
+            b"U" => &mut self.u,
+            _ => return self.put_field_internal(field, EpicsValue::Double(value)),
+        };
+        *var = value;
+        Ok(())
+    }
+
+    /// C `monitor()` posts every input A..U when the alarm moved, changed or
+    /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcoutRecord.c:681-682).
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+            "R", "S", "T", "U",
+        ]
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

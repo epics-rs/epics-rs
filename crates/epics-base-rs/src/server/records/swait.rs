@@ -338,11 +338,9 @@ impl SwaitRecord {
     }
 
     fn num_val_index(name: &str) -> Option<usize> {
-        // Single letter A-L
-        if name.len() == 1 {
-            CHAN.iter().position(|&c| c.to_string() == name)
-        } else {
-            None
+        match name.as_bytes() {
+            [c @ b'A'..=b'L'] => Some(usize::from(c - b'A')),
+            _ => None,
         }
     }
 
@@ -436,6 +434,18 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 const SWAIT_ODLY_PRECISION: i16 = 3;
 
 impl Record for SwaitRecord {
+    /// What `put_field` stores for `A`..`L`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match Self::num_val_index(field) {
+            Some(idx) => {
+                self.num_vals[idx] = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

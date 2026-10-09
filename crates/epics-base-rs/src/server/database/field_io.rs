@@ -540,21 +540,37 @@ fn special_after_put(
     // re-runs the load into that input's value field and posts it. Without it a
     // constant link is load-once dead state — the link layer delivers nothing
     // for a constant at process time, so `caput CO.INPB 7` would store the text
-    // and leave `B` at its `.db` value forever.
+    // and leave `B` at its `.db` value forever. The post does not depend on the
+    // load: C posts `pvalue` for an empty link too, which loads nothing.
     //
     // The record only DECLARES the pairs (`special_reseed_input_links`); the
     // load itself is the shared `rec_gbl_init_constant_link` owner, the same one
     // the init seed uses. Records whose C `special()` does not re-seed (calc,
     // sub, sel, aSub, swait, …) declare nothing and are untouched.
-    if let Some(value_field) =
-        crate::server::record::reseed_constant_input_link(&mut *instance.record, field)
-    {
-        // The mask is the C call site's, and they disagree — calcout posts a
-        // literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record carries it.
-        let mask = instance.record.special_reseed_post_mask();
-        // `value_field` is the calc-class value slot behind the link just
-        // written (`INPA` -> `A`), i.e. exactly a link-backed field.
-        instance.notify_field_backed(value_field, mask, backing);
+    let reseed = instance
+        .record
+        .special_reseed_input_links()
+        .iter()
+        .find(|(link, _)| *link == field)
+        .map(|(_, value_field)| *value_field);
+    if let Some(value_field) = reseed {
+        crate::server::record::reseed_constant_input_link(&mut *instance.record, field);
+        let constant = matches!(
+            instance.record.get_field(field),
+            Some(EpicsValue::String(text)) if matches!(
+                crate::server::record::parse_link_v2(&text.as_str_lossy()).link_type(),
+                crate::server::record::LinkType::Empty | crate::server::record::LinkType::Constant
+            )
+        );
+        if constant {
+            // The mask is the C call site's, and they disagree — calcout posts
+            // a literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record
+            // carries it.
+            let mask = instance.record.special_reseed_post_mask();
+            // `value_field` is the calc-class value slot behind the link just
+            // written (`INPA` -> `A`), i.e. exactly a link-backed field.
+            instance.notify_field_backed(value_field, mask, backing);
+        }
     }
 
     // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the

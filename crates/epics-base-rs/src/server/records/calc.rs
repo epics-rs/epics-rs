@@ -5,6 +5,12 @@ use crate::server::record::{
 };
 use crate::types::{EpicsValue, PvString};
 
+/// The calc-family input fields `A..U`, in `LA..LU` order.
+pub(crate) const CALC_INPUT_FIELDS: [&str; crate::calc::CALC_NARGS] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U",
+];
+
 /// Calc record — evaluates CALC expression with inputs A-U.
 ///
 /// Matches epics-base PR #655 (12 → 21 inputs, A-L → A-U).
@@ -56,6 +62,9 @@ pub struct CalcRecord {
     pub vars: [f64; crate::calc::CALC_NARGS],
     // Previous values LA-LU (saved after each process)
     pub prev: [f64; crate::calc::CALC_NARGS],
+    // The inputs this cycle's `advance_prev_inputs` found apart from LA..LU,
+    // bit i for input i; zero on a cycle that ran no advance.
+    input_changes: u32,
     // This cycle's `calcPerform` outcome (C `calcRecord.c:121-123`). A per-cycle
     // fact, not record state: `check_alarms` — the owner of this record's alarm
     // transitions — consumes it, so it cannot outlive the cycle that set it.
@@ -127,6 +136,7 @@ impl Default for CalcRecord {
             inp_generation: 0,
             vars: [0.0; crate::calc::CALC_NARGS],
             prev: [0.0; crate::calc::CALC_NARGS],
+            input_changes: 0,
             calc_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
@@ -174,14 +184,6 @@ impl CalcRecord {
         ));
     }
 
-    /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
-    /// only when the input `X` actually changed since the last post.
-    fn advance_prev(new: f64, prev: &mut f64) {
-        if new != *prev {
-            *prev = new;
-        }
-    }
-
     /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
     /// it inside the per-field change test
     /// (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only for
@@ -193,9 +195,14 @@ impl CalcRecord {
     /// calcRecord.c:119-125), so both paths through `process()` come through
     /// here.
     fn advance_prev_inputs(&mut self) {
-        for (new, prev) in self.vars.iter().zip(self.prev.iter_mut()) {
-            Self::advance_prev(*new, prev);
+        let mut changes = 0;
+        for (i, (new, prev)) in self.vars.iter().zip(self.prev.iter_mut()).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 1 << i;
+            }
         }
+        self.input_changes = changes;
     }
 
     pub fn get_inp_link(&self, idx: usize) -> &str {
@@ -326,10 +333,11 @@ impl Record for CalcRecord {
     /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
     /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:418-420).
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
-            "R", "S", "T", "U",
-        ]
+        &CALC_INPUT_FIELDS
+    }
+
+    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
+        (&CALC_INPUT_FIELDS, self.input_changes)
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {
@@ -415,6 +423,7 @@ impl Record for CalcRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.input_changes = 0;
         // C `calcRecord.c::process` (119-125):
         //
         // ```c

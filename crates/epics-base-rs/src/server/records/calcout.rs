@@ -113,6 +113,10 @@ pub struct CalcoutRecord {
     pub s: f64,
     pub t: f64,
     pub u: f64,
+    // The inputs this cycle's `advance_prev_all` found apart from LA..LU,
+    // bit i for input i; zero on a cycle that ran no advance (the ODLY
+    // delaying cycle, which C leaves before `monitor()`).
+    input_changes: u32,
     // Previous values LA..LU
     pub la: f64,
     pub lb: f64,
@@ -207,10 +211,9 @@ pub struct CalcoutRecord {
     // the OUT link into these. Index 0..21 maps to inputs A..U.
     in_status: [i16; 21],
     out_status: i16,
-    // Mirror of the common OUT-link string, synced from `CommonFields::out`
-    // in `check_alarms`. The OUT link is a common field, not a calcout-owned
-    // field, so this is the only in-record path to observe it for OUTV
-    // classification (see `check_alarms`).
+    // The common OUT-link text as `init_links` saw it at load, for the init
+    // classification. A runtime OUT put is classified from the record's own
+    // OUT (`post_put_link_status`), so this is never read after load.
     out: crate::server::record::SparseText,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
@@ -279,6 +282,7 @@ impl Default for CalcoutRecord {
             s: 0.0,
             t: 0.0,
             u: 0.0,
+            input_changes: 0,
             la: 0.0,
             lb: 0.0,
             lc: 0.0,
@@ -334,41 +338,46 @@ impl Default for CalcoutRecord {
 }
 
 impl CalcoutRecord {
-    /// C `calcoutRecord.c::monitor`: advance the `LX` previous-value
-    /// field only when the input `X` actually changed since the last
-    /// monitor post.
-    fn advance_prev(new: f64, prev: &mut f64) {
-        if new != *prev {
-            *prev = new;
-        }
-    }
-
     /// The 21 `LX` advances as one step. C reaches them in `monitor`
     /// (`calcoutRecord.c:679-685`), which `process` calls at `:306` — below
     /// the ODLY early return at `:282`, so both the immediate cycle and the
     /// delayed continuation run them and the delaying cycle does not.
     fn advance_prev_all(&mut self) {
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
+        let prev = [
+            &mut self.la,
+            &mut self.lb,
+            &mut self.lc,
+            &mut self.ld,
+            &mut self.le,
+            &mut self.lf,
+            &mut self.lg,
+            &mut self.lh,
+            &mut self.li,
+            &mut self.lj,
+            &mut self.lk,
+            &mut self.ll,
+            &mut self.lm,
+            &mut self.ln,
+            &mut self.lo,
+            &mut self.lp,
+            &mut self.lq,
+            &mut self.lr,
+            &mut self.ls,
+            &mut self.lt,
+            &mut self.lu,
+        ];
+        let new = [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ];
+        let mut changes = 0;
+        for (i, (new, prev)) in new.into_iter().zip(prev).enumerate() {
+            if new != *prev {
+                *prev = new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
     }
 
     /// C `calcoutRecord.c::execOutput` (613-627), the "Determine output data"
@@ -517,14 +526,16 @@ impl CalcoutRecord {
         }
     }
 
-    /// True for the INP link-config fields whose put must re-classify the
-    /// link diagnostics (C `calcoutRecord.c::special` SPC_MOD → `checkLinks`).
-    /// `OUT` is excluded: it is a common field, so its post-put string is not
-    /// visible here — OUTV re-classifies from `check_alarms` instead.
-    fn is_link_config_field(name: &str) -> bool {
-        match name.strip_prefix("INP") {
-            Some(rest) => matches!(rest.as_bytes(), [b'A'..=b'U']),
-            None => false,
+    /// The status field of a link `special()` handles — C's `plinkValid =
+    /// &prec->inav + lnkIndex` (calcoutRecord.c:371) over INPA..INPU and OUT,
+    /// whose status follows INUV.
+    fn link_status_field(name: &str) -> Option<&'static str> {
+        if name == "OUT" {
+            return Some("OUTV");
+        }
+        match name.strip_prefix("INP")?.as_bytes() {
+            [c @ b'A'..=b'U'] => Some(CALCOUT_INAV_FIELDS[(c - b'A') as usize]),
+            _ => None,
         }
     }
 
@@ -532,11 +543,9 @@ impl CalcoutRecord {
     /// `menu(calcoutINAV)` connection status and post the live
     /// `INAV`..`INUV`/`OUTV` diagnostics, mirroring C
     /// `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) and the
-    /// `checkLinksCallback` re-poll. epics-base-rs surfaces no link
-    /// connection-change signal, so (like sseq) the refresh runs at record
-    /// init (`set_async_context`), on `special()` of an INP field, and when
-    /// `check_alarms` observes the OUT link change. No-op without an async
-    /// context.
+    /// `checkLinksCallback` re-poll. Runs at record init only
+    /// (`set_async_context`, `init_links`); a link put is
+    /// [`Self::post_put_link_status`]'s. No-op without an async context.
     fn refresh_link_status(&self) {
         let mut links: Vec<(&'static str, String, LinkRole)> = self
             .input_links()
@@ -550,6 +559,39 @@ impl CalcoutRecord {
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
+            crate::server::recgbl::EventMask::VALUE,
+        );
+    }
+
+    /// The status post a put to the link behind `put` owes (C
+    /// `calcoutRecord.c:404`). OUT is read back from the record: it is a
+    /// common field, and `self.out` holds its load-time text only.
+    fn post_put_link_status(&self, put: &'static str) {
+        use crate::server::records::link_status::{LinkSlot, LinkText};
+        let mut links: Vec<LinkSlot> = self
+            .input_links()
+            .into_iter()
+            .enumerate()
+            .map(|(i, link)| LinkSlot {
+                status_field: CALCOUT_INAV_FIELDS[i],
+                text: LinkText::Held(link),
+                role: LinkRole::Input,
+                held: self.in_status[i],
+                value_field: None,
+            })
+            .collect();
+        links.push(LinkSlot {
+            status_field: "OUTV",
+            text: LinkText::Common("OUT"),
+            role: LinkRole::Output,
+            held: self.out_status,
+            value_field: Some("OVAL"),
+        });
+        crate::server::records::link_status::post_link_put_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            links,
+            put,
             crate::server::recgbl::EventMask::VALUE,
         );
     }
@@ -619,10 +661,14 @@ impl Record for CalcoutRecord {
     /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
     /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcoutRecord.c:681-682).
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
-            "R", "S", "T", "U",
-        ]
+        &crate::server::records::calc::CALC_INPUT_FIELDS
+    }
+
+    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
+        (
+            &crate::server::records::calc::CALC_INPUT_FIELDS,
+            self.input_changes,
+        )
     }
 
     fn alarm_cycle_posts_value_log(&self) -> bool {
@@ -763,6 +809,7 @@ impl Record for CalcoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.input_changes = 0;
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` + `dlya`
         // branch, `:294-301`). No input fetch and no CALC pass — C's `pact`
@@ -1539,9 +1586,8 @@ impl Record for CalcoutRecord {
         // the OUT link into INAV..INUV/OUTV. The INP links are calcout fields
         // already applied (record fields load before `add_record`), so
         // classify them now. The OUT link is a common field not yet applied
-        // at `add_record`; it is captured later in `init_links` (load) or
-        // `check_alarms` (a runtime OUT re-point). The generation gate lets
-        // that later, fuller refresh supersede this one.
+        // at `add_record`; it is captured later in `init_links`. The
+        // generation gate lets that later, fuller refresh supersede this one.
         self.refresh_link_status();
     }
 
@@ -1583,13 +1629,12 @@ impl Record for CalcoutRecord {
             }
             _ => {}
         }
-        // A put to an INP link re-classifies the link diagnostics: C
-        // `calcoutRecord.c::special` (SPC_MOD) re-runs `checkLinks`. The INP
-        // string the put just stored is re-read by `refresh_link_status`.
-        // OUT is excluded here (see `is_link_config_field`); it re-classifies
-        // from `check_alarms`.
-        if Self::is_link_config_field(field) {
-            self.refresh_link_status();
+        // A put to INPA..INPU or OUT re-classifies that link and posts its
+        // status (calcoutRecord.c:366-405). The value field a constant INPx
+        // loads is posted by the framework's re-seed
+        // (`special_reseed_input_links`); OUT's OVAL by the status task.
+        if let Some(status_field) = Self::link_status_field(field) {
+            self.post_put_link_status(status_field);
         }
         Ok(())
     }
@@ -1619,17 +1664,6 @@ impl Record for CalcoutRecord {
         // as defined.
         if std::mem::take(&mut self.value_computed) {
             common.udf = self.value_is_undefined() as u8;
-        }
-
-        // The OUT link lives in the common fields, not a calcout-owned field.
-        // `init_links` captures it at load; this hook catches a *runtime* OUT
-        // re-point (a put to OUT does not process, so `special("OUT")` cannot
-        // re-classify it — see `is_link_config_field`). C re-runs the same
-        // `init_record`/`checkLinks` OUT classification on any link change
-        // (calcoutRecord.c:160-189). Only re-classify when OUT actually moved.
-        if self.out != common.out {
-            self.out.set(&common.out);
-            self.refresh_link_status();
         }
 
         // C `calcoutRecord.c:238-241` (CALC) and `:622` (OCAL, inside
@@ -1683,15 +1717,15 @@ mod link_status_tests {
         assert_eq!(CalcoutRecord::input_status_index("INABV"), None);
     }
 
-    // Boundary: `special()` re-classifies only on an INP link put; OUT is a
-    // common field whose post-put string is invisible here.
+    // Boundary: C's `lnkIndex` covers INPA..INPU and OUT, nothing else.
     #[test]
-    fn is_link_config_field_only_inp_links() {
-        assert!(CalcoutRecord::is_link_config_field("INPA"));
-        assert!(CalcoutRecord::is_link_config_field("INPU"));
-        assert!(!CalcoutRecord::is_link_config_field("OUT"));
-        assert!(!CalcoutRecord::is_link_config_field("INAV")); // status, not link
-        assert!(!CalcoutRecord::is_link_config_field("CALC"));
+    fn link_status_field_boundaries() {
+        assert_eq!(CalcoutRecord::link_status_field("INPA"), Some("INAV"));
+        assert_eq!(CalcoutRecord::link_status_field("INPU"), Some("INUV"));
+        assert_eq!(CalcoutRecord::link_status_field("OUT"), Some("OUTV"));
+        assert_eq!(CalcoutRecord::link_status_field("INPV"), None); // past U
+        assert_eq!(CalcoutRecord::link_status_field("INAV"), None); // status
+        assert_eq!(CalcoutRecord::link_status_field("CALC"), None);
     }
 
     // Every INAV..INUV and OUTV serves the menu(calcoutINAV) labels; the

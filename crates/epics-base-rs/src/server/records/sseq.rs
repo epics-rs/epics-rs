@@ -1035,12 +1035,11 @@ impl SseqRecord {
                 (s.dol.clone(), s.lnk.clone(), s.wait)
             })
             .collect();
-        let link_gen = self.link_gen.clone();
         // Stamp this refresh. A concurrent later refresh (a runtime DOLn/LNKn
         // re-point through `special()`) issues a newer token; this task then
         // sees its token is stale and drops its post so an init-time snapshot
         // finishing late cannot clobber the newer classification.
-        let token = link_gen.next();
+        let token = self.link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
@@ -1068,13 +1067,12 @@ impl SseqRecord {
             // `:872`, `:877`, `:1005`, `:1008`, `:1011`; `lnk_status` `:240`,
             // `:900`, `:905`, `:914`, `:1047`, `:1052`, `:1057`;
             // `waitConfigErr` `:910`, `:919`, `:925`, `:932`.
-            if link_gen.is_current(token) {
-                let _ = handle.post_fields_with_mask(
-                    &name,
-                    fields,
-                    crate::server::recgbl::EventMask::VALUE,
-                );
-            }
+            token.post(
+                &handle,
+                &name,
+                fields,
+                crate::server::recgbl::EventMask::VALUE,
+            );
         });
     }
 

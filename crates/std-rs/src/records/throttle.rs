@@ -1,6 +1,7 @@
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{
     FieldDesc, FieldMetadataOverride, LinkType, ProcessAction, ProcessOutcome, Record,
     link_field_type,
@@ -228,10 +229,9 @@ impl ThrottleRecord {
         let handle = handle.clone();
         let out = self.out.clone();
         let sinp = self.sinp.clone();
-        let link_gen = self.link_gen.clone();
         // Stamp this refresh so a later re-point (an OUT/SINP `special()`)
         // supersedes an init-time snapshot that finishes late.
-        let token = link_gen.next();
+        let token = self.link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
@@ -241,15 +241,15 @@ impl ThrottleRecord {
             // CONSTANT link's field-type code by direction.
             let (ov, _) = classify_link(&handle, &out, LinkRole::Output);
             let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input);
-            if link_gen.is_current(token) {
-                let _ = handle.post_fields(
-                    &name,
-                    vec![
-                        ("OV".to_string(), EpicsValue::Short(ov)),
-                        ("SIV".to_string(), EpicsValue::Short(siv)),
-                    ],
-                );
-            }
+            token.post(
+                &handle,
+                &name,
+                vec![
+                    ("OV".to_string(), EpicsValue::Short(ov)),
+                    ("SIV".to_string(), EpicsValue::Short(siv)),
+                ],
+                EventMask::VALUE | EventMask::LOG,
+            );
         });
     }
 

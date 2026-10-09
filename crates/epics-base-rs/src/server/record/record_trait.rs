@@ -3302,6 +3302,17 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Fields whose C `monitor()` change test reads the record's own previous
+    /// copy rather than what was last posted, and which of them this cycle
+    /// found changed (bit i for `names[i]`). calc/calcout compare `A..U`
+    /// against `LA..LU` (calcRecord.c:418, calcoutRecord.c:681), which a put
+    /// does not move, so a put-then-process posts the input twice in C.
+    ///
+    /// Default: none — every field is compared against its last post.
+    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
+        (&[], 0)
+    }
+
     /// Fields the record's C `monitor()` re-posts with `DBE_VAL_LOG` on
     /// every cycle that recomputed them, even when the value did not
     /// change — the analogue of an unconditional `MARK(field)` in C.

@@ -368,6 +368,23 @@ impl AsyncDbHandle {
         }
     }
 
+    /// [`Self::post_fields_with_mask`], dropped whole unless `current` holds
+    /// once the record write lock is taken — see
+    /// [`PvDatabase::post_fields_with_mask_if`].
+    pub(crate) fn post_fields_with_mask_if(
+        &self,
+        name: &str,
+        repost: Option<&str>,
+        fields: Vec<(String, EpicsValue)>,
+        mask: crate::server::recgbl::EventMask,
+        current: impl FnOnce() -> bool,
+    ) -> CaResult<Vec<String>> {
+        match self.db() {
+            Some(db) => db.post_fields_with_mask_if(name, repost, fields, mask, current),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// C `dbCaPutLinkCallback`'s return status, asked before the put is
     /// issued: would a put-WITH-completion to `link` be admitted right now?
     ///
@@ -2766,6 +2783,22 @@ impl PvDatabase {
         fields: Vec<(String, EpicsValue)>,
         mask: crate::server::recgbl::EventMask,
     ) -> CaResult<Vec<String>> {
+        self.post_fields_with_mask_if(name, None, fields, mask, || true)
+    }
+
+    /// [`Self::post_fields_with_mask`], asking `current` under the record
+    /// write lock and posting nothing when it says no. A check made before
+    /// the lock is taken can be overtaken by a put that holds it; asked under
+    /// the lock, it sees every put that ran before this post. `repost` is a
+    /// field posted first at the value it holds.
+    pub(crate) fn post_fields_with_mask_if(
+        &self,
+        name: &str,
+        repost: Option<&str>,
+        fields: Vec<(String, EpicsValue)>,
+        mask: crate::server::recgbl::EventMask,
+        current: impl FnOnce() -> bool,
+    ) -> CaResult<Vec<String>> {
         let rec = {
             let records = self.inner.records.read();
             records.get(name).cloned()
@@ -2781,6 +2814,12 @@ impl PvDatabase {
             fields.iter().map(|(f, v)| (f.as_str(), v)),
         );
         let mut inst = rec.write();
+        if !current() {
+            return Ok(Vec::new());
+        }
+        if let Some(field) = repost {
+            inst.notify_field_backed(field, mask, link_backing);
+        }
         let mut posted = Vec::with_capacity(fields.len());
         for (field, value) in fields {
             inst.put_internal_field_of(&field, value, &mut links)?;

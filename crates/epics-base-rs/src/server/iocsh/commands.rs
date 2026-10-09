@@ -14644,8 +14644,13 @@ Total 3 records, 2 aliases
         );
         run_cmd(&ctx, "dbLoadRecords", &[&format!("{dir}/t.db")]);
         ctx.block_on(db.ioc_init());
+        let cmds = include_str!("testdata/dollar_view/cmds.txt");
+        let want = include_str!("testdata/dollar_view/softioc.out");
+        // Zipping two empty files would compare nothing.
+        assert!(cmds.lines().count() > 0, "cmds.txt is empty");
+        assert!(want.lines().count() > 0, "softioc.out is empty");
         let mut out = String::new();
-        for line in include_str!("testdata/dollar_view/cmds.txt").lines() {
+        for line in cmds.lines() {
             let mut words = line.split_whitespace();
             let cmd = words.next().unwrap();
             // iocsh's quoting: `""` is the empty argument, `'...'` one word.
@@ -14675,7 +14680,6 @@ Total 3 records, 2 aliases
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let want = include_str!("testdata/dollar_view/softioc.out");
         for (n, (got, want)) in mask(&out).lines().zip(mask(want).lines()).enumerate() {
             assert_eq!(got, want, "line {}", n + 1);
         }

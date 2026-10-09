@@ -7282,6 +7282,7 @@ impl RecordInstance {
         let marked_only = self.record.fields_posted_only_when_marked();
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
+        let (prev_compared, prev_changed) = self.record.prev_compared_inputs();
 
         // The walk covers every field whose published value is tracked — each
         // subscribed field, and each field a post has already published — not
@@ -7320,9 +7321,12 @@ impl RecordInstance {
             let Some(val) = read else {
                 continue;
             };
-            let changed = match published.map(|p| &p.value) {
-                Some(prev) => prev != &val,
-                None => self.posted_value(field).is_none_or(|prev| prev != &val),
+            let changed = match prev_compared.iter().position(|name| *name == field) {
+                Some(bit) => prev_changed & (1 << bit) != 0,
+                None => match published.map(|p| &p.value) {
+                    Some(prev) => prev != &val,
+                    None => self.posted_value(field).is_none_or(|prev| prev != &val),
+                },
             };
             if let Some(gate) = value_gate(value_masked, field) {
                 // C posts this secondary value field with VAL's own monitor_mask,

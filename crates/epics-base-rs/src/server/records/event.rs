@@ -223,6 +223,17 @@ impl Record for EventRecord {
         Some(EpicsValue::String(self.val.clone()))
     }
 
+    /// INP (`devEventSoft.c:56`) and SIOL (`eventRecord.c:185`) are both
+    /// `dbGetLink(.., DBR_STRING, .., 0, 0)`; the native read built the same
+    /// text through the generic VAL put.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match link_field {
+            "INP" | "SIOL" => LinkReadAs::String,
+            _ => LinkReadAs::Native,
+        })
+    }
+
     /// `devEventSoft.c::read_event` (76-80): the `DBR_STRING` read replaces
     /// VAL only when it differs (`strcmp` then `strcpy`). The read is already
     /// VAL's own type, so it skips the generic put's field-shape lookups.

@@ -136,11 +136,28 @@ impl Record for LsoRecord {
         use crate::server::record::LinkReadAs;
         use crate::types::DbFieldType;
         Some(match source.field_type {
-            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
-                max_elements: self.sizv as usize,
-            },
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
+    }
+
+    /// The closed-loop DOL read lands through `dbGetLinkLS`
+    /// (`lsoRecord.c:114`), not the 40-byte DBR_STRING put of a VAL write.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        match value {
+            EpicsValue::String(s) => self.val = truncate_bytes(s, self.capacity()),
+            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+                if let Some(v) = super::lsi::link_ls_chars(&b, self.sizv) {
+                    self.val = v;
+                }
+            }
+            EpicsValue::Char(b) | EpicsValue::UChar(b) => {
+                self.val = super::lsi::link_ls_chars(&[b], self.sizv).unwrap_or_default()
+            }
+            other => return self.put_field_internal("VAL", other),
+        }
+        self.len = (self.val.len() + 1) as u32;
+        Ok(())
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsoRecord.dbd.pod`): `SIMM`

@@ -959,7 +959,7 @@ impl EpicsValue {
                 }),
                 DbFieldType::Char => EpicsValue::CharArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i8(v) as u8).collect(),
                 }),
                 // DBF_UCHAR[] narrows off the integer view (low 8 bits), the
                 // unsigned twin of the Char target.
@@ -1055,9 +1055,10 @@ impl EpicsValue {
                 if let EpicsValue::String(s) = self {
                     EpicsValue::CharArray(s.as_bytes().to_vec().into())
                 } else {
+                    // `Char` carries the epicsInt8's bits: C `(epicsInt8) d`.
                     EpicsValue::Char(match self.as_int_i64() {
                         Some(i) => i as u8,
-                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
+                        None => c_cast::f64_to_i8(self.to_f64().unwrap_or(0.0)) as u8,
                     })
                 }
             }
@@ -1066,28 +1067,17 @@ impl EpicsValue {
                 None => c_cast::f64_to_i32(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
-            DbFieldType::Int64 => {
-                // Avoid f64 round-trip when value is already Int64.
-                if let EpicsValue::Int64(v) = self {
-                    EpicsValue::Int64(*v)
-                } else if let EpicsValue::UInt64(v) = self {
-                    // UInt64 → Int64: exact bit-preserving integer cast,
-                    // not an f64 round-trip (lossy above 2^53).
-                    EpicsValue::Int64(*v as i64)
-                } else {
-                    EpicsValue::Int64(c_cast::f64_to_i64(self.to_f64().unwrap_or(0.0)))
-                }
-            }
-            DbFieldType::UInt64 => {
-                // Avoid f64 round-trip when value is already an integer.
-                if let EpicsValue::UInt64(v) = self {
-                    EpicsValue::UInt64(*v)
-                } else if let EpicsValue::Int64(v) = self {
-                    EpicsValue::UInt64(*v as u64)
-                } else {
-                    EpicsValue::UInt64(c_cast::f64_to_u64(self.to_f64().unwrap_or(0.0)))
-                }
-            }
+            // Every integer source keeps its bits through the i64 view, signed
+            // ones sign-extending (C `getLongUInt64`/`cvt_l_uq`: -200 ->
+            // 0xffffffffffffff38); only a float takes the f64 cast.
+            DbFieldType::Int64 => EpicsValue::Int64(match self.as_int_i64() {
+                Some(i) => i,
+                None => c_cast::f64_to_i64(self.to_f64().unwrap_or(0.0)),
+            }),
+            DbFieldType::UInt64 => EpicsValue::UInt64(match self.as_int_i64() {
+                Some(i) => i as u64,
+                None => c_cast::f64_to_u64(self.to_f64().unwrap_or(0.0)),
+            }),
             // Unsigned narrowing mirrors the signed targets: integer sources
             // truncate off the i64 view (C/pvxs `static_cast`), float/string
             // sources fall back to the f64 round-trip.
@@ -1783,6 +1773,57 @@ mod array_convert_tests {
 #[cfg(test)]
 mod int_narrow_scalar_tests {
     use super::*;
+
+    /// `DBF_CHAR` is epicsInt8: a double reaches it through C's
+    /// `(epicsInt8) d` (`cvt_d_c`), so -1.0 is 0xff (softIoc: printf `%hhd`
+    /// of an ai at -1 prints -1, `%c` writes 0xff), not the unsigned clamp's 0.
+    #[test]
+    fn a_signed_integer_reaches_dbf_uint64_sign_extended() {
+        for v in [
+            EpicsValue::Long(-200),
+            EpicsValue::Short(-200),
+            EpicsValue::Int64(-200),
+        ] {
+            assert_eq!(
+                v.convert_to(DbFieldType::UInt64),
+                EpicsValue::UInt64(0xffff_ffff_ffff_ff38),
+                "{v:?}"
+            );
+        }
+        assert_eq!(
+            EpicsValue::Char(0xff).convert_to(DbFieldType::UInt64),
+            EpicsValue::UInt64(u64::MAX)
+        );
+        assert_eq!(
+            EpicsValue::UInt64(u64::MAX).convert_to(DbFieldType::Int64),
+            EpicsValue::Int64(-1)
+        );
+        assert_eq!(
+            EpicsValue::ULong(u32::MAX).convert_to(DbFieldType::Int64),
+            EpicsValue::Int64(u32::MAX as i64)
+        );
+    }
+
+    #[test]
+    fn a_double_reaches_dbf_char_signed() {
+        for (d, b) in [
+            (-1.0, 0xff),
+            (-2.7, 0xfe),
+            (65.0, 65),
+            (-300.0, 0xd4),
+            (300.0, 0x2c),
+        ] {
+            assert_eq!(
+                EpicsValue::Double(d).convert_to(DbFieldType::Char),
+                EpicsValue::Char(b),
+                "{d}"
+            );
+        }
+        assert_eq!(
+            EpicsValue::DoubleArray(vec![-1.0, 300.0].into()).convert_to(DbFieldType::Char),
+            EpicsValue::CharArray(vec![0xff, 0x2c].into())
+        );
+    }
 
     #[test]
     fn uint_carrier_narrows_to_signed_by_truncation() {

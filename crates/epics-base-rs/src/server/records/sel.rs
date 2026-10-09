@@ -222,6 +222,31 @@ impl Record for SelRecord {
         "sel"
     }
 
+    /// `selRecord.c:102-105` writes NaN into A..L in pass 1, before the
+    /// constant-link load, so a `.db` value survives only behind a
+    /// constant INPx.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 1 {
+            for v in [
+                &mut self.a,
+                &mut self.b,
+                &mut self.c,
+                &mut self.d,
+                &mut self.e,
+                &mut self.f,
+                &mut self.g,
+                &mut self.h,
+                &mut self.i,
+                &mut self.j,
+                &mut self.k,
+                &mut self.l,
+            ] {
+                *v = f64::NAN;
+            }
+        }
+        Ok(())
+    }
+
     /// C `selRecord.c::do_sel` — pick VAL per SELM, updating SELN for
     /// the High/Low/Median algorithms and setting VAL=NaN (→ UDF) when
     /// no valid input exists or the selected input is undefined.

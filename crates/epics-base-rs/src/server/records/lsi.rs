@@ -22,6 +22,18 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
     PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
+/// C `dbGetLinkLS`'s char arm (`dbLink.c:507-522`): a CHAR/UCHAR source is
+/// read as up to SIZV raw elements and `pbuffer[--len] = 0` then overwrites
+/// the last one read, so "hij" with no NUL lands as "hi". `None` is the
+/// empty read, which writes `pbuffer[-1]` and leaves VAL. Its DBR_STRING
+/// arm is the plain cut to SIZV - 1.
+pub(crate) fn link_ls_chars(read: &[u8], sizv: u16) -> Option<PvString> {
+    let n = read.len().min(sizv as usize);
+    let text = &read[..n.checked_sub(1)?];
+    let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+    Some(PvString::from_bytes(text[..end].to_vec()))
+}
+
 // Long string input record (EPICS 7).
 // Native CA type is DBR_CHAR array; SIZV (default 256) sets the max byte count.
 // LEN reports the current string length (number of bytes including NUL terminator).
@@ -86,6 +98,25 @@ impl LsiRecord {
         rec
     }
 
+    /// The char-source read of `dbGetLinkLS`; any other read is the VAL put.
+    /// Kept out of [`Record::soft_input_read`] so the DBR_STRING read does
+    /// not pay this match's dispatch.
+    fn land_link_chars(&mut self, value: EpicsValue) -> CaResult<()> {
+        match value {
+            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+                if let Some(v) = link_ls_chars(&b, self.sizv) {
+                    self.val = v;
+                }
+            }
+            EpicsValue::Char(b) | EpicsValue::UChar(b) => {
+                self.val = link_ls_chars(&[b], self.sizv).unwrap_or_default()
+            }
+            other => return self.set_val(other),
+        }
+        self.len = (self.val.len() + 1) as u32;
+        Ok(())
+    }
+
     /// VAL's byte capacity: SIZV less the NUL. VAL never exceeds it — every
     /// write, and a SIZV put, cuts to it.
     fn capacity(&self) -> usize {
@@ -134,9 +165,7 @@ impl Record for LsiRecord {
         use crate::server::record::LinkReadAs;
         use crate::types::DbFieldType;
         Some(match source.field_type {
-            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
-                max_elements: self.sizv as usize,
-            },
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
     }
@@ -268,9 +297,14 @@ impl Record for LsiRecord {
                 self.len = (self.val.len() + 1) as u32;
                 Ok(())
             }
-            Some(other) => self.set_val(other),
+            Some(other) => self.land_link_chars(other),
             None => Ok(()),
         }
+    }
+
+    /// The simulated SIOL read is the same `dbGetLinkLS` (`lsiRecord.c:244`).
+    fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
+        self.soft_input_read(Some(value))
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

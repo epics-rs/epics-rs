@@ -40,6 +40,14 @@
 //! off 2026-07-14; Tier 1 is untouched, because a `DBF_LONG` field carries 32
 //! bits on the wire regardless of which 32 bits we chose.
 //!
+//! The widths narrower than 32 bits take one more, DEFINED step. Both
+//! targets compile `(epicsInt8) d` / `(epicsUInt16) d` as a 32-bit convert
+//! followed by a truncation to the low bits (x86-64 `cvttsd2si %eax` then
+//! `%al`/`%ax`; aarch64 `fcvtzs w0` then the same), so the narrow helpers are
+//! [`f64_to_i32`] then a wrapping `as`: softIoc stores 300 into a `DBF_CHAR`
+//! as 44 and -2.7 into a `DBF_USHORT` as 65534. Only the 32-bit step carries
+//! the saturation policy (an x86-64 IOC stores 0 for 1e10, an ARM one 255).
+//!
 //! No alarm is raised: `dbConvert`'s routines run on the put path, outside the
 //! record's own process cycle, so an alarm raised here would be erased by the
 //! next `recGblResetAlarms` unless routed through `nsta`/`nsev` — and even
@@ -70,25 +78,25 @@ pub fn f64_to_i64(v: f64) -> i64 {
     v as i64
 }
 
-/// C `(char) d` / `(epicsInt8) d`, saturated: clamps to `i8`'s range, NaN -> 0.
+/// C `(char) d` / `(epicsInt8) d`: the 32-bit convert, then the low byte.
 pub fn f64_to_i8(v: f64) -> i8 {
-    v as i8
+    f64_to_i32(v) as i8
 }
 
-/// C `(epicsUInt8) d`, saturated: clamps to `u8`'s range, negatives and NaN -> 0.
+/// C `(epicsUInt8) d`: the 32-bit convert, then the low byte.
 pub fn f64_to_u8(v: f64) -> u8 {
-    v as u8
+    f64_to_i32(v) as u8
 }
 
-/// C `(epicsInt16) d`, saturated: clamps to `i16`'s range, NaN -> 0.
+/// C `(epicsInt16) d`: the 32-bit convert, then the low 16 bits.
 pub fn f64_to_i16(v: f64) -> i16 {
-    v as i16
+    f64_to_i32(v) as i16
 }
 
-/// C `(epicsUInt16) d` / `(epicsEnum16) d`, saturated: clamps to `u16`'s range,
-/// negatives and NaN -> 0.
+/// C `(epicsUInt16) d` / `(epicsEnum16) d`: the 32-bit convert, then the low
+/// 16 bits.
 pub fn f64_to_u16(v: f64) -> u16 {
-    v as u16
+    f64_to_i32(v) as u16
 }
 
 /// C `(epicsUInt32) d`, saturated: clamps to `u32`'s range, negatives and
@@ -146,7 +154,8 @@ pub fn f64_to_f32(v: f64) -> f32 {
 mod tests {
     use super::*;
 
-    /// The conversion saturates at the destination's bounds and sends NaN to 0.
+    /// The 32-bit step saturates and sends NaN to 0; a narrower dest wraps
+    /// that result.
     ///
     /// The out-of-range rows are exactly where a compiled x86-64 IOC would store
     /// the "integer indefinite" instead (`3.0e9 -> i32` = `INT_MIN` there). We
@@ -160,37 +169,35 @@ mod tests {
             (1.7, 1, 1, 1, 1, 1, 1, 1, 1),
             (2.2, 2, 2, 2, 2, 2, 2, 2, 2),
             (-0.5, 0, 0, 0, 0, 0, 0, 0, 0),
-            // Truncation is toward zero, as in C.
-            (-3.9, -3, 0, -3, 0, -3, 0, -3, 0),
-            // Boundary: exactly representable at each width's edge.
+            // Truncation is toward zero; a narrow dest takes the low bits of
+            // the 32-bit result (softIoc: -2.7 -> DBF_USHORT 65534).
+            (-3.9, -3, 253, -3, 65533, -3, 0, -3, 0),
+            (-1.0, -1, 255, -1, 65535, -1, 0, -1, 0),
             (127.0, 127, 127, 127, 127, 127, 127, 127, 127),
-            (255.9, 127, 255, 255, 255, 255, 255, 255, 255),
-            (32767.5, 127, 255, 32767, 32767, 32767, 32767, 32767, 32767),
-            (65535.7, 127, 255, 32767, 65535, 65535, 65535, 65535, 65535),
-            // Over an inner width, still inside a wider one: the narrow dest
-            // CLAMPS (C's x86 build would wrap here — 70000 & 0xFFFF = 4464).
-            (70000.9, 127, 255, 32767, 65535, 70000, 70000, 70000, 70000),
-            // Over i32, inside u32/i64/u64.
+            (255.9, -1, 255, 255, 255, 255, 255, 255, 255),
+            (32767.5, -1, 255, 32767, 32767, 32767, 32767, 32767, 32767),
+            (65535.7, -1, 255, -1, 65535, 65535, 65535, 65535, 65535),
+            // softIoc: 70000 -> DBF_CHAR 112, DBF_USHORT 4464.
+            (70000.9, 112, 112, 4464, 4464, 70000, 70000, 70000, 70000),
+            // Past i32: the 32-bit step saturates (an x86-64 IOC stores INT_MIN
+            // there, so 0 in every narrow dest; an ARM one agrees with this).
             (
                 3.0e9,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 3000000000,
                 3000000000,
                 3000000000,
             ),
-            // Negative: every unsigned dest clamps to 0, not to a wrapped bit pattern.
-            (-1.0, -1, 0, -1, 0, -1, 0, -1, 0),
-            (-3.0e9, i8::MIN, 0, i16::MIN, 0, i32::MIN, 0, -3000000000, 0),
-            // At and beyond the i32 edge.
+            (-3.0e9, 0, 0, 0, 0, i32::MIN, 0, -3000000000, 0),
             (
                 2147483647.5,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 2147483647,
@@ -199,34 +206,32 @@ mod tests {
             ),
             (
                 4294967295.5,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 u32::MAX,
                 4294967295,
                 4294967295,
             ),
-            // Beyond every 32-bit dest.
             (
                 1.0e19,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 u32::MAX,
                 i64::MAX,
                 10000000000000000000,
             ),
-            (-1.0e19, i8::MIN, 0, i16::MIN, 0, i32::MIN, 0, i64::MIN, 0),
-            // Beyond every dest, and the infinities: saturate, never indefinite.
+            (-1.0e19, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
             (
                 1.0e300,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 u32::MAX,
@@ -235,28 +240,18 @@ mod tests {
             ),
             (
                 f64::INFINITY,
-                127,
+                -1,
                 255,
-                32767,
+                -1,
                 65535,
                 i32::MAX,
                 u32::MAX,
                 i64::MAX,
                 u64::MAX,
             ),
-            (
-                f64::NEG_INFINITY,
-                i8::MIN,
-                0,
-                i16::MIN,
-                0,
-                i32::MIN,
-                0,
-                i64::MIN,
-                0,
-            ),
+            (f64::NEG_INFINITY, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
             // NaN is 0 in every destination — an ARM IOC agrees; an x86 one stores
-            // INT_MIN.
+            // INT_MIN, which is 0 in the narrow ones too.
             (f64::NAN, 0, 0, 0, 0, 0, 0, 0, 0),
         ];
         for &(d, i8v, u8v, i16v, u16v, i32v, u32v, i64v, u64v) in rows {
@@ -276,7 +271,7 @@ mod tests {
     #[test]
     fn saturation_is_rusts_native_as() {
         assert_eq!(f64_to_i32(3.0e9), 3.0e9 as i32);
-        assert_eq!(f64_to_i16(70000.9), 70000.9_f64 as i16);
+        assert_eq!(f64_to_i16(70000.9), 70000.9_f64 as i32 as i16);
         assert_eq!(f64_to_u32(-1.0), -1.0_f64 as u32);
     }
 }

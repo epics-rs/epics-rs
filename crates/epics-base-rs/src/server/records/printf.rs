@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{ProcessOutcome, Record};
+use crate::server::record::{LinkReadAs, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString, SharedArray};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -62,6 +62,9 @@ pub struct PrintfRecord {
     resolved: [bool; 10],
     /// `process`'s format buffer, kept so a cycle formats without allocating.
     fmt_buf: Vec<u8>,
+    /// [`Self::slot_requests`] of `fmt`, written with it by [`Self::set_fmt`]
+    /// so the per-cycle [`Record::input_link_request`] is a lookup.
+    requests: [LinkReadAs; 10],
     /// [`Record::input_links_generation`]: moved on by every write of an
     /// `INPn` text or of the `FMT` that [`Record::input_link_request`] reads.
     links_generation: u64,
@@ -83,6 +86,7 @@ impl Default for PrintfRecord {
             len: 0,
             ivls: PvString::from("LNK"),
             resolved: [false; 10],
+            requests: [LinkReadAs::Native; 10],
             links_generation: 0,
             fmt_buf: Vec::new(),
         }
@@ -140,82 +144,61 @@ enum LengthMod {
 }
 
 impl PrintfRecord {
-    /// Stringify an input value for the `%s` / `%ls` conversion.
-    /// Mirrors C reading the link as `DBR_STRING` / `DBR_CHAR`.
+    /// The bytes `%s` / `%ls` print: the `DBR_STRING` text, or the char
+    /// array up to its NUL.
     fn val_as_bytes(v: &EpicsValue) -> std::borrow::Cow<'_, [u8]> {
         use std::borrow::Cow;
         match v {
             EpicsValue::String(s) => Cow::Borrowed(s.as_bytes()),
-            EpicsValue::CharArray(bytes) => {
+            EpicsValue::CharArray(bytes) | EpicsValue::UCharArray(bytes) => {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 Cow::Borrowed(&bytes[..end])
             }
-            EpicsValue::Double(d) => Cow::Owned(format!("{d}").into_bytes()),
-            EpicsValue::Float(f) => Cow::Owned(format!("{f}").into_bytes()),
-            EpicsValue::Long(n) => Cow::Owned(format!("{n}").into_bytes()),
-            EpicsValue::Short(n) => Cow::Owned(format!("{n}").into_bytes()),
-            EpicsValue::Int64(n) => Cow::Owned(format!("{n}").into_bytes()),
-            EpicsValue::Char(c) => Cow::Owned(format!("{c}").into_bytes()),
-            EpicsValue::Enum(e) => Cow::Owned(format!("{e}").into_bytes()),
-            other => Cow::Owned(format!("{other:?}").into_bytes()),
+            other => Cow::Owned(format!("{other}").into_bytes()),
         }
     }
 
-    fn val_as_f64(v: &EpicsValue) -> f64 {
-        v.to_f64().unwrap_or(0.0)
-    }
-
-    /// The signed integer C's `dbGetLink(plink, DBR_CHAR/SHORT/LONG/INT64)`
-    /// delivers (`printfRecord.c:188-201`), as `epicsSnprintf` then prints it.
-    ///
-    /// An integer source keeps all its bits up to the narrowing, as C's
-    /// `dbConvert` does. A float source takes C's cast (`dbFastLinkConv.c`
-    /// `cvt_d_*`), which on x86-64 lands NaN and out-of-range values on the
-    /// integer-indefinite minimum. `%ld` prints the `epicsInt32` C passes as
-    /// the zero-extended 64-bit long printf reads (softIoc: -200 -> 4294967096).
-    fn signed_arg(v: &EpicsValue, length: LengthMod) -> i64 {
-        let n = v.as_int_i64().unwrap_or_else(|| {
-            let f = Self::val_as_f64(v);
-            match length {
-                LengthMod::LongLong => cvt_i64(f),
-                _ => cvt_i32(f) as i64,
-            }
-        });
-        match length {
-            LengthMod::Char => n as i8 as i64,
-            LengthMod::Short => n as i16 as i64,
-            LengthMod::None => n as i32 as i64,
-            LengthMod::Long => n as u32 as i64,
-            LengthMod::LongLong => n,
-        }
-    }
-
-    /// The unsigned integer C's `DBR_UCHAR/USHORT/ULONG/UINT64` read delivers
-    /// (`printfRecord.c:203-216`); a float source takes the x86-64 C cast to
-    /// that width, as in [`Self::signed_arg`].
-    fn unsigned_arg(v: &EpicsValue, length: LengthMod) -> u64 {
-        let n = v.as_int_i64().map_or_else(
-            || {
-                let f = Self::val_as_f64(v);
-                match length {
-                    LengthMod::Char | LengthMod::Short => cvt_i32(f) as u64,
-                    LengthMod::None | LengthMod::Long => cvt_i64(f) as u64,
-                    LengthMod::LongLong => cvt_u64(f),
-                }
+    /// The `dbGetLink` request C's `doPrintf` makes for a directive's own
+    /// slot (`printfRecord.c:186-292`, `GET_PRINT` at `:47-57`); a `*` reads
+    /// `DBR_SHORT` (`:121-124`).
+    fn directive_read(d: &Directive) -> LinkReadAs {
+        use LengthMod as L;
+        match d.conv {
+            b'c' => LinkReadAs::Char,
+            b'd' | b'i' => match d.length {
+                L::Char => LinkReadAs::Char,
+                L::Short => LinkReadAs::Short,
+                L::LongLong => LinkReadAs::Int64,
+                L::None | L::Long => LinkReadAs::Long,
             },
-            |n| n as u64,
-        );
-        match length {
-            LengthMod::Char => n as u8 as u64,
-            LengthMod::Short => n as u16 as u64,
-            LengthMod::None | LengthMod::Long => n as u32 as u64,
-            LengthMod::LongLong => n,
+            b'o' | b'x' | b'X' | b'u' => match d.length {
+                L::Char => LinkReadAs::UChar,
+                L::Short => LinkReadAs::UShort,
+                L::LongLong => LinkReadAs::UInt64,
+                L::None | L::Long => LinkReadAs::ULong,
+            },
+            b's' if d.long => LinkReadAs::CharArrayAsString {
+                max_elements: usize::MAX,
+            },
+            b's' => LinkReadAs::String,
+            _ if d.length == L::Short => LinkReadAs::Float,
+            _ => LinkReadAs::Double,
         }
     }
 
-    /// Which INP0..INP9 slots FMT consumes with a plain `%s` (no `l`
-    /// modifier) — the directives C reads with `DBR_STRING`
-    /// (`printfRecord.c:291`), so an ENUM/MENU source delivers its label.
+    /// A slot's value at the type its directive reads. The framework
+    /// delivers it at that type already; a constant or a test slot takes the
+    /// one `get_convert` rule. `None` is C's failed `dbGetLink` (F_BADLNK).
+    fn typed(v: &EpicsValue, read: LinkReadAs) -> Option<std::borrow::Cow<'_, EpicsValue>> {
+        use std::borrow::Cow;
+        match read.dbr_type() {
+            Some(t) if v.db_field_type() != t => v.get_convert(t).ok().map(Cow::Owned),
+            _ => Some(Cow::Borrowed(v)),
+        }
+    }
+
+    /// The request of each INP0..INP9 slot FMT consumes, per
+    /// [`Self::directive_read`]; an unconsumed slot reads native.
     ///
     /// Deliberate deviation, stated precisely: this map is computed at
     /// FETCH time under the no-failure slot pairing. When a `*` width
@@ -231,8 +214,14 @@ impl PrintfRecord {
     /// model, which the async-read/sync-format phase split rules out.
     /// The failed-`*` directive itself emits IVLS in both
     /// implementations.
-    fn plain_string_slots(&self) -> [bool; 10] {
-        let mut out = [false; 10];
+    fn set_fmt(&mut self, fmt: PvString) {
+        self.fmt = fmt;
+        self.requests = self.slot_requests();
+        self.links_generation += 1;
+    }
+
+    fn slot_requests(&self) -> [LinkReadAs; 10] {
+        let mut out = [LinkReadAs::Native; 10];
         let bytes = self.fmt.as_bytes();
         let mut i = 0;
         let mut slot = 0usize;
@@ -251,19 +240,17 @@ impl PrintfRecord {
                 continue;
             }
             // Consumption order mirrors `apply_fmt`: `*` width, then `*`
-            // precision (both numeric), then the conversion's own slot.
-            if d.star_width {
-                slot += 1;
-            }
-            if d.star_prec {
-                slot += 1;
+            // precision, then the conversion's own slot.
+            for star in [d.star_width, d.star_prec] {
+                if star && slot < out.len() {
+                    out[slot] = LinkReadAs::Short;
+                    slot += 1;
+                }
             }
             if slot >= out.len() {
                 break;
             }
-            if d.conv == b's' && !d.long {
-                out[slot] = true;
-            }
+            out[slot] = Self::directive_read(&d);
             slot += 1;
         }
         out
@@ -447,25 +434,23 @@ impl PrintfRecord {
 
             // Resolve `*` width / precision from the next input(s). A
             // `*` consumes a link slot even when it fails to resolve.
-            let width = if d.star_width {
-                match take(&mut inp_idx) {
-                    Some(v) => Self::signed_arg(v, LengthMod::Short),
+            let mut star = |idx: &mut usize| -> i64 {
+                let v = take(idx).and_then(|v| Self::typed(v, LinkReadAs::Short));
+                match v.and_then(|v| v.as_int_i64()) {
+                    Some(n) => n,
                     None => {
                         bad_link = true;
                         0
                     }
                 }
+            };
+            let width = if d.star_width {
+                star(&mut inp_idx)
             } else {
                 d.width.unwrap_or(0) as i64
             };
             let precision = if d.star_prec {
-                match take(&mut inp_idx) {
-                    Some(v) => Self::signed_arg(v, LengthMod::Short).max(0) as usize,
-                    None => {
-                        bad_link = true;
-                        0
-                    }
-                }
+                star(&mut inp_idx).max(0) as usize
             } else {
                 d.precision.unwrap_or(usize::MAX)
             };
@@ -484,19 +469,15 @@ impl PrintfRecord {
             let arg = if bad_link {
                 None
             } else {
-                let a = take(&mut inp_idx);
-                if a.is_none() {
-                    bad_link = true;
-                }
-                a
+                take(&mut inp_idx).and_then(|v| Self::typed(v, Self::directive_read(&d)))
             };
-
-            if bad_link {
+            let Some(arg) = arg else {
                 // F_BADLNK: emit the Invalid Link String once for the
                 // whole directive (printfRecord.c:307).
                 result.extend_from_slice(self.ivls.as_bytes());
                 continue;
-            }
+            };
+            let arg = &*arg;
 
             let conv_prec = if precision == usize::MAX {
                 6
@@ -513,7 +494,15 @@ impl PrintfRecord {
             let mut pad = true;
             match d.conv {
                 b'd' | b'i' => {
-                    let v = arg.map_or(0, |v| Self::signed_arg(v, d.length));
+                    // `%ld` prints the `epicsInt32` C passes as the
+                    // zero-extended long printf reads (softIoc: -200 ->
+                    // 4294967096).
+                    let v = arg.as_int_i64().unwrap_or(0);
+                    let v = if d.length == LengthMod::Long {
+                        v as u32 as i64
+                    } else {
+                        v
+                    };
                     if v < 0 {
                         result.push(b'-');
                     }
@@ -523,7 +512,7 @@ impl PrintfRecord {
                     push_sign(result, start, d.sign);
                 }
                 b'u' | b'o' | b'x' | b'X' => {
-                    let v = arg.map_or(0, |v| Self::unsigned_arg(v, d.length));
+                    let v = arg.as_int_i64().unwrap_or(0) as u64;
                     let _ = match d.conv {
                         b'u' => write!(result, "{v}"),
                         b'o' => write!(result, "{v:o}"),
@@ -541,15 +530,7 @@ impl PrintfRecord {
                     }
                 }
                 b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
-                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
-                    // C `printfRecord.c:220-222`: `h` reads the link as
-                    // `DBR_FLOAT`, so the value is rounded to single
-                    // precision before it is formatted.
-                    let v = if d.length == LengthMod::Short {
-                        v as f32 as f64
-                    } else {
-                        v
-                    };
+                    let v = arg.to_f64().unwrap_or(0.0);
                     result.extend_from_slice(
                         format_float_conv(d.conv, v, conv_prec, d.alt_form).as_bytes(),
                     );
@@ -559,21 +540,21 @@ impl PrintfRecord {
                 b'c' => {
                     // %c: C reads DBR_CHAR and writes that `epicsInt8` as one
                     // byte (softIoc: 300 -> ',', -1 -> 0xff, 3e9 -> NUL).
-                    let byte = match arg {
-                        Some(EpicsValue::String(s)) => {
-                            s.as_bytes().first().copied().unwrap_or(b' ')
-                        }
-                        Some(v) => Self::signed_arg(v, LengthMod::Char) as u8,
-                        None => 0,
-                    };
-                    result.push(byte);
+                    result.push(arg.as_int_i64().unwrap_or(0) as u8);
                     zero_pad = false;
                 }
                 b's' => {
                     // %s / %ls: print the link's STRING content.
-                    let s = arg.map(Self::val_as_bytes).unwrap_or_default();
-                    // Precision caps the number of bytes printed.
-                    result.extend_from_slice(&s[..s.len().min(precision)]);
+                    let s = Self::val_as_bytes(arg);
+                    // Precision caps the bytes printed. `%ls` reads
+                    // `precision + 1` of them and takes 0 as no cap
+                    // (`printfRecord.c:237-238`; softIoc `%.3ls` prints 4).
+                    let max = match (d.long, precision) {
+                        (true, 0 | usize::MAX) => usize::MAX,
+                        (true, p) => p + 1,
+                        (false, p) => p,
+                    };
+                    result.extend_from_slice(&s[..s.len().min(max)]);
                     zero_pad = false;
                 }
                 _ => pad = false,
@@ -608,38 +589,6 @@ impl PrintfRecord {
             }
         }
         None
-    }
-}
-
-/// C's `(epicsInt32)double` on x86-64 (`cvttsd2si`): truncation, with NaN
-/// and out-of-range values landing on `INT_MIN`.
-fn cvt_i32(f: f64) -> i32 {
-    if f > -2_147_483_649.0 && f < 2_147_483_648.0 {
-        f as i32
-    } else {
-        i32::MIN
-    }
-}
-
-/// C's `(epicsInt64)double` on x86-64, as [`cvt_i32`] at 64 bits.
-fn cvt_i64(f: f64) -> i64 {
-    // -2^63 is the lowest double whose truncation fits.
-    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
-        f as i64
-    } else {
-        i64::MIN
-    }
-}
-
-/// C's `(epicsUInt64)double` on x86-64: gcc converts below 2^63 directly and
-/// above it from `f - 2^63` with the top bit flipped back, so NaN and
-/// negatives take the signed path (softIoc: NaN -> 2^63, 1e30 -> 0).
-fn cvt_u64(f: f64) -> u64 {
-    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
-    if f >= TWO_63 {
-        cvt_i64(f - TWO_63) as u64 ^ (1 << 63)
-    } else {
-        cvt_i64(f) as u64
     }
 }
 
@@ -1039,8 +988,7 @@ impl Record for PrintfRecord {
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {
-                    self.fmt = s;
-                    self.links_generation += 1;
+                    self.set_fmt(s);
                 } else {
                     return Err(CaError::TypeMismatch("FMT".into()));
                 }
@@ -1088,17 +1036,14 @@ impl Record for PrintfRecord {
         crate::server::record::put_field_internal_default(self, name, value)
     }
 
-    /// C `GET_PRINT` reads each link with the conversion's own `dbrType`:
-    /// `%s` is `dbGetLink(..., DBR_STRING, ...)` (`printfRecord.c:291`), so
-    /// an ENUM/MENU source delivers its state label, not the index
-    /// (epics-base#183). Every other conversion's numeric request is
-    /// value-equivalent to the native fetch (`%ls` reads the char array the
-    /// native fetch already delivers).
+    /// C `GET_PRINT` reads each link with the conversion's own `dbrType`, so
+    /// `%s` of an ENUM/MENU source delivers its state label (epics-base#183),
+    /// `%ld` of an Int64 its `epicsInt32` truncation, and a source C cannot
+    /// convert (`%d` of "abc") fails the read: LINK alarm and IVLS.
     fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
-        use crate::server::record::{InputLinkRequest, LinkReadAs};
-        InputLinkRequest::As(match Self::inp_index(link_field) {
-            Some(idx) if self.plain_string_slots()[idx] => LinkReadAs::String,
-            _ => LinkReadAs::Native,
+        crate::server::record::InputLinkRequest::As(match Self::inp_index(link_field) {
+            Some(idx) => self.requests[idx],
+            None => LinkReadAs::Native,
         })
     }
 
@@ -1425,10 +1370,9 @@ mod tests {
     use super::*;
 
     fn rec_with(fmt: &str) -> PrintfRecord {
-        PrintfRecord {
-            fmt: PvString::from(fmt),
-            ..Default::default()
-        }
+        let mut rec = PrintfRecord::default();
+        rec.set_fmt(PvString::from(fmt));
+        rec
     }
 
     impl PrintfRecord {
@@ -1456,17 +1400,20 @@ mod tests {
     /// rounded digits, because the value went through `to_f64` first; and
     /// `h`/`hh` were parsed and then discarded, so `%hd` of 40000 printed
     /// 40000 where C prints the `epicsInt16` conversion.
-    /// A double source takes C's cast to the conversion's integer width, as
-    /// softIoc R7.0.10.1 on x86-64 prints it (calc source -> printf, one
-    /// directive per INPn). Columns: `%d %x %u %hd %hhd %ld %lld %llu %hhu %hu
-    /// %o %X`, then `[%*d|%.*d]` of 42 with the source as both stars.
+    /// A double source reaches an integer conversion through the DBR read C
+    /// makes for it (`dbFastLinkConv.c` `cvt_d_*`), a cast that is UB once
+    /// the value is past 32 bits or negative into unsigned. softIoc R7.0.10.1
+    /// on x86-64 prints the `cvttsd2si` result there (INT_MIN for `%d` of 3e9);
+    /// the port takes `c_cast`'s rule, the one owner every field, link and wire
+    /// conversion shares: the 32-bit step saturates and a narrower width wraps
+    /// it (softIoc: `%hhd` of 300 is 44, `%hu` of -2.7 is 65534). Columns:
+    /// `%d %x %u %hd %hhd %ld %lld %llu %hhu %hu %o %X`, then the stars.
     #[test]
-    fn double_sources_take_the_c_cast_to_each_width() {
+    fn double_sources_saturate_where_c_x86_64_prints_int_min_by_ub() {
         const CONVS: [&str; 12] = [
             "%d", "%x", "%u", "%hd", "%hhd", "%ld", "%lld", "%llu", "%hhu", "%hu", "%o", "%X",
         ];
-        const MIN32: &str = "-2147483648";
-        const MIN64: &str = "-9223372036854775808";
+        const U64: &str = "18446744073709551615";
         let rows: [(f64, [&str; 12]); 13] = [
             (
                 300.0,
@@ -1479,51 +1426,51 @@ mod tests {
                 -200.0,
                 [
                     "-200",
-                    "ffffff38",
-                    "4294967096",
+                    "0",
+                    "0",
                     "-200",
                     "56",
                     "4294967096",
                     "-200",
-                    "18446744073709551416",
+                    "0",
                     "56",
                     "65336",
-                    "37777777470",
-                    "FFFFFF38",
+                    "0",
+                    "0",
                 ],
             ),
             (
                 -1.0,
                 [
                     "-1",
-                    "ffffffff",
-                    "4294967295",
+                    "0",
+                    "0",
                     "-1",
                     "-1",
                     "4294967295",
                     "-1",
-                    "18446744073709551615",
+                    "0",
                     "255",
                     "65535",
-                    "37777777777",
-                    "FFFFFFFF",
+                    "0",
+                    "0",
                 ],
             ),
             (
                 -2.7,
                 [
                     "-2",
-                    "fffffffe",
-                    "4294967294",
+                    "0",
+                    "0",
                     "-2",
                     "-2",
                     "4294967294",
                     "-2",
-                    "18446744073709551614",
+                    "0",
                     "254",
                     "65534",
-                    "37777777776",
-                    "FFFFFFFE",
+                    "0",
+                    "0",
                 ],
             ),
             (
@@ -1536,16 +1483,16 @@ mod tests {
             (
                 3e9,
                 [
-                    MIN32,
+                    "2147483647",
                     "b2d05e00",
                     "3000000000",
-                    "0",
-                    "0",
-                    "2147483648",
+                    "-1",
+                    "-1",
+                    "2147483647",
                     "3000000000",
                     "3000000000",
-                    "0",
-                    "0",
+                    "255",
+                    "65535",
                     "26264057000",
                     "B2D05E00",
                 ],
@@ -1553,65 +1500,65 @@ mod tests {
             (
                 -3e9,
                 [
-                    MIN32,
-                    "4d2fa200",
-                    "1294967296",
+                    "-2147483648",
+                    "0",
+                    "0",
                     "0",
                     "0",
                     "2147483648",
                     "-3000000000",
-                    "18446744070709551616",
                     "0",
                     "0",
-                    "11513721000",
-                    "4D2FA200",
+                    "0",
+                    "0",
+                    "0",
                 ],
             ),
             (
                 5e9,
                 [
-                    MIN32,
-                    "2a05f200",
-                    "705032704",
-                    "0",
-                    "0",
-                    "2147483648",
+                    "2147483647",
+                    "ffffffff",
+                    "4294967295",
+                    "-1",
+                    "-1",
+                    "2147483647",
                     "5000000000",
                     "5000000000",
-                    "0",
-                    "0",
-                    "5201371000",
-                    "2A05F200",
+                    "255",
+                    "65535",
+                    "37777777777",
+                    "FFFFFFFF",
                 ],
             ),
             (
                 1e19,
                 [
-                    MIN32,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "2147483648",
-                    MIN64,
+                    "2147483647",
+                    "ffffffff",
+                    "4294967295",
+                    "-1",
+                    "-1",
+                    "2147483647",
+                    "9223372036854775807",
                     "10000000000000000000",
-                    "0",
-                    "0",
-                    "0",
-                    "0",
+                    "255",
+                    "65535",
+                    "37777777777",
+                    "FFFFFFFF",
                 ],
             ),
             (
                 -1e19,
                 [
-                    MIN32,
+                    "-2147483648",
                     "0",
                     "0",
                     "0",
                     "0",
                     "2147483648",
-                    MIN64,
-                    "9223372036854775808",
+                    "-9223372036854775808",
+                    "0",
                     "0",
                     "0",
                     "0",
@@ -1621,53 +1568,40 @@ mod tests {
             (
                 1e30,
                 [
-                    MIN32,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "2147483648",
-                    MIN64,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "0",
+                    "2147483647",
+                    "ffffffff",
+                    "4294967295",
+                    "-1",
+                    "-1",
+                    "2147483647",
+                    "9223372036854775807",
+                    "18446744073709551615",
+                    "255",
+                    "65535",
+                    "37777777777",
+                    "FFFFFFFF",
                 ],
             ),
             (
                 f64::INFINITY,
                 [
-                    MIN32,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "2147483648",
-                    MIN64,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "0",
+                    "2147483647",
+                    "ffffffff",
+                    "4294967295",
+                    "-1",
+                    "-1",
+                    "2147483647",
+                    "9223372036854775807",
+                    "18446744073709551615",
+                    "255",
+                    "65535",
+                    "37777777777",
+                    "FFFFFFFF",
                 ],
             ),
             (
                 f64::NAN,
-                [
-                    MIN32,
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                    "2147483648",
-                    MIN64,
-                    "9223372036854775808",
-                    "0",
-                    "0",
-                    "0",
-                    "0",
-                ],
+                ["0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
             ),
         ];
         for (src, want) in rows {
@@ -1681,26 +1615,27 @@ mod tests {
         for (src, want) in [
             (9.3e18, "9300000000000000000"),
             (1.8e19, "18000000000000000000"),
-            (2e19, "0"),
-            (-9.3e18, "9223372036854775808"),
+            (2e19, U64),
+            (-9.3e18, "0"),
         ] {
             let mut rec = rec_with("%llu");
             rec.set_input(0, EpicsValue::Double(src));
             rec.process().unwrap();
             assert_eq!(val(&rec), want, "%llu of {src}");
         }
-        // A negative star precision is left out: glibc echoes the malformed
-        // `%.-5d` C builds as `%.0-5d`.
+        // A `*` reads DBR_SHORT. A negative star precision is left out: glibc
+        // echoes the malformed `%.-5d` C builds as `%.0-5d`.
         let mut rec = rec_with("[%*d]");
         rec.set_input(0, EpicsValue::Double(-5.5));
         rec.set_input(1, EpicsValue::Long(42));
         rec.process().unwrap();
         assert_eq!(val(&rec), "[42   ]", "star width of -5.5");
+        // softIoc: 65541 reads DBR_SHORT as 5.
         for (src, want) in [
-            (3e9, "[42|42]"),
             (2.9, "[42|42]"),
-            (f64::INFINITY, "[42|42]"),
             (f64::NAN, "[42|42]"),
+            (3e9, "[42|42]"),
+            (f64::INFINITY, "[42|42]"),
             (65541.0, "[   42|00042]"),
         ] {
             let mut rec = rec_with("[%*d|%.*d]");
@@ -1854,6 +1789,23 @@ mod tests {
     }
 
     /// `%ls` long-string conversion prints the string input.
+    /// softIoc, `%ls` of a CHAR waveform "hello_world": C's `n =
+    /// precision + 1` read prints one byte past the precision, and
+    /// precision 0 caps nothing.
+    #[test]
+    fn ls_precision_reads_one_byte_more_like_softioc() {
+        for (fmt, want) in [
+            ("[%.3ls]", "[hell]"),
+            ("[%.0ls]", "[hello_world]"),
+            ("[%-8.1ls]", "[he      ]"),
+        ] {
+            let mut rec = rec_with(fmt);
+            rec.set_input(0, EpicsValue::CharArray(b"hello_world".as_slice().into()));
+            rec.process().unwrap();
+            assert_eq!(val(&rec), want, "{fmt}");
+        }
+    }
+
     #[test]
     fn long_string_conversion() {
         let mut rec = rec_with("%ls");
@@ -2022,11 +1974,13 @@ mod tests {
         };
         let d = EpicsValue::Double;
         assert_eq!(bytes("[%c]", &[d(65.0)]).0, b"[A]");
+        // epicsInt8 is the low byte of the 32-bit convert; 3e9 is past it,
+        // where x86-64 softIoc writes NUL and the saturated step 0xff.
         assert_eq!(bytes("[%c]", &[d(300.0)]).0, b"[,]");
         assert_eq!(bytes("[%c]", &[d(-1.0)]).0, b"[\xff]");
         assert_eq!(bytes("[%c]", &[d(-2.7)]).0, b"[\xfe]");
         assert_eq!(bytes("[%c]", &[d(200.0)]).0, b"[\xc8]");
-        assert_eq!(bytes("[%c]", &[d(3e9)]), (b"[\0]".to_vec(), 4));
+        assert_eq!(bytes("[%c]", &[d(3e9)]), (b"[\xff]".to_vec(), 4));
         assert_eq!(bytes("%3c|", &[d(-23.0)]).0, b"  \xe9|");
         assert_eq!(
             bytes(
@@ -2082,7 +2036,9 @@ mod tests {
             (
                 "[% .1f|%+x|%+e|%+g|% 6g]",
                 "[ 1.0|1|+1.000000e+00|+1|     1]",
-                "[-3.5|fffffffd|-3.500000e+00|-3.5|  -3.5]",
+                // `%+x` of -3.5 is C's UB `(epicsUInt32)` cast (x86-64
+                // softIoc prints fffffffd); c_cast saturates to 0.
+                "[-3.5|0|-3.500000e+00|-3.5|  -3.5]",
             ),
         ];
         for (fmt, pos, neg) in cases {

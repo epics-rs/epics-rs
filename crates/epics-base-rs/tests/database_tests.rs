@@ -6341,9 +6341,10 @@ async fn test_sel_nvl_link() {
     let mut sel = SelRecord::default();
     sel.selm = 0;
     sel.nvl = "NVL_SRC".to_string();
-    sel.a = 10.0;
-    sel.b = 20.0;
-    sel.c = 30.0;
+    // Constant links: init_record resets A..L to NaN (selRecord.c:102-105).
+    sel.inpa = "10".to_string();
+    sel.inpb = "20".to_string();
+    sel.inpc = "30".to_string();
     db.add_record("SEL_REC", Box::new(sel)).await.unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SEL_REC", &mut visited)
@@ -8079,8 +8080,7 @@ async fn test_histogram_csta_is_no_mod() {
 /// record(aao,"AAO") { field(DOL,"[1.7,2.2,-3.9,70000,5,6]") field(OUT,"WFS.VAL") }
 /// (WFS: NELM=4 FTVL=SHORT)
 /// dbpf AAO.PROC 1 ; dbgf WFS.VAL -> DBF_SHORT[4]: 1  2  -3  4464
-///                                  (port: 1 2 -3 32767 — 4464 is 70000's low
-///                                   16 bits, a wrap no reader can interpret)
+///                                  (port agrees: only the 32-bit step is UB)
 ///
 /// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3   (port agrees:
 ///                                   in range, no policy in play)
@@ -8124,9 +8124,8 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
         .unwrap();
     assert_eq!(db.get_pv("CVT_LO.VAL").unwrap(), EpicsValue::Long(-3));
 
-    // FTVL=SHORT destination: each element clamps at the ELEMENT's width, so
-    // 70000 -> 32767. A C IOC converts through a 32-bit instruction and then
-    // truncates to 16 bits, giving 70000's low half, 4464.
+    // FTVL=SHORT destination: the 32-bit convert, then the low 16 bits, as a
+    // C IOC on either target stores it: 70000 -> 4464.
     db.put_record_field_from_ca(
         "CVT_WFS",
         "VAL",
@@ -8135,11 +8134,7 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     .await
     .unwrap();
     match db.get_pv("CVT_WFS.VAL").unwrap() {
-        EpicsValue::ShortArray(v) => assert_eq!(
-            v,
-            vec![1, 2, -3, 32767],
-            "CBUG-E2: saturate. x86-64 C: 1 2 -3 4464"
-        ),
+        EpicsValue::ShortArray(v) => assert_eq!(v, vec![1, 2, -3, 4464], "softIoc: 1 2 -3 4464"),
         other => panic!("expected ShortArray, got {other:?}"),
     }
 }

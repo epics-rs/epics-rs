@@ -7512,18 +7512,16 @@ impl CycleValue {
             Self::Long(_) => Self::Long(self.to_i32()),
             Self::ULong(_) => Self::ULong(int.map_or_else(|| c_cast::f64_to_u32(f), |i| i as u32)),
             Self::Int64(_) => Self::Int64(self.to_i64()),
-            // Only a 64-bit source keeps its bits; a narrower one goes
-            // through the double, as `convert_to` does.
-            Self::UInt64(_) => Self::UInt64(match self {
-                Self::UInt64(v) => v,
-                Self::Int64(v) => v as u64,
-                _ => c_cast::f64_to_u64(f),
-            }),
+            Self::UInt64(_) => {
+                Self::UInt64(int.map_or_else(|| c_cast::f64_to_u64(f), |i| i as u64))
+            }
             Self::Short(_) => Self::Short(int.map_or_else(|| c_cast::f64_to_i16(f), |i| i as i16)),
             Self::UShort(_) => {
                 Self::UShort(int.map_or_else(|| c_cast::f64_to_u16(f), |i| i as u16))
             }
-            Self::Char(_) => Self::Char(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
+            Self::Char(_) => {
+                Self::Char(int.map_or_else(|| c_cast::f64_to_i8(f) as u8, |i| i as u8))
+            }
             Self::UChar(_) => Self::UChar(int.map_or_else(|| c_cast::f64_to_u8(f), |i| i as u8)),
             Self::Enum(_) => Self::Enum(int.map_or_else(|| c_cast::f64_to_u16(f), |i| i as u16)),
         }

@@ -311,29 +311,36 @@ async fn int64in_reads_inp_at_its_dsets_type() {
     }
 }
 
-/// A double outside `u16` narrows by the `c_cast` policy in both bi dsets,
-/// `DBR_USHORT` and `DBR_ENUM` alike. softIoc on x86 stores the undefined
-/// cast's 65535 and 4464; the port saturates to 0 and 65535.
+/// A double outside `u16` narrows by the `c_cast` rule in both bi dsets,
+/// `DBR_USHORT` and `DBR_ENUM` alike: the 32-bit convert, then its low 16
+/// bits, as softIoc stores them (-1 -> 65535, -2.7 -> 65534, 70000.9 -> 4464).
 #[epics_macros_rs::epics_test]
 async fn bi_narrows_an_out_of_range_double_alike_in_both_dsets() {
     use EpicsValue::Enum;
-    for (source, val) in [("-1", 0), ("70000", 65535)] {
-        for dtyp in ["Soft Channel", "Async Soft Channel"] {
-            let db = ioc(&format!(
-                r#"record(ai, "D") {{
+    for (source, val) in [
+        ("-1", 65535),
+        ("70000", 4464),
+        ("-2.7", 65534),
+        ("70000.9", 4464),
+    ] {
+        for rtyp in ["bi", "mbbi"] {
+            for dtyp in ["Soft Channel", "Async Soft Channel"] {
+                let db = ioc(&format!(
+                    r#"record(ai, "D") {{
     field(VAL, "{source}")
 }}
-record(bi, "R") {{
+record({rtyp}, "R") {{
     field(DTYP, "{dtyp}")
     field(INP, "D")
 }}"#
-            ))
-            .await;
-            assert_eq!(
-                read_after_process(&db, "R", &["VAL"]).await,
-                [Enum(val), NO_ALARM],
-                "{dtyp} from {source}"
-            );
+                ))
+                .await;
+                assert_eq!(
+                    read_after_process(&db, "R", &["VAL"]).await,
+                    [Enum(val), NO_ALARM],
+                    "{rtyp} {dtyp} from {source}"
+                );
+            }
         }
     }
 }

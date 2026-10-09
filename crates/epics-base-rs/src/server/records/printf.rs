@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{ProcessOutcome, Record};
-use crate::types::{EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString, SharedArray};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -29,11 +29,16 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
 // can recover the string content instead of stringifying a
 // coerced f64.
 pub struct PrintfRecord {
-    pub val: String,
+    /// VAL's bytes, without C's terminating NUL. Shared, so the cycle's
+    /// readers (`val`, the monitor post, the OUT write) take a reference to
+    /// it instead of a copy.
+    pub val: SharedArray<u8>,
     pub sizv: u16,
-    pub fmt: PvString,
+    /// Private with `inp_links`: [`Record::put_field`] is their one writer,
+    /// and it moves `links_generation`.
+    fmt: PvString,
     /// INP0-INP9: input link strings.
-    pub inp_links: [String; 10],
+    inp_links: [String; 10],
     /// A-J: current values from the input links, kept in their native
     /// type. `%s` reads the string form, numeric conversions read the
     /// numeric form.
@@ -55,12 +60,17 @@ pub struct PrintfRecord {
     /// resolved as a bad link — the framework analogue of C
     /// `RTN_SUCCESS(dbGetLink(...))` / `recGblInitConstantLink` failing.
     resolved: [bool; 10],
+    /// `process`'s format buffer, kept so a cycle formats without allocating.
+    fmt_buf: String,
+    /// [`Record::input_links_generation`]: moved on by every write of an
+    /// `INPn` text or of the `FMT` that [`Record::input_link_request`] reads.
+    links_generation: u64,
 }
 
 impl Default for PrintfRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
+            val: SharedArray::default(),
             // Intentional deviation from C `printfRecord.dbd.pod`
             // `field(SIZV,DBF_USHORT){ initial("41") }`: the port defaults to a
             // larger 256-byte result buffer rather than C's 41. Kept by design
@@ -73,6 +83,8 @@ impl Default for PrintfRecord {
             len: 0,
             ivls: "LNK".to_string(),
             resolved: [false; 10],
+            links_generation: 0,
+            fmt_buf: String::new(),
         }
     }
 }
@@ -369,8 +381,11 @@ impl PrintfRecord {
         (d, i)
     }
 
-    fn apply_fmt(&self) -> String {
-        let mut result = String::new();
+    /// C `doPrintf` into `out`, which the caller clears — the record's own
+    /// buffer, as C formats into `prec->val`.
+    fn apply_fmt(&self, out: &mut String) {
+        use std::fmt::Write;
+        let result = out;
         let bytes = self.fmt.as_bytes();
         let mut i = 0;
         let mut inp_idx = 0usize;
@@ -482,43 +497,43 @@ impl PrintfRecord {
                 precision
             };
 
-            let substituted = match d.conv {
+            // Every conversion appends its text, then pads what it appended.
+            // `write!` into a `String` cannot fail.
+            let start = result.len();
+            let mut zero_pad = d.zero_pad;
+            let mut pad = true;
+            match d.conv {
                 b'd' | b'i' => {
                     let v = arg.map(Self::val_as_int).unwrap_or(0);
-                    let v = Self::narrow_signed(v, d.length);
-                    pad_string(format!("{v}"), width, left_align, d.zero_pad)
+                    let _ = write!(result, "{}", Self::narrow_signed(v, d.length));
                 }
                 b'u' => {
                     let v = arg.map(Self::val_as_int).unwrap_or(0);
-                    let v = Self::narrow_unsigned(v, d.length);
-                    pad_string(format!("{v}"), width, left_align, d.zero_pad)
+                    let _ = write!(result, "{}", Self::narrow_unsigned(v, d.length));
                 }
                 b'o' => {
                     let v = Self::narrow_unsigned(arg.map(Self::val_as_int).unwrap_or(0), d.length);
-                    let s = if d.alt_form && v != 0 {
-                        format!("0{v:o}")
+                    let _ = if d.alt_form && v != 0 {
+                        write!(result, "0{v:o}")
                     } else {
-                        format!("{v:o}")
+                        write!(result, "{v:o}")
                     };
-                    pad_string(s, width, left_align, d.zero_pad)
                 }
                 b'x' => {
                     let v = Self::narrow_unsigned(arg.map(Self::val_as_int).unwrap_or(0), d.length);
-                    let s = if d.alt_form && v != 0 {
-                        format!("0x{v:x}")
+                    let _ = if d.alt_form && v != 0 {
+                        write!(result, "0x{v:x}")
                     } else {
-                        format!("{v:x}")
+                        write!(result, "{v:x}")
                     };
-                    pad_string(s, width, left_align, d.zero_pad)
                 }
                 b'X' => {
                     let v = Self::narrow_unsigned(arg.map(Self::val_as_int).unwrap_or(0), d.length);
-                    let s = if d.alt_form && v != 0 {
-                        format!("0X{v:X}")
+                    let _ = if d.alt_form && v != 0 {
+                        write!(result, "0X{v:X}")
                     } else {
-                        format!("{v:X}")
+                        write!(result, "{v:X}")
                     };
-                    pad_string(s, width, left_align, d.zero_pad)
                 }
                 b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
                     let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
@@ -530,8 +545,7 @@ impl PrintfRecord {
                     } else {
                         v
                     };
-                    let s = format_float_conv(d.conv, v, conv_prec, d.alt_form);
-                    pad_string(s, width, left_align, d.zero_pad)
+                    result.push_str(&format_float_conv(d.conv, v, conv_prec, d.alt_form));
                 }
                 b'c' => {
                     // %c: the input value as a single character (C reads
@@ -546,20 +560,24 @@ impl PrintfRecord {
                         }
                         None => '\u{0}',
                     };
-                    pad_string(ch.to_string(), width, left_align, false)
+                    result.push(ch);
+                    zero_pad = false;
                 }
                 b's' => {
                     // %s / %ls: print the link's STRING content.
-                    let mut s = arg.map(Self::val_as_string).unwrap_or_default();
+                    let s = arg.map(Self::val_as_string).unwrap_or_default();
                     // Precision caps the number of characters printed.
-                    if precision != usize::MAX && s.chars().count() > precision {
-                        s = s.chars().take(precision).collect();
+                    match s.char_indices().nth(precision) {
+                        Some((cut, _)) if precision != usize::MAX => result.push_str(&s[..cut]),
+                        _ => result.push_str(&s),
                     }
-                    pad_string(s, width, left_align, false)
+                    zero_pad = false;
                 }
-                _ => String::new(),
-            };
-            result.push_str(&substituted);
+                _ => pad = false,
+            }
+            if pad {
+                pad_tail(result, start, width, left_align, zero_pad);
+            }
         }
 
         let max = (self.sizv as usize).saturating_sub(1);
@@ -571,7 +589,6 @@ impl PrintfRecord {
                 .unwrap_or(0);
             result.truncate(trunc);
         }
-        result
     }
 
     fn inp_index(name: &str) -> Option<usize> {
@@ -598,22 +615,27 @@ impl PrintfRecord {
     }
 }
 
-// Apply width padding. Handles left-align, right-align, and zero-fill.
-// For zero-fill on signed values the sign is placed before the zeros.
-fn pad_string(s: String, width: usize, left_align: bool, zero_pad: bool) -> String {
-    if width <= s.chars().count() {
-        return s;
+/// Pad `out[start..]` — the text one conversion just appended — to `width`
+/// characters: spaces after it when left-aligned, zeros between the sign and
+/// the digits when zero-filled, spaces before it otherwise.
+fn pad_tail(out: &mut String, start: usize, width: usize, left_align: bool, zero_pad: bool) {
+    let len = out[start..].chars().count();
+    if width <= len {
+        return;
     }
+    let fill = width - len;
     if left_align {
-        format!("{s:<width$}")
-    } else if zero_pad {
-        if s.starts_with('-') || s.starts_with('+') {
-            format!("{}{:0>width$}", &s[..1], &s[1..], width = width - 1)
-        } else {
-            format!("{s:0>width$}")
-        }
+        out.extend(std::iter::repeat_n(' ', fill));
+        return;
+    }
+    let (at, ch) = if zero_pad {
+        let signed = out[start..].starts_with(['-', '+']);
+        (start + usize::from(signed), '0')
     } else {
-        format!("{s:>width$}")
+        (start, ' ')
+    };
+    for _ in 0..fill {
+        out.insert(at, ch);
     }
 }
 
@@ -859,7 +881,16 @@ impl Record for PrintfRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.val = self.apply_fmt();
+        let mut out = std::mem::take(&mut self.fmt_buf);
+        out.clear();
+        self.apply_fmt(&mut out);
+        // In place while no monitor snapshot still holds the last VAL.
+        if !self.val.is_shared() && self.val.len() == out.len() {
+            self.val.make_mut().copy_from_slice(out.as_bytes());
+        } else {
+            self.val = out.as_bytes().into();
+        }
+        self.fmt_buf = out;
         // C `printfRecord.c:321-322`: `*pval++ = 0; prec->len = pval - prec->val`
         // — LEN counts the formatted bytes plus the terminating NUL.
         self.len = (self.val.len() + 1) as u32;
@@ -867,7 +898,11 @@ impl Record for PrintfRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.val.as_bytes().to_vec().into()))
+        Some(EpicsValue::CharArray(self.val.clone()))
+    }
+
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        Some(crate::server::record::ValueView::Char(&self.val))
     }
 
     /// C reads `prec->inp0..inp9` off the record and copies nothing; the generic
@@ -883,7 +918,7 @@ impl Record for PrintfRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec().into())),
+            "VAL" => Some(EpicsValue::CharArray(self.val.clone())),
             "LEN" => Some(EpicsValue::ULong(self.len)),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone())),
@@ -937,13 +972,14 @@ impl Record for PrintfRecord {
                 if text.len() > max {
                     text = truncate_bytes(text, max);
                 }
-                self.val = text.as_str_lossy().into_owned();
+                self.val = text.as_bytes().into();
                 // C `printfRecord.c:321-322`: LEN counts the bytes plus NUL.
                 self.len = (self.val.len() + 1) as u32;
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {
                     self.fmt = s;
+                    self.links_generation += 1;
                 } else {
                     return Err(CaError::TypeMismatch("FMT".into()));
                 }
@@ -961,6 +997,7 @@ impl Record for PrintfRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     if let EpicsValue::String(s) = value {
                         self.inp_links[idx] = s.as_str_lossy().into_owned();
+                        self.links_generation += 1;
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }
@@ -1002,6 +1039,10 @@ impl Record for PrintfRecord {
             Some(idx) if self.plain_string_slots()[idx] => LinkReadAs::String,
             _ => LinkReadAs::Native,
         })
+    }
+
+    fn input_links_generation(&self) -> Option<u64> {
+        Some(self.links_generation)
     }
 
     /// `FMT` is a field, so the request above is the instance's.
@@ -1315,6 +1356,11 @@ mod libc_differential {
 
 #[cfg(test)]
 mod tests {
+    /// VAL as text, for comparing against the expected format output.
+    fn val(rec: &PrintfRecord) -> String {
+        String::from_utf8_lossy(&rec.val).into_owned()
+    }
+
     use super::*;
 
     fn rec_with(fmt: &str) -> PrintfRecord {
@@ -1357,25 +1403,29 @@ mod tests {
         let mut rec = rec_with("%lld");
         rec.set_input(0, EpicsValue::Int64(big));
         rec.process().unwrap();
-        assert_eq!(rec.val, format!("{big}"), "%lld must not round through f64");
+        assert_eq!(
+            val(&rec),
+            format!("{big}"),
+            "%lld must not round through f64"
+        );
 
         // Default width is DBR_LONG: 32-bit, so the same value truncates.
         let mut rec = rec_with("%d");
         rec.set_input(0, EpicsValue::Int64(big));
         rec.process().unwrap();
-        assert_eq!(rec.val, format!("{}", big as i32));
+        assert_eq!(val(&rec), format!("{}", big as i32));
 
         // `h` = DBR_SHORT: 40000 does not fit an epicsInt16.
         let mut rec = rec_with("%hd");
         rec.set_input(0, EpicsValue::Long(40000));
         rec.process().unwrap();
-        assert_eq!(rec.val, "-25536");
+        assert_eq!(val(&rec), "-25536");
 
         // `hh` = DBR_CHAR: 300 does not fit an epicsInt8.
         let mut rec = rec_with("%hhd");
         rec.set_input(0, EpicsValue::Long(300));
         rec.process().unwrap();
-        assert_eq!(rec.val, "44");
+        assert_eq!(val(&rec), "44");
 
         // The unsigned family is 32-bit by default (DBR_ULONG), so -1 is
         // 4294967295 — not the 64-bit reinterpretation the old
@@ -1383,22 +1433,22 @@ mod tests {
         let mut rec = rec_with("%u");
         rec.set_input(0, EpicsValue::Long(-1));
         rec.process().unwrap();
-        assert_eq!(rec.val, "4294967295");
+        assert_eq!(val(&rec), "4294967295");
 
         let mut rec = rec_with("%hx");
         rec.set_input(0, EpicsValue::Long(-1));
         rec.process().unwrap();
-        assert_eq!(rec.val, "ffff");
+        assert_eq!(val(&rec), "ffff");
 
         let mut rec = rec_with("%llx");
         rec.set_input(0, EpicsValue::Int64(-1));
         rec.process().unwrap();
-        assert_eq!(rec.val, "ffffffffffffffff");
+        assert_eq!(val(&rec), "ffffffffffffffff");
 
         let mut rec = rec_with("%hhx");
         rec.set_input(0, EpicsValue::Long(-1));
         rec.process().unwrap();
-        assert_eq!(rec.val, "ff");
+        assert_eq!(val(&rec), "ff");
 
         // `%c` always reads DBR_CHAR, whatever the modifier says
         // (`printfRecord.c:189`).
@@ -1406,7 +1456,7 @@ mod tests {
         rec.set_input(0, EpicsValue::Long(-1));
         rec.set_input(1, EpicsValue::Long(8));
         rec.process().unwrap();
-        assert_eq!(rec.val, "-1/10");
+        assert_eq!(val(&rec), "-1/10");
     }
 
     /// `h` on a float conversion reads `DBR_FLOAT`, so the value is rounded
@@ -1417,13 +1467,17 @@ mod tests {
         let mut rec = rec_with("%.10f");
         rec.set_input(0, EpicsValue::Double(v));
         rec.process().unwrap();
-        let full = rec.val.clone();
+        let full = val(&rec);
 
         let mut rec = rec_with("%.10hf");
         rec.set_input(0, EpicsValue::Double(v));
         rec.process().unwrap();
-        assert_eq!(rec.val, format!("{:.10}", v as f32 as f64));
-        assert_ne!(rec.val, full, "h must actually narrow to single precision");
+        assert_eq!(val(&rec), format!("{:.10}", v as f32 as f64));
+        assert_ne!(
+            val(&rec),
+            full,
+            "h must actually narrow to single precision"
+        );
     }
 
     /// C's modifier state machine rejects a mixed or over-long run
@@ -1435,7 +1489,12 @@ mod tests {
             let mut rec = rec_with(fmt);
             rec.set_input(0, EpicsValue::Long(7));
             rec.process().unwrap();
-            assert_eq!(rec.val, fmt, "{fmt} must be F_BADFMT, got {:?}", rec.val);
+            assert_eq!(
+                val(&rec),
+                fmt,
+                "{fmt} must be F_BADFMT, got {:?}",
+                val(&rec)
+            );
         }
     }
 
@@ -1445,7 +1504,7 @@ mod tests {
         let mut rec = rec_with("name=%s");
         rec.set_input(0, EpicsValue::String("motor1".into()));
         rec.process().unwrap();
-        assert_eq!(rec.val, "name=motor1");
+        assert_eq!(val(&rec), "name=motor1");
     }
 
     /// a string input survives even when other slots are numeric.
@@ -1454,7 +1513,7 @@ mod tests {
         let mut rec = rec_with("[%8s]");
         rec.set_input(0, EpicsValue::String("ab".into()));
         rec.process().unwrap();
-        assert_eq!(rec.val, "[      ab]");
+        assert_eq!(val(&rec), "[      ab]");
     }
 
     /// `%*d` reads the field width from the next input link.
@@ -1464,7 +1523,7 @@ mod tests {
         rec.set_input(0, EpicsValue::Long(6)); // width
         rec.set_input(1, EpicsValue::Long(42)); // value
         rec.process().unwrap();
-        assert_eq!(rec.val, "    42");
+        assert_eq!(val(&rec), "    42");
     }
 
     /// `%ld` long modifier is consumed, not emitted literally.
@@ -1473,7 +1532,7 @@ mod tests {
         let mut rec = rec_with("%ld");
         rec.set_input(0, EpicsValue::Long(99));
         rec.process().unwrap();
-        assert_eq!(rec.val, "99");
+        assert_eq!(val(&rec), "99");
     }
 
     /// `%ls` long-string conversion prints the string input.
@@ -1482,7 +1541,7 @@ mod tests {
         let mut rec = rec_with("%ls");
         rec.set_input(0, EpicsValue::String("hello".into()));
         rec.process().unwrap();
-        assert_eq!(rec.val, "hello");
+        assert_eq!(val(&rec), "hello");
     }
 
     /// `%c` prints a single character.
@@ -1491,7 +1550,7 @@ mod tests {
         let mut rec = rec_with("%c");
         rec.set_input(0, EpicsValue::Long(65)); // 'A'
         rec.process().unwrap();
-        assert_eq!(rec.val, "A");
+        assert_eq!(val(&rec), "A");
     }
 
     /// A bad conversion echoes the literal directive text (C
@@ -1500,7 +1559,7 @@ mod tests {
     fn bad_format_echoes_directive_text() {
         let mut rec = rec_with("x=%q");
         rec.process().unwrap();
-        assert_eq!(rec.val, "x=%q");
+        assert_eq!(val(&rec), "x=%q");
     }
 
     /// A trailing bare `%` (no conversion char) is also a bad directive
@@ -1509,7 +1568,7 @@ mod tests {
     fn trailing_percent_echoes_verbatim() {
         let mut rec = rec_with("v=%");
         rec.process().unwrap();
-        assert_eq!(rec.val, "v=%");
+        assert_eq!(val(&rec), "v=%");
     }
 
     /// LEN reports the formatted byte count INCLUDING the NUL terminator
@@ -1519,7 +1578,7 @@ mod tests {
         let mut rec = rec_with("name=%s");
         rec.set_input(0, EpicsValue::String("motor1".into()));
         rec.process().unwrap();
-        assert_eq!(rec.val, "name=motor1");
+        assert_eq!(val(&rec), "name=motor1");
         // 11 chars + 1 NUL.
         assert_eq!(rec.len, 12);
         assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(12)));
@@ -1531,7 +1590,7 @@ mod tests {
     fn len_of_empty_value_is_one() {
         let mut rec = rec_with("");
         rec.process().unwrap();
-        assert_eq!(rec.val, "");
+        assert_eq!(val(&rec), "");
         assert_eq!(rec.len, 1);
         assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(1)));
     }
@@ -1542,12 +1601,12 @@ mod tests {
         let mut rec = rec_with("%g");
         rec.set_input(0, EpicsValue::Double(0.0));
         rec.process().unwrap();
-        assert_eq!(rec.val, "0");
+        assert_eq!(val(&rec), "0");
 
         let mut rec = rec_with("%#.3g");
         rec.set_input(0, EpicsValue::Double(0.0));
         rec.process().unwrap();
-        assert_eq!(rec.val, "0.00");
+        assert_eq!(val(&rec), "0.00");
     }
 
     /// C `%g` chooses fixed vs scientific from the exponent of the
@@ -1561,7 +1620,7 @@ mod tests {
         let mut rec = rec_with("%g");
         rec.set_input(0, EpicsValue::Double(9.9999995e-05));
         rec.process().unwrap();
-        assert_eq!(rec.val, "0.0001");
+        assert_eq!(val(&rec), "0.0001");
     }
 
     /// `%%` escapes a literal percent.
@@ -1569,7 +1628,7 @@ mod tests {
     fn percent_escape() {
         let mut rec = rec_with("100%%");
         rec.process().unwrap();
-        assert_eq!(rec.val, "100%");
+        assert_eq!(val(&rec), "100%");
     }
 
     /// A directive whose INPn link did not resolve this cycle emits IVLS
@@ -1580,7 +1639,7 @@ mod tests {
         let mut rec = rec_with("v=%d");
         // No set_input → INP0 did not resolve.
         rec.process().unwrap();
-        assert_eq!(rec.val, "v=LNK");
+        assert_eq!(val(&rec), "v=LNK");
     }
 
     /// Only the unresolved directive emits IVLS; resolved neighbours
@@ -1591,7 +1650,7 @@ mod tests {
         rec.set_input(0, EpicsValue::Long(7)); // INP0 resolves
         // INP1 (slot 1) unconfigured.
         rec.process().unwrap();
-        assert_eq!(rec.val, "7/LNK");
+        assert_eq!(val(&rec), "7/LNK");
     }
 
     /// More directives than the 10 INP slots: the exhausted slot
@@ -1604,7 +1663,7 @@ mod tests {
         }
         rec.process().unwrap();
         // First ten format their slot; the 11th is exhausted → IVLS.
-        assert_eq!(rec.val, "0123456789LNK");
+        assert_eq!(val(&rec), "0123456789LNK");
     }
 
     /// IVLS is configurable and is what gets emitted on a bad link.
@@ -1614,7 +1673,7 @@ mod tests {
         rec.put_field("IVLS", EpicsValue::String("BAD".into()))
             .unwrap();
         rec.process().unwrap();
-        assert_eq!(rec.val, "BAD");
+        assert_eq!(val(&rec), "BAD");
         assert_eq!(
             rec.get_field("IVLS"),
             Some(EpicsValue::String("BAD".into()))
@@ -1641,6 +1700,84 @@ mod tests {
         // Slot 0 (the star width) unresolved; slot 1 resolves to 42.
         rec.set_input(1, EpicsValue::Long(42));
         rec.process().unwrap();
-        assert_eq!(rec.val, "LNK|42");
+        assert_eq!(val(&rec), "LNK|42");
+    }
+
+    /// softIoc, FMT `[%-5d|%05d|%5s]` over a calc source of 1 (the `%s` slot
+    /// reads it as DBR_STRING, "1"): VAL `[1    |00001|    1]`, and
+    /// FMT `v=%d` gives `v=1` with LEN 4.
+    #[test]
+    fn padding_and_len_match_softioc() {
+        let mut rec = rec_with("[%-5d|%05d|%5s]");
+        for i in 0..2 {
+            rec.set_input(i, EpicsValue::Double(1.0));
+        }
+        rec.set_input(2, EpicsValue::String("1".into()));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "[1    |00001|    1]");
+
+        let mut rec = rec_with("v=%d");
+        rec.set_input(0, EpicsValue::Double(1.0));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "v=1");
+        assert_eq!(rec.len, 4);
+    }
+
+    /// The contract of [`Record::input_links_generation`]: while it stands
+    /// still, no `INPn` text and no `input_link_request` answer has moved.
+    #[test]
+    fn the_links_generation_moves_with_every_text_and_request() {
+        let answers = |rec: &PrintfRecord| {
+            rec.multi_input_links()
+                .iter()
+                .map(|&(link, _)| {
+                    (
+                        rec.link_text_ref(link).map(str::to_owned),
+                        rec.input_link_request(link),
+                        rec.input_link_failure_is_inert(link),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut rec = PrintfRecord::default();
+        let steps = [
+            ("INP0", "SRC"),
+            ("FMT", "v=%d"),
+            ("A", "x"),
+            ("FMT", "v=%s"),
+            ("IVLS", "BAD"),
+            ("FMT", "v=%s"),
+            ("INP9", ""),
+        ];
+        let mut moved = 0;
+        for (field, text) in steps {
+            let (before, generation) = (answers(&rec), rec.input_links_generation());
+            rec.put_field(field, EpicsValue::String(text.into()))
+                .unwrap();
+            if rec.input_links_generation() == generation {
+                assert_eq!(answers(&rec), before, "{field} changed an answer in place");
+            } else {
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, 5, "INPn and FMT writes move it; A and IVLS do not");
+    }
+
+    /// VAL is reformatted in place only while nothing else holds it: a
+    /// snapshot taken before the next cycle keeps the text it was taken with.
+    #[test]
+    fn a_held_val_snapshot_is_not_rewritten() {
+        let mut rec = rec_with("v=%d");
+        rec.set_input(0, EpicsValue::Double(1.0));
+        rec.process().unwrap();
+        let held = rec.val();
+        rec.set_input(0, EpicsValue::Double(2.0));
+        rec.process().unwrap();
+        assert_eq!(held, Some(EpicsValue::CharArray(b"v=1".as_slice().into())));
+        assert_eq!(val(&rec), "v=2");
+        drop(held);
+        rec.set_input(0, EpicsValue::Double(3.0));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "v=3");
     }
 }

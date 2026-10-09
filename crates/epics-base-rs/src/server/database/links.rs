@@ -1105,10 +1105,15 @@ impl PvDatabase {
             // its element 0 (C asks for one element, so `dbGet` converts offset
             // 0), the same rule the multi-input fetch applies.
             LinkReadAs::Double => link_value_as_f64(value).map(EpicsValue::Double),
-            LinkReadAs::Long => link_value_get_as(value, DbFieldType::Long),
-            LinkReadAs::ULong => link_value_get_as(value, DbFieldType::ULong),
-            LinkReadAs::UShort => link_value_get_as(value, DbFieldType::UShort),
-            LinkReadAs::Int64 => link_value_get_as(value, DbFieldType::Int64),
+            LinkReadAs::Char
+            | LinkReadAs::UChar
+            | LinkReadAs::Short
+            | LinkReadAs::Float
+            | LinkReadAs::Long
+            | LinkReadAs::ULong
+            | LinkReadAs::UShort
+            | LinkReadAs::Int64
+            | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type()?),
             LinkReadAs::Enum => self.enum_read_of(link, value),
             LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {

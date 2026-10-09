@@ -497,6 +497,14 @@ pub enum LinkReadAs {
     /// state LABEL (`dbConvert.c` `getEnumString` → the record's
     /// `get_enum_str`), never the index; a link/`DTYP` field delivers its text.
     String,
+    /// C `dbGetLink(..., DBR_CHAR, ...)`.
+    Char,
+    /// C `dbGetLink(..., DBR_UCHAR, ...)`.
+    UChar,
+    /// C `dbGetLink(..., DBR_SHORT, ...)`.
+    Short,
+    /// C `dbGetLink(..., DBR_FLOAT, ...)`.
+    Float,
     /// C `dbGetLink(..., DBR_DOUBLE, ...)`.
     Double,
     /// C `dbGetLink(..., DBR_LONG, ...)`.
@@ -507,6 +515,8 @@ pub enum LinkReadAs {
     UShort,
     /// C `dbGetLink(..., DBR_INT64, ...)`.
     Int64,
+    /// C `dbGetLink(..., DBR_UINT64, ...)`.
+    UInt64,
     /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer. Numeric
     /// sources convert as [`Self::UShort`] does. A one-element `DBF_STRING`
     /// source goes to the SOURCE record's `put_enum_str` (`cvt_st_e`), which on
@@ -529,11 +539,16 @@ impl LinkReadAs {
         use crate::types::DbFieldType as T;
         Some(match self {
             Self::String => T::String,
+            Self::Char => T::Char,
+            Self::UChar => T::UChar,
+            Self::Short => T::Short,
+            Self::Float => T::Float,
             Self::Double => T::Double,
             Self::Long => T::Long,
             Self::ULong => T::ULong,
             Self::UShort => T::UShort,
             Self::Int64 => T::Int64,
+            Self::UInt64 => T::UInt64,
             Self::Enum { .. } => T::Enum,
             Self::Native | Self::CharArrayAsString { .. } => return None,
         })
@@ -4308,6 +4323,14 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether a soft-channel INP read that landed a value clears UDF. This
+    /// is the soft dset's behaviour, separate from [`Self::clears_udf`]:
+    /// `devSiSoft.c:72` and `devEventSoft.c:84` clear it, `devLsiSoft.c`
+    /// does not.
+    fn soft_read_clears_udf(&self) -> bool {
+        true
+    }
+
     /// Does this record's C `process()` re-derive `udf` after a DEVICE read
     /// that wrote VAL directly (C `return 2`)?
     ///
@@ -6093,6 +6116,28 @@ mod declaration_numbering_tests {
 mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
+
+    /// Each scalar request names the `dbrType` of the same name.
+    #[test]
+    fn a_scalar_link_request_names_its_dbr_type() {
+        use crate::types::DbFieldType as T;
+        for (read_as, dbr) in [
+            (LinkReadAs::String, T::String),
+            (LinkReadAs::Char, T::Char),
+            (LinkReadAs::UChar, T::UChar),
+            (LinkReadAs::Short, T::Short),
+            (LinkReadAs::UShort, T::UShort),
+            (LinkReadAs::Long, T::Long),
+            (LinkReadAs::ULong, T::ULong),
+            (LinkReadAs::Int64, T::Int64),
+            (LinkReadAs::UInt64, T::UInt64),
+            (LinkReadAs::Float, T::Float),
+            (LinkReadAs::Double, T::Double),
+            (LinkReadAs::Enum, T::Enum),
+        ] {
+            assert_eq!(read_as.dbr_type(), Some(dbr), "{read_as:?}");
+        }
+    }
 
     /// A type that reads its own link texts to answer
     /// [`Record::set_input_link_slots`] must give the answer the default body's

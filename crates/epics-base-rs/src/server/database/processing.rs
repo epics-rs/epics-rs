@@ -1153,13 +1153,7 @@ impl PvDatabase {
             link.request,
             &mut fetch,
         );
-        let read_failed = !fetch.is_ok();
-        // C `dbGetLink` on failure: `recGblSetSevrMsg(LINK_ALARM)` — for the
-        // types whose fetch IS `dbGetLink`, and not for a link whose failure
-        // the type declares inert.
-        if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
-            crate::server::recgbl::rec_gbl_set_link_alarm(common, link.link_field);
-        }
+        let mut read_failed = !fetch.is_ok();
         let value = match fetch {
             LinkFetch::Value(v) => Some(v),
             LinkFetch::NoData if plan.constants_deliver_at_process => {
@@ -1167,8 +1161,18 @@ impl PvDatabase {
             }
             _ => None,
         };
-        if let Some(value) = value {
-            deliver_multi_input(record, link.val_field, value, store_raw);
+        let mut alarm = alarm;
+        if let Some(value) = value
+            && !deliver_multi_input(record, link.val_field, value, store_raw)
+        {
+            read_failed = true;
+            alarm = None;
+        }
+        // C `dbGetLink` on failure: `recGblSetSevrMsg(LINK_ALARM)` — for the
+        // types whose fetch IS `dbGetLink`, and not for a link whose failure
+        // the type declares inert.
+        if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
+            crate::server::recgbl::rec_gbl_set_link_alarm(common, link.link_field);
         }
         // MS/NMS propagation from the source record, C `recGblInheritSevrMsg`
         // inside a successful `dbGetLink`.
@@ -1222,8 +1226,11 @@ impl PvDatabase {
         if native.shadowed {
             let pv_name = local_name(&target.record, field);
             if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
-                deliver_multi_input(record, declared[cache_slot].1, pv.get(), false);
-                return false;
+                let failed = !deliver_multi_input(record, declared[cache_slot].1, pv.get(), false);
+                if failed && sets_link_alarm {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, declared[cache_slot].0);
+                }
+                return failed;
             }
         }
         let inherits = native.inherits;
@@ -1247,7 +1254,18 @@ impl PvDatabase {
         };
         let stored = match value {
             Ok(f) => Some(f),
-            Err(value) => deliver_converted(record, declared[cache_slot].1, value),
+            Err(value) => match deliver_converted(record, declared[cache_slot].1, value) {
+                Ok(stored) => stored,
+                Err(()) => {
+                    if sets_link_alarm {
+                        crate::server::recgbl::rec_gbl_set_link_alarm(
+                            common,
+                            declared[cache_slot].0,
+                        );
+                    }
+                    return true;
+                }
+            },
         };
         if let Some(f) = stored
             && !native
@@ -1447,6 +1465,14 @@ impl PvDatabase {
         let (link_field, val_field) = declared[cache_slot];
         let rec = guard.rec;
         let inst = guard.hold();
+        let generation = inst.record.input_links_generation();
+        let entry = ParsedInputLink::validated(
+            &mut inst.parsed_inputs,
+            &*inst.record,
+            cache_slot,
+            declared,
+            generation,
+        )?;
         let (failure_is_inert, request) = if plan.multi_inputs_read_native {
             debug_assert!(
                 !inst.record.input_link_failure_is_inert(link_field)
@@ -1458,19 +1484,8 @@ impl PvDatabase {
             );
             (false, InputLinkRequest::As(LinkReadAs::Native))
         } else {
-            (
-                inst.record.input_link_failure_is_inert(link_field),
-                inst.record.input_link_request(link_field),
-            )
+            entry.link_answers(&*inst.record, link_field, generation)
         };
-        let generation = inst.record.input_links_generation();
-        let entry = ParsedInputLink::validated(
-            &mut inst.parsed_inputs,
-            &*inst.record,
-            cache_slot,
-            declared,
-            generation,
-        )?;
         let (parsed, target) = entry.target(self, rec.unframed(), cache_slot);
         // C `dbGetLink`: a `ProcessPassive` DB input link processes its
         // passive source record before the value is read. The source's cycle
@@ -1558,48 +1573,58 @@ impl PvDatabase {
 /// One `fetch_values` result into its value field — C's `dbGetLink(plink,
 /// DBR_DOUBLE, &prec->a, ...)` store, for the types that funnel through the
 /// numeric put and the ones that take the value as read.
+///
+/// `false` is C's non-zero `dbGetLink` status: the source cannot convert to
+/// the requested type (a non-numeric string for a numeric request).
 #[inline]
 fn deliver_multi_input(
     record: &mut dyn crate::server::record::Record,
     val_field: &'static str,
     value: EpicsValue,
     store_raw: bool,
-) {
+) -> bool {
     if store_raw {
-        // A string-class declared request (printf `%s`) already produced the
-        // value the record asked for — the numeric funnel below is the OTHER
-        // records' `DBR_DOUBLE` request, not a store rule.
+        // A declared DBR-typed request (printf `%s`, `%ld`) already produced
+        // the value the record asked for, at that type — the numeric funnel
+        // below is the OTHER records' `DBR_DOUBLE` request, not a store rule.
         let _ = record.put_field_internal(val_field, value);
-        return;
+        return true;
     }
     // What a numeric source's `DBR_DOUBLE` fetch is; everything else
     // converts in its own frame.
     let f = match value.into_double() {
         Ok(f) => f,
         Err(value) => match deliver_converted(record, val_field, value) {
-            Some(f) => f,
-            None => return,
+            Ok(Some(f)) => f,
+            Ok(None) => return true,
+            Err(()) => return false,
         },
     };
     let _ = record.put_multi_input_f64(val_field, f);
+    true
 }
 
 /// [`deliver_multi_input`]'s non-`Double` arm: an array stored whole when
 /// the field takes one, else the scalar the numeric funnel makes of it.
+/// `Ok(None)` is a value stored (or an empty array, which C's `dbGet`
+/// converts nothing of and succeeds); `Err` is a conversion C fails.
 fn deliver_converted(
     record: &mut dyn crate::server::record::Record,
     val_field: &'static str,
     value: EpicsValue,
-) -> Option<f64> {
+) -> Result<Option<f64>, ()> {
     if value.is_array() {
         if record.put_field_internal(val_field, value.clone()).is_ok() {
-            return None;
+            return Ok(None);
         }
         // The target is a scalar field: element 0, as C's one-element
         // destination takes.
-        return value.first_element().and_then(|v| v.get_convert_f64());
+        return match value.first_element() {
+            Some(v) => v.get_convert_f64().map(Some).ok_or(()),
+            None => Ok(None),
+        };
     }
-    value.get_convert_f64()
+    value.get_convert_f64().map(Some).ok_or(())
 }
 
 /// The record's data guard across the guarded segments of one process cycle.
@@ -5001,7 +5026,11 @@ impl PvDatabase {
                 // return `false` here so a Soft-Channel `epid` still runs
                 // `do_pid()` in `process()`.
                 let soft_input_skips_convert =
-                    is_soft && !is_output && plan.soft_channel_skips_convert;
+                    crate::server::record::RecordInstance::input_dset_skips_convert(
+                        instance.common.dtyp.soft(),
+                        is_output,
+                        plan.soft_channel_skips_convert,
+                    );
                 let mut device_did_compute =
                     (soft_inp_applied && is_soft) || soft_input_skips_convert;
                 // Input records read every cycle (`!is_output`). An OUTPUT record
@@ -5580,7 +5609,7 @@ impl PvDatabase {
                     // `if (status == 0)` and never reach it.
                     instance.record.rederives_udf_on_computed_read()
                 } else {
-                    plan.clears_udf || device_did_compute
+                    plan.clears_udf || (device_did_compute && plan.soft_read_clears_udf)
                 };
                 if derive_udf {
                     instance.common.udf = instance.record.value_is_undefined() as u8;
@@ -7986,10 +8015,10 @@ impl PvDatabase {
         match self.link_read_as(record, link_field, link, request) {
             None => false,
             Some(read_as) => {
-                let raw = matches!(
-                    read_as,
-                    LinkReadAs::String | LinkReadAs::CharArrayAsString { .. }
-                );
+                // A request at a DBR type delivers the value converted at that
+                // type; only `Double` (and `Enum`'s unwritten buffer) is the
+                // numeric funnel's.
+                let raw = !matches!(read_as, LinkReadAs::Double | LinkReadAs::Enum);
                 match self.apply_link_read_as(link, read_as, value) {
                     Some(v) => {
                         *fetch = LinkFetch::Value(v);

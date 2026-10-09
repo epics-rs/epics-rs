@@ -21,6 +21,7 @@
 //! destroyed on the next scan and A read 0 before the first process.
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::printf::PrintfRecord;
 use epics_base_rs::server::records::sel::SelRecord;
@@ -137,9 +138,9 @@ async fn seq_seeds_constant_sell_and_doln_at_init() {
 async fn printf_constants_still_deliver_every_cycle() {
     let db = PvDatabase::new();
     let mut p = PrintfRecord::default();
-    p.fmt = "%g-%g".into();
-    p.inp_links[0] = "7".to_string();
-    p.inp_links[1] = "8".to_string();
+    for (field, text) in [("FMT", "%g-%g"), ("INP0", "7"), ("INP1", "8")] {
+        p.put_field(field, EpicsValue::String(text.into())).unwrap();
+    }
     db.add_record("P1", Box::new(p)).await.unwrap();
 
     // printf's VAL is a long string (DBF_CHAR array).

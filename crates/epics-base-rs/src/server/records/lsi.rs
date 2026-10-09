@@ -179,6 +179,10 @@ impl Record for LsiRecord {
         false
     }
 
+    fn soft_read_clears_udf(&self) -> bool {
+        false
+    }
+
     /// `lsiRecord.c::process` never re-derives UDF after a DEVICE read that
     /// wrote VAL directly (C `return 2`): its two `prec->udf = FALSE` sites
     /// are `init_record` (`:88`) and the simulated SIOL read (`:245`). Same

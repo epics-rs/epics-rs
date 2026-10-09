@@ -1009,6 +1009,7 @@ impl ProcessPlan {
         skips_timestamp_when_undefined: false,
         restamps_time_after_completion: false,
         clears_udf: true,
+        soft_read_clears_udf: true,
     };
 
     /// Whether this type's cycle is [`Self::PLAIN_INPUT`] once the simulation
@@ -1042,6 +1043,7 @@ impl ProcessPlan {
             skips_timestamp_when_undefined,
             restamps_time_after_completion,
             clears_udf,
+            soft_read_clears_udf,
         } = *self;
         let p = &Self::PLAIN_INPUT;
         dset_can_refuse == p.dset_can_refuse
@@ -1069,6 +1071,7 @@ impl ProcessPlan {
             && skips_timestamp_when_undefined == p.skips_timestamp_when_undefined
             && restamps_time_after_completion == p.restamps_time_after_completion
             && clears_udf == p.clears_udf
+            && soft_read_clears_udf == p.soft_read_clears_udf
     }
 
     /// The answers, asked of the record type once. Pure in the record's
@@ -1125,6 +1128,7 @@ impl ProcessPlan {
             skips_timestamp_when_undefined: record.skips_timestamp_when_undefined(),
             restamps_time_after_completion: record.restamps_time_after_completion(),
             clears_udf: record.clears_udf(),
+            soft_read_clears_udf: record.soft_read_clears_udf(),
         }
     }
 }
@@ -1562,6 +1566,7 @@ pub(crate) struct ProcessPlan {
     pub(crate) skips_timestamp_when_undefined: bool,
     pub(crate) restamps_time_after_completion: bool,
     pub(crate) clears_udf: bool,
+    pub(crate) soft_read_clears_udf: bool,
 }
 
 /// How many record borrows this thread holds, in builds with debug
@@ -2271,6 +2276,12 @@ pub(crate) struct ParsedInputLink {
     /// need not read the field to know.
     generation: Option<u64>,
     parsed: Arc<ParsedLink>,
+    /// [`Record::input_link_failure_is_inert`] and
+    /// [`Record::input_link_request`] for this link, with the
+    /// [`Record::input_links_generation`] they were asked at: a record that
+    /// answers a generation moves it on every write that can change either,
+    /// so an answer stamped with the current generation is still the answer.
+    answers: Option<(u64, bool, super::record_trait::InputLinkRequest)>,
     /// C's `dbAddr` from `dbDbInitLink` (`dbDbLink.c:88-111`): the target
     /// record, resolved once and read through until something can have
     /// changed the answer. C re-resolves only when the link text is put; the
@@ -2411,8 +2422,43 @@ impl ParsedInputLink {
             text: text.to_owned(),
             generation: None,
             parsed: Arc::new(parse_link_v2(text)),
+            answers: None,
             target: None,
         }
+    }
+
+    /// What the record answers for this link's failure and request: asked of
+    /// the record once per [`Record::input_links_generation`] it answers, and
+    /// every time for a record that answers none.
+    #[inline(always)]
+    pub(crate) fn link_answers(
+        &mut self,
+        record: &dyn Record,
+        link_field: &str,
+        generation: Option<u64>,
+    ) -> (bool, super::record_trait::InputLinkRequest) {
+        let ask = || {
+            (
+                record.input_link_failure_is_inert(link_field),
+                record.input_link_request(link_field),
+            )
+        };
+        let Some(generation) = generation else {
+            return ask();
+        };
+        if let Some((at, inert, request)) = self.answers
+            && at == generation
+        {
+            debug_assert!(
+                (inert, request) == ask(),
+                "{link_field}: an input_link answer changed under generation {generation} — \
+                 a writer of what it reads does not move input_links_generation"
+            );
+            return (inert, request);
+        }
+        let (inert, request) = ask();
+        self.answers = Some((generation, inert, request));
+        (inert, request)
     }
 
     /// The parse, shared: the cycle hands it to reads that run after the
@@ -7364,14 +7410,30 @@ impl RecordInstance {
     /// kin for "Soft Channel" (and async soft), never "Raw Soft Channel",
     /// whose read lands in RVAL and must convert.
     pub(crate) fn soft_input_skips_convert(&self) -> bool {
-        matches!(
+        Self::input_dset_skips_convert(
             self.common.dtyp.soft(),
+            self.record.can_device_write(),
+            self.record.soft_channel_skips_convert(),
+        )
+    }
+
+    /// [`Self::soft_input_skips_convert`] over answers the caller already
+    /// holds, so the process cycle (which reads `soft_channel_skips_convert`
+    /// from its [`ProcessPlan`]) and the put path share the one predicate.
+    #[inline(always)]
+    pub(crate) fn input_dset_skips_convert(
+        soft: Option<crate::server::device_support::SoftDtyp>,
+        is_output: bool,
+        record_skips_convert: bool,
+    ) -> bool {
+        matches!(
+            soft,
             Some(
                 crate::server::device_support::SoftDtyp::Plain
                     | crate::server::device_support::SoftDtyp::Async
             )
-        ) && !self.record.can_device_write()
-            && self.record.soft_channel_skips_convert()
+        ) && !is_output
+            && record_skips_convert
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.

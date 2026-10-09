@@ -417,7 +417,7 @@ async fn long_string_count_clamp_trims_char_array() {
 #[serial]
 async fn printf_val_native_type_is_scalar_dbr_string() {
     let mut rec = PrintfRecord::default();
-    rec.val = "log: 42".to_string();
+    rec.val = b"log: 42".as_slice().into();
     let server = CaServer::builder()
         .port(0)
         .record("R3C2:PF:VAL", rec)

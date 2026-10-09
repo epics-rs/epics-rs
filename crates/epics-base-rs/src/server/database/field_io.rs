@@ -679,10 +679,12 @@ fn commit_special_reset_alarm(
 fn coerce_write_value(
     record: &dyn crate::server::record::Record,
     field: &str,
+    shape: crate::server::record::StoredShape,
+    dbaddr: bool,
     target: crate::types::DbFieldType,
     value: EpicsValue,
 ) -> CaResult<crate::types::c_parse::Converted> {
-    crate::server::record::dbput_coerce_value(record, field, target, value)
+    crate::server::record::dbput_coerce_value_in(record, field, shape, dbaddr, target, value)
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner
@@ -734,9 +736,10 @@ fn dbput_request(
     record_name: &str,
     record: &dyn crate::server::record::Record,
     field: &str,
+    at: &crate::server::record::record_instance::PutAddr,
     value: EpicsValue,
 ) -> CaResult<PutRequest> {
-    dbput_request_unnamed(record, field, value).map_err(|e| name_refusal(e, record_name))
+    dbput_request_unnamed(record, field, at, value).map_err(|e| name_refusal(e, record_name))
 }
 
 /// The value shapes `dbPutFieldLink` takes a link's text from.
@@ -768,16 +771,22 @@ pub struct HeldRecord<'n> {
 /// (QSRV's atomic group PUT); see [`PvDatabase::put_many_locked`].
 /// Each put's outcome goes back to the body, and what it owes past the gate
 /// stays here until the guard is down.
-pub struct HeldPuts<'a> {
+pub struct HeldPuts<'a, 'h> {
     db: &'a PvDatabase,
     records: Vec<&'a str>,
     owed: Vec<OwedPut<'a>>,
+    _brand: Brand<'h>,
 }
 
 /// One record of a [`HeldPuts`] transaction's locked set, the only target its
 /// puts take, so a put to a record outside the set cannot be written.
 #[derive(Clone, Copy)]
-pub struct LockedRecord<'a>(&'a str);
+pub struct LockedRecord<'a, 'h>(&'a str, Brand<'h>);
+
+/// One [`PvDatabase::put_many_locked`] call: invariant, and chosen by the
+/// call's `for<'h>` body, so a [`LockedRecord`] can neither leave the call nor
+/// enter another one, where its put would lock outside `lock_records`' order.
+type Brand<'h> = std::marker::PhantomData<fn(&'h ()) -> &'h ()>;
 
 struct OwedPut<'a> {
     record: &'a str,
@@ -788,20 +797,21 @@ struct OwedPut<'a> {
     after: Option<AfterGate>,
 }
 
-impl<'a> HeldPuts<'a> {
+impl<'a, 'h> HeldPuts<'a, 'h> {
     /// `records[index]` of the [`PvDatabase::put_many_locked`] that made this.
-    pub fn record(&self, index: usize) -> Option<LockedRecord<'a>> {
-        self.records.get(index).copied().map(LockedRecord)
+    pub fn record(&self, index: usize) -> Option<LockedRecord<'a, 'h>> {
+        let record = self.records.get(index)?;
+        Some(LockedRecord(record, self._brand))
     }
 
     /// [`PvDatabase::put_pv_already_locked`] for one member.
     pub fn put_pv(
         &mut self,
-        record: LockedRecord<'a>,
+        record: LockedRecord<'a, 'h>,
         field: &'a str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        let LockedRecord(record) = record;
+        let LockedRecord(record, _) = record;
         let mut after = None;
         let put = self
             .db
@@ -814,11 +824,11 @@ impl<'a> HeldPuts<'a> {
     /// one member.
     pub fn put_record_field_from_ca_no_notify(
         &mut self,
-        record: LockedRecord<'a>,
+        record: LockedRecord<'a, 'h>,
         field: &'a str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        let LockedRecord(record) = record;
+        let LockedRecord(record, _) = record;
         let link_text = is_link_text(&value);
         let mut after = None;
         let put = self
@@ -853,7 +863,7 @@ impl<'a> HeldPuts<'a> {
 /// unwind, drops the gate and then settles every put made under it.
 struct SettleOnDrop<'a> {
     gate: Option<super::ManyRecordWriteGuard>,
-    puts: HeldPuts<'a>,
+    puts: HeldPuts<'a, 'static>,
 }
 
 impl Drop for SettleOnDrop<'_> {
@@ -872,13 +882,14 @@ impl Drop for SettleOnDrop<'_> {
 fn dbput_request_unnamed(
     record: &dyn crate::server::record::Record,
     field: &str,
+    at: &crate::server::record::record_instance::PutAddr,
     value: EpicsValue,
 ) -> CaResult<PutRequest> {
-    use crate::server::record::FieldDeclaration;
+    let shape = crate::server::record::StoredShape::of(record, field);
     // C `no_elements` for this destination: the count the ARRAY arm clamps to.
-    let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
+    let dest_is_array = shape.is_array();
     if value.is_empty_array() {
-        if !record.field_is_dbaddr(field) {
+        if !at.dbaddr() {
             return Ok(PutRequest::StoreNothing { alarm: true });
         }
         // Array arm, `nRequest == 0`. A field this port stores as a Vec models
@@ -898,10 +909,7 @@ fn dbput_request_unnamed(
     // because the `.dbd` says `DBF_MENU` would make its `Short` arm unreachable.
     // Same rule as `put_field_internal_default` and `db_loader::apply_fields`.
     // The `.dbd` type is the fallback for a field with no current value.
-    let target = record
-        .get_field(field)
-        .map(|v| v.db_field_type())
-        .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, field));
+    let target = shape.ty();
 
     // Both remaining halves of the branch belong to `coerce_write_value`, and
     // this body must not re-derive either of them: the request is rendered in
@@ -916,7 +924,8 @@ fn dbput_request_unnamed(
     // `field_size - 1`, so it is not a no-op on a type match either). With no
     // gate there is no exception list to keep in step.
     match target {
-        Some(target) => match coerce_write_value(record, field, target, value)? {
+        Some(target) => match coerce_write_value(record, field, shape, at.dbaddr(), target, value)?
+        {
             crate::types::c_parse::Converted::Stored(v) => Ok(PutRequest::Write(v)),
             // C's `cvt_st_ul` returned success without storing: the same
             // "nothing stored, status still 0" arm the zero-element request
@@ -1239,14 +1248,7 @@ fn dbput_post_put_field(
     at: &crate::server::record::record_instance::PutAddr,
     backing: crate::server::database::LinkBacking<'_>,
 ) {
-    let suppress = field == instance.record.primary_field()
-        && instance
-            .record
-            .process_passive_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(field));
-    if !suppress {
-        instance.cleanup_subscribers();
+    if !at.post_suppressed() {
         instance.notify_field_at(
             field,
             at,
@@ -1508,11 +1510,39 @@ impl PvDatabase {
     /// settles, in the order made — on an unwind out of `body` too.
     /// `capacity` is the put count expected, so the hold allocates nothing
     /// for the list.
+    ///
+    /// A [`LockedRecord`] is good for its own call only; neither of these
+    /// compiles:
+    ///
+    /// ```compile_fail,E0521
+    /// # use epics_base_rs::server::database::PvDatabase;
+    /// # use epics_base_rs::types::EpicsValue;
+    /// fn later_call(db: &PvDatabase) {
+    ///     let mut saved = None;
+    ///     db.put_many_locked(&["X"], 1, |puts| saved = puts.record(0));
+    ///     db.put_many_locked(&["Y"], 1, |puts| {
+    ///         let _ = puts.put_pv(saved.unwrap(), "VAL", EpicsValue::Double(1.0));
+    ///     });
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0521
+    /// # use epics_base_rs::server::database::PvDatabase;
+    /// # use epics_base_rs::types::EpicsValue;
+    /// fn nested_call(db: &PvDatabase) {
+    ///     db.put_many_locked(&["X"], 1, |outer| {
+    ///         let x = outer.record(0).unwrap();
+    ///         db.put_many_locked(&["Y"], 1, |inner| {
+    ///             let _ = inner.put_pv(x, "VAL", EpicsValue::Double(1.0));
+    ///         });
+    ///     });
+    /// }
+    /// ```
     pub fn put_many_locked<'a, S, R>(
         &'a self,
         records: &'a [S],
         capacity: usize,
-        body: impl FnOnce(&mut HeldPuts<'a>) -> R,
+        body: impl for<'h> FnOnce(&mut HeldPuts<'a, 'h>) -> R,
     ) -> R
     where
         S: AsRef<str>,
@@ -1523,6 +1553,7 @@ impl PvDatabase {
                 db: self,
                 records: records.iter().map(AsRef::as_ref).collect(),
                 owed: Vec::with_capacity(capacity),
+                _brand: std::marker::PhantomData,
             },
         };
         held.gate = Some(self.lock_records(&held.puts.records));
@@ -1788,7 +1819,7 @@ impl PvDatabase {
             // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
             check_not_link_field(field, at.field.desc)?;
 
-            let request = dbput_request(&instance.name, &*instance.record, field, value)?;
+            let request = dbput_request(&instance.name, &*instance.record, field, at, value)?;
 
             // Pre-write special hook (C EPICS dbPutSpecial pass=0).
             // C `dbPut` runs it on EVERY entry path — dbPutField and
@@ -1802,7 +1833,7 @@ impl PvDatabase {
             // invalidation (and the downstream `DBE_PROPERTY`
             // emission) can be skipped when the put is a no-op —
             // epics-base faac1df1.
-            let prev_value = instance.resolve_field_stored_at(field, at.field.desc);
+            let prev_value = instance.pre_put_at(field, at);
             let old_nord = array_nord_before_put(&instance, field);
 
             // Link writes the record's `special()` makes itself (C runs them
@@ -1897,12 +1928,7 @@ impl PvDatabase {
 
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
-            instance.notify_field_written_if_changed_at(
-                field,
-                at,
-                prev_value.as_ref(),
-                link_backing,
-            );
+            instance.notify_field_written_if_changed_at(field, at, prev_value, link_backing);
 
             // C `dbPut:1408-1413`'s field-monitor post, through the one owner
             // (`dbput_post_put_field`, shared with the CA route). `put_pv`
@@ -2152,7 +2178,7 @@ impl PvDatabase {
                 check_no_mod_in_db_put(&instance, &field, &at)?;
                 check_not_link_field(&field, at.field.desc)?;
 
-                let request = dbput_request(&instance.name, &*instance.record, &field, value)?;
+                let request = dbput_request(&instance.name, &*instance.record, &field, &at, value)?;
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0) —
                 // C `dbPut` runs it on every entry path; this is the third
@@ -2160,6 +2186,7 @@ impl PvDatabase {
                 instance.record.special(&field, false)?;
 
                 let old_value = instance.resolve_field_stored_at(&field, at.field.desc);
+                let pre_put = instance.pre_put_at(&field, &at);
                 let old_stat = instance.common.stat;
                 let old_sevr = instance.common.sevr;
                 let old_nord = array_nord_before_put(&instance, &field);
@@ -2224,12 +2251,7 @@ impl PvDatabase {
                 // Invalidate metadata cache only if a metadata-class
                 // field actually changed value (faac1df1 — DBE_PROPERTY
                 // fires on real changes, not no-op writes).
-                instance.notify_field_written_if_changed_at(
-                    &field,
-                    &at,
-                    old_value.as_ref(),
-                    link_backing,
-                );
+                instance.notify_field_written_if_changed_at(&field, &at, pre_put, link_backing);
 
                 // Post monitor events if value or alarm changed. Read
                 // through the SAME reader the pre-value came from: a field
@@ -2246,7 +2268,6 @@ impl PvDatabase {
                 if value_changed || alarm_changed || nord_changed {
                     // Update timestamp so the snapshot carries current time
                     instance.common.time = crate::runtime::general_time::get_current();
-                    instance.cleanup_subscribers();
                     if value_changed || alarm_changed {
                         instance.notify_field_with_origin(
                             &field,
@@ -3321,14 +3342,14 @@ impl PvDatabase {
                 // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
                 // This matches C EPICS db_put_field() which converts from the CA client's type
                 // to the record field's native type.
-                let request = dbput_request(&instance.name, &*instance.record, &field, value)?;
+                let request = dbput_request(&instance.name, &*instance.record, &field, &at, value)?;
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0)
                 instance.record.special(&field, false)?;
                 special_before_put(&mut instance, &field);
 
                 // Capture pre-put value for faac1df1 idempotent-write suppression.
-                let prev_value = instance.resolve_field_stored_at(&field, at.field.desc);
+                let prev_value = instance.pre_put_at(&field, &at);
                 let old_nord = array_nord_before_put(&instance, &field);
 
                 // Try record-specific field first; fall back to common on FieldNotFound.
@@ -3410,12 +3431,7 @@ impl PvDatabase {
 
                 // Invalidate metadata cache only if the metadata-class
                 // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed_at(
-                    &field,
-                    &at,
-                    prev_value.as_ref(),
-                    link_backing,
-                );
+                instance.notify_field_written_if_changed_at(&field, &at, prev_value, link_backing);
 
                 // `putf` is neither set nor cleared anywhere in this block: C's
                 // `dbPut` does not touch it. It is raised in `put_driven_process`
@@ -3894,7 +3910,7 @@ impl PvDatabase {
                 instance.record.special(&field, false)?;
                 special_before_put(&mut instance, &field);
 
-                let prev_value = instance.resolve_field_stored_at(&field, at.field.desc);
+                let prev_value = instance.pre_put_at(&field, &at);
                 // C's `reboot_restore` writes through `dbPutField` → `dbPut`,
                 // which renders the request in the destination field's shape
                 // AND THEN runs the `dbPutConvertRoutine` type row
@@ -4006,12 +4022,7 @@ impl PvDatabase {
                 clear_udf_on_value_put(&mut instance, &field);
                 // Invalidate metadata cache only if the metadata-class
                 // field actually changed (faac1df1).
-                instance.notify_field_written_if_changed_at(
-                    &field,
-                    &at,
-                    prev_value.as_ref(),
-                    link_backing,
-                );
+                instance.notify_field_written_if_changed_at(&field, &at, prev_value, link_backing);
                 // The drain of the posts the after pass queued — `special()`
                 // and its post are ONE step, so a mark cannot outlive the put
                 // that made it and be emitted by some later cycle.

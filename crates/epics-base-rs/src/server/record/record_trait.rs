@@ -5424,13 +5424,23 @@ pub trait Record: Send + Sync + 'static {
 ///
 /// An `EnumWithChoices` carrier is left alone in both — it is a transient link
 /// payload, not a stored value, and `convert_to` collapses it to a bare index.
-/// `shaped_destination` carries the rest of the shared rule.
+/// [`StoredShape`] carries the rest of the shared rule.
 pub fn put_value_in_field_shape<R: Record + ?Sized>(
     record: &R,
     field: &str,
     value: EpicsValue,
 ) -> EpicsValue {
-    let Some(dest_is_array) = shaped_destination(record, field, &value) else {
+    put_value_in_shape(record, field, StoredShape::of(record, field), value)
+}
+
+/// [`put_value_in_field_shape`] against a destination already read.
+fn put_value_in_shape<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    shape: StoredShape,
+    value: EpicsValue,
+) -> EpicsValue {
+    let Some(dest_is_array) = shape.renders(&value) else {
         return value;
     };
     match (dest_is_array, value.is_array()) {
@@ -5479,35 +5489,57 @@ pub fn link_value_in_field_shape<R: Record + ?Sized>(
     field: &str,
     value: EpicsValue,
 ) -> EpicsValue {
-    match shaped_destination(record, field, &value) {
+    match StoredShape::of(record, field).renders(&value) {
         Some(false) if value.is_array() => value.first_element().unwrap_or(value),
         _ => value,
     }
 }
 
-/// `Some(dest_is_array)` when `field` has a shape this row may render into,
-/// `None` when it must be left alone.
-///
-/// The destination test is the field's CURRENT VALUE SHAPE, not
-/// [`FieldDeclaration::field_is_dbaddr`]. `mbbo.VAL` is `special(SPC_DBADDR)`
-/// and stored as a scalar; wrapping it would put a one-element array in front
-/// of the menu row that owns that put.
-///
-/// The exempt shape is a `CharArray` into a `DBF_STRING` field: that is the
-/// dbChannel `$` char view of a string field, decoded by `convert_to`.
-fn shaped_destination<R: Record + ?Sized>(
-    record: &R,
-    field: &str,
-    value: &EpicsValue,
-) -> Option<bool> {
-    let target = record
-        .get_field(field)
-        .map(|v| v.db_field_type())
-        .or_else(|| super::record_instance::declared_field_type_of(record, field));
-    if matches!(value, EpicsValue::CharArray(_)) && target == Some(DbFieldType::String) {
-        return None;
+/// What a put asks of the value its destination field holds: the type it is
+/// stored as (the `.dbd` type for a field holding none) and whether it is a
+/// buffer. Read once per put, since `get_field` copies the value out.
+#[derive(Clone, Copy)]
+pub(crate) struct StoredShape {
+    ty: Option<DbFieldType>,
+    is_array: bool,
+}
+
+impl StoredShape {
+    pub(crate) fn of<R: Record + ?Sized>(record: &R, field: &str) -> Self {
+        let current = record.get_field(field);
+        StoredShape {
+            ty: current
+                .as_ref()
+                .map(EpicsValue::db_field_type)
+                .or_else(|| super::record_instance::declared_field_type_of(record, field)),
+            is_array: current.is_some_and(|v| v.is_array()),
+        }
     }
-    Some(record.get_field(field).is_some_and(|v| v.is_array()))
+
+    pub(crate) fn ty(&self) -> Option<DbFieldType> {
+        self.ty
+    }
+
+    pub(crate) fn is_array(&self) -> bool {
+        self.is_array
+    }
+
+    /// `Some(dest_is_array)` when this destination has a shape a request
+    /// may be rendered into, `None` when it must be left alone.
+    ///
+    /// The destination test is the field's CURRENT VALUE SHAPE, not
+    /// [`FieldDeclaration::field_is_dbaddr`]. `mbbo.VAL` is
+    /// `special(SPC_DBADDR)` and stored as a scalar; wrapping it would put a
+    /// one-element array in front of the menu row that owns that put.
+    ///
+    /// The exempt shape is a `CharArray` into a `DBF_STRING` field: that is
+    /// the dbChannel `$` char view of a string field, decoded by `convert_to`.
+    fn renders(&self, value: &EpicsValue) -> Option<bool> {
+        if matches!(value, EpicsValue::CharArray(_)) && self.ty == Some(DbFieldType::String) {
+            return None;
+        }
+        Some(self.is_array)
+    }
 }
 
 /// The client `dbPut` entry to the write-side converter: C `dbPut`'s value
@@ -5533,12 +5565,33 @@ pub fn dbput_coerce_value<R: Record + ?Sized>(
     target: DbFieldType,
     value: EpicsValue,
 ) -> CaResult<Converted> {
+    let shape = StoredShape::of(record, field);
+    dbput_coerce_value_in(
+        record,
+        field,
+        shape,
+        record.field_is_dbaddr(field),
+        target,
+        value,
+    )
+}
+
+/// [`dbput_coerce_value`] against a destination already read: `shape` and
+/// `dbaddr` ([`FieldDeclaration::field_is_dbaddr`]) are the field's.
+pub(crate) fn dbput_coerce_value_in<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    shape: StoredShape,
+    dbaddr: bool,
+    target: DbFieldType,
+    value: EpicsValue,
+) -> CaResult<Converted> {
     // C's row test (`dbAccess.c:1355`), asked of the request before its shape
     // is settled: `nRequest > 1 || special == SPC_DBADDR`. A scalar-stored
     // `SPC_DBADDR` field (`mbbo.VAL`, an `aSub` channel at NOA 1) takes the
     // `putString*` row, which has no empty-string arm.
-    let array_row = value.count() > 1 || record.field_is_dbaddr(field);
-    let value = put_value_in_field_shape(record, field, value);
+    let array_row = value.count() > 1 || dbaddr;
+    let value = put_value_in_shape(record, field, shape, value);
     coerce_put_value_in_row(record, field, target, value, array_row)
 }
 

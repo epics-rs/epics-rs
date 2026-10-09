@@ -1546,14 +1546,14 @@ impl GroupChannel {
     ///
     /// The member's put goes through `puts`, which settles it once the
     /// caller's gate drops.
-    fn apply_member_value_already_locked<'m>(
+    fn apply_member_value_already_locked<'m, 'h>(
         &self,
-        record: epics_base_rs::server::database::LockedRecord<'m>,
+        record: epics_base_rs::server::database::LockedRecord<'m, 'h>,
         member: &'m MemberChannel,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         grant: super::provider::WriteGrant,
-        puts: &mut epics_base_rs::server::database::HeldPuts<'m>,
+        puts: &mut epics_base_rs::server::database::HeldPuts<'m, 'h>,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
         let (record_name, field_name) = member.names();

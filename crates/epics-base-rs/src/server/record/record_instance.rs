@@ -1705,6 +1705,12 @@ pub struct RecordCell {
 pub(crate) struct RecordDesc {
     pub(crate) record_type: &'static str,
     pub(crate) fields: &'static [FieldDesc],
+    /// [`Record::long_string_fields`], which C's `cvt_dbaddr` serves as
+    /// `SPC_DBADDR` buffers.
+    long_strings: &'static [&'static str],
+    /// [`Record::primary_field`] and [`Record::process_passive_fields`].
+    primary_field: &'static str,
+    pp_fields: &'static [&'static str],
 }
 
 impl RecordDesc {
@@ -1712,6 +1718,9 @@ impl RecordDesc {
         RecordDesc {
             record_type: record.record_type(),
             fields: record.field_list(),
+            long_strings: record.long_string_fields(),
+            primary_field: record.primary_field(),
+            pp_fields: record.process_passive_fields(),
         }
     }
 }
@@ -1770,7 +1779,21 @@ pub(crate) struct PutAddr {
     cache_source: bool,
     /// [`walk_skip_term`]: a published value is kept in `skipped_posted`.
     walk_skip: bool,
+    /// [`super::FieldDeclaration::field_is_dbaddr`]: `dbPut` takes its
+    /// array arm whatever the request's count.
+    dbaddr: bool,
+    /// A write the faac1df1 change test watches: `cache_source`, or a
+    /// `prop(YES)` field ([`RecordInstance::field_posts_property`]).
+    watched: bool,
+    /// The value field when it is `pp(TRUE)`, whose put-time post the
+    /// processing cycle makes instead (`dbput_post_put_field`).
+    post_suppressed: bool,
 }
+
+/// What [`RecordInstance::notify_field_written_if_changed_at`] compares a put
+/// against: the field's value before it, captured only for a watched field
+/// ([`RecordInstance::pre_put_at`]).
+pub(crate) struct PrePut(Option<Option<EpicsValue>>);
 
 impl PutAddr {
     /// `field` is upper-case already. Takes no lock, as
@@ -1778,12 +1801,35 @@ impl PutAddr {
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
         let addr = FieldAddr::resolve_in(rec, field);
         let (deadband_field, event_posted) = rec.walk_terms;
+        let rdes = rec.rdes();
         PutAddr {
+            dbaddr: addr
+                .desc
+                .is_some_and(|d| d.special == super::record_trait::Special::DbAddr)
+                || rdes
+                    .long_strings
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(field)),
             no_mod: declared_no_mod(field, addr.desc),
+            watched: is_metadata_cache_source(field)
+                || RecordInstance::field_posts_property(addr.desc),
             cache_source: is_metadata_cache_source(field),
+            post_suppressed: field == rdes.primary_field
+                && rdes.pp_fields.iter().any(|f| f.eq_ignore_ascii_case(field)),
             walk_skip: walk_skip_term(field, deadband_field, event_posted),
             field: addr,
         }
+    }
+
+    /// Whether `dbPut` takes its array arm for this field whatever the
+    /// request's count.
+    pub(crate) fn dbaddr(&self) -> bool {
+        self.dbaddr
+    }
+
+    /// Whether `dbPut` leaves this field's put-time post to the cycle.
+    pub(crate) fn post_suppressed(&self) -> bool {
+        self.post_suppressed
     }
 }
 
@@ -4080,10 +4126,28 @@ impl RecordInstance {
         &mut self,
         field: &str,
         at: &PutAddr,
-        prev: Option<&EpicsValue>,
+        pre: PrePut,
         backing: LinkBacking<'_>,
     ) {
-        self.written_if_changed(field, at.cache_source, at.field.desc, prev, backing);
+        let PrePut(Some(prev)) = pre else {
+            return;
+        };
+        self.written_if_changed(
+            field,
+            at.cache_source,
+            at.field.desc,
+            prev.as_ref(),
+            backing,
+        );
+    }
+
+    /// The pre-put value of `field` at `at` for the change test; a field the
+    /// test does not watch is not read.
+    pub(crate) fn pre_put_at(&self, field: &str, at: &PutAddr) -> PrePut {
+        PrePut(
+            at.watched
+                .then(|| self.resolve_field_stored_at(field, at.field.desc)),
+        )
     }
 
     /// `desc` is `upper`'s declaration ([`Self::field_desc`]).
@@ -5878,7 +5942,6 @@ impl RecordInstance {
         use crate::server::recgbl::EventMask;
         let ack_mask = EventMask::VALUE | EventMask::ALARM;
         self.common.ackt = new_ackt;
-        self.cleanup_subscribers();
         self.notify_field_backed("ACKT", ack_mask, backing);
         // C `:1294-1297`: turning transient acknowledgement off lowers a
         // sticky ACKS down to the current SEVR — an alarm that has already
@@ -5907,7 +5970,6 @@ impl RecordInstance {
         }
         use crate::server::recgbl::EventMask;
         self.common.acks = AlarmSeverity::NoAlarm;
-        self.cleanup_subscribers();
         self.notify_field_backed("ACKS", EventMask::VALUE | EventMask::ALARM, backing);
         self.notify_record_alarm(backing);
     }
@@ -8724,8 +8786,13 @@ impl RecordInstance {
         let publishes_value = mask.intersects(
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
         );
-        let subs = self.subscribers.get(field).filter(|subs| !subs.is_empty());
-        if subs.is_none() && !publishes_value {
+        // Rows whose consumer went away without unsubscribing are reaped
+        // from the bucket being posted, not by a sweep of every field per put.
+        let subscribed = self.subscribers.get_mut(field).is_some_and(|subs| {
+            subs.retain(|s| !s.is_closed());
+            !subs.is_empty()
+        });
+        if !subscribed && !publishes_value {
             return;
         }
         let Some(value) = read(self) else {
@@ -8733,11 +8800,11 @@ impl RecordInstance {
         };
         // With no subscriber the post is value-class (the return above), and
         // the value goes straight to the owner.
-        let Some(subs) = subs else {
+        if !subscribed {
             let walk_skip = walk_skip(self);
             self.record_value_post_as(field, walk_skip, value);
             return;
-        };
+        }
         let posted = publishes_value.then(|| value.clone());
         // A refused post publishes nothing, so it must not advance
         // `last_posted` either, or the next cycle's change detector would
@@ -8748,7 +8815,7 @@ impl RecordInstance {
         };
         {
             let mon_snap = Arc::new(snap);
-            for sub in subs {
+            for sub in &self.subscribers[field] {
                 // Paused subscriber (`db_event_disable`): suppress at
                 // the source — no delivery, no coalesce.
                 if !sub.active {
@@ -9232,6 +9299,29 @@ mod metadata_cache_tests {
             "a post that replaces an unobserved queued entry must record a \
              dropped monitor event (before={before}, after={after})"
         );
+    }
+
+    /// A row whose reader dropped without unsubscribing is reaped by the
+    /// next post to its field; the live row beside it stays.
+    #[test]
+    fn a_post_reaps_its_fields_closed_subscriber_rows() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut add = |sid| {
+            inst.add_subscriber(
+                "VAL",
+                sid,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscriber added")
+        };
+        let gone = add(1);
+        let _live = add(2);
+        drop(gone);
+        inst.notify_field_with_origin("VAL", EventMask::VALUE, 0, LinkBacking::none());
+        let sids: Vec<u32> = inst.subscribers["VAL"].iter().map(|s| s.sid).collect();
+        assert_eq!(sids, [2]);
     }
 
     #[test]

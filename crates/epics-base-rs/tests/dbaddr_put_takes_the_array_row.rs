@@ -14,6 +14,8 @@ record(mbbo, "S1") { field(ZRST, "zero") field(ONST, "one") field(TWST, "two") f
 record(aSub, "AS") { field(FTA, "DOUBLE") field(NOA, "1") field(FTVA, "LONG") field(NOVA, "1") }
 record(ao, "AO") { field(VAL, "4") }
 record(bo, "BO") { field(ZNAM, "off") field(ONAM, "on") field(VAL, "1") }
+record(mbbo, "LM") { field(VAL, "3") }
+record(aao, "LA") { field(FTVL, "STRING") field(NELM, "2") field(OUT, "LM PP") }
 "#;
 
 /// Each put in turn on one fresh IOC; the last one's status and value.
@@ -78,4 +80,28 @@ async fn an_empty_string_into_an_asub_channel_is_refused() {
 #[epics_macros_rs::epics_test]
 async fn a_plain_scalar_keeps_the_empty_string_arm() {
     assert_eq!(put("AO", "").await, (true, Some(EpicsValue::Double(0.0))));
+}
+
+/// `dbPut` clamps `nRequest` to the scalar's one element (`dbAccess.c:1359`)
+/// before converting. softIoc: `LA` writing ["2","xyz"] through `OUT "LM PP"`
+/// stores 2; ["xyz","2"] leaves it and raises LINK on `LA`.
+#[epics_macros_rs::epics_test]
+async fn an_array_link_into_a_scalar_dbaddr_field_converts_element_zero() {
+    for (texts, want) in [(["2", "xyz"], 2), (["xyz", "2"], 3)] {
+        let (db, _) = IocBuilder::new()
+            .db_string(DB, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let value = EpicsValue::StringArray(texts.map(PvString::from).to_vec().into());
+        db.put_record_field_from_ca("LA", "VAL", value)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_pv("LM").ok(),
+            Some(EpicsValue::UShort(want)),
+            "{texts:?}"
+        );
+    }
 }

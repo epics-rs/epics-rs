@@ -394,6 +394,11 @@ impl Record for MbboRecord {
         false
     }
 
+    /// VAL, the one `SPC_DBADDR` field, is a single `epicsEnum16`.
+    fn dbaddr_stored_as_scalar(&self, _field: &str) -> bool {
+        true
+    }
+
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::NONE
     }

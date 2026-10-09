@@ -2335,7 +2335,7 @@ impl Record for AcalcoutRecord {
         }
     }
 
-    /// Scalar inputs `A..L` are re-posted with the alarm bits on a cycle whose
+    /// Scalar inputs `A..L` are re-posted on a cycle whose
     /// alarm transition fired, even when their value did not change: C
     /// `monitor()` posts each with `monitor_mask|DBE_VALUE|DBE_LOG` when
     /// `(*pnew != *pprev) || (monitor_mask & DBE_ALARM)`
@@ -2343,6 +2343,10 @@ impl Record for AcalcoutRecord {
     /// (change-gated) are NOT in this set, so they are omitted.
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
         &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
     }
 
     /// SPC_NOMOD / internal trackers that this record mutates in `process()` /

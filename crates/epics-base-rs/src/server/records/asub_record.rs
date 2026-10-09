@@ -395,6 +395,14 @@ fn channel_get(v: &EpicsValue) -> EpicsValue {
     }
 }
 
+/// Whether [`channel_get`] serves `v` as a scalar.
+fn channel_is_scalar(v: &EpicsValue) -> bool {
+    match v {
+        EpicsValue::DoubleArray(a) => a.len() <= 1,
+        other => !other.is_array(),
+    }
+}
+
 impl Record for ASubRecord {
     fn acts_before_process(&self) -> bool {
         false
@@ -480,6 +488,14 @@ impl Record for ASubRecord {
             "" => Some(self.noa[idx].max(0) as u32),
             "VAL" => Some(self.nova[idx].max(0) as u32),
             _ => None,
+        }
+    }
+
+    fn dbaddr_stored_as_scalar(&self, field: &str) -> bool {
+        match parse_channel(field) {
+            Some(("", idx)) => !self.a[idx].is_array(),
+            Some(("VAL", idx)) => channel_is_scalar(&self.vala[idx]),
+            _ => false,
         }
     }
 

@@ -2032,6 +2032,13 @@ pub trait FieldDeclaration {
     /// five are exactly [`Record::long_string_fields`] (`lsi`/`lso` VAL+OVAL,
     /// `printf` VAL), so the second half asks the record for them.
     fn field_is_dbaddr(&self, field: &str) -> bool;
+
+    /// Whether the port stores `field` as a buffer — what `get_field(field)`
+    /// would answer with `is_array()`, without cloning the value to ask. Only
+    /// a [`Self::field_is_dbaddr`] field holds one; among those a record
+    /// names the scalar-stored ones in [`Record::dbaddr_stored_as_scalar`].
+    /// A type without a generated `.dbd` still asks its value.
+    fn field_stores_array(&self, field: &str) -> bool;
 }
 
 impl<R: Record + ?Sized> FieldDeclaration for R {
@@ -2060,6 +2067,18 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
                 .long_string_fields()
                 .iter()
                 .any(|f| f.eq_ignore_ascii_case(field))
+    }
+
+    fn field_stores_array(&self, field: &str) -> bool {
+        if self.field_is_dbaddr(field) {
+            return !self.dbaddr_stored_as_scalar(field);
+        }
+        if super::dbd_generated::record_fields(self.record_type()).is_some() {
+            return false;
+        }
+        // A hand-written declaration need not mark its buffers `SPC_DBADDR`:
+        // the stored value is the only witness.
+        self.get_field(field).is_some_and(|v| v.is_array())
     }
 }
 
@@ -3616,6 +3635,14 @@ pub trait Record: Send + Sync + 'static {
     /// - mca `VAL`/`BG` → `NMAX` (`mcaRecord.c:857`).
     fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
         None
+    }
+
+    /// Whether this record stores the `SPC_DBADDR` field `field` as a single
+    /// element rather than a buffer (`mbbo.VAL`, an `aSub` channel at count 1).
+    /// [`FieldDeclaration::field_stores_array`] reads it so a put can learn
+    /// the destination's shape without cloning the value under the lock.
+    fn dbaddr_stored_as_scalar(&self, _field: &str) -> bool {
+        false
     }
 
     /// The part of C's `init_record` tail that is NOT tracker seeding: an
@@ -5639,9 +5666,12 @@ pub(crate) fn dbput_coerce_value_in<R: Record + ?Sized>(
     // is settled: `nRequest > 1 || special == SPC_DBADDR`. A scalar-stored
     // `SPC_DBADDR` field (`mbbo.VAL`, an `aSub` channel at NOA 1) takes the
     // `putString*` row, which has no empty-string arm.
-    let array_row = value.count() > 1 || dbaddr;
+    let row = PutRow::DbPut {
+        multi_request: value.count() > 1,
+        dbaddr,
+    };
     let value = put_value_in_shape(record, field, shape, value);
-    coerce_put_value_in_row(record, field, target, value, array_row)
+    coerce_put_value_in_row(record, field, target, value, row)
 }
 
 /// `value` as the one-element buffer of its OWN element type. The element type
@@ -5713,8 +5743,8 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     record.put_field(name, value)
 }
 
-/// C's `putString*` row when the destination is an ARRAY — `Some` when this row
-/// owns the put, `None` when it does not apply and the scalar rows below do.
+/// C's `putString*` row when the destination is an ARRAY — `Ok` when this row
+/// owns the put, `Err` handing the request back when the scalar rows below do.
 ///
 /// `dbPut` reaches it for every `special(SPC_DBADDR)` field regardless of
 /// `nRequest` (`dbAccess.c:1350`), so a one-element string put is this row too;
@@ -5733,18 +5763,24 @@ fn put_string_array_row<R: Record + ?Sized>(
     record: &R,
     field: &str,
     target: DbFieldType,
-    value: &EpicsValue,
-    array_row: bool,
-) -> CaResult<Option<Converted>> {
-    let texts: &[crate::types::PvString] = match value {
+    value: EpicsValue,
+    row: PutRow,
+) -> CaResult<Result<Converted, EpicsValue>> {
+    let texts: &[crate::types::PvString] = match &value {
         EpicsValue::String(s) => std::slice::from_ref(s),
         EpicsValue::StringArray(a) => a,
-        _ => return Ok(None),
+        _ => return Ok(Err(value)),
+    };
+    let array_row = match row {
+        PutRow::DbPut {
+            multi_request,
+            dbaddr,
+        } => multi_request || dbaddr,
+        PutRow::StoredShape => record.field_stores_array(field),
     };
     if !array_row {
-        return Ok(None);
+        return Ok(Err(value));
     }
-    let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
     // `putStringString` is a byte copy, and the record stores the text: hand the
     // value over unchanged rather than falling through to the SCALAR numeric
     // row below, which would parse `printf.VAL`'s `"7"` into the number 7.
@@ -5753,20 +5789,26 @@ fn put_string_array_row<R: Record + ?Sized>(
         .iter()
         .any(|f| f.eq_ignore_ascii_case(field))
     {
-        return Ok(Some(Converted::Stored(value.clone())));
+        return Ok(Ok(Converted::Stored(value)));
     }
-    if !dest_is_array && target == DbFieldType::Enum {
-        return super::resolve_put_string_enum(field, record, &texts[0])
-            .map(|v| Some(Converted::Stored(v)));
+    // A scalar-held destination has `no_elements` 1, so `dbPut` clamps the
+    // request to its first element (`dbAccess.c:1359`) and converts only that.
+    let first = match texts {
+        [first, ..] if !record.field_stores_array(field) => Some(first),
+        _ => None,
+    };
+    if let Some(first) = first
+        && target == DbFieldType::Enum
+    {
+        return super::resolve_put_string_enum(field, record, first)
+            .map(|v| Ok(Converted::Stored(v)));
     }
     let Some(numeric) = c_parse::NumericField::of(target) else {
-        return Ok(Some(Converted::Stored(value.clone())));
+        return Ok(Ok(Converted::Stored(value)));
     };
-    match c_parse::put_string_elements(field, numeric, texts)? {
-        Converted::Stored(v) if !dest_is_array => {
-            Ok(Some(Converted::Stored(v.first_element().unwrap_or(v))))
-        }
-        converted => Ok(Some(converted)),
+    match first {
+        Some(first) => c_parse::put_string_element(field, numeric, &first.as_str_lossy()).map(Ok),
+        None => c_parse::put_string_elements(field, numeric, texts).map(Ok),
     }
 }
 
@@ -5824,18 +5866,27 @@ pub fn coerce_put_value<R: Record + ?Sized>(
     target: DbFieldType,
     value: EpicsValue,
 ) -> CaResult<Converted> {
-    let array_row = record.get_field(field).is_some_and(|v| v.is_array());
-    coerce_put_value_in_row(record, field, target, value, array_row)
+    coerce_put_value_in_row(record, field, target, value, PutRow::StoredShape)
 }
 
-/// [`coerce_put_value`] with `dbPut`'s row choice made by the caller:
-/// `array_row` is `dbPutConvertRoutine`, otherwise `dbFastPutConvertRoutine`.
+/// How a put picks between `dbPutConvertRoutine` (`putString*`) and
+/// `dbFastPutConvertRoutine`, asked only once the request is a string.
+#[derive(Clone, Copy)]
+enum PutRow {
+    /// `dbPut`'s own test (`dbAccess.c:1355`): `nRequest > 1`, read before
+    /// the request's shape was rendered, or `special == SPC_DBADDR`.
+    DbPut { multi_request: bool, dbaddr: bool },
+    /// An internal delivery: the destination's stored shape.
+    StoredShape,
+}
+
+/// [`coerce_put_value`] with the row picked by `row`.
 fn coerce_put_value_in_row<R: Record + ?Sized>(
     record: &R,
     field: &str,
     target: DbFieldType,
     value: EpicsValue,
-    array_row: bool,
+    row: PutRow,
 ) -> CaResult<Converted> {
     // The ARRAY row first, so both counts of the SAME C routine have one owner:
     // a scalar `String` and a `StringArray` into an array destination are both
@@ -5843,9 +5894,10 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
     // (`dbAccess.c:1350` takes that arm for every `special(SPC_DBADDR)` field,
     // whatever the count). Menu/DTYP/enum fields are never array destinations,
     // so nothing below is shadowed.
-    if let Some(converted) = put_string_array_row(record, field, target, &value, array_row)? {
-        return Ok(converted);
-    }
+    let value = match put_string_array_row(record, field, target, value, row)? {
+        Ok(converted) => return Ok(converted),
+        Err(value) => value,
+    };
     if let EpicsValue::String(s) = &value {
         // DTYP (DBF_DEVICE) validates against the record type's FULL device
         // menu — static `device()` lines PLUS runtime-contributed device
@@ -5878,20 +5930,22 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
         if let Some(numeric) = c_parse::NumericField::of(target) {
             return c_parse::put_string(field, numeric, &s.as_str_lossy());
         }
-        if target == DbFieldType::String {
-            // C `putStringString` (dbConvert.c:916-925): `strncpy(pdst, psrc,
-            // field_size); pdst[field_size-1] = 0` — the DBF_STRING put
-            // truncates to `field_size - 1` bytes. The row is NOT a no-op even
-            // for a String source, so it must run even when source and stored
-            // type match (the two gates that call this converter skip it on a
-            // type match; both route a String target here regardless). The CA
-            // wire already caps a DBR_STRING at `MAX_STRING_SIZE - 1` (39), so
-            // this only bites a field whose `.dbd` `size(N)` is under 40 —
-            // dbCommon `ASG` `size(29)` → 28, and the like.
-            return Ok(Converted::Stored(EpicsValue::String(
-                cap_string_to_field_size(record, field, s),
-            )));
-        }
+    }
+    if target == DbFieldType::String
+        && let EpicsValue::String(s) = value
+    {
+        // C `putStringString` (dbConvert.c:916-925): `strncpy(pdst, psrc,
+        // field_size); pdst[field_size-1] = 0` — the DBF_STRING put
+        // truncates to `field_size - 1` bytes. The row is NOT a no-op even
+        // for a String source, so it must run even when source and stored
+        // type match (the two gates that call this converter skip it on a
+        // type match; both route a String target here regardless). The CA
+        // wire already caps a DBR_STRING at `MAX_STRING_SIZE - 1` (39), so
+        // this only bites a field whose `.dbd` `size(N)` is under 40 —
+        // dbCommon `ASG` `size(29)` → 28, and the like.
+        return Ok(Converted::Stored(EpicsValue::String(
+            cap_string_to_field_size(record, field, s),
+        )));
     }
     // The float/double rows of C's DBR_STRING put column render through the
     // record's `get_precision`, seeded 6: `putFloatString`/`putDoubleString`
@@ -5955,18 +6009,14 @@ fn put_string_precision<R: Record + ?Sized>(record: &R) -> u16 {
 /// `field_size - 1` bytes (its `.dbd` `size(N)` less the forced NUL). A field
 /// with no declared size (`0` — a Tier 3 hand table, or a field with no
 /// declaration) is left uncapped beyond the wire's own `MAX_STRING_SIZE - 1`.
-fn cap_string_to_field_size<R: Record + ?Sized>(record: &R, field: &str, s: &PvString) -> PvString {
+fn cap_string_to_field_size<R: Record + ?Sized>(record: &R, field: &str, s: PvString) -> PvString {
     match super::record_instance::field_desc_of(record, field) {
-        Some(desc) if desc.size > 0 => {
-            let cap = (desc.size as usize).saturating_sub(1);
-            let bytes = s.as_bytes();
-            if bytes.len() > cap {
-                PvString::from_bytes(bytes[..cap].to_vec())
-            } else {
-                s.clone()
-            }
+        Some(desc) if desc.size > 0 && s.len() >= desc.size as usize => {
+            let mut bytes = s.into_bytes();
+            bytes.truncate(desc.size as usize - 1);
+            PvString::from_bytes(bytes)
         }
-        _ => s.clone(),
+        _ => s,
     }
 }
 

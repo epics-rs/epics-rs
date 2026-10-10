@@ -1541,16 +1541,24 @@ mod menu_choice_tests {
 
 #[cfg(test)]
 mod channel_table_tests {
-    use super::{MAX_SCALER_CHANNELS, SCALER_STATE_IDLE, ScalerRecord};
+    use super::{MAX_SCALER_CHANNELS, PROCESS_POSTED_FIELDS, SCALER_STATE_IDLE, ScalerRecord};
     use epics_base_rs::server::record::Record;
     use std::collections::BTreeSet;
 
     /// Each `nch` slice holds exactly its channels' names: the empty record,
     /// channel 1 (whose PR1 sits in the fixed head), and every count up to the
-    /// table's end.
+    /// table's end. The process-posted head is read from the table itself:
+    /// which fixed names it holds is the table's decision, not this test's.
     #[test]
     fn sliced_tables_hold_exactly_the_active_channels() {
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let head = PROCESS_POSTED_FIELDS.len() - MAX_SCALER_CHANNELS;
+        let all_sn: Vec<String> = (1..=MAX_SCALER_CHANNELS).map(|i| format!("S{i}")).collect();
+        assert_eq!(
+            PROCESS_POSTED_FIELDS[head..],
+            all_sn,
+            "the channels follow the head"
+        );
         for nch in 0..=MAX_SCALER_CHANNELS {
             let rec = ScalerRecord {
                 nch: nch as i16,
@@ -1559,7 +1567,7 @@ mod channel_table_tests {
             };
             let sn: Vec<String> = (1..=nch).map(|i| format!("S{i}")).collect();
             let mut value_only = set(&["CNT", "T", "VAL", "PR1", "TP", "FREQ"]);
-            let mut posted = set(&["VAL", "T", "CNT", "PR1", "TP", "FREQ"]);
+            let mut posted = set(&PROCESS_POSTED_FIELDS[..head]);
             for i in 1..=nch {
                 value_only.extend([
                     format!("S{i}"),

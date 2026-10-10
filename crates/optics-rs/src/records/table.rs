@@ -5441,6 +5441,9 @@ mod init_alarm_tests {
     use epics_base_rs::types::EpicsValue;
     use std::collections::HashMap;
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+
     /// oracleTableIoc `table.db` (one default table): after iocInit `T.UDF`
     /// reads 1 and `T.STAT`/`T.SEVR` read NO_ALARM, and a `caput T.SSET 1`
     /// leaves them so — `init_record`'s `monitor()` (`tableRecord.c:405`)

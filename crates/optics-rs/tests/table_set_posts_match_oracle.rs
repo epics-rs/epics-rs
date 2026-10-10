@@ -17,7 +17,7 @@
 //! C never clears SSET. C posts NO_ALARM throughout; the alarm half is
 //! `TableRecord::init_resets_alarms`'s and is not compared here.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — passes on the exec backend
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both pass on the exec backend
 // (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs
 // --test table_set_posts_match_oracle`); no CA server is built.
 

@@ -17,6 +17,7 @@
 //! ```
 
 #![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};

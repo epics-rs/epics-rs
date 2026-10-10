@@ -1449,6 +1449,9 @@ mod tests {
         assert_eq!(n, 1, "{lines:?}");
     }
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+
     /// An unknown filter drops the group. softIocPVX on
     /// `info(Q:group, {"G":{"v":{+channel:"VAL{\"bad\":{}}"}}})`:
     ///

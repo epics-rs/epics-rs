@@ -48,33 +48,14 @@ const ORDER: ByteOrder = ByteOrder::Little;
 /// Start a `PvaServer` on a random loopback port serving `provider`'s
 /// records and groups through the QSRV source.
 fn spawn_qsrv(provider: Arc<BridgeProvider>) -> (PvaServer, SocketAddr) {
-    let pick_tcp = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick_tcp(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
     let source = QsrvPvStore::new(
         epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
         provider,
     );
-    let server = PvaServer::start(Arc::new(source), cfg).expect("qsrv test server must start");
-    (server, bound)
+    let server = PvaServer::start(Arc::new(source), PvaServerConfig::isolated())
+        .expect("qsrv test server must start");
+    let addr = server.tcp_addr();
+    (server, addr)
 }
 
 // ---------------------------------------------------------------------------

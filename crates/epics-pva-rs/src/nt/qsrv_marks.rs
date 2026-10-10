@@ -191,6 +191,7 @@ mod tests {
                 control_double: bits & 8 != 0,
                 alarm_double: bits & 16 != 0,
                 enum_strs: bits & 32 != 0,
+                put_enum_str: None,
             };
             let leaves = property_leaves(props);
             for n in never {

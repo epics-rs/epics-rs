@@ -1476,20 +1476,31 @@ impl EpicsValue {
     /// (`epicsString.c:106`, `OUT(u)` into a `char`), so `field(VAL,"h\xffz")`
     /// is the three bytes `h`, `0xFF`, `z` — measured on softIoc, where `dbgf`
     /// prints `"h\xffz"` (one escape, not the `\xc3\xbf` a UTF-8 encoding of
-    /// U+00FF would print). Going through [`Self::parse`] would force the value
+    /// U+00FF would print). Going through a `&str` parse would force the value
     /// through a Rust `String` and turn that one byte into two.
     ///
     /// Every other DBF type is a number or a menu label — ASCII by
-    /// construction, and a byte outside ASCII is a parse error either way — so
-    /// they are handed to [`Self::parse`] unchanged.
+    /// construction, and a byte outside ASCII is a parse error either way. An
+    /// integer width is `dbPutStringNum`'s 64-bit parse then C's cast; the
+    /// floats take [`Self::parse`].
     pub fn parse_bytes(dbr_type: DbFieldType, bytes: &[u8]) -> CaResult<Self> {
         if dbr_type == DbFieldType::String {
             return Ok(Self::String(PvString::from_bytes(bytes.trim_ascii())));
         }
-        Self::parse(dbr_type, &String::from_utf8_lossy(bytes))
+        let text = String::from_utf8_lossy(bytes);
+        // An integer width in a `.db` body or a `.dbd` `initial(...)` is C's
+        // `dbPutStringNum` (64-bit parse, then C's cast), not the put row.
+        match dbr_type {
+            DbFieldType::Float | DbFieldType::Double => Self::parse(dbr_type, &text),
+            _ if text.trim().is_empty() => Self::parse(dbr_type, &text),
+            _ => crate::server::db_loader::db_put_string_num(dbr_type, &text),
+        }
     }
 
-    /// Parse a string value into an EpicsValue of the given type
+    /// Parse a literal into an `EpicsValue` of the given type, strictly: an
+    /// integer outside the width, or with a tail, is an error, never a value
+    /// cast into the width. A `.db` body or `.dbd` `initial(...)` takes
+    /// [`Self::parse_bytes`], which casts as `dbPutStringNum` does.
     pub fn parse(dbr_type: DbFieldType, s: &str) -> CaResult<Self> {
         // C EPICS treats empty/whitespace strings as zero for numeric fields
         let s = s.trim();
@@ -1511,9 +1522,6 @@ impl EpicsValue {
         }
         match dbr_type {
             DbFieldType::String => Ok(Self::String(s.into())),
-            DbFieldType::Short => Self::parse_int(s)
-                .map(|v| Self::Short(v as i16))
-                .map_err(|_| CaError::InvalidValue(menu_label_hint("short", s))),
             // `dbStaticLib.c:2797` parses a `DBF_FLOAT` field with
             // `epicsParseFloat32`, the same routine `putStringFloat` uses, so
             // the narrowing gate belongs on this path too: without it `1e300`
@@ -1523,32 +1531,37 @@ impl EpicsValue {
                 .and_then(super::c_parse::narrow_to_f32)
                 .map(Self::Float)
                 .ok_or_else(|| CaError::InvalidValue(format!("invalid float literal: {s}"))),
-            DbFieldType::Enum => Self::parse_int(s)
-                .map(|v| Self::Enum(v as u16))
-                .map_err(|_| CaError::InvalidValue(menu_label_hint("enum", s))),
-            DbFieldType::Char => Self::parse_int(s)
-                .map(|v| Self::Char(v as u8))
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::Long => Self::parse_int(s)
-                .map(|v| Self::Long(v as i32))
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::Int64 => Self::parse_int(s)
-                .map(Self::Int64)
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::UInt64 => Self::parse_uint(s)
-                .map(Self::UInt64)
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::UShort => Self::parse_uint(s)
-                .map(|v| Self::UShort(v as u16))
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::ULong => Self::parse_uint(s)
-                .map(|v| Self::ULong(v as u32))
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
-            // DBF_UCHAR parses unsigned like its UShort/ULong siblings
-            // (epicsUInt8), narrowing off the low byte.
-            DbFieldType::UChar => Self::parse_uint(s)
-                .map(|v| Self::UChar(v as u8))
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
+            // Every integer width is `c_parse`'s strict `epicsParse*` row
+            // (`units == NULL`, base 0): a literal outside the width, or with a
+            // tail, is an error — never a value cast into the width. A `.db`
+            // record body is a different C rule (`dbPutStringNum`) and takes
+            // [`Self::parse_bytes`]; a `caput`/`dbpf` takes the put row
+            // (`c_parse::put_string`) on the server.
+            DbFieldType::Short
+            | DbFieldType::Enum
+            | DbFieldType::Char
+            | DbFieldType::Long
+            | DbFieldType::Int64
+            | DbFieldType::UInt64
+            | DbFieldType::UShort
+            | DbFieldType::ULong
+            | DbFieldType::UChar => {
+                // `DBF_ENUM` is the unsigned 16-bit row (`dbTest.c:678`).
+                let numeric = match dbr_type {
+                    DbFieldType::Enum => super::c_parse::NumericField::UShort,
+                    t => super::c_parse::NumericField::of(t)
+                        .expect("an integer DbFieldType has a NumericField row"),
+                };
+                match super::c_parse::parse_auto_base_units_null(numeric, s) {
+                    Some(Self::UShort(v)) if dbr_type == DbFieldType::Enum => Ok(Self::Enum(v)),
+                    Some(v) => Ok(v),
+                    None => Err(CaError::InvalidValue(match dbr_type {
+                        DbFieldType::Short => menu_label_hint("short", s),
+                        DbFieldType::Enum => menu_label_hint("enum", s),
+                        _ => format!("invalid {dbr_type:?} literal: {s}"),
+                    })),
+                }
+            }
             DbFieldType::Double => parse_string_to_f64(s)
                 .map(Self::Double)
                 .ok_or_else(|| CaError::InvalidValue(format!("invalid double literal: {s}"))),
@@ -1819,8 +1832,49 @@ mod parse_radix_tests {
             EpicsValue::Short(127)
         );
         assert_eq!(
-            EpicsValue::parse(DbFieldType::Char, "0xFF").unwrap(),
+            EpicsValue::parse(DbFieldType::Char, "0x7F").unwrap(),
+            EpicsValue::Char(127)
+        );
+        // 0xFF is outside `epicsInt8`: refused, where the `as u8` it used to
+        // take stored 255. A `.db` body casts instead, as `dbPutStringNum` does.
+        assert!(EpicsValue::parse(DbFieldType::Char, "0xFF").is_err());
+        assert_eq!(
+            EpicsValue::parse_bytes(DbFieldType::Char, b"0xFF").unwrap(),
             EpicsValue::Char(255)
+        );
+    }
+
+    /// `parse` is the strict `epicsParse*` row: nothing outside the width is
+    /// cast into it. `parse_bytes` is a `.db` body, where C's `dbPutStringNum`
+    /// parses 64 bits and casts (`field(PHAS,"70000")` is 4464).
+    #[test]
+    fn parse_refuses_what_the_width_cannot_hold_and_a_db_body_casts_it() {
+        for (t, text) in [
+            (DbFieldType::Long, "2147483648"),
+            (DbFieldType::Long, "-2147483649"),
+            (DbFieldType::Long, "9223372036854775807"),
+            (DbFieldType::Short, "32768"),
+            (DbFieldType::UShort, "65536"),
+            (DbFieldType::Enum, "65536"),
+            (DbFieldType::UChar, "256"),
+            (DbFieldType::Int64, "9223372036854775808"),
+            (DbFieldType::UInt64, "18446744073709551616"),
+            (DbFieldType::Long, "12abc"),
+            (DbFieldType::Long, "1e3"),
+        ] {
+            assert!(EpicsValue::parse(t, text).is_err(), "{t:?} {text}");
+        }
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Int64, "9223372036854775807").unwrap(),
+            EpicsValue::Int64(i64::MAX)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::UInt64, "18446744073709551615").unwrap(),
+            EpicsValue::UInt64(u64::MAX)
+        );
+        assert_eq!(
+            EpicsValue::parse_bytes(DbFieldType::Short, b"70000").unwrap(),
+            EpicsValue::Short(4464)
         );
     }
 

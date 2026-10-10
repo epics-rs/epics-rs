@@ -132,6 +132,11 @@ impl Circuit {
         self.sock.write_all(frame).expect("write frame");
     }
 
+    /// The peer address the server sees, which RSRV's console lines name.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.sock.local_addr().expect("local address")
+    }
+
     /// Wait for a frame carrying `cmmd`, keeping everything else.
     pub fn expect(&mut self, cmmd: u16, what: &str) -> Vec<u8> {
         self.expect_where(|f| cmmd_of(f) == cmmd, what)
@@ -239,6 +244,34 @@ impl Circuit {
             self.pending.push_back(frame);
         }
         panic!("{what}: no matching frame within {FRAME_BUDGET} frames");
+    }
+
+    /// The next frame, which must be a `CA_PROTO_ERROR`; its ECA status.
+    pub fn expect_error(&mut self, what: &str) -> u32 {
+        assert!(
+            self.pending.is_empty(),
+            "{what}: unclaimed {:?}",
+            self.pending
+        );
+        let frame = self.read_one_frame();
+        assert_eq!(cmmd_of(&frame), CA_PROTO_ERROR, "{what}");
+        u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]])
+    }
+
+    /// Wait for the server to close the circuit, with nothing unclaimed
+    /// before the close.
+    pub fn expect_closed(&mut self, what: &str) {
+        assert!(
+            self.pending.is_empty(),
+            "{what}: unclaimed {:?}",
+            self.pending
+        );
+        let mut byte = [0u8; 1];
+        match self.sock.read(&mut byte) {
+            Ok(0) => {}
+            Ok(_) => panic!("{what}: the server sent more before closing"),
+            Err(e) => panic!("{what}: {e}"),
+        }
     }
 
     /// Read exactly one whole CA frame (header + declared payload), leaving the

@@ -401,6 +401,11 @@ pub struct PropertySupport {
     pub alarm_double: bool,
     /// `rset.get_enum_strs`
     pub enum_strs: bool,
+    /// `rset.put_enum_str`, never narrowed: C's scalar `DBF_STRING` →
+    /// `DBR_ENUM` get (`cvt_st_e`, `dbFastLinkConv.c:247-258`) calls it for
+    /// any field of the record and fails `S_db_noRSET` without it. `None` for
+    /// a bare PV, which has no rset to ask.
+    pub put_enum_str: Option<bool>,
 }
 
 impl PropertySupport {
@@ -413,6 +418,7 @@ impl PropertySupport {
         control_double: false,
         alarm_double: false,
         enum_strs: false,
+        put_enum_str: Some(false),
     };
 
     /// Every numeric slot, no enum strings — the `ai`/`ao`/`calc` shape.
@@ -423,6 +429,7 @@ impl PropertySupport {
         control_double: true,
         alarm_double: true,
         enum_strs: false,
+        put_enum_str: Some(false),
     };
 
     /// The record type's slots narrowed to ONE addressed field — C's second

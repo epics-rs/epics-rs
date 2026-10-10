@@ -1398,9 +1398,8 @@ impl CaClient {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let snap = ch.snapshot()?;
-        let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put_nowait(&value).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        ch.put_as_dbr_nowait(dbr_type, &value).await?;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
@@ -1421,9 +1420,9 @@ impl CaClient {
         let timeout = crate::estdlib::duration_from_secs(timeout_secs);
         ch.wait_connected(timeout).await?;
 
-        let snap = ch.snapshot()?;
-        let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put_with_timeout(&value, timeout).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        ch.put_as_dbr_with_timeout(dbr_type, &value, timeout)
+            .await?;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
@@ -1741,6 +1740,48 @@ pub struct CaChannel {
     /// [`Self::on_access_rights_change`]) can start their tasks from a thread
     /// that has entered no runtime.
     reactor: epics_base_rs::runtime::task::Reactor,
+}
+
+/// The value C `caput` puts for one scalar token (`caput.c:455-552`): every
+/// non-ENUM type goes out as the escape-decoded `DBR_STRING`, so the server's
+/// `putString*` (`epicsParse*`) decides what it means and refuses what does
+/// not fit; an ENUM goes by menu name as a string, else as a `DBR_DOUBLE`
+/// number, each under its own wire type. The client never parses a number into
+/// the field's width.
+async fn caput_wire_value(ch: &CaChannel, token: &str) -> CaResult<(u16, EpicsValue)> {
+    // C `EpicsStr`: one `DBR_STRING` is at most 39 bytes plus the NUL.
+    const DBR_STRING_PAYLOAD_MAX: usize = 39;
+    let native = ch.snapshot()?.native_type;
+    let mut escaped = epics_base_rs::runtime::epics_string::raw_from_escaped(token);
+    escaped.truncate(DBR_STRING_PAYLOAD_MAX);
+    if native == DbFieldType::Enum {
+        let menu = ch
+            .get_with_metadata(DbrClass::Gr)
+            .await?
+            .enums
+            .map(|e| e.strings)
+            .unwrap_or_default();
+        if menu
+            .iter()
+            .any(|name| name.as_bytes() == escaped.as_slice())
+        {
+            return Ok((
+                DbFieldType::String as u16,
+                EpicsValue::String(PvString::from_bytes(escaped)),
+            ));
+        }
+        let text = String::from_utf8_lossy(&escaped);
+        return match text.trim().parse::<f64>() {
+            Ok(index) => Ok((DbFieldType::Double as u16, EpicsValue::Double(index))),
+            Err(_) => Err(CaError::InvalidValue(format!(
+                "Enum string value '{text}' invalid."
+            ))),
+        };
+    }
+    Ok((
+        DbFieldType::String as u16,
+        EpicsValue::String(PvString::from_bytes(escaped)),
+    ))
 }
 
 #[cfg(test)]

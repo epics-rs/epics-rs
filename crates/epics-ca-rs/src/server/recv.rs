@@ -147,6 +147,12 @@ pub(crate) struct GateError {
     pub(crate) status: u32,
     /// C's own diagnostic text for this gate, verbatim.
     pub(crate) diagnostic: String,
+    /// The `pContext` the gate hands `log_header`, which is not always the
+    /// diagnostic: the oversize refusal words the two differently.
+    pub(crate) context: &'static str,
+    /// `log_header`'s `mnum`: the messages this parse pass had dispatched
+    /// (C `nmsg`), or 0 where C passes 0.
+    pub(crate) mnum: u32,
 }
 
 /// What [`RecvAccumulator::next_message`] decided about the bytes at the parse
@@ -193,7 +199,7 @@ pub(crate) enum Gate {
 
 /// A per-client receive buffer that cannot be grown by a peer, and cannot be
 /// parsed except through the gate sequence.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RecvAccumulator {
     buf: Vec<u8>,
     /// C `client->recvBytesToDrain` (`camessage.c:2375-2384`): bytes of an
@@ -215,6 +221,12 @@ pub(crate) struct RecvAccumulator {
     rate_strikes: u32,
     /// `EPICS_CAS_RATE_LIMIT_STRIKES`; zero never disconnects.
     rate_strike_threshold: u32,
+    /// [`Self::body_ceiling`], read once per circuit as C sizes
+    /// `rsrvSizeofLargeBufTCP` once, so no message pays the env lookup.
+    body_ceiling: usize,
+    /// C `nmsg`, local to one `camessage` call — one pass over what a read
+    /// buffered. Reset by [`Self::accept`].
+    nmsg: u32,
 }
 
 impl RecvAccumulator {
@@ -229,9 +241,14 @@ impl RecvAccumulator {
     /// environment — for tests, which must not depend on process-wide state.
     pub(crate) fn with_rate_limit(cfg: &RateLimitConfig) -> Self {
         Self {
+            buf: Vec::new(),
+            to_drain: 0,
+            offset: 0,
             rate: cfg.build(),
+            rate_strikes: 0,
             rate_strike_threshold: cfg.strike_threshold,
-            ..Self::default()
+            nmsg: 0,
+            body_ceiling: Self::body_ceiling(),
         }
     }
 
@@ -278,8 +295,8 @@ impl RecvAccumulator {
     /// is a `u16`), but making that a consequence of the size rather than a
     /// special case is what keeps a future header form from arriving
     /// unguarded.
-    fn admits_body(declared_body: usize) -> Result<(), usize> {
-        let ceiling = Self::body_ceiling();
+    fn admits_body(&self, declared_body: usize) -> Result<(), usize> {
+        let ceiling = self.body_ceiling;
         if declared_body > ceiling {
             Err(ceiling)
         } else {
@@ -296,8 +313,8 @@ impl RecvAccumulator {
     /// partially-received *next* frame pipelined behind a full one in the
     /// same read burst does not trip it either. A buffer longer than that
     /// cannot be explained by a legal peer.
-    pub(crate) fn accumulation_ceiling() -> usize {
-        Self::body_ceiling()
+    pub(crate) fn accumulation_ceiling(&self) -> usize {
+        self.body_ceiling
             .saturating_add(24)
             .saturating_add(64 * 1024)
     }
@@ -310,6 +327,7 @@ impl RecvAccumulator {
     /// body costs no memory however slowly it is dribbled — then enforces
     /// [`Self::accumulation_ceiling`] before appending.
     pub(crate) fn accept(&mut self, chunk: &[u8]) -> Admit {
+        self.nmsg = 0;
         let chunk = if self.to_drain > 0 {
             let drop_now = self.to_drain.min(chunk.len());
             self.to_drain -= drop_now;
@@ -322,7 +340,7 @@ impl RecvAccumulator {
             // owed. Nothing was appended, so the buffer did not grow.
             return Admit::Draining;
         }
-        let ceiling = Self::accumulation_ceiling();
+        let ceiling = self.accumulation_ceiling();
         if self.buf.len().saturating_add(chunk.len()) > ceiling {
             return Admit::Overflow(ceiling);
         }
@@ -471,6 +489,8 @@ impl RecvAccumulator {
                 hdr,
                 status: ECA_DEFUNCT,
                 diagnostic: format!("CAS: Client version {client_minor} too old"),
+                context: "CAS: Client version too old",
+                mnum: self.nmsg,
             });
         }
 
@@ -487,18 +507,22 @@ impl RecvAccumulator {
                     hdr,
                     status: ECA_INTERNAL,
                     diagnostic: MISALIGNED_DIAGNOSTIC.to_string(),
+                    context: MISALIGNED_DIAGNOSTIC,
+                    mnum: self.nmsg,
                 }),
                 reason: CaError::Protocol("misaligned CA payload".into()),
             };
         }
 
         // 7. Oversize: refuse this message, keep the circuit.
-        if let Err(ceiling) = Self::admits_body(body) {
+        if let Err(ceiling) = self.admits_body(body) {
             self.skip_refused(msg_len);
             return Gate::Refuse(GateError {
                 hdr,
                 status: ECA_TOLARGE,
                 diagnostic: too_large_message(ceiling),
+                context: "CAS: server unable to load large request message",
+                mnum: self.nmsg,
             });
         }
 
@@ -515,12 +539,16 @@ impl RecvAccumulator {
         //    recover. Advancing past the message first keeps the wire
         //    accounting identical to the delivered case.
         self.offset += msg_len;
+        self.nmsg += 1;
         if !is_legal_tcp_command(hdr.cmmd) {
             return Gate::TearDown {
                 error: Some(GateError {
                     hdr,
                     status: ECA_INTERNAL,
                     diagnostic: BAD_TCP_COMMAND_DIAGNOSTIC.to_string(),
+                    // `bad_tcp_cmd_action` passes 0 (`camessage.c:346`).
+                    context: BAD_TCP_COMMAND_DIAGNOSTIC,
+                    mnum: 0,
                 }),
                 reason: CaError::Protocol(format!(
                     "illegal TCP command {} (C bad_tcp_cmd_action)",
@@ -616,7 +644,7 @@ mod tests {
     /// and over reached by two reads that are each individually small.
     #[test]
     fn accumulation_stops_exactly_at_the_ceiling() {
-        let ceiling = RecvAccumulator::accumulation_ceiling();
+        let ceiling = RecvAccumulator::new().accumulation_ceiling();
 
         let mut acc = RecvAccumulator::new();
         assert_eq!(acc.accept(&vec![0u8; ceiling - 1]), Admit::Parse);
@@ -645,15 +673,13 @@ mod tests {
     #[test]
     fn declared_bodies_are_admitted_up_to_the_ceiling_and_no_further() {
         let ceiling = RecvAccumulator::body_ceiling();
-        assert_eq!(RecvAccumulator::admits_body(0), Ok(()));
-        assert_eq!(RecvAccumulator::admits_body(ceiling - 1), Ok(()));
-        assert_eq!(RecvAccumulator::admits_body(ceiling), Ok(()));
-        assert_eq!(RecvAccumulator::admits_body(ceiling + 1), Err(ceiling));
+        let acc = RecvAccumulator::new();
+        assert_eq!(acc.admits_body(0), Ok(()));
+        assert_eq!(acc.admits_body(ceiling - 1), Ok(()));
+        assert_eq!(acc.admits_body(ceiling), Ok(()));
+        assert_eq!(acc.admits_body(ceiling + 1), Err(ceiling));
         // The v4.9 extended form's worst case: a `u32` postsize.
-        assert_eq!(
-            RecvAccumulator::admits_body(u32::MAX as usize),
-            Err(ceiling)
-        );
+        assert_eq!(acc.admits_body(u32::MAX as usize), Err(ceiling));
     }
 
     /// The dribble: a peer declares a ~4 GiB body, is refused, then sends
@@ -667,10 +693,7 @@ mod tests {
         // 24-byte extended header lands; the body is refused before any of
         // it is believed.
         assert_eq!(acc.accept(&[0u8; 24]), Admit::Parse);
-        assert_eq!(
-            RecvAccumulator::admits_body(huge),
-            Err(RecvAccumulator::body_ceiling())
-        );
+        assert_eq!(acc.admits_body(huge), Err(RecvAccumulator::body_ceiling()));
         let msg_len = 24 + huge;
         assert_eq!(acc.refuse(0, msg_len), Refused::DrainPending);
         assert_eq!(acc.drain_pending(), huge);

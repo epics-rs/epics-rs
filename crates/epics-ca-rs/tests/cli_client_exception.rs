@@ -105,14 +105,14 @@ async fn a_server_rejected_put_prints_the_client_exception_block() {
         "severity + ca_message(status): {err:?}"
     );
     // `op=1` is CA_OP_PUT, the channel is the one the write was on, and the
-    // type/count come from the echoed request header. `ctx` is whatever
-    // diagnostic the server put in the error payload (rsrv sends the record
-    // name; the Rust server sends the full channel name).
+    // type/count come from the echoed request header. `ctx` is the diagnostic
+    // the server put in the error payload: rsrv's `RECORD_NAME`, the record
+    // without the `.RTYP` the channel was opened with.
     assert_eq!(
         lines.get(2).copied(),
         Some(
             "    Context: \"op=1, channel=TST:LO.RTYP, type=DBR_STRING, count=1, \
-             ctx=\"TST:LO.RTYP\"\""
+             ctx=\"TST:LO\"\""
         ),
         "C's channel-scoped context (ca_client_context.cpp:342-347): {err:?}"
     );

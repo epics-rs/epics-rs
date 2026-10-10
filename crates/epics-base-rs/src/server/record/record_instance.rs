@@ -259,7 +259,9 @@ pub struct NotifyWaitSet {
     ///
     /// Written in exactly one place, [`RecordInstance::take_notify_slot`],
     /// which is also the only writer of the slot itself — so "every record
-    /// holding this set is named here" holds by construction.
+    /// holding this set is named here or as [`Self::entry`]" holds by
+    /// construction. The entry record is never repeated here: it is named
+    /// already, and a WRITE_NOTIFY then pays no second copy of its name.
     joined: StdMutex<Vec<Box<str>>>,
     tx: StdMutex<Option<crate::runtime::sync::oneshot::Sender<()>>>,
     /// C `dbChannelRecord(ppn->chan)` — the record the notify was ISSUED
@@ -277,9 +279,9 @@ pub struct NotifyWaitSet {
     /// so "the entry names the record whose slot minted it" holds by
     /// construction rather than by a check.
     ///
-    /// It is NOT the membership test. Every member, entry or joined, is named
-    /// in [`Self::joined`]; this only says which member `dbNotifyDump` prints
-    /// a block for (`dbNotify.c:659-660`).
+    /// It is half the membership list: [`Self::joined`] names every other
+    /// member, and [`Self::joined_records`] yields this one first. It is also
+    /// the member `dbNotifyDump` prints a block for (`dbNotify.c:659-660`).
     ///
     /// [`PvDatabase::new_put_notify`]: crate::server::database::PvDatabase::new_put_notify
     entry: Option<Box<str>>,
@@ -354,7 +356,9 @@ impl NotifyWaitSet {
     /// ([`RecordInstance::take_notify_slot`]), so joining the list and taking
     /// the slot are one act and cannot be done separately.
     fn record_joined(&self, name: &str) {
-        self.joined.lock().unwrap().push(name.into());
+        if self.entry.as_deref() != Some(name) {
+            self.joined.lock().unwrap().push(name.into());
+        }
     }
 
     /// Every record that has held this set — C's wait list as
@@ -365,7 +369,8 @@ impl NotifyWaitSet {
     /// missed member: a record can only join a set that is still answerable,
     /// and this is read only of a set that is not.
     pub(crate) fn joined_records(&self) -> Vec<Box<str>> {
-        self.joined.lock().unwrap().clone()
+        let joined = self.joined.lock().unwrap();
+        self.entry.iter().chain(joined.iter()).cloned().collect()
     }
 
     /// Nobody is left to answer: the completion never fired (the sender is
@@ -682,22 +687,6 @@ fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
     }
 }
 
-/// Coerce a db-loaded `String` for a numeric/menu **common** field to that
-/// field's canonical DBF type before [`RecordInstance::put_common_field`]
-/// dispatches on it.
-///
-/// The db loader applies a record's own fields with the typed
-/// `EpicsValue::parse(desc.dbf_type, value_str)` (`db_loader::apply_fields`),
-/// but a field absent from `field_list` is pushed to the common-field path as
-/// a raw `EpicsValue::String` — it has no `FieldDesc` to parse against. The
-/// numeric common-field arms in `put_common_field` match only their typed
-/// variant, so without this step a `.db` `field(PHAS, "1")`,
-/// `field(PRIO, "HIGH")`, `field(DISS, "MAJOR")`, `field(DISA, "1")`, … is
-/// silently dropped at IOC load. Routing the String through the same
-/// `EpicsValue::parse` the record-field path uses handles the numeric *and*
-/// menu-label forms uniformly, so the arm receives the value it expects.
-///
-/// Only fields whose canonical type is numeric/menu are listed; the
 /// Port of libcom `epicsParseInt32(str, &to, 10, NULL)`
 /// (`libcom/src/misc/epicsStdlib.c:26-53,245-261`), which is how pvxs parses
 /// the `nsec:lsb:` digit count. Returns `None` for every status the C
@@ -771,6 +760,20 @@ fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option
     })
 }
 
+/// Coerce a db-loaded `String` for a numeric/menu **common** field to that
+/// field's canonical DBF type before [`RecordInstance::put_common_field`]
+/// dispatches on it.
+///
+/// The db loader converts a record's own fields to their typed value
+/// (`db_loader::apply_fields`), but a field absent from `field_list` is
+/// pushed to the common-field path as a raw `EpicsValue::String` — it has no
+/// `FieldDesc` to parse against. The numeric common-field arms in
+/// `put_common_field` match only their typed variant, so without this step a
+/// `.db` `field(PHAS, "1")`,
+/// `field(PRIO, "HIGH")`, `field(DISS, "MAJOR")`, `field(DISA, "1")`, … is
+/// silently dropped at IOC load. This step gives the String that typed value,
+/// numeric *and* menu-label forms alike, so the arm receives what it expects.
+///
 /// **The single owner of "what type does a `dbCommon` field hold"**, run on
 /// EVERY put before the typed arms below see the value — so an arm may bind one
 /// variant and know the put cannot have arrived in another.
@@ -2230,7 +2233,7 @@ impl RecordCell {
     }
 
     /// The record's name — C `precord->name` — without taking its lock set.
-    pub(crate) fn name(&self) -> &std::sync::Arc<str> {
+    pub fn name(&self) -> &std::sync::Arc<str> {
         &self.name
     }
 
@@ -9624,44 +9627,56 @@ impl RecordInstance {
         if self.destroyed {
             return None;
         }
-        let field_str = field.to_string();
-        let bucket = self.subscribers.entry(field_str.clone()).or_default();
-        // Reap rows whose consumer is gone before
-        // counting against the cap. A record field whose value
-        // never changes (e.g. a quasi-static catalog field) never
-        // triggers `notify_field_with_origin`'s retain-filter, so
-        // a long-lived subscribe-disconnect storm could pin the
-        // bucket at `cap` worth of dead rows and lock out
-        // genuine new subscribers.
-        bucket.retain(|s| !s.is_closed());
-        if bucket.len() >= cap {
+        // Looked up by `&str`: the key is copied only for a field's first
+        // monitor, since a bucket outlives its last subscriber.
+        let live = match self.subscribers.get_mut(field) {
+            Some(bucket) => {
+                // Reap rows whose consumer is gone before
+                // counting against the cap. A record field whose value
+                // never changes (e.g. a quasi-static catalog field) never
+                // triggers `notify_field_with_origin`'s retain-filter, so
+                // a long-lived subscribe-disconnect storm could pin the
+                // bucket at `cap` worth of dead rows and lock out
+                // genuine new subscribers.
+                bucket.retain(|s| !s.is_closed());
+                bucket.len()
+            }
+            None => 0,
+        };
+        if live >= cap {
             tracing::warn!(
                 record = %self.name,
-                field = %field_str,
-                live = bucket.len(),
+                field = %field,
+                live,
                 cap,
                 "record field subscriber cap reached, refusing add_subscriber"
             );
             return None;
         }
         let (sink, reader) = crate::server::event_queue::attach(user, sid);
-        bucket.push(Subscriber {
+        let subscriber = Subscriber {
             sid,
             data_type,
             mask,
             sink,
             filters: crate::server::database::filters::FilterChain::new(),
             active: true,
-        });
+        };
+        match self.subscribers.get_mut(field) {
+            Some(bucket) => bucket.push(subscriber),
+            None => {
+                self.subscribers.insert(field.to_string(), vec![subscriber]);
+            }
+        }
         // A field with no `last_posted` entry has never been published: seed it
         // with the value the client is handed in the EVENT_ADD response, so the
         // first process cycle does not treat it as changed. An existing entry
         // is left alone — every post advances it whether or not anyone was
         // subscribed, so it is what was last published, and a change since
         // then is still owed to the field's other subscribers.
-        if self.posted_value(&field_str).is_none() {
-            if let Some(val) = self.resolve_field(&field_str) {
-                self.record_value_post(&field_str, val);
+        if self.posted_value(field).is_none() {
+            if let Some(val) = self.resolve_field(field) {
+                self.record_value_post(field, val);
             }
         }
         Some(reader)

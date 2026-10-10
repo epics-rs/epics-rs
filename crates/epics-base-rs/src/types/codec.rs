@@ -673,6 +673,13 @@ pub fn encode_dbr_into(
     // route string requests through the precision-aware converter here.
     if native == DbFieldType::String {
         convert_value_to_dbr_string(&snapshot.value, snapshot)?.write_into(dst);
+    } else if native == DbFieldType::Enum
+        && snapshot.properties.put_enum_str == Some(false)
+        && matches!(snapshot.value, EpicsValue::String(_))
+    {
+        return Err(CaError::GetConvertFailed(
+            "string to DBR_ENUM without rset put_enum_str (S_db_noRSET)".into(),
+        ));
     } else {
         convert_and_serialize_into(native, &snapshot.value, dst)?;
     }
@@ -1399,6 +1406,7 @@ fn decode_gr_ctrl(
         alarm_double: display.is_some(),
         control_double: control.is_some(),
         enum_strs: enums.is_some(),
+        put_enum_str: None,
     }
     .narrowed_to_field(snap.value.db_field_type(), false);
     snap.display = display;
@@ -1962,6 +1970,7 @@ mod alarm_limit_seed_tests {
             control_double: true,
             alarm_double: false,
             enum_strs: false,
+            put_enum_str: None,
         };
         s
     }
@@ -2148,6 +2157,7 @@ mod integer_limit_narrowing_tests {
             control_double: true,
             alarm_double: true,
             enum_strs: false,
+            put_enum_str: None,
         };
         s
     }

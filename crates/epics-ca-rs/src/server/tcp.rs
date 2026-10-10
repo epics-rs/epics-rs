@@ -205,7 +205,7 @@ pub enum ServerConnectionEvent {
     /// transitions (see `ca_gateway::cache::GwPvEntry::add_subscriber`).
     ChannelCreated {
         peer: SocketAddr,
-        pv_name: String,
+        pv_name: Arc<str>,
         cid: u32,
     },
     /// `CA_PROTO_CLEAR_CHANNEL` (or implicit teardown) closed a channel
@@ -213,7 +213,7 @@ pub enum ServerConnectionEvent {
     /// [`Self::ChannelCreated`] event one-to-one. Reverse of that event.
     ChannelCleared {
         peer: SocketAddr,
-        pv_name: String,
+        pv_name: Arc<str>,
         cid: u32,
     },
     /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
@@ -228,7 +228,7 @@ pub enum ServerConnectionEvent {
     /// (`gatePv.cc:1749-1752`).
     SubscriptionOpened {
         peer: SocketAddr,
-        pv_name: String,
+        pv_name: Arc<str>,
         sub_id: u32,
         mask: u16,
     },
@@ -238,7 +238,7 @@ pub enum ServerConnectionEvent {
     /// count.
     SubscriptionClosed {
         peer: SocketAddr,
-        pv_name: String,
+        pv_name: Arc<str>,
         sub_id: u32,
     },
 }
@@ -276,11 +276,30 @@ pub(crate) enum ChannelTarget {
     SimplePv(Arc<ProcessVariable>),
     RecordField {
         record: Arc<RecordCell>,
-        field: String,
+        field: Arc<str>,
     },
 }
 
 impl ChannelTarget {
+    /// C rsrv's `RECORD_NAME(pciu->dbch)` (`camessage.c:56`): the diagnostic
+    /// every channel-scoped `send_err` carries, and what libca prints as the
+    /// exception block's `ctx=`. It is the record's name, never `REC.FIELD`.
+    /// Read without the record's lock set, so a hot path may hold it eagerly.
+    pub(crate) fn rsrv_record_name(&self) -> &str {
+        match self {
+            ChannelTarget::SimplePv(pv) => &pv.name,
+            ChannelTarget::RecordField { record, .. } => record.name(),
+        }
+    }
+
+    /// The name the audit log and the trap-write listeners record: `REC.FIELD`.
+    fn audit_name(&self) -> String {
+        match self {
+            ChannelTarget::SimplePv(pv) => pv.name.clone(),
+            ChannelTarget::RecordField { record, field } => format!("{}.{}", record.name(), field),
+        }
+    }
+
     /// Whether the database object this channel serves has been destroyed.
     ///
     /// A channel holds an `Arc` to its target, so removal from the database
@@ -626,8 +645,9 @@ struct ChannelEntry {
     cid: u32,
     /// PV name as the client originally requested it (with any
     /// `.FIELD` suffix). Retained so the `ChannelCleared` lifecycle
-    /// event can emit the same name as `ChannelCreated`.
-    pv_name: String,
+    /// event can emit the same name as `ChannelCreated`, and shared with
+    /// every lifecycle event rather than copied into it.
+    pv_name: Arc<str>,
     /// Raw channel-filter JSON suffix the client appended after the
     /// record (epics-base 3.15.7). `None` for ordinary channels;
     /// `Some` when the client requested `REC.{"dbnd":{"d":0.5}}`
@@ -1065,6 +1085,23 @@ impl ClientState {
         self.client_minor_version
     }
 
+    /// C `MPTOPCIU` for [`print_log_header`]: the channel `sid` names on
+    /// this circuit, as an address.
+    pub(crate) fn channel_addr(&self, sid: u32) -> Option<*const ()> {
+        self.channels
+            .get(&sid)
+            .map(|entry| std::ptr::from_ref(entry).cast())
+    }
+
+    /// [`Self::audit`] for channel `sid`, naming it `REC.FIELD`. The name is
+    /// built only when an audit logger is installed.
+    fn audit_channel(&self, event: &str, sid: u32, value: &str, result: &str) {
+        if self.audit.is_some() {
+            let pv = self.channels.get(&sid).map(|e| e.target.audit_name());
+            self.audit(event, pv.as_deref().unwrap_or_default(), value, result);
+        }
+    }
+
     fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
             logger.log(crate::audit::AuditEvent {
@@ -1237,7 +1274,7 @@ impl ClientState {
                     // state-raised NOMOD of `Record::field_no_mod` (compress
                     // VAL under BALG=LIFO), so the server advertised WRITE on
                     // fields it would then refuse.
-                    let is_ro = instance.is_no_mod(f.as_str());
+                    let is_ro = instance.is_no_mod(f);
                     (
                         is_ro,
                         instance.common.access_group().to_string(),
@@ -2262,6 +2299,7 @@ where
                             &err.diagnostic,
                             state.client_minor_version,
                         );
+                        print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         continue;
                     }
@@ -2281,8 +2319,10 @@ where
                                 &err.diagnostic,
                                 state.client_minor_version,
                             );
+                            print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
                         }
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        print_forcing_disconnect(peer);
                         break 'client_loop Err(reason);
                     }
                     Gate::Discard => {
@@ -2345,6 +2385,7 @@ where
                         // because the underlying TCP is most likely
                         // already broken (which is why dispatch failed).
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
                     }
                     Err(_) => {
@@ -3176,7 +3217,7 @@ pub(crate) async fn dispatch_message(
                                     element_count,
                                     ChannelTarget::RecordField {
                                         record: rec.clone(),
-                                        field: field.clone(),
+                                        field: field.as_str().into(),
                                     },
                                     mode,
                                 )
@@ -3214,12 +3255,13 @@ pub(crate) async fn dispatch_message(
                     _ => AccessLevel::NoAccess,
                 };
 
+                let shared_name: Arc<str> = pv_name.as_str().into();
                 state.channels.insert(
                     sid,
                     ChannelEntry {
                         target,
                         cid: client_cid,
-                        pv_name: pv_name.clone(),
+                        pv_name: shared_name.clone(),
                         filter_suffix: filter_suffix.clone(),
                         put_notify_slot: PutNotifySlot::default(),
                         long_string_mode,
@@ -3279,7 +3321,7 @@ pub(crate) async fn dispatch_message(
                 if let Some(tx) = &conn_events {
                     let _ = tx.send(ServerConnectionEvent::ChannelCreated {
                         peer,
-                        pv_name: pv_name.clone(),
+                        pv_name: shared_name,
                         cid: client_cid,
                     });
                 }
@@ -3380,18 +3422,13 @@ pub(crate) async fn dispatch_message(
             // bad type means the deprecated READ command.
             // `LAST_BUFFER_TYPE = 38`.
             if requested_type > LAST_BUFFER_TYPE {
-                let audit_pv = match &entry.target {
-                    ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                    ChannelTarget::RecordField { record, field } => {
-                        format!("{}.{}", record.read().name, field)
-                    }
-                };
+                let record_name = entry.target.rsrv_record_name();
                 send_ca_error(
                     writer,
                     hdr,
                     ECA_BADTYPE,
                     entry.cid,
-                    &audit_pv,
+                    record_name,
                     state.client_minor_version,
                 )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -3446,18 +3483,13 @@ pub(crate) async fn dispatch_message(
                         // timeout instead of the C error callback.
                         // outer cid is `pciu->cid` per
                         // `vsend_err` (camessage.c:162-165).
-                        let audit_pv = match &entry.target {
-                            ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                            ChannelTarget::RecordField { record, field } => {
-                                format!("{}.{}", record.read().name, field)
-                            }
-                        };
+                        let record_name = entry.target.rsrv_record_name();
                         send_ca_error(
                             writer,
                             hdr,
                             denied.eca_code(),
                             entry.cid,
-                            &audit_pv,
+                            record_name,
                             state.client_minor_version,
                         )?;
                     }
@@ -3512,18 +3544,13 @@ pub(crate) async fn dispatch_message(
                             },
                         )?;
                     } else {
-                        let audit_pv = match &entry.target {
-                            ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                            ChannelTarget::RecordField { record, field } => {
-                                format!("{}.{}", record.read().name, field)
-                            }
-                        };
+                        let record_name = entry.target.rsrv_record_name();
                         send_ca_error(
                             writer,
                             hdr,
                             ECA_GETFAIL,
                             entry.cid,
-                            &audit_pv,
+                            record_name,
                             state.client_minor_version,
                         )?;
                     }
@@ -3672,7 +3699,7 @@ pub(crate) async fn dispatch_message(
                             hdr,
                             ECA_BADTYPE,
                             entry.cid,
-                            "bad READ data type",
+                            entry.target.rsrv_record_name(),
                             state.client_minor_version,
                         )?;
                     }
@@ -3705,7 +3732,7 @@ pub(crate) async fn dispatch_message(
                         hdr,
                         ECA_GETFAIL,
                         entry.cid,
-                        "get conversion failed",
+                        entry.target.rsrv_record_name(),
                         state.client_minor_version,
                     );
                 }
@@ -3818,9 +3845,14 @@ pub(crate) async fn dispatch_message(
                         },
                     );
                     if let Some(tx) = conn_events {
+                        let pv_name = state
+                            .channels
+                            .get(&s.channel_sid)
+                            .map(|e| e.pv_name.clone())
+                            .unwrap_or_default();
                         let _ = tx.send(ServerConnectionEvent::SubscriptionOpened {
                             peer,
-                            pv_name: s.sub_pv_name,
+                            pv_name,
                             sub_id: s.sub_id,
                             mask: s.mask,
                         });
@@ -3847,11 +3879,6 @@ pub(crate) async fn dispatch_message(
                 state.unlink_subscription(hdr.cid, sub_id);
                 if let Some(sub) = state.subscriptions.remove(&sub_id) {
                     sub.task.abort();
-                    let pv_name_for_event = state
-                        .channels
-                        .get(&sub.channel_sid)
-                        .map(|e| e.pv_name.clone())
-                        .unwrap_or_default();
                     match &sub.target {
                         ChannelTarget::SimplePv(pv) => {
                             pv.remove_subscriber(sub.sub_id);
@@ -3861,9 +3888,14 @@ pub(crate) async fn dispatch_message(
                         }
                     }
                     if let Some(tx) = conn_events {
+                        let pv_name = state
+                            .channels
+                            .get(&sub.channel_sid)
+                            .map(|e| e.pv_name.clone())
+                            .unwrap_or_default();
                         let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
                             peer,
-                            pv_name: pv_name_for_event,
+                            pv_name,
                             sub_id,
                         });
                     }
@@ -4375,18 +4407,13 @@ pub(crate) async fn serve_write_head(
                     // travel the same WRITE opcodes, so this
                     // branch covers alarm-acknowledge PUTs too.
                     // outer cid is `pciu->cid`.
-                    let audit_pv = match &entry.target {
-                        ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                        ChannelTarget::RecordField { record, field } => {
-                            format!("{}.{}", record.read().name, field)
-                        }
-                    };
+                    let record_name = entry.target.rsrv_record_name();
                     send_ca_error(
                         writer,
                         hdr,
                         denied.eca_code(),
                         entry_cid,
-                        &audit_pv,
+                        record_name,
                         state.client_minor_version,
                     )?;
                 }
@@ -4436,13 +4463,13 @@ pub(crate) async fn serve_write_head(
         }
         let result = match &entry.target {
             ChannelTarget::RecordField { record, field } => {
-                let name = record.read().name.clone();
+                let name: &str = record.name();
                 // Alarm-ack puts are immediate in C even for the
                 // notify variant — `rsrv/camessage.c` writes ACKT/
                 // ACKS via `dbPutField` and replies straight away,
                 // never building a putNotify. Neither mode here
                 // awaits a completion receiver, so park nothing.
-                db.put_alarm_ack_from_ca(&name, field, ack, value_u16).await
+                db.put_alarm_ack_from_ca(name, field, ack, value_u16).await
             }
             ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
                 "PUT_ACKT/PUT_ACKS only valid on record-backed channels".to_string(),
@@ -4472,19 +4499,14 @@ pub(crate) async fn serve_write_head(
             // non-notify alarm-ack path silently swallowed
             // record-side write errors so the libca peer never
             // saw the failure.
-            let audit_pv = match &entry.target {
-                ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                ChannelTarget::RecordField { record, field } => {
-                    format!("{}.{}", record.read().name, field)
-                }
-            };
+            let record_name = entry.target.rsrv_record_name();
             let eca = PutStatus::of_failure(e);
             send_ca_error(
                 writer,
                 hdr,
                 eca.eca(),
                 entry_cid,
-                &audit_pv,
+                record_name,
                 state.client_minor_version,
             )?;
         }
@@ -4537,22 +4559,17 @@ pub(crate) async fn serve_write_head(
     // without holding the `entry` borrow across them.
     let put_notify_slot = entry.put_notify_slot.clone();
 
-    // Resolve the audit-friendly PV name once. Cheap when audit
-    // is off because state.audit() is a single None check.
-    let audit_pv = match &entry.target {
-        ChannelTarget::SimplePv(pv) => pv.name.clone(),
-        ChannelTarget::RecordField { record, field } => {
-            format!("{}.{}", record.read().name, field)
-        }
-    };
+    // The text a refused request carries in its `CA_PROTO_ERROR`: C sends
+    // `RECORD_NAME(pciu->dbch)`, the record without its field.
+    let rsrv_name = entry.target.rsrv_record_name();
     // The record a deferred put-callback parks a notify on, captured under the
-    // same `entry` borrow as `audit_pv`. C keeps it as `pciu->pPutNotify`'s
+    // same `entry` borrow. C keeps it as `pciu->pPutNotify`'s
     // `dbChannel` for exactly one purpose: `rsrvFreePutNotify` needs something
     // to hand `dbNotifyCancel` when the client dies still busy
     // (`camessage.c:1630-1638`). See [`PendingWriteNotify`]'s `Drop`.
     let notify_record = match &entry.target {
         ChannelTarget::SimplePv(_) => None,
-        ChannelTarget::RecordField { record, .. } => Some(record.read().name.clone()),
+        ChannelTarget::RecordField { record, .. } => Some(record.name().clone()),
     };
 
     // Post-#934 (epics-base 4128a7c07) BOTH opcodes gate the TYPE first,
@@ -4675,7 +4692,7 @@ pub(crate) async fn serve_write_head(
                         client_minor: state.client_minor_version,
                     },
                 )?;
-                state.audit("caput", &audit_pv, "", "denied");
+                state.audit_channel("caput", sid, "", "denied");
                 return Ok(WriteHeadOutcome::Done);
             }
         };
@@ -4697,10 +4714,10 @@ pub(crate) async fn serve_write_head(
                     hdr,
                     denied.eca_code(),
                     entry_cid,
-                    &audit_pv,
+                    rsrv_name,
                     state.client_minor_version,
                 )?;
-                state.audit("caput", &audit_pv, "", "denied");
+                state.audit_channel("caput", sid, "", "denied");
                 return Ok(WriteHeadOutcome::Done);
             }
         }
@@ -4785,7 +4802,7 @@ pub(crate) async fn serve_write_head(
                 hdr,
                 ECA_BADTYPE,
                 entry_cid,
-                "bad WRITE payload bytes",
+                rsrv_name,
                 state.client_minor_version,
             )?;
         }
@@ -4860,7 +4877,11 @@ pub(crate) async fn serve_write_head(
     let mut trap_guard = trap_listeners_active.then(|| {
         epics_base_rs::server::access_security::TrapWriteGuard::begin(
             epics_base_rs::server::access_security::TrapWriteFields {
-                pv_name: audit_pv.clone(),
+                pv_name: state
+                    .channels
+                    .get(&sid)
+                    .map(|e| e.target.audit_name())
+                    .unwrap_or_default(),
                 user: state.username.clone(),
                 host: state.hostname.as_str().to_string(),
                 peer: state.peer.clone(),
@@ -4914,7 +4935,7 @@ pub(crate) async fn serve_write_head(
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
-                    let name = record.read().name.clone();
+                    let name: &str = record.name();
                     // A `$` channel writes through C's DBR_CHAR address of the
                     // field: the shared owner turns the chars into what that
                     // `dbPutField` stores, or refuses as C does.
@@ -4927,7 +4948,7 @@ pub(crate) async fn serve_write_head(
                     match new_value {
                         Err(e) => Err(e),
                         Ok(new_value) if is_notify => {
-                            db.put_record_field_from_ca(&name, field, new_value).await
+                            db.put_record_field_from_ca(name, field, new_value).await
                         }
                         Ok(new_value) => {
                             // C `write_action` (`rsrv/camessage.c:781-789`)
@@ -4939,7 +4960,7 @@ pub(crate) async fn serve_write_head(
                             // motor's whole motion), failing every
                             // legitimate WRITE_NOTIFY on the record with
                             // ECA_PUTCBINPROG in the meantime.
-                            db.put_record_field_from_ca_no_notify(&name, field, new_value)
+                            db.put_record_field_from_ca_no_notify(name, field, new_value)
                                 .await
                                 .map(|()| ProcessCompletion::Sync)
                         }
@@ -4951,7 +4972,7 @@ pub(crate) async fn serve_write_head(
         }
     };
 
-    state.audit("caput", &audit_pv, &display_value, audit_result);
+    state.audit_channel("caput", sid, &display_value, audit_result);
 
     // SYNCHRONOUS write paths (no async record completion
     // pending): fire AfterWrite now with the known status via
@@ -4983,7 +5004,7 @@ pub(crate) async fn serve_write_head(
                 hdr,
                 eca.eca(),
                 entry_cid,
-                &audit_pv,
+                rsrv_name,
                 state.client_minor_version,
             )?;
         }
@@ -5139,7 +5160,7 @@ pub(crate) struct PendingWriteNotify {
     /// record it parked on. `None` for a simple PV, which has no `dbCommon`
     /// and so no `ppn` slot to release. C carries the equivalent as
     /// `pciu->pPutNotify`'s `dbChannel`.
-    cancel: Option<(Arc<PvDatabase>, String)>,
+    cancel: Option<(Arc<PvDatabase>, Arc<str>)>,
 }
 
 /// C `rsrvFreePutNotify` (`rsrv/camessage.c:1630-1638`): a client torn down
@@ -5356,7 +5377,6 @@ pub(crate) struct SpawnedSubscription {
     pub data_count: u32,
     pub denied: Arc<AtomicBool>,
     pub stage: super::DeliveryStage,
-    pub sub_pv_name: String,
     pub mask: u16,
 }
 
@@ -5548,19 +5568,16 @@ pub(crate) async fn register_subscription(
             hdr,
             ECA_ALLOCMEM,
             entry_cid,
-            &format!("EVENT_ADD invalid mask {mask}: must be 1..={}", u8::MAX),
+            &format!(
+                "subscription install into record {} failed",
+                entry.target.rsrv_record_name()
+            ),
             state.client_minor_version,
         )?;
         return Err(epics_base_rs::error::CaError::Protocol(
                     "EVENT_ADD invalid mask (matches C db_add_event select==0 || select>UCHAR_MAX + RSRV_ERROR)".into(),
                 ));
     }
-    // Captured up front so the SubscriptionOpened event we
-    // emit after a successful insert below doesn't have to
-    // re-borrow `state.channels` (the insert path mutates
-    // `state.subscriptions` so the entry borrow has to be
-    // released before then).
-    let sub_pv_name = entry.pv_name.clone();
     let long_string_mode = entry.long_string_mode;
     // C's `dbChannel` order whatever the JSON order: the pre chain runs on
     // the post, the post chain as each event is read (`dbEvent.c:901,923`,
@@ -5844,7 +5861,6 @@ pub(crate) async fn register_subscription(
                     data_count: requested_count,
                     denied,
                     stage: stage.clone(),
-                    sub_pv_name: sub_pv_name.clone(),
                     mask,
                 }))
             }
@@ -5993,7 +6009,10 @@ pub(crate) async fn register_subscription(
                             hdr,
                             ECA_ALLOCMEM,
                             entry.cid,
-                            "EVENT_ADD refused: record-field subscriber cap",
+                            &format!(
+                                "subscription install into record {} failed",
+                                entry.target.rsrv_record_name()
+                            ),
                             state.client_minor_version,
                         )?;
                         return Ok(SubscriptionOutcome::Refused);
@@ -6264,7 +6283,6 @@ pub(crate) async fn register_subscription(
                     data_count: requested_count,
                     denied,
                     stage: stage.clone(),
-                    sub_pv_name: sub_pv_name.clone(),
                     mask,
                 }))
             }
@@ -6290,7 +6308,7 @@ pub(crate) fn cancel_subscription_reply(
     // C `event_cancel_reply` resolves the channel first (`MPTOPCIU`); an unknown
     // channel id draws `logBadId` (ECA_INTERNAL "Bad Resource ID") + RSRV_ERROR.
     let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
-        Some(entry) => (entry.cid, entry.pv_name.clone()),
+        Some(entry) => (entry.cid, entry.target.rsrv_record_name()),
         None => {
             send_ca_error(
                 writer,
@@ -6324,7 +6342,7 @@ pub(crate) fn cancel_subscription_reply(
             hdr,
             ECA_BADMONID,
             entry_cid,
-            &entry_pv_name,
+            entry_pv_name,
             state.client_minor_version,
         )?;
         return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -6657,7 +6675,7 @@ pub(crate) async fn run_event_task<W>(
                         }
                     };
                     if !encode_ok {
-                        // C: an unencodable field ends this monitor's producer loop.
+                        // An unsupported DBR type ends this monitor's producer loop.
                         return DeliverStep::EndSubscription;
                     }
                     if deliver {
@@ -7144,6 +7162,38 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
     }
 }
 
+/// C `log_header` (`camessage.c:282-307`), which every receive-gate refusal
+/// prints after its `send_err`. `paddr` is the channel `m_cid` names on this
+/// circuit, as `MPTOPCIU` finds it; glibc prints a NULL one as `(nil)`.
+pub(crate) fn print_log_header(
+    peer: SocketAddr,
+    err: &crate::server::recv::GateError,
+    paddr: Option<*const ()>,
+) {
+    use epics_base_rs::runtime::log::errlog_printf;
+    let hdr = &err.hdr;
+    let paddr = paddr.map_or_else(|| "(nil)".to_string(), |p| format!("{p:p}"));
+    errlog_printf(&format!("CAS: request from {peer} => {}\n", err.context));
+    errlog_printf(&format!(
+        "CAS: Request from {peer} => cmmd={} cid={:#x} type={} count={} postsize={}\n",
+        hdr.cmmd,
+        hdr.cid,
+        hdr.data_type,
+        hdr.actual_count(),
+        hdr.actual_postsize()
+    ));
+    errlog_printf(&format!(
+        "CAS: Request from {peer} =>   available={:#x} \tN={} paddr={paddr}\n",
+        hdr.available, err.mnum
+    ));
+}
+
+/// C `camsgtask.c:151`: the line every RSRV_ERROR from message handling
+/// prints as it ends the circuit, whichever handler refused.
+pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
+    epics_base_rs::runtime::log::errlog_printf(&format!("CAS: forcing disconnect from {peer}\n"));
+}
+
 /// Send a `no_read_access_event`-shaped reply: same wire frame as the
 /// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
 /// ECA status and a `dbr_buffer_size`-sized zero payload. C
@@ -7166,17 +7216,32 @@ fn send_no_read_access_event(
     reply: ReplyContext,
 ) -> CaResult<()> {
     let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
+    match status_event_frame(cmd, data_type, count, available, eca_status, client_minor) {
+        Some(frame) => {
+            writer.push(frame);
+            Ok(())
+        }
+        None => send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor),
+    }
+}
+
+/// The [`send_no_read_access_event`] frame, or `None` when `count` does not
+/// fit the peer's header.
+pub(crate) fn status_event_frame(
+    cmd: u16,
+    data_type: u16,
+    count: u32,
+    available: u32,
+    eca_status: u32,
+    client_minor: u16,
+) -> Option<Vec<u8>> {
     let native = epics_base_rs::types::native_type_for_dbr(data_type)
         .unwrap_or(epics_base_rs::types::DbFieldType::Char);
     let payload_size = epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize);
     let padded_size = align8(payload_size);
     let mut hdr = CaHeader::new(cmd);
-    if hdr
-        .set_payload_size(padded_size, count, client_minor)
-        .is_err()
-    {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
-    }
+    hdr.set_payload_size(padded_size, count, client_minor)
+        .ok()?;
     hdr.data_type = data_type;
     hdr.cid = eca_status;
     hdr.available = available;
@@ -7187,8 +7252,7 @@ fn send_no_read_access_event(
     let mut frame = Vec::with_capacity(hdr_bytes.len() + padded_size);
     frame.extend_from_slice(&hdr_bytes);
     frame.resize(frame.len() + padded_size, 0);
-    writer.push(frame);
-    Ok(())
+    Some(frame)
 }
 
 /// Why a READ / READ_NOTIFY reply could not be framed. The two variants
@@ -12950,5 +13014,383 @@ mod snapshot_scan_lock_tests {
             "the snapshot must carry the put's stamped TIME, not the pre-put one \
              — L1 serialises the read behind the whole put+process"
         );
+    }
+}
+
+#[cfg(tokio_backend)]
+#[cfg(test)]
+mod string_as_enum_getfail_tests {
+    //! A scalar `DBF_STRING` read as `DBR_ENUM` goes through `cvt_st_e`
+    //! (`dbFastLinkConv.c:247`), which needs the record's `put_enum_str`;
+    //! stringin has none, so `dbChannel_get` fails and RSRV answers
+    //! ECA_GETFAIL. Every expectation below is softIoc R7.0.10-146-g8f5015b66
+    //! serving `record(stringin,"SI"){field(VAL,"abc")}` and
+    //! `record(stringin,"SN"){field(VAL,"3")}` to a raw socket.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::records::stringin::StringinRecord;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const DBR_FLOAT: u16 = 2;
+    const DBR_ENUM: u16 = 3;
+    const DBR_STS_ENUM: u16 = 10;
+    const DBR_CTRL_ENUM: u16 = 31;
+
+    fn request(cmmd: u16, sid: u32, ioid: u32, data_type: u16, body: &[u8]) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = data_type;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(body.len(), 1, crate::protocol::CA_MINOR_VERSION)
+            .unwrap();
+        let mut frame = h.to_bytes_extended().to_vec();
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// EVENT_ADD body: three zero deadbands, mask DBE_VALUE | DBE_ALARM.
+    const EVENT_ADD_BODY: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0];
+
+    async fn next_frame(
+        client: &mut tokio::io::DuplexStream,
+        acc: &mut Vec<u8>,
+    ) -> (CaHeader, Vec<u8>) {
+        loop {
+            if acc.len() >= CaHeader::SIZE {
+                let (hdr, hdr_size) = CaHeader::from_bytes_extended(acc).unwrap();
+                let len = hdr_size + hdr.actual_postsize();
+                if acc.len() >= len {
+                    let payload = acc[hdr_size..len].to_vec();
+                    acc.drain(..len);
+                    return (hdr, payload);
+                }
+            }
+            let mut buf = [0u8; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                .await
+                .expect("reply within 3 s")
+                .unwrap();
+            assert!(n > 0, "server closed the circuit");
+            acc.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stringin_read_as_dbr_enum_is_getfail() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SI", Box::new(StringinRecord::new("abc")))
+            .await
+            .unwrap();
+        db.add_record("SN", Box::new(StringinRecord::new("3")))
+            .await
+            .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (mut client, server_io) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:55360".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        client.write_all(&version_frame()).await.unwrap();
+        for (cid, name, float_value) in [(1, "SI", None), (2, "SN", Some(3.0f32))] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+            let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+            let mut acc = Vec::new();
+
+            client
+                .write_all(&request(CA_PROTO_READ, sid, 7, DBR_ENUM, &[]))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            assert_eq!(
+                (hdr.cmmd, hdr.cid, hdr.available),
+                (CA_PROTO_ERROR, cid, ECA_GETFAIL),
+                "{name} READ"
+            );
+            assert_eq!(&payload[16..], format!("{name}\0\0\0\0\0\0").as_bytes());
+
+            for (cmmd, dt, size) in [
+                (CA_PROTO_READ_NOTIFY, DBR_ENUM, 8),
+                (CA_PROTO_READ_NOTIFY, DBR_STS_ENUM, 8),
+                (CA_PROTO_READ_NOTIFY, DBR_CTRL_ENUM, 424),
+                (CA_PROTO_EVENT_ADD, DBR_ENUM, 8),
+            ] {
+                let body: &[u8] = if cmmd == CA_PROTO_EVENT_ADD {
+                    &EVENT_ADD_BODY
+                } else {
+                    &[]
+                };
+                client
+                    .write_all(&request(cmmd, sid, 10 * cid, dt, body))
+                    .await
+                    .unwrap();
+                let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+                assert_eq!(
+                    (hdr.cmmd, hdr.data_type, hdr.cid, payload.len()),
+                    (cmmd, dt, ECA_GETFAIL, size),
+                    "{name} cmd {cmmd} type {dt}"
+                );
+                assert!(
+                    payload.iter().all(|&b| b == 0),
+                    "{name} cmd {cmmd} type {dt}"
+                );
+            }
+
+            client
+                .write_all(&request(CA_PROTO_READ_NOTIFY, sid, 9, DBR_FLOAT, &[]))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            match float_value {
+                None => assert_eq!(hdr.cid, ECA_GETFAIL, "{name} DBR_FLOAT"),
+                Some(v) => assert_eq!(
+                    (hdr.cid, &payload[..4]),
+                    (ECA_NORMAL, &v.to_be_bytes()[..]),
+                    "{name} DBR_FLOAT"
+                ),
+            }
+
+            // The update a put fans out to the DBR_ENUM subscription is the
+            // same zeroed GETFAIL, and the subscription survives it.
+            for text in [b"xyz", b"uvw"] {
+                let mut value = [0u8; 40];
+                value[..3].copy_from_slice(text);
+                client
+                    .write_all(&request(CA_PROTO_WRITE, sid, 0, 0, &value))
+                    .await
+                    .unwrap();
+                let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+                assert_eq!(
+                    (hdr.cmmd, hdr.cid, hdr.available, payload),
+                    (CA_PROTO_EVENT_ADD, ECA_GETFAIL, 10 * cid, vec![0; 8]),
+                    "{name} update"
+                );
+            }
+        }
+        handle.abort();
+    }
+}
+
+#[cfg(tokio_backend)]
+#[cfg(test)]
+mod scalar_string_without_nul_tests {
+    //! The six raw-socket rows of softIoc 8f5015b66 (qa's long-string pins):
+    //! a DBR_STRING count-1 put whose 40-byte body holds no NUL, then an
+    //! ECHO. C answers neither, drops the circuit (camessage.c:764, :1696)
+    //! and keeps `"x"` (LEN 2 on an lso).
+    use super::non_graceful_disconnect_teardown_tests::{create_chan_frame, version_frame};
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::records::lso::LsoRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Every errlog line that starts with `CAS: forcing`.
+    fn forcing_lines() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        epics_base_rs::runtime::log::ErrlogListenerId,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let id = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+            if line.starts_with("CAS: forcing") {
+                sink.lock().unwrap().push(line.to_string());
+            }
+        });
+        (seen, id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_40_byte_string_put_without_a_nul_drops_the_circuit() {
+        let (seen, listener) = forcing_lines();
+        for (port, name, cmmd) in [
+            (55370, "L41", CA_PROTO_WRITE_NOTIFY),
+            (55371, "L128", CA_PROTO_WRITE_NOTIFY),
+            (55372, "SO", CA_PROTO_WRITE_NOTIFY),
+            (55373, "L41", CA_PROTO_WRITE),
+            (55374, "L128", CA_PROTO_WRITE),
+            (55375, "SO", CA_PROTO_WRITE),
+        ] {
+            let db = Arc::new(PvDatabase::new());
+            for (rec, sizv) in [("L41", 41), ("L128", 128)] {
+                let mut lso = LsoRecord::new("x");
+                lso.sizv = sizv;
+                db.add_record(rec, Box::new(lso)).await.unwrap();
+            }
+            db.add_record("SO", Box::new(StringoutRecord::new("x")))
+                .await
+                .unwrap();
+            let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+            let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+            let (mut client, server_io) = tokio::io::duplex(1 << 16);
+            let peer: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let served = db.clone();
+            let handle = tokio::spawn(async move {
+                handle_client(
+                    server_io,
+                    peer,
+                    served,
+                    acf,
+                    acf_reload_rx,
+                    5064,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    #[cfg(feature = "cap-tokens")]
+                    None,
+                    #[cfg(feature = "cap-tokens")]
+                    None,
+                )
+                .await
+            });
+
+            let mut put = CaHeader::new(cmmd);
+            put.data_type = 0;
+            put.cid = 1;
+            put.available = 9;
+            put.set_payload_size(40, 1, crate::protocol::CA_MINOR_VERSION)
+                .unwrap();
+            let mut frames = version_frame();
+            frames.extend_from_slice(&create_chan_frame(1, name));
+            frames.extend_from_slice(&put.to_bytes_extended());
+            frames.extend_from_slice(&b"abcdefghij".repeat(4));
+            frames.extend_from_slice(&CaHeader::new(CA_PROTO_ECHO).to_bytes_extended());
+            client.write_all(&frames).await.unwrap();
+
+            let res = tokio::time::timeout(Duration::from_secs(3), handle)
+                .await
+                .expect("the circuit closes")
+                .unwrap();
+            assert!(res.is_err(), "{name} cmd {cmmd}: RSRV_ERROR");
+            epics_base_rs::runtime::log::errlog_flush();
+            assert_eq!(
+                std::mem::take(&mut *seen.lock().unwrap()),
+                vec![format!("CAS: forcing disconnect from 127.0.0.1:{port}\n")],
+                "{name} cmd {cmmd}"
+            );
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).await.unwrap();
+            let mut cmds = Vec::new();
+            while let Ok((hdr, size)) = CaHeader::from_bytes_extended(&wire) {
+                cmds.push(hdr.cmmd);
+                wire.drain(..size + hdr.actual_postsize());
+            }
+            assert!(
+                !cmds.contains(&cmmd) && !cmds.contains(&CA_PROTO_ECHO),
+                "{name} cmd {cmmd}: no reply, got {cmds:?}"
+            );
+            let val = match db.get_pv(name).unwrap() {
+                EpicsValue::String(s) => s.to_string(),
+                EpicsValue::CharArray(b) => {
+                    String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap()).into_owned()
+                }
+                v => format!("{v:?}"),
+            };
+            assert_eq!(val, "x", "{name} cmd {cmmd}");
+            if name != "SO" {
+                assert_eq!(
+                    db.get_pv(&format!("{name}.LEN")).unwrap().to_f64(),
+                    Some(2.0),
+                    "{name} cmd {cmmd}"
+                );
+            }
+        }
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+    }
+
+    /// The receive gate's refusals end the circuit with the same line:
+    /// softIoc 8f5015b66 answers an ECHO with postsize 4 with
+    /// "CAS: Missaligned protocol rejected", prints `log_header`'s three
+    /// lines and then the disconnect. N=1 counts the VERSION read with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receive_gate_teardown_prints_forcing_disconnect() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+            if line.starts_with("CAS: ") && line.contains("127.0.0.1:55376") {
+                sink.lock().unwrap().push(line.to_string());
+            }
+        });
+        let db = Arc::new(PvDatabase::new());
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (mut client, server_io) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:55376".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        let mut frames = version_frame();
+        let mut echo = CaHeader::new(CA_PROTO_ECHO);
+        echo.postsize = 4;
+        echo.data_type = 7;
+        echo.count = 3;
+        echo.cid = 0x1234;
+        echo.available = 0x55;
+        frames.extend_from_slice(&echo.to_bytes());
+        frames.extend_from_slice(b"abcd");
+        client.write_all(&frames).await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("the circuit closes")
+            .unwrap();
+        assert!(res.is_err());
+        epics_base_rs::runtime::log::errlog_flush();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "CAS: request from 127.0.0.1:55376 => CAS: Missaligned protocol rejected\n",
+                "CAS: Request from 127.0.0.1:55376 => cmmd=23 cid=0x1234 type=7 count=3 postsize=4\n",
+                "CAS: Request from 127.0.0.1:55376 =>   available=0x55 \tN=1 paddr=(nil)\n",
+                "CAS: forcing disconnect from 127.0.0.1:55376\n",
+            ]
+        );
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
     }
 }

@@ -135,9 +135,17 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-ca-rs",
         "tests/calink_out_put_clamps_to_element_count.rs",
     ),
+    (
+        "epics-ca-rs",
+        "tests/caput_cli_string_put_prints_what_c_caput_prints.rs",
+    ),
     ("epics-ca-rs", "tests/caput_long_string_readback.rs"),
     ("epics-ca-rs", "tests/caput_old_read_never_aborts.rs"),
     ("epics-ca-rs", "tests/caput_readback_timeout.rs"),
+    (
+        "epics-ca-rs",
+        "tests/caput_sends_the_string_c_caput_sends.rs",
+    ),
     ("epics-ca-rs", "tests/channel_field_spelling.rs"),
     ("epics-ca-rs", "tests/channel_filters.rs"),
     ("epics-ca-rs", "tests/cli_cainfo_host.rs"),
@@ -158,6 +166,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     ("epics-ca-rs", "tests/put_native_type_conversion.rs"),
     ("epics-ca-rs", "tests/rate_limit_parity.rs"),
+    ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
     (
         "epics-ca-rs",

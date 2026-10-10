@@ -1877,12 +1877,11 @@ impl PvDatabase {
     /// (`check_not_link_field`). `false` for an unknown record or a non-link
     /// field.
     pub fn is_dbf_link_field(&self, record_name: &str, field: &str) -> bool {
-        let field_upper = field.to_ascii_uppercase();
         let Some(rec) = self.get_record(record_name) else {
             return false;
         };
         let guard = rec.read();
-        crate::types::dbf_link_class(guard.record.record_type(), &field_upper).is_some()
+        crate::types::dbf_link_class(guard.record.record_type(), field).is_some()
     }
 
     pub(super) fn put_pv_body(

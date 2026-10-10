@@ -1551,6 +1551,7 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         // `get_alarm_double`.
         "bi" | "mbbi" | "mbbo" => P {
             enum_strs: true,
+            put_enum_str: Some(true),
             ..P::NONE
         },
         "bo" => P {
@@ -1558,6 +1559,7 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
             precision: true,
             control_double: true,
             enum_strs: true,
+            put_enum_str: Some(true),
             ..P::NONE
         },
         // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
@@ -1565,6 +1567,7 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         "busy" => P {
             precision: true,
             enum_strs: true,
+            put_enum_str: Some(true),
             ..P::NONE
         },
         // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
@@ -6631,7 +6634,7 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
         if field.eq_ignore_ascii_case("DTYP") {
             let choices = super::merged_device_menu(record.record_type());
             if !choices.is_empty() {
-                return super::resolve_menu_field_string(
+                return super::menu_choices::resolve_device_field_string(
                     field,
                     &choices,
                     target,

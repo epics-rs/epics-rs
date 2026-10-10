@@ -396,8 +396,34 @@ pub fn resolve_menu_field_string(
 /// `putStringMenu`/`dbPutStringNum` hand back to `dbPut`, which aborts before
 /// storing anything (`dbAccess.c:1362` `if (status) goto done`), so the field
 /// keeps its previous value and the record is not processed.
-fn bad_choice(field: &str, choices: &[&str], s: &str) -> CaError {
-    CaError::BadChoice(crate::error::ChoiceRefusal::menu(field, s, choices.len()))
+/// `converter` is the C converter whose `recGblDbaddrError` report the
+/// refusal owes; the loader's `dbPutStringNum` prints none.
+fn bad_choice(field: &str, choices: &[&str], s: &str, converter: Option<&'static str>) -> CaError {
+    CaError::BadChoice(crate::error::ChoiceRefusal::menu(
+        field,
+        s,
+        choices.len(),
+        converter,
+    ))
+}
+
+/// The `DBF_DEVICE` twin of [`resolve_menu_field_string`]: C's
+/// `cvt_st_device` (`dbFastLinkConv.c:319-349`) takes the same exact label or
+/// index below `nChoice`, and reports a refusal under its own name.
+pub(crate) fn resolve_device_field_string(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+) -> CaResult<EpicsValue> {
+    resolve_choice(
+        field,
+        choices,
+        dbf_type,
+        s,
+        MenuBound::DbPut,
+        Some("dbFastLinkConv(cvt_st_device)"),
+    )
 }
 
 /// Resolve a `DBF_MENU` field's `.db` value — C `dbStaticRun.c::dbPutStringNum`
@@ -615,8 +641,20 @@ pub(crate) fn resolve_menu_field_string_bounded(
     s: &str,
     bound: MenuBound,
 ) -> CaResult<EpicsValue> {
-    let index =
-        menu_index_from_string(choices, s, bound).ok_or_else(|| bad_choice(field, choices, s))?;
+    let converter = matches!(bound, MenuBound::DbPut).then_some("dbFastLinkConv(cvt_st_menu)");
+    resolve_choice(field, choices, dbf_type, s, bound, converter)
+}
+
+fn resolve_choice(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+    bound: MenuBound,
+    converter: Option<&'static str>,
+) -> CaResult<EpicsValue> {
+    let index = menu_index_from_string(choices, s, bound)
+        .ok_or_else(|| bad_choice(field, choices, s, converter))?;
     Ok(menu_index_value(dbf_type, index))
 }
 

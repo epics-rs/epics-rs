@@ -1453,23 +1453,6 @@ fn cmd_dbpf() -> CommandDef {
             let base = addr.record.as_str();
             let field = addr.field.clone();
 
-            // Try to determine the field type for proper parsing
-            let dbf_type = ctx.block_on(async {
-                if let Some(rec) = ctx.db().get_record(base) {
-                    let inst = rec.read();
-                    // Check record-specific fields
-                    if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
-                        inst.record.as_ref(),
-                        &field,
-                    ) {
-                        return Some(t);
-                    }
-                    // Common field types
-                    return common_field_dbf_type(&field);
-                }
-                None
-            });
-
             // C `dbTest.c:413-429`: an ARRAY field is put through its OWN
             // `dbr_field_type`, never the `DBR_STRING` a scalar `dbpf` uses.
             // `no_elements` is the DBADDR capacity `cvt_dbaddr` wrote (`NELM`,
@@ -1541,53 +1524,18 @@ fn cmd_dbpf() -> CommandDef {
 
             let value = if let Some(v) = array_value {
                 v
-            } else if field == "DTYP" {
-                // DTYP is DBF_DEVICE: its choices are the record type's live
-                // device menu (dynamic, per record type — device support names
-                // registered at runtime), NOT the field-blind static table that
-                // `EpicsValue::parse(Enum, _)` used to consult (the field-blind
-                // menu table, removed with 03 L-7).
-                // `declared_field_type_of(DTYP)` reports `Enum`, so the generic
-                // path below parsed every device-support name as an enum/menu
-                // string and rejected it ("invalid enum or menu string"), which
-                // failed `dbpf <rec>.DTYP <device-support-name>` for every record
-                // type. Feed the value straight to the put path, which already
-                // resolves a numeric index against `device_menu` and stores a
-                // device-support NAME as-is (tier-3, `put_common_field`'s "DTYP"
-                // arm).
-                match value_str.trim().parse::<i64>() {
-                    Ok(i) => EpicsValue::Enum(i as u16),
-                    Err(_) => EpicsValue::String(value_str.trim().into()),
-                }
-            } else if let Some(dbf) = dbf_type {
-                // A `DBF_MENU`/`DBF_ENUM` label is menu-SPECIFIC — "Specified"
-                // is index 1 of `menuFanout` but index 0 of `selSELM` — so its
-                // one resolver is `resolve_menu_field_string`, which needs the
-                // field's own menu. `dbpf` has only the field's declared TYPE
-                // here, so it must not resolve the label itself: it hands the
-                // token to the put path, exactly as the DTYP arm above does.
-                // Resolving it here is what made `dbpf <sel>.SELM Specified`
-                // store menuFanout's 1 instead of selSELM's 0.
-                //
-                // A numeric token still parses here, so a typed put keeps its
-                // typed error, and a token that is neither a number nor a valid
-                // choice is refused downstream by `put_string`/`bad_choice`
-                // rather than silently landing as index 0.
-                //
-                // The fallback is not the menu arm's alone. C hands `dbpf`'s
-                // scalar text to `dbPutField` as `DBR_STRING` and never parses
-                // it itself (`dbTest.c:413`, `:431`), so text no conversion
-                // takes is a failed PUT — value unchanged, nothing printed by
-                // `dbpf`, and the closing `dbgf` still run. Parsing here and
-                // raising the error instead put `ERROR <file> line <n>: cannot
-                // parse 'notanumber' as Double` on stderr and skipped the
-                // read-back entirely, where `softIoc` R7.0.10-146 printed only
-                // `DBF_DOUBLE:         1.5`.
-                EpicsValue::parse(dbf, value_str)
-                    .unwrap_or_else(|_| EpicsValue::String(value_str.trim().into()))
             } else {
-                // No type info available, try as string
-                EpicsValue::String(value_str.clone().into())
+                // C hands `dbpf`'s scalar text to `dbPutField` as
+                // `DBR_STRING` and never parses it itself (`dbTest.c:413`,
+                // `:431`), so the text goes to the put path untouched for every
+                // type: `putStringMenu`/`putStringEnum` resolve a label against
+                // the field's own choices (`dbpf <sel>.SELM Specified` is
+                // selSELM's 0, not menuFanout's 1), `putStringString` copies
+                // the bytes, and `c_parse::put_string` is the one `epicsParse*`
+                // port for the numeric widths. Text no conversion takes is a
+                // failed PUT — value unchanged, nothing printed by `dbpf`, and
+                // the closing `dbgf` still run.
+                EpicsValue::String(value_str.as_str().into())
             };
 
             // C `dbpf` writes via `dbPutField` — processing put, but no
@@ -7733,23 +7681,6 @@ mod dbgf_escape_tests {
     }
 }
 
-/// Map common field names to their DBF types.
-fn common_field_dbf_type(field: &str) -> Option<crate::types::DbFieldType> {
-    use crate::types::DbFieldType;
-    match field {
-        "SCAN" => Some(DbFieldType::String),
-        "DTYP" => Some(DbFieldType::String),
-        "INP" | "OUT" | "FLNK" | "ASG" => Some(DbFieldType::String),
-        // The dbCommon `DBF_MENU` fields carry a menu index (served as
-        // `DBR_ENUM`); `UDF`/`TPRO` are the genuine `DBF_UCHAR` flags.
-        "SEVR" | "STAT" | "PINI" => Some(DbFieldType::Short),
-        "UDF" | "TPRO" => Some(DbFieldType::Char),
-        "HIHI" | "HIGH" | "LOW" | "LOLO" => Some(DbFieldType::Double),
-        "HHSV" | "HSV" | "LSV" | "LLSV" => Some(DbFieldType::Short),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9351,6 +9282,237 @@ mod tests {
         );
     }
 
+    /// C `dbpf` hands the text to `dbPutField` as `DBR_STRING`, so every
+    /// scalar goes through `putString*`'s `epicsParse*`: an out-of-range
+    /// literal is a refused put and the field keeps its value (77 here).
+    /// Rows are softIoc R7.0.10-146-g8f5015b66 `dbpf` followed by `dbgf`, with
+    /// the hex tail dropped and spaces collapsed; the previous `as`-narrowing
+    /// stored `-2147483648` for `LO.VAL 2147483648`.
+    #[test]
+    fn dbpf_refuses_a_literal_outside_the_field_width_as_epics_parse_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sp.db");
+        std::fs::write(
+            &path,
+            "record(longout, \"LO\") {}\n\
+             record(int64out, \"IQ\") {}\n\
+             record(mbbo, \"MB\") {}\n\
+             record(waveform, \"WU\") { field(FTVL, \"ULONG\") field(NELM, \"2\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        // `dbgf` prints `<value> = 0x<hex>` per element; the rows keep the value.
+        let norm = |out: String| {
+            let mut words = Vec::new();
+            let mut it = out.split_whitespace();
+            while let Some(w) = it.next() {
+                if w == "=" {
+                    it.next();
+                } else {
+                    words.push(w);
+                }
+            }
+            words.join(" ")
+        };
+        for (pv, text, want) in [
+            ("LO.VAL", "2147483648", "DBF_LONG: 77"),
+            ("IQ.VAL", "2147483648", "DBF_INT64: 2147483648"),
+            ("MB.RVAL", "2147483648", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "2147483648", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "-2147483649", "DBF_LONG: 77"),
+            ("IQ.VAL", "-2147483649", "DBF_INT64: -2147483649"),
+            ("MB.RVAL", "-2147483649", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "-2147483649", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "2147483647", "DBF_LONG: 2147483647"),
+            ("IQ.VAL", "2147483647", "DBF_INT64: 2147483647"),
+            ("MB.RVAL", "2147483647", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "2147483647", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "-2147483648", "DBF_LONG: -2147483648"),
+            ("IQ.VAL", "-2147483648", "DBF_INT64: -2147483648"),
+            ("MB.RVAL", "-2147483648", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "-2147483648", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "9223372036854775807", "DBF_LONG: 77"),
+            (
+                "IQ.VAL",
+                "9223372036854775807",
+                "DBF_INT64: 9223372036854775807",
+            ),
+            ("MB.RVAL", "9223372036854775807", "DBF_ULONG: 77"),
+            ("WU.VAL", "9223372036854775807", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "9223372036854775808", "DBF_LONG: 77"),
+            ("IQ.VAL", "9223372036854775808", "DBF_INT64: 77"),
+            ("MB.RVAL", "9223372036854775808", "DBF_ULONG: 77"),
+            ("WU.VAL", "9223372036854775808", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "-9223372036854775808", "DBF_LONG: 77"),
+            (
+                "IQ.VAL",
+                "-9223372036854775808",
+                "DBF_INT64: -9223372036854775808",
+            ),
+            ("MB.RVAL", "-9223372036854775808", "DBF_ULONG: 77"),
+            ("WU.VAL", "-9223372036854775808", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "-9223372036854775809", "DBF_LONG: 77"),
+            ("IQ.VAL", "-9223372036854775809", "DBF_INT64: 77"),
+            ("MB.RVAL", "-9223372036854775809", "DBF_ULONG: 77"),
+            ("WU.VAL", "-9223372036854775809", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "18446744073709551615", "DBF_LONG: 77"),
+            ("IQ.VAL", "18446744073709551615", "DBF_INT64: 77"),
+            ("MB.RVAL", "18446744073709551615", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "18446744073709551615", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "18446744073709551616", "DBF_LONG: 77"),
+            ("IQ.VAL", "18446744073709551616", "DBF_INT64: 77"),
+            ("MB.RVAL", "18446744073709551616", "DBF_ULONG: 77"),
+            ("WU.VAL", "18446744073709551616", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "4294967295", "DBF_LONG: 77"),
+            ("IQ.VAL", "4294967295", "DBF_INT64: 4294967295"),
+            ("MB.RVAL", "4294967295", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "4294967295", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "4294967296", "DBF_LONG: 77"),
+            ("IQ.VAL", "4294967296", "DBF_INT64: 4294967296"),
+            ("MB.RVAL", "4294967296", "DBF_ULONG: 77"),
+            ("WU.VAL", "4294967296", "DBF_ULONG: 0"),
+            ("LO.VAL", "-0", "DBF_LONG: 0"),
+            ("IQ.VAL", "-0", "DBF_INT64: 0"),
+            ("MB.RVAL", "-0", "DBF_ULONG: 0"),
+            ("WU.VAL", "-0", "DBF_ULONG: 0"),
+            ("LO.VAL", "0x7fffffff", "DBF_LONG: 2147483647"),
+            ("IQ.VAL", "0x7fffffff", "DBF_INT64: 2147483647"),
+            ("MB.RVAL", "0x7fffffff", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "0x7fffffff", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "0x80000000", "DBF_LONG: 77"),
+            ("IQ.VAL", "0x80000000", "DBF_INT64: 2147483648"),
+            ("MB.RVAL", "0x80000000", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "0x80000000", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "0xffffffff", "DBF_LONG: 77"),
+            ("IQ.VAL", "0xffffffff", "DBF_INT64: 4294967295"),
+            ("MB.RVAL", "0xffffffff", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "0xffffffff", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "0x100000000", "DBF_LONG: 77"),
+            ("IQ.VAL", "0x100000000", "DBF_INT64: 4294967296"),
+            ("MB.RVAL", "0x100000000", "DBF_ULONG: 77"),
+            ("WU.VAL", "0x100000000", "DBF_ULONG: 0"),
+            ("LO.VAL", "1e3", "DBF_LONG: 1"),
+            ("IQ.VAL", "1e3", "DBF_INT64: 1"),
+            ("MB.RVAL", "1e3", "DBF_ULONG: 1000"),
+            ("WU.VAL", "1e3", "DBF_ULONG: 1000"),
+            ("LO.VAL", "1.5", "DBF_LONG: 1"),
+            ("IQ.VAL", "1.5", "DBF_INT64: 1"),
+            ("MB.RVAL", "1.5", "DBF_ULONG: 1"),
+            ("WU.VAL", "1.5", "DBF_ULONG: 1"),
+            ("LO.VAL", " 12", "DBF_LONG: 12"),
+            ("IQ.VAL", " 12", "DBF_INT64: 12"),
+            ("MB.RVAL", " 12", "DBF_ULONG: 12"),
+            ("WU.VAL", " 12", "DBF_ULONG: 12"),
+            ("LO.VAL", "12abc", "DBF_LONG: 12"),
+            ("IQ.VAL", "12abc", "DBF_INT64: 12"),
+            ("MB.RVAL", "12abc", "DBF_ULONG: 12"),
+            ("WU.VAL", "12abc", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "12 ", "DBF_LONG: 12"),
+            ("IQ.VAL", "12 ", "DBF_INT64: 12"),
+            ("MB.RVAL", "12 ", "DBF_ULONG: 12"),
+            ("WU.VAL", "12 ", "DBF_ULONG: 12"),
+            ("LO.VAL", "0", "DBF_LONG: 0"),
+            ("IQ.VAL", "0", "DBF_INT64: 0"),
+            ("MB.RVAL", "0", "DBF_ULONG: 0"),
+            ("WU.VAL", "0", "DBF_ULONG: 0"),
+            ("LO.VAL", "-1", "DBF_LONG: -1"),
+            ("IQ.VAL", "-1", "DBF_INT64: -1"),
+            ("MB.RVAL", "-1", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "-1", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "+5", "DBF_LONG: 5"),
+            ("IQ.VAL", "+5", "DBF_INT64: 5"),
+            ("MB.RVAL", "+5", "DBF_ULONG: 5"),
+            ("WU.VAL", "+5", "DBF_ULONG: 5"),
+            ("LO.VAL", "010", "DBF_LONG: 8"),
+            ("IQ.VAL", "010", "DBF_INT64: 8"),
+            ("MB.RVAL", "010", "DBF_ULONG: 8"),
+            ("WU.VAL", "010", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "", "DBF_LONG: 0"),
+            ("IQ.VAL", "", "DBF_INT64: 0"),
+            ("MB.RVAL", "", "DBF_ULONG: 0"),
+            ("WU.VAL", "", "DBF_ULONG[0]: (empty)"),
+            ("LO.VAL", "abc", "DBF_LONG: 77"),
+            ("IQ.VAL", "abc", "DBF_INT64: 77"),
+            ("MB.RVAL", "abc", "DBF_ULONG: 77"),
+            ("WU.VAL", "abc", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "0x", "DBF_LONG: 0"),
+            ("IQ.VAL", "0x", "DBF_INT64: 0"),
+            ("MB.RVAL", "0x", "DBF_ULONG: 0"),
+            ("WU.VAL", "0x", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "1e", "DBF_LONG: 1"),
+            ("IQ.VAL", "1e", "DBF_INT64: 1"),
+            ("MB.RVAL", "1e", "DBF_ULONG: 1"),
+            ("WU.VAL", "1e", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "99999999999999999999", "DBF_LONG: 77"),
+            ("IQ.VAL", "99999999999999999999", "DBF_INT64: 77"),
+            ("MB.RVAL", "99999999999999999999", "DBF_ULONG: 77"),
+            ("WU.VAL", "99999999999999999999", "DBF_ULONG[2]: 77 78"),
+        ] {
+            let seed = if pv.starts_with("WU") {
+                "[77,78]"
+            } else {
+                "77"
+            };
+            run_cmd(&ctx, "dbpf", &[pv, seed]);
+            // softIoc prints no error line for a refused scalar put: `dbpf`
+            // echoes the field as it stands, the text `dbgf` then prints. A
+            // refused array put prints `dbConvertJSON: ...` on the error
+            // stream and nothing here.
+            let echo = norm(run_cmd(&ctx, "dbpf", &[pv, text]));
+            if want == "DBF_ULONG[2]: 77 78" {
+                assert_eq!(echo, "", "dbpf {pv} {text:?} echo");
+            } else {
+                assert_eq!(echo, want, "dbpf {pv} {text:?} echo");
+            }
+            assert_eq!(
+                norm(run_cmd(&ctx, "dbgf", &[pv])),
+                want,
+                "dbpf {pv} {text:?}"
+            );
+        }
+    }
+
+    /// `dbpf` on an enum or string field hands the text over untrimmed, as on
+    /// every other type. softIoc R7.0.10-146-g8f5015b66, each row after
+    /// `dbpf BO.VAL 0` / `dbpf SO.VAL z`, on
+    /// `record(bo,"BO"){field(ZNAM,"Off") field(ONAM,"On")}` and
+    /// `record(stringout,"SO"){}`; each refused row also errlogs
+    /// `recGblRecordError: <text> Illegal choice PV: BO`.
+    #[test]
+    fn dbpf_puts_enum_and_string_text_as_c_putstringenum_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("es.db");
+        std::fs::write(
+            &path,
+            "record(bo, \"BO\") { field(ZNAM, \"Off\") field(ONAM, \"On\") }\n\
+             record(stringout, \"SO\") {}\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, seed, text, want) in [
+            ("BO.VAL", "0", "On", "DBF_STRING:         \"On\"      \n"),
+            ("BO.VAL", "0", "1", "DBF_STRING:         \"On\"      \n"),
+            ("BO.VAL", "0", "65537", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "-1", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", " On", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "On ", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "2", "DBF_STRING:         \"Off\"     \n"),
+            ("SO.VAL", "z", "a", "DBF_STRING:         \"a\"       \n"),
+            ("SO.VAL", "z", " a", "DBF_STRING:         \" a\"      \n"),
+        ] {
+            run_cmd(&ctx, "dbpf", &[pv, seed]);
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &[pv, text]),
+                want,
+                "dbpf {pv} {text:?}"
+            );
+        }
+    }
+
     /// A long-string VAL is one `DBF_STRING` to every capacity reader
     /// (`cvt_dbaddr`'s `no_elements = 1`), whatever LEN a `$` put left.
     /// Oracle — softIoc R7.0.10, `record(lso,"LSO"){field(SIZV,"40")}`:
@@ -10697,6 +10859,41 @@ BO_REC
             run_cmd(&ctx, "dbpr", &["G:S1", "1"]).contains("SELM: Low Signal"),
             "dbpr renders a DBF_MENU field as its choice"
         );
+    }
+
+    /// `dbpf` hands `DTYP` its text untouched, and C's `cvt_st_device`
+    /// (`dbFastLinkConv.c:319-349`) takes only an exact device name or an
+    /// index below the menu's length. Each row is softIoc 8f5015b66 putting
+    /// the text over `"Raw Soft Channel"`.
+    #[test]
+    fn dbpf_dtyp_puts_the_text_untrimmed() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dtyp.db");
+        std::fs::write(&path, "record(ai, \"X\") {}\n").unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+
+        for (text, kept) in [
+            (" Soft Channel", "Raw Soft Channel"),
+            ("Soft Channel ", "Raw Soft Channel"),
+            ("Soft  Channel", "Raw Soft Channel"),
+            ("", "Raw Soft Channel"),
+            ("nope", "Raw Soft Channel"),
+            ("Soft Channel", "Soft Channel"),
+            ("1", "Raw Soft Channel"),
+            (" 0 ", "Soft Channel"),
+            ("2", "Async Soft Channel"),
+            ("65536", "Raw Soft Channel"),
+            ("-1", "Raw Soft Channel"),
+        ] {
+            run_cmd(&ctx, "dbpf", &["X.DTYP", "Raw Soft Channel"]);
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["X.DTYP", text]).trim_end(),
+                format!("DBF_STRING:         \"{kept}\""),
+                "dbpf X.DTYP {text:?}"
+            );
+        }
     }
 
     /// C's `getMaxRangeValues` (`recGbl.c:372-419`) switches on the DECLARED

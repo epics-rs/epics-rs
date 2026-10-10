@@ -510,6 +510,7 @@ impl ProcessVariable {
             alarm_double: snap.display.is_some(),
             control_double: snap.control.is_some(),
             enum_strs: snap.enums.is_some(),
+            put_enum_str: None,
         }
         .narrowed_to_field(snap.value.db_field_type(), false);
     }

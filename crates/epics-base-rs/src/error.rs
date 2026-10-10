@@ -186,12 +186,12 @@ pub struct ChoiceRefusal(Choice);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Choice {
     /// `from` names none of `field`'s `count` choices and is no index below
-    /// it. `reported` while the report C prints with it is still owed.
+    /// it, with the report C prints for it while that is still owed.
     String {
         field: ReportString,
         from: ReportString,
         count: u16,
-        reported: bool,
+        owed: Owed,
     },
     /// `index` is past `field`'s `count` choices.
     Index {
@@ -202,6 +202,16 @@ enum Choice {
     Said(&'static str),
     /// A `.db` load's refusal, made with no hold.
     Text(String),
+}
+
+/// The report a [`Choice::String`] refusal still owes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    Nothing,
+    /// `recGblRecordError(S_db_badChoice, precord, from)`.
+    Record,
+    /// `recGblDbaddrError(S_db_badChoice, paddr, converter)`.
+    Dbaddr(&'static str),
 }
 
 use crate::server::recgbl::ReportString;
@@ -215,17 +225,25 @@ impl ChoiceRefusal {
             field: ReportString::new(field),
             from: ReportString::new(from),
             count: count as u16,
-            reported: true,
+            owed: Owed::Record,
         })
     }
 
     /// `from` names no menu choice of `field` and is no index below `count`.
-    pub(crate) fn menu(field: &str, from: &str, count: usize) -> Self {
+    /// `converter` is the C converter whose `recGblDbaddrError` the refusal
+    /// owes (`cvt_st_menu` / `cvt_st_device`, `dbFastLinkConv.c:314`, `:347`);
+    /// the loader's `dbPutStringNum` prints none.
+    pub(crate) fn menu(
+        field: &str,
+        from: &str,
+        count: usize,
+        converter: Option<&'static str>,
+    ) -> Self {
         Self(Choice::String {
             field: ReportString::new(field),
             from: ReportString::new(from),
             count: count as u16,
-            reported: false,
+            owed: converter.map_or(Owed::Nothing, Owed::Dbaddr),
         })
     }
 
@@ -240,10 +258,19 @@ impl ChoiceRefusal {
 
     /// Move out the report C prints with this refusal, for the put's owner.
     pub(crate) fn take_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        use crate::server::recgbl::PutReport;
         match &mut self.0 {
-            Choice::String { from, reported, .. } if *reported => {
-                *reported = false;
-                Some(crate::server::recgbl::PutReport::IllegalChoice { from: *from })
+            Choice::String { from, owed, .. } => {
+                let report = match *owed {
+                    Owed::Nothing => None,
+                    Owed::Record => Some(PutReport::IllegalChoice { from: *from }),
+                    Owed::Dbaddr(converter) => Some(PutReport::DbaddrError {
+                        status: "Illegal choice",
+                        message: converter,
+                    }),
+                };
+                *owed = Owed::Nothing;
+                report
             }
             _ => None,
         }

@@ -154,8 +154,32 @@ pub(crate) fn send_event(
     // client's send buffer and `dbGet` converting into that space
     // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
-    encode_dbr_into(frame.dst(), data_type, snapshot)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
+    if let Err(e) = encode_dbr_into(frame.dst(), data_type, snapshot) {
+        // C `read_reply` (`camessage.c:540-557`): a refused conversion is a
+        // zeroed ECA_GETFAIL update, and the subscription stays.
+        let getfail = matches!(e, epics_base_rs::error::CaError::GetConvertFailed(_))
+            .then(|| {
+                super::tcp::status_event_frame(
+                    CA_PROTO_EVENT_ADD,
+                    data_type,
+                    data_count,
+                    sub_id,
+                    ECA_GETFAIL,
+                    reply.client_minor,
+                )
+            })
+            .flatten();
+        return match getfail {
+            Some(getfail) => {
+                outbox.push_with(getfail, credit);
+                Ok(())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encode",
+            )),
+        };
+    }
     // Size the payload and pick the header count — `size_dbr_reply` owns the
     // rule (autosize, request-count pad/truncate, and the DBR_CLASS_NAME
     // fixed single element). A SimplePv channel carries no record_type, so

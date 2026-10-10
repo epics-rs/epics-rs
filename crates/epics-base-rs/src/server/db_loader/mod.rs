@@ -707,6 +707,44 @@ fn db_load_numeric_value(
     Ok(Some(cast(bits)))
 }
 
+/// C `dbPutStringNum`'s integer arms for a typed text, as the `EpicsValue` of
+/// `dbr_type`: what a number spelled in a `.db` body or a `.dbd` `initial(...)`
+/// becomes in a field of that width ([`EpicsValue::parse_bytes`]). The put-path
+/// row, which refuses instead of casting, is [`EpicsValue::parse`].
+pub(crate) fn db_put_string_num(
+    dbr_type: crate::types::DbFieldType,
+    s: &str,
+) -> CaResult<EpicsValue> {
+    use crate::types::DbFieldType;
+    let declared = match dbr_type {
+        DbFieldType::Char => DbfCode::Char,
+        DbFieldType::UChar => DbfCode::UChar,
+        DbFieldType::Short => DbfCode::Short,
+        DbFieldType::UShort => DbfCode::UShort,
+        DbFieldType::Enum => DbfCode::Enum,
+        DbFieldType::Long => DbfCode::Long,
+        DbFieldType::ULong => DbfCode::ULong,
+        DbFieldType::Int64 => DbfCode::Int64,
+        DbFieldType::UInt64 => DbfCode::UInt64,
+        DbFieldType::Float => DbfCode::Float,
+        DbFieldType::Double => DbfCode::Double,
+        DbFieldType::String => {
+            return Err(CaError::InvalidValue(format!(
+                "{dbr_type:?} is not a numeric field type"
+            )));
+        }
+    };
+    match db_load_numeric_value(declared, "", s.trim()) {
+        // C gives DBF_ENUM the unsigned 16-bit arm; the carrier is the caller's.
+        Ok(Some(EpicsValue::UShort(v))) if dbr_type == DbFieldType::Enum => Ok(EpicsValue::Enum(v)),
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Err(CaError::InvalidValue(format!(
+            "{dbr_type:?} has no numeric arm"
+        ))),
+        Err(status) => Err(CaError::InvalidValue(status.to_string())),
+    }
+}
+
 /// Which of `epicsParseLong`'s three statuses (`epicsStdlib.c:38-47`) refused
 /// `s`, once the strict parse has said that one of them did.
 fn integer_refusal(

@@ -159,8 +159,8 @@ use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
     SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
-    dispatch_message, is_peer_disconnect, register_subscription, run_event_task, send_ca_error,
-    serve_write_head,
+    dispatch_message, is_peer_disconnect, print_forcing_disconnect, print_log_header,
+    register_subscription, run_event_task, send_ca_error, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1400,6 +1400,7 @@ fn handle_client_blocking(
                             &err.diagnostic,
                             state.client_minor_version(),
                         );
+                        print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
                         continue;
                     }
                     Gate::TearDown { error, reason } => {
@@ -1419,8 +1420,10 @@ fn handle_client_blocking(
                                 &err.diagnostic,
                                 state.client_minor_version(),
                             );
+                            print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
                         }
                         let _ = drain_outbox_locked(&send_lock, &mut drain);
+                        print_forcing_disconnect(peer);
                         return Err(reason);
                     }
                     Gate::Discard => {
@@ -1512,6 +1515,7 @@ fn handle_client_blocking(
                         }
                         Ok(Err(e)) => {
                             let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            print_forcing_disconnect(peer);
                             return Err(e);
                         }
                         Err(_not_blockable) => {
@@ -1555,6 +1559,7 @@ fn handle_client_blocking(
                             // The CA_PROTO_ERROR is queued; ship it, then end the
                             // circuit (C `event_cancel_reply` RSRV_ERROR).
                             let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            print_forcing_disconnect(peer);
                             return Err(e);
                         }
                     }
@@ -1590,6 +1595,7 @@ fn handle_client_blocking(
                             // error frame; ship it, then end the circuit — same rule
                             // as the async server (RSRV_ERROR).
                             let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            print_forcing_disconnect(peer);
                             return Err(e);
                         }
                         Err(_not_blockable) => {
@@ -1644,6 +1650,7 @@ fn handle_client_blocking(
                             // Ship anything an earlier handler in this burst (or
                             // this handler's own error frame) queued, then end.
                             let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            print_forcing_disconnect(peer);
                             return Err(e);
                         }
                         Err(_not_blockable) => {
@@ -4201,6 +4208,44 @@ mod tests {
             let (res, stored) = write_scalar_string(body);
             assert!(res.is_err(), "{body:?}");
             assert_eq!(stored, EpicsValue::String("seed".into()), "{body:?}");
+        }
+    }
+
+    /// epics-base PR #944 (camessage.c:764, :1696): a scalar DBR_STRING put
+    /// must hold a NUL within `m_postsize`, at any length, or it is
+    /// RSRV_ERROR with no reply and no put. softIoc 8f5015b66 drops the
+    /// circuit for each body below on both opcodes and keeps the old value.
+    #[test]
+    fn a_scalar_string_put_without_a_nul_drops_the_circuit() {
+        for body in [&b"AAAAAAAA"[..], b"", &[b'a'; 40]] {
+            for cmmd in [CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY] {
+                let (db, mut state, outbox, mut drain) =
+                    write_test_session("WR:STR", EpicsValue::String("x".into()));
+                let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+                let f = put_frame(cmmd, epics_base_rs::types::DBR_STRING, 1, 1, 0x54, body);
+                let (hdr, hdr_size) =
+                    CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+                let payload = f[hdr_size..].to_vec();
+                let res = block_on_sync(dispatch_message(
+                    &hdr,
+                    &payload,
+                    &mut state,
+                    &db,
+                    &outbox,
+                    peer,
+                    None,
+                    SubscriptionDelivery::HandOff,
+                ))
+                .unwrap();
+                let what = format!("cmmd {cmmd}, {} bytes", body.len());
+                assert!(res.is_err(), "{what}");
+                assert!(drain.try_next().is_none(), "{what}");
+                assert_eq!(
+                    simple_pv(&db, "WR:STR").get(),
+                    EpicsValue::String("x".into()),
+                    "{what}"
+                );
+            }
         }
     }
 

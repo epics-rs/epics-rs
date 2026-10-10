@@ -1020,7 +1020,19 @@ impl EpicsValue {
         if self.db_field_type() == target && !matches!(self, Self::EnumWithChoices { .. }) {
             return self;
         }
-        self.convert_to(target)
+        self.into_other_type(target)
+    }
+
+    /// [`Self::into_type`] for a value not already of `target`: one call that
+    /// consumes it, where `convert_to` and a drop of the borrowed value were two.
+    #[inline(never)]
+    fn into_other_type(self, target: DbFieldType) -> EpicsValue {
+        if let Some(v) = self.num().and_then(|n| n.to_field(target)) {
+            // A numeric scalar owns nothing, so its drop is skipped, not leaked.
+            std::mem::forget(self);
+            return v;
+        }
+        self.convert_other(target)
     }
 
     /// [`Self::convert_to`] for every row but a numeric scalar into a numeric

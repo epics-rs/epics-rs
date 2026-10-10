@@ -1263,9 +1263,8 @@ pub(crate) struct SelmResult {
 ///   `SELL` pointing at a `DBF_LONG` field holding `-1` gives `SELN = 65535`.
 /// * **Float source** — `(epicsUInt16)d`. Conversion of an out-of-range
 ///   *float* is **undefined** (C17 6.3.1.4p1), so compiled C is not
-///   single-valued: x86-64 wraps, aarch64 saturates. What the port does about
-///   that is [`crate::types::c_cast`]'s call — the single owner of the policy —
-///   and deliberately not restated here.
+///   single-valued: x86-64 wraps, aarch64 saturates. The port takes x86-64's
+///   value, from [`crate::types::c_cast`] — the single owner of the policy.
 ///
 /// Both rules already live in [`EpicsValue::convert_to`], the single
 /// value-coercion owner: it takes the integer view (`as_int_i64`) when the

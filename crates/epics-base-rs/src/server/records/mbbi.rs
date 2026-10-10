@@ -334,6 +334,11 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbbiRecord {
+    /// `mbbiRecord.c:126` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
+    fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
+        Some(crate::types::DbFieldType::UShort)
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

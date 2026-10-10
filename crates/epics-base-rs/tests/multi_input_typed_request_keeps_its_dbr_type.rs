@@ -196,14 +196,14 @@ async fn a_string_requested_as_long_is_a_failed_read() {
 }
 
 #[epics_macros_rs::epics_test]
-async fn an_infinite_double_requested_as_long_saturates() {
+async fn an_infinite_double_requested_as_long_is_int_min() {
     let (v, _) = read(
         EpicsValue::Double(f64::INFINITY),
         "src_f64",
         LinkReadAs::Long,
     )
     .await;
-    assert_eq!(v, Some(EpicsValue::Long(i32::MAX)));
+    assert_eq!(v, Some(EpicsValue::Long(i32::MIN)));
 }
 
 /// The numeric funnel's own request fails the same way: a non-numeric

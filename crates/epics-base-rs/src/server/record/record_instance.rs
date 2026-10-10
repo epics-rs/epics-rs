@@ -5766,11 +5766,9 @@ impl RecordInstance {
             // render through the field's string source. A short field that is
             // neither has no source and stays the plain number C converts it to.
             &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
-            &EpicsValue::Short(v) => {
-                render.label = u16::try_from(v)
-                    .ok()
-                    .and_then(|idx| self.label_of(field, idx));
-            }
+            // A menu index is an `epicsEnum16`: a negative short reads as its
+            // unsigned bits, which `cvt_menu_st` prints with `%u`.
+            &EpicsValue::Short(v) => render.label = self.label_of(field, v as u16),
             _ => {}
         }
         render

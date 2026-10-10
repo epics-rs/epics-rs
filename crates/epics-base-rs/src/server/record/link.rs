@@ -389,6 +389,36 @@ impl LnkConst {
     }
 }
 
+impl LnkConst {
+    /// C `lnkConst_loadScalar` (`lnkConst.c:358-417`): the value, or an
+    /// array's element 0, through `dbFastPutConvertRoutine[its own
+    /// type][dbrType]`, so a JSON double takes the C cast (`{const:5e9}` into
+    /// `DBF_LONG` is `INT_MIN`) and only a string can refuse.
+    fn load_scalar(&self, dbr_type: DbFieldType) -> Result<EpicsValue, ConstLoadError> {
+        let row = match dbr_type {
+            DbFieldType::Enum => DbFieldType::UShort,
+            t => t,
+        };
+        let strings = |v: &[String]| match strings_into(row, v) {
+            (loaded, true) => Ok(loaded),
+            (_, false) => Err(ConstLoadError::Conversion),
+        };
+        let loaded = match self {
+            Self::Integer(i) => integers_into(row, std::slice::from_ref(i)),
+            Self::Integers(v) => integers_into(row, &v[..1]),
+            Self::Double(d) => doubles_into(row, std::slice::from_ref(d)),
+            Self::Doubles(v) => doubles_into(row, &v[..1]),
+            Self::String(s) => strings(std::slice::from_ref(s))?,
+            Self::Strings(v) => strings(&v[..1])?,
+            Self::Empty => return Err(ConstLoadError::BadField),
+        };
+        loaded
+            .into_type(dbr_type)
+            .first_element()
+            .ok_or(ConstLoadError::BadField)
+    }
+}
+
 /// `cvtInt64ToString` / `cvt_q_*`.
 fn integers_into(row: DbFieldType, v: &[i64]) -> EpicsValue {
     if row == DbFieldType::String {
@@ -516,8 +546,29 @@ impl ConstantLink {
             .map_err(|_| ConstLoadError::BadField)
     }
 
+    /// `lnkConst_loadScalar` for a `{const: …}` link; `None` for a
+    /// `dbConstLink` one, whose load is its text.
+    pub(crate) fn load_json_scalar(
+        &self,
+        dbr_type: DbFieldType,
+    ) -> Option<Result<EpicsValue, ConstLoadError>> {
+        self.json.as_ref().map(|json| json.load_scalar(dbr_type))
+    }
+
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// C `dbLoadLinkLS` over this constant: `lnkConst_loadLS` for a
+    /// `{const: …}` link, which loads only its string forms
+    /// (`lnkConst.c:419-449`), else `dbConstLoadLS` ([`load_link_ls`]).
+    pub(crate) fn load_ls(&self) -> Option<LsLoad> {
+        match &self.json {
+            Some(LnkConst::String(s)) => Some(LsLoad::Text(s.clone())),
+            Some(LnkConst::Strings(v)) => v.first().cloned().map(LsLoad::Text),
+            Some(_) => None,
+            None => load_link_ls(&self.text),
+        }
     }
 
     /// Whether this is a `{const: …}` link, loaded by `lnkConst` rather than

@@ -92,14 +92,14 @@ async fn an_integer_source_wraps_into_an_unsigned_rval() {
     }
 }
 
-/// A FLOAT source is the other row of the table: the bare cast, which is UB out of
-/// range and which this port saturates (CBUG-E2) rather than reproducing x86-64's
-/// `INT32_MIN`. The two rules must not be collapsed into one — this is why the
-/// conversion is the coercion owner's to make and not a `to_f64()` away.
+/// A FLOAT source is the other row of the table: the bare cast, which x86-64
+/// compiles to `cvttsd2si` and so stores `INT32_MIN` out of range. The two rules
+/// must not be collapsed into one — this is why the conversion is the coercion
+/// owner's to make and not a `to_f64()` away.
 #[epics_macros_rs::epics_test]
-async fn a_float_source_saturates_into_a_signed_rval() {
+async fn a_float_source_takes_the_x86_cvttsd2si_into_a_signed_rval() {
     let db = ioc().await;
-    assert_eq!(rval(&db, "AI:DBL").await, EpicsValue::Long(i32::MAX));
+    assert_eq!(rval(&db, "AI:DBL").await, EpicsValue::Long(i32::MIN));
 }
 
 /// The control: in range, both rules agree, so no test above proves anything

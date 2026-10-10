@@ -1658,11 +1658,12 @@ pub(super) fn db_get_string(
     let text = match desc.declared_dbf {
         DbfCode::Menu | DbfCode::Device => {
             // The index is an `epicsEnum16` in C whatever the port stores it
-            // in; a value that is not an index at all leaves the choice list
-            // unreachable and falls through to the plain rendering.
+            // in, so a negative short reads as its unsigned bits; a value
+            // that is not an index at all leaves the choice list unreachable
+            // and falls through to the plain rendering.
             let index = match value {
                 EpicsValue::Enum(v) => Some(*v),
-                EpicsValue::Short(v) => u16::try_from(*v).ok(),
+                EpicsValue::Short(v) => Some(*v as u16),
                 EpicsValue::UShort(v) => Some(*v),
                 EpicsValue::UChar(v) => Some(u16::from(*v)),
                 _ => None,

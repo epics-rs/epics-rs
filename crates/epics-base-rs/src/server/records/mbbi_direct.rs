@@ -81,6 +81,11 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
 ];
 
 impl Record for MbbiDirectRecord {
+    /// `mbbiDirectRecord.c:109` loads a constant SIOL as `DBF_ULONG` into the LONG SVAL.
+    fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
+        Some(crate::types::DbFieldType::ULong)
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

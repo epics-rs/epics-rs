@@ -173,17 +173,6 @@ impl LinkFetch {
     }
 }
 
-/// C `dbConstLoadScalar` (`dbConstLink.c:152-175`): the value a CONSTANT link
-/// hands its record ONCE, at `init_record`, through `dbLoadLink`. An empty
-/// constant returns `S_db_badField` — i.e. nothing is stored, the field keeps
-/// its dbd `initial()` — which is the `None` here.
-pub fn constant_load_value(link: &crate::server::record::ParsedLink) -> Option<EpicsValue> {
-    match link {
-        crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
-        _ => None,
-    }
-}
-
 /// Whether a link is a C CONSTANT link — `dbLinkIsConstant` (`dbLink.c:220`).
 /// An unset link is constant (its `lset` is `dbConst_lset` with a NULL string),
 /// which is why `recGblInitSimm`'s `if (dbLinkIsConstant(psiml))` covers the

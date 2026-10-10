@@ -8101,30 +8101,23 @@ async fn test_histogram_csta_is_no_mod() {
 }
 
 /// C `dbConvert.c`'s `PUT(epicsFloat64, epicsInt32)` / `(epicsInt16)` is a bare
-/// cast (`*pdst = (typeb) *psrc`, :96-113), which the standard leaves UNDEFINED
-/// once the value is out of the destination's range (C17 6.3.1.4p1). Compiled C
-/// is therefore not single-valued — an x86-64 IOC's `cvttsd2si` answers with the
-/// integer indefinite, an aarch64 IOC's `fcvtzs` saturates. Per CBUG-E2 the port
-/// saturates and NaN goes to 0, through the single owner `types::c_cast`.
-///
-/// The values a compiled x86-64 softIoc gives, which the port DELIBERATELY does
-/// not reproduce, are recorded here so the divergence stays visible:
+/// cast (`*pdst = (typeb) *psrc`, :96-113), which x86-64 compiles to
+/// `cvttsd2si`: the integer indefinite once the value is out of the
+/// destination's range. The port reproduces that value through the single
+/// owner `types::c_cast`; the values below are softIoc R7.0.10-146-g8f5015b66:
 ///
 /// ```text
 /// record(calcout,"CO") { field(CALC,"3.0e9") field(OUT,"LO.VAL PP") }
 /// dbpf CO.PROC 1 ; dbgf LO.VAL   -> DBF_LONG: -2147483648 = 0x80000000
-///                                  (port: 2147483647; aarch64 C agrees)
 ///
 /// record(aao,"AAO") { field(DOL,"[1.7,2.2,-3.9,70000,5,6]") field(OUT,"WFS.VAL") }
 /// (WFS: NELM=4 FTVL=SHORT)
 /// dbpf AAO.PROC 1 ; dbgf WFS.VAL -> DBF_SHORT[4]: 1  2  -3  4464
-///                                  (port agrees: only the 32-bit step is UB)
 ///
-/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3   (port agrees:
-///                                   in range, no policy in play)
+/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3
 /// ```
 #[epics_macros_rs::epics_test]
-async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
+async fn test_double_to_int_narrowing_is_the_x86_64_cvttsd2si() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     use epics_base_rs::server::records::waveform::WaveformRecord;
     use epics_base_rs::types::DbFieldType;
@@ -8140,16 +8133,14 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     .await
     .unwrap();
 
-    // DBF_LONG destination: `(epicsInt32) 3.0e9` clamps to i32::MAX. An x86-64
-    // C IOC stores the integer indefinite (0x80000000) instead — UB, and the
-    // opposite end of the range from the value the user asked for.
+    // DBF_LONG destination: `(epicsInt32) 3.0e9` is the integer indefinite.
     db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(3.0e9))
         .await
         .unwrap();
     assert_eq!(
         db.get_pv("CVT_LO.VAL").unwrap(),
-        EpicsValue::Long(2147483647),
-        "CBUG-E2: saturate. x86-64 C: -2147483648"
+        EpicsValue::Long(i32::MIN),
+        "softIoc x86-64: -2147483648"
     );
 
     // In-range doubles still truncate toward zero.
@@ -8162,8 +8153,8 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
         .unwrap();
     assert_eq!(db.get_pv("CVT_LO.VAL").unwrap(), EpicsValue::Long(-3));
 
-    // FTVL=SHORT destination: the 32-bit convert, then the low 16 bits, as a
-    // C IOC on either target stores it: 70000 -> 4464.
+    // FTVL=SHORT destination: the 32-bit convert, then the low 16 bits:
+    // 70000 -> 4464.
     db.put_record_field_from_ca(
         "CVT_WFS",
         "VAL",

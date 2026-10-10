@@ -591,7 +591,14 @@ impl Record for HistogramRecord {
             return Ok(());
         }
         let svl = crate::server::record::parse_link_v2(&self.svl);
-        if let Some(v) = crate::server::recgbl::simm::constant_load_value(&svl)
+        // `recGblInitConstantLink(&prec->svl, DBF_DOUBLE, &prec->sgnl)`
+        // (`devHistogramSoft.c:44`).
+        if let crate::server::record::ParsedLink::Constant(constant) = &svl
+            && let Some(crate::types::c_parse::Converted::Stored(v)) =
+                crate::server::record::constant_load_scalar(
+                    constant,
+                    crate::types::DbFieldType::Double,
+                )
             && let Some(f) = v.to_f64()
         {
             self.sgnl = f;

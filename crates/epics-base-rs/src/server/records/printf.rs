@@ -1426,19 +1426,15 @@ mod tests {
     /// 40000 where C prints the `epicsInt16` conversion.
     /// A double source reaches an integer conversion through the DBR read C
     /// makes for it (`dbFastLinkConv.c` `cvt_d_*`), a cast that is UB once
-    /// the value is past its width. softIoc R7.0.10.1 on x86-64 prints the
-    /// `cvttsd2si` result there (INT_MIN for `%d` of 3e9); the port takes
-    /// `c_cast`'s rule, the one owner every field, link and wire conversion
-    /// shares: a signed 32-bit width saturates, an unsigned one keeps the bits
-    /// of `(long) d` as x86 does (`%x` of -200 is ffffff38), and a narrower one
-    /// wraps x86's step (`%hhd` of 300 is 44, `%hu` of -2.7 is 65534). Columns:
+    /// the value is past its width. The rows are softIoc R7.0.10-146-g8f5015b66
+    /// on x86-64 (`cvttsd2si`: INT_MIN for `%d` of 3e9), and `c_cast` is the
+    /// one owner of that value. Columns:
     /// `%d %x %u %hd %hhd %ld %lld %llu %hhu %hu %o %X`, then the stars.
     #[test]
-    fn double_sources_saturate_where_c_x86_64_prints_int_min_by_ub() {
+    fn double_sources_print_what_softioc_x86_64_prints() {
         const CONVS: [&str; 12] = [
             "%d", "%x", "%u", "%hd", "%hhd", "%ld", "%lld", "%llu", "%hhu", "%hu", "%o", "%X",
         ];
-        const U64: &str = "18446744073709551615";
         let rows: [(f64, [&str; 12]); 13] = [
             (
                 300.0,
@@ -1508,12 +1504,12 @@ mod tests {
             (
                 3e9,
                 [
-                    "2147483647",
+                    "-2147483648",
                     "b2d05e00",
                     "3000000000",
                     "0",
                     "0",
-                    "2147483647",
+                    "2147483648",
                     "3000000000",
                     "3000000000",
                     "0",
@@ -1542,12 +1538,12 @@ mod tests {
             (
                 5e9,
                 [
-                    "2147483647",
+                    "-2147483648",
                     "2a05f200",
                     "705032704",
                     "0",
                     "0",
-                    "2147483647",
+                    "2147483648",
                     "5000000000",
                     "5000000000",
                     "0",
@@ -1559,18 +1555,18 @@ mod tests {
             (
                 1e19,
                 [
-                    "2147483647",
-                    "ffffffff",
-                    "4294967295",
+                    "-2147483648",
                     "0",
                     "0",
-                    "2147483647",
-                    "9223372036854775807",
+                    "0",
+                    "0",
+                    "2147483648",
+                    "-9223372036854775808",
                     "10000000000000000000",
                     "0",
                     "0",
-                    "37777777777",
-                    "FFFFFFFF",
+                    "0",
+                    "0",
                 ],
             ),
             (
@@ -1593,40 +1589,53 @@ mod tests {
             (
                 1e30,
                 [
-                    "2147483647",
-                    "ffffffff",
-                    "4294967295",
+                    "-2147483648",
                     "0",
                     "0",
-                    "2147483647",
-                    "9223372036854775807",
-                    "18446744073709551615",
                     "0",
                     "0",
-                    "37777777777",
-                    "FFFFFFFF",
+                    "2147483648",
+                    "-9223372036854775808",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
                 ],
             ),
             (
                 f64::INFINITY,
                 [
-                    "2147483647",
-                    "ffffffff",
-                    "4294967295",
+                    "-2147483648",
                     "0",
                     "0",
-                    "2147483647",
-                    "9223372036854775807",
-                    "18446744073709551615",
                     "0",
                     "0",
-                    "37777777777",
-                    "FFFFFFFF",
+                    "2147483648",
+                    "-9223372036854775808",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
                 ],
             ),
             (
                 f64::NAN,
-                ["0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                [
+                    "-2147483648",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "2147483648",
+                    "-9223372036854775808",
+                    "9223372036854775808",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                ],
             ),
         ];
         for (src, want) in rows {
@@ -1640,7 +1649,7 @@ mod tests {
         for (src, want) in [
             (9.3e18, "9300000000000000000"),
             (1.8e19, "18000000000000000000"),
-            (2e19, U64),
+            (2e19, "0"),
             (-9.3e18, "9223372036854775808"),
         ] {
             let mut rec = rec_with("%llu");

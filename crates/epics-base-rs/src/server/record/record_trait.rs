@@ -3234,10 +3234,12 @@ pub trait Record: Send + Sync + 'static {
 
     /// The `dbrType` the same soft dset's `init_record` loads a constant INP
     /// at — `recGblInitConstantLink(&prec->inp, dbrType, …)`, a call of its own
-    /// in C. `None` keeps the link's own parsed value.
+    /// in C. `None` loads nothing.
     ///
     /// Default: the type [`Self::soft_input_request`] reads at, which is the
-    /// init type of every soft dset but `devMbbiSoftRaw`.
+    /// init type of every soft dset but `devMbbiSoftRaw`; a request that names
+    /// no type falls back to VAL's, the type `devLiSoft` and `devI64inSoft`
+    /// load at (`DBF_LONG`, `DBF_INT64`).
     fn soft_input_load_type(
         &self,
         soft: crate::server::device_support::SoftDtyp,
@@ -3246,6 +3248,16 @@ pub trait Record: Send + Sync + 'static {
             InputLinkRequest::As(read_as) => read_as.dbr_type(),
             InputLinkRequest::NotRead | InputLinkRequest::FromSource => None,
         }
+        .or_else(|| crate::server::record::record_instance::declared_field_type_of(self, "VAL"))
+    }
+
+    /// The `dbftype` `init_record` loads a constant SIOL into SVAL at —
+    /// `recGblInitConstantLink(&prec->siol, DBF_x, &prec->sval)`, which names
+    /// its own type rather than SVAL's.
+    ///
+    /// Default: SVAL's declared type.
+    fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
+        crate::server::record::record_instance::declared_field_type_of(self, "SVAL")
     }
 
     /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`

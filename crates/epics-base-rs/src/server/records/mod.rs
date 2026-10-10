@@ -11,11 +11,11 @@ use crate::types::{DbFieldType, EpicsValue};
 /// integer source reaches `getLongUlong` and converts MODULO 2^32, which C
 /// defines (C17 6.3.1.3p2) — `0xdeadbeef` read from a signed `DBF_LONG` lands in
 /// RVAL as `0xdeadbeef` — while a float source reaches `getDoubleUlong` and hits
-/// the UB cast that CBUG-E2 saturates.
+/// the UB cast, which `c_cast` takes as x86-64's `cvttsd2si`.
 ///
 /// [`EpicsValue::convert_to`] is the owner of that split. Reaching for
 /// `c_cast::f64_to_*(value.to_f64())` instead — as all four dsets once did —
-/// forces the FLOAT rule onto integer sources and saturates what C wraps.
+/// forces the FLOAT rule onto integer sources and clamps what C wraps.
 ///
 /// `convert_to` coerces rather than fails, so the not-numeric rejection has to
 /// stay explicit: without this gate a string INP would land in RVAL as a silent

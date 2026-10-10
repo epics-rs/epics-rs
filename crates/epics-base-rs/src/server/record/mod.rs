@@ -21,7 +21,7 @@ pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub(crate) use common_fields::StampBegun;
 pub use common_fields::{BkptFlag, CommonFields, TimeLast};
-pub(crate) use constant_link::constant_load_scalar;
+pub(crate) use constant_link::{constant_load_as, constant_load_scalar};
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use contributed_dbd::{ContributedDbd, register_contributed_dbd};
 pub(crate) use contributed_dbd::{

@@ -1201,12 +1201,18 @@ impl PvDatabase {
             render,
         );
         let mut read_failed = !fetch.is_ok();
-        let value = match fetch {
-            LinkFetch::Value(v) => Some(v),
+        // A refused per-read constant load is C's `!ok` from
+        // `recGblInitConstantLink`: the slot fails, with no LINK alarm.
+        let mut load_refused = false;
+        let (value, store_raw) = match fetch {
+            LinkFetch::Value(v) => (Some(v), store_raw),
             LinkFetch::NoData if plan.constants_deliver_at_process => {
-                crate::server::recgbl::simm::constant_load_value(link.parsed)
+                // Loaded at the request's own type, so it is stored as read.
+                let loaded = crate::server::record::constant_load_as(link.parsed, link.request);
+                load_refused = loaded.is_none();
+                (loaded, true)
             }
-            _ => None,
+            _ => (None, store_raw),
         };
         let mut alarm = alarm;
         if let Some(value) = value
@@ -1221,6 +1227,7 @@ impl PvDatabase {
         if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
             crate::server::recgbl::rec_gbl_set_link_alarm(common, link.link_field);
         }
+        read_failed |= load_refused;
         // MS/NMS propagation from the source record, C `recGblInheritSevrMsg`
         // inside a successful `dbGetLink`.
         if let Some(alarm) = alarm {
@@ -8830,8 +8837,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             (crate::server::record::ParsedLink::Constant(constant), None, Some(dbr_type)) => {
                 crate::server::record::constant_load_scalar(constant, dbr_type)
             }
-            _ => crate::server::recgbl::simm::constant_load_value(&inp)
-                .map(crate::types::c_parse::Converted::Stored),
+            _ => None,
         };
         let mut loaded = false;
         // `cvt_st_UInt32`'s success without a store: the load succeeded and
@@ -8932,6 +8938,16 @@ impl PvDatabase {
             if instance.resolve_field("SIMM").is_none() {
                 return;
             }
+            // `dbLoadLink` on a constant link: its `loadScalar` at `dbftype`.
+            let load_constant = |link: &crate::server::record::ParsedLink, dbftype| match link {
+                crate::server::record::ParsedLink::Constant(c) => {
+                    match crate::server::record::constant_load_scalar(c, dbftype)? {
+                        crate::types::c_parse::Converted::Stored(v) => Some(v),
+                        crate::types::c_parse::Converted::Unchanged => None,
+                    }
+                }
+                _ => None,
+            };
             let link_of = |instance: &RecordInstance, field: &str| {
                 instance.resolve_field(field).and_then(|v| {
                     if let EpicsValue::String(s) = v {
@@ -8960,20 +8976,32 @@ impl PvDatabase {
                 .is_none_or(crate::server::recgbl::simm::is_constant);
             if siml_is_constant {
                 instance.rec_gbl_save_simm();
+                // `dbLoadLink(psiml, DBF_USHORT, psimm)`.
                 if let Some(v) = siml
                     .as_ref()
-                    .and_then(crate::server::recgbl::simm::constant_load_value)
+                    .and_then(|l| load_constant(l, crate::types::DbFieldType::UShort))
                 {
-                    let _ = instance.record.put_field_internal("SIMM", v);
+                    let _ = instance
+                        .record
+                        .put_field_internal("SIMM", v.into_type(crate::types::DbFieldType::Enum));
                 }
             }
             // `recGblInitConstantLink(&prec->siol, DBF_<sval>, &prec->sval)` — the
             // records with no SVAL (waveform/aai read into `bptr`, lsi into `val`)
             // load nothing here, exactly as their C `init_record` does.
             if instance.record.get_field("SVAL").is_some() {
-                if let Some(siol) = link_of(&instance, "SIOL") {
-                    if let Some(v) = crate::server::recgbl::simm::constant_load_value(&siol) {
-                        let _ = instance.record.put_field_internal("SVAL", v);
+                if let (Some(siol), Some(load_type), Some(sval_type)) = (
+                    link_of(&instance, "SIOL"),
+                    instance.record.siol_load_type(),
+                    crate::server::record::record_instance::declared_field_type_of(
+                        &*instance.record,
+                        "SVAL",
+                    ),
+                ) {
+                    if let Some(v) = load_constant(&siol, load_type) {
+                        let _ = instance
+                            .record
+                            .put_field_internal("SVAL", v.into_type(sval_type));
                     }
                 }
             }

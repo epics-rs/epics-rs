@@ -21,44 +21,6 @@
 use super::{ConstantInitLink, ParsedLink, Record, parse_link_v2};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-/// Load a CONSTANT link's value into a field of `target` type, with C's
-/// constant-link conversion rules (`dbConstLink.c`'s `cvt_st_*` family). The
-/// number itself was already parsed by the one owner of "link text → number",
-/// [`super::parse_c_double`] (hex included).
-fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> EpicsValue {
-    use DbFieldType as T;
-    // `cvt_st_st` is a plain `strncpy` of the link TEXT, so a stringout with
-    // `field(DOL,"1.50")` holds "1.50" — not the "1.5" an f64 round-trip would
-    // render (softIoc-verified).
-    if target == T::String {
-        return EpicsValue::String(PvString::from(raw));
-    }
-    let integral = matches!(
-        target,
-        T::Char
-            | T::UChar
-            | T::Short
-            | T::UShort
-            | T::Enum
-            | T::Long
-            | T::ULong
-            | T::Int64
-            | T::UInt64
-    );
-    // C truncates the parsed number into the (possibly unsigned) target with a
-    // plain integer cast, so `-1` into a DBF_USHORT is 65535. The generic
-    // float→unsigned conversion SATURATES (Rust `as`), which would make it 0 —
-    // go through the integer view instead.
-    if integral {
-        if let Some(v) = value.to_f64() {
-            if v.is_finite() {
-                return EpicsValue::Int64(v.trunc() as i64).into_type(target);
-            }
-        }
-    }
-    value.into_type(target)
-}
-
 /// C `recGblInitConstantLink(plink, DBF_x, pvalue)` for ONE link → field pair,
 /// or `dbLoadLinkArray` for a seed that carries an array request.
 ///
@@ -87,23 +49,25 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
         record.put_field(seed.target_field, value.clone()).ok()?;
         return Some(value);
     }
-    let raw = constant.text();
-    let value = constant.value().clone();
     // C loads into the target field's own DBF type
-    // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
-    // through the field's descriptor before the put.
-    // A runtime-typed target (`mbbo.VAL`, whose type C's `cvt_dbaddr` derives
-    // from SDEF) has no type in its declaration, so the variant it currently
-    // holds is the type C would load into.
+    // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`) through
+    // `dbLoadLink`, which is the link's `loadScalar` (`recGbl.c:175`,
+    // `dbLink.c:238`). A runtime-typed target (`mbbo.VAL`, whose type C's
+    // `cvt_dbaddr` derives from SDEF) has no type in its declaration, so the
+    // variant it currently holds is the type C would load into.
     let target_type = super::record_instance::declared_field_type_of(record, seed.target_field)
         .or_else(|| {
             record
                 .get_field(seed.target_field)
                 .map(|v| v.db_field_type())
-        });
-    let value = match target_type {
-        Some(t) => constant_to_field_type(value, t, raw),
-        None => value,
+        })?;
+    // A refused load leaves the field and UDF alone; a success that stores
+    // nothing (`[]`, `cvt_st_UInt32`'s silent miss) is still a success.
+    let value = match constant_load_scalar(constant, target_type)? {
+        crate::types::c_parse::Converted::Stored(v) => v.into_type(target_type),
+        crate::types::c_parse::Converted::Unchanged => {
+            return record.get_field(seed.target_field);
+        }
     };
     // bo loads into a temporary and stores the BOOLEAN of it
     // (`boRecord.c:146-148`: `prec->val = !!ival`), so DOL="5" leaves VAL=1.
@@ -144,16 +108,19 @@ pub fn reseed_constant_input_link<R: Record + ?Sized>(
 ///
 /// A JSON array constant (`[…]`) is `dbPutConvertJSON` at `nReq = 1`
 /// instead: element 0 in the destination's type, a string refused unless that
-/// is `DBF_STRING`, and `[]` a success that writes nothing.
+/// is `DBF_STRING`, and `[]` a success that writes nothing. A `{const: …}`
+/// link is `lnkConst_loadScalar` instead.
 pub(crate) fn constant_load_scalar(
     constant: &super::ConstantLink,
     dbr_type: DbFieldType,
 ) -> Option<crate::types::c_parse::Converted> {
     use crate::types::c_parse::{self, Converted, NumericField};
+    if let Some(loaded) = constant.load_json_scalar(dbr_type) {
+        return loaded.ok().map(Converted::Stored);
+    }
     let text = constant.text();
-    // `dbConstLoadScalar`'s `!pstr[0]` refusal; `lnkConst_loadScalar` hands
-    // a `{const:""}` to `cvt_st_*`, which loads 0 or "".
-    if text.is_empty() && !constant.is_json() {
+    // `dbConstLoadScalar`'s `!pstr[0]` refusal.
+    if text.is_empty() {
         return None;
     }
     let dbr_type = match dbr_type {
@@ -172,5 +139,32 @@ pub(crate) fn constant_load_scalar(
         // `cvt_st_st`: the text itself; the field's own put applies the
         // `MAX_STRING_SIZE` cut.
         None => Some(Converted::Stored(EpicsValue::String(PvString::from(text)))),
+    }
+}
+
+/// The value a reader that loads a CONSTANT link per read gets at `request`:
+/// printf's `recGblInitConstantLink(plink, DBRTYPE, &val)` for each
+/// conversion's type, and `dbLoadLinkLS` for `%ls` (`printfRecord.c:47-57`,
+/// `:240-243`). `None` is C's failed load, or a link that is not constant.
+pub(crate) fn constant_load_as(
+    link: &ParsedLink,
+    request: super::InputLinkRequest,
+) -> Option<EpicsValue> {
+    use super::{InputLinkRequest, LinkReadAs, LsLoad};
+    let ParsedLink::Constant(constant) = link else {
+        return None;
+    };
+    let InputLinkRequest::As(read_as) = request else {
+        return None;
+    };
+    if let LinkReadAs::CharArrayAsString { .. } = read_as {
+        return Some(EpicsValue::CharArray(match constant.load_ls()? {
+            LsLoad::Text(s) => s.into_bytes().into(),
+            LsLoad::LenOnly => Vec::new().into(),
+        }));
+    }
+    match constant_load_scalar(constant, read_as.dbr_type()?)? {
+        crate::types::c_parse::Converted::Stored(v) => Some(v),
+        crate::types::c_parse::Converted::Unchanged => None,
     }
 }

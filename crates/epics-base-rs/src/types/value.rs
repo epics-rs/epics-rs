@@ -1389,7 +1389,7 @@ impl EpicsValue {
     /// source's integer-ness, and C picks its conversion routine BY the source
     /// type (`dbFastGetConvertRoutine` is a 2-D table, `dbConvert.c:1571-1638`).
     /// An integer source takes C's DEFINED modular conversion; only a float
-    /// source takes the UB cast that CBUG-E2 saturates. Going through `to_f64`
+    /// source takes the UB cast, which `c_cast` gives as x86-64's `cvttsd2si`. Going through `to_f64`
     /// forces the float rule onto both.
     pub(crate) fn to_dbf_i16(&self) -> Option<i16> {
         self.to_f64()?;
@@ -1671,7 +1671,7 @@ mod parse_radix_tests {
 
     /// The scalar rows' edges: a float to its own type is a copy (a
     /// subnormal is not `c_cast`'s MIN_POSITIVE), a u64 widens unsigned to
-    /// a float but truncates to an integer, a float saturates.
+    /// a float but truncates to an integer, a float takes x86-64's `cvttsd2si`.
     #[test]
     fn scalar_rows_keep_the_source_class() {
         let sub = f32::from_bits(1);
@@ -1689,7 +1689,7 @@ mod parse_radix_tests {
         assert_eq!(u.convert_to(DbFieldType::Long), EpicsValue::Long(-1));
         assert_eq!(
             EpicsValue::Double(3e9).convert_to(DbFieldType::Long),
-            EpicsValue::Long(i32::MAX)
+            EpicsValue::Long(i32::MIN)
         );
         assert_eq!(
             EpicsValue::Long(-200).convert_to(DbFieldType::UInt64),

@@ -831,7 +831,7 @@ pub(crate) fn get_limits(
 /// The alarm four are the only group C guards — `finite(x) ? (epicsInt32) x
 /// : 0` (`:305-312`) — because they are the only limits it seeds non-finite
 /// (see [`LIMIT_SEED`]). `get_graphics` and `get_control` cast unguarded, so
-/// an infinite HOPR saturates here exactly as it would in C's `(epicsInt32)`.
+/// an infinite HOPR is `INT32_MIN` here exactly as in C's `(epicsInt32)` on x86-64.
 pub(crate) fn limits_as_integers(limits: [f64; 8]) -> [i32; 8] {
     let mut out = limits.map(c_cast::f64_to_i32);
     for i in ALARM_LIMITS {
@@ -2182,14 +2182,14 @@ mod integer_limit_narrowing_tests {
     #[test]
     fn only_the_alarm_group_is_guarded_against_a_non_finite_limit() {
         // C's `finite` guard is in the `DBR_AL_LONG` arm alone. An infinite
-        // display or control limit reaches the unguarded `(epicsInt32)` cast,
-        // which this port resolves by saturation rather than C's UB.
+        // display or control limit reaches the unguarded `(epicsInt32)` cast
+        // (`dbAccess.c:226,266`): x86-64's INT_MIN for either sign.
         let mut limits = [f64::INFINITY; 8];
         limits[1] = f64::NEG_INFINITY;
         let out = limits_as_integers(limits);
-        assert_eq!(out[0], i32::MAX, "display limits are cast unguarded");
+        assert_eq!(out[0], i32::MIN, "display limits are cast unguarded");
         assert_eq!(out[1], i32::MIN);
         assert_eq!(&out[2..6], &[0, 0, 0, 0], "the alarm four are guarded");
-        assert_eq!(out[6], i32::MAX, "control limits are cast unguarded");
+        assert_eq!(out[6], i32::MIN, "control limits are cast unguarded");
     }
 }

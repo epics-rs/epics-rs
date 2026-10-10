@@ -1765,39 +1765,17 @@ pub(crate) mod live_borrows {
 /// (a `write()` under a live guard of the same record never returned). The
 /// set recurses, so that refusal is `borrow`'s now, and it panics —
 /// on the thread that did it, naming the record — instead of parking it.
+#[repr(C)]
 pub struct RecordCell {
-    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
-    /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
-    /// moved onto a set of its own by the registry, which adopts this very
-    /// cell for the record's name so that the record and the registry can
-    /// never hold two answers to "which set is this record in". A lock-set
-    /// MERGE moves the set the cell points at, never the cell.
-    lock_record: std::sync::Arc<crate::server::database::LockRecord>,
-    /// `RefCell`-style borrow state of `data`: `0` free, `n > 0` that many
-    /// shared borrows, `-1` one exclusive borrow. Touched only by the thread
-    /// holding the record's lock set, which is why plain loads and stores
-    /// (no read-modify-write) are enough — the atomic is for `Sync`, not for
-    /// contention, and there is none.
-    borrow: std::sync::atomic::AtomicIsize,
-    /// The record's `BKPT` byte, shared with `data.common.bkpt` — reachable
-    /// here without the lock set, as C reads `precord->bkpt` (see
-    /// [`BkptFlag`]).
-    bkpt: BkptFlag,
-    /// Which published `cp_links` map `PvDatabase::sources_cp_edges` was resolved
-    /// from, or 0 before it ever was.
-    ///
-    /// The question the cache answers — "does any CP/CPP edge name this
-    /// record as its source?" — is asked once per process cycle by
-    /// `PvDatabase::dispatch_cp_targets`, and the registry that holds the
-    /// answer is keyed by record NAME. Asking it directly costs a hash of the
-    /// name and a map probe every cycle to hear `false`, which is what every
-    /// record with no CP holder hears forever. The registry moves its
-    /// revision on every edit, so a record that has heard the answer once may
-    /// keep it until it does.
-    cp_edges_revision: std::sync::atomic::AtomicU64,
-    /// The cached answer, valid only while [`Self::cp_edges_revision`] still
-    /// matches the registry's.
-    cp_edges: std::sync::atomic::AtomicBool,
+    /// First, and `repr(C)` keeps it there: `run_process_frame` reaches the
+    /// instance through the cell pointer, and at any other offset every
+    /// borrow pays a `lea` (+6 instr/cycle when a `RecordDesc` resize moved
+    /// it to 0x40). The other fields are in rustc's own release order.
+    data: LockSetGuarded<RecordInstance>,
+    /// The record's own terms of [`walk_skip_term`], so a [`PutAddr`]
+    /// resolves without a borrow of the record. `&'static` answers the record
+    /// never changes ([`RecordInstance::walk_skips`]).
+    walk_terms: (&'static str, &'static [&'static str]),
     /// C `dbCommon::rdes` — the record type's description, reachable without
     /// a borrow of the record because a cell's type never changes. What a
     /// link target's field address ([`FieldAddr`]) is resolved against.
@@ -1813,14 +1791,24 @@ pub struct RecordCell {
     /// fetch stores through ([`Record::put_slot_f64`]) when the type hands
     /// one out.
     multi_input_val_slots: Box<[Option<super::record_trait::FieldSlot>]>,
-    /// The type-static answers a process cycle tests — see [`ProcessPlan`].
-    /// Fixed by the type, like `rdes`, so it is reachable without a borrow
-    /// of the record.
-    plan: ProcessPlan,
-    /// The record's own terms of [`walk_skip_term`], so a [`PutAddr`]
-    /// resolves without a borrow of the record. `&'static` answers the record
-    /// never changes ([`RecordInstance::walk_skips`]).
-    walk_terms: (&'static str, &'static [&'static str]),
+    /// `RefCell`-style borrow state of `data`: `0` free, `n > 0` that many
+    /// shared borrows, `-1` one exclusive borrow. Touched only by the thread
+    /// holding the record's lock set, which is why plain loads and stores
+    /// (no read-modify-write) are enough — the atomic is for `Sync`, not for
+    /// contention, and there is none.
+    borrow: std::sync::atomic::AtomicIsize,
+    /// Which published `cp_links` map `PvDatabase::sources_cp_edges` was resolved
+    /// from, or 0 before it ever was.
+    ///
+    /// The question the cache answers — "does any CP/CPP edge name this
+    /// record as its source?" — is asked once per process cycle by
+    /// `PvDatabase::dispatch_cp_targets`, and the registry that holds the
+    /// answer is keyed by record NAME. Asking it directly costs a hash of the
+    /// name and a map probe every cycle to hear `false`, which is what every
+    /// record with no CP holder hears forever. The registry moves its
+    /// revision on every edit, so a record that has heard the answer once may
+    /// keep it until it does.
+    cp_edges_revision: std::sync::atomic::AtomicU64,
     /// C `dbRecordNode::order` (`dbStaticLib.c:1704`) — this record's place in
     /// the database load sequence: the scan index's secondary sort key, and
     /// the order every whole-database walk visits.
@@ -1833,6 +1821,24 @@ pub struct RecordCell {
     /// cell the sequence is born with the node, cannot go missing from it, and
     /// dies with it.
     load_order: u64,
+    /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
+    /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
+    /// moved onto a set of its own by the registry, which adopts this very
+    /// cell for the record's name so that the record and the registry can
+    /// never hold two answers to "which set is this record in". A lock-set
+    /// MERGE moves the set the cell points at, never the cell.
+    lock_record: std::sync::Arc<crate::server::database::LockRecord>,
+    /// The record's `BKPT` byte, shared with `data.common.bkpt` — reachable
+    /// here without the lock set, as C reads `precord->bkpt` (see
+    /// [`BkptFlag`]).
+    bkpt: BkptFlag,
+    /// The type-static answers a process cycle tests — see [`ProcessPlan`].
+    /// Fixed by the type, like `rdes`, so it is reachable without a borrow
+    /// of the record.
+    plan: ProcessPlan,
+    /// The cached answer, valid only while [`Self::cp_edges_revision`] still
+    /// matches the registry's.
+    cp_edges: std::sync::atomic::AtomicBool,
     /// This record's `init_record` is still OWED to `iocInit` — it was created
     /// during the LOAD phase, which defers the whole init half (C runs
     /// `dbLoadRecords` and `initDatabase` as two passes).
@@ -1845,8 +1851,9 @@ pub struct RecordCell {
     /// answer is the record's own, and the owed-ness cannot name a record
     /// that does not exist.
     init_owed: std::sync::atomic::AtomicBool,
-    data: LockSetGuarded<RecordInstance>,
 }
+
+const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
 
 /// A record type's declaration, C's `dbRecordType` behind `precord->rdes`:
 /// the two static tables a field name is resolved against.
@@ -2810,10 +2817,6 @@ pub struct RecordInstance {
     /// from the database* and *destroyed* are one event for both target
     /// kinds and a server can sweep them with one uniform test.
     destroyed: bool,
-    /// C `ellCount(&precord->rdes->devList) > 0`, read once here: the menus
-    /// are registered before any record is built, and the INP/OUT put asks
-    /// this under the record's write hold.
-    has_device_list: bool,
     // Link parse cache
     pub parsed_inp: LinkCache,
     /// The parsed form of each [`Record::multi_input_links`] slot the record
@@ -4222,8 +4225,6 @@ impl RecordInstance {
             "int64in" | "int64out" => Some(AnalogAlarmConfig::int64()),
             _ => None,
         };
-        let has_device_list = super::dbd_generated::device_menu(rtype).is_some()
-            || super::has_contributed_device_menu(rtype);
         let mut common = CommonFields::default();
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
@@ -4242,7 +4243,6 @@ impl RecordInstance {
 
         Self {
             destroyed: false,
-            has_device_list,
             name,
             record,
             common,
@@ -5358,7 +5358,9 @@ impl RecordInstance {
     /// C `ellCount(&precord->rdes->devList) > 0`: the loaded `.dbd` set
     /// declares a `device()` for this type, statically or contributed.
     fn has_device_list(&self) -> bool {
-        self.has_device_list
+        let record_type = self.record.record_type();
+        super::dbd_generated::device_menu(record_type).is_some()
+            || super::has_contributed_device_menu(record_type)
     }
 
     /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
@@ -9594,6 +9596,17 @@ pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
         0.0
     };
     delta > deadband
+}
+
+#[cfg(test)]
+mod record_cell_layout_tests {
+    /// The test build is the other side of the boundary: its `#[cfg(test)]`
+    /// fields change `RecordInstance`'s size, and under rustc's own field order
+    /// that alone put `data` at 0xb8 here while the release build had it at 0.
+    #[test]
+    fn data_stays_first_when_the_instance_changes_size() {
+        assert_eq!(std::mem::offset_of!(super::RecordCell, data), 0);
+    }
 }
 
 #[cfg(test)]

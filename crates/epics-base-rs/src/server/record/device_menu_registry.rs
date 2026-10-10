@@ -23,6 +23,7 @@
 //! not that particular record binds an asyn DTYP.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use super::DbLinkType;
@@ -38,6 +39,13 @@ type DeviceMenu = &'static [(&'static str, DbLinkType)];
 /// [`register_device_menu`]): a second `IocApplication` built in one process, or
 /// a helper called twice, must not double the menu.
 static CONTRIBUTED: OnceLock<RwLock<HashMap<String, Vec<DeviceMenu>>>> = OnceLock::new();
+
+/// The record types with a contributed choice, as an immutable list that a
+/// registration adding a type republishes (leaking the old one: one per such
+/// type, at startup). [`has_contributed_device_menu`] is asked on the INP/OUT
+/// put under the record's write hold, so it reads this with one load instead
+/// of taking [`CONTRIBUTED`]'s lock.
+static CONTRIBUTED_TYPES: AtomicPtr<Vec<&'static str>> = AtomicPtr::new(std::ptr::null_mut());
 
 fn registry() -> &'static RwLock<HashMap<String, Vec<DeviceMenu>>> {
     CONTRIBUTED.get_or_init(|| RwLock::new(HashMap::new()))
@@ -62,6 +70,18 @@ pub fn register_device_menu(record_type: &str, menu: &'static [(&'static str, Db
     if !list.contains(&menu) {
         list.push(menu);
     }
+    if !menu.is_empty() && !has_contributed_device_menu(record_type) {
+        // Published under the write lock, so publishers are serialised.
+        let mut types = contributed_types().to_vec();
+        types.push(Box::leak(record_type.into()));
+        CONTRIBUTED_TYPES.store(Box::into_raw(Box::new(types)), Ordering::Release);
+    }
+}
+
+fn contributed_types() -> &'static [&'static str] {
+    let types = CONTRIBUTED_TYPES.load(Ordering::Acquire);
+    // SAFETY: a non-null pointer came from `Box::into_raw` and is never freed.
+    unsafe { types.as_ref() }.map_or(&[], Vec::as_slice)
 }
 
 /// The contributed `(choice, link_type)` rows for `record_type`, flattened in
@@ -90,12 +110,7 @@ pub(crate) fn contributed_device_menu(record_type: &str) -> Vec<&'static str> {
 
 /// Whether any choice was contributed for `record_type`.
 pub(crate) fn has_contributed_device_menu(record_type: &str) -> bool {
-    CONTRIBUTED.get().is_some_and(|lock| {
-        lock.read()
-            .expect("device-menu registry lock poisoned")
-            .get(record_type)
-            .is_some_and(|list| list.iter().any(|slice| !slice.is_empty()))
-    })
+    contributed_types().contains(&record_type)
 }
 
 /// The full DTYP menu for `record_type` — the static `device()` declarations
@@ -122,6 +137,20 @@ pub(crate) fn merged_device_menu(record_type: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lock-free answer flips with the first non-empty menu for a type and
+    /// for no other: an empty menu contributes no `device()` line.
+    #[test]
+    fn has_contributed_device_menu_follows_non_empty_registration() {
+        static EMPTY: &[(&str, DbLinkType)] = &[];
+        static M: &[(&str, DbLinkType)] = &[("devC", DbLinkType::Constant)];
+        assert!(!has_contributed_device_menu("regtest_has"));
+        register_device_menu("regtest_has", EMPTY);
+        assert!(!has_contributed_device_menu("regtest_has"));
+        register_device_menu("regtest_has", M);
+        assert!(has_contributed_device_menu("regtest_has"));
+        assert!(!has_contributed_device_menu("regtest_has_other"));
+    }
 
     /// Registering a menu makes its choices visible, appended in registration
     /// order; a second identical registration is a no-op (not doubled).

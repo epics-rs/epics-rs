@@ -551,6 +551,116 @@ mod exec_model {
             "the fallback must actually be the demo database:\n{bare_log}"
         );
     }
+
+    /// `build_ioc`'s link passes open the external links at init, before
+    /// anything processes: `setup_cp_links` warms the CP link of a Passive
+    /// holder, whose monitor is then the only thing that processes it, and
+    /// `setup_external_link_opens` opens a link no record ever reads.
+    ///
+    /// The upstream is an in-process database behind [`BlockingCaServer`], so
+    /// both facts are read off it: DOWN:CP's OUT lands the CP value in
+    /// UPSTREAM:ECHO, and the open of DOWN:IN's link is a monitor on
+    /// UPSTREAM:IN.
+    #[test]
+    fn build_ioc_opens_external_links_before_anything_processes() {
+        use epics_base_rs::runtime::task::{background_init, block_on_sync};
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use epics_base_rs::types::EpicsValue;
+        use epics_ca_rs::server::blocking::BlockingCaServer;
+        use std::sync::Arc;
+
+        background_init();
+        let (upstream, _) = block_on_sync(
+            IocBuilder::new()
+                .db_string(
+                    "record(ao, \"UPSTREAM:CP\") { field(VAL, \"42.5\") }\n\
+                     record(ao, \"UPSTREAM:IN\") { field(VAL, \"7\") }\n\
+                     record(ao, \"UPSTREAM:ECHO\") {}\n",
+                    &std::collections::HashMap::new(),
+                )
+                .expect("load the upstream db")
+                .build(),
+        )
+        .expect("no async runtime entered on this test thread")
+        .expect("build the upstream");
+        let server = Arc::new(
+            BlockingCaServer::bind(
+                "127.0.0.1:0",
+                Arc::clone(&upstream),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+            )
+            .expect("bind the upstream CA server"),
+        );
+        let upstream_port = server.local_addr().expect("local_addr").port();
+        let srv = Arc::clone(&server);
+        let accept = std::thread::spawn(move || srv.serve());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("down.db");
+        std::fs::write(
+            &db,
+            "record(calcout, \"DOWN:CP\") { field(INPA, \"UPSTREAM:CP CP\") \
+             field(CALC, \"A\") field(OUT, \"UPSTREAM:ECHO\") }\n\
+             record(ai, \"DOWN:IN\") { field(INP, \"UPSTREAM:IN\") }\n",
+        )
+        .expect("write the db");
+        let booted = boot_on_a_named_port(
+            dir.path(),
+            |cmd, port| {
+                cmd.arg(&db)
+                    .env(
+                        "EPICS_CA_NAME_SERVERS",
+                        format!("127.0.0.1:{upstream_port}"),
+                    )
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            },
+            |console| boot_report(console).is_some(),
+        );
+
+        let read = |name: &str| {
+            let rec = upstream.get_record(name).expect("upstream record");
+            let rec = rec.read();
+            (rec.record.get_field("VAL"), !rec.subscribers.is_empty())
+        };
+        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        // The first monitor event can process DOWN:CP before its OUT link has
+        // connected, which C drops too; each new CP value is another event.
+        let mut sent = 42.5;
+        loop {
+            let (echo, _) = read("UPSTREAM:ECHO");
+            let (_, in_opened) = read("UPSTREAM:IN");
+            if echo == Some(EpicsValue::Double(sent)) && in_opened {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "UPSTREAM:ECHO is {echo:?} (CP value {sent}), UPSTREAM:IN \
+                 monitored: {in_opened}:\n{}",
+                booted.console()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            // Only while nothing has crossed: once ECHO moves, the chain is
+            // live and the last value sent must arrive.
+            if echo.is_none() || echo == Some(EpicsValue::Double(0.0)) {
+                sent += 1.0;
+                block_on_sync(upstream.put_record_field_from_ca(
+                    "UPSTREAM:CP",
+                    "VAL",
+                    EpicsValue::Double(sent),
+                ))
+                .expect("no async runtime entered on this test thread")
+                .expect("put UPSTREAM:CP");
+            }
+        }
+
+        drop(booted);
+        server.shutdown();
+        accept.join().expect("the accept thread exits on shutdown");
+    }
 }
 
 #[path = "common/budget.rs"]

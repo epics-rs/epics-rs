@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
 #[cfg(tokio_backend)]
@@ -67,19 +67,16 @@ async fn main() -> CaResult<()> {
 
     epics_base_rs::runtime::env::set_default("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    // Parse st.cmd or fall back to defaults
-    let (db, group_file) = if args.len() > 1 && !args[1].starts_with('-') {
-        let script = std::fs::read_to_string(&args[1])
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", args[1]));
-        parse_and_build(&script).await?
-    } else {
-        let macros: HashMap<String, String> = HashMap::new();
-        let db_path = format!("{}/db/qsrv_demo.db", env!("CARGO_MANIFEST_DIR"));
-        let ioc = IocBuilder::new().db_file(&db_path, &macros)?;
-        let (db, _) = ioc.build().await?;
-        let group_path = format!("{}/db/group.json", env!("CARGO_MANIFEST_DIR"));
-        (db, Some(group_path))
+    // With no script the demo runs its own `ioc/st.cmd`, which is where the
+    // `P` its database needs is set.
+    let script_path = match args.get(1) {
+        Some(arg) if !arg.starts_with('-') => arg.clone(),
+        _ => format!("{}/ioc/st.cmd", env!("CARGO_MANIFEST_DIR")),
     };
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("cannot read {script_path}: {e}"));
+    let (ioc, group_file) = parse_and_build(&script).await?;
+    let db = Arc::clone(ioc.database());
 
     // ── QSRV provider (group PVs, PVA-only) ──
     let provider = BridgeProvider::new(db.clone());
@@ -106,7 +103,7 @@ async fn main() -> CaResult<()> {
     // ── Scan start (C iocInit owns it, the servers do not scan) ──
     // One core-owned scan owner covers both front-ends; held to the end
     // of main so periodic SCAN fields stay live while the IOC serves.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+    let _scan_owner = ioc.run().await;
 
     // ── Build both servers from the same database ──
     // One policy cell for both protocols, so an `asInit` from the shell
@@ -129,8 +126,8 @@ async fn main() -> CaResult<()> {
     result
 }
 
-/// Parse a simplified st.cmd — returns shared PvDatabase + optional group file.
-async fn parse_and_build(script: &str) -> CaResult<(Arc<PvDatabase>, Option<String>)> {
+/// Parse a simplified st.cmd — returns the built IOC + optional group file.
+async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     let mut macros: HashMap<String, String> = HashMap::new();
     // Seed QSRV_IOC so $(QSRV_IOC) expands in st.cmd
     macros.insert("QSRV_IOC".into(), env!("CARGO_MANIFEST_DIR").into());
@@ -173,8 +170,7 @@ async fn parse_and_build(script: &str) -> CaResult<(Arc<PvDatabase>, Option<Stri
         }
     }
 
-    let (db, _) = ioc.build().await?;
-    Ok((db, group_file))
+    Ok((ioc.build_ioc().await?, group_file))
 }
 
 fn spawn_simulator(reactor: &epics_base_rs::runtime::task::Reactor, db: Arc<PvDatabase>) {

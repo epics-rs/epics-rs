@@ -274,6 +274,7 @@ mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process::ExitCode;
+    #[cfg(feature = "bringup-probes")]
     use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
@@ -281,9 +282,10 @@ mod ioc {
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_app::GroupLoadRequest;
-    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
     use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
@@ -348,7 +350,7 @@ mod ioc {
     /// has to name itself there. A named file that fails to load is already an
     /// error and stays one: falling back to the demo database on a load
     /// failure would be the same defect with a louder cause.
-    fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
+    fn load_database(db_files: &[String]) -> CaResult<BareIoc> {
         let macros = HashMap::new();
         let mut builder = IocBuilder::new();
         #[cfg(feature = "bench-subroutines")]
@@ -381,9 +383,8 @@ mod ioc {
                 builder = builder.db_file(path, &macros)?;
             }
         }
-        let (db, _autosave) = block_on_sync(builder.build())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")?;
-        Ok(db)
+        block_on_sync(builder.build_ioc())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
     }
 
     /// `01020304…` — the GUID as the wire carries it, so a console line can be
@@ -680,13 +681,14 @@ mod ioc {
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a file to load, split by suffix below.
         let (db_files, group_files) = split_load_args(&boot_args);
-        let db = match load_database(&db_files) {
-            Ok(db) => db,
+        let ioc = match load_database(&db_files) {
+            Ok(ioc) => ioc,
             Err(e) => {
                 eprintln!("realtime-pva-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        let db = ioc.database().clone();
         let db_for_names = db.clone();
         let db_for_status = db.clone();
 
@@ -807,7 +809,8 @@ mod ioc {
             }
         }
 
-        let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+        let _scan_owner = block_on_sync(ioc.run())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.

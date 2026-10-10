@@ -4267,7 +4267,7 @@ impl PvDatabase {
             }
         }
         if converted > 0 {
-            tracing::info!(converted, "iocInit: non-local DB links made external");
+            tracing::debug!("iocInit: {converted} non-local DB link(s) made external");
         }
         if refused > 0 {
             eprintln!(
@@ -4397,7 +4397,7 @@ impl PvDatabase {
         let db_count = links.len() - ext_count;
         self.set_cp_links(true, &links);
         if db_count > 0 {
-            tracing::info!(db_count, "iocInit: CP link subscriptions");
+            tracing::debug!("iocInit: {db_count} CP link subscriptions");
         }
         // Warm external CP/CPP links. A Passive holder of an external CP
         // link is never scanned, so its link never opens lazily and the
@@ -4412,10 +4412,9 @@ impl PvDatabase {
             for pv in &ext_pvs {
                 let _ = self.resolve_external_pv(pv);
             }
-            tracing::info!(
-                ext_count,
-                warmed = ext_pvs.len(),
-                "iocInit: external CP link subscriptions"
+            tracing::debug!(
+                "iocInit: {ext_count} external CP link subscriptions ({} PVs warmed)",
+                ext_pvs.len()
             );
         }
     }
@@ -4565,7 +4564,7 @@ impl PvDatabase {
             }
         }
         if staged > 0 {
-            tracing::info!(staged, "iocInit: external link opens staged");
+            tracing::debug!("iocInit: {staged} external link opens staged");
         }
         staged
     }

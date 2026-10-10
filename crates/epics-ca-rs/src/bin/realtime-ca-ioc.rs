@@ -495,11 +495,12 @@ mod ioc {
     use epics_base_rs::runtime::net::cas_server_port;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::server::database::PvDatabase;
-    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
-    use epics_ca_rs::calink::install_calink_resolver;
+    use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
     use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
 
     use crate::demo_db::DEMO_DB;
@@ -952,9 +953,19 @@ mod ioc {
     /// Driven by `block_on_sync`, which parks this thread between polls of the
     /// build future — `IocBuilder::build` awaits only in-process locks, so no
     /// reactor is involved.
-    fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
+    fn load_database(db_files: &[String]) -> CaResult<(BareIoc, CaLinkResolver)> {
         let macros = HashMap::new();
-        let mut builder = IocBuilder::new();
+        // The `ca://` / ` CA` record-link resolver, installed by the build at
+        // C `dbCaLinkInit` so the link passes and PINI that follow it see the
+        // link set. The CA client it builds lazily reads the `EPICS_CA_*`
+        // variables `main` set before this call; its tasks land on the
+        // callback pool, never a tokio runtime. Kept for the link report.
+        let resolver = Arc::new(std::sync::OnceLock::new());
+        let installed = Arc::clone(&resolver);
+        let mut builder = IocBuilder::new().register_link_set_installer(move |db| async move {
+            let _ = installed.set(install_calink_resolver(&db).await);
+            Vec::new()
+        });
         if db_files.is_empty() {
             println!(
                 "realtime-ca-ioc: no database named on the boot command line; \
@@ -981,9 +992,13 @@ mod ioc {
                 builder = builder.db_file(path, &macros)?;
             }
         }
-        let (db, _autosave) = block_on_sync(builder.build())
+        let ioc = block_on_sync(builder.build_ioc())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered")?;
-        Ok(db)
+        let resolver = resolver
+            .get()
+            .cloned()
+            .expect("a successful build_ioc ran dbCaLinkInit");
+        Ok((ioc, resolver))
     }
 
     pub fn main() -> ExitCode {
@@ -1128,67 +1143,14 @@ mod ioc {
 
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a `.db` to load, in order (C `dbLoadRecords`).
-        let db = match load_database(&boot_args) {
-            Ok(db) => db,
+        let (ioc, resolver) = match load_database(&boot_args) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("realtime-ca-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
-
-        // (2b) The calink resolver: install the `ca://` record-link resolver on
-        //      the database so ` CA`-modified / `ca://...` INP/OUT fields
-        //      resolve. C reaches the same state through `dbCaLinkInit`
-        //      (`dbCa.c:352-355`) during iocInit, after the database exists.
-        //      Installed here — after the database, before the CA front-end —
-        //      so every record's link fields route through it before the
-        //      server answers its first client.
-        //
-        //      The CA client reaches upstream servers the way a host client
-        //      does — the UDP SEARCH socket plus any `EPICS_CA_NAME_SERVERS`
-        //      circuits — and every task the resolver spawns lands on the
-        //      callback pool `background_init` started above via
-        //      `runtime::task::spawn`, never a tokio runtime.
-        let resolver = block_on_sync(install_calink_resolver(&db))
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-
-        // (2c) iocInit's link phases, in `IocApplication::run`'s order
-        //      (`ioc_app.rs:913-925`) and for its reasons. Without them the
-        //      resolver above is mounted and unreachable:
-        //
-        //      * `initialize_link_locality` commits C `dbInitLink`'s locality
-        //        decision (`dbLink.c:118-129` falling through
-        //        `dbDbInitLink`'s `S_db_notFound`, `dbDbLink.c:94-96`) — a
-        //        `Db` link naming a record this IOC does not have becomes a
-        //        `Ca` link. `INP=UPSTREAM:AI CP`, the bare ` CA`-modifier
-        //        spelling C calls `pvlOptCA`, is a `Db` link until this runs,
-        //        so without it that whole spelling reads nothing forever.
-        //      * `setup_cp_links` warms external CP/CPP links. A Passive
-        //        holder of one is never scanned, so its link never opens
-        //        lazily and its monitor is never created — a chicken-and-egg
-        //        a lazy open cannot break.
-        //      * `setup_external_link_opens` stages the rest, as C's
-        //        `dbInitLink` hands every non-local `PV_LINK` to
-        //        `dbCaAddLink` regardless of direction. Without it every
-        //        other external link pays one cold scan cycle to stage its
-        //        own open.
-        //
-        //      AFTER the mount above, not before: the warm path
-        //      (`resolve_external_pv`) routes through the registered link
-        //      set's lazy open and is a documented no-op when no lset is
-        //      installed, so running these first would silently warm nothing.
-        //
-        //      `realtime-pva-ioc` needs no equivalent: `install_pvalink_resolver`
-        //      walks the whole database itself and pre-registers every
-        //      `pva://` link. `install_calink_resolver` registers the link set
-        //      and scans nothing — C's `dbCaLinkInit` does not scan either —
-        //      because for CA the scan IS these three iocInit passes.
-        block_on_sync(async {
-            db.initialize_link_locality().await;
-            db.setup_cp_links().await;
-            db.setup_external_link_opens().await;
-        })
-        .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let db = ioc.database().clone();
 
         // (2d) Periodic scan + PINI. C `iocInit` owns `scanInit`/
         //      `initialProcess` (`dbScan.c`, `iocInit.c:653`) independent
@@ -1196,12 +1158,14 @@ mod ioc {
         //      had NO scan start at all (the scheduler lived only in the
         //      hosted async CA server's run loop, which this blocking
         //      target never runs), so every periodic `SCAN` field and
-        //      every `PINI=YES` record was silently dead here. The core
-        //      `ScanOwner` runs the PINI pass and the `scan-%g` threads on
-        //      a dedicated owner thread (exec-backend safe: a parked
-        //      detached task would be dropped by the executor). Held to
-        //      the end of `main`: this IOC scans for as long as it serves.
-        let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+        //      every `PINI=YES` record was silently dead here. PINI=YES ran
+        //      inside `build_ioc`; `run` is `iocRun` with PINI=RUN/RUNNING,
+        //      and its `ScanOwner` runs the `scan-%g` threads on a dedicated
+        //      owner thread (exec-backend safe: a parked detached task would
+        //      be dropped by the executor). Held to the end of `main`: this
+        //      IOC scans for as long as it serves.
+        let _scan_owner = block_on_sync(ioc.run())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:492-500). No ACF is
@@ -1729,46 +1693,29 @@ mod tests {
     }
 
     /// The mount is not enough on its own: iocInit's three link phases are
-    /// what route the database's links through it.
-    ///
-    /// This binary does not go through `IocApplication::run`, which is the
-    /// only other place these are called, so dropping them here drops them
-    /// entirely — and the failure is silent in exactly the way the target
-    /// cannot survive. Without `initialize_link_locality` the bare
-    /// ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local `Db` link
-    /// to a record that does not exist; without `setup_cp_links` a Passive
-    /// holder of an external CP link never opens it; without
-    /// `setup_external_link_opens` every other external link waits for a cold
-    /// scan. The IOC boots and serves in all three cases.
+    /// what route the database's links through it, and PINI=YES reads them.
+    /// Both run inside `IocBuilder::build_ioc`, after the link-set
+    /// installers it runs at C `dbCaLinkInit`, so the resolver must be
+    /// mounted by an installer registered on the builder. Mounted after the
+    /// build, the IOC boots and serves with the phases having routed nothing:
+    /// the bare ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local
+    /// `Db` link and a Passive holder of an external CP link never opens it.
     #[test]
-    fn iocinit_link_phases_run_after_the_mount() {
+    fn the_calink_mount_is_installed_by_the_build() {
         let src = include_str!("realtime-ca-ioc.rs");
         let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
-        let mount = concat!("install_calink_", "resolver(&db)");
-        let phases = [
-            concat!("initialize_link_", "locality()"),
-            concat!("setup_cp_", "links()"),
-            concat!("setup_external_link_", "opens()"),
-        ];
-        let mount_at = prod
-            .find(mount)
-            .expect("the mount guard above covers this; if it passed, this cannot fail");
-        for phase in phases {
-            let at = prod.find(phase).unwrap_or_else(|| {
-                panic!(
-                    "this entry point no longer calls `{phase}`; it is not reached by \
-                     `IocApplication::run` either, so the database's ca:// links would \
-                     never be routed through the mounted resolver and the IOC would boot \
-                     and serve with every external link dead"
-                )
-            });
-            assert!(
-                at > mount_at,
-                "`{phase}` must run AFTER the resolver mount: the warm path routes \
-                 through the registered link set and is a no-op with none installed"
-            );
-        }
+        let at = |needle: &str| {
+            prod.find(needle)
+                .unwrap_or_else(|| panic!("this entry point no longer calls `{needle}`"))
+        };
+        let registered = at(concat!("register_link_set_", "installer("));
+        let mount = at(concat!("install_calink_", "resolver(&db)"));
+        let build = at(concat!("builder.build_", "ioc()"));
+        assert!(
+            registered < mount && mount < build,
+            "the calink mount must be the installer the build runs at dbCaLinkInit"
+        );
     }
 
     /// A panic on a per-connection thread kills that thread and leaves the IOC

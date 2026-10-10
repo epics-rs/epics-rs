@@ -370,7 +370,7 @@ mod tests {
     /// shell: refused from the wrong state, accepted from the right one.
     #[test]
     fn ioc_run_and_ioc_pause_carry_the_transition_status() {
-        use crate::server::ioc_app::{IocState, get_ioc_state, note_scan_owner_started};
+        use crate::server::ioc_app::{IocState, build_without_application, get_ioc_state, ioc_run};
 
         let ctx = make_ctx();
         {
@@ -384,7 +384,8 @@ mod tests {
         assert!(run(&ctx, "iocRun", &[]).1, "iocRun from iocVoid fails");
         assert!(run(&ctx, "iocPause", &[]).1, "iocPause from iocVoid fails");
 
-        note_scan_owner_started();
+        assert!(build_without_application(|| {}));
+        assert_eq!(ioc_run(), 0);
         assert!(!run(&ctx, "iocPause", &[]).1, "a running IOC pauses");
         assert_eq!(get_ioc_state(), IocState::Paused);
         assert!(!run(&ctx, "iocRun", &[]).1, "a paused IOC runs again");

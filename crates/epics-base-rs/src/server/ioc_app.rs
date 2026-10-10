@@ -238,11 +238,15 @@ struct Lifecycle {
     /// running and merely stops them scanning, which is what lets
     /// `iocRun` resume the rates in phase.
     scan: Option<crate::server::scan::ScanOwner>,
+    /// The database `iocBuild` built, from [`initial_process`] until
+    /// `iocShutdown` — C's `pdbbase` as `piniProcess` walks it.
+    db: Option<Arc<PvDatabase>>,
 }
 
 static LIFECYCLE: Mutex<Lifecycle> = Mutex::new(Lifecycle {
     state: IocState::Void,
     scan: None,
+    db: None,
 });
 
 fn lifecycle() -> std::sync::MutexGuard<'static, Lifecycle> {
@@ -275,60 +279,57 @@ fn adopt_scan_owner(owner: crate::server::scan::ScanOwner) {
 /// neither state.
 ///
 /// The port's `iocRun` covers C's `scanRun` and `dbRunServers` halves.
-/// `dbCaRun` has no analogue: the link sets ([`crate::server::database::LinkSet`])
+/// `dbCaRun` has no analogue here: the link sets ([`crate::server::database::LinkSet`])
 /// carry no lifecycle methods, so external links keep running across a
-/// pause — see [`ioc_pause`].
+/// pause — see [`ioc_pause`]. The first run's connect-time CP pass sits
+/// between the two halves, in [`run_built`].
 pub fn ioc_run() -> i32 {
+    match ioc_run_begin() {
+        Some(running) => {
+            running.finish();
+            0
+        }
+        None => -1,
+    }
+}
+
+/// `iocRun` up to and including `scanRun`; [`IocRunStarted::finish`] is the
+/// rest. `None` when the IOC is neither built nor paused.
+fn ioc_run_begin() -> Option<IocRunStarted> {
     let from = get_ioc_state();
     if from != IocState::Paused && from != IocState::Built {
         crate::runtime::log::errlog_printf(&format!(
             "iocRun: {} IOC not paused\n",
             crate::runtime::log::erl_warning()
         ));
-        return -1;
+        return None;
     }
     init_hook_announce(InitHookState::AtIocRun);
 
     crate::server::scan::scan_run();
-    init_hook_announce(InitHookState::AfterDatabaseRunning);
-
-    crate::server::db_server::db_run_servers();
-    init_hook_announce(InitHookState::AfterCaServerRunning);
-
-    crate::runtime::log::errlog_printf(if from == IocState::Built {
-        "iocRun: All initialization complete\n"
-    } else {
-        "iocRun: IOC restarted\n"
-    });
-    set_ioc_state(IocState::Running);
-    init_hook_announce(InitHookState::AfterIocRunning);
-    0
+    Some(IocRunStarted { from })
 }
 
-/// The `iocRun` transition as reached by [`crate::server::scan::ScanOwner::start`]
-/// — the one line every bring-up path in this workspace shares.
-///
-/// `IocApplication` is the port of C's `iocBuild`, but it is not the only
-/// way an IOC starts here: `softioc-rs`, `qsrv-rs`, `dual_ioc_rs`,
-/// `oracle_ioc` and the two realtime IOCs build their database through
-/// `CaServerBuilder` / `PvaServerBuilder` and then start the scan owner
-/// themselves. Those paths have no build phase to announce, so their
-/// database is already built by the time they start scanning — which is
-/// why [`IocState::Void`] resolves to [`IocState::Built`] here rather than
-/// being refused. Without this the lifecycle would be correct on one path
-/// and permanently `Void` on six, and `iocPause` would answer "IOC not
-/// running" on the very IOC that is.
-///
-/// A redundant owner (the `try_claim_scan_start` case) finds the IOC
-/// already running and only re-arms the facility cell.
-pub(crate) fn note_scan_owner_started() {
-    if get_ioc_state() == IocState::Void {
-        set_ioc_state(IocState::Built);
-    }
-    if get_ioc_state() == IocState::Built {
-        ioc_run();
-    } else {
-        crate::server::scan::scan_run();
+/// An `iocRun` past `scanRun`, where C runs `dbCaRun` (`iocInit.c:260`).
+#[must_use]
+struct IocRunStarted {
+    from: IocState,
+}
+
+impl IocRunStarted {
+    fn finish(self) {
+        init_hook_announce(InitHookState::AfterDatabaseRunning);
+
+        crate::server::db_server::db_run_servers();
+        init_hook_announce(InitHookState::AfterCaServerRunning);
+
+        crate::runtime::log::errlog_printf(if self.from == IocState::Built {
+            "iocRun: All initialization complete\n"
+        } else {
+            "iocRun: IOC restarted\n"
+        });
+        set_ioc_state(IocState::Running);
+        init_hook_announce(InitHookState::AfterIocRunning);
     }
 }
 
@@ -385,6 +386,8 @@ pub fn ioc_shutdown() -> i32 {
     // first so the join happens with the lifecycle unlocked.
     let owner = lifecycle().scan.take();
     drop(owner);
+    let db = lifecycle().db.take();
+    drop(db);
     // A build that never reached `iocRun` has no owner to drop, so the
     // facility is stopped here rather than by the drop above.
     crate::server::scan::scan_stop();
@@ -1129,53 +1132,145 @@ pub(crate) fn build_refusal() -> String {
     )
 }
 
-/// The build for a shell with no [`IocApplication`] behind it — every
-/// `CaServerBuilder` binary and every bare [`PvDatabase`] shell.
+/// C `iocBuild_1` and `iocBuild_3` for an IOC with no [`IocApplication`]
+/// behind it — the bare shell's `iocBuild`/`iocInit` and
+/// [`IocBuilder::build_ioc`](crate::server::ioc_builder::IocBuilder::build_ioc).
 ///
-/// C has no such shell: `iocBuild_1` runs for everyone, so the state cell
-/// advances, `coreRelease()` prints and `Starting iocInit` is said whatever
-/// built the IOC. This arm did none of that. It closed the record load and
-/// returned, leaving `iocState` at [`IocState::Void`], which is why a
-/// measured `iocBuild`/`iocRun` pair answered `iocRun: WARNING IOC not
-/// paused` where C answers `iocRun: All initialization complete`, why a
-/// second `iocBuild` was accepted where C refuses it, and why the
-/// `coreRelease` banner C puts between the two command echoes was missing
-/// from stdout.
-///
-/// `close_record_load` is the caller's half — it needs the shell's database
-/// and its blocking bridge — and it sits exactly where C's record work sits,
-/// after `coreRelease()` and inside [`IocState::Building`]. The transition
-/// itself stays here because [`set_ioc_state`] is private to this module and
-/// must remain the only writer.
+/// C has no such IOC: `iocBuild_1` runs for everyone, so the state cell
+/// advances, `coreRelease()` prints and `Starting iocInit` is said, before
+/// `initDatabase` runs any `init_record`, whatever built the IOC. A value of
+/// this type is [`IocState::Building`]: only [`BareBuild::begin`] makes one,
+/// so record work done while holding it is after that line by construction.
 ///
 /// The init hooks C announces around this (`initHookAtIocBuild`,
 /// `initHookAtBeginning`, `initHookAfterIocBuilt`) are deliberately not
 /// announced: they produce no output, so nothing measured says what a bare
-/// shell should do with them, and firing hooks nobody has asked for is not
-/// something a byte-parity fix should decide.
-/// What `iocBuild_1` prints before any record work, for a build with no
-/// init hooks to announce between the two: `Starting iocInit` on the errlog
-/// (`iocInit.c:129`), then `coreRelease()`'s banner, whose `printf`
-/// (`misc/epicsRelease.c:23-27`) is the build's only stdout write
-/// (`iocInit.c:147`).
-pub fn print_ioc_build_banner() {
-    crate::runtime::log::errlog_printf("Starting iocInit\n");
-    for line in crate::server::iocsh::misc_commands::core_release_block() {
-        println!("{line}");
+/// IOC should do with them.
+pub(crate) struct BareBuild(());
+
+impl BareBuild {
+    /// C `iocBuild_1` (`iocInit.c:116-148`): refused from any state but
+    /// `iocVoid`; otherwise `Starting iocInit` on the errlog (`:129`), then
+    /// `coreRelease()`, whose `printf` (`misc/epicsRelease.c:23-27`) is the
+    /// build's only stdout write (`:147`), then `iocBuilding`.
+    pub(crate) fn begin() -> Option<Self> {
+        if get_ioc_state() != IocState::Void {
+            crate::runtime::log::errlog_printf(&build_refusal());
+            return None;
+        }
+        crate::runtime::log::errlog_printf("Starting iocInit\n");
+        for line in crate::server::iocsh::misc_commands::core_release_block() {
+            println!("{line}");
+        }
+        set_ioc_state(IocState::Building);
+        Some(Self(()))
+    }
+
+    /// C `iocBuild_3` (`iocInit.c:205`). A build that fails before this
+    /// leaves `iocBuilding`, as C's does.
+    pub(crate) fn finish(self) {
+        set_ioc_state(IocState::Built);
     }
 }
 
-pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
-    // C `iocBuild_1` (`iocInit.c:117-120`).
-    if get_ioc_state() != IocState::Void {
-        crate::runtime::log::errlog_printf(&build_refusal());
-        return false;
+/// C `dbCaLinkInit` (`iocInit.c:217`, between `iocBuild_1` and
+/// `iocBuild_2`): every external link set is registered before any record
+/// initialises, and each installer's iocsh commands go onto the process's
+/// command table.
+pub(crate) async fn ca_link_init(db: &Arc<PvDatabase>, installers: Vec<LinkSetInstaller>) {
+    for installer in installers {
+        for cmd in installer(db.clone()).await {
+            iocsh::register_command(cmd);
+        }
     }
-    print_ioc_build_banner();
-    set_ioc_state(IocState::Building);
+}
+
+/// The link half of C `initDatabase` for both IOC build paths, after the
+/// records have initialised and before the `iocInit` barrier.
+pub(crate) async fn init_links(db: &PvDatabase) {
+    // C `dbInitLink`'s locality decision, committed once for the whole
+    // database now that every record has loaded: a `Db` link naming a
+    // record this IOC does not have becomes a `Ca` link
+    // (`dbLink.c:118-130` falling through `dbDbInitLink`'s
+    // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
+    // for C's reason — `initPVLinks` initialises links before anything
+    // consumes them — and it is a one-shot: C guards re-entry with
+    // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:96-100`), so a record added
+    // later at runtime does not un-convert a link already made external.
+    db.initialize_link_locality().await;
+    db.setup_cp_links().await;
+    // Open the rest of the external links at init, as C does. Every
+    // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
+    // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
+    // C IOC's first scan finds an already-connecting channel.
+    // `setup_cp_links` above covers only the CP/CPP subset; without this
+    // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
+    // link pays one cold scan cycle to stage its own open. Runs here — the
+    // same init phase, after link parsing and before scan start — and
+    // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
+    // non-local CP holders is already visible to the enumeration.
+    db.setup_external_link_opens().await;
+}
+
+/// C `initialProcess()` (`iocInit.c:194-195`, `:653-657`): the PINI=YES
+/// pass, the last record work of `iocBuild_2`, and the registration of
+/// `piniProcessHook` (`:630-651`), which runs the RUN, RUNNING, PAUSE and
+/// PAUSED passes from every `iocRun` and `iocPause` after it. Completion is
+/// published so the scan owner started later skips its own pass, as C runs
+/// it once.
+pub(crate) fn initial_process(db: &Arc<PvDatabase>) {
+    // C's `initHookRegister` ignores a function already registered, so a
+    // rebuild after `iocShutdown` still has one hook.
+    static PINI_HOOK: std::sync::Once = std::sync::Once::new();
+    PINI_HOOK.call_once(|| init_hook_register(Arc::new(pini_process_hook)));
+    let previous = lifecycle().db.replace(Arc::clone(db));
+    drop(previous);
+    db.pini_pass(crate::server::record::PiniMode::Yes);
+    db.mark_pini_done();
+}
+
+/// C `piniProcessHook` (`iocInit.c:630-651`), over the database the current
+/// build published rather than one captured at registration.
+fn pini_process_hook(state: InitHookState) {
+    use crate::server::record::PiniMode;
+    let mode = match state {
+        InitHookState::AtIocRun => PiniMode::Run,
+        InitHookState::AfterIocRunning => PiniMode::Running,
+        InitHookState::AtIocPause => PiniMode::Pause,
+        InitHookState::AfterIocPaused => PiniMode::Paused,
+        _ => return,
+    };
+    let db = lifecycle().db.clone();
+    if let Some(db) = db {
+        db.pini_pass(mode);
+    }
+}
+
+/// C `iocRun` over an IOC whose build ran [`initial_process`] — the one
+/// run body for [`IocApplication`] and
+/// [`BareIoc`](crate::server::ioc_builder::BareIoc). `None` when `iocRun`
+/// refused, which it has already reported; nothing is started then.
+pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> Option<crate::server::scan::ScanOwner> {
+    // C `iocInit` is `iocBuild() || iocRun()` (iocInit.c:107-110): the same
+    // `iocRun` the shell's runs, with the owner its `scanRun` starts. The
+    // owner skips PINI=YES, which `initial_process` published.
+    let running = ioc_run_begin()?;
+    let owner = crate::server::scan::ScanOwner::start_running(Arc::clone(db));
+    // C `dbCaRun` (`iocInit.c:260`): the CP/CPP links' connect-time
+    // process, after `scanRun` and before the `iocRun` line.
+    db.process_cp_links_on_connect().await;
+    running.finish();
+    Some(owner)
+}
+
+/// The bare shell's build: `close_record_load` is its record work, run
+/// inside [`BareBuild`]. False when `iocBuild_1` refused.
+pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
+    let Some(build) = BareBuild::begin() else {
+        return false;
+    };
     close_record_load();
-    // C `iocBuild_3` (`iocInit.c:205`).
-    set_ioc_state(IocState::Built);
+    build.finish();
     true
 }
 
@@ -1430,11 +1525,7 @@ impl IocBuild {
         // shell was constructed before this line, so a per-shell table could
         // never carry these names into the script, however they were handed
         // around afterwards.
-        for installer in link_set_installers {
-            for cmd in installer(db.clone()).await {
-                iocsh::register_command(cmd);
-            }
-        }
+        ca_link_init(&db, link_set_installers).await;
 
         announce!(InitHookState::AfterInitDrvSup);
         announce!(InitHookState::AfterInitRecSup);
@@ -1461,28 +1552,7 @@ impl IocBuild {
         db.drain_deferred_record_inits();
         setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
-        // C `dbInitLink`'s locality decision, committed once for the whole
-        // database now that every record has loaded: a `Db` link naming a
-        // record this IOC does not have becomes a `Ca` link
-        // (`dbLink.c:118-130` falling through `dbDbInitLink`'s
-        // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
-        // for C's reason — `initPVLinks` initialises links before anything
-        // consumes them — and it is a one-shot: C guards re-entry with
-        // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:96-100`), so a record added
-        // later at runtime does not un-convert a link already made external.
-        db.initialize_link_locality().await;
-        db.setup_cp_links().await;
-        // Open the rest of the external links at init, as C does. Every
-        // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
-        // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
-        // C IOC's first scan finds an already-connecting channel.
-        // `setup_cp_links` above covers only the CP/CPP subset; without this
-        // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
-        // link pays one cold scan cycle to stage its own open. Runs here — the
-        // same init phase, after link parsing and before scan start — and
-        // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
-        // non-local CP holders is already visible to the enumeration.
-        db.setup_external_link_opens().await;
+        init_links(&db).await;
 
         // Phase 2b.5: wait for the CA links to local records to connect
         // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit
@@ -1502,12 +1572,7 @@ impl IocBuild {
                 .await;
             if total > 0 {
                 if connected == total {
-                    tracing::info!(
-                        target: "epics_base_rs::ioc_app",
-                        connected,
-                        total,
-                        "iocInit: external links connected"
-                    );
+                    tracing::debug!("iocInit: {connected}/{total} external links connected");
                 } else {
                     let unconnected = db.unconnected_external_links().await;
                     tracing::info!(
@@ -1581,16 +1646,7 @@ impl IocBuild {
         // client connecting in the first moments after IOC start
         // could `caget` a PINI record's UDF/default value instead of
         // its processed value. C guarantees this cannot happen.
-        {
-            // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
-            db.pini_process(crate::server::record::PiniMode::Yes).await;
-            // Publish completion: a later-started scan owner (or a
-            // non-owner scheduler) sees PINI as already done — the
-            // owner branch then skips its own PINI pass (exactly-once,
-            // as C's `initialProcess`) and non-owners run their hooks
-            // without blocking.
-            db.mark_pini_done();
-        }
+        initial_process(&db);
         announce!(InitHookState::AfterInitialProcess);
 
         // Phase 2d: Build AutosaveManager from startup config
@@ -1642,39 +1698,14 @@ impl BuiltIoc {
             protocol,
         } = self;
 
-        // C `piniProcessHook` (iocInit.c:629-646): the hook registered by
-        // `initialProcess()` runs `piniProcess(menuPiniRUN)` when
-        // `initHookAtIocRun` is announced. It is a hook CONSUMER in C, not
-        // part of `iocRun`'s body; the port's hook table is synchronous
-        // and `pini_process` is not, so the pass runs here, immediately
-        // before the transition that announces the state it keys on.
-        db.pini_process(crate::server::record::PiniMode::Run).await;
-        // Periodic scanning is owned by the IOC core, not by any protocol
-        // server — a PVA-only or server-less IOC scans all the same. The
-        // owner's PINI=YES pass is skipped (Phase 2b.6 already ran it and
-        // published completion); the `try_claim_scan_start` claim it takes
-        // keeps a protocol runner or embedded harness that starts another
-        // owner parked and harmless.
-        //
         // Handed to the lifecycle rather than held in a local: `iocShutdown`
         // is what stops the scan threads now, and `run` reaches it through
         // the `epicsAtExit` registration below on every exit path — which
         // the local could only do by returning from this function.
-        // C `iocInit` is `iocBuild() || iocRun()` (iocInit.c:107-110), and
-        // starting the owner is that `iocRun`: `ScanOwner::start` calls
-        // [`note_scan_owner_started`], which runs the same transition the
-        // shell's `iocRun` runs. One caller, so the two cannot announce
-        // different things.
-        adopt_scan_owner(crate::server::scan::ScanOwner::start(db.clone()));
-        // C `dbCaRun` (`iocInit.c:260`): the CP/CPP links' connect-time
-        // process, after `scanRun` and before PINI=RUNNING.
-        db.process_cp_links_on_connect().await;
-        // C `piniProcessHook` at `initHookAfterIocRunning` (iocInit.c:637-639)
-        // — `piniProcess(menuPiniRUNNING)`; a hook consumer for the same
-        // reason as the PINI=RUN pass above, run immediately after the
-        // transition that announces its state.
-        db.pini_process(crate::server::record::PiniMode::Running)
-            .await;
+        // `perform_build` left the IOC built, so this `iocRun` cannot refuse.
+        if let Some(owner) = run_built(&db).await {
+            adopt_scan_owner(owner);
+        }
 
         // H3: drain `after_init_hooks` HERE — a guaranteed drain
         // point inside `run`. These were previously moved into
@@ -2694,10 +2725,10 @@ pub(crate) fn wire_subroutine(
                 eprintln!("{name}.INAM {erl} function '{inam}' not found");
                 return false;
             };
+            // `subRecord.c:116`, `aSubRecord.c:143`: the status is dropped
+            // and nothing is printed, whatever the routine returned.
             let init_fn = init_fn.clone();
-            if let Err(e) = init_fn(&mut *instance.record) {
-                eprintln!("iocInit: {name}.INAM '{inam}' init routine failed: {e}");
-            }
+            let _ = init_fn(&mut *instance.record);
         }
     }
     // C resolves SNAM at init only for a record that will USE the resolution:
@@ -3697,12 +3728,38 @@ mod lifecycle_tests {
         assert_eq!(get_ioc_state(), IocState::Void);
     }
 
-    /// The full walk, and the scan gate at each stop. `note_scan_owner_started`
-    /// stands in for the bring-up path here so the test needs no threads:
-    /// what it drives is the same `ioc_run` the shell's command calls.
+    /// The bare bring-up without its scan owner thread: `iocBuild_1`,
+    /// `iocBuild_3`, then the `ioc_run` the shell's command calls.
+    fn build_and_run() {
+        assert!(build_without_application(|| {}));
+        assert_eq!(get_ioc_state(), IocState::Built);
+        assert_eq!(ioc_run(), 0);
+    }
+
+    /// BOUNDARY: `iocBuild_1` from anything but `iocVoid` refuses and moves
+    /// nothing (`iocInit.c:116-121`), so a second bring-up in one process
+    /// cannot say `Starting iocInit` twice.
+    #[test]
+    fn a_second_bare_build_is_refused() {
+        build_and_run();
+        assert!(BareBuild::begin().is_none());
+        assert_eq!(get_ioc_state(), IocState::Running);
+    }
+
+    /// BOUNDARY: a held [`BareBuild`] is `iocBuilding`, and one never
+    /// finished leaves the state there, as a failed C `iocBuild` does.
+    #[test]
+    fn an_unfinished_bare_build_stays_building() {
+        let _unfinished: BareBuild = BareBuild::begin().expect("void");
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(ioc_run(), -1, "iocRun from iocBuilding is C's -1");
+    }
+
+    /// The full walk, and the scan gate at each stop.
     #[test]
     fn the_lifecycle_walks_void_running_paused_running_void() {
-        note_scan_owner_started();
+        build_and_run();
         assert_eq!(get_ioc_state(), IocState::Running);
         assert_eq!(scan_ctl(), ScanCtl::Run);
 
@@ -3728,7 +3785,7 @@ mod lifecycle_tests {
     /// not paused", both -1, and neither moves the state.
     #[test]
     fn a_repeated_transition_is_refused_from_its_own_end_state() {
-        note_scan_owner_started();
+        build_and_run();
         assert_eq!(ioc_run(), -1, "already running");
         assert_eq!(get_ioc_state(), IocState::Running);
 
@@ -3741,7 +3798,7 @@ mod lifecycle_tests {
     /// non-void state, not only from running.
     #[test]
     fn a_paused_ioc_can_be_shut_down() {
-        note_scan_owner_started();
+        build_and_run();
         assert_eq!(ioc_pause(), 0);
         assert_eq!(ioc_shutdown(), 0);
         assert_eq!(get_ioc_state(), IocState::Void);
@@ -3790,7 +3847,7 @@ mod lifecycle_tests {
         }
         db.update_scan_index("EV", ScanType::Passive, ScanType::Event, 0, 0);
 
-        note_scan_owner_started();
+        build_and_run();
         db.post_event().await;
         let while_running = runs.load(Ordering::SeqCst);
         assert_eq!(while_running, 1, "a running IOC processes its Event list");

@@ -181,21 +181,21 @@ async fn main() -> ExitCode {
         };
     }
 
-    let (db, autosave_cfg) = match builder.build().await {
-        Ok(p) => p,
+    let ioc = match builder.build_ioc().await {
+        Ok(ioc) => ioc,
         Err(e) => {
             eprintln!("error building IOC: {e}");
             return ExitCode::from(2);
         }
     };
-    let _ = autosave_cfg;
 
     // C iocInit owns scan start (scanInit/scanRun) — neither the CA nor
     // the PVA front-end scans. One core-owned scan owner covers whichever
     // subset of the two servers is enabled; `try_claim_scan_start` keeps
     // any redundant start parked, so the shared database never
     // double-scans. Held to process end.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+    let db = ioc.database().clone();
+    let _scan_owner = ioc.run().await;
 
     // Flag > EPICS environment > compiled default. `from_parts` takes a
     // literal port, so the environment fallback is resolved here.

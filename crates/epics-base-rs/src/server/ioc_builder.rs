@@ -71,6 +71,15 @@ pub struct IocBuilder {
     record_factories: HashMap<String, RecordFactory>,
     subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
     autosave_config: Option<autosave::SaveSetConfig>,
+    link_set_installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
+}
+
+/// Whether the build runs the link passes of C `initDatabase`.
+enum LinkInit {
+    /// An in-process fixture: links are left as loaded, for the caller.
+    Caller,
+    /// An IOC process: the build runs them, as `IocApplication`'s does.
+    Build,
 }
 
 impl IocBuilder {
@@ -106,6 +115,7 @@ impl IocBuilder {
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),
             autosave_config: None,
+            link_set_installers: Vec::new(),
         }
     }
 
@@ -257,6 +267,21 @@ impl IocBuilder {
         self
     }
 
+    /// Register an external link-set installer, run at C `dbCaLinkInit`
+    /// before any record initialises — the builder twin of
+    /// [`IocApplication::register_link_set_installer`](crate::server::ioc_app::IocApplication::register_link_set_installer).
+    pub fn register_link_set_installer<F, Fut>(mut self, installer: F) -> Self
+    where
+        F: FnOnce(Arc<PvDatabase>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Vec<crate::server::iocsh::registry::CommandDef>>
+            + Send
+            + 'static,
+    {
+        self.link_set_installers
+            .push(Box::new(move |db| Box::pin(installer(db))));
+        self
+    }
+
     /// Build the populated database.
     ///
     /// Performs, in order:
@@ -270,7 +295,42 @@ impl IocBuilder {
     ///
     /// Returns the populated database and the optional autosave config (so the
     /// caller can start the autosave loop).
+    ///
+    /// The database has no IOC lifecycle: `iocState` is not touched and
+    /// nothing of `iocBuild` is said. An IOC process builds with
+    /// [`Self::build_ioc`] instead.
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
+        let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Caller).await?;
+        Ok((db, autosave_config))
+    }
+
+    /// Build the database as an IOC process's `iocBuild`: the same steps as
+    /// [`Self::build`], with C `iocBuild_1` — `Starting iocInit`, the
+    /// `coreRelease` banner, `iocBuilding` — between the record load and the
+    /// first `init_record`, where `dbLoadRecords` ends and `iocInit` begins,
+    /// then `initialProcess` (PINI=YES) and `iocBuilt` at the end. Run it
+    /// with [`BareIoc::run`].
+    ///
+    /// Once per process: a second call is refused as C's `iocBuild` is.
+    pub async fn build_ioc(self) -> CaResult<BareIoc> {
+        let (db, autosave_config, build) = self
+            .build_through(crate::server::ioc_app::BareBuild::begin, LinkInit::Build)
+            .await?;
+        crate::server::ioc_app::initial_process(&db);
+        build.finish();
+        Ok(BareIoc {
+            db,
+            autosave_config,
+        })
+    }
+
+    /// `build`'s body. `iocinit_begins` runs once the load has succeeded and
+    /// before any deferred `init_record`; `None` from it fails the build.
+    async fn build_through<T>(
+        self,
+        iocinit_begins: impl FnOnce() -> Option<T>,
+        link_init: LinkInit,
+    ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>, T)> {
         let db = Arc::new(PvDatabase::new());
 
         // A build is a load plus C's `iocInit`: records are created here, and
@@ -310,11 +370,12 @@ impl IocBuilder {
 
         // 2. Inline records
         for (name, record) in self.records {
-            // The sink runs C's `iocInit` passes (`run_init_passes`) — an
-            // inline record has no `.db` field set to load first, so it is
-            // complete the moment it is added. Common-link classification
-            // (init_links) and the mbboDirect UDF finalisation stay on the
-            // `.db` path only: an inline record has no parsed common fields
+            // The sink owes the record its `iocInit` passes, as it owes a
+            // `.db` record's: `begin_load` above opened the LOAD phase, so
+            // `drain_deferred_record_inits` runs them after `iocinit_begins`.
+            // Common-link classification (init_links) and the mbboDirect UDF
+            // finalisation stay on the `.db` path only: an inline record has
+            // no parsed common fields
             // to classify or fold. The sink also ends in the init-seed owner
             // (`seed_constant_links`), which runs BOTH halves of C's
             // `init_record` tail — this loop must not call either half itself,
@@ -561,6 +622,15 @@ impl IocBuilder {
         for load in failed_loads {
             eprintln!("{ERL_ERROR}: Failed to load '{}'", self.sources[load]);
         }
+        let Some(begun) = iocinit_begins() else {
+            return Err(CaError::InvalidValue(
+                "IOC can only be initialized from uninitialized or stopped state".into(),
+            ));
+        };
+        // C `iocBuild` runs `dbCaLinkInit` right after `iocBuild_1`
+        // (`iocInit.c:217`), so a link set exists before `init_record` and the
+        // link passes below.
+        crate::server::ioc_app::ca_link_init(&db, self.link_set_installers).await;
 
         // 4. Autosave restore
         if let Some(ref autosave_cfg) = self.autosave_config {
@@ -588,13 +658,39 @@ impl IocBuilder {
         // from the I/O Intr wiring above. Shared with the IocApplication
         // iocInit path so both builders arm the enum callback identically.
         crate::server::ioc_app::setup_property_posts(db.clone()).await;
+        if let LinkInit::Build = link_init {
+            crate::server::ioc_app::init_links(&db).await;
+        }
 
         // 7. The `iocInit` barrier: every record exists, so run the link-status
         // classifications queued during the load. Link status is FINAL when
         // `build` returns, as it is when C's `iocInit` returns.
         db.ioc_init().await;
 
-        Ok((db, self.autosave_config))
+        Ok((db, self.autosave_config, begun))
+    }
+}
+
+/// An IOC [`IocBuilder::build_ioc`] built: C's `iocBuilt`, quiescent.
+pub struct BareIoc {
+    db: Arc<PvDatabase>,
+    autosave_config: Option<autosave::SaveSetConfig>,
+}
+
+impl BareIoc {
+    pub fn database(&self) -> &Arc<PvDatabase> {
+        &self.db
+    }
+
+    pub fn autosave_config(&self) -> Option<&autosave::SaveSetConfig> {
+        self.autosave_config.as_ref()
+    }
+
+    /// C `iocRun` (`iocInit.c:246-276`); the scan owner it returns is held
+    /// for as long as the IOC scans. `None` when `iocRun` refused, which it
+    /// has already reported.
+    pub async fn run(self) -> Option<crate::server::scan::ScanOwner> {
+        crate::server::ioc_app::run_built(&self.db).await
     }
 }
 
@@ -607,6 +703,55 @@ impl Default for IocBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An inline record's `init_record` runs after `iocBuild_1`, as a `.db`
+    /// record's does: the build is in its LOAD phase when step 2 adds it.
+    #[epics_macros_rs::epics_test]
+    async fn an_inline_record_initialises_after_ioc_init_begins() {
+        use crate::server::record::{FieldDesc, ProcessOutcome};
+        use std::sync::Mutex;
+
+        struct InitProbe(Arc<Mutex<Vec<String>>>);
+        impl Record for InitProbe {
+            fn record_type(&self) -> &'static str {
+                "init_probe"
+            }
+            fn init_record(&mut self, pass: u8) -> CaResult<()> {
+                self.0.lock().unwrap().push(format!("init_record({pass})"));
+                Ok(())
+            }
+            fn process(&mut self) -> CaResult<ProcessOutcome> {
+                Ok(ProcessOutcome::complete())
+            }
+            fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+                None
+            }
+            fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &[]
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let begun = Arc::clone(&log);
+        IocBuilder::new()
+            .record("INLINE", InitProbe(Arc::clone(&log)))
+            .build_through(
+                move || {
+                    begun.lock().unwrap().push("iocBuild_1".to_string());
+                    Some(())
+                },
+                LinkInit::Caller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["iocBuild_1", "init_record(0)", "init_record(1)"]
+        );
+    }
 
     fn ai_factory() -> Box<dyn Record> {
         Box::new(crate::server::records::ai::AiRecord::new(0.0))

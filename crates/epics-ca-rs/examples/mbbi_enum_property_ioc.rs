@@ -35,6 +35,8 @@
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport, PropertyPost};
+#[cfg(tokio_backend)]
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
@@ -112,14 +114,22 @@ record(mbbi, "RIG:MBBI") {
     field(SCAN, "Passive")
 }
 "#;
-    let server = CaServer::builder()
-        .port(port)
-        .tcp_port(port)
+    let ioc = IocBuilder::new()
         .db_string(db, &HashMap::new())?
         .register_device_support("enumProp", || Box::new(EnumProp::new()))
-        .build()
+        .build_ioc()
         .await?;
-    let _scan = epics_base_rs::server::scan::ScanOwner::start(server.database().clone());
+    let db = ioc.database().clone();
+    let _scan = ioc.run().await;
+    let server = CaServer::from_parts(
+        db,
+        port,
+        Some(port),
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .await?;
     eprintln!("[ioc] serving RIG:MBBI on CA port {port}");
     server.run().await
 }

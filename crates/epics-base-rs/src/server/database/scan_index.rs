@@ -666,10 +666,11 @@ impl PvDatabase {
     /// full link chain.
     ///
     /// The single owner of "run a PINI pass": `initialProcess()` calls it with
-    /// [`PiniMode::Yes`], and the `initHook` lifecycle calls it with
-    /// [`PiniMode::Run`] / [`PiniMode::Running`]. Every driver goes through
-    /// here, so neither the pass selection nor the phase ordering can diverge
-    /// between them.
+    /// [`PiniMode::Yes`], and `piniProcessHook` with the RUN, RUNNING, PAUSE
+    /// and PAUSED modes from the lifecycle transitions. Every driver goes
+    /// through here, so neither the pass selection nor the phase ordering can
+    /// diverge between them. Synchronous, as the hooks that call it are;
+    /// [`Self::pini_process`] is its async spelling.
     ///
     /// The sweep is C's, not a pre-sorted list: each pass over the database
     /// processes the records at the current phase and, while doing so, finds
@@ -679,6 +680,11 @@ impl PvDatabase {
     /// phase is raised by an earlier PINI record's processing is still picked
     /// up in the correct later pass, which a snapshot-and-sort would miss.
     pub async fn pini_process(&self, mode: PiniMode) {
+        self.pini_pass(mode);
+    }
+
+    /// C `piniProcess` (`iocInit.c:608-627`); see [`Self::pini_process`].
+    pub(crate) fn pini_pass(&self, mode: PiniMode) {
         // C `dbScan.h:34-35`: MAX_PHASE = SHRT_MAX, MIN_PHASE = SHRT_MIN. The
         // phase cursors are `int` (`phaseData_t`), so `MAX_PHASE + 1` — the
         // "no further phase found" sentinel — does not overflow.

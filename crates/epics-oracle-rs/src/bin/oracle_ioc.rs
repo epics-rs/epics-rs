@@ -135,29 +135,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
     }
 
-    // The C side loads its `.db` from an st.cmd, so a refused field fails the
-    // load, the script goes on, and iocInit boots the record anyway.
-    let (db, _autosave) = port_ioc_builder()
+    let ioc = port_ioc_builder()
         .db_file(&db_path, &macros)?
-        .boot_past_failed_loads()
-        .build()
+        .build_ioc()
         .await?;
 
     // C `connectPVs`, which waits for `interruptAccept`: the inputs are
     // records of the database just loaded. A port missing an input fails on
     // its own; the IOC keeps running.
     #[cfg(feature = "scaler")]
-    epics_oracle_rs::scaler_soft_ports().connect(&db);
+    epics_oracle_rs::scaler_soft_ports().connect(ioc.database());
+
+    // C iocInit owns scanInit/initialProcess — neither server scans. The
+    // harness compares against a C softIoc whose iocInit runs
+    // initialProcess and scanRun, so the Rust IOC runs its `iocRun` (PINI
+    // pass + scan-%g threads) itself, before serving either protocol.
+    let db = Arc::clone(ioc.database());
+    let _scan_owner = ioc.run().await;
 
     if args.pva {
         return serve_pva(db).await;
     }
-
-    // C iocInit owns scanInit/initialProcess — the CA server does not
-    // scan. The harness compares against a C softIoc whose iocInit runs
-    // initialProcess and scanRun, so the Rust IOC starts the core-owned
-    // scan owner (PINI pass + scan-%g threads) itself, before serving.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
 
     // Port 0 => the kernel assigns; `from_parts` binds first and reports the
     // port it actually bound. This is the bind-and-read-back the harness
@@ -200,9 +198,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve_pva(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Same reasoning as the CA path: scanning is core-owned (C iocInit),
-    // not the PVA server's — the harness's Scanned drive records need it.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
     let server = PvaServer::from_parts(
         db,
         0,

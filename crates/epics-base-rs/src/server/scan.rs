@@ -1566,9 +1566,12 @@ impl ScanScheduler {
 ///   `initHookAfterDatabaseRunning`), so every `IocApplication`-built IOC
 ///   scans no matter which protocol runner it hands off to.
 /// * Entry-point binaries that assemble an IOC without `IocApplication`
-///   (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
-///   `realtime-ca-ioc`, `realtime-pva-ioc`) start one themselves, right where
-///   their hand-rolled iocInit sequence ends.
+///   (`oracle-ioc`, `dual-ioc-rs`, `realtime-ca-ioc`, `realtime-pva-ioc`)
+///   get one from [`crate::server::ioc_builder::BareIoc::run`], C's `iocRun`
+///   over the build [`crate::server::ioc_builder::IocBuilder::build_ioc`] did.
+/// * A database with no IOC lifecycle at all — an in-process test, an
+///   embedded harness — calls [`ScanOwner::start`], which runs the facility
+///   and touches no `iocState`.
 ///
 /// Protocol servers must NOT start scanning — that was the defect this
 /// type closes: the `ScanScheduler` used to be constructed and driven
@@ -1608,16 +1611,26 @@ pub struct ScanOwner {
 }
 
 impl ScanOwner {
-    /// Start the scan owner thread for `db`. See the type docs for who
-    /// calls this and why redundant calls are harmless.
+    /// Start the scan owner thread for a `db` with no IOC lifecycle: C's
+    /// `scanRun` and nothing of `iocRun`'s, so `iocState` is left alone. An
+    /// IOC reaches its owner through [`Self::start_running`] instead, after
+    /// the lifecycle owner's `iocRun`. See the type docs for why redundant
+    /// calls are harmless.
     pub fn start(db: Arc<PvDatabase>) -> Self {
-        // This is the port's `iocRun` point: `IocApplication` calls it
-        // exactly where C's `iocRun` calls `scanRun`, and the six binaries
-        // that build their database through a server builder call it as
-        // the last step of their own init. The transition itself belongs
-        // to the lifecycle owner, which is why it is not `scan_run()`
-        // here — see `ioc_app::note_scan_owner_started`.
-        crate::server::ioc_app::note_scan_owner_started();
+        // A process that entered `iocBuild_1` is an IOC, and its owner comes
+        // from the lifecycle's `iocRun`; a bare start there would scan
+        // outside `iocPause`'s reach.
+        debug_assert_eq!(
+            crate::server::ioc_app::get_ioc_state(),
+            crate::server::ioc_app::IocState::Void,
+            "ScanOwner::start on an IOC process; use IocBuilder::build_ioc"
+        );
+        scan_run();
+        Self::start_running(db)
+    }
+
+    /// The owner thread for an IOC whose `iocRun` has already run `scanRun`.
+    pub(crate) fn start_running(db: Arc<PvDatabase>) -> Self {
         let (stop_tx, stop_rx) = crate::runtime::sync::oneshot::channel::<()>();
         // The scan facility's one and only ambient capture, taken on the
         // caller's thread because neither the owner thread nor the `scan-%g`

@@ -29,7 +29,7 @@
 //! processGroups
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -83,31 +83,49 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
             // groups; `-file.json` removes the groups a previous
             // `dbLoadGroup(file.json, macros)` of the matching identity
             // placed. Removal is identity-based (raw filename + raw
-            // macros), so it never touches the filesystem.
+            // macros), so it never touches the filesystem. pvxs prints
+            // nothing on any success path.
             if let Some(rest) = filename.strip_prefix('-') {
                 if rest == "*" {
-                    let n = provider.clear_group_files();
-                    ctx.println(&format!(
-                        "dbLoadGroup: cleared all file groups ({n} removed)"
-                    ));
+                    provider.clear_group_files();
                 } else {
-                    let n = provider.remove_group_file(rest, &macros_str);
-                    ctx.println(&format!("dbLoadGroup: removed '{rest}' ({n} group(s))"));
+                    provider.remove_group_file(rest, &macros_str);
                 }
                 return Ok(CommandOutcome::Continue);
             }
 
             match apply_group_file(&provider, &filename, &macros_str) {
-                Ok(total) => {
-                    ctx.println(&format!(
-                        "dbLoadGroup: loaded '{filename}' ({total} groups total)"
-                    ));
-                    Ok(CommandOutcome::Continue)
+                Ok(_) => Ok(CommandOutcome::Continue),
+                // pvxs's bare `fprintf` plus `iocshSetError`
+                // (groupsourcehooks.cpp:47, :149-151).
+                Err(GroupFileError::Open(line)) => {
+                    ctx.eprintln(&line);
+                    Ok(CommandOutcome::Failed)
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         },
     )
+}
+
+/// Why [`apply_group_file`] loaded nothing; pvxs treats the two apart.
+#[derive(Debug)]
+pub(crate) enum GroupFileError {
+    /// The file could not be read: `dbLoadGroup` prints and the IOC goes on
+    /// (groupsourcehooks.cpp:149-151).
+    Open(String),
+    /// The file did not parse: `loadConfigFiles` throws out of the noexcept
+    /// init hook (groupconfigprocessor.cpp:121-123, iochooks.cpp:328), so the
+    /// IOC terminates. Carries pvxs's `what()` text.
+    Parse(String),
+}
+
+impl std::fmt::Display for GroupFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(m) | Self::Parse(m) => f.write_str(m),
+        }
+    }
 }
 
 /// Apply one `dbLoadGroup(filename, macros)` to `provider`: read the file,
@@ -126,9 +144,9 @@ pub(crate) fn apply_group_file(
     provider: &BridgeProvider,
     filename: &str,
     macros: &str,
-) -> Result<usize, String> {
-    let raw =
-        std::fs::read_to_string(filename).map_err(|e| format!("dbLoadGroup '{filename}': {e}"))?;
+) -> Result<usize, GroupFileError> {
+    let raw = std::fs::read_to_string(filename)
+        .map_err(|_| GroupFileError::Open(format!("Error opening \"{filename}\"")))?;
     let expanded = if macros.is_empty() {
         raw
     } else {
@@ -174,7 +192,15 @@ pub(crate) fn apply_group_file(
     };
     provider
         .load_group_file_tracked(filename, macros, &expanded)
-        .map_err(|e| format!("dbLoadGroup '{filename}' failed: {e}"))?;
+        .map_err(|e| {
+            let cause = match e {
+                crate::error::BridgeError::GroupConfigError(m) => m,
+                e => e.to_string(),
+            };
+            GroupFileError::Parse(format!(
+                "Error reading group definition file \"{filename}\"\n{cause}"
+            ))
+        })?;
     Ok(provider.group_count())
 }
 
@@ -742,6 +768,61 @@ mod tests {
         assert_eq!(n, 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// softIocPVX 1.5.3 on `dbLoadGroup("nosuch.json")`: stderr is exactly
+    /// `Error opening "nosuch.json"` and the line is marked failed.
+    #[test]
+    fn db_load_group_on_a_missing_file_prints_pvxs_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let shell = epics_base_rs::server::iocsh::IocShell::new(db.clone(), bridge);
+        shell.register(db_load_group_command(Arc::new(BridgeProvider::new(db))));
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let missing = tmpdir.path().join("nosuch.json");
+        let err = tmpdir.path().join("err");
+        let outcome = shell.execute_line(&format!(
+            "dbLoadGroup(\"{}\") 2> {}",
+            missing.display(),
+            err.display()
+        ));
+        assert!(matches!(outcome, Ok(CommandOutcome::Failed)));
+        assert_eq!(
+            std::fs::read_to_string(&err).unwrap(),
+            format!("Error opening \"{}\"\n", missing.display())
+        );
+    }
+
+    /// softIocPVX 1.5.3 prints nothing for `dbLoadGroup("good.json")`,
+    /// `dbLoadGroup("-good.json")` or `dbLoadGroup("-*")`.
+    #[test]
+    fn db_load_group_prints_nothing_on_success() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let shell = epics_base_rs::server::iocsh::IocShell::new(db.clone(), bridge);
+        shell.register(db_load_group_command(Arc::new(BridgeProvider::new(db))));
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let good = tmpdir.path().join("good.json");
+        std::fs::write(&good, r#"{"G":{"a":{"+channel":"A.VAL"}}}"#).unwrap();
+        for arg in [
+            good.display().to_string(),
+            format!("-{}", good.display()),
+            "-*".into(),
+        ] {
+            let out = tmpdir.path().join("out");
+            let outcome =
+                shell.execute_line(&format!("dbLoadGroup(\"{arg}\") > {}", out.display()));
+            assert!(matches!(outcome, Ok(CommandOutcome::Continue)), "{arg}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "", "{arg}");
+        }
     }
 
     #[test]

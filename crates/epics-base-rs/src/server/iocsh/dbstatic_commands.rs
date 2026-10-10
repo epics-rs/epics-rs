@@ -2852,6 +2852,7 @@ variable(seqDLYprecision,int)
             dbf_type: DbFieldType::Long,
             declared_dbf: DbfCode::Long,
             runtime_typed: false,
+            long_string: false,
             read_only: false,
             special: Special::None,
             declared_special: Special::None,

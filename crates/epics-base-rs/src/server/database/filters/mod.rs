@@ -30,6 +30,7 @@ use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 
 pub mod arr;
+pub mod channel;
 pub mod dbnd;
 pub mod decimate;
 pub mod parser;
@@ -38,6 +39,7 @@ pub mod ts;
 pub mod utag;
 
 pub use arr::{ArrayFilter, ArrayFilterConfig};
+pub use channel::{ChannelCreateError, DbChannel, db_channel_create};
 pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
 pub use parser::{
@@ -113,6 +115,20 @@ pub trait SubscriptionFilter: Send + Sync + 'static {
     fn final_element_count(&self, input: usize) -> usize {
         input
     }
+
+    /// The field type this filter emits for an `input`-typed log, as its
+    /// `channelRegisterPost` sets `probe->field_type` (C
+    /// `dbChannelFinalFieldType`). Only `ts`'s value modes change it.
+    fn final_field_type(&self, input: crate::types::DbFieldType) -> crate::types::DbFieldType {
+        input
+    }
+
+    /// C's `channelRegisterPost` stage: the filter runs on the log the
+    /// event task reads, off the record lock (`dbEvent.c:984-985`), not on
+    /// the post (`dbEvent.c:901,923`).
+    fn post_chain(&self) -> bool {
+        false
+    }
 }
 
 /// Ordered chain of filters owned by one subscriber. The default is
@@ -167,6 +183,23 @@ impl FilterChain {
             .fold(native, |n, f| f.final_element_count(n))
     }
 
+    /// Final field type this chain produces for a `native`-typed field (C
+    /// `dbChannelFinalFieldType`), folded like
+    /// [`final_element_count`](Self::final_element_count).
+    pub fn final_field_type(&self, native: crate::types::DbFieldType) -> crate::types::DbFieldType {
+        self.filters
+            .iter()
+            .fold(native, |t, f| f.final_field_type(t))
+    }
+
+    /// The chain as C's `dbChannel` runs it, whatever the JSON order: the
+    /// pre chain, run on the post, and the post chain, run as the event is
+    /// read (`dbEvent.c:901,923` and `:984-985`).
+    pub fn split(&self) -> (Self, Self) {
+        let (post, pre) = self.filters.iter().cloned().partition(|f| f.post_chain());
+        (Self { filters: pre }, Self { filters: post })
+    }
+
     /// Iterate over the filters in registration order.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn SubscriptionFilter>> {
         self.filters.iter()
@@ -198,9 +231,21 @@ impl FilterChain {
         if self.filters.is_empty() {
             return Some(value);
         }
+        let snap =
+            crate::server::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::now());
+        self.apply_single(snap, read_context, mask)
+            .map(|snap| snap.value)
+    }
+
+    /// [`Self::apply_single_value`] on a whole snapshot, whose timestamp a
+    /// `ts` value mode reads and whose properties it narrows.
+    fn apply_single(
+        &self,
+        snap: crate::server::snapshot::Snapshot,
+        read_context: bool,
+        mask: EventMask,
+    ) -> Option<crate::server::snapshot::Snapshot> {
         use crate::server::pv::MonitorEvent;
-        use crate::server::snapshot::Snapshot;
-        let snap = Snapshot::new(value, 0, 0, std::time::SystemTime::now());
         let event = MonitorEvent {
             snapshot: std::sync::Arc::new(snap),
             origin: 0,
@@ -212,9 +257,18 @@ impl FilterChain {
             FilteredMonitorEvent::new(event)
         };
         let filtered = self.apply(wrapped)?;
-        // Sole owner on this path (the snapshot was built one statement above
-        // and never shared), so `unwrap_or_clone` moves rather than copies.
-        Some(std::sync::Arc::unwrap_or_clone(filtered.event.snapshot).value)
+        // Sole owner on this path (the snapshot was wrapped above and never
+        // shared), so `unwrap_or_clone` moves rather than copies.
+        Some(std::sync::Arc::unwrap_or_clone(filtered.event.snapshot))
+    }
+
+    /// [`Self::apply_to_read_value`] on the field's snapshot, the read log
+    /// `dbGet` takes its value, time and options from.
+    pub fn apply_to_read_snapshot(
+        &self,
+        snap: crate::server::snapshot::Snapshot,
+    ) -> Option<crate::server::snapshot::Snapshot> {
+        self.apply_single(snap, true, EventMask::NONE)
     }
 
     /// epics-base PR `17a8dbc` parity: apply the filter chain to a

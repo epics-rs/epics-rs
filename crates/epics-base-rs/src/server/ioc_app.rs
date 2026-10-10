@@ -482,40 +482,27 @@ pub fn db_load_group_startup_command() -> CommandDef {
             let mut queue = GROUP_LOAD_REQUESTS.lock().unwrap();
             // Leading `-`: removal by identity, applied to the queue (pvxs
             // groupsourcehooks.cpp:140-179 — never touches the filesystem).
+            // pvxs prints nothing on any success path.
             if let Some(rest) = filename.strip_prefix('-') {
                 if rest == "*" {
-                    let n = queue.len();
                     queue.clear();
-                    ctx.println(&format!(
-                        "dbLoadGroup: cleared all queued group files ({n} removed)"
-                    ));
                 } else {
-                    let before = queue.len();
                     queue.retain(|r| !(r.filename == rest && r.macros == macros));
-                    let dropped = before - queue.len();
-                    ctx.println(&format!(
-                        "dbLoadGroup: removed '{rest}' ({dropped} queued entr{} dropped)",
-                        if dropped == 1 { "y" } else { "ies" }
-                    ));
                 }
                 return Ok(CommandOutcome::Continue);
             }
-            // pvxs opens the file at command time (early error); mirror that
-            // with a readability probe. The QSRV runner re-reads and parses.
-            if let Err(e) = std::fs::metadata(&filename) {
-                return Err(format!("dbLoadGroup: error opening \"{filename}\": {e}"));
+            // pvxs opens the file at command time and answers a failure with
+            // a bare `fprintf` plus `iocshSetError` (groupsourcehooks.cpp:47,
+            // :149-151), not showError's framing. The QSRV runner re-reads
+            // and parses.
+            if std::fs::File::open(&filename).is_err() {
+                ctx.eprintln(&format!("Error opening \"{filename}\""));
+                return Ok(CommandOutcome::Failed);
             }
             // Re-load of the same identity first drops the prior queue entry
             // (pvxs erases the matching `(fname, macros)` before appending).
             queue.retain(|r| !(r.filename == filename && r.macros == macros));
-            queue.push(GroupLoadRequest {
-                filename: filename.clone(),
-                macros,
-            });
-            ctx.println(&format!(
-                "dbLoadGroup: queued '{filename}' ({} group file(s) queued)",
-                queue.len()
-            ));
+            queue.push(GroupLoadRequest { filename, macros });
             Ok(CommandOutcome::Continue)
         },
     )
@@ -552,6 +539,17 @@ pub type DynamicDeviceSupportFactory =
 /// — is what makes a Passive holder of an external CP/CPP link warm at
 /// iocInit: `setup_cp_links`'s `resolve_external_pv` open path is a no-op
 /// unless the matching link set is already installed.
+/// An async consumer of `initHookAfterInitDatabase`, handed the database and
+/// the IOC's one ACF cell. See [`IocApplication::register_after_init_database`].
+pub type AfterInitDatabaseHook = Box<
+    dyn FnOnce(
+            Arc<PvDatabase>,
+            access_security::AcfCell,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
 pub type LinkSetInstaller = Box<
     dyn FnOnce(
             Arc<PvDatabase>,
@@ -996,6 +994,7 @@ struct IocBuild {
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     link_set_installers: Vec<LinkSetInstaller>,
+    after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
     protocol: ProtocolStart,
 }
@@ -1154,20 +1153,25 @@ pub(crate) fn build_refusal() -> String {
 /// announced: they produce no output, so nothing measured says what a bare
 /// shell should do with them, and firing hooks nobody has asked for is not
 /// something a byte-parity fix should decide.
+/// What `iocBuild_1` prints before any record work, for a build with no
+/// init hooks to announce between the two: `Starting iocInit` on the errlog
+/// (`iocInit.c:129`), then `coreRelease()`'s banner, whose `printf`
+/// (`misc/epicsRelease.c:23-27`) is the build's only stdout write
+/// (`iocInit.c:147`).
+pub fn print_ioc_build_banner() {
+    crate::runtime::log::errlog_printf("Starting iocInit\n");
+    for line in crate::server::iocsh::misc_commands::core_release_block() {
+        println!("{line}");
+    }
+}
+
 pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
     // C `iocBuild_1` (`iocInit.c:117-120`).
     if get_ioc_state() != IocState::Void {
         crate::runtime::log::errlog_printf(&build_refusal());
         return false;
     }
-    // C `iocInit.c:129`, before anything the build prints.
-    crate::runtime::log::errlog_printf("Starting iocInit\n");
-    // C `iocInit.c:147`: `coreRelease()` immediately before the state moves,
-    // and its `printf` (`misc/epicsRelease.c:23-27`) is the only stdout write
-    // on the whole path.
-    for line in crate::server::iocsh::misc_commands::core_release_block() {
-        println!("{line}");
-    }
+    print_ioc_build_banner();
     set_ioc_state(IocState::Building);
     close_record_load();
     // C `iocBuild_3` (`iocInit.c:205`).
@@ -1206,6 +1210,7 @@ impl IocBuild {
             autosave_config,
             autosave_startup,
             link_set_installers,
+            after_init_database_hooks,
             after_init_hooks,
             protocol,
         } = self;
@@ -1318,6 +1323,15 @@ impl IocBuild {
                         }
                     })
                 }),
+            ));
+        }
+
+        // C registers these with `initHookRegister`, after autosave's.
+        for hook in after_init_database_hooks {
+            let (db, acf) = (db.clone(), acf.clone());
+            lifecycle_hooks.push((
+                InitHookState::AfterInitDatabase,
+                Box::new(move || hook(db, acf)),
             ));
         }
 
@@ -1445,8 +1459,7 @@ impl IocBuild {
         // restores were loaded before that.
         announce!(InitHookState::AfterInitDevSup);
         db.drain_deferred_record_inits();
-        let record_count = db.records_with_device_support().await;
-        let io_intr_count = setup_io_intr(db.clone()).await;
+        setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
         // C `dbInitLink`'s locality decision, committed once for the whole
         // database now that every record has loaded: a `Db` link naming a
@@ -1586,17 +1599,6 @@ impl IocBuild {
         } else {
             None
         };
-
-        let total_records = db.all_record_names().await.len();
-        // A line C does not have, kept because the three counts are what an
-        // operator checks an `st.cmd` by — but said through the errlog, which
-        // is where C puts everything the boot says. A raw `eprintln!` here
-        // was outside `eltc`'s reach: measured, `eltc 0` then `iocInit`
-        // silenced C's console completely and left this line and the CA
-        // server's on the port's.
-        crate::runtime::log::errlog_printf(&format!(
-            "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr\n"
-        ));
 
         // C: rsrv init / iocBuild end. The Rust CA/PVA listener is
         // owned by the protocol runner, but PINI is already complete
@@ -1781,6 +1783,9 @@ pub struct IocApplication {
     /// `AfterCaLinkInit` hook in [`Self::run`] — before `setup_cp_links`
     /// — so a Passive holder of an external CP link warms at iocInit.
     link_set_installers: Vec<LinkSetInstaller>,
+    /// Async `initHookAfterInitDatabase` consumers
+    /// ([`Self::register_after_init_database`]).
+    after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     /// C softMain's own turn between the startup script and `iocInit`
     /// ([`Self::before_ioc_init`]). `None` is [`IocInitDecision::run`].
     ioc_init_gate: Option<Box<dyn FnOnce() -> IocInitDecision + Send>>,
@@ -1821,6 +1826,7 @@ impl IocApplication {
             inline_records: Vec::new(),
             after_init_hooks: Vec::new(),
             link_set_installers: Vec::new(),
+            after_init_database_hooks: Vec::new(),
             ioc_init_gate: None,
         }
     }
@@ -1943,6 +1949,20 @@ impl IocApplication {
     {
         self.link_set_installers
             .push(Box::new(move |db| Box::pin(installer(db))));
+        self
+    }
+
+    /// Register an async `initHookAfterInitDatabase` consumer, run inside
+    /// `iocBuild` before `scanInit` and `initialProcess`: pvxs's
+    /// `processGroups` is one (iochooks.cpp:355), so a group file that throws
+    /// aborts before any scan or PINI.
+    pub fn register_after_init_database<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(Arc<PvDatabase>, access_security::AcfCell) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.after_init_database_hooks
+            .push(Box::new(move |db, acf| Box::pin(hook(db, acf))));
         self
     }
 
@@ -2154,6 +2174,7 @@ impl IocApplication {
             inline_records,
             after_init_hooks,
             link_set_installers,
+            after_init_database_hooks,
             ioc_init_gate,
         } = self;
 
@@ -2240,6 +2261,7 @@ impl IocApplication {
             autosave_config: autosave_config.clone(),
             autosave_startup,
             link_set_installers,
+            after_init_database_hooks,
             after_init_hooks,
             // C parity (`caservertask.c:492-500`): the server-side env var
             // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and `ca_udp_port =
@@ -2503,11 +2525,11 @@ impl IocApplication {
             // whose failure is not the catch block's.
             res = server.wait() => Some(res),
             _ = ctrl_c => {
-                tracing::info!(target: "epics_base_rs::ioc_app", "SIGINT received, shutting down IOC");
+                tracing::debug!(target: "epics_base_rs::ioc_app", "SIGINT received, shutting down IOC");
                 None
             }
             _ = sigterm => {
-                tracing::info!(target: "epics_base_rs::ioc_app", "SIGTERM received, shutting down IOC");
+                tracing::debug!(target: "epics_base_rs::ioc_app", "SIGTERM received, shutting down IOC");
                 None
             }
         };
@@ -3207,12 +3229,19 @@ mod tests {
             .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
             .unwrap();
 
-        // Missing file → early error at the st.cmd line (pvxs parity).
-        assert!(
-            shell
-                .execute_line("dbLoadGroup(\"/no/such/group.json\")")
-                .is_err(),
-            "a missing group file must error at command time"
+        // Missing file: softIocPVX 1.5.3 writes `Error opening "nosuch.json"`
+        // to stderr at the st.cmd line and marks the line failed.
+        let err = tmpdir.path().join("err");
+        assert!(matches!(
+            shell.execute_line(&format!(
+                "dbLoadGroup(\"/no/such/group.json\") 2> {}",
+                err.display()
+            )),
+            Ok(crate::server::iocsh::registry::CommandOutcome::Failed)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&err).unwrap(),
+            "Error opening \"/no/such/group.json\"\n"
         );
 
         // `-file` removes only the matching identity (a, macros="").

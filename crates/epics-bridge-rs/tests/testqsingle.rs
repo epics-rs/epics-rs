@@ -17,12 +17,13 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(33): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(41): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::char_view::PvaDollar;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
@@ -228,12 +229,11 @@ async fn put_then_get_round_trips_string() {
 
 /// EPICS `$` long-string field modifier (C `dbChannel.c:486-505`): a
 /// `DBF_STRING` field named with a trailing `$` is re-viewed as a
-/// `DBR_CHAR` character array, which pvxs serves as the `form = "String"`
-/// long-string `NTScalar` (`ioc/iocsource.cpp:133-136`). `REC.VAL$`
-/// therefore resolves (it no longer becomes a bogus field `VAL$`) and is
-/// served as a string scalar via [`NtType::LongString`].
+/// `DBR_CHAR` character array, which pvxs serves as `int8_t[]`, the text and
+/// its NUL: `softIocPVX` 1.5.3 serves a stringin `REC.VAL$` holding `init`
+/// as `{5}[105,110,105,116,0]`.
 #[tokio::test]
-async fn dollar_modifier_serves_string_field_as_long_string() {
+async fn dollar_modifier_serves_string_field_as_its_char_image() {
     use epics_bridge_rs::qsrv::provider::{BridgeProvider, ChannelProvider};
 
     let db = Arc::new(PvDatabase::new());
@@ -260,17 +260,14 @@ async fn dollar_modifier_serves_string_field_as_long_string() {
     // Resolved field drops the `$`; the channel serves the string view.
     assert_eq!(ch.record_name(), "TEST:str");
     assert_eq!(ch.field(), "VAL");
-    assert!(
-        matches!(ch.nt_type(), NtType::LongString),
-        "`$` string field must be served as the long-string NTScalar view"
-    );
+    assert_eq!(ch.nt_type(), NtType::Dollar(PvaDollar::Chars));
 
     let result = ch.get(&empty_request()).await.expect("get");
-    let value = extract_value(&result).expect("NTScalar.value");
-    match value {
-        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "init"),
-        other => panic!("expected string scalar from `$` char view, got {other:?}"),
-    }
+    assert_eq!(extract_value(&result), Some(&chars(b"init\0")));
+}
+
+fn chars(b: &[u8]) -> PvField {
+    epics_bridge_rs::convert::epics_to_pv_field(&EpicsValue::CharArray(b.to_vec().into()))
 }
 
 /// The SECOND channel for a `$` name — the one `BridgeProvider` builds from
@@ -311,18 +308,16 @@ async fn a_cached_dollar_channel_keeps_the_view_of_its_name() {
 
     let first = build("TEST:cached.VAL$").await;
     let cached = build("TEST:cached.VAL$").await;
-    assert!(
-        matches!(cached.nt_type(), NtType::LongString),
-        "the cached channel advertises the same long-string NT"
+    assert_eq!(
+        cached.nt_type(),
+        NtType::Dollar(PvaDollar::Chars),
+        "the cached channel advertises the same char-image NT"
     );
 
-    let of = |r: &PvStructure| match extract_value(r).expect("NTScalar.value") {
-        PvField::Scalar(ScalarValue::String(s)) => s.clone(),
-        other => panic!("expected a string scalar, got {other:?}"),
-    };
+    let of = |r: &PvStructure| extract_value(r).expect("value").clone();
     let a = of(&first.get(&empty_request()).await.expect("first get"));
     let b = of(&cached.get(&empty_request()).await.expect("cached get"));
-    assert_eq!(a, "seed");
+    assert_eq!(a, chars(b"seed\0"));
     assert_eq!(a, b, "the cached channel serves what the fresh one serves");
 
     // The unviewed channel for the SAME field is a different channel, and
@@ -331,7 +326,7 @@ async fn a_cached_dollar_channel_keeps_the_view_of_its_name() {
     let plain = build("TEST:cached.VAL").await;
     assert_eq!(
         of(&plain.get(&empty_request()).await.expect("plain get")),
-        "seed"
+        PvField::Scalar(ScalarValue::String("seed".into()))
     );
 }
 
@@ -368,8 +363,8 @@ async fn dollar_modifier_serves_link_field_as_string() {
     };
     assert_eq!(ch.field(), "FLNK");
     assert!(
-        matches!(ch.nt_type(), NtType::LongString),
-        "`$` link field must be served as the long-string NTScalar view"
+        matches!(ch.nt_type(), NtType::Dollar(PvaDollar::Text)),
+        "`$` link field must be served as its text"
     );
 
     let result = ch.get(&empty_request()).await.expect("get");
@@ -383,8 +378,9 @@ async fn dollar_modifier_serves_link_field_as_string() {
 /// `$` is innermost in the channel name (`REC.FIELD$[range]{json}`), so it
 /// must coexist with a trailing channel-filter suffix (C parses `$` then
 /// `[range]` then `{json}`, `dbChannel.c:486-516`). A `$` channel that
-/// also carries a JSON filter still resolves to the long-string view, and
-/// the filter chain is attached for the read path.
+/// also carries a JSON filter still resolves to the char image, and the
+/// filter chain is attached for the read path: `softIocPVX` 1.5.3 serves
+/// `REC.VAL${"dbnd":{"d":0.5}}` as `REC.VAL$`.
 #[tokio::test]
 async fn dollar_modifier_with_filter_suffix_resolves() {
     use epics_bridge_rs::qsrv::provider::BridgeProvider;
@@ -404,18 +400,11 @@ async fn dollar_modifier_with_filter_suffix_resolves() {
         _ => panic!("expected single-record channel"),
     };
     assert_eq!(ch.field(), "VAL");
-    assert!(
-        matches!(ch.nt_type(), NtType::LongString),
-        "`$`+filter string channel must still be the long-string view"
-    );
+    assert_eq!(ch.nt_type(), NtType::Dollar(PvaDollar::Chars));
     // The stream-only `dbnd` filter short-circuits in read context, so the
-    // GET still returns the underlying string.
+    // GET still returns the underlying image.
     let result = ch.get(&empty_request()).await.expect("get");
-    let value = extract_value(&result).expect("NTScalar.value");
-    match value {
-        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "seed"),
-        other => panic!("expected string scalar, got {other:?}"),
-    }
+    assert_eq!(extract_value(&result), Some(&chars(b"seed\0")));
 }
 
 /// `$` on a non-string, non-link field is `S_dbLib_fieldNotFound` in C
@@ -699,7 +688,8 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
         "`[1:3]` must serve the slice, not the full array"
     );
 
-    // `[N]` single element selects index N only.
+    // `[N]` selects index N only, and one element is a scalar channel:
+    // softIocPVX 1.5.3 serves `W.VAL[2]` over `[1,2,3]` as `int32_t = 3`.
     let ch1 = single(
         provider
             .create_channel_for("TEST:rng_wf.VAL[2]", "u", "h")
@@ -707,8 +697,8 @@ async fn legacy_array_range_modifier_resolves_and_slices() {
             .expect("`[2]` range resolves"),
     );
     assert_eq!(
-        doubles(&ch1.get(&empty_request()).await.expect("get")),
-        vec![30.0],
+        extract_value(&ch1.get(&empty_request()).await.expect("get")),
+        Some(&PvField::Scalar(ScalarValue::Double(30.0))),
         "`[2]` must serve only element 2"
     );
 
@@ -834,8 +824,8 @@ async fn lsi_long_string_get_put_round_trips_as_string() {
         .await
         .unwrap();
 
-    // `BridgeChannel::new` classifies the channel from the record's
-    // `long_string_fields` declaration.
+    // `BridgeChannel::new` classifies the channel from the field.s
+    // `FieldDesc::long_string` declaration.
     let ch = BridgeChannel::new(db.clone(), "TEST:lsi")
         .await
         .expect("new");
@@ -1699,9 +1689,9 @@ async fn a_one_character_long_string_stays_a_long_string() {
     );
 }
 
-/// A PVA put to `$` is pvxs's `putLongString`, `dbPut(DBR_CHAR, str,
-/// strlen+1)`: SIZV bounds it, not `DBR_STRING`'s 40. softIoc R7.0.10 with
-/// `lsi` SIZV 50 stores 45 characters and LEN 46.
+/// A PVA put to `$` is `dbPut(DBR_CHAR)` of its `int8_t[]`: SIZV bounds it,
+/// not `DBR_STRING`'s 40. `softIocPVX` 1.5.3, an lso SIZV 64 given 45
+/// characters and the NUL, reads back `{46}[…]` on `$` and the text plain.
 #[tokio::test]
 async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     let db = Arc::new(PvDatabase::new());
@@ -1713,12 +1703,10 @@ async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     let ch = BridgeChannel::new(db.clone(), "TEST:li.VAL$")
         .await
         .expect("new");
-    let text: String = ('a'..='z').chain('A'..='S').collect();
-    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
-    put.fields.push((
-        "value".into(),
-        PvField::Scalar(ScalarValue::String(text.as_str().into())),
-    ));
+    let mut image: Vec<u8> = (b'a'..=b'z').chain(b'A'..=b'S').collect();
+    image.push(0);
+    let mut put = PvStructure::new("epics:nt/NTScalarArray:1.0");
+    put.fields.push(("value".into(), chars(&image)));
     ch.put(&put).await.expect("`$` put");
     assert_eq!(
         db.get_pv("TEST:li.LEN").expect("LEN"),
@@ -1726,6 +1714,340 @@ async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     );
     assert_eq!(
         extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
-        &PvField::Scalar(ScalarValue::String(text.as_str().into()))
+        &chars(&image)
     );
+}
+
+/// Every value a started monitor on `ch` posts: `put` runs at the first
+/// 300 ms without an event, and the next quiet 300 ms ends the watch.
+async fn monitor_values(
+    ch: &BridgeChannel,
+    put: impl std::future::Future<Output = ()>,
+) -> Vec<PvField> {
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    let mut mon = ch.create_monitor().await.expect("monitor");
+    mon.start().await.expect("start");
+    let mut seen = Vec::new();
+    let mut put = Some(Box::pin(put));
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(300), mon.poll()).await {
+            Ok(Some(ev)) => seen.push(extract_value(&ev.value).expect("value").clone()),
+            Ok(None) => break,
+            Err(_) => match put.take() {
+                Some(p) => p.await,
+                None => break,
+            },
+        }
+    }
+    seen
+}
+
+/// A plain lso VAL monitor posts the text. `softIocPVX` 1.5.3,
+/// `record(lso,"LS64"){field(SIZV,"64")}`, `pvxmonitor LS64.VAL` while
+/// `pvxput LS64.VAL abc`: `""` then `"abc"`.
+#[tokio::test]
+async fn lso_long_string_monitor_posts_the_text() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lso, "LS64") { field(SIZV, "64") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let val = BridgeChannel::new(db.clone(), "LS64").await.expect("VAL");
+    let writer = BridgeChannel::new(db.clone(), "LS64")
+        .await
+        .expect("writer");
+    let put = async move {
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::String("abc".into())),
+        ));
+        writer.put(&put).await.expect("put");
+    };
+    let string = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+    // The initial event is the server's read (`monitor.rs` caches none).
+    let initial = val.get(&empty_request()).await.expect("get");
+    assert_eq!(extract_value(&initial), Some(&string("")));
+    assert_eq!(monitor_values(&val, put).await, vec![string("abc")]);
+}
+
+/// The records the `$` pins below read, as `softIocPVX` 1.5.3 loaded them.
+async fn dollar_db() -> Arc<PvDatabase> {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"
+            record(lso, "LZ:O") { field(SIZV, "64") }
+            record(lso, "LZ:F") { field(SIZV, "64") info(Q:form, "String") }
+            record(lso, "LZ:S") { field(SIZV, "20") }
+            record(lsi, "LZ:J") { field(SIZV, "64") }
+            record(waveform, "LZ:W") { field(FTVL, "STRING") field(NELM, "4") }
+            record(calcout, "LZ:C") { field(INPA, "LZ:J") }
+            "#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db
+}
+
+async fn dollar_put(db: &Arc<PvDatabase>, name: &str, value: PvField) {
+    let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+    let mut put = PvStructure::new("structure");
+    put.fields.push(("value".into(), value));
+    ch.put(&put).await.expect("put");
+}
+
+fn text(t: &str) -> PvField {
+    PvField::Scalar(ScalarValue::String(t.into()))
+}
+
+fn strings(t: &[&str]) -> PvField {
+    epics_bridge_rs::convert::epics_to_pv_field(&EpicsValue::StringArray(
+        t.iter().map(|s| (*s).into()).collect::<Vec<_>>().into(),
+    ))
+}
+
+/// A `$` GET per shape, each the `pvxget -r value` answer of `softIocPVX`
+/// 1.5.3 over the same records after `pvxput LZ:O world`, `LZ:F world`,
+/// `LZ:S abc` and `LZ:W '["abc","de"]'`.
+#[tokio::test]
+async fn a_dollar_get_serves_what_softiocpvx_serves() {
+    let db = dollar_db().await;
+    for (name, t) in [("LZ:O", "world"), ("LZ:F", "world"), ("LZ:S", "abc")] {
+        dollar_put(&db, name, text(t)).await;
+    }
+    dollar_put(&db, "LZ:W", strings(&["abc", "de"])).await;
+    let cases = [
+        ("LZ:O.VAL$", chars(b"world\0")),
+        ("LZ:O.DESC$", chars(b"\0")),
+        ("LZ:O.RTYP$", chars(b"lso\0")),
+        ("LZ:S.VAL$", chars(b"abc\0")),
+        ("LZ:J.VAL$", chars(b"")),
+        ("LZ:W.VAL$", chars(b"ab")),
+        ("LZ:F.VAL$", text("world")),
+        ("LZ:C.INPA$", text("LZ:J NPP NMS")),
+    ];
+    for (name, want) in cases {
+        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let got = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(extract_value(&got), Some(&want), "{name}");
+    }
+}
+
+/// A `$` monitor per shape: `softIocPVX` 1.5.3's `pvxmonitor -r value`
+/// over `pvxput LZ:O again`, `LZ:W '["xyz"]'`, `LZ:F again`, and
+/// `LZ:C.INPA$` over `pvxput LZ:C.INPA LZ:O`.
+#[tokio::test]
+async fn a_dollar_monitor_serves_what_softiocpvx_serves() {
+    let db = dollar_db().await;
+    let cases = [
+        ("LZ:O", text("again"), chars(b"again\0")),
+        ("LZ:W", strings(&["xyz"]), chars(b"x")),
+        ("LZ:F", text("again"), text("again")),
+    ];
+    for (name, second, want) in cases {
+        let ch = BridgeChannel::new(db.clone(), &format!("{name}.VAL$"))
+            .await
+            .expect(name);
+        let put = dollar_put(&db, name, second);
+        assert_eq!(monitor_values(&ch, put).await, vec![want], "{name}");
+    }
+    let ch = BridgeChannel::new(db.clone(), "LZ:C.INPA$")
+        .await
+        .expect("LZ:C.INPA$");
+    let put = dollar_put(&db, "LZ:C.INPA", text("LZ:O"));
+    assert_eq!(
+        monitor_values(&ch, put).await,
+        vec![text("LZ:O NPP NMS")],
+        "LZ:C.INPA$"
+    );
+}
+
+/// An `int8_t[]` put to a `$` channel is `dbPut(DBR_CHAR)`, its NUL
+/// supplied when absent: `softIocPVX` 1.5.3, `pvxput 'LZ:O.VAL$'
+/// '[104,105,0]'` reads back `"hi"` and `{3}[104,105,0]`, and `'[106,107]'`
+/// reads back `"jk"` and `{3}[106,107,0]`.
+#[tokio::test]
+async fn a_dollar_char_put_is_a_dbr_char_put() {
+    let db = dollar_db().await;
+    for (put, t, image) in [(&b"hi\0"[..], "hi", &b"hi\0"[..]), (b"jk", "jk", b"jk\0")] {
+        dollar_put(&db, "LZ:O.VAL$", chars(put)).await;
+        for (name, want) in [("LZ:O", text(t)), ("LZ:O.VAL$", chars(image))] {
+            let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+            let got = ch.get(&empty_request()).await.expect("get");
+            assert_eq!(extract_value(&got), Some(&want), "{name}");
+        }
+    }
+}
+
+/// An `arr` slice of a `$` channel: C's filter cuts the `field_size` image
+/// and `dbGet` then forces a NUL into the last element and cuts at the first
+/// (`dbAccess.c:1037-1045`). `softIocPVX` 1.5.3 over
+/// `record(stringin,"FS"){field(VAL,"hello")}`, `pvxget -r value`.
+#[tokio::test]
+async fn a_dollar_arr_slice_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"
+            record(stringin, "FS") { field(VAL, "hello") }
+            "#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let cases = [
+        (r#"FS.VAL$"#, chars(b"hello\0")),
+        (r#"FS.VAL${"arr":{"s":1,"e":3}}"#, chars(b"el\0")),
+        (r#"FS.VAL${"arr":{"s":-3}}"#, chars(b"\0")),
+        (r#"FS.VAL${"arr":{"s":1,"e":-1}}"#, chars(b"ello\0")),
+        (r#"FS.VAL${"arr":{"s":3,"e":8}}"#, chars(b"lo\0")),
+        (r#"FS.VAL${"arr":{"s":1,"e":3,"i":2}}"#, chars(b"e\0")),
+        (r#"FS.VAL${"arr":{"s":2,"e":5}}"#, chars(b"llo\0")),
+    ];
+    for (name, want) in cases {
+        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let got = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(extract_value(&got), Some(&want), "{name}");
+    }
+}
+
+/// A `$` monitor slices the char image, as its GET does: `softIocPVX`
+/// 1.5.3's `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":3}}'` over `pvxput FS
+/// world`, `FS ab`, `FS x`.
+#[tokio::test]
+async fn a_dollar_arr_monitor_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let ch = BridgeChannel::new(db.clone(), r#"FS.VAL${"arr":{"s":1,"e":3}}"#)
+        .await
+        .expect("channel");
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    let mut mon = ch.create_monitor().await.expect("monitor");
+    mon.start().await.expect("start");
+    for (t, want) in [("world", &b"or\0"[..]), ("ab", b"b\0"), ("x", b"\0")] {
+        dollar_put(&db, "FS", text(t)).await;
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), mon.poll())
+            .await
+            .expect("a monitor update")
+            .expect("open");
+        assert_eq!(extract_value(&ev.value), Some(&chars(want)), "{t}");
+    }
+}
+
+/// A one-element `arr` slice is a scalar channel: `softIocPVX` 1.5.3's
+/// `pvxget` over `FS` = "hello", `W` = `[1,2,3]` and `LS` = "hey", and
+/// `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":1}}'` over `pvxput FS world`,
+/// `FS ab`, `FS x`.
+#[tokio::test]
+async fn a_one_element_arr_slice_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") }
+            record(waveform, "W") { field(FTVL, "LONG") field(NELM, "5") }
+            record(lsi, "LS") { field(SIZV, "20") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    dollar_put(
+        &db,
+        "W",
+        PvField::ScalarArrayTyped(epics_pva_rs::pvdata::TypedScalarArray::Int(
+            vec![1, 2, 3].into(),
+        )),
+    )
+    .await;
+    dollar_put(&db, "LS", text("hey")).await;
+    let cases = [
+        (r#"FS.VAL${"arr":{"s":1,"e":1}}"#, ScalarValue::Byte(101)),
+        (r#"LS.VAL${"arr":{"s":1,"e":1}}"#, ScalarValue::Byte(101)),
+        (r#"W.VAL{"arr":{"s":1,"e":1}}"#, ScalarValue::Int(2)),
+    ];
+    for (name, want) in cases {
+        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let epics_pva_rs::pvdata::FieldDesc::Structure { fields, .. } =
+            ch.get_field().await.expect("get_field")
+        else {
+            panic!("{name}: no NT descriptor");
+        };
+        let desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+        assert_eq!(
+            desc,
+            Some(&epics_pva_rs::pvdata::FieldDesc::Scalar(want.scalar_type())),
+            "{name}"
+        );
+        let got = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(extract_value(&got), Some(&PvField::Scalar(want)), "{name}");
+    }
+    let ch = BridgeChannel::new(db.clone(), r#"FS.VAL${"arr":{"s":1,"e":1}}"#)
+        .await
+        .expect("channel");
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    let mut mon = ch.create_monitor().await.expect("monitor");
+    mon.start().await.expect("start");
+    for (t, want) in [("world", 111), ("ab", 98), ("x", 0)] {
+        dollar_put(&db, "FS", text(t)).await;
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), mon.poll())
+            .await
+            .expect("a monitor update")
+            .expect("open");
+        assert_eq!(
+            extract_value(&ev.value),
+            Some(&PvField::Scalar(ScalarValue::Byte(want))),
+            "{t}"
+        );
+    }
+}
+
+/// A link's or an attribute's `$` through `arr` is its text re-read at the
+/// slice's count, from the start: `softIocPVX` 1.5.3's `pvxget`, `LK.INP`
+/// being `FS NPP NMS`.
+#[tokio::test]
+async fn a_dollar_link_arr_slice_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") }
+            record(stringin, "LK") { field(INP, "FS NPP") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let byte = |b| PvField::Scalar(ScalarValue::Byte(b));
+    let cases = [
+        ("LK.INP$", text("FS NPP NMS")),
+        (r#"LK.INP${"arr":{"s":0,"e":1}}"#, text("F")),
+        (r#"LK.INP${"arr":{"s":0,"e":2}}"#, text("FS")),
+        (r#"LK.INP${"arr":{"s":1,"e":3}}"#, text("FS")),
+        (r#"LK.INP${"arr":{"s":1,"e":1}}"#, byte(0)),
+        (r#"LK.INP${"arr":{"s":0,"e":5}}"#, text("FS NP")),
+        (r#"LK.INP${"arr":{"s":2}}"#, text("FS NPP NMS")),
+        ("FS.RTYP$", chars(b"stringin\0")),
+        (r#"FS.RTYP${"arr":{"s":1,"e":3}}"#, chars(b"st\0")),
+        (r#"FS.RTYP${"arr":{"s":1,"e":1}}"#, byte(0)),
+        (r#"FS.RTYP${"arr":{"s":0,"e":0}}"#, byte(0)),
+    ];
+    for (name, want) in cases {
+        let ch = BridgeChannel::new(db.clone(), name).await.expect(name);
+        let got = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(extract_value(&got), Some(&want), "{name}");
+    }
 }

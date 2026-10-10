@@ -50,6 +50,16 @@ impl<T> SharedArray<T> {
         Arc::get_mut(&mut self.buf)
     }
 
+    /// Write access to the served elements in place, while this is the only
+    /// holder, whatever the view's length; `None` where a write would copy.
+    /// Unlike [`get_mut`](Self::get_mut), a [`head`](Self::head) view whose
+    /// source has gone qualifies, and the unused tail stays as it was.
+    #[inline]
+    pub fn head_mut(&mut self) -> Option<&mut [T]> {
+        let len = self.len;
+        Arc::get_mut(&mut self.buf).map(|buf| &mut buf[..len])
+    }
+
     /// Whether both views read the same buffer.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.buf, &other.buf)
@@ -273,6 +283,19 @@ mod tests {
         assert_eq!(&*h, &[7, 2]);
         assert_eq!(h.buffer().len(), 2);
         assert_eq!(&*a, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn head_mut_writes_a_sole_head_view_in_place() {
+        let full: SharedArray<u8> = vec![1, 2, 3, 4].into();
+        let mut head = full.head(2);
+        assert!(head.head_mut().is_none(), "the source still reads it");
+        drop(full);
+        let buf = Arc::as_ptr(head.buffer());
+        head.head_mut().expect("sole holder")[1] = 9;
+        assert_eq!(&*head, &[1, 9]);
+        assert_eq!(&head.buffer()[..], &[1, 9, 3, 4]);
+        assert_eq!(Arc::as_ptr(head.buffer()), buf, "no copy");
     }
 
     #[test]

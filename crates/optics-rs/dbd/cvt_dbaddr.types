@@ -6,7 +6,7 @@
 # here, citing the C, and the generator refuses to emit a `SPC_DBADDR` field
 # that has no row (`emit::field_dbf`).
 #
-# record.FIELD  DBF_TYPE    SPC_xxx      selector|-   cite
+# record.FIELD  DBF_TYPE    SPC_xxx      selector|-   size|-  cite
 #
 # tableRecord.c:745-747 — every one of the eight is typed unconditionally:
 #     paddr->field_type = DBF_DOUBLE; paddr->dbr_field_type = DBR_DOUBLE;
@@ -15,11 +15,11 @@
 # `A`/`B` are the 3x3 geometry matrices (no_elements 9, tableRecord.c:735-740);
 # `PP0..PP2`/`PPO0..PPO2` are the 3-element pivot/offset vectors
 # (no_elements 3, tableRecord.c:741-743).
-table.A     DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:735-736,745
-table.B     DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:738-739,745
-table.PP0   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
-table.PP1   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
-table.PP2   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
-table.PPO0  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
-table.PPO1  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
-table.PPO2  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.A     DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:735-736,745
+table.B     DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:738-739,745
+table.PP0   DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745
+table.PP1   DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745
+table.PP2   DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745
+table.PPO0  DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745
+table.PPO1  DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745
+table.PPO2  DBF_DOUBLE  SPC_DBADDR  -   -       tableRecord.c:741-743,745

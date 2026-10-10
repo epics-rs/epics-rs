@@ -1,6 +1,8 @@
 use super::lsi::LongStringVal;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{InputLinkRequest, LinkReadAs, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDeclaration, InputLinkRequest, LinkReadAs, ProcessOutcome, Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Truncate `s` to at most `max` bytes. C keeps the result in a fixed
@@ -917,14 +919,10 @@ impl Record for PrintfRecord {
         true
     }
 
-    fn long_string_fields(&self) -> &'static [&'static str] {
-        &["VAL"]
-    }
-
     /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
     /// `printfRecord.c:416`), whatever LEN holds.
     fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        self.long_string_fields().contains(&field).then_some(1)
+        self.field_is_long_string(field).then_some(1)
     }
 
     fn uses_monitor_deadband(&self) -> bool {

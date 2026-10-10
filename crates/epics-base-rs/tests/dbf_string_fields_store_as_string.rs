@@ -88,12 +88,8 @@ fn every_dbf_string_field_reports_dbf_string() {
         // A long-string field is `DBF_NOACCESS` + `SPC_DBADDR` in C and is
         // refused at load by name, above the parse (`db_loader/mod.rs:1675`),
         // so its stored `CharArray` never reaches `parse_bytes`.
-        let long_strings = rec.long_string_fields();
-
         for f in fields {
-            if f.dbf_type != DbFieldType::String
-                || long_strings.iter().any(|l| l.eq_ignore_ascii_case(f.name))
-            {
+            if f.dbf_type != DbFieldType::String || f.long_string {
                 continue;
             }
             // A field the record does not answer for is framework-owned (INP,

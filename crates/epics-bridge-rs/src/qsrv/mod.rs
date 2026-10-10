@@ -56,5 +56,5 @@ pub use pva_adapter::{
 // reactor-gated in their own crates. See the definition for the full
 // reasoning.
 #[cfg(all(feature = "qsrv", tokio_backend))]
-pub use pva_adapter::{run_ca_pva_qsrv_ioc, run_ca_pva_qsrv_ioc_app};
+pub use pva_adapter::{run_ca_pva_qsrv_ioc_app, run_qsrv_ioc_app};
 pub use pvif::{FieldMapping, NtType};

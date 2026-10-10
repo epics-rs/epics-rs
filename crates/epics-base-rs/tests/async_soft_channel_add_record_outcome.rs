@@ -83,7 +83,6 @@ async fn a_refused_inp_is_never_read_devaisoftcallback_c_171() {
 }
 
 #[epics_macros_rs::epics_test]
-#[ignore = "needs the add_record local-record lookup armed by the init caller"]
 async fn a_pv_name_opens_a_local_channel_devaisoftcallback_c_95() {
     let (db, log) = processed(&["A1", "A2", "A3"]).await;
     for name in ["A2", "A3"] {
@@ -96,7 +95,13 @@ async fn a_pv_name_opens_a_local_channel_devaisoftcallback_c_95() {
         );
     }
     assert!(!log.contains("PV: A1"), "{log:?}");
-    assert_eq!(state(&db, "A1"), (5.0, 0.0, 0.0, 0.0));
     assert_eq!(state(&db, "A2"), (0.0, 0.0, 0.0, 0.0));
     assert_eq!(state(&db, "A3"), (0.0, 0.0, 0.0, 0.0));
+}
+
+#[epics_macros_rs::epics_test]
+#[ignore = "the port reads a CA-flagged Async INP over CA; add_record opens it as a local dbChannel"]
+async fn a_ca_flagged_pv_name_reads_the_local_record_devaisoftcallback_c_95() {
+    let (db, _) = processed(&["A1"]).await;
+    assert_eq!(state(&db, "A1"), (5.0, 0.0, 0.0, 0.0));
 }

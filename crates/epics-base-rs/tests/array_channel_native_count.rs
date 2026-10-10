@@ -27,7 +27,7 @@
 //! * `lsi` / `lso` / `printf` — C's `cvt_dbaddr` sets `no_elements = 1` and
 //!   `field_type = DBF_STRING` (`lsiRecord.c:141-143`): a long string is ONE
 //!   string element on the channel, not a capacity. The CA server already
-//!   serves that through `Record::long_string_fields`.
+//!   serves that through `FieldDesc::long_string`.
 //! * `sCalcout` — `no_elements = STRING_SIZE`, a constant, with no
 //!   `get_array_info` to disagree with it.
 

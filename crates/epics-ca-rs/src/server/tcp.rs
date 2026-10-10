@@ -265,6 +265,7 @@ use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
+use epics_base_rs::server::database::filters::ChannelCreateError;
 use epics_base_rs::server::database::{PvDatabase, PvEntry};
 use epics_base_rs::server::pv::ProcessVariable;
 use epics_base_rs::server::record::{FieldDeclaration, RecordCell};
@@ -666,6 +667,10 @@ struct ChannelEntry {
     /// waveform) — clamping to the live length would truncate a
     /// legitimate `caget -# NELM` on a dynamic waveform.
     final_element_count: u32,
+    /// The field's own element count, C `paddr->no_elements`: what an
+    /// autosize request reads, whatever the filters make of the log
+    /// (`camessage.c:512-514`).
+    field_element_count: u32,
     /// The subscriptions installed on this channel, by monitor id — C
     /// `pciu->eventq`, the per-channel `event_ext` list `clear_channel_reply`
     /// drains (`camessage.c:1890-1903`).
@@ -754,10 +759,10 @@ struct SubscriptionEntry {
     /// [`MonitorGate`](crate::server::outbox::MonitorGate).
     gate: crate::server::outbox::MonitorGate,
     task: epics_base_rs::runtime::task::TaskHandle<()>,
-    /// mirrors `ChannelEntry::long_string_mode`; stored here so the
-    /// access-restore path and `reeval_access_rights` can apply the
-    /// same boundary conversion without re-borrowing the channel entry.
-    long_string_mode: LongStringMode,
+    /// What the producer reads each event through; stored here so the
+    /// access-restore path sends its single event through the same stage
+    /// without re-borrowing the channel entry.
+    stage: super::DeliveryStage,
     /// The validated `DBE_*` mask this EVENT_ADD requested — C
     /// `pevent->select` (`dbEvent.c:482`). `db_post_single_event` seeds
     /// the synthetic log's mask from it (`:746-754`, `:914-927`), so the
@@ -3012,6 +3017,31 @@ pub(crate) async fn dispatch_message(
             if let Some(entry) = db.find_entry_from(record_path, Some(peer)).await {
                 let sid = state.alloc_sid();
 
+                // C `dbChannelCreate` returning NULL — a field or `$` the
+                // record refuses, or a filter suffix `chf_parse` stops on —
+                // is CREATE_CH_FAIL on the CA wire.
+                let channel =
+                    match epics_base_rs::server::database::filters::db_channel_create(db, &pv_name)
+                    {
+                        Ok(channel) => channel,
+                        Err(e) => {
+                            tracing::debug!(
+                                pv = %pv_name,
+                                error = %e,
+                                "rejecting CREATE_CHAN: dbChannelCreate failed",
+                            );
+                            let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                            fail.cid = client_cid;
+                            writer.push(fail.to_bytes().to_vec());
+                            let reason = match e {
+                                ChannelCreateError::NotFound => "not_found",
+                                ChannelCreateError::Filter(_) => "filter_parse_fail",
+                            };
+                            state.audit("create_chan", &pv_name, "", reason);
+                            return Ok(());
+                        }
+                    };
+
                 let (dbr_type, element_count, target, long_string_mode) = match entry {
                     PvEntry::Simple(pv) => {
                         let value = pv.get();
@@ -3037,6 +3067,9 @@ pub(crate) async fn dispatch_message(
                                 LongStringMode::DollarChar {
                                     no_elements: 40,
                                     nul_at_count: true,
+                                    view: epics_base_rs::server::database::char_view::DollarView::of_string(
+                                        40, &channel.chain,
+                                    ),
                                 },
                             )
                         } else {
@@ -3083,9 +3116,14 @@ pub(crate) async fn dispatch_message(
                                     match epics_base_rs::server::database::char_view::char_view(
                                         &instance, &field,
                                     ) {
-                                        Some(view) => {
-                                            Some((view.no_elements as u32, view.nul_at_count()))
-                                        }
+                                        Some(view) => Some((
+                                            view.no_elements as u32,
+                                            view.nul_at_count(),
+                                            epics_base_rs::server::database::char_view::DollarView::of(
+                                                &instance, &field, &channel.chain,
+                                            )
+                                            .expect("char_view answered this field"),
+                                        )),
                                         None => {
                                             let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                                             fail.cid = client_cid;
@@ -3097,20 +3135,17 @@ pub(crate) async fn dispatch_message(
                                     None
                                 };
                                 let (dbr_type_val, element_count, mode) =
-                                    if let Some((no_elements, nul_at_count)) = dollar {
+                                    if let Some((no_elements, nul_at_count, view)) = dollar {
                                         (
                                             DbFieldType::Char,
                                             no_elements,
                                             LongStringMode::DollarChar {
                                                 no_elements,
                                                 nul_at_count,
+                                                view,
                                             },
                                         )
-                                    } else if instance
-                                        .record
-                                        .long_string_fields()
-                                        .contains(&field.as_str())
-                                    {
+                                    } else if instance.record.field_is_long_string(&field) {
                                         // Long-string *record* field (lsi/lso VAL &
                                         // OVAL, printf VAL). C `cvt_dbaddr` presents
                                         // it as a scalar `DBF_STRING` with
@@ -3157,23 +3192,7 @@ pub(crate) async fn dispatch_message(
                     }
                 };
 
-                // Parse the channel-filter suffix STRICTLY at channel
-                // creation — EPICS `dbChannelCreate()` parity. C runs
-                // `chf_parse()` while building the channel; a malformed /
-                // non-object suffix, an unknown filter name, or a filter
-                // whose own `parse_end()` rejects its config sets `status`,
-                // and at `finish:` `dbChannelCreate()` does
-                // `dbChannelDelete(chan); chan = NULL` and returns NULL —
-                // i.e. CREATE_CH_FAIL on the CA wire (dbChannel.c:176-182 for
-                // the unknown name, :285-300 where a rejected parse becomes
-                // `S_db_notFound`, :512-529 for the call and the cleanup).
-                // The earlier CA path used the
-                // permissive `parse_filter_chain`, which fails OPEN to an
-                // unfiltered channel on a bad suffix, so a typo in a filter
-                // used to throttle / slice / synchronize exposure read the
-                // raw stream where C refuses the channel.
-                //
-                // On success the validated chain also yields the
+                // The validated chain also yields the
                 // filter-FINAL element count (C `dbChannelFinalElements`):
                 // a count-reshaping filter (`arr` slice) shrinks how many
                 // elements the channel can ever deliver, and the client
@@ -3181,27 +3200,12 @@ pub(crate) async fn dispatch_message(
                 // — and buffer allocation — match the filtered payload. An
                 // empty / value-gating-only chain folds to the identity, so
                 // unfiltered channels keep their native count unchanged.
-                let element_count = match &filter_suffix {
-                    Some(json) => {
-                        match epics_base_rs::server::database::filters::try_parse_filter_chain(json)
-                        {
-                            Ok(chain) => chain.final_element_count(element_count as usize) as u32,
-                            Err(e) => {
-                                tracing::debug!(
-                                    pv = %pv_name,
-                                    error = %e,
-                                    "rejecting CREATE_CHAN: invalid channel-filter suffix",
-                                );
-                                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                                fail.cid = client_cid;
-                                writer.push(fail.to_bytes().to_vec());
-                                state.audit("create_chan", &pv_name, "", "filter_parse_fail");
-                                return Ok(());
-                            }
-                        }
-                    }
-                    None => element_count,
-                };
+                let field_element_count = element_count;
+                let element_count =
+                    channel.chain.final_element_count(element_count as usize) as u32;
+                // C claims `dbChannelFinalCAType`, the type the filters'
+                // probe ends at (`camessage.c:1202`).
+                let dbr_type = channel.final_field_type(dbr_type);
 
                 let (access, rule_was_trap) = state.compute_access(&target).await;
                 let access_level = match access {
@@ -3223,6 +3227,7 @@ pub(crate) async fn dispatch_message(
                         // announced in the CREATE_CHAN reply — the ceiling
                         // a later request's element count is clamped to.
                         final_element_count: element_count,
+                        field_element_count,
                         subscriptions: HashMap::new(),
                     },
                 );
@@ -3248,7 +3253,7 @@ pub(crate) async fn dispatch_message(
                     element_count
                 };
                 let mut resp = CaHeader::new(CA_PROTO_CREATE_CHAN);
-                resp.data_type = dbr_type as u16;
+                resp.data_type = dbr_type.ca_wire_type();
                 resp.cid = client_cid;
                 resp.available = sid;
                 resp.set_payload_size(0, nelem, state.client_minor_version)
@@ -3557,7 +3562,9 @@ pub(crate) async fn dispatch_message(
             // BEFORE the requested-count truncate so the client's `-#`
             // count caps the FILTERED result, matching C (arr slices
             // first, then the count limits).
-            let read_chain = entry.filter_chain();
+            // C's `dbChannel` order whatever the JSON order: the pre chain,
+            // then the post chain on a `$` channel's char image.
+            let (read_chain, post_chain) = entry.filter_chain().split();
             if !read_chain.is_empty() {
                 if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
                     snapshot.value = v;
@@ -3572,7 +3579,18 @@ pub(crate) async fn dispatch_message(
             // `NativeString` is the inverse — a long-string record field
             // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
             // string so plain access ships one DBR_STRING (C cvt_dbaddr).
-            super::apply_long_string_mode(&mut snapshot, entry.long_string_mode, requested_count);
+            let stage = super::DeliveryStage::new(
+                post_chain,
+                entry.long_string_mode,
+                entry.field_element_count,
+            );
+            if !stage.is_identity() {
+                // The post chain drops nothing (`arr`, `ts`), so `None` is
+                // unreachable; it keeps the value as read.
+                if let Some(read) = stage.prepare_snapshot(snapshot.clone(), requested_count, 0) {
+                    snapshot = read;
+                }
+            }
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
                 snapshot.value.truncate(requested_count as usize);
@@ -3795,7 +3813,7 @@ pub(crate) async fn dispatch_message(
                             denied: s.denied,
                             gate: s.gate.clone(),
                             task: s.task,
-                            long_string_mode: s.long_string_mode,
+                            stage: s.stage,
                             select_mask: s.mask,
                         },
                     );
@@ -5340,7 +5358,7 @@ pub(crate) struct SpawnedSubscription {
     pub data_type: u16,
     pub data_count: u32,
     pub denied: Arc<AtomicBool>,
-    pub long_string_mode: LongStringMode,
+    pub stage: super::DeliveryStage,
     pub sub_pv_name: String,
     pub mask: u16,
 }
@@ -5361,7 +5379,7 @@ pub(crate) struct RegisteredSubscription {
     pub data_count: u32,
     pub denied: Arc<AtomicBool>,
     pub gate: crate::server::outbox::MonitorGate,
-    pub long_string_mode: LongStringMode,
+    pub stage: super::DeliveryStage,
     pub client_minor: u16,
     pub stats: Option<Arc<super::stats::ServerStats>>,
 }
@@ -5547,6 +5565,11 @@ pub(crate) async fn register_subscription(
     // released before then).
     let sub_pv_name = entry.pv_name.clone();
     let long_string_mode = entry.long_string_mode;
+    // C's `dbChannel` order whatever the JSON order: the pre chain runs on
+    // the post, the post chain as each event is read (`dbEvent.c:901,923`,
+    // `:984-985`).
+    let (pre_chain, post_chain) = entry.filter_chain().split();
+    let stage = super::DeliveryStage::new(post_chain, long_string_mode, entry.field_element_count);
     // Captured with them and for the same reason: the blocking driver's event
     // thread addresses its retirement frame by the CLIENT's cid, and the
     // `entry` borrow is released before the hand-off is built.
@@ -5647,7 +5670,7 @@ pub(crate) async fn register_subscription(
                 // record-field `attach_filter_to_last_subscriber`
                 // path below; both source the chain from the single
                 // `ChannelEntry::filter_chain` owner.
-                pv.attach_filters_to_subscriber(sub_id, entry.filter_chain());
+                pv.attach_filters_to_subscriber(sub_id, pre_chain);
 
                 let denied = Arc::new(AtomicBool::new(access_denied));
                 // One gate per subscription, revoked by whichever teardown
@@ -5685,6 +5708,8 @@ pub(crate) async fn register_subscription(
                     let snap = pv.snapshot();
                     if entry
                         .filter_chain()
+                        .split()
+                        .0
                         .apply_to_event_value(
                             snap.value.clone(),
                             epics_base_rs::server::recgbl::EventMask::from_bits(mask),
@@ -5723,21 +5748,19 @@ pub(crate) async fn register_subscription(
                     // only `if(pLog)`), so send no initial
                     // frame — never fall back to the unfiltered
                     // value.
-                    let init_chain = entry.filter_chain();
-                    match init_chain.apply_to_event_value(
-                        snap.value.clone(),
-                        epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                    ) {
-                        Some(v) => {
+                    // The pre chain on the post, then the post chain and
+                    // the long-string conversion as the event task reads it.
+                    let init_chain = entry.filter_chain().split().0;
+                    match init_chain
+                        .apply_to_event_value(
+                            snap.value.clone(),
+                            epics_base_rs::server::recgbl::EventMask::from_bits(mask),
+                        )
+                        .and_then(|v| {
                             snap.value = v;
-                            // long-string boundary conversion
-                            // (`$` → CHAR[40], or native record field
-                            // → scalar DBR_STRING); no-op otherwise.
-                            super::apply_long_string_mode(
-                                &mut snap,
-                                long_string_mode,
-                                requested_count,
-                            );
+                            stage.prepare_snapshot(snap, requested_count, mask)
+                        }) {
+                        Some(snap) => {
                             // the initial event honours
                             // the EVENT_ADD request count for
                             // BOTH directions —
@@ -5792,7 +5815,7 @@ pub(crate) async fn register_subscription(
                         data_count: requested_count,
                         denied: denied.clone(),
                         gate: gate.clone(),
-                        long_string_mode,
+                        stage: stage.clone(),
                         client_minor: state.client_minor_version,
                         stats: state.stats.clone(),
                     }));
@@ -5806,7 +5829,7 @@ pub(crate) async fn register_subscription(
                     rx,
                     denied.clone(),
                     gate.clone(),
-                    long_string_mode,
+                    stage.clone(),
                     state.stats.clone(),
                     ReplyContext {
                         req_hdr: *hdr,
@@ -5823,7 +5846,7 @@ pub(crate) async fn register_subscription(
                     data_type: requested_type,
                     data_count: requested_count,
                     denied,
-                    long_string_mode,
+                    stage: stage.clone(),
                     sub_pv_name: sub_pv_name.clone(),
                     mask,
                 }))
@@ -5881,7 +5904,7 @@ pub(crate) async fn register_subscription(
                     // permissive: malformed JSON or unknown filters
                     // degrade gracefully to an empty chain with a
                     // tracing::warn!, so an empty chain is a no-op loop.
-                    for filt in entry.filter_chain().iter() {
+                    for filt in pre_chain.iter() {
                         instance.attach_filter_to_last_subscriber(field, filt.clone());
                     }
 
@@ -5913,25 +5936,15 @@ pub(crate) async fn register_subscription(
                             // only `if(pLog)`); fold it through so the
                             // send below is skipped — never fall back
                             // to the unfiltered value.
-                            let init_chain = entry.filter_chain();
-                            match init_chain.apply_to_event_value(
+                            // The pre chain on the post, then the stage the
+                            // event task reads every event through.
+                            let init_chain = entry.filter_chain().split().0;
+                            let v = init_chain.apply_to_event_value(
                                 snap.value.clone(),
                                 epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                            ) {
-                                Some(v) => {
-                                    snap.value = v;
-                                    // long-string boundary conversion
-                                    // (`$` → CHAR[40], or native record
-                                    // field → scalar DBR_STRING).
-                                    super::apply_long_string_mode(
-                                        &mut snap,
-                                        long_string_mode,
-                                        requested_count,
-                                    );
-                                    Some(snap)
-                                }
-                                None => None,
-                            }
+                            )?;
+                            snap.value = v;
+                            stage.prepare_snapshot(snap, requested_count, mask)
                         })
                     };
                     // Derive the field's element
@@ -5955,6 +5968,8 @@ pub(crate) async fn register_subscription(
                                 let count = snap.value.count();
                                 entry
                                     .filter_chain()
+                                    .split()
+                                    .0
                                     .apply_to_event_value(
                                         snap.value,
                                         epics_base_rs::server::recgbl::EventMask::from_bits(mask),
@@ -6061,7 +6076,7 @@ pub(crate) async fn register_subscription(
                         data_count: requested_count,
                         denied: denied.clone(),
                         gate: gate.clone(),
-                        long_string_mode,
+                        stage: stage.clone(),
                         client_minor: state.client_minor_version,
                         stats: state.stats.clone(),
                     }));
@@ -6071,6 +6086,7 @@ pub(crate) async fn register_subscription(
                 let denied_for_task = denied.clone();
                 let gate_for_task = gate.clone();
                 let stats_for_task = state.stats.clone();
+                let stage_for_task = stage.clone();
                 // C stores the EVENT_ADD request (`pevext->msg`) with
                 // the subscription: every later delivery is framed for
                 // this client's negotiated version, and echoes this
@@ -6126,21 +6142,16 @@ pub(crate) async fn register_subscription(
                             std::sync::Arc::make_mut(&mut event.snapshot).class_name =
                                 Some(record_for_task.read().record.record_type().to_string());
                         }
-                        // long-string boundary conversion before
-                        // encoding: `$` → CHAR[40]+NUL, or a native
-                        // record field → scalar DBR_STRING. Both this and
-                        // the CLASS_NAME override are per-subscription
-                        // rewrites of a snapshot every other subscriber
-                        // shares, so they take the copy-on-write path —
-                        // and only when they have something to write, so a
-                        // `Plain` channel (the common case) never copies.
-                        if long_string_mode != crate::server::LongStringMode::Plain {
-                            super::apply_long_string_mode(
-                                std::sync::Arc::make_mut(&mut event.snapshot),
-                                long_string_mode,
-                                requested_count,
-                            );
-                        }
+                        // The post chain and the long-string conversion.
+                        // Both this and the CLASS_NAME override are
+                        // per-subscription rewrites of a snapshot every
+                        // other subscriber shares, so they take the
+                        // copy-on-write path — and only when they have
+                        // something to write, so an identity stage (the
+                        // common case) never copies.
+                        let Some(event) = stage_for_task.prepare(event, requested_count) else {
+                            continue;
+                        };
                         // Header space reserved up front, payload encoded
                         // straight into it — see `server::frame` for the C
                         // `cas_copy_in_header` shape this ports.
@@ -6255,7 +6266,7 @@ pub(crate) async fn register_subscription(
                     data_type: requested_type,
                     data_count: requested_count,
                     denied,
-                    long_string_mode,
+                    stage: stage.clone(),
                     sub_pv_name: sub_pv_name.clone(),
                     mask,
                 }))
@@ -6364,7 +6375,7 @@ pub(crate) struct MonitorDelivery {
     pub data_count: u32,
     pub denied: Arc<AtomicBool>,
     pub gate: crate::server::outbox::MonitorGate,
-    pub long_string_mode: LongStringMode,
+    pub stage: super::DeliveryStage,
     pub req_hdr: CaHeader,
     pub client_minor: u16,
     pub stats: Option<Arc<super::stats::ServerStats>>,
@@ -6638,7 +6649,7 @@ pub(crate) async fn run_event_task<W>(
                                 // send lock immediately below, so the socket — not
                                 // credit — is already this producer's bound.
                                 crate::server::outbox::Credit::none(),
-                                d.long_string_mode,
+                                &d.stage,
                                 ReplyContext {
                                     req_hdr: d.req_hdr,
                                     client_minor: d.client_minor,
@@ -6947,6 +6958,8 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                 let dropped_by_filter = match (state.channels.get(&sid), &snap) {
                     (Some(entry), Some(snap)) => entry
                         .filter_chain()
+                        .split()
+                        .0
                         .apply_to_event_value(
                             snap.value.clone(),
                             epics_base_rs::server::recgbl::EventMask::from_bits(select_mask),
@@ -7006,15 +7019,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
             // at the live `snapshot.value.count()`, only truncating
             // and never padding.
             for sub_id in &affected {
-                let (
-                    target,
-                    data_type,
-                    data_count,
-                    sub_id_val,
-                    sub_long_string_mode,
-                    req_hdr,
-                    select_mask,
-                ) = {
+                let (target, data_type, data_count, sub_id_val, sub_stage, req_hdr, select_mask) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -7024,7 +7029,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                         sub.data_type,
                         sub.data_count,
                         sub.sub_id,
-                        sub.long_string_mode,
+                        sub.stage.clone(),
                         sub.request_header(),
                         sub.select_mask,
                     )
@@ -7042,7 +7047,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                     // chain per subscriber keeps `dec`/`sync`/`dbnd`
                     // state isolated. `None` => send no restore frame.
                     if let Some(entry) = state.channels.get(&sid) {
-                        match entry.filter_chain().apply_to_event_value(
+                        match entry.filter_chain().split().0.apply_to_event_value(
                             snap.value.clone(),
                             epics_base_rs::server::recgbl::EventMask::from_bits(select_mask),
                         ) {
@@ -7050,9 +7055,11 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                             None => continue,
                         }
                     }
-                    // long-string boundary conversion (`$` → CHAR[40], or
-                    // native record field → scalar DBR_STRING).
-                    super::apply_long_string_mode(&mut snap, sub_long_string_mode, data_count);
+                    // Then the stage the producer reads every event through.
+                    let Some(snap) = sub_stage.prepare_snapshot(snap, data_count, select_mask)
+                    else {
+                        continue;
+                    };
                     send_monitor_snapshot(
                         writer,
                         sub_id_val,
@@ -12472,7 +12479,7 @@ mod destroyed_channel_teardown_tests {
                 data_type: DBR_DOUBLE,
                 data_count: 1,
                 denied: Arc::new(AtomicBool::new(false)),
-                long_string_mode: LongStringMode::Plain,
+                stage: crate::server::DeliveryStage::plain(),
                 req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
                 client_minor: CA_MINOR_VERSION,
                 stats: None,

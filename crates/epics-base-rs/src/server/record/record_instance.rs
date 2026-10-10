@@ -1179,6 +1179,7 @@ pub(crate) struct UdfAlarm {
 }
 
 mod link_cache {
+    use crate::server::builtin_devices::soft_callback::{AddRecordInput, AddRecordRefusal};
     use crate::server::record::{LinkFieldType, ParsedLink};
     use std::sync::{Arc, LazyLock};
 
@@ -1210,6 +1211,10 @@ mod link_cache {
         pub(super) field: &'static str,
         pub(super) text: String,
         pub(super) parsed: ParsedLink,
+        /// An INP put's `add_record` input, taken before the hold.
+        pub(crate) add_record: Option<AddRecordInput>,
+        /// What that `add_record` refused, for the caller to report after it.
+        pub(crate) add_record_refusal: Option<AddRecordRefusal>,
     }
 
     impl PreparedCommonLink {
@@ -1250,7 +1255,29 @@ mod link_cache {
                 field,
                 parsed: crate::server::record::parse_link_field(&text, ftype),
                 text,
+                add_record: None,
+                add_record_refusal: None,
             })
+        }
+
+        pub(crate) fn parsed(&self) -> &ParsedLink {
+            &self.parsed
+        }
+
+        /// An INP put's [`AddRecordInput`], resolved before the hold.
+        pub(crate) fn prepare_add_record(
+            &mut self,
+            db: &crate::server::database::PvDatabase,
+            rec: &super::RecordCell,
+        ) {
+            if self.field == "INP" {
+                self.add_record =
+                    crate::server::builtin_devices::soft_callback::add_record_input_of(
+                        db,
+                        rec,
+                        Some(&self.text),
+                    );
+            }
         }
     }
 
@@ -1354,6 +1381,10 @@ mod link_cache {
 
         pub(crate) fn field(&self) -> &'static str {
             self.field
+        }
+
+        pub(crate) fn parsed(&self) -> &ParsedLink {
+            &self.parsed
         }
     }
 
@@ -1861,9 +1892,6 @@ const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
 pub(crate) struct RecordDesc {
     pub(crate) record_type: &'static str,
     pub(crate) fields: &'static [FieldDesc],
-    /// [`Record::long_string_fields`], which C's `cvt_dbaddr` serves as
-    /// `SPC_DBADDR` buffers.
-    long_strings: &'static [&'static str],
     /// [`Record::primary_field`] and [`Record::process_passive_fields`].
     primary_field: &'static str,
     pp_fields: &'static [&'static str],
@@ -1874,7 +1902,6 @@ impl RecordDesc {
         RecordDesc {
             record_type: record.record_type(),
             fields: record.field_list(),
-            long_strings: record.long_string_fields(),
             primary_field: record.primary_field(),
             pp_fields: record.process_passive_fields(),
         }
@@ -1977,11 +2004,7 @@ impl PutAddr {
         PutAddr {
             dbaddr: addr
                 .desc
-                .is_some_and(|d| d.special == super::record_trait::Special::DbAddr)
-                || rdes
-                    .long_strings
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(field)),
+                .is_some_and(|d| d.declared_special == super::record_trait::Special::DbAddr),
             no_mod: declared_no_mod(field, addr.desc),
             watched: is_metadata_cache_source(field)
                 || RecordInstance::field_posts_property(addr.desc),
@@ -2118,6 +2141,11 @@ impl RecordCell {
     /// The record type's declaration — C `precord->rdes`.
     pub(crate) fn rdes(&self) -> &RecordDesc {
         &self.rdes
+    }
+
+    /// [`FieldDesc::long_string`] of `field`, without taking the lock set.
+    pub fn field_is_long_string(&self, field: &str) -> bool {
+        super::record_trait::long_string_in(self.rdes.fields, field)
     }
 
     /// The record's name — C `precord->name` — without taking its lock set.
@@ -4370,7 +4398,11 @@ impl RecordInstance {
         }
     }
 
-    pub(crate) fn run_init_passes(&mut self, name: &str) {
+    pub(crate) fn run_init_passes(
+        &mut self,
+        name: &str,
+        add_record_input: Option<crate::server::builtin_devices::soft_callback::AddRecordInput>,
+    ) {
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
         // restart list is empty.
@@ -4411,7 +4443,11 @@ impl RecordInstance {
         // `pdsxt->add_record(precord)` and then `dbInitLink` for that same
         // link. This is that call, and it keeps C's position — before the link
         // it complains about is initialised, after pass 0 has run.
-        crate::server::builtin_devices::soft_callback::add_record(self, name);
+        if let Some(refusal) =
+            crate::server::builtin_devices::soft_callback::add_record(self, add_record_input)
+        {
+            refusal.report(name);
+        }
         if let Err(e) = self.record.init_record(1) {
             eprintln!("init_record(1) failed for {name}: {e}");
         }
@@ -5587,11 +5623,8 @@ impl RecordInstance {
     /// through [`Self::enum_string_form_for`], the owner the CA/PVA encoders
     /// use, so a link read and a `caget -t` of one field cannot disagree.
     pub(crate) fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
-        let long_string = self
-            .record
-            .long_string_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(field));
+        // Only an array value reads the flag, so a scalar pays no lookup.
+        let long_string = value.is_array() && self.record.field_is_long_string(field);
         let mut render = SourceRender {
             long_string,
             precision: None,
@@ -5733,8 +5766,19 @@ impl RecordInstance {
     /// `into_type`, and re-projecting a projected value is a no-op. That is
     /// what lets the CA path derive the native type from the value it is about
     /// to serve.
+    ///
+    /// A long-string field ([`FieldDesc::long_string`]) stays the `LEN`
+    /// elements it holds: its plain `DBF_STRING` address and its `$`
+    /// `DBR_CHAR` address read the same buffer differently, so each channel
+    /// projects for itself, and a `String` here would already have lost `LEN`.
     pub fn project_to_declared_type(&self, field: &str, value: EpicsValue) -> EpicsValue {
         match self.declared_field_type(field) {
+            Some(DbFieldType::String)
+                if matches!(value, EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
+                    && self.record.field_is_long_string(field) =>
+            {
+                value
+            }
             Some(declared) => value.into_type(declared),
             None => value,
         }
@@ -6886,6 +6930,17 @@ impl RecordInstance {
                         self.swap_link_cache("INP", &mut link.parsed);
                     }
                     self.rebind_device_link(bound);
+                    // `new_dsxt->add_record(precord)` (`dbAccess.c:1196`), on
+                    // the input the caller prepared before the hold.
+                    if matches!(bound, MenuBound::DbPut)
+                        && let Some(input) = link.add_record.take()
+                    {
+                        link.add_record_refusal =
+                            crate::server::builtin_devices::soft_callback::add_record(
+                                self,
+                                Some(input),
+                            );
+                    }
                 }
             }
             "OUT" => {
@@ -9670,7 +9725,7 @@ mod device_menu_marking_tests {
         let mut inst = RecordInstance::new("X".into(), AiRecord::default());
         inst.common.dtyp = "asynInt32".into();
         assert!(!inst.init_record_reaches_body());
-        inst.run_init_passes("X");
+        inst.run_init_passes("X", None);
         inst.common.dtyp.set_name("Soft Channel");
         assert_eq!(inst.common.dtyp.soft(), None);
     }

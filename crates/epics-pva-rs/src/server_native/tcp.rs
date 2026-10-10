@@ -4491,13 +4491,20 @@ pub(super) async fn handle_connection_io(
                 let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
                 let Some(desc) = ready.desc else {
                     // The source has no descriptor for this channel and
-                    // never will — a park is not an indefinite hold.
+                    // never will — a park is not an indefinite hold. pvxs
+                    // answers an op its source never connected from the
+                    // setup op's destructor (servermon.cpp:394,
+                    // serverget.cpp:179).
+                    let text = match parked.kind {
+                        OpKind::Monitor => "Monitor Create implied error",
+                        _ => "Op Create implied error",
+                    };
                     send_chan_op_error(
                         &chan_tx,
                         parked.kind,
                         ready.ioid,
                         parked.subcmd,
-                        Status::error("must provide prototype"),
+                        Status::error(text),
                         order,
                     )
                     .await?;
@@ -8727,8 +8734,9 @@ async fn handle_get_field(
                 // `Variant` here (the old `unwrap_or`) reported success
                 // and taught the client a wrong type tree, so a later
                 // GET/PUT/MONITOR would decode against the wrong shape.
-                Status::error("field introspection unavailable".to_string())
-                    .write_into(order, &mut payload);
+                // The text is `~ServerIntrospectControl`'s
+                // (`serverintrospect.cpp:70-72`).
+                Status::error("Implicit Cancel".to_string()).write_into(order, &mut payload);
             }
         }
         let h = PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);

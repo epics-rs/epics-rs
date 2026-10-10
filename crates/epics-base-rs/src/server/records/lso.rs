@@ -1,6 +1,6 @@
 use super::lsi::LongStringVal;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldDeclaration, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -159,14 +159,10 @@ impl Record for LsoRecord {
         }
     }
 
-    fn long_string_fields(&self) -> &'static [&'static str] {
-        &["VAL", "OVAL"]
-    }
-
     /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
     /// `lsoRecord.c:183`), whatever LEN holds.
     fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        self.long_string_fields().contains(&field).then_some(1)
+        self.field_is_long_string(field).then_some(1)
     }
 
     /// C `lsoRecord.c::process:131-140` (`menuIvoaSet_output_to_IVOV`) writes

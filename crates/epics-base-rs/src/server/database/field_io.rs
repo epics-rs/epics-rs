@@ -452,6 +452,36 @@ fn snam_special_after_put(
     Ok(())
 }
 
+/// C `dbPutFieldLink`'s `dbChannelCreate` of a new PV link's target, made
+/// before `dbScanLockMany` and so before this put's hold
+/// (`dbAccess.c:1104-1107`). Only its errlog line is kept: locality is
+/// decided where the port binds the link.
+fn create_put_link_channel(
+    db: &PvDatabase,
+    link: Option<&PreparedLink>,
+    common: Option<&PreparedCommonLink>,
+) {
+    use crate::server::record::{LinkProcessPolicy, ParsedLink};
+    let parsed = link
+        .map(PreparedLink::parsed)
+        .or(common.map(PreparedCommonLink::parsed));
+    if let Some(ParsedLink::Db(target)) = parsed
+        && !matches!(
+            target.policy,
+            LinkProcessPolicy::ChannelProcess | LinkProcessPolicy::ChannelProcessPassive
+        )
+    {
+        let _ = super::filters::db_channel_create(db, &target.pvname());
+    }
+}
+
+/// Print what this put's `add_record` refused, now that the hold is down.
+fn report_add_record_refusal(link: &mut Option<PreparedCommonLink>, record_name: &str) {
+    if let Some(refusal) = link.as_mut().and_then(|l| l.add_record_refusal.take()) {
+        refusal.report(record_name);
+    }
+}
+
 /// Move the work a `special(_, true)` left for after the gate into the put's
 /// slot.
 fn collect_after_gate(instance: &mut RecordInstance, after: &mut Option<AfterGate>) {
@@ -3107,6 +3137,10 @@ impl PvDatabase {
         }
         let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
         let mut common_link = PreparedCommonLink::for_put(record_name, &field, &value);
+        create_put_link_channel(self, link.as_ref(), common_link.as_ref());
+        if let Some(l) = common_link.as_mut() {
+            l.prepare_add_record(self, &rec);
+        }
         // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
         // relinks the record's lock set, and its parse/`dbCanSetLink` refusals
         // return before it does. Taken out below them, so a refused put never
@@ -3625,6 +3659,7 @@ impl PvDatabase {
         // No put-notify is armed here: C's restart owner is the cycle tail
         // (`end_process_cycle`), never the `pact = FALSE` store.
 
+        report_add_record_refusal(&mut common_link, record_name);
         let common_result = match outcome {
             Ok(cr) => cr,
             Err((e, should_process)) => {
@@ -3902,6 +3937,10 @@ impl PvDatabase {
             }
             let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
             let mut common_link = PreparedCommonLink::for_put(base, &field, &value);
+            create_put_link_channel(self, link.as_ref(), common_link.as_ref());
+            if let Some(l) = common_link.as_mut() {
+                l.prepare_add_record(self, &rec);
+            }
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
             // field relinks the record's lock set, inside the gate window
             // above, which holds both sets the relink moves between. Below
@@ -4062,6 +4101,7 @@ impl PvDatabase {
                 result
             };
 
+            report_add_record_refusal(&mut common_link, &canonical_base);
             // No put-notify is armed here: C's restart owner is the cycle
             // tail (`end_process_cycle`), never the `pact = FALSE` store.
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::LongStringMode;
 use super::frame::{FrameBuf, size_dbr_reply};
 use super::outbox::{Credit, MonitorGate, Outbox};
 use super::stats::ServerStats;
@@ -49,7 +48,7 @@ pub(crate) fn spawn_monitor_sender(
     // confirmation, so a delivery still in flight is dropped rather than
     // written after it — see `MonitorGate`.
     gate: MonitorGate,
-    long_string_mode: LongStringMode,
+    stage: super::DeliveryStage,
     stats: Option<Arc<ServerStats>>,
     // The EVENT_ADD request header (C `pevext->msg`) plus the client's
     // negotiated minor version. Every delivery on this subscription is framed
@@ -103,14 +102,7 @@ pub(crate) fn spawn_monitor_sender(
             // delivery was between its ring and the outbox.
             match gate.deliver(|| {
                 send_event(
-                    data_type,
-                    data_count,
-                    sub_id,
-                    &event,
-                    &outbox,
-                    credit,
-                    long_string_mode,
-                    reply,
+                    data_type, data_count, sub_id, &event, &outbox, credit, &stage, reply,
                 )
             }) {
                 Some(Ok(())) => {}
@@ -138,26 +130,25 @@ pub(crate) fn send_event(
     // Spent on the delivery below. `Credit::none()` from callers that already
     // run under the connection loop's own bound — see `super::outbox`.
     credit: Credit,
-    long_string_mode: LongStringMode,
+    stage: &super::DeliveryStage,
     reply: super::tcp::ReplyContext,
 ) -> std::io::Result<()> {
     let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
-    // Apply the channel's long-string boundary conversion before
-    // encoding (`$` → CHAR[40]+NUL, or a long-string record field →
-    // scalar DBR_STRING). Clone only when a conversion actually runs
-    // (most channels are `Plain`).
-    let ls_snap;
-    let snapshot: &epics_base_rs::server::snapshot::Snapshot =
-        if long_string_mode == LongStringMode::Plain {
-            &event.snapshot
-        } else {
-            ls_snap = {
-                let mut s = (*event.snapshot).clone();
-                super::apply_long_string_mode(&mut s, long_string_mode, data_count);
-                s
-            };
-            &ls_snap
-        };
+    // The channel's post chain and long-string boundary conversion
+    // (`$` → CHAR[40]+NUL, or a long-string record field → scalar
+    // DBR_STRING). The snapshot is copied only when the stage writes.
+    let prepared;
+    let snapshot: &epics_base_rs::server::snapshot::Snapshot = if stage.is_identity() {
+        &event.snapshot
+    } else {
+        match stage.prepare(event.clone(), data_count) {
+            Some(event) => {
+                prepared = event;
+                &prepared.snapshot
+            }
+            None => return Ok(()),
+        }
+    };
     // One buffer with the header space reserved at the front, and the payload
     // encoded straight into it — C `cas_copy_in_header` reserving inside the
     // client's send buffer and `dbGet` converting into that space
@@ -263,7 +254,7 @@ mod tests {
             &event,
             &outbox,
             Credit::none(),
-            LongStringMode::Plain,
+            &crate::server::DeliveryStage::plain(),
             crate::server::tcp::ReplyContext {
                 req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
                 client_minor: crate::protocol::CA_MINOR_VERSION,
@@ -377,7 +368,7 @@ mod tests {
                 reader,
                 Arc::new(AtomicBool::new(false)),
                 crate::server::outbox::MonitorGate::open(),
-                LongStringMode::Plain,
+                crate::server::DeliveryStage::plain(),
                 Some(stats.clone()),
                 crate::server::tcp::ReplyContext {
                     req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
@@ -427,7 +418,7 @@ mod tests {
                 reader,
                 Arc::new(AtomicBool::new(true)), // read access denied
                 crate::server::outbox::MonitorGate::open(),
-                LongStringMode::Plain,
+                crate::server::DeliveryStage::plain(),
                 Some(stats.clone()),
                 crate::server::tcp::ReplyContext {
                     req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),

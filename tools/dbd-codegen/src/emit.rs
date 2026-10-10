@@ -150,10 +150,12 @@ pub struct CvtDbAddr {
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
     pub selector: Option<String>,
+    /// The field that sets C's `field_size` (`SIZV`): a long string.
+    pub size: Option<String>,
 }
 
 /// Parse `dbd/cvt_dbaddr.types`:
-/// `record.FIELD  DBF_TYPE  SPC_xxx  selector|-  cite`.
+/// `record.FIELD  DBF_TYPE  SPC_xxx  selector|-  size|-  cite`.
 pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAddr>, String> {
     let mut out = BTreeMap::new();
     for (n, line) in src.lines().enumerate() {
@@ -162,12 +164,12 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(key), Some(dbf), Some(spc), Some(sel)) =
-            (it.next(), it.next(), it.next(), it.next())
+        let (Some(key), Some(dbf), Some(spc), Some(sel), Some(size)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next())
         else {
             return Err(format!(
                 "cvt_dbaddr.types:{}: expected \
-                 `record.FIELD DBF_TYPE SPC_xxx selector`, got `{line}`",
+                 `record.FIELD DBF_TYPE SPC_xxx selector size`, got `{line}`",
                 n + 1
             ));
         };
@@ -178,12 +180,16 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             return Err(format!("cvt_dbaddr.types:{}: unknown type `{dbf}`", n + 1));
         }
         special_variant(spc).map_err(|e| format!("cvt_dbaddr.types:{}: {e}", n + 1))?;
+        if size != "-" && dbf != "DBF_STRING" {
+            return Err(format!("cvt_dbaddr.types:{}: a size on a {dbf} row", n + 1));
+        }
         let prev = out.insert(
             (rec.to_string(), field.to_string()),
             CvtDbAddr {
                 dbf: dbf.to_string(),
                 special: spc.to_string(),
                 selector: (sel != "-").then(|| sel.to_string()),
+                size: (size != "-").then(|| size.to_string()),
             },
         );
         if prev.is_some() {
@@ -1108,6 +1114,7 @@ fn emit_field(
         }
     }
     let runtime_typed = entry.is_some_and(|c| c.selector.is_some());
+    let long_string = entry.is_some_and(|c| c.size.is_some());
     // The RAW declaration, before `field_dbf` swapped in the cvt_dbaddr type —
     // C's `pdbFldDes->field_type`, which `dbDumpField` prints and which
     // `dbPutString` refuses a `.db` assignment on (`dbStaticLib.c:2646-2650`).
@@ -1123,6 +1130,7 @@ fn emit_field(
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
     writeln!(s, "        declared_dbf: DbfCode::{declared_dbf},").unwrap();
     writeln!(s, "        runtime_typed: {runtime_typed},").unwrap();
+    writeln!(s, "        long_string: {long_string},").unwrap();
     writeln!(s, "        read_only: {read_only},").unwrap();
     writeln!(s, "        special: {special},").unwrap();
     writeln!(s, "        declared_special: {declared_special},").unwrap();

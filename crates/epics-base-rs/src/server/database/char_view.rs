@@ -4,6 +4,7 @@
 //! commands and the CA server — so they cannot disagree about which fields
 //! take the modifier, how many elements the view has, or what a put stores.
 
+use crate::server::database::filters::FilterChain;
 use crate::server::record::{FieldDesc, RecordInstance, Special};
 use crate::types::{DbfCode, EpicsValue};
 
@@ -128,7 +129,7 @@ pub(crate) fn long_string_sizv(inst: &crate::server::record::RecordInstance) -> 
 
 /// Where a `$` address's characters come from — `dbGet`'s three routes
 /// (`dbAccess.c:944-952`).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CharSource {
     /// `pfield` itself, converted element by element.
     Field,
@@ -216,13 +217,7 @@ impl CharView {
         };
         match (self.source, target) {
             (CharSource::Field, _) => {
-                // `dbAccess.c:963`: one element is the scalar path, with no
-                // terminator rule.
-                let n = if self.count == 1 {
-                    1
-                } else {
-                    n_req.min(self.count).min(bytes.len())
-                };
+                let n = field_count(self.count, n_req).min(bytes.len());
                 let mut b = bytes[..n].to_vec();
                 if self.count != 1 && target == T::Char && self.truncate && n > 0 {
                     b[n - 1] = 0;
@@ -394,12 +389,36 @@ pub enum CharWrite {
     Elements(crate::types::DbFieldType, EpicsValue),
 }
 
+impl CharWrite {
+    /// A PVA put's `dbPut(DBR_CHAR)`: a string is `putLongString`, its bytes
+    /// and NUL (`ioc/iocsource.cpp:511`); an `int8_t[]` is `putArray`, its
+    /// elements. `None` for any other payload.
+    pub fn from_pva(value: &EpicsValue) -> Option<Self> {
+        match value {
+            EpicsValue::String(s) => {
+                let mut chars = s.as_bytes().to_vec();
+                chars.push(0);
+                Some(Self::Chars(chars))
+            }
+            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => Some(Self::Chars(b.to_vec())),
+            _ => None,
+        }
+    }
+}
+
 /// A `DBR_CHAR` conversion's elements as the bytes `epicsInt8` stores.
 fn char_bytes(v: &EpicsValue) -> Vec<u8> {
     match v {
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => b.to_vec(),
         v => vec![v.to_f64().map_or(0, |n| n as i64 as u8)],
     }
+}
+
+/// How many elements `dbGet` reads from a `$` field whose `get_array_info`
+/// count is `count`, for an `n_req`-element request. One element is the
+/// scalar path, with no terminator rule (`dbAccess.c:963`).
+fn field_count(count: usize, n_req: usize) -> usize {
+    if count == 1 { 1 } else { n_req.min(count) }
 }
 
 /// The bytes before the first NUL.
@@ -472,18 +491,236 @@ pub(crate) fn char_elements(target: crate::types::DbFieldType, chars: &[u8]) -> 
     }
 }
 
+/// A long-string field's `LEN` elements ([`FieldDesc::long_string`]) as its
+/// plain `DBF_STRING` address reads them: the text before the first NUL. Any
+/// other value is returned unchanged.
+///
+/// [`FieldDesc::long_string`]: crate::server::record::FieldDesc::long_string
+pub fn long_string_text(value: EpicsValue) -> EpicsValue {
+    match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+            EpicsValue::String(crate::types::PvString::from_bytes(nul_text(&b)))
+        }
+        value => value,
+    }
+}
+
+/// What pvxs serves a `$` channel as, from its `getChannelValueType`
+/// (`ioc/iocsource.cpp:619-643`). The native PVA source and QSRV both ask
+/// it, so the two servers cannot part on a `$` channel's type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PvaDollar {
+    /// The view's text: pvxs's format is `"String"` — a link, whose type
+    /// `dbChannelCreate` keeps so pvxs's own reshape fires
+    /// (`ioc/channel.cpp:68-73`), or a VAL carrying `info(Q:form, "String")`
+    /// (`ioc/channel.cpp:40-47`).
+    Text,
+    /// The `DBR_CHAR` image, `int8_t[]`: `dbChannelCreate` made the field
+    /// `DBF_CHAR` (`dbChannel.c:488-493`), so the format stays `Default`.
+    Chars,
+}
+
+impl PvaDollar {
+    /// Of a `$` channel on `field`, or `None` where `$` is
+    /// `S_dbLib_fieldNotFound`.
+    pub fn of(inst: &RecordInstance, field: &str) -> Option<Self> {
+        let view = char_view(inst, field)?;
+        let text = view.source == CharSource::Link
+            || (field.eq_ignore_ascii_case("VAL") && inst.get_info("Q:form") == Some("String"));
+        Some(if text { Self::Text } else { Self::Chars })
+    }
+}
+
+/// A `$` channel's read, split where C's filters run: [`Self::render`] is the
+/// `DBR_CHAR` image a field log holds, [`Self::finish`] what `dbGet` and
+/// pvxs then make of the log a filter chain handed back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DollarView {
+    /// What pvxs serves the channel as.
+    pub serve: PvaDollar,
+    /// `field_size` of a `DBF_STRING` field, which `dbGet` reads as that
+    /// many chars and then cuts at the NUL (`dbAccess.c:1037-1045`); 0 for
+    /// a link or an attribute, which `dbGet` does not cut.
+    pad: usize,
+    source: CharSource,
+    /// `dbChannelFinalElements`: the `nRequest` pvxs reads with.
+    final_elements: usize,
+}
+
+impl DollarView {
+    /// Of a `$` channel on `field` whose filter chain is `filters`, or
+    /// `None` where `$` is `S_dbLib_fieldNotFound`.
+    pub fn of(inst: &RecordInstance, field: &str, filters: &FilterChain) -> Option<Self> {
+        let view = char_view(inst, field)?;
+        let serve = PvaDollar::of(inst, field)?;
+        let pad = if view.source == CharSource::Field && view.truncate {
+            view.no_elements
+        } else {
+            0
+        };
+        Some(Self {
+            serve,
+            pad,
+            source: view.source,
+            final_elements: filters.final_element_count(view.no_elements),
+        })
+    }
+
+    /// Of a `$` channel on a `DBF_STRING` value `field_size` chars wide that
+    /// no record holds, whose filter chain is `filters`.
+    pub fn of_string(field_size: usize, filters: &FilterChain) -> Self {
+        Self {
+            serve: PvaDollar::Chars,
+            pad: field_size,
+            source: CharSource::Field,
+            final_elements: filters.final_element_count(field_size),
+        }
+    }
+
+    /// Whether the channel serves one `int8_t` instead of an array: pvxs's
+    /// `getScalarValue` for a final count of 1.
+    pub fn scalar(self) -> bool {
+        self.final_elements == 1
+    }
+
+    /// The field log's image of the field's value — read, or posted: a
+    /// `DBF_STRING` field's `field_size` chars, else the posted chars.
+    pub fn render(self, value: EpicsValue) -> EpicsValue {
+        match value {
+            EpicsValue::String(text) if self.pad > 0 => {
+                let text = text.as_bytes();
+                let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+                let mut image = Vec::with_capacity(self.pad.max(len + 1));
+                image.extend_from_slice(&text[..len]);
+                image.resize(self.pad.max(len + 1), 0);
+                EpicsValue::CharArray(image.into())
+            }
+            value => posted_char_view(value, usize::MAX, false),
+        }
+    }
+
+    /// What is served of the `image` [`Self::render`] made, given the `log`
+    /// a filter chain made of it: [`Self::read`], then [`Self::text`].
+    pub fn finish(self, image: EpicsValue, log: EpicsValue) -> EpicsValue {
+        self.text(self.read(image, log))
+    }
+
+    /// `dbGet`'s chars from the `log` a filter chain made of `image`. A
+    /// field's are the log, cut ([`Self::cut`]). A link's or an attribute's
+    /// are its text afresh: `getLinkValue`/`getAttrValue` ignore the log and
+    /// keep only its count, `nRequest` (`dbAccess.c:817-895,945-952`).
+    pub fn read(self, image: EpicsValue, log: EpicsValue) -> EpicsValue {
+        self.read_request(image, log, usize::MAX)
+    }
+
+    /// [`Self::read`] for a `dbGet` of `n_request` chars, a CA client's
+    /// count: it bounds the copy before the last char becomes the NUL.
+    pub fn read_request(self, image: EpicsValue, log: EpicsValue, n_request: usize) -> EpicsValue {
+        if self.source == CharSource::Field {
+            drop(image);
+            // `getCharChar` NULs char `nRequest - 1` of a log of more than
+            // one element, whatever `nRequest`; a one-element log takes the
+            // fast copy (`dbAccess.c` `dbGet`, `dbConvert.c` `getCharChar`).
+            let log = match log {
+                EpicsValue::CharArray(mut b)
+                    if self.pad > 0 && n_request < b.len() && b.len() > 1 =>
+                {
+                    b.truncate(n_request.max(1));
+                    let last = b.len() - 1;
+                    if let Some(chars) = b.head_mut() {
+                        chars[last] = 0;
+                    } else {
+                        b.make_mut()[last] = 0;
+                    }
+                    EpicsValue::CharArray(b)
+                }
+                log => log,
+            };
+            return self.cut(log);
+        }
+        let final_elements = self.final_elements.min(n_request);
+        drop(log);
+        match image {
+            // `strncpy` into `nRequest` chars, the last a NUL, then
+            // `strlen + 1`; nothing at all for `nRequest == 0`.
+            EpicsValue::CharArray(mut b) => {
+                let len = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                let Some(keep) = final_elements.checked_sub(1) else {
+                    return EpicsValue::CharArray(Default::default());
+                };
+                let keep = keep.min(len);
+                if keep < b.len() {
+                    if let Some(chars) = b.head_mut() {
+                        chars[keep] = 0;
+                    } else {
+                        b.make_mut()[keep] = 0;
+                    }
+                    b.truncate(keep + 1);
+                } else {
+                    b.push(0);
+                }
+                EpicsValue::CharArray(b)
+            }
+            value => value,
+        }
+    }
+
+    /// `dbGet`'s tail on a `DBF_STRING` field's read: a NUL in the last
+    /// element and a cut to `strlen + 1` (`dbAccess.c:1037-1045`), except a
+    /// one-element read, which takes `dbGet`'s scalar path.
+    fn cut(self, value: EpicsValue) -> EpicsValue {
+        match value {
+            EpicsValue::CharArray(mut b) if self.pad > 0 && b.len() > 1 => {
+                let last = b.len() - 1;
+                if b[last] != 0 {
+                    // An `arr` prefix is a view of the render's buffer, which
+                    // nothing else holds by now.
+                    if let Some(chars) = b.head_mut() {
+                        chars[last] = 0;
+                    } else {
+                        b.make_mut()[last] = 0;
+                    }
+                }
+                let len = b.iter().position(|&c| c == 0).unwrap_or(last);
+                b.truncate(len + 1);
+                EpicsValue::CharArray(b)
+            }
+            value => value,
+        }
+    }
+
+    /// The text of a [`PvaDollar::Text`] array channel: the image up to its
+    /// NUL (`ioc/iocsource.cpp:133-136`).
+    pub fn text(self, value: EpicsValue) -> EpicsValue {
+        match self.serve {
+            PvaDollar::Text if !self.scalar() => long_string_text(value),
+            _ => value,
+        }
+    }
+}
+
 /// `dbGet`'s `DBR_CHAR` answer for a `$` address, taken from the value a post
 /// carries instead of from the record, for an `n`-element request: the text
-/// and its NUL, NUL at element `n - 1` where
-/// [`CharView::nul_at_count`] holds, else cut at `n`. That is
-/// [`CharView::get`] for every value a post can carry, so a delivery path
-/// that holds no record lock reads this. Any other value is returned
-/// unchanged.
+/// and its NUL, NUL at element `n - 1`, where [`CharView::nul_at_count`]
+/// holds; else a long string's `LEN` elements read raw, as
+/// [`CharView::get`] reads them, so `LEN` 0 posts none. A delivery path that
+/// holds no record lock reads this. Any other value is returned unchanged.
 pub fn posted_char_view(value: EpicsValue, n: usize, nul_at_count: bool) -> EpicsValue {
-    let mut chars = match &value {
+    let mut chars = match value {
+        EpicsValue::CharArray(mut b) | EpicsValue::UCharArray(mut b) if !nul_at_count => {
+            b.truncate(field_count(b.len(), n));
+            return EpicsValue::CharArray(b);
+        }
+        // An `FTVL=STRING` buffer: `NORD` elements of its first string's
+        // 40 bytes, raw, as [`CharView::get`] reads them.
+        EpicsValue::StringArray(v) if !nul_at_count => {
+            let mut b = v.first().map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+            b.resize(field_count(v.len(), n).min(MAX_STRING_SIZE), 0);
+            return EpicsValue::CharArray(b.into());
+        }
         EpicsValue::String(s) => nul_text(s.as_bytes()),
-        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => nul_text(b),
-        _ => return value,
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => nul_text(&b),
+        value => return value,
     };
     if nul_at_count {
         chars.truncate(n.saturating_sub(1));
@@ -497,7 +734,31 @@ pub fn posted_char_view(value: EpicsValue, n: usize, nul_at_count: bool) -> Epic
 
 #[cfg(test)]
 mod tests {
-    use super::{CharSource, CharView};
+    use super::{CharSource, CharView, DollarView, PvaDollar};
+
+    /// `FS.VAL${"arr":{"s":0,"e":2}}` on `"hello"`: the prefix view is cut
+    /// in the render's own buffer.
+    #[test]
+    fn cut_writes_a_prefix_slice_in_place() {
+        let view = DollarView {
+            serve: PvaDollar::Chars,
+            pad: 40,
+            source: CharSource::Field,
+            final_elements: 40,
+        };
+        let EpicsValue::CharArray(image) = view.render(EpicsValue::String("hello".into())) else {
+            panic!("a char image");
+        };
+        let prefix = image.head(3);
+        drop(image);
+        let buf = std::sync::Arc::as_ptr(prefix.buffer());
+        let EpicsValue::CharArray(cut) = view.cut(EpicsValue::CharArray(prefix)) else {
+            panic!("a char image");
+        };
+        assert_eq!(&*cut, b"he\0");
+        assert_eq!(std::sync::Arc::as_ptr(cut.buffer()), buf, "no copy");
+    }
+
     use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString};
 
     fn view(

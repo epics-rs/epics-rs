@@ -458,7 +458,7 @@ async fn printf_val_native_type_is_scalar_dbr_string() {
 
 /// lsi/lso VAL & OVAL share the same long-string carrier and the same C
 /// `cvt_dbaddr` scalar-DBF_STRING presentation (lsiRecord.c:141-143).
-/// The CA boundary keys on the record's `long_string_fields()`, so the
+/// The CA boundary keys on the field.s `FieldDesc::long_string`, so the
 /// whole family — not just printf — reports native DBF_STRING/1. An
 /// over-40-char value clips to the 40-byte DBR_STRING slot exactly as C
 /// does (the full value is reachable only via the `$` modifier).

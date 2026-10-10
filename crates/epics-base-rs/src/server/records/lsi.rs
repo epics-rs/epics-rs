@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldDeclaration, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, SharedArray};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -305,14 +305,10 @@ impl Record for LsiRecord {
         }
     }
 
-    fn long_string_fields(&self) -> &'static [&'static str] {
-        &["VAL", "OVAL"]
-    }
-
     /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
     /// `lsiRecord.c:141`), whatever LEN holds.
     fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        self.long_string_fields().contains(&field).then_some(1)
+        self.field_is_long_string(field).then_some(1)
     }
 
     fn uses_monitor_deadband(&self) -> bool {

@@ -11,7 +11,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(34): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(37): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -2292,4 +2292,181 @@ async fn group_monitor_seed_marks_the_negotiated_queue_size() {
             "{path} must be marked on the seed, got {marked:?}"
         );
     }
+}
+
+/// A group named by one record's info(Q:group) alone, with the relative
+/// `"+channel":"VAL"` pvxs prefixes with the record name. softIocPVX 1.5.3
+/// creates it, and after `pvxput LZ:O world` serves `txt.value string =
+/// "world"`. The port refused it with "Invalid PV: VAL".
+#[tokio::test]
+async fn a_single_info_group_fragment_resolves_its_relative_channel() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lso, "LZ:O") {
+                field(SIZV, "64")
+                info(Q:group, {"LZ:G":{"txt":{"+channel":"VAL"}}})
+            }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = BridgeProvider::new(db.clone());
+    let json = db
+        .get_record("LZ:O")
+        .unwrap()
+        .read()
+        .get_info("Q:group")
+        .map(str::to_string)
+        .unwrap();
+    provider.load_info_group("LZ:O", &json).expect("load");
+    assert_eq!(provider.process_groups().await, 1);
+
+    db.put_pv("LZ:O", EpicsValue::String("world".into()))
+        .await
+        .unwrap();
+    let def = provider.groups().get("LZ:G").cloned().expect("LZ:G");
+    let got = GroupChannel::new(db, def)
+        .get(&empty_request())
+        .await
+        .expect("get");
+    let Some(PvField::Structure(txt)) = got.get_field("txt") else {
+        panic!("no txt in {got:?}");
+    };
+    assert_eq!(
+        txt.get_field("value"),
+        Some(&PvField::Scalar(ScalarValue::String("world".into())))
+    );
+}
+
+/// `$` text members, against `softIocPVX` 1.5.3 over
+/// `record(lso,"LZ:F"){field(SIZV,"64") info(Q:form,"String")}` and
+/// `record(calcout,"LZ:C"){field(INPA,"LZ:J")}`. `GZ` (`LZ:F.VAL$` as a
+/// plain `fp` and a scalar `fs`) answers `pvxget GZ` after `pvxput LZ:F
+/// world` with `fp string = "world"`, `fs.value string = "world"`, and
+/// `pvxmonitor GZ` over `pvxput LZ:F again` posts `fp = "again"`, then
+/// `fs.value = "again"` with `fs.timeStamp`. A group on `LZ:C.INPA$` prints
+/// `Error Group not created: Link fields not allowed in this context`.
+#[tokio::test]
+async fn a_dollar_text_member_serves_what_softiocpvx_serves() {
+    use epics_bridge_rs::qsrv::channel::BridgeChannel;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"
+            record(lso, "LZ:F") { field(SIZV, "64") info(Q:form, "String") }
+            record(lsi, "LZ:J") { field(SIZV, "64") }
+            record(calcout, "LZ:C") { field(INPA, "LZ:J") }
+            "#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(
+            r#"{
+                "GZ": {
+                    "fp": { "+channel": "LZ:F.VAL$", "+type": "plain" },
+                    "fs": { "+channel": "LZ:F.VAL$" }
+                },
+                "GL": { "lp": { "+channel": "LZ:C.INPA$", "+type": "plain" } }
+            }"#,
+        )
+        .expect("load");
+    assert_eq!(provider.process_groups().await, 1, "GL is not created");
+
+    let writer = BridgeChannel::new(db.clone(), "LZ:F").await.expect("LZ:F");
+    let put = |t: &'static str| {
+        let writer = &writer;
+        async move {
+            let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+            put.fields.push((
+                "value".into(),
+                PvField::Scalar(ScalarValue::String(t.into())),
+            ));
+            writer.put(&put).await.expect("put");
+        }
+    };
+    let text = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+    let member = |s: &PvStructure, path: &str| -> PvField {
+        let (head, tail) = path.split_once('.').unwrap_or((path, ""));
+        let field = s.get_field(head).cloned().expect(head);
+        match (field, tail) {
+            (field, "") => field,
+            (PvField::Structure(inner), tail) => inner.get_field(tail).cloned().expect(tail),
+            (other, _) => panic!("{path}: {other:?}"),
+        }
+    };
+
+    put("world").await;
+    let def = provider.groups().get("GZ").cloned().expect("GZ");
+    let got = GroupChannel::new(db.clone(), def.clone())
+        .get(&empty_request())
+        .await
+        .expect("get");
+    assert_eq!(member(&got, "fp"), text("world"));
+    assert_eq!(member(&got, "fs.value"), text("world"));
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    put("again").await;
+    let mut posted = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await {
+        for path in ev.marked.clone().unwrap_or_default() {
+            posted.push((path.clone(), member(&ev.value, &path)));
+        }
+    }
+    mon.stop().await;
+    posted.sort_by(|a, b| a.0.cmp(&b.0));
+    let paths: Vec<&str> = posted.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["fp", "fs.timeStamp", "fs.value"]);
+    assert_eq!(posted[0].1, text("again"));
+    assert_eq!(posted[2].1, text("again"));
+}
+
+/// A `$` member with an `arr` slice reads as a single-record one does:
+/// `softIocPVX` 1.5.3 over `record(stringin,"FS"){field(VAL,"hello")}` and
+/// this group answers `pvxget FG` with `t.value` and `p` both
+/// `int8_t[] = {3}[101, 108, 0]`.
+#[tokio::test]
+async fn a_dollar_arr_member_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(
+            r#"{"FG":{
+                "t":{"+channel":"FS.VAL${\"arr\":{\"s\":1,\"e\":3}}"},
+                "p":{"+channel":"FS.VAL${\"arr\":{\"s\":1,\"e\":3}}","+type":"plain"}
+            }}"#,
+        )
+        .expect("load");
+    assert_eq!(provider.process_groups().await, 1);
+    let def = provider.groups().get("FG").cloned().expect("FG");
+    let got = GroupChannel::new(db.clone(), def)
+        .get(&empty_request())
+        .await
+        .expect("get");
+    let want = epics_bridge_rs::convert::epics_to_pv_field(&EpicsValue::CharArray(
+        b"el\0".to_vec().into(),
+    ));
+    let Some(PvField::Structure(t)) = got.get_field("t") else {
+        panic!("{got:?}");
+    };
+    assert_eq!(t.get_field("value"), Some(&want));
+    assert_eq!(got.get_field("p"), Some(&want));
 }

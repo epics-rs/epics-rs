@@ -255,6 +255,62 @@ pub struct DbSubscription {
     /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
     record: std::sync::Arc<crate::server::record::RecordCell>,
     sid: u32,
+    /// What is done to each event as it is read; `None` for most
+    /// channels, which have neither.
+    read: Option<Box<PostStage>>,
+}
+
+/// A subscription's read-time work, C's post chain on its `dbChannel`, run
+/// off the record lock as the event is read (`dbEvent.c:984-985`).
+#[derive(Default)]
+pub struct PostStage {
+    /// The channel's post-chain filters.
+    post: crate::server::database::filters::FilterChain,
+    /// A `$` channel's view: the post chain sees its char image.
+    dollar: Option<crate::server::database::char_view::DollarView>,
+}
+
+impl PostStage {
+    /// The stage for post chain `post` on a channel with `$` view `dollar`,
+    /// `None` where it would do nothing.
+    pub fn new(
+        post: crate::server::database::filters::FilterChain,
+        dollar: Option<crate::server::database::char_view::DollarView>,
+    ) -> Option<Self> {
+        (!post.is_empty() || dollar.is_some()).then_some(Self { post, dollar })
+    }
+
+    /// The event as read, `None` where the post chain drops it.
+    pub fn read(&self, event: MonitorEvent) -> Option<MonitorEvent> {
+        self.read_request(event, usize::MAX)
+    }
+
+    /// [`Self::read`] by a `dbGet` of `n_request` elements, a CA client's
+    /// count, which a `$` channel's chars are cut to
+    /// ([`DollarView::read_request`](crate::server::database::char_view::DollarView::read_request)).
+    pub fn read_request(&self, mut event: MonitorEvent, n_request: usize) -> Option<MonitorEvent> {
+        let image = self.dollar.map(|view| {
+            let snap = std::sync::Arc::make_mut(&mut event.snapshot);
+            let value = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
+            snap.value = view.render(value);
+            (view, snap.value.clone())
+        });
+        if !self.post.is_empty() {
+            use crate::server::database::filters::FilteredMonitorEvent;
+            event = self.post.apply(FilteredMonitorEvent::new(event))?.event;
+        }
+        if let Some((view, image)) = image {
+            let snap = std::sync::Arc::make_mut(&mut event.snapshot);
+            let log = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
+            snap.value = view.read_request(image, log, n_request);
+        }
+        Some(event)
+    }
+
+    /// Whether the stage reads a `$` channel's chars itself.
+    pub fn reads_chars(&self) -> bool {
+        self.dollar.is_some()
+    }
 }
 
 /// Detachable enable/disable handle for one [`DbSubscription`], holding
@@ -312,11 +368,10 @@ impl DbSubscription {
     }
 
     /// Subscribe with both a custom event mask and an
-    /// optional pvxs-compatible channel filter chain. The chain's
-    /// filters are attached to the new subscriber so the per-event
-    /// filter framework gates / transforms events at posting time
-    /// (matches pvxs/dbChannel field-scoped filter semantics —
-    /// state is per-subscriber, not subscription-wide).
+    /// optional pvxs-compatible channel filter chain. Per-subscriber
+    /// state, as a `dbChannel`'s. The pre-chain filters run on the post,
+    /// the post-chain ones as the event is read
+    /// ([`SubscriptionFilter::post_chain`](crate::server::database::filters::SubscriptionFilter::post_chain)).
     pub async fn subscribe_with_mask_and_filters(
         db: &PvDatabase,
         pv_name: &str,
@@ -328,13 +383,12 @@ impl DbSubscription {
         let field = field.to_ascii_uppercase();
         let rec = db.get_record(record_name)?;
         let sid = next_sid();
+        let (pre, post) = filters.map(|chain| chain.split()).unwrap_or_default();
         let reader = {
             let mut instance = rec.write();
             let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
-            if let Some(chain) = filters {
-                for filter in chain.iter() {
-                    instance.attach_filter_to_last_subscriber(&field, filter.clone());
-                }
+            for filter in pre.iter() {
+                instance.attach_filter_to_last_subscriber(&field, filter.clone());
             }
             reader
         };
@@ -344,7 +398,33 @@ impl DbSubscription {
             ignore_origin,
             record: rec,
             sid,
+            read: PostStage::new(post, None).map(Box::new),
         })
+    }
+
+    /// Serve this subscription as a `$` channel: each event is read as
+    /// [`DollarView::render`](crate::server::database::char_view::DollarView::render)'s
+    /// image, through the post chain, then
+    /// [`DollarView::cut`](crate::server::database::char_view::DollarView::cut).
+    pub fn with_dollar_view(
+        mut self,
+        view: crate::server::database::char_view::DollarView,
+    ) -> Self {
+        self.read.get_or_insert_default().dollar = Some(view);
+        self
+    }
+
+    /// The event as read, `None` where it is skipped: the one place
+    /// `ignore_origin`, the `$` view and the post chain apply, for every
+    /// reader.
+    fn read_event(&self, event: MonitorEvent) -> Option<MonitorEvent> {
+        if self.ignore_origin != 0 && event.origin == self.ignore_origin {
+            return None;
+        }
+        match self.read.as_deref() {
+            Some(read) => read.read(event),
+            None => Some(event),
+        }
     }
 
     /// Pause (`active == false`) or resume (`true`) this subscription's
@@ -380,10 +460,9 @@ impl DbSubscription {
     async fn next_event(&mut self) -> Option<MonitorEvent> {
         loop {
             let event = self.reader.recv().await?;
-            if self.ignore_origin != 0 && event.origin == self.ignore_origin {
-                continue;
+            if let Some(event) = self.read_event(event) {
+                return Some(event);
             }
-            return Some(event);
         }
     }
 
@@ -401,10 +480,9 @@ impl DbSubscription {
     fn try_next_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
         loop {
             let event = self.reader.try_recv()?;
-            if self.ignore_origin != 0 && event.origin == self.ignore_origin {
-                continue;
+            if let Some(event) = self.read_event(event) {
+                return Ok(event);
             }
-            return Ok(event);
         }
     }
 
@@ -473,10 +551,10 @@ impl DbSubscription {
     ) -> std::task::Poll<Option<MonitorEvent>> {
         loop {
             match self.reader.poll_recv(cx) {
-                std::task::Poll::Ready(Some(event))
-                    if self.ignore_origin != 0 && event.origin == self.ignore_origin =>
-                {
-                    continue;
+                std::task::Poll::Ready(Some(event)) => {
+                    if let Some(event) = self.read_event(event) {
+                        return std::task::Poll::Ready(Some(event));
+                    }
                 }
                 other => return other,
             }
@@ -560,12 +638,8 @@ impl DbMultiMonitor {
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
             for sub in &mut self.subs {
-                match sub.reader.try_recv() {
+                match sub.try_next_event() {
                     Ok(event) => {
-                        // Skip self-triggered events
-                        if sub.ignore_origin != 0 && event.origin == sub.ignore_origin {
-                            continue;
-                        }
                         let val = event.snapshot.value.to_f64().unwrap_or(0.0);
                         return (sub.pv_name.clone(), val);
                     }

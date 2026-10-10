@@ -7,7 +7,7 @@
 //! (`linkGlobal_t::init`).
 //!
 //! Pre-fix, pvalink installed inside the Phase-3 protocol runner
-//! (`run_ca_pva_qsrv_ioc`), AFTER iocInit. This test drives the
+//! (`run_ca_pva_qsrv_ioc_app`'s), AFTER iocInit. This test drives the
 //! PRODUCTION `IocApplication::run` path with a CUSTOM runner that
 //! installs nothing itself: the registered seam installer is therefore
 //! the ONLY thing that can make the `pva` scheme appear, so a pre-fix

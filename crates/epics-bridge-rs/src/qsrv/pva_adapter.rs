@@ -161,8 +161,8 @@ pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
         .insert(pv_name.to_string(), handle);
 }
 
-/// Take all registered native PVA PVs. Called by `run_ca_pva_qsrv_ioc`
-/// to wire them into `QsrvPvStore`.
+/// Take all registered native PVA PVs. Called by `run_ca_pva_qsrv_ioc_app`'s
+/// runner to wire them into `QsrvPvStore`.
 pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
 }
@@ -1380,7 +1380,7 @@ fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>)
 /// environment. Pinning it here is the structural single-source-of-truth:
 /// the two consumers that run at different iocInit points — the pvalink
 /// install seam (`pvalink_link_set_install`, fired at `AfterCaLinkInit`)
-/// and the Phase-3 protocol runner (`run_ca_pva_qsrv_ioc`) — read this one
+/// and the QSRV mount build (`build_qsrv_mount`) — read this one
 /// cell, so they cannot disagree on whether QSRV2 is on. Mirrors pvxs,
 /// where `enable2()` is evaluated once in `pvxsBaseRegistrar` and the
 /// single result gates `single_enable()` / `group_enable()` /
@@ -1388,34 +1388,24 @@ fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>)
 static QSRV2_DECISION: OnceLock<Qsrv2Decision> = OnceLock::new();
 
 /// The single owner of the QSRV2 enable decision. Reads
-/// `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE` and applies the pvxs
-/// `enable2()` rule on the FIRST call only; every later caller reuses the
-/// cached [`Qsrv2Decision`]. Pure and silent — the startup diagnostics are
-/// emitted once by [`qsrv2_enabled`] (the runner's authoritative print),
-/// so callers that only need the boolean (the install seam) take no
-/// diagnostic side effect.
+/// `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE`, applies the pvxs
+/// `enable2()` rule and prints its diagnostics on the FIRST call only, as
+/// `enable2()` does from `pvxsBaseRegistrar` before the st.cmd runs
+/// (iochooks.cpp:459-462); every later caller reuses the cached
+/// [`Qsrv2Decision`].
 fn qsrv2_decision() -> &'static Qsrv2Decision {
     QSRV2_DECISION.get_or_init(|| {
         let ignore = std::env::var("EPICS_IOC_IGNORE_SERVERS").ok();
         let enable = std::env::var("PVXS_QSRV_ENABLE").ok();
-        resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref())
+        let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
+        if let Some(e) = &decision.error {
+            eprintln!("{e}");
+        }
+        if let Some(i) = &decision.info {
+            println!("{i}");
+        }
+        decision
     })
-}
-
-/// Apply the cached QSRV2 decision, print the same synchronous startup
-/// diagnostics pvxs emits (iochooks.cpp:421-446), and return whether QSRV2
-/// database/group serving is enabled. Called once, by the protocol runner,
-/// so the `INFO:` / `ERROR:` line prints exactly once at the pvxs-equivalent
-/// point.
-fn qsrv2_enabled() -> bool {
-    let decision = qsrv2_decision();
-    if let Some(e) = &decision.error {
-        eprintln!("{e}");
-    }
-    if let Some(i) = &decision.info {
-        println!("{i}");
-    }
-    decision.enabled
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,7 +1436,7 @@ pub struct QsrvMount {
 ///
 /// **This is the single owner of that sequence.** Both entry points that can
 /// serve QSRV go through it: the host dual-protocol runner
-/// (`run_ca_pva_qsrv_ioc`) and the RTEMS target IOC, which has no iocsh, no
+/// (`run_ca_pva_qsrv_ioc_app`) and the RTEMS target IOC, which has no iocsh, no
 /// `IocApplication` and no CA server and so could not reach the runner. Two
 /// hand-rolled copies of "decide, build, load groups, wrap" is how the two
 /// would come to disagree about whether `PVXS_QSRV_ENABLE` is honoured or
@@ -1491,7 +1481,7 @@ pub async fn build_qsrv_mount(
     // mounted and the PVA server still serves native PVA PVs, but the
     // BridgeProvider answers "absent" for every DB/group channel — matching a
     // pvxs IOC where enable2() returned false.
-    let enabled = qsrv2_enabled();
+    let enabled = qsrv2_decision().enabled;
 
     let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
 
@@ -1614,9 +1604,8 @@ impl QsrvMount {
 /// installer — a database with no PVA links stays fully serviceable,
 /// and the shared PVA client is created lazily per link, so there is
 /// no init failure to abort the IOC on. The gate reads the shared
-/// `qsrv2_decision` (silent), so this seam and the runner's
-/// `qsrv2_enabled` print always agree on the same one decision; the
-/// authoritative startup diagnostic is emitted once by the runner.
+/// `qsrv2_decision`, so this seam and `build_qsrv_mount` always agree on
+/// the same one decision.
 pub async fn pvalink_link_set_install(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
@@ -1638,7 +1627,7 @@ pub async fn pvalink_link_set_install(
 #[cfg(tokio_backend)]
 /// Runs a combined CA + PVA IOC with QSRV bridge.
 ///
-/// Designed as a protocol runner for [`epics_base_rs::server::ioc_app::IocApplication::run`]. Starts a CA
+/// Runs `app` through [`epics_base_rs::server::ioc_app::IocApplication::run`]: starts a CA
 /// server in the background, creates a `QsrvPvStore` wrapping the database,
 /// registers any native PVA PVs (NTNDArray from NDPluginPva), then runs the
 /// PVA server with an interactive iocsh shell.
@@ -1646,9 +1635,7 @@ pub async fn pvalink_link_set_install(
 /// # Example
 ///
 /// ```rust,ignore
-/// AdIoc::new()
-///     .run_with_script_and_runner("st.cmd", run_ca_pva_qsrv_ioc)
-///     .await
+/// run_ca_pva_qsrv_ioc_app(IocApplication::new().startup_script("st.cmd")).await
 /// ```
 ///
 /// Reactor-backed builds only, and it needs the full `qsrv` selection.
@@ -1670,8 +1657,8 @@ pub async fn pvalink_link_set_install(
 ///   `qsrv-core` split exists to avoid.
 ///
 /// The target's equivalent entry point is `epics-bridge-rs`'s `realtime-pva-ioc`.
-/// Stand `app` up on CA + pvAccess + QSRV — [`run_ca_pva_qsrv_ioc`] with both
-/// protocol registrars already run.
+/// Stand `app` up on CA + pvAccess + QSRV, with both protocol registrars
+/// already run and the QSRV mount built at `initHookAfterInitDatabase`.
 ///
 /// C and pvxs each register their shell commands from a registrar the `.dbd`
 /// names, so `casr` and `pvxsr` answer on the first `st.cmd` line. Rust has
@@ -1682,20 +1669,59 @@ pub async fn pvalink_link_set_install(
 /// with it. Pairing the two registrars with the runner is what removes the
 /// choice.
 ///
-/// `IocApplication::run(run_ca_pva_qsrv_ioc)` still works and still puts both
-/// commands on the INTERACTIVE shell; only the startup shell needs this.
+/// pvxs runs `processGroups` at `initHookAfterInitDatabase`
+/// (iochooks.cpp:355), before `scanInit` and `initialProcess`; a protocol
+/// runner runs after `iocRun`, so the mount is built at that hook and handed
+/// over, and there is no runner entry point that builds it late.
 #[cfg(all(feature = "qsrv", tokio_backend))]
 pub async fn run_ca_pva_qsrv_ioc_app(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::error::CaResult<()> {
     let app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
     let app = epics_pva_rs::server::iocsh::register_pvxs_commands(app);
-    app.run(run_ca_pva_qsrv_ioc).await
+    // No `group_files`: this IOC's `dbLoadGroup` requests sit on the base
+    // startup queue, put there by the iocsh command during st.cmd.
+    run_qsrv_ioc_app(app, Vec::new(), serve_ca_pva_qsrv).await
+}
+
+/// Run `app` with [`build_qsrv_mount`] at `initHookAfterInitDatabase`, ahead
+/// of `scanInit` and `initialProcess` as pvxs `processGroups` is
+/// (iochooks.cpp:355), and hand the mount to `serve` at `iocRun`.
+///
+/// Every `IocApplication` route that serves QSRV goes through here, so none
+/// can order the mount against scan start by hand.
+#[cfg(all(feature = "qsrv", tokio_backend))]
+pub async fn run_qsrv_ioc_app<F, Fut>(
+    app: epics_base_rs::server::ioc_app::IocApplication,
+    group_files: Vec<epics_base_rs::server::ioc_app::GroupLoadRequest>,
+    serve: F,
+) -> epics_base_rs::error::CaResult<()>
+where
+    F: FnOnce(epics_base_rs::server::ioc_app::IocRunConfig, QsrvMount) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = epics_base_rs::error::CaResult<()>> + Send + 'static,
+{
+    // pvxsBaseRegistrar's point: the decision and its INFO line come before
+    // the st.cmd, not at iocInit.
+    qsrv2_decision();
+    let slot = Arc::new(parking_lot::Mutex::new(None::<QsrvMount>));
+    let built = slot.clone();
+    let app = app.register_after_init_database(move |db, acf| async move {
+        *built.lock() = Some(build_qsrv_mount(&db, acf, &group_files).await);
+    });
+    app.run(move |config| async move {
+        let mount = slot
+            .lock()
+            .take()
+            .expect("iocBuild announces initHookAfterInitDatabase before iocRun");
+        serve(config, mount).await
+    })
+    .await
 }
 
 #[cfg(all(feature = "qsrv", tokio_backend))]
-pub async fn run_ca_pva_qsrv_ioc(
+async fn serve_ca_pva_qsrv(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
+    mount: QsrvMount,
 ) -> epics_base_rs::error::CaResult<()> {
     use epics_base_rs::error::CaError;
 
@@ -1706,7 +1732,7 @@ pub async fn run_ca_pva_qsrv_ioc(
     // the callback band, which has no reactor for the `TcpStream` each
     // accepted client mints.
     let reactor = tokio::runtime::Handle::try_current()
-        .expect("run_ca_pva_qsrv_ioc is awaited on the IOC's reactor");
+        .expect("serve_ca_pva_qsrv is awaited on the IOC's reactor");
     let ca_port = config.port;
     // pvxs owns the PVA port, and it is NOT the CA rule: `PickOne` reads the
     // server-specific `EPICS_PVAS_SERVER_PORT` before the shared
@@ -1716,22 +1742,13 @@ pub async fn run_ca_pva_qsrv_ioc(
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     // ── QSRV bridge ──
-    // The enable gate, the provider, the ACF install and the
-    // `processGroups()`-equivalent group load all live in `build_qsrv_mount`
-    // — the one owner shared with the RTEMS target IOC, so the two entry
-    // points cannot disagree about whether `PVXS_QSRV_ENABLE` was honoured
-    // or whether groups were finalized before the first client GET. The ACF
-    // is the same `config.acf` CELL the CA server adopts via
-    // `CaServer::from_parts` below — one cell for CA, PVA, QSRV and the
-    // iocsh `asInit` command; handing any side a different one is the
-    // documented configuration trap.
+    // Built by `build_qsrv_mount` at `initHookAfterInitDatabase` — the one
+    // owner shared with the RTEMS target IOC — over the same ACF cell the CA
+    // server adopts via `CaServer::from_parts` below.
     let QsrvMount {
         store,
         enabled: qsrv2_on,
-        // Empty `group_files`: this runner's `dbLoadGroup` requests already sit
-        // on the base startup queue, put there by the iocsh command during
-        // st.cmd. The parameter exists for the target IOC, which has no iocsh.
-    } = build_qsrv_mount(&db, config.acf.clone(), &[]).await;
+    } = mount;
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
     // Handles were stored in the global registry during st.cmd execution.
@@ -1839,9 +1856,10 @@ pub async fn run_ca_pva_qsrv_ioc(
 ///     (`resolveTriggerReferences` / `createGroups`).
 ///
 /// Cross-source duplicate fields collapse first-wins inside the provider's
-/// field-keyed merge, matching pvxs `fieldConfigMap` accumulation. A
-/// failing source logs a warning and is skipped — a malformed group must
-/// not abort an otherwise-serviceable IOC.
+/// field-keyed merge, matching pvxs `fieldConfigMap` accumulation. A bad
+/// info tag warns and is skipped, an unreadable file prints pvxs's
+/// `Error opening` line and is skipped; a group file that
+/// does not parse aborts, as pvxs's throw out of its noexcept hook does.
 async fn load_qsrv_groups(
     provider: &Arc<BridgeProvider>,
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
@@ -1870,17 +1888,21 @@ async fn load_qsrv_groups(
     for req in take_group_load_requests().iter().chain(extra) {
         match super::iocsh::apply_group_file(provider, &req.filename, &req.macros) {
             Ok(total) => {
-                tracing::info!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
+                tracing::debug!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
             }
-            Err(e) => {
-                tracing::warn!(file = %req.filename, "qsrv: dbLoadGroup failed: {e}");
+            Err(super::iocsh::GroupFileError::Open(line)) => eprintln!("{line}"),
+            Err(super::iocsh::GroupFileError::Parse(what)) => {
+                // libstdc++'s verbose terminate handler framing pvxs's throw.
+                eprintln!(
+                    "terminate called after throwing an instance of 'std::runtime_error'\n  what():  {what}"
+                );
+                std::process::abort();
             }
         }
     }
 
     // 3. Finalize (pvxs resolveTriggerReferences / createGroups).
-    let n = provider.process_groups().await;
-    tracing::info!("qsrv: processGroups created {n} group(s)");
+    provider.process_groups().await;
 }
 
 #[cfg(test)]
@@ -2554,6 +2576,70 @@ mod tests {
             got, canonical,
             "client-side introspection must recover the producer's UnionArray variants over the wire"
         );
+    }
+
+    /// softIocPVX 1.5.3 on `{"G2":{"a":{"+channel":"NOPE.VAL"}}}` prints
+    /// `G2: Error Group not created`, still answers G2, and fails each op:
+    ///
+    /// ```text
+    /// pvxinfo G2      Error: Implicit Cancel
+    /// pvxget G2       Op Create implied error
+    /// pvxput G2 a=1   RemoteError : Op Create implied error
+    /// pvxmonitor G2   RemoteError : Monitor Create implied error
+    /// ```
+    #[cfg(all(feature = "qsrv", tokio_backend))]
+    #[tokio::test]
+    async fn an_uncreated_group_answers_and_fails_each_op_with_pvxs_text() {
+        use std::time::Duration;
+
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        provider
+            .load_group_config(
+                r#"{"G1":{"a":{"+channel":"A.VAL"}},"G2":{"a":{"+channel":"NOPE.VAL"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(provider.process_groups().await, 1);
+        let store = Arc::new(QsrvPvStore::new(crate::test_reactor(), provider));
+        let server =
+            PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");
+        let client = server.client_config();
+        let within = Duration::from_secs(5);
+
+        let err = tokio::time::timeout(within, client.pvinfo("G2"))
+            .await
+            .expect("pvinfo G2 timed out")
+            .expect_err("pvinfo G2");
+        assert!(err.to_string().contains("Implicit Cancel"), "{err}");
+        let err = tokio::time::timeout(within, client.pvget("G2"))
+            .await
+            .expect("pvget G2 timed out")
+            .expect_err("pvget G2");
+        assert!(err.to_string().contains("Op Create implied error"), "{err}");
+        let err = tokio::time::timeout(within, client.pvput("G2", "1"))
+            .await
+            .expect("pvput G2 timed out")
+            .expect_err("pvput G2");
+        assert!(err.to_string().contains("Op Create implied error"), "{err}");
+        let err = tokio::time::timeout(within, client.pvmonitor("G2", |_| {}))
+            .await
+            .expect("pvmonitor G2 timed out")
+            .expect_err("pvmonitor G2");
+        assert!(
+            err.to_string().contains("Monitor Create implied error"),
+            "{err}"
+        );
+        tokio::time::timeout(within, client.pvget("G1"))
+            .await
+            .expect("pvget G1 timed out")
+            .expect("G1 was created");
     }
 
     /// PUT INIT pvRequest `record._options.process=true` reaches

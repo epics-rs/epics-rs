@@ -1665,10 +1665,10 @@ impl PvDatabase {
             .store(Some(Arc::new(resolver)));
     }
 
-    /// How many records hold device support — the `iocInit: N records, M with
-    /// device support` count. Derived from the records themselves rather than
-    /// tallied by a wiring pass, because there is no longer a wiring pass:
-    /// the bind happens at each record's creation.
+    /// How many records hold device support. Derived from the records
+    /// themselves rather than tallied by a wiring pass, because there is no
+    /// longer a wiring pass: the bind happens at each record's creation.
+    #[cfg(test)]
     pub(crate) async fn records_with_device_support(&self) -> usize {
         let names = self.all_record_names().await;
         names
@@ -3373,7 +3373,9 @@ impl PvDatabase {
             // failure is an early return that the init tail must not run past,
             // and only the init owner can honour that.
             instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            instance.run_init_passes(name);
+            // No `add_record` channel: resolving INP's target here would take
+            // a record lock under L46.
+            instance.run_init_passes(name, None);
 
             // The init-seed owner: every CONSTANT link the record declares
             // (`Record::constant_init_links`) is loaded into its value field
@@ -3507,6 +3509,8 @@ impl PvDatabase {
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
     fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>) {
+        let add_record_input =
+            crate::server::builtin_devices::soft_callback::add_record_input_of(self, rec_arc, None);
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
@@ -3516,7 +3520,7 @@ impl PvDatabase {
                 self.inner.device_support_resolver.load().as_deref(),
             );
             instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            instance.run_init_passes(name);
+            instance.run_init_passes(name, add_record_input);
             super::database::processing::seed_constant_links(instance);
             (
                 instance.common.scan,

@@ -62,8 +62,8 @@ bench-subroutines = []
 # present (`epics_ca_rs::calink`, no feature). pvxs likewise ties pvalink
 # to QSRV2 (`iochooks.cpp:461-496`).
 #
-# `epics-ca-rs` is needed by exactly one item — `run_ca_pva_qsrv_ioc`, the host
-# dual-protocol runner — which is why it is here and not in `qsrv-core`.
+# `epics-ca-rs` is needed by exactly one item — `run_ca_pva_qsrv_ioc_app`, the
+# host dual-protocol runner — which is why it is here and not in `qsrv-core`.
 # The `epics-pva-rs/*` entries restore what `default-features = false` on the
 # dependency drops; see the note over the dependency itself.
 qsrv = [
@@ -75,7 +75,7 @@ qsrv = [
     "epics-pva-rs/pkcs12",
 ]
 # QSRV daemon binary (qsrv-rs)
-qsrv-bin = ["qsrv", "dep:clap", "dep:tracing-subscriber"]
+qsrv-bin = ["qsrv", "dep:clap"]
 # CA fan-out gateway (C++ ca-gateway equivalent)
 ca-gateway = ["dep:epics-ca-rs", "dep:regex"]
 # CA gateway daemon binary (ca-gateway-rs)

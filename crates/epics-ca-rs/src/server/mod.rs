@@ -82,15 +82,17 @@ pub(super) fn apply_long_string(
 /// NUL; the DBR_STRING encoder then truncates to `MAX_STRING_SIZE`
 /// (= 40), so an over-long value clips on the wire exactly as C does.
 /// Non-`CharArray` values pass through unchanged.
+///
+/// The carrier holds `LEN` elements, and `dbGet` reads `min(LEN, 1)`
+/// (`get_array_info` against the capacity of 1, `dbAccess.c:936-1001`), so
+/// an empty carrier is no element, not `""`.
 pub(super) fn apply_native_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::{EpicsValue, PvString};
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::CharArray(bytes) => {
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            EpicsValue::String(PvString::from_bytes(&bytes[..end]))
+    use epics_base_rs::types::EpicsValue;
+    snap.value = match std::mem::replace(&mut snap.value, EpicsValue::Long(0)) {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) if b.is_empty() => {
+            EpicsValue::StringArray(Vec::new().into())
         }
-        other => other,
+        v => epics_base_rs::server::database::char_view::long_string_text(v),
     };
 }
 
@@ -108,6 +110,8 @@ pub(super) enum LongStringMode {
     DollarChar {
         no_elements: u32,
         nul_at_count: bool,
+        /// The `DBR_CHAR` image the channel's post chain runs on.
+        view: epics_base_rs::server::database::char_view::DollarView,
     },
     /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
     /// printf VAL): C `cvt_dbaddr` presents it as a scalar `DBF_STRING`,
@@ -127,9 +131,113 @@ pub(super) fn apply_long_string_mode(
         LongStringMode::DollarChar {
             no_elements,
             nul_at_count,
+            ..
         } => apply_long_string(snap, no_elements, nul_at_count, requested_count),
         LongStringMode::NativeString => apply_native_long_string(snap),
         LongStringMode::Plain => {}
+    }
+}
+
+/// What one CA subscription does to each event between its queue and the
+/// wire: the channel's post chain, on a `$` channel's char image, then the
+/// long-string boundary conversion. Every delivery path reads its events
+/// through this one owner, as C's event task runs the post chain for every
+/// `event_read` (`dbEvent.c:984-985`).
+#[derive(Clone)]
+pub(crate) struct DeliveryStage {
+    post: Option<std::sync::Arc<epics_base_rs::server::database::db_access::PostStage>>,
+    long_string_mode: LongStringMode,
+    /// What an autosize request reads, C `paddr->no_elements`.
+    autosize: u32,
+}
+
+impl DeliveryStage {
+    /// The stage for a channel whose post chain is `post`, on a field of
+    /// `autosize` elements.
+    pub(crate) fn new(
+        post: epics_base_rs::server::database::filters::FilterChain,
+        long_string_mode: LongStringMode,
+        autosize: u32,
+    ) -> Self {
+        let dollar = match long_string_mode {
+            LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
+            _ => None,
+        };
+        Self {
+            post: epics_base_rs::server::database::db_access::PostStage::new(post, dollar)
+                .map(std::sync::Arc::new),
+            long_string_mode,
+            autosize,
+        }
+    }
+
+    /// A stage that sends every event as posted.
+    #[cfg(test)]
+    pub(crate) fn plain() -> Self {
+        Self {
+            post: None,
+            long_string_mode: LongStringMode::Plain,
+            autosize: 0,
+        }
+    }
+
+    /// Whether every event goes out exactly as posted.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.post.is_none() && self.long_string_mode == LongStringMode::Plain
+    }
+
+    /// `event` as sent for a `requested_count` request, `None` where the post
+    /// chain drops it.
+    pub(crate) fn prepare(
+        &self,
+        event: epics_base_rs::server::pv::MonitorEvent,
+        requested_count: u32,
+    ) -> Option<epics_base_rs::server::pv::MonitorEvent> {
+        // `read_reply`'s `item_count`: an autosize request reads the field's
+        // own count, which a log the filters grew (`ts`) is cut to.
+        let n_request = match requested_count {
+            0 => self.autosize,
+            n => n,
+        } as usize;
+        let mut event = match &self.post {
+            // A `$` view's read is already `dbGet`'s chars for this count.
+            Some(post) if post.reads_chars() => return post.read_request(event, n_request),
+            Some(post) => {
+                let mut event = post.read(event)?;
+                if event.snapshot.value.count() as usize > n_request {
+                    std::sync::Arc::make_mut(&mut event.snapshot)
+                        .value
+                        .truncate(n_request);
+                }
+                event
+            }
+            None => event,
+        };
+        if self.long_string_mode != LongStringMode::Plain {
+            apply_long_string_mode(
+                std::sync::Arc::make_mut(&mut event.snapshot),
+                self.long_string_mode,
+                requested_count,
+            );
+        }
+        Some(event)
+    }
+
+    /// [`Self::prepare`] for a snapshot no queue carried: a read, or a single
+    /// event posted under subscriber mask `mask`.
+    pub(crate) fn prepare_snapshot(
+        &self,
+        snapshot: epics_base_rs::server::snapshot::Snapshot,
+        requested_count: u32,
+        mask: u16,
+    ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+        let event = epics_base_rs::server::pv::MonitorEvent {
+            snapshot: std::sync::Arc::new(snapshot),
+            origin: 0,
+            mask: epics_base_rs::server::recgbl::EventMask::from_bits(mask),
+        };
+        self.prepare(event, requested_count)
+            .map(|event| std::sync::Arc::unwrap_or_clone(event.snapshot))
     }
 }
 

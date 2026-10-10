@@ -1499,7 +1499,7 @@ fn handle_client_blocking(
                                 data_count: r.data_count,
                                 denied: r.denied,
                                 gate: r.gate,
-                                long_string_mode: r.long_string_mode,
+                                stage: r.stage,
                                 req_hdr: hdr,
                                 client_minor: r.client_minor,
                                 stats: r.stats,
@@ -4351,7 +4351,7 @@ mod tests {
             &event,
             &outbox,
             crate::server::outbox::Credit::none(),
-            r.long_string_mode,
+            &r.stage,
             crate::server::tcp::ReplyContext {
                 req_hdr: hdr,
                 client_minor: r.client_minor,

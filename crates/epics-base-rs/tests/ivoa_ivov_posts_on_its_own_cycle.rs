@@ -74,9 +74,8 @@ fn armed_records() -> [Armed; 5] {
             kind: "lso",
             fields: r#"field(IVOV,"fault")"#,
             dbf: DbFieldType::Char,
-            // A long string that fits `MAX_STRING_SIZE` is posted as `String`;
-            // a longer one arrives as `CharArray`.
-            posted: EpicsValue::String("fault".into()),
+            // A long string posts its `LEN` elements, text and NUL.
+            posted: EpicsValue::CharArray(b"fault\0".to_vec().into()),
         },
     ]
 }

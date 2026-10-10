@@ -109,6 +109,11 @@ impl SubscriptionFilter for ArrayFilter {
         "arr"
     }
 
+    /// `arr.c:177-178`.
+    fn post_chain(&self) -> bool {
+        true
+    }
+
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         let cfg = self.config;
         let mut event = event;

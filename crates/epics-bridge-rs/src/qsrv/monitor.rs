@@ -41,6 +41,9 @@ pub struct BridgeMonitor {
     /// Bound field (uppercased; defaults to `VAL`).
     field: String,
     nt_type: NtType,
+    /// The channel's `$` decision; the subscriptions carry it, so only the
+    /// text is left here.
+    view: super::pvif::View,
     /// VALUE | ALARM subscription — matches pvxs QSRV default DBE mask
     /// (singlesource.cpp:142). Replaces the previous VALUE | LOG default
     /// so a no-options PVA monitor sees alarm transitions but not the
@@ -82,12 +85,18 @@ pub struct BridgeMonitor {
 }
 
 impl BridgeMonitor {
+    pub(crate) fn with_view(mut self, view: super::pvif::View) -> Self {
+        self.view = view;
+        self
+    }
+
     pub fn new(db: Arc<PvDatabase>, record_name: String, field: String, nt_type: NtType) -> Self {
         Self {
             db,
             record_name,
             field,
             nt_type,
+            view: super::pvif::View::Field,
             subscription: None,
             property_subscription: None,
             value_mask_override: None,
@@ -259,6 +268,7 @@ impl PvaMonitor for BridgeMonitor {
             filters_opt,
         )
         .await
+        .map(|sub| self.view.subscribed(sub))
         .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // pvxs QSRV opens a second subscription with the
@@ -290,6 +300,7 @@ impl PvaMonitor for BridgeMonitor {
             property_filters_opt,
         )
         .await
+        .map(|sub| self.view.subscribed(sub))
         .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // The native PVA server emits the initial snapshot via
@@ -329,7 +340,7 @@ impl PvaMonitor for BridgeMonitor {
         // metadata as freshly changed on every value event.
         let value_mask = self.value_mask();
         loop {
-            let (snapshot, change) = match (
+            let (mut snapshot, change) = match (
                 self.subscription.as_mut(),
                 self.property_subscription.as_mut(),
             ) {
@@ -353,6 +364,12 @@ impl PvaMonitor for BridgeMonitor {
                 }
                 _ => return None,
             };
+            if let super::pvif::View::Dollar(view) = self.view {
+                let snap = std::sync::Arc::make_mut(&mut snapshot);
+                let value =
+                    std::mem::replace(&mut snap.value, epics_base_rs::types::EpicsValue::Long(0));
+                snap.value = view.text(value);
+            }
             // A single-record channel's NT IS the root, so the mapped node
             // has an empty prefix. pvxs's `SingleInfo` carries a default
             // `MappingInfo` — `MappingInfo::Scalar` — for every single

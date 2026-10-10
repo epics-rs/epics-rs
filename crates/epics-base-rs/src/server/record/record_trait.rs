@@ -172,6 +172,12 @@ pub struct FieldDesc {
     /// carries no selector, so the declared type is the true one and it is
     /// projected like any other field.
     pub runtime_typed: bool,
+    /// A `DBF_STRING` whose `field_size` is the record's `SIZV` (`lsi`/`lso`
+    /// VAL+OVAL, `printf` VAL): the `size` column of `cvt_dbaddr.types`. It is
+    /// pvxs's long string (`field_size > MAX_STRING_SIZE+1`,
+    /// `ioc/channel.cpp:58-67`); the record stores its `LEN` elements as a
+    /// `CharArray`, and every server asks this, not the record.
+    pub long_string: bool,
     /// `special(SPC_NOMOD)` — the field is immutable for this record type. The
     /// static half of the no-modify declaration; see [`Record::field_no_mod`]
     /// for the half a record decides at runtime.
@@ -284,6 +290,7 @@ impl FieldDesc {
             // The `cvt_dbaddr` records are all on the generated table, which
             // sets this from `cvt_dbaddr.types`.
             runtime_typed: false,
+            long_string: false,
             read_only,
             special: if read_only {
                 Special::NoMod
@@ -2415,6 +2422,14 @@ pub fn calc_class_link_backed_metadata_field(field: &str) -> Option<String> {
         .map(|n| arg_link_field("INP", n))
 }
 
+/// [`FieldDesc::long_string`] of `field` in `fields`. The flag is tested
+/// first, so only a long-string row pays a name compare.
+pub(crate) fn long_string_in(fields: &[FieldDesc], field: &str) -> bool {
+    fields
+        .iter()
+        .any(|d| d.long_string && d.name.eq_ignore_ascii_case(field))
+}
+
 pub trait FieldDeclaration {
     /// The record type's field descriptors, in `.dbd` declaration order.
     fn field_list(&self) -> &'static [FieldDesc];
@@ -2451,14 +2466,13 @@ pub trait FieldDeclaration {
     /// `lsiRecord.c:127-134` raises `paddr->special` to `SPC_MOD` on VAL and
     /// `SPC_NOMOD` on OVAL, and the branch still takes the array arm.
     ///
-    /// That distinction is why this cannot be one lookup here either.
-    /// [`FieldDesc::special`] carries the `cvt_dbaddr` special for a DBADDR
-    /// field, not the declaration (`dbd/cvt_dbaddr.types` says so, and derives
-    /// `read_only` from it) — which preserves `SPC_DBADDR` for every such field
-    /// except the five long-string ones, whose `cvt_dbaddr` overwrites it. Those
-    /// five are exactly [`Record::long_string_fields`] (`lsi`/`lso` VAL+OVAL,
-    /// `printf` VAL), so the second half asks the record for them.
+    /// That distinction is why this reads [`FieldDesc::declared_special`]:
+    /// [`FieldDesc::special`] carries the `cvt_dbaddr` special, which is no
+    /// longer `SPC_DBADDR` on the five long-string fields.
     fn field_is_dbaddr(&self, field: &str) -> bool;
+
+    /// [`FieldDesc::long_string`] of `field`.
+    fn field_is_long_string(&self, field: &str) -> bool;
 
     /// Whether the port stores `field` as a buffer — what `get_field(field)`
     /// would answer with `is_array()`, without cloning the value to ask. Only
@@ -2496,11 +2510,11 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
         }
         self.field_list()
             .iter()
-            .any(|d| d.name.eq_ignore_ascii_case(field) && d.special == Special::DbAddr)
-            || self
-                .long_string_fields()
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(field))
+            .any(|d| d.name.eq_ignore_ascii_case(field) && d.declared_special == Special::DbAddr)
+    }
+
+    fn field_is_long_string(&self, field: &str) -> bool {
+        long_string_in(self.field_list(), field)
     }
 
     fn field_stores_array(&self, field: &str) -> bool {
@@ -2846,24 +2860,6 @@ pub trait Record: Send + Sync + 'static {
     /// Override it in the record's own file, citing the C rset lines.
     fn property_support(&self) -> crate::server::snapshot::PropertySupport {
         default_property_support(self.record_type())
-    }
-
-    /// Field names this record serves as a *long string*: a `DBF_CHAR`
-    /// array field that semantically holds a NUL-terminated string.
-    ///
-    /// In EPICS such a field is declared `DBF_NOACCESS` (or carries a `$`
-    /// modifier) and is accessed through a `DBR_CHAR` array view whose
-    /// `form` is `"String"`; pvxs maps that view to a scalar `pvString`
-    /// rather than an `int8[]` (`ioc/channel.cpp:58-68`,
-    /// `ioc/iocsource.cpp:619-643`). QSRV uses this list to serve those
-    /// fields as scalar-string NTScalar values instead of byte scalars.
-    ///
-    /// The record keeps its `CharArray` storage; the QSRV boundary does
-    /// the `CharArray <-> String` conversion. Default empty — only
-    /// long-string record types (`lsi`/`lso` VAL/OVAL, `printf` VAL)
-    /// override this. Names are matched case-insensitively.
-    fn long_string_fields(&self) -> &'static [&'static str] {
-        &[]
     }
 
     /// Field names declared `pp(TRUE)` in this record type's DBD (empty if
@@ -6117,25 +6113,16 @@ fn put_value_in_shape<R: Record + ?Sized>(
         // C's ARRAY arm at `nRequest == 1` — except into a long-string field.
         // C's `cvt_dbaddr` re-types those five to `DBF_STRING`
         // (`lsiRecord.c:127-134`), so their conversion row is
-        // `putStringString`, a byte copy of the text, and this port carries
-        // that text as the value itself — `lsi.VAL` as a `String`, `printf.VAL`
-        // as a `CharArray`. Wrapping a `String` request into a one-element
-        // `StringArray` hands that row an array and the record a variant no
-        // `put_field` arm takes.
-        (true, false) if !is_long_string_field(record, field) => {
+        // `putStringString`, a byte copy of the text, and the record's put
+        // takes the `String` itself as that `DBR_STRING` put (all five store
+        // their `LEN` elements as a `CharArray`). Wrapping a `String` request
+        // into a one-element `StringArray` hands that row an array and the
+        // record a variant no `put_field` arm takes.
+        (true, false) if !record.field_is_long_string(field) => {
             one_element_buffer(&value).unwrap_or(value)
         }
         _ => value,
     }
-}
-
-/// `field` is one of the record's long-string fields (`lsi`/`lso` VAL+OVAL,
-/// `printf` VAL), matched as [`Record::long_string_fields`] specifies.
-fn is_long_string_field<R: Record + ?Sized>(record: &R, field: &str) -> bool {
-    record
-        .long_string_fields()
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(field))
 }
 
 /// The same question for INTERNAL DELIVERY — an input link or device support
@@ -6381,11 +6368,7 @@ fn put_string_array_row<R: Record + ?Sized>(
     // `putStringString` is a byte copy, and the record stores the text: hand the
     // value over unchanged rather than falling through to the SCALAR numeric
     // row below, which would parse `printf.VAL`'s `"7"` into the number 7.
-    if record
-        .long_string_fields()
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(field))
-    {
+    if record.field_is_long_string(field) {
         return Ok(Ok(Converted::Stored(value)));
     }
     // A scalar-held destination has `no_elements` 1, so `dbPut` clamps the
@@ -6452,7 +6435,7 @@ fn put_string_array_row<R: Record + ?Sized>(
 ///
 /// Two array destinations are outside the numeric row, and both are C's own
 /// distinction rather than a carve-out here: a LONG-STRING field
-/// ([`Record::long_string_fields`]) is `DBF_STRING` in its `cvt_dbaddr`, so its
+/// ([`FieldDesc::long_string`]) is `DBF_STRING` in its `cvt_dbaddr`, so its
 /// row is `putStringString`, a byte copy; and an `FTVL=STRING` buffer is the
 /// same copy per element. Those keep the string and their records store it. A
 /// string reaching a char buffer as its BYTES is the DBR_CHAR row (`caput -S`),
@@ -6816,9 +6799,9 @@ mod tests {
 
     /// The generated `SPC_DBADDR` list answers the table walk: C's declared
     /// special (asyn's `ERRS` is resolved to `NoMod` but declared `SPC_DBADDR`,
-    /// `asynRecord.dbd:622-624`), plus the long-string fields whose
-    /// `cvt_dbaddr` overwrites it. A type only another crate can create is
-    /// pinned on its generated table alone.
+    /// `asynRecord.dbd:622-624`), which the long-string fields keep although
+    /// their `cvt_dbaddr` overwrites the resolved one. A type only another
+    /// crate can create is pinned on its generated table alone.
     #[test]
     fn the_dbaddr_list_is_what_the_field_table_walk_answers() {
         use crate::server::record::dbd_generated::{
@@ -6844,13 +6827,13 @@ mod tests {
             let walk = |field: &str| {
                 probe.field_list().iter().any(|d| {
                     d.name.eq_ignore_ascii_case(field) && d.declared_special == Special::DbAddr
-                }) || probe
-                    .long_string_fields()
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(field))
+                })
             };
-            seen_long_string += probe.long_string_fields().len();
             for desc in probe.field_list() {
+                if desc.long_string {
+                    seen_long_string += 1;
+                    assert!(walk(desc.name), "{record_type}.{} is SPC_DBADDR", desc.name);
+                }
                 assert_eq!(
                     listed.contains(&desc.name),
                     walk(desc.name),

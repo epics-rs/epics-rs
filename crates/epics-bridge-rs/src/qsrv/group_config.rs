@@ -187,12 +187,16 @@ impl GroupPvDef {
         );
     }
 
-    fn resolve_self_trigger_default(&mut self) {
-        let has_explicit = self
-            .members
+    /// pvxs's `hasTriggers`: some member names a non-empty `+trigger`
+    /// (`groupconfigprocessor.cpp:300-303`).
+    pub fn has_triggers(&self) -> bool {
+        self.members
             .iter()
-            .any(|m| matches!(m.triggers, TriggerDef::All | TriggerDef::Fields(_)));
-        if has_explicit {
+            .any(|m| matches!(m.triggers, TriggerDef::All | TriggerDef::Fields(_)))
+    }
+
+    fn resolve_self_trigger_default(&mut self) {
+        if self.has_triggers() {
             for m in &mut self.members {
                 if matches!(m.triggers, TriggerDef::SelfOnly) {
                     m.triggers = TriggerDef::None;
@@ -299,7 +303,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
         // A semantic error in one group must not hide valid siblings in
         // the same file; the JSON *syntax* error above still rejects the
         // whole file (matching the strict-parse boundary).
-        match raw_to_group_def(name.clone(), raw) {
+        match raw_to_group_def(name.clone(), raw, "") {
             Ok(def) => groups.push(def),
             Err(e) => tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV group"),
         }
@@ -320,9 +324,6 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 ///     })
 /// }
 /// ```
-///
-/// The `record_name` is used as channel prefix: if `+channel` is a bare field
-/// name (no `:` separator), it becomes `"record_name.FIELD"`.
 pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
     let normalized = relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
@@ -332,29 +333,16 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
     for (name, raw) in root {
         // Per-group recovery, as in `parse_group_config` — one invalid
         // group in an info(Q:group) body must not drop its siblings
-        // (pvxs groupconfigprocessor.cpp:128-163).
-        let mut def = match raw_to_group_def(name.clone(), raw) {
+        // (pvxs groupconfigprocessor.cpp:128-163). pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
+        // `"{record}."`, including ones that already hold ':' or '.'
+        // (groupprocessorcontext.cpp:65-66, groupconfigprocessor.cpp:810-818).
+        let def = match raw_to_group_def(name.clone(), raw, &format!("{record_name}.")) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV info(Q:group) group");
                 continue;
             }
         };
-        // pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
-        // `"{record}."` — `channelPrefix = dbRecordName + "."` is applied
-        // unconditionally (groupprocessorcontext.cpp:65-66,
-        // groupconfigprocessor.cpp:810-818); it does NOT skip values that
-        // already contain ':' or '.'. Record-info group JSON is always
-        // record-relative; absolute PV names are reachable only through the
-        // file-based dbLoadGroup path (the empty-prefix case). The earlier
-        // ':'/'.' scan let an info(Q:group) member reference an unrelated
-        // absolute PV that pvxs would not model. Skip only the channel-less
-        // Structure/Const members (empty channel).
-        for member in &mut def.members {
-            if !member.channel.is_empty() {
-                member.channel = format!("{}.{}", record_name, member.channel);
-            }
-        }
         groups.push(def);
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
@@ -608,7 +596,13 @@ fn json_value_as_i64(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> {
+/// `channel_prefix` is pvxs's `channelPrefix`: `"REC."` for a record's
+/// info(Q:group), empty for a group file.
+fn raw_to_group_def(
+    name: String,
+    raw: RawGroupDef,
+    channel_prefix: &str,
+) -> BridgeResult<GroupPvDef> {
     let mut members = Vec::new();
 
     for (field_name, value) in &raw.fields {
@@ -617,7 +611,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
             continue;
         }
 
-        let member = parse_member(field_name, value)?;
+        let member = parse_member(field_name, value, channel_prefix)?;
         // pvxs `defineFields` only permits an empty top-level field name
         // for a metadata mapping: `+type:"meta"` merges alarm/timeStamp at
         // the struct root, every other mapping must be named
@@ -772,7 +766,11 @@ fn validate_field_name(field_name: &str) -> BridgeResult<()> {
         .map_err(BridgeError::GroupConfigError)
 }
 
-fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<GroupMember> {
+fn parse_member(
+    field_name: &str,
+    value: &serde_json::Value,
+    channel_prefix: &str,
+) -> BridgeResult<GroupMember> {
     // pvxs constructs `FieldName(def.name)` before anything else in the field
     // definition; a malformed path throws and aborts this group's build.
     validate_field_name(field_name)?;
@@ -844,11 +842,12 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             let v = obj.get("+channel").ok_or_else(|| {
                 BridgeError::GroupConfigError(format!("field '{field_name}' missing +channel"))
             })?;
-            json_value_as_string(v).ok_or_else(|| {
+            let channel = json_value_as_string(v).ok_or_else(|| {
                 BridgeError::GroupConfigError(format!(
                     "field '{field_name}': +channel value {v} is not a string, number, or bool"
                 ))
-            })?
+            })?;
+            format!("{channel_prefix}{channel}")
         }
     };
 

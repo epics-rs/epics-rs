@@ -144,6 +144,32 @@ impl SubscriptionFilter for TimestampFilter {
         "ts"
     }
 
+    /// Only `generate` stamps the post (`ts.c:308-334`).
+    fn post_chain(&self) -> bool {
+        self.mode != TsMode::Generate
+    }
+
+    /// `channelRegisterPost`'s probe: one element, two for `ts`
+    /// (`ts.c:343-348`).
+    fn final_element_count(&self, input: usize) -> usize {
+        match self.mode {
+            TsMode::Generate => input,
+            TsMode::Array => 2,
+            _ => 1,
+        }
+    }
+
+    /// `channelRegisterPost`'s probe type (`ts.c:350-362`).
+    fn final_field_type(&self, input: crate::types::DbFieldType) -> crate::types::DbFieldType {
+        use crate::types::DbFieldType;
+        match self.mode {
+            TsMode::Generate => input,
+            TsMode::Double => DbFieldType::Double,
+            TsMode::Seconds | TsMode::Nanoseconds | TsMode::Array => DbFieldType::ULong,
+            TsMode::StringEpics | TsMode::StringIso => DbFieldType::String,
+        }
+    }
+
     fn apply(&self, mut event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         // One `make_mut` for the whole filter: it copies the snapshot only
         // when another subscriber still holds the same `Arc`, and every arm
@@ -187,6 +213,14 @@ impl SubscriptionFilter for TimestampFilter {
             TsMode::StringIso => {
                 snap.value = EpicsValue::String(format_iso_string(snap.timestamp).into());
             }
+        }
+        if self.mode != TsMode::Generate {
+            // `dbGet` keeps the options the log's new type allows
+            // (`dbAccess.c:341-348,387-394`).
+            snap.properties = snap.properties.narrowed_to_field(
+                self.final_field_type(crate::types::DbFieldType::Double),
+                false,
+            );
         }
         Some(event)
     }

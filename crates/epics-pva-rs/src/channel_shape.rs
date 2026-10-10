@@ -13,6 +13,7 @@
 //! VAL) and as `pvxput` refusing the drive with "Unable to assign string[]
 //! with String".
 
+use epics_base_rs::server::database::filters::FilterChain;
 use epics_base_rs::server::record::{FieldDeclaration, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
@@ -39,16 +40,6 @@ pub enum ChannelShape {
 /// answer for a plain scalar field (one) and for a `SPC_DBADDR` field whose
 /// record declares no `cvt_dbaddr` capacity (`histogram` VAL, whose buffer is
 /// always `NELM` long).
-/// Whether `field_upper` is one of the record's long-string fields
-/// (`lsi`/`lso` VAL+OVAL, `printf` VAL), matched as
-/// [`Record::long_string_fields`] specifies.
-fn is_long_string(record: &dyn Record, field_upper: &str) -> bool {
-    record
-        .long_string_fields()
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(field_upper))
-}
-
 pub fn channel_final_elements(
     record: &dyn Record,
     field_upper: &str,
@@ -60,13 +51,25 @@ pub fn channel_final_elements(
 }
 
 impl ChannelShape {
-    /// Classify the channel bound to `record.field_upper`. `resolved` is the
-    /// value that channel serves (`client_field_value`, i.e. already
-    /// projected onto the field's declared type).
+    /// The shape of a channel whose filter chain leaves `final_elements`.
+    pub fn of_count(final_elements: usize) -> Self {
+        if final_elements == 1 {
+            ChannelShape::Scalar
+        } else {
+            ChannelShape::Array
+        }
+    }
+
+    /// Classify the channel bound to `record.field_upper` through its filter
+    /// chain `filters`, whose `arr` reshapes the count as its
+    /// `channel_report` does. `resolved` is the value that channel serves
+    /// (`client_field_value`, i.e. already projected onto the field's
+    /// declared type).
     pub fn of_channel(
         record: &dyn Record,
         field_upper: &str,
         resolved: Option<&EpicsValue>,
+        filters: &FilterChain,
     ) -> Self {
         // A long-string field is never a scalar channel. C's `cvt_dbaddr`
         // gives it `no_elements = 1`, but pvxs reshapes a `DBF_STRING` wider
@@ -74,14 +77,14 @@ impl ChannelShape {
         // (`ioc/channel.cpp:58-67`) and reaches its long-string arms
         // (`putLongString`, `iocsource.cpp:602-603`) BECAUSE of that, so the
         // count is not what can answer here; the declaration is.
-        if is_long_string(record, field_upper) {
+        if record.field_is_long_string(field_upper) {
             return ChannelShape::Array;
         }
-        if channel_final_elements(record, field_upper, resolved) == 1 {
-            ChannelShape::Scalar
-        } else {
-            ChannelShape::Array
-        }
+        Self::of_count(filters.final_element_count(channel_final_elements(
+            record,
+            field_upper,
+            resolved,
+        ) as usize))
     }
 
     /// [`Self::of_channel`] for a live record, resolving the field's value
@@ -96,17 +99,18 @@ impl ChannelShape {
     pub fn of_record_channel(
         instance: &epics_base_rs::server::record::RecordInstance,
         field_upper: &str,
+        filters: &FilterChain,
     ) -> Self {
-        if is_long_string(&*instance.record, field_upper) {
+        if instance.record.field_is_long_string(field_upper) {
             return ChannelShape::Array;
         }
         match instance.record.field_native_count(field_upper) {
-            Some(1) => ChannelShape::Scalar,
-            Some(_) => ChannelShape::Array,
+            Some(n) => Self::of_count(filters.final_element_count(n as usize)),
             None => Self::of_channel(
                 &*instance.record,
                 field_upper,
                 instance.client_field_value(field_upper).as_ref(),
+                filters,
             ),
         }
     }

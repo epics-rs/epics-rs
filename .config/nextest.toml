@@ -228,6 +228,16 @@ test-group = 'ca_softioc'
 #                                        time at host load 35; each child
 #                                        serves and searches its own
 #                                        ephemeral port on 127.0.0.1.
+#   binary(softioc_db_channel_create_line)
+#                                      — 0 failures in 20 runs at host
+#                                        load 34; the child serves its own
+#                                        free port on 127.0.0.1.
+#   binary(qsrv_rs_group_file)         — 0 failures in 20 runs, 2 at a
+#                                        time at host load 13-20; each
+#                                        child takes `--port 0` and
+#                                        `EPICS_PVAS_BROADCAST_PORT=0`
+#                                        and is waited on by its own
+#                                        `iocRun` line.
 #   binary(interop_pvxs)               — fix-db measured 3 failures in 20
 #                                        runs with ONE test alone in the
 #                                        run on an idle host: not a
@@ -235,7 +245,7 @@ test-group = 'ca_softioc'
 #                                        would cost wall time and buy
 #                                        nothing.
 [[profile.default.overrides]]
-filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(interop_pvxs)'
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(interop_pvxs)'
 test-group = 'ioc_unthrottled'
 
 [test-groups]

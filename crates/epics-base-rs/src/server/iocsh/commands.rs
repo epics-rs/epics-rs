@@ -6123,7 +6123,12 @@ async fn install_record_defs(
                 // first_output_done) get re-initialised — still better than
                 // silently ignoring field overrides that affect init.
                 if !init_deferred {
-                    rec_arc.write().run_init_passes(&def.name);
+                    let input = crate::server::builtin_devices::soft_callback::add_record_input_of(
+                        ctx.db(),
+                        &rec_arc,
+                        None,
+                    );
+                    rec_arc.write().run_init_passes(&def.name, input);
                 }
             }
             // C's `init_record` checkLinks (`init_links`) and the constant-INP

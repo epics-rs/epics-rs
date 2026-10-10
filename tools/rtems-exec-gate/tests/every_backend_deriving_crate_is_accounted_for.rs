@@ -112,7 +112,9 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("asyn-rs", "tests/process_gate_tests.rs"),
     ("epics-base-rs", "tests/client_server.rs"),
     ("epics-bridge-rs", "tests/pva_gateway.rs"),
+    ("epics-bridge-rs", "tests/qsrv_app_group_file.rs"),
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
+    ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),
     ("epics-ca-rs", "src/server/tcp.rs"),
@@ -124,7 +126,9 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/beacon_ramp_connect.rs"),
     ("epics-ca-rs", "tests/ca_char_put_is_unsigned.rs"),
     ("epics-ca-rs", "tests/ca_client_char_is_unsigned.rs"),
+    ("epics-ca-rs", "tests/ca_filter_pre_post.rs"),
     ("epics-ca-rs", "tests/ca_out_link_write_access_gate.rs"),
+    ("epics-ca-rs", "tests/ca_ts_filter_probe.rs"),
     ("epics-ca-rs", "tests/caget_dbr_type.rs"),
     ("epics-ca-rs", "tests/calink_enum_ctrl_attributes.rs"),
     (
@@ -146,6 +150,8 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/differential_libca.rs"),
     ("epics-ca-rs", "tests/discovery_mdns.rs"),
     ("epics-ca-rs", "tests/dollar_long_string_record.rs"),
+    ("epics-ca-rs", "tests/long_string_dollar_monitor_counts.rs"),
+    ("epics-ca-rs", "tests/long_string_plain_monitor_counts.rs"),
     (
         "epics-ca-rs",
         "tests/put_failure_status_is_the_layer_not_the_error.rs",

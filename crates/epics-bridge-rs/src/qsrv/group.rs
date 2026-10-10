@@ -1081,38 +1081,12 @@ impl GroupChannel {
     /// Decode one member's value from an already-borrowed record
     /// instance. Shared by the locked (atomic) and self-locking
     /// (non-atomic) read paths so both produce identical output.
-    /// Run the member's VALUE-channel filter chain in READ context.
     ///
     /// pvxs reads a group member through `dbChannelGet` on that member's own
     /// `dbChannel` (`iocsource.cpp:79,127,175,268` under `IOCSource::get`),
     /// so `arr` slicing and `ts` tagging reach a group GET exactly as they
-    /// reach a single-record one.
-    ///
-    /// A chain that DROPS the read yields the unfiltered value, not an
-    /// error. C builds a read log with a zero `mask`
-    /// (`db_create_read_log` → `db_create_field_log`'s `freeListCalloc`,
-    /// `dbEvent.c:702,760-770`), so a value-gating filter's
-    /// `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)` starts at 0 and
-    /// `recGblCheckDeadband`'s zero `add_mask` can never raise it
-    /// (`filters/dbnd.c:83-88`) — the log is deleted and `NULL` reaches
-    /// `IOCSource::get`. pvxs passes that `NULL` straight into
-    /// `dbChannelGet` (`iocsource.cpp:79`, `localfieldlog.cpp:15-27`),
-    /// which then reads the live record (`dbAccess.c:924-930`). So a
-    /// `{"dbnd":…}` member serves every GET; only the event stream is
-    /// gated.
-    fn filter_read_value(
-        member: &MemberChannel,
-        value: epics_base_rs::types::EpicsValue,
-    ) -> epics_base_rs::types::EpicsValue {
-        if member.value_filters.is_empty() {
-            return value;
-        }
-        member
-            .value_filters
-            .apply_to_read_value(value.clone())
-            .unwrap_or(value)
-    }
-
+    /// reach a single-record one: every value comes through
+    /// [`MemberChannel::read_with`] or [`MemberChannel::snapshot_in`].
     fn decode_member(
         member: &MemberChannel,
         record_name: &str,
@@ -1122,13 +1096,14 @@ impl GroupChannel {
     ) -> BridgeResult<PvField> {
         match member.def.mapping {
             FieldMapping::Scalar => {
-                let mut snapshot = member.snapshot_in(instance, backing).ok_or_else(|| {
-                    BridgeError::FieldNotFound {
-                        record: record_name.to_string(),
-                        field: field_name.to_string(),
-                    }
-                })?;
-                snapshot.value = Self::filter_read_value(member, snapshot.value);
+                let not_found = || BridgeError::FieldNotFound {
+                    record: record_name.to_string(),
+                    field: field_name.to_string(),
+                };
+                let view = member.view_in(instance).ok_or_else(not_found)?;
+                let snapshot = member
+                    .snapshot_in(instance, view, backing)
+                    .ok_or_else(not_found)?;
                 // Derive the NT shape from the configured field's resolved
                 // value (record → common → virtual), not from the owning
                 // record type: a `REC.SCAN` member is NTEnum and a
@@ -1138,20 +1113,18 @@ impl GroupChannel {
                 // enum choices (e.g. `.SCAN`). Matches the single-record
                 // path and pvxs's per-channel `getChannelValueType`
                 // (groupconfigprocessor.cpp:960-974).
-                let nt_type = member.nt_type_in(instance, Some(&snapshot.value));
+                let nt_type = member.nt_type_in(instance, Some(&snapshot.value), view);
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
             }
             FieldMapping::Plain => {
-                let value =
-                    member
-                        .value_in(instance)
-                        .ok_or_else(|| BridgeError::FieldNotFound {
-                            record: record_name.to_string(),
-                            field: field_name.to_string(),
-                        })?;
-                let value = Self::filter_read_value(member, value);
+                let not_found = || BridgeError::FieldNotFound {
+                    record: record_name.to_string(),
+                    field: field_name.to_string(),
+                };
+                let view = member.view_in(instance).ok_or_else(not_found)?;
+                let value = member.read_with(instance, view).ok_or_else(not_found)?;
                 // The bare leaf renders through the same classifier the
                 // introspection uses, so the value can never be a shape the
                 // advertised descriptor does not describe (R18-26: a
@@ -1162,17 +1135,19 @@ impl GroupChannel {
                     &member.field,
                     Some(&value),
                     value.db_field_type(),
-                    member.string_view,
+                    view,
+                    &member.value_filters,
                 )
                 .value(&value))
             }
             FieldMapping::Meta => {
-                let snapshot = member.snapshot_in(instance, backing).ok_or_else(|| {
-                    BridgeError::FieldNotFound {
+                let snapshot = member
+                    .view_in(instance)
+                    .and_then(|view| member.snapshot_in(instance, view, backing))
+                    .ok_or_else(|| BridgeError::FieldNotFound {
                         record: record_name.to_string(),
                         field: field_name.to_string(),
-                    }
-                })?;
+                    })?;
                 // Same unnamed enclosing structure the descriptor
                 // advertises (see `meta_desc`), so the two cannot drift.
                 let mut meta = PvStructure::new("");
@@ -1187,14 +1162,13 @@ impl GroupChannel {
                 Ok(PvField::Structure(meta))
             }
             FieldMapping::Any => {
-                let value =
-                    member
-                        .value_in(instance)
-                        .ok_or_else(|| BridgeError::FieldNotFound {
-                            record: record_name.to_string(),
-                            field: field_name.to_string(),
-                        })?;
-                let value = Self::filter_read_value(member, value);
+                let value = member
+                    .view_in(instance)
+                    .and_then(|view| member.read_with(instance, view))
+                    .ok_or_else(|| BridgeError::FieldNotFound {
+                        record: record_name.to_string(),
+                        field: field_name.to_string(),
+                    })?;
                 // pvxs serves `+type:"any"` as a PVA `any` slot whose
                 // payload carries the concrete DB field type: `IOCSource::
                 // get` allocates `anyType.cloneEmpty()` and writes the
@@ -1208,8 +1182,13 @@ impl GroupChannel {
                 // asked of the classifier rather than read off the stored
                 // variant — a one-element array field's `any` payload is a
                 // scalar, exactly as its plain and scalar members are.
-                let pv = pvif::BareLeaf::any_payload_of_channel(instance, &member.field, &value)
-                    .value(&value);
+                let pv = pvif::BareLeaf::any_payload_of_channel(
+                    instance,
+                    &member.field,
+                    &value,
+                    &member.value_filters,
+                )
+                .value(&value);
                 let desc = pv.wire_descriptor();
                 Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }
@@ -1242,13 +1221,22 @@ impl GroupChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read();
-        let resolved = member.value_in(&instance);
-        let nt_type = member.nt_type_in(&instance, resolved.as_ref());
-        let value_dbf = resolved
-            .as_ref()
-            .map(|v| v.db_field_type())
-            .or_else(|| instance.declared_field_type(&member.field))
-            .unwrap_or(DbFieldType::Double);
+        // A member whose `$` is refused never passes group creation.
+        let view = member
+            .view_in(&instance)
+            .ok_or_else(|| BridgeError::FieldNotFound {
+                record: record_name.to_string(),
+                field: member.field.clone(),
+            })?;
+        let resolved = member.value_with(&instance, view);
+        let nt_type = member.nt_type_in(&instance, resolved.as_ref(), view);
+        let value_dbf = member.value_filters.final_field_type(
+            resolved
+                .as_ref()
+                .map(|v| v.db_field_type())
+                .or_else(|| instance.declared_field_type(&member.field))
+                .unwrap_or(DbFieldType::Double),
+        );
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
@@ -1295,7 +1283,7 @@ impl GroupChannel {
             return false;
         }
         // Through the shared classifier so the put gate and the group
-        // CREATION gate (`BridgeProvider::group_creation_error`) answer
+        // CREATION gate (`BridgeProvider::group_creation_errors`) answer
         // "is this a link field" from one table.
         super::channel::channel_link_class(&self.db, member).is_some()
     }
@@ -1384,6 +1372,14 @@ impl GroupChannel {
         // `IOCSource::put` does; the incoming node's own shape never
         // decides this.
         let pv_field = Self::put_leaf(member.def.mapping, pv_field)?;
+        if member.string_view {
+            // `dbPut(DBR_CHAR)` through the char address, as the
+            // single-record `$` channel puts.
+            use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+            let rec = self.db.get_record(&member.record)?;
+            let write = CharWrite::from_pva(&crate::convert::pv_field_to_epics(pv_field)?)?;
+            return char_view(&rec.read(), &member.field)?.put_value(write);
+        }
         match pv_field {
             // A string into a `DBF_CHAR` array member is pvxs's
             // `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`, the same
@@ -6025,25 +6021,14 @@ mod tests {
         }
     }
 
-    /// A `$` `+channel` is served, not refused: the group surface reaches
-    /// the same long-string view the single-record one does.
-    ///
-    /// pvxs has one getter for both surfaces — `groupsource.cpp:344,377` and
-    /// `singlesource.cpp:59,289` both call `IOCSource::get`, whose
-    /// `final_type == DBR_CHAR && value.type() == TypeCode::String` branch
-    /// (`iocsource.cpp:133-136`) collapses a char buffer to a NUL-terminated
-    /// string — this port hands a `$` member that leaf type for the
-    /// `DBF_STRING` half too, which pvxs does not
-    /// (`qsrv::pvif::nt_type_for_channel`). The port had the group path resolve the BARE
-    /// field name, which cannot see the view and therefore cannot apply the
-    /// eligibility test either, so the only safe thing left was to refuse
-    /// `$` at bind time — the parser accepted a name the decode path could
-    /// not serve. Asking the view is what restores both halves at once, and
-    /// both mappings are checked here because they render through different
-    /// builders (`snapshot_to_pv_structure` vs `BareLeaf`) with the NT owner
-    /// making them agree.
+    /// A `$` `+channel` is served, not refused, as the single-record channel
+    /// serves it: `softIocPVX` 1.5.3 serves a group's `DESC$` members as
+    /// `int8_t[]` (`d int8_t[] = {1}[0]` plain, `vs.value int8_t[]` inside an
+    /// `NTScalarArray` scalar) and a link's `$` as its text. Both mappings
+    /// are checked because they render through different builders
+    /// (`snapshot_to_pv_structure` vs `BareLeaf`).
     #[tokio::test]
-    async fn a_dollar_group_member_serves_the_long_string_view() {
+    async fn a_dollar_group_member_serves_what_softiocpvx_serves() {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
         use epics_pva_rs::ScalarValue;
@@ -6097,23 +6082,14 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
         let pv = channel.read_group().await.expect("`$` group GET");
 
+        let image = crate::convert::epics_to_pv_field(&EpicsValue::CharArray(
+            b"a description longer than a byte\0".to_vec().into(),
+        ));
         match get_nested_field(&pv, "d").as_deref() {
-            Some(PvField::Structure(nt)) => match nt.get_field("value") {
-                Some(PvField::Scalar(ScalarValue::String(v))) => {
-                    assert_eq!(v, "a description longer than a byte");
-                }
-                other => panic!("scalar `$` member must carry a string value, got {other:?}"),
-            },
-            other => panic!("member 'd' must be an NTScalar structure, got {other:?}"),
+            Some(PvField::Structure(nt)) => assert_eq!(nt.get_field("value"), Some(&image)),
+            other => panic!("member 'd' must be an NT structure, got {other:?}"),
         }
-        match get_nested_field(&pv, "p").as_deref() {
-            Some(PvField::Scalar(ScalarValue::String(v))) => {
-                assert_eq!(v, "a description longer than a byte");
-            }
-            other => panic!(
-                "plain `$` member must be a bare string leaf, not a byte array, got {other:?}"
-            ),
-        }
+        assert_eq!(get_nested_field(&pv, "p").as_deref(), Some(&image));
         assert_eq!(
             get_nested_field(&pv, "f").as_deref(),
             Some(&PvField::Scalar(ScalarValue::String("LS:other".into()))),
@@ -6138,18 +6114,16 @@ mod tests {
                 .1
         };
         match leaf("d") {
-            FieldDesc::Structure { fields, .. } => assert_eq!(
-                &fields.iter().find(|(n, _)| n == "value").unwrap().1,
-                &FieldDesc::Scalar(ScalarType::String),
-                "a scalar `$` member advertises an NTScalar string"
-            ),
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
+                assert_eq!(
+                    &fields.iter().find(|(n, _)| n == "value").unwrap().1,
+                    &FieldDesc::ScalarArray(ScalarType::Byte),
+                );
+            }
             other => panic!("member 'd' descriptor must be an NT structure, got {other:?}"),
         }
-        assert_eq!(
-            leaf("p"),
-            &FieldDesc::Scalar(ScalarType::String),
-            "a plain `$` member advertises a bare string, not a byte array"
-        );
+        assert_eq!(leaf("p"), &FieldDesc::ScalarArray(ScalarType::Byte));
         assert_eq!(
             leaf("f"),
             &FieldDesc::Scalar(ScalarType::String),
@@ -6193,13 +6167,12 @@ mod tests {
 
     /// A `$` member is writable, and the write goes to the field the view is
     /// of. pvxs puts a group member through the same `IOCSource::put` as a
-    /// single-record channel (`groupsource.cpp:564-567`), so the conversion
-    /// target must be the VIEWED type — a string — not the raw field's.
+    /// single-record channel (`groupsource.cpp:564-567`), so its `int8_t[]`
+    /// is a `dbPut(DBR_CHAR)` through the char address.
     #[tokio::test]
     async fn a_dollar_group_member_round_trips_a_put() {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
-        use epics_pva_rs::ScalarValue;
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("LS:rt", Box::new(AiRecord::new(0.0)))
@@ -6219,10 +6192,9 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
 
         let mut top = PvStructure::new("structure");
-        top.fields.push((
-            "d".into(),
-            PvField::Scalar(ScalarValue::String("after".into())),
-        ));
+        let image =
+            crate::convert::epics_to_pv_field(&EpicsValue::CharArray(b"after\0".to_vec().into()));
+        top.fields.push(("d".into(), image.clone()));
         channel
             .put_with_options(
                 &top,
@@ -6240,7 +6212,7 @@ mod tests {
         );
         assert_eq!(
             get_nested_field(&channel.read_group().await.unwrap(), "d").as_deref(),
-            Some(&PvField::Scalar(ScalarValue::String("after".into()))),
+            Some(&image),
         );
     }
 

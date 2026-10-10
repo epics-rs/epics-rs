@@ -840,6 +840,7 @@ mod dbf_link_class_tests {
             dbf_type: DbFieldType::String,
             declared_dbf: DbfCode::Inlink,
             runtime_typed: false,
+            long_string: false,
             read_only: false,
             special: crate::server::record::Special::None,
             declared_special: crate::server::record::Special::None,

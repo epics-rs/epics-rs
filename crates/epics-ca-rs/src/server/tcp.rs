@@ -4623,22 +4623,19 @@ pub(crate) async fn serve_write_head(
     // `caput -a PV 0` a short frame, and a short frame is RSRV_ERROR —
     // the port dropped the circuit where C accepts the put.
     //
-    // Scalar DBR_STRING is exempt outright: libca frames it as
-    // `CA_MESSAGE_ALIGN(strlen + 1)` (comQueSend.cpp:332-341), not the
-    // 40-byte `dbr_size[DBR_STRING]`, so #934 as merged drops every
-    // default-mode `caput` (upstream regression #943). C takes a short
-    // body into a 40-byte scratch zero-filled past `m_postsize`
-    // (camessage.c write_action, and the same copy into the put-notify
-    // buffer in write_notify_action) and demands no terminator anywhere
-    // in the received bytes; a body of 40 or more then satisfies
-    // `dbr_size_n` on its own. So every scalar-string frame is accepted
-    // and there is no boundary to special-case. `EpicsValue::from_bytes`
-    // is the scratch buffer's analogue: it bounds the slice at 40 and
-    // ends the string at the first NUL *or at the slice end*, which is
-    // what C's zero-fill produces.
+    // Scalar DBR_STRING is checked for a NUL within the received bytes
+    // instead (camessage.c:761-766, :1696-1701): libca frames it as
+    // `CA_MESSAGE_ALIGN(strlen + 1)` (comQueSend.cpp:332-341), not 40 bytes.
     let size_check = || -> CaResult<()> {
         if hdr.data_type == epics_base_rs::types::DBR_STRING && write_count == 1 {
-            return Ok(());
+            if payload.contains(&0) {
+                return Ok(());
+            }
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "scalar DBR_STRING payload of {} bytes has no NUL \
+                 (matches C epicsStrnLen >= m_postsize RSRV_ERROR)",
+                payload.len()
+            )));
         }
         let native = epics_base_rs::types::native_type_for_dbr(hdr.data_type)?;
         let size =

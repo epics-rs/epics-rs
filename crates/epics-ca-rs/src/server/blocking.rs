@@ -4150,25 +4150,19 @@ mod tests {
         );
     }
 
-    /// epics-base PR #944 (regression #943): a scalar DBR_STRING put is
-    /// exempt from the `dbr_size_n` check — libca frames it as
-    /// `CA_MESSAGE_ALIGN(strlen+1)`, not 40 bytes. C requires no
-    /// terminator: `write_action` copies the short body into a 40-byte
-    /// scratch and zero-fills the remainder, so the received bytes are
-    /// the whole string. An unterminated body must therefore be accepted
-    /// verbatim, not dropped.
-    #[test]
-    fn write_scalar_string_without_nul_is_accepted_whole() {
-        let (db, mut state, outbox, _drain) = write_test_session("WR:STR", EpicsValue::Double(1.0));
+    /// Dispatch a scalar DBR_STRING WRITE of `body` to `WR:STR`, seeded
+    /// with `"seed"`; the dispatch result and the stored value.
+    fn write_scalar_string(body: &[u8]) -> (CaResult<()>, EpicsValue) {
+        let (db, mut state, outbox, _drain) =
+            write_test_session("WR:STR", EpicsValue::String("seed".into()));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-
         let f = put_frame(
             CA_PROTO_WRITE,
             epics_base_rs::types::DBR_STRING,
             1,
             1,
             0x54,
-            b"AAAAAAAA",
+            body,
         );
         let (hdr, hdr_size) =
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
@@ -4183,54 +4177,31 @@ mod tests {
             None,
             SubscriptionDelivery::HandOff,
         ))
-        .unwrap();
-        assert!(
-            res.is_ok(),
-            "scalar string with no NUL must be accepted: C zero-fills past m_postsize"
-        );
-        assert_eq!(
-            simple_pv(&db, "WR:STR").get(),
-            EpicsValue::String("AAAAAAAA".into()),
-            "the whole received body is the string, terminator or not"
-        );
+        .unwrap()
+        .map(|_| ());
+        (res, simple_pv(&db, "WR:STR").get())
     }
 
-    /// The zero-length body of the same exemption: `caput PV ''` frames
-    /// `m_postsize` 0, which C's scratch copy turns into 40 NULs, i.e.
-    /// the empty string. It must not be read as a truncated frame.
+    /// Regression #943: libca frames a scalar DBR_STRING put as
+    /// `CA_MESSAGE_ALIGN(strlen+1)`, so `caput PV OK` is an 8-byte body
+    /// that the 40-byte `dbr_size_n` check would refuse.
     #[test]
-    fn write_scalar_string_with_an_empty_body_stores_the_empty_string() {
-        let (db, mut state, outbox, _drain) =
-            write_test_session("WR:STR", EpicsValue::String("seed".into()));
-        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+    fn write_scalar_string_short_body_with_its_nul_is_accepted() {
+        let (res, stored) = write_scalar_string(b"OK\0\0\0\0\0\0");
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(stored, EpicsValue::String("OK".into()));
+    }
 
-        let f = put_frame(
-            CA_PROTO_WRITE,
-            epics_base_rs::types::DBR_STRING,
-            1,
-            1,
-            0x54,
-            b"",
-        );
-        let (hdr, hdr_size) =
-            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
-        let payload = f[hdr_size..].to_vec();
-        block_on_sync(dispatch_message(
-            &hdr,
-            &payload,
-            &mut state,
-            &db,
-            &outbox,
-            peer,
-            None,
-            SubscriptionDelivery::HandOff,
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            simple_pv(&db, "WR:STR").get(),
-            EpicsValue::String(String::new().into())
-        );
+    /// A body with no NUL, short or empty, is RSRV_ERROR:
+    /// `epicsStrnLen(pPayload, m_postsize) >= m_postsize`
+    /// (camessage.c:761-766), and the record keeps its value.
+    #[test]
+    fn write_scalar_string_without_nul_drops_the_circuit() {
+        for body in [&b"AAAAAAAA"[..], b""] {
+            let (res, stored) = write_scalar_string(body);
+            assert!(res.is_err(), "{body:?}");
+            assert_eq!(stored, EpicsValue::String("seed".into()), "{body:?}");
+        }
     }
 
     fn events_off_frame() -> Vec<u8> {

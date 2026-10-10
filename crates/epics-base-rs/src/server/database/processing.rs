@@ -5570,24 +5570,31 @@ impl PvDatabase {
                 )
             };
 
-            if matches!(
+            // The outcomes that skip the whole epilogue (alarm, timestamp,
+            // snapshot, OUT, FLNK) and still run the cycle's process actions:
+            // C's `process()` returning before `recGblGetTimeStamp`, either
+            // with PACT set for an async wait (`aiRecord.c:153`) or with PACT
+            // cleared (`compressRecord.c:365`, `scalerRecord.c:470-545`).
+            let async_pending = matches!(
                 process_result,
                 crate::server::record::RecordProcessResult::AsyncPending
-            ) {
-                // C `dbProcess` contract: when device support / record body
-                // signals "async pending", `pact` MUST be true so subsequent
-                // dbProcess attempts on the same record bail at the entry
-                // guard. Previous Rust port assumed `process_local` had
-                // already set it via the swap-true at function entry, but
-                // this main path bypasses `process_local` and calls
-                // `record.process()` directly — leaving `processing=false`.
-                // Mirrors `aiRecord.c:122` and similar: `prec->pact = TRUE;
-                // return 0;` before async work.
-                guard.hold().enter_pact();
+            );
+            if async_pending
+                || matches!(
+                    process_result,
+                    crate::server::record::RecordProcessResult::CompleteNoEmit
+                )
+            {
+                // This path calls `record.process()` directly, not through
+                // `process_local`'s PACT swap, so an async wait sets PACT here
+                // for the entry guard to refuse the next `dbProcess`.
+                if async_pending {
+                    guard.hold().enter_pact();
+                }
                 guard.release();
 
-                // PACT stays set; skip alarm/timestamp/snapshot/OUT/FLNK.
-                // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
+                // `ReprocessAfter` for a delayed re-entry, and the record's own
+                // `dbPutLink`s made inside `process()`.
                 self.execute_process_actions_in(name, rec, process_actions, visited);
                 // After every action this arm runs, so the ordering rule holds
                 // whatever the outcome carried. The `ReprocessAfter` a pending
@@ -5595,43 +5602,10 @@ impl PvDatabase {
                 // enters through `process_record_continuation`, which acquires
                 // the same per-record gate this body still holds.
                 self.publish_post_write_fields(name, rec, post_write_fields);
-                // The SIM continuation released the SDLY PACT and the body then
-                // went async again: still run the restart check, which finds the
-                // record busy again and leaves the queue head where it is (the
-                // deferral is closed under its own restart).
-                self.apply_pact_exit(name, cycle_end.take());
-                return Ok(());
-            }
-            if matches!(
-                process_result,
-                crate::server::record::RecordProcessResult::CompleteNoEmit
-            ) {
-                guard.release();
-                // C `compressRecord.c:365` `if (status != 1)`: the record
-                // completed synchronously but emitted no new value this cycle
-                // (a compress still accumulating toward its next compressed
-                // sample). C runs none of `prec->udf = FALSE`,
-                // `recGblGetTimeStamp`, `monitor`, nor `recGblFwdLink` — so the
-                // entire value-publication epilogue (UDF clear / alarm commit /
-                // timestamp / monitor / FLNK) is skipped. PACT is already clear
-                // on this synchronous path (only the async branches set it), so
-                // there is nothing to release. `complete_no_emit()` carries no
-                // actions and compress is soft (no deferred device actions), so
-                // there is nothing to run — return without awaiting
-                // `execute_process_actions`, which would enlarge this hot
-                // recursive function's async frame (the FLNK chain nests one
-                // poll frame per hop, unbounded as in C; the write guard
-                // `instance` is released on return).
-                debug_assert!(
-                    process_actions.is_empty(),
-                    "CompleteNoEmit must carry no process actions"
-                );
-                // No actions means no link writes to order against, so the rule
-                // is satisfied here; the arm still publishes, so the mechanism
-                // has no arm-shaped hole.
-                self.publish_post_write_fields(name, rec, post_write_fields);
-                // The record is idle (this path sets no PACT), so a notify queued
-                // on a released SDLY window replays straight away.
+                // A record left idle replays a queued notify straight away; one
+                // that went async again (the SIM continuation released the SDLY
+                // PACT and the body re-entered it) leaves the queue head where it
+                // is, the deferral closed under its own restart.
                 self.apply_pact_exit(name, cycle_end.take());
                 return Ok(());
             }
@@ -6659,9 +6633,8 @@ impl PvDatabase {
         // `AsyncPendingNotify` ODLY defer above). The `ReprocessAfter` itself is
         // dispatched by the shared deferred-actions site at the tail, NOT a
         // separate `execute_process_actions_in().await` here — adding one would
-        // enlarge this hot recursive function's async frame (see the
-        // `CompleteNoEmit` note above; it overflowed the stack in the deep-chain
-        // tests).
+        // enlarge this hot recursive function's frame (one overflowed the
+        // stack in the deep-chain tests).
         // Holding `processing=true` also makes the tail's putf-clear (gated on
         // `!is_processing()`) a no-op, leaving putf for the continuation.
         if result_is_defer_output {

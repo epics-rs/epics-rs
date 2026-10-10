@@ -1981,6 +1981,9 @@ pub enum RecordProcessResult {
     /// FLNK). C parity `compressRecord.c:365` `if (status != 1)`: a compress
     /// record still accumulating toward its next compressed sample runs none of
     /// `recGblGetTimeStamp` / `monitor` / `recGblFwdLink` on that cycle.
+    /// ProcessActions are still executed: the `dbPutLink`s C makes inside
+    /// `process()` before that return (a scaler's COUT on a non-idle cycle,
+    /// `scalerRecord.c:456-466`) have already happened.
     CompleteNoEmit,
     /// Ran the value-publication epilogue NOW (UDF clear / timestamp / monitor —
     /// VAL and the alarm fields are posted this cycle), but the OUTPUT side (OUT
@@ -2092,6 +2095,14 @@ impl ProcessOutcome {
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+        }
+    }
+
+    /// [`Self::complete_no_emit`] with the actions `process()` queued.
+    pub fn complete_no_emit_with(actions: Vec<ProcessAction>) -> Self {
+        Self {
+            actions,
+            ..Self::complete_no_emit()
         }
     }
 

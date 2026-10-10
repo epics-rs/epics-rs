@@ -32,7 +32,7 @@ pub use declared_field_registry::{
 };
 pub use device_menu_registry::register_device_menu;
 pub(crate) use device_menu_registry::{
-    contributed_device_menu, contributed_device_rows, merged_device_menu,
+    contributed_device_rows, has_contributed_device_menu, merged_device_menu,
 };
 pub use link::{
     CaLink, CalcArg, CalcLink, ConstLoadError, ConstantLink, DbLink, DbLinkType, HwLink,

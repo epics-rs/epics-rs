@@ -286,7 +286,7 @@ pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
 /// Port of libCom `cvtFloatToString` (cvtFast.c:32-109). The fast path runs
 /// in f32 to match the C float arithmetic; the overflow branches cast to
 /// double exactly as the C `sprintf((double) flt_value)` does.
-fn cvt_float_to_string(val: f32, precision: u16) -> String {
+pub(crate) fn cvt_float_to_string(val: f32, precision: u16) -> String {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val >= 1e8 || val <= -1e8 {
             let p = precision.min(12) as usize;

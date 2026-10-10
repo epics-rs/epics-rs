@@ -566,6 +566,21 @@ pub enum LinkReadAs {
 }
 
 impl LinkReadAs {
+    /// Does this request render a `DBR_STRING` at the source, so the read
+    /// owes the conversion the source's
+    /// [`SourceRender`](super::record_instance::SourceRender)?
+    #[inline(always)]
+    pub(crate) fn renders_at_source(self) -> bool {
+        matches!(
+            self,
+            Self::String
+                | Self::Array {
+                    dbr: crate::types::DbFieldType::String,
+                    ..
+                }
+        )
+    }
+
     /// The scalar `dbrType` this request names; `None` for the native read and
     /// the char-array one, which name none.
     pub(crate) fn dbr_type(self) -> Option<crate::types::DbFieldType> {
@@ -715,6 +730,17 @@ pub enum InputLinkRequest {
 }
 
 impl InputLinkRequest {
+    /// [`LinkReadAs::renders_at_source`] for a request that may still be
+    /// the source's to settle.
+    #[inline(always)]
+    pub(crate) fn renders_at_source(self) -> bool {
+        match self {
+            Self::As(read_as) => read_as.renders_at_source(),
+            Self::NotRead => false,
+            Self::FromSource => true,
+        }
+    }
+
     /// INP's request under the record's DTYP, the one answer both INP reads of
     /// a cycle ask: a soft DTYP's dset decides it
     /// ([`Record::soft_input_request`]), any other leaves it to the record.
@@ -4357,6 +4383,13 @@ pub trait Record: Send + Sync + 'static {
     /// record crates outside this one, which keep the three fields behind
     /// [`Self::get_field`]; the callers read them there.
     fn simm_cells(&self) -> Option<SimmCells> {
+        None
+    }
+
+    /// seq link group `group`'s `(DLYn, DOn)` as stored, for the dispatch
+    /// that reads them every cycle. `None` keeps them behind
+    /// [`Self::get_field`], where the caller reads them.
+    fn seq_group_cells(&self, _group: usize) -> Option<(f64, f64)> {
         None
     }
 

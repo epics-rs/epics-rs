@@ -454,7 +454,13 @@ fn menu_name_of(choices: &'static [&'static str]) -> Option<&'static str> {
 /// `detail` is `pdbentry->message`, which C prints unconditionally between the
 /// value and the status text — an arm that set no message still leaves the two
 /// spaces that produces.
-fn cant_set_line(record: &str, field: &str, value: &str, detail: &str, status: &str) -> String {
+pub(crate) fn cant_set_line(
+    record: &str,
+    field: &str,
+    value: &str,
+    detail: &str,
+    status: &str,
+) -> String {
     format!("{ERL_ERROR}: Can't set '{record}.{field}' to '{value}' {detail} : {status}")
 }
 

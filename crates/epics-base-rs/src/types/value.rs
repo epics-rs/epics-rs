@@ -964,6 +964,32 @@ impl EpicsValue {
         })
     }
 
+    /// Each element's text in its own type, never through the f64 view: an
+    /// int64/uint64 element above 2^53 does not survive it (C's
+    /// `cvtInt64ToString` prints the exact integer). A float element is
+    /// `putFloatString`/`putDoubleString` with no `get_precision` to ask, so
+    /// precision 6.
+    fn element_texts(&self, nums: &[f64]) -> SharedArray<PvString> {
+        fn texts<T: fmt::Display>(a: &[T]) -> SharedArray<PvString> {
+            a.iter().map(|v| v.to_string().into()).collect()
+        }
+        match self {
+            Self::UInt64Array(a) => texts(a),
+            Self::FloatArray(a) => a
+                .iter()
+                .map(|&v| super::codec::cvt_float_to_string(v, 6).into())
+                .collect(),
+            Self::DoubleArray(a) => a
+                .iter()
+                .map(|&v| super::codec::cvt_double_to_string(v, 6).into())
+                .collect(),
+            _ => match self.as_int_i64_array() {
+                Some(ints) => texts(&ints),
+                None => texts(nums),
+            },
+        }
+    }
+
     /// Coerce to a different native type — the PUT direction, plus the
     /// whole-value text projection.
     ///
@@ -1070,9 +1096,7 @@ impl EpicsValue {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
                     None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
                 }),
-                DbFieldType::String => {
-                    EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
-                }
+                DbFieldType::String => EpicsValue::StringArray(self.element_texts(&nums)),
             };
         }
         if let EpicsValue::CharArray(bytes) = self {
@@ -1147,6 +1171,13 @@ impl EpicsValue {
             }
             (DbFieldType::UChar, EpicsValue::String(s)) => {
                 EpicsValue::UCharArray(s.as_bytes().to_vec().into())
+            }
+            // `cvt_f_st`/`cvt_d_st` with no `get_precision` to ask print at 6.
+            (DbFieldType::String, EpicsValue::Float(v)) => {
+                EpicsValue::String(super::codec::cvt_float_to_string(*v, 6).into())
+            }
+            (DbFieldType::String, EpicsValue::Double(v)) => {
+                EpicsValue::String(super::codec::cvt_double_to_string(*v, 6).into())
             }
             _ => self
                 .num()
@@ -2211,6 +2242,45 @@ mod wire_array_tests {
         assert_eq!(
             EpicsValue::from_bytes_array(DbFieldType::UShort, &shorts[..5], 3).unwrap(),
             EpicsValue::UShortArray(vec![5, 6].into())
+        );
+    }
+
+    #[test]
+    fn array_to_string_renders_each_element_natively() {
+        let texts = |v: EpicsValue| match v.convert_to(DbFieldType::String) {
+            EpicsValue::StringArray(a) => a
+                .iter()
+                .map(|s| s.as_str_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            texts(EpicsValue::Int64Array(
+                vec![(1 << 53) + 1, i64::MIN, -2].into()
+            )),
+            ["9007199254740993", "-9223372036854775808", "-2"]
+        );
+        assert_eq!(
+            texts(EpicsValue::UInt64Array(
+                vec![u64::MAX, (1 << 53) + 1].into()
+            )),
+            ["18446744073709551615", "9007199254740993"]
+        );
+        assert_eq!(
+            texts(EpicsValue::FloatArray(vec![1.25, 0.1, -0.0000003].into())),
+            ["1.250000", "0.100000", "-0.000000"]
+        );
+        assert_eq!(
+            texts(EpicsValue::DoubleArray(vec![66.46, 1e300].into())),
+            ["66.460000", "1.000000e+300"]
+        );
+        assert_eq!(
+            EpicsValue::Double(1.25).convert_to(DbFieldType::String),
+            EpicsValue::String("1.250000".into())
+        );
+        assert_eq!(
+            EpicsValue::Float(0.1).convert_to(DbFieldType::String),
+            EpicsValue::String("0.100000".into())
         );
     }
 }

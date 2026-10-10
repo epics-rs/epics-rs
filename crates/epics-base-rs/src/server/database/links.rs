@@ -509,18 +509,30 @@ impl MultiOut {
     }
 }
 
-/// The parse of each link in `fields` that `indices` selects, through the
-/// record's link cache ([`RecordInstance::record_link`]).
-fn selected_links(
-    instance: &RecordInstance,
-    fields: &[&'static str; 16],
-    indices: &[usize],
-) -> SelectedLinks {
+/// The parse of each output-row link that `indices` selects
+/// ([`RecordInstance::out_row_link`]).
+fn selected_links(instance: &RecordInstance, indices: &[usize]) -> SelectedLinks {
     let mut links: SelectedLinks = Default::default();
     for &i in indices {
-        links[i] = Some(instance.record_link(fields[i]).clone());
+        links[i] = Some(instance.out_row_link(i).clone());
     }
     links
+}
+
+/// The sixteen-link rows [`PvDatabase::dispatch_multi_output`] reads by
+/// index, by record type: the output row, and seq's `DOLn` row.
+pub(crate) fn multi_out_rows(
+    record_type: &str,
+) -> (
+    Option<&'static [&'static str; 16]>,
+    Option<&'static [&'static str; 16]>,
+) {
+    match record_type {
+        "fanout" => (Some(&LNK_LINK_FIELDS), None),
+        "dfanout" => (Some(&DFANOUT_LINK_FIELDS), None),
+        "seq" => (Some(&LNK_LINK_FIELDS), Some(&DOL_LINK_FIELDS)),
+        _ => (None, None),
+    }
 }
 
 /// Record types whose multi-output link groups are dispatched by
@@ -767,8 +779,11 @@ impl PvDatabase {
         let Some((name, rec)) = self.lookup_record(&db.target().record) else {
             return DbLinkAnswer::Absent;
         };
-        let put =
+        let mut put =
             crate::server::record::record_instance::PutAddr::resolve_in(&rec, &db.target().field);
+        if db.target().string_view {
+            put.field = put.field.viewed_as_chars();
+        }
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
                 .then(|| super::field_io::double_slot(put.field))
@@ -854,34 +869,56 @@ impl PvDatabase {
     /// Both [`Self::read_link_value_and_alarm`]'s hit and
     /// [`Self::read_db_link_at`] are this, so the two cannot disagree.
     /// `held` is the reader's set, which a target merged into it rides.
+    /// `render` asks for the [`SourceRender`] a `DBR_STRING` conversion of the
+    /// value needs, taken under this same hold.
+    ///
+    /// [`SourceRender`]: crate::server::record::record_instance::SourceRender
     #[inline(always)]
     fn read_db_at(
         &self,
         held: Option<&crate::server::database::SetGuard>,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
-    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        render_requested: bool,
+    ) -> RenderedRead {
         // A shadowed target has no address (`resolve_db_link`).
         let target = db.target();
         // Built in the shape it is returned in, and filtered in place: each
-        // repack of the value on the way up is a copy the optimiser keeps.
+        // repack of the value on the way up is a copy the optimiser keeps —
+        // which is also why a `$` address does not return early, and hands
+        // its hold to the cold build instead.
         let instance = match held {
             Some(set) => at.rec.read_in(set),
             None => at.rec.read(),
         };
-        let mut value = self.read_field_at(&instance, &target.field, at.put.field);
-        let alarm =
-            (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
-                SourceAlarm::local(
-                    SourceId::of(&at.rec),
-                    LinkAlarm::committed(&instance.common),
-                )
-            });
-        drop(instance);
+        let mut value;
+        let alarm;
+        let render;
+        if at.put.field.char_view {
+            alarm = db_link_alarm(db, at, &instance);
+            value = char_image_after_hold(instance, &target.field);
+            render = None;
+        } else {
+            value = self.read_field_at(&instance, &target.field, at.put.field);
+            alarm = db_link_alarm(db, at, &instance);
+            // A `$` source is a `DBF_CHAR` array, which renders with nothing
+            // of the record's; a string renders as itself.
+            render = match &value {
+                Some(v)
+                    if render_requested
+                        && !target.string_view
+                        && !matches!(v, EpicsValue::String(_) | EpicsValue::StringArray(_)) =>
+                {
+                    Some(instance.source_render_of(&target.field, v))
+                }
+                _ => None,
+            };
+            drop(instance);
+        }
         if let Some(suffix) = target.json_suffix.as_deref() {
             value = value.map(|v| filter_read(suffix, v));
         }
-        (value, alarm)
+        (value, alarm, render)
     }
 
     /// The read itself: `rec`'s field at `addr` — `None` when it resolves but
@@ -899,11 +936,14 @@ impl PvDatabase {
         addr: crate::server::record::record_instance::FieldAddr,
     ) -> (Option<EpicsValue>, Option<LinkAlarm>) {
         let instance = rec.read();
-        (
-            self.read_field_at(&instance, &db.target().field, addr),
-            (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
-                .then(|| LinkAlarm::committed(&instance.common)),
-        )
+        let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
+            .then(|| LinkAlarm::committed(&instance.common));
+        let value = if addr.char_view {
+            char_image_after_hold(instance, &db.target().field)
+        } else {
+            self.read_field_at(&instance, &db.target().field, addr)
+        };
+        (value, alarm)
     }
 
     /// `get_pv`'s own first question, and NOT redundant with the records
@@ -1003,18 +1043,23 @@ impl PvDatabase {
     /// reads where C resolves nothing and reads once through its `dbAddr`. It
     /// also tore, since the severity then came off a later read than the value
     /// it was reported with.
+    ///
+    /// `render` asks for the source's
+    /// [`SourceRender`](crate::server::record::record_instance::SourceRender),
+    /// taken under the read's own hold.
     pub(crate) fn read_link_value_and_alarm_at_source(
         &self,
         link: &crate::server::record::ParsedLink,
+        render: bool,
         visited: &mut ProcStack,
-    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+    ) -> RenderedRead {
         // PP: process a Passive DB source before reading, threading the
         // caller's chain state so an A<->B cycle terminates at the existing
         // guard — `read_link_value`'s rule, unchanged.
         if let crate::server::record::ParsedLink::Db(db) = link {
             self.process_passive_db_source(db, visited);
         }
-        let (value, alarm) = self.read_link_value_and_alarm(link);
+        let (value, alarm, render) = self.read_link_value_and_alarm(link, render);
         // A failed read inherits NOTHING: the gate
         // [`Self::read_link_with_alarm_at`] applies, kept at the primitive
         // here too so the illegal "no value, but here is the source's
@@ -1023,7 +1068,7 @@ impl PvDatabase {
             None if !crate::server::recgbl::simm::is_constant(link) => None,
             _ => alarm,
         };
-        (value, alarm)
+        (value, alarm, render)
     }
 
     /// C `dbGetLink(plink, dbrType, ...)` — an input-link read for the DBR class
@@ -1060,11 +1105,12 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        let (value, alarm) = self.read_link_value_and_alarm_at_source(link, visited);
+        let (value, alarm, render) =
+            self.read_link_value_and_alarm_at_source(link, read_as.renders_at_source(), visited);
         let Some(value) = value else {
             return (empty_read_fetch(link), None);
         };
-        match self.apply_link_read_as(link, read_as, value) {
+        match self.apply_link_read_as(link, read_as, value, render) {
             Some(v) => (LinkFetch::Value(v), alarm),
             None => (LinkFetch::Failed, None),
         }
@@ -1078,15 +1124,20 @@ impl PvDatabase {
     /// `None` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
     /// conversion slot), i.e. a FAILED read — never a silent no-op.
     #[inline(always)]
+    ///
+    /// `render` is what the read that produced `value` took of a local source
+    /// under its own hold ([`RenderedRead`]): a `DBR_STRING` conversion never
+    /// goes back to the source for it.
     pub(crate) fn apply_link_read_as(
         &self,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         match read_as {
             crate::server::record::LinkReadAs::Native => Some(value),
-            _ => self.convert_link_read(link, read_as, value),
+            _ => self.convert_link_read(link, read_as, value, render),
         }
     }
 
@@ -1097,6 +1148,7 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         use crate::server::record::LinkReadAs;
         match read_as {
@@ -1115,11 +1167,15 @@ impl PvDatabase {
             | LinkReadAs::Int64
             | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type()?),
             LinkReadAs::Enum => self.enum_read_of(link, value),
-            LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
+            LinkReadAs::String => self
+                .dbr_string_of(link, value, render)
+                .map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
-            LinkReadAs::Array { dbr, n_request } => self.array_read_of(link, dbr, n_request, value),
+            LinkReadAs::Array { dbr, n_request } => {
+                self.array_read_of(link, dbr, n_request, value, render)
+            }
         }
     }
 
@@ -1132,20 +1188,19 @@ impl PvDatabase {
         dbr: DbFieldType,
         n_request: usize,
         mut value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         if value.is_array() {
-            value.truncate(n_request);
-            if dbr == DbFieldType::String
-                && let crate::server::record::ParsedLink::Db(db) = link
-                && let Some(at) = self.db_link_addr(db)
-                && let Some(rendered) = at.rec.read().dbr_string_at_precision(&value)
-            {
-                return Some(rendered);
+            if dbr == DbFieldType::String {
+                return self.dbr_strings_of(value, n_request, render);
             }
+            value.truncate(n_request);
             return value.get_convert(dbr).ok();
         }
         match dbr {
-            DbFieldType::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
+            DbFieldType::String => self
+                .dbr_string_of(link, value, render)
+                .map(EpicsValue::String),
             DbFieldType::Enum => self.enum_read_of(link, value),
             _ => value.get_convert(dbr).ok(),
         }
@@ -1212,17 +1267,66 @@ impl PvDatabase {
     /// `ENUM`/`MENU` index into a state label — C `getEnumString`), by the value
     /// itself otherwise (an external link / constant / lnkCalc result carries no
     /// reachable field metadata).
+    ///
+    /// `value` is the read itself: only an index goes back to the source, for
+    /// its choice table at the cached address, so a cycle resolves no name.
+    ///
+    /// The result is C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as
+    /// `getStringString` copies (`dbConvert.c`), whatever the source holds.
     fn dbr_string_of(
         &self,
         link: &crate::server::record::ParsedLink,
-        value: &EpicsValue,
+        value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<PvString> {
+        self.dbr_string_rendered(link, value, render)
+            .map(cap_dbr_string)
+    }
+
+    /// [`Self::dbr_string_of`] for every element of an array source: `dbGet`
+    /// converts `nRequest` elements at the source, so a float field renders
+    /// at ITS precision (`getFloatString`), not the reader's.
+    fn dbr_strings_of(
+        &self,
+        mut value: EpicsValue,
+        n_request: usize,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<EpicsValue> {
+        let rendered = match render {
+            Some(render) => render.dbr_strings(value, n_request)?,
+            None => {
+                value.truncate(n_request);
+                value.get_convert(DbFieldType::String).ok()?
+            }
+        };
+        Some(match rendered {
+            EpicsValue::StringArray(a) => {
+                EpicsValue::StringArray(a.iter().cloned().map(cap_dbr_string).collect())
+            }
+            EpicsValue::String(s) => EpicsValue::String(cap_dbr_string(s)),
+            other => other,
+        })
+    }
+
+    fn dbr_string_rendered(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<PvString> {
+        let value = match value {
+            EpicsValue::String(s) => return Some(s),
+            value => value,
+        };
+        // A `$` source is a `DBF_CHAR` array whatever the field holds:
+        // `getCharString` of element 0, with no field metadata to apply.
         if let crate::server::record::ParsedLink::Db(db) = link
-            && let target = db.target()
-            && let Some(at) = self.db_link_addr(db)
+            && db.target().string_view
         {
-            let guard = at.rec.read();
-            return guard.field_as_dbr_string(&target.field);
+            return crate::server::record::value_as_dbr_string(&value.first_element()?);
+        }
+        if let Some(render) = render {
+            return render.dbr_string(value);
         }
         // An external ENUM value crosses the wire as a bare index; the label
         // table lives in the lset's cached metadata (CA: the one-shot
@@ -1230,7 +1334,7 @@ impl PvDatabase {
         // `DBR_STRING` monitor for exactly this read, `dbCa.c` `pgetString`).
         // An index past the cached table falls through to the digits, the
         // same rule as [`value_as_dbr_string`]'s `EnumWithChoices` arm.
-        if let EpicsValue::Enum(idx) = value
+        if let EpicsValue::Enum(idx) = &value
             && let Some(name) = link.external_pv_name()
             && let Some(m) = self.external_link_metadata(&name)
             && let Some(choices) = m.enum_choices
@@ -1238,7 +1342,7 @@ impl PvDatabase {
         {
             return Some(PvString::from(label.as_str()));
         }
-        crate::server::record::value_as_dbr_string(value)
+        crate::server::record::value_as_dbr_string(&value)
     }
 
     /// Read a link's current value WITHOUT processing a Passive source —
@@ -1355,22 +1459,31 @@ impl PvDatabase {
     /// failed read that gates `fetch_values`. The constant reaches the record
     /// exactly once, at init, through
     /// [`super::PvDatabase::rec_gbl_init_constant_links`].
+    ///
+    /// `render` asks for the source's part of a `DBR_STRING` conversion, as
+    /// [`Self::read_link_with_alarm_at`] takes it.
     pub(crate) fn read_link_with_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
-        self.read_link_with_alarm_at(link, None)
+        render: bool,
+    ) -> RenderedFetch {
+        self.read_link_with_alarm_at(link, None, render)
     }
 
     /// [`Self::read_link_with_alarm`] with the link's local target already
     /// in hand — `at` is the record's cached handle for the link, validated
     /// by [`ParsedInputLink::target`](crate::server::record::record_instance::ParsedInputLink::target), and `None` resolves the
-    /// name as before.
+    /// name as before. `render` asks for the [`SourceRender`] a `DBR_STRING`
+    /// conversion of the value takes from a local source, under the read's
+    /// own hold.
+    ///
+    /// [`SourceRender`]: crate::server::record::record_instance::SourceRender
     pub(crate) fn read_link_with_alarm_at(
         &self,
         link: &crate::server::record::ParsedLink,
         at: Option<&crate::server::record::record_instance::ResolvedTarget>,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+        render: bool,
+    ) -> RenderedFetch {
         use crate::server::recgbl::simm::LinkFetch;
         // C `dbDbGetValue` through the link's `dbAddr`: the target in hand
         // is read in one lock hold and classified here, straight into the
@@ -1382,9 +1495,9 @@ impl PvDatabase {
         // is a `break` — so its alarm is not carried to the fold that
         // would drop it.
         if let (crate::server::record::ParsedLink::Db(db), Some(at)) = (link, at) {
-            return self.read_db_link_at(None, db, at);
+            return self.read_db_link_at(None, db, at, render);
         }
-        let (value, alarm) = self.read_link_value_and_alarm(link);
+        let (value, alarm, render) = self.read_link_value_and_alarm(link, render);
         let fetch = match value {
             Some(v) => LinkFetch::Value(v),
             None => empty_read_fetch(link),
@@ -1417,7 +1530,7 @@ impl PvDatabase {
             LinkFetch::Failed => None,
             _ => alarm,
         };
-        (fetch, alarm)
+        (fetch, alarm, render)
     }
 
     /// The cached-target arm of [`Self::read_link_with_alarm_at`], in its
@@ -1432,11 +1545,12 @@ impl PvDatabase {
         held: Option<&crate::server::database::SetGuard>,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+        render: bool,
+    ) -> RenderedFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        match self.read_db_at(held, db, at) {
-            (Some(v), alarm) => (LinkFetch::Value(v), alarm),
-            (None, _) => (LinkFetch::Failed, None),
+        match self.read_db_at(held, db, at, render) {
+            (Some(v), alarm, render) => (LinkFetch::Value(v), alarm, render),
+            (None, ..) => (LinkFetch::Failed, None, None),
         }
     }
 
@@ -1460,10 +1574,12 @@ impl PvDatabase {
             let (value, alarm) = self.read_db_link_f64_at(held, db, at);
             return (value.map(EpicsValue::Double), alarm);
         }
-        let (Some(value), alarm) = self.read_db_at(Some(held), db, at) else {
+        let (Some(value), alarm, render) =
+            self.read_db_at(Some(held), db, at, read_as.renders_at_source())
+        else {
             return (None, None);
         };
-        match self.apply_link_read_as(link, read_as, value) {
+        match self.apply_link_read_as(link, read_as, value, render) {
             Some(value) => (Some(value), alarm),
             None => (None, None),
         }
@@ -1495,12 +1611,12 @@ impl PvDatabase {
                 });
             return (Some(value), alarm);
         }
-        match self.read_db_at(Some(held), db, at) {
-            (Some(v), alarm) => match link_value_as_f64(v) {
+        match self.read_db_at(Some(held), db, at, false) {
+            (Some(v), alarm, _) => match link_value_as_f64(v) {
                 Some(f) => (Some(f), alarm),
                 None => (None, None),
             },
-            (None, _) => (None, None),
+            (None, ..) => (None, None),
         }
     }
 
@@ -1600,19 +1716,21 @@ impl PvDatabase {
     fn read_link_value_and_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        render: bool,
+    ) -> RenderedRead {
         if let crate::server::record::ParsedLink::Db(db) = link {
             match self.db_link_answer(db) {
                 crate::server::record::DbLinkAnswer::Local(at) => {
-                    return self.read_db_at(None, db, &at);
+                    return self.read_db_at(None, db, &at, render);
                 }
                 crate::server::record::DbLinkAnswer::Shadowed(pv) => {
-                    return (Some(filtered_read(db.target(), pv.get())), None);
+                    return (Some(filtered_read(db.target(), pv.get())), None, None);
                 }
                 crate::server::record::DbLinkAnswer::Absent => {}
             }
         }
-        self.read_unresolved_link_value_and_alarm(link)
+        let (value, alarm) = self.read_unresolved_link_value_and_alarm(link);
+        (value, alarm, None)
     }
 
     /// [`Self::read_link_value_and_alarm`] for every link that is not a DB
@@ -2183,19 +2301,21 @@ impl PvDatabase {
         is_soft: bool,
         visited: &mut ProcStack,
     ) -> Option<EpicsValue> {
-        self.read_link_value_soft_with_alarm(link, is_soft, visited)
+        self.read_link_value_soft_with_alarm(link, is_soft, false, visited)
             .0
     }
 
     /// [`Self::read_link_value_soft`] and the source's alarm off the SAME
     /// read. The arms decide only WHETHER the link reads this cycle; the read
-    /// is [`Self::read_link_value_and_alarm_at_source`]'s.
+    /// is [`Self::read_link_value_and_alarm_at_source`]'s, with the source's
+    /// `DBR_STRING` part when `render` asks for it.
     pub(crate) fn read_link_value_soft_with_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
+        render: bool,
         visited: &mut ProcStack,
-    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+    ) -> RenderedRead {
         match link {
             // A CONSTANT input link delivers NOTHING at process time. C
             // `dbConstGetValue` (`dbConstLink.c:219-225`) returns status 0
@@ -2214,32 +2334,32 @@ impl PvDatabase {
             // into an aai/waveform whose INP is an unset/constant link, which
             // is how EVERY device-fed and client-fed array record is
             // configured) was clobbered on the next scan.
-            crate::server::record::ParsedLink::Constant(_) => (None, None),
+            crate::server::record::ParsedLink::Constant(_) => (None, None, None),
             crate::server::record::ParsedLink::Db(_) if is_soft => {
-                self.read_link_value_and_alarm_at_source(link, visited)
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
                 if is_soft =>
             {
-                self.read_link_value_and_alarm_at_source(link, visited)
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
             // soft path) or remote CA/PVA, but the calc evaluation
             // is uniform either way.
             crate::server::record::ParsedLink::Calc(_) => {
-                self.read_link_value_and_alarm_at_source(link, visited)
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
             // A state link answers whatever the DTYP, for the same reason a
             // calc link does: `lnkState`'s own lset implements `getValue`
             // (`lnkState.c:139-151`), so there is no device support to route
             // around and no target record to process first.
             crate::server::record::ParsedLink::State(_) => {
-                self.read_link_value_and_alarm_at_source(link, visited)
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
-            _ => (None, None),
+            _ => (None, None, None),
         }
     }
 
@@ -2824,6 +2944,19 @@ impl PvDatabase {
                     LinkTarget::External => return external(db.pvname()),
                 };
                 let guard = target.read();
+                // `dbGetLinkDBFtype` / `dbGetNelements` of a `$` address: the
+                // `DBF_CHAR` view and its `no_elements`.
+                if addressed.string_view {
+                    return match super::char_view::char_view(&guard, &addressed.field) {
+                        Some(view) => OutTarget {
+                            field_type: Some(DbFieldType::Char),
+                            element_count: (view.no_elements as i64).max(1),
+                            is_ca_link: false,
+                            puts_as_string: false,
+                        },
+                        None => OutTarget::UNRESOLVED,
+                    };
+                }
                 let field_type = crate::server::record::record_instance::declared_field_type_of(
                     guard.record.as_ref(),
                     &addressed.field,
@@ -3336,7 +3469,7 @@ impl PvDatabase {
                     // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
                     // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
                     // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
-                    let links = selected_links(&instance, &LNK_LINK_FIELDS, &sel.indices);
+                    let links = selected_links(&instance, &sel.indices);
                     Some((sel, MultiOut::Fanout(links), None))
                 }
                 "dfanout" => {
@@ -3377,7 +3510,7 @@ impl PvDatabase {
                         0,
                         DFANOUT_LINK_FIELDS.len(),
                     );
-                    let links = selected_links(&instance, &DFANOUT_LINK_FIELDS, &sel.indices);
+                    let links = selected_links(&instance, &sel.indices);
                     Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {
@@ -3399,23 +3532,28 @@ impl PvDatabase {
                         shft,
                         LNK_LINK_FIELDS.len(),
                     );
+                    let by_name = |field| {
+                        instance
+                            .record
+                            .get_field(field)
+                            .and_then(|v| v.to_f64())
+                            .unwrap_or(0.0)
+                    };
                     let groups: Vec<SeqGroup> = sel
                         .indices
                         .iter()
-                        .map(|&i| SeqGroup {
-                            idx: i,
-                            dol: instance.record_link(DOL_LINK_FIELDS[i]).clone(),
-                            lnk: instance.record_link(LNK_LINK_FIELDS[i]).clone(),
-                            dly: instance
-                                .record
-                                .get_field(dly_names[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
-                            dov: instance
-                                .record
-                                .get_field(SEQ_DO_FIELDS[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
+                        .map(|&i| {
+                            let (dly, dov) =
+                                instance.record.seq_group_cells(i).unwrap_or_else(|| {
+                                    (by_name(dly_names[i]), by_name(SEQ_DO_FIELDS[i]))
+                                });
+                            SeqGroup {
+                                idx: i,
+                                dol: instance.dol_row_link(i).clone(),
+                                lnk: instance.out_row_link(i).clone(),
+                                dly,
+                                dov,
+                            }
                         })
                         .collect();
                     Some((sel, MultiOut::Seq(groups), None))
@@ -3675,7 +3813,8 @@ impl PvDatabase {
         // DOLn raises `setLinkAlarm` (LINK/INVALID, AMSG `field DOL0`) on the
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
-            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, visited)
+            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, false, visited)
+                .0
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)
@@ -4427,6 +4566,62 @@ impl PvDatabase {
     }
 }
 
+/// A `$` address's link read: the view is taken under `instance`'s hold and
+/// its `DBF_CHAR` image built after releasing it. `None` is a field `$` does
+/// not apply to, which `dbChannelTest` refuses.
+#[cold]
+#[inline(never)]
+fn char_image_after_hold(
+    instance: crate::server::record::record_instance::RecordRef<'_>,
+    field: &str,
+) -> Option<EpicsValue> {
+    let view = super::char_view::char_view(&instance, field);
+    drop(instance);
+    view.map(super::char_view::CharView::into_chars)
+}
+
+/// The source alarm a read of `db` reports, taken under the read's hold:
+/// only an `MS`/`MSS`/`MSI` link inherits one.
+#[inline(always)]
+fn db_link_alarm(
+    db: &crate::server::record::DbLink,
+    at: &crate::server::record::record_instance::ResolvedTarget,
+    instance: &crate::server::record::RecordInstance,
+) -> Option<SourceAlarm> {
+    (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
+        SourceAlarm::local(
+            SourceId::of(&at.rec),
+            LinkAlarm::committed(&instance.common),
+        )
+    })
+}
+
+/// A link read with the source's part of its `DBR_STRING` conversion, when
+/// the reader asked for one.
+pub(crate) type RenderedRead = (
+    Option<EpicsValue>,
+    Option<SourceAlarm>,
+    Option<crate::server::record::record_instance::SourceRender>,
+);
+
+/// The fetch twin of [`RenderedRead`].
+pub(crate) type RenderedFetch = (
+    crate::server::recgbl::simm::LinkFetch,
+    Option<SourceAlarm>,
+    Option<crate::server::record::record_instance::SourceRender>,
+);
+
+/// C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as `getStringString`
+/// copies (`dbConvert.c`), whatever the source holds.
+fn cap_dbr_string(s: PvString) -> PvString {
+    const MAX: usize = 39;
+    if s.len() > MAX {
+        PvString::from_bytes(&s.as_bytes()[..MAX])
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod out_link_put_fail_tests {
     use super::{LinkAlarm, OutLinkSrc};
@@ -5080,7 +5275,7 @@ mod nonlocal_db_link_read_tests {
 
         let mut visited = crate::server::database::ProcStack::new();
         let v = db
-            .read_link_value_and_alarm_at_source(&link, &mut visited)
+            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
             .0;
         assert_eq!(
             v,
@@ -5103,7 +5298,7 @@ mod nonlocal_db_link_read_tests {
         .await;
 
         let link = parse_link_v2("OTHER:PV");
-        let (fetch, alarm) = db.read_link_with_alarm(&link);
+        let (fetch, alarm, _) = db.read_link_with_alarm(&link, false);
         assert_eq!(
             fetch.value(),
             Some(EpicsValue::Double(5.0)),
@@ -5132,7 +5327,7 @@ mod nonlocal_db_link_read_tests {
         let link = parse_link_v2("SRC");
         let mut visited = crate::server::database::ProcStack::new();
         let v = db
-            .read_link_value_and_alarm_at_source(&link, &mut visited)
+            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
             .0;
         assert_eq!(
             v,
@@ -5429,7 +5624,7 @@ mod db_link_addr_tests {
     use std::sync::Arc;
 
     fn read(db: &PvDatabase, link: &ParsedLink) -> Option<EpicsValue> {
-        db.read_link_value_and_alarm_at_source(link, &mut ProcStack::new())
+        db.read_link_value_and_alarm_at_source(link, false, &mut ProcStack::new())
             .0
     }
 
@@ -5548,8 +5743,8 @@ mod db_link_addr_tests {
         let reader = db.get_record("READER").unwrap();
         let alarm_of = |text: &str| {
             let link = parse_link_v2(text);
-            let (value, alarm) =
-                db.read_link_value_and_alarm_at_source(&link, &mut ProcStack::new());
+            let (value, alarm, _) =
+                db.read_link_value_and_alarm_at_source(&link, false, &mut ProcStack::new());
             assert_eq!(value, Some(EpicsValue::Double(1.0)));
             (
                 alarm.is_some(),

@@ -242,6 +242,59 @@ impl CharView {
         }
     }
 
+    /// [`Self::get`]`(DBR_CHAR, count)` — every element of the view, as a
+    /// `$` link reads it — built in one allocation from the value the view
+    /// holds, or none where a long string's own buffer already is the image.
+    pub fn into_chars(self) -> EpicsValue {
+        use std::iter::{once, repeat_n};
+        let count = self.count;
+        if count == 0 {
+            return EpicsValue::CharArray(Vec::new().into());
+        }
+        let src: &[u8] = match &self.value {
+            Some(EpicsValue::String(s)) => s.as_bytes(),
+            Some(EpicsValue::CharArray(b) | EpicsValue::UCharArray(b)) => b,
+            Some(EpicsValue::StringArray(v)) => v.first().map_or(&[], |s| s.as_bytes()),
+            _ => &[],
+        };
+        // Text up to the first NUL within `max` bytes, then the NUL.
+        let text = |max: usize| -> crate::types::SharedArray<u8> {
+            let end = src.len().min(max);
+            let len = src[..end].iter().position(|&c| c == 0).unwrap_or(end);
+            src[..len]
+                .iter()
+                .copied()
+                .chain(once(0))
+                .collect::<std::sync::Arc<[u8]>>()
+                .into()
+        };
+        let chars = match self.source {
+            CharSource::Field if count == 1 => [src.first().copied().unwrap_or(0)][..].into(),
+            CharSource::Field => {
+                let n = count.min(self.no_elements);
+                if n == 0 {
+                    Vec::new().into()
+                } else if self.truncate {
+                    text(n - 1)
+                } else if let Some(EpicsValue::CharArray(b)) = &self.value
+                    && b.len() >= n
+                {
+                    b.head(n)
+                } else {
+                    let m = src.len().min(n);
+                    src[..m]
+                        .iter()
+                        .copied()
+                        .chain(repeat_n(0, n - m))
+                        .collect::<std::sync::Arc<[u8]>>()
+                        .into()
+                }
+            }
+            CharSource::Link | CharSource::Attribute => text(count - 1),
+        };
+        EpicsValue::CharArray(chars)
+    }
+
     /// `dbPutField(paddr, dbrType, …)` of `written` as the value the record's
     /// put path stores, or `None` where C refuses it.
     pub fn put_value(&self, written: CharWrite) -> Option<EpicsValue> {
@@ -440,4 +493,60 @@ pub fn posted_char_view(value: EpicsValue, n: usize, nul_at_count: bool) -> Epic
         chars.truncate(n);
     }
     EpicsValue::CharArray(chars.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CharSource, CharView};
+    use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString};
+
+    fn view(
+        source: CharSource,
+        value: EpicsValue,
+        count: usize,
+        cap: usize,
+        cut: bool,
+    ) -> CharView {
+        CharView {
+            source,
+            value: Some(value),
+            count,
+            no_elements: cap,
+            field_type: DbfCode::Char,
+            truncate: cut,
+        }
+    }
+
+    #[test]
+    fn into_chars_is_the_whole_char_get_at_every_boundary() {
+        let s = |t: &str| EpicsValue::String(PvString::from(t));
+        let c = |b: &[u8]| EpicsValue::CharArray(b.to_vec().into());
+        let long = [b'x'; 45];
+        let cases = [
+            view(CharSource::Field, s("train"), 40, 40, true),
+            view(CharSource::Field, c(&long), 40, 40, true),
+            view(CharSource::Field, c(b"0123456789\0"), 11, 100, false),
+            view(CharSource::Field, c(&long), 20, 20, false),
+            view(CharSource::Field, c(b"abc\0"), 20, 20, false),
+            view(CharSource::Field, c(b"abc"), 30, 20, false),
+            view(CharSource::Field, s("q"), 1, 40, true),
+            view(CharSource::Field, s("q"), 0, 40, true),
+            view(CharSource::Field, s("q"), 5, 0, true),
+            view(
+                CharSource::Field,
+                EpicsValue::StringArray(vec![PvString::from("ab"), PvString::from("cd")].into()),
+                2,
+                40,
+                true,
+            ),
+            view(CharSource::Link, s("SRC.VAL NPP NMS"), 80, 80, false),
+            view(CharSource::Link, s("SRC.VAL NPP NMS"), 5, 80, false),
+            view(CharSource::Attribute, s("ai"), 40, 40, false),
+        ];
+        for v in cases {
+            let want = v.get(DbFieldType::Char, v.count);
+            let label = format!("{:?}/{}/{}", v.value, v.count, v.no_elements);
+            assert_eq!(Some(v.into_chars()), want, "{label}");
+        }
+    }
 }

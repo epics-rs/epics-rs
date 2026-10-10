@@ -1272,6 +1272,19 @@ fn dbput_post_put_field(
     }
 }
 
+/// A `$` address's `dbGet` as the source delivers it: every element of the
+/// `DBF_CHAR` view, as a CHAR waveform source delivers its NORD. `None` is
+/// a field `$` does not apply to, which `dbChannelTest` refuses. A link read
+/// does not come here: it builds the image after its hold, from the view.
+#[cold]
+#[inline(never)]
+fn read_char_view(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+) -> Option<EpicsValue> {
+    super::char_view::char_view(instance, field).map(super::char_view::CharView::into_chars)
+}
+
 /// Does `record_type` declare a field called `field`?
 ///
 /// C's `dbFindFieldPart` searches `papFldDes`, which is every field the
@@ -1320,15 +1333,17 @@ impl PvDatabase {
 
         // Records — alias-aware via `get_record` (epics-base PR #336).
         if let Some(rec) = self.get_record(base) {
+            // Resolved from the cell's settled declaration, before the hold.
+            let addr = crate::server::record::record_instance::FieldAddr::resolve_in(&rec, &field);
             let instance = rec.read();
-            return self.read_resolved_field(&instance, &field, name);
+            return self.read_resolved_field_at(&instance, &field, name, addr);
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
     }
 
     /// The half of [`Self::get_pv`] that runs once the name HAS resolved to a
-    /// record — the attribute shadow test and the field read itself.
+    /// record and its field to an address — the field read itself.
     ///
     /// Split out so a caller holding the record already does not resolve the
     /// name a second time to reach it. C has the same split: `dbNameToAddr`
@@ -1337,20 +1352,6 @@ impl PvDatabase {
     ///
     /// `field` is upper-case already: every caller hands it a channel name's
     /// or a parsed link's field, both normalised where they were made.
-    pub(crate) fn read_resolved_field(
-        &self,
-        instance: &crate::server::record::RecordInstance,
-        field: &str,
-        name: &str,
-    ) -> CaResult<EpicsValue> {
-        let rdes = crate::server::record::record_instance::RecordDesc::of(&*instance.record);
-        let addr = crate::server::record::record_instance::FieldAddr::resolve(&rdes, field);
-        self.read_resolved_field_at(instance, field, name, addr)
-    }
-
-    /// [`Self::read_resolved_field`] with the field's address already
-    /// resolved — what a link target reads through every cycle, C's `dbGet`
-    /// on a `dbAddr` from `dbDbInitLink`.
     pub(crate) fn read_resolved_field_at(
         &self,
         instance: &crate::server::record::RecordInstance,
@@ -1397,6 +1398,9 @@ impl PvDatabase {
         field: &str,
         addr: crate::server::record::record_instance::FieldAddr,
     ) -> Option<EpicsValue> {
+        if addr.char_view {
+            return read_char_view(instance, field);
+        }
         // C's `dbGet` through the `dbAddr`: a slot is a field the record's
         // typed accessor answers, and `get_slot_f64` is `get_field` followed
         // by the numeric funnel — the identity on a field served as
@@ -2279,9 +2283,9 @@ impl PvDatabase {
                     old_stat != instance.common.stat || old_sevr != instance.common.sevr;
                 let nord_changed =
                     old_nord.is_some() && instance.record.get_field("NORD") != old_nord;
+                // TIME is left alone: C `dbPut` never stamps it, only the
+                // process cycle's `recGblGetTimeStamp` does.
                 if value_changed || alarm_changed || nord_changed {
-                    // Update timestamp so the snapshot carries current time
-                    instance.common.time = crate::runtime::general_time::get_current();
                     if value_changed || alarm_changed {
                         instance.notify_field_with_origin(
                             &field,
@@ -3935,7 +3939,8 @@ impl PvDatabase {
                 // field-blind `convert_to` that stored `0` for a label and
                 // `32767` for a refused `PREC 32768`. A field the record
                 // SERVES routes through the same single owner the client
-                // `dbPut` path uses (`dbput_coerce_value` = shape THEN type);
+                // `dbPut` path uses (`dbput_coerce_value_in` = shape THEN type,
+                // its `SPC_DBADDR` answer from the `PutAddr`);
                 // a `dbCommon` field the record does not serve has no served
                 // type to convert against, so it keeps the shape-only reshape
                 // its `put_common_field` fallback needs.
@@ -3946,9 +3951,13 @@ impl PvDatabase {
                 // carried instead.
                 let mut common = None;
                 let refused = match instance.record.get_field(&field).map(|v| v.db_field_type()) {
-                    Some(target) => match crate::server::record::dbput_coerce_value(
+                    // Not `coerce_write_value`: a second caller of that wrapper
+                    // un-inlines it from `dbput_request`'s hot path.
+                    Some(target) => match crate::server::record::dbput_coerce_value_in(
                         &*instance.record,
                         &field,
+                        crate::server::record::StoredShape::of(&*instance.record, &field),
+                        at.dbaddr(),
                         target,
                         value,
                     ) {

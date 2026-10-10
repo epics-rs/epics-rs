@@ -177,7 +177,10 @@ async fn a_refused_json_link_loses_the_field_and_keeps_the_record() {
     drop(held);
 
     assert!(
-        err.starts_with("ERROR: Can't set 'J1.INP' to '{\"bogus\":}' "),
+        err.starts_with(
+            "dbJLinkInit: Link type 'bogus' not found\n\
+             ERROR: Can't set 'J1.INP' to '{\"bogus\":}'  : Bad Field value\n"
+        ),
         "C prints the value with its quotes stripped and escapes translated; got:\n{err}"
     );
     assert!(

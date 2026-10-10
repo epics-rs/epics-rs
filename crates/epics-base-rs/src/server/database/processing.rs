@@ -1174,10 +1174,7 @@ impl PvDatabase {
         reader: InFrame<'_>,
         link: &MultiInputLink<'_>,
         plan: &crate::server::record::record_instance::ProcessPlan,
-        (mut fetch, alarm): (
-            crate::server::recgbl::simm::LinkFetch,
-            Option<super::links::SourceAlarm>,
-        ),
+        (mut fetch, alarm, render): super::links::RenderedFetch,
     ) -> LinkOutcome {
         use crate::server::recgbl::simm::LinkFetch;
         let store_raw = self.convert_link_fetch_as(
@@ -1186,6 +1183,7 @@ impl PvDatabase {
             link.parsed,
             link.request,
             &mut fetch,
+            render,
         );
         let mut read_failed = !fetch.is_ok();
         let value = match fetch {
@@ -1548,7 +1546,7 @@ impl PvDatabase {
         let owned;
         let owned_target;
         let (record, common, parsed, read) = if let Some((db, at)) = held_target {
-            let read = self.read_db_link_at(Some(rec.set()), db, at);
+            let read = self.read_db_link_at(Some(rec.set()), db, at, request.renders_at_source());
             (&mut *inst.record, &mut inst.common, parsed, read)
         } else {
             owned_target = target.cloned();
@@ -1557,7 +1555,11 @@ impl PvDatabase {
             if let ParsedLink::Db(db) = &*owned {
                 self.process_passive_db_source(db, visited);
             }
-            let read = self.read_link_with_alarm_at(&owned, owned_target.as_ref());
+            let read = self.read_link_with_alarm_at(
+                &owned,
+                owned_target.as_ref(),
+                request.renders_at_source(),
+            );
             let inst = guard.hold();
             (&mut *inst.record, &mut inst.common, &*owned, read)
         };
@@ -4048,17 +4050,16 @@ impl PvDatabase {
         // conversion applied to it either.
         let (inp_value, inp_source_alarm) = match inp.as_ref() {
             Some(inp_parsed) => {
-                let (raw, alarm) =
-                    self.read_link_value_soft_with_alarm(inp_parsed, is_soft, visited);
+                let request = inp_request.expect("INP request is asked with the link");
+                let (raw, alarm, render) = self.read_link_value_soft_with_alarm(
+                    inp_parsed,
+                    is_soft,
+                    request.renders_at_source(),
+                    visited,
+                );
                 (
                     raw.and_then(|v| {
-                        self.typed_input_value_requested(
-                            rec,
-                            "INP",
-                            inp_parsed,
-                            inp_request.expect("INP request is asked with the link"),
-                            v,
-                        )
+                        self.typed_input_value_requested(rec, "INP", inp_parsed, request, v, render)
                     }),
                     alarm,
                 )
@@ -4165,8 +4166,15 @@ impl PvDatabase {
                 // DOL with `DBR_STRING` (`stringoutRecord.c:141`), lso via
                 // `dbGetLinkLS` (`lsoRecord.c:114`) — an ENUM/MENU DOL source
                 // delivers its label, not the index.
-                let fetch = self.db_get_input_link_in(rec, "DOL", dol_parsed, visited);
-                self.convert_link_fetch(rec, "DOL", dol_parsed, fetch).0
+                let render = rec
+                    .read()
+                    .record
+                    .input_link_request("DOL")
+                    .renders_at_source();
+                let (fetch, render) =
+                    self.db_get_input_link_in(rec, "DOL", dol_parsed, render, visited);
+                self.convert_link_fetch(rec, "DOL", dol_parsed, fetch, render)
+                    .0
             });
         // C's `if (status)` on the closed-loop DOL read, read twice below: once
         // by the record's own failure arm at the DOL-apply site, once by the
@@ -4194,7 +4202,7 @@ impl PvDatabase {
         } else {
             match sel_nvl_link {
                 Some(parsed) => {
-                    let fetch = self.db_get_input_link_in(rec, "NVL", &parsed, visited);
+                    let (fetch, _) = self.db_get_input_link_in(rec, "NVL", &parsed, false, visited);
                     // C `dbGetLink(&nvl, DBR_USHORT, &seln, 0, 0)`: the source
                     // is converted at DBR_USHORT (an array contributes element
                     // 0), so a value outside 0..65535 wraps as C's GET table
@@ -4205,6 +4213,7 @@ impl PvDatabase {
                                 &parsed,
                                 crate::server::record::LinkReadAs::UShort,
                                 v,
+                                None,
                             );
                             sel_nvl_read_failed = converted.is_none();
                             converted
@@ -8109,17 +8118,31 @@ impl PvDatabase {
         reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
     ) -> crate::server::recgbl::simm::LinkFetch {
+        self.db_try_get_link_rendered(reader, link, false).0
+    }
+
+    /// [`Self::db_try_get_link`] with the source's `DBR_STRING` part when
+    /// `render` asks for it.
+    fn db_try_get_link_rendered(
+        &self,
+        reader: InFrame<'_>,
+        link: &crate::server::record::ParsedLink,
+        render: bool,
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<crate::server::record::record_instance::SourceRender>,
+    ) {
         // A constant or unset link has no source, so this whole read is C's
         // `dbConstGetValue`: status 0, nothing stored, nothing to inherit.
         // Every record carries several — SDIS and TSEL at minimum — and each
         // one otherwise spent the read, a reader-name resolution and two lock
         // acquisitions per cycle to arrive back at `NoData`.
         if crate::server::recgbl::simm::is_constant(link) {
-            return crate::server::recgbl::simm::LinkFetch::NoData;
+            return (crate::server::recgbl::simm::LinkFetch::NoData, None);
         }
-        let (fetch, alarm) = self.read_link_with_alarm(link);
+        let (fetch, alarm, render) = self.read_link_with_alarm(link, render);
         self.inherit_link_severity(reader, link, alarm);
-        fetch
+        (fetch, render)
     }
 
     /// **C `dbGetLink`** (`dbLink.c:324-340`) — [`Self::db_try_get_link`] plus the
@@ -8158,12 +8181,28 @@ impl PvDatabase {
         link_field: &str,
         link: &crate::server::record::ParsedLink,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        let fetch = self.db_try_get_link(reader, link);
+        self.db_get_link_rendered_in(reader, link_field, link, false)
+            .0
+    }
+
+    /// [`Self::db_get_link_in`] with the source's `DBR_STRING` part when
+    /// `render` asks for it.
+    pub(crate) fn db_get_link_rendered_in(
+        &self,
+        reader: InFrame<'_>,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        render: bool,
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<crate::server::record::record_instance::SourceRender>,
+    ) {
+        let (fetch, render) = self.db_try_get_link_rendered(reader, link, render);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
             let mut instance = reader.write();
             crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
         }
-        fetch
+        (fetch, render)
     }
 
     /// [`Self::db_get_link_in`] for an INPUT link — same classification, same
@@ -8175,12 +8214,16 @@ impl PvDatabase {
         reader: InFrame<'_>,
         link_field: &str,
         link: &crate::server::record::ParsedLink,
+        render: bool,
         visited: &mut ProcStack,
-    ) -> crate::server::recgbl::simm::LinkFetch {
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<crate::server::record::record_instance::SourceRender>,
+    ) {
         if let crate::server::record::ParsedLink::Db(db) = link {
             self.process_passive_db_source(db, visited);
         }
-        self.db_get_link_in(reader, link_field, link)
+        self.db_get_link_rendered_in(reader, link_field, link, render)
     }
 
     /// [`Self::execute_process_actions_in`] for a caller holding no frame
@@ -8221,12 +8264,19 @@ impl PvDatabase {
         link_field: &str,
         link: &crate::server::record::ParsedLink,
         fetch: crate::server::recgbl::simm::LinkFetch,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> (crate::server::recgbl::simm::LinkFetch, bool) {
         let instance = rec.read();
         let request = instance.record.input_link_request(link_field);
         let mut fetch = fetch;
-        let store_raw =
-            self.convert_link_fetch_as(&*instance.record, link_field, link, request, &mut fetch);
+        let store_raw = self.convert_link_fetch_as(
+            &*instance.record,
+            link_field,
+            link,
+            request,
+            &mut fetch,
+            render,
+        );
         (fetch, store_raw)
     }
 
@@ -8243,6 +8293,7 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> bool {
         use crate::server::recgbl::simm::LinkFetch;
         use crate::server::record::{InputLinkRequest, LinkReadAs};
@@ -8256,7 +8307,7 @@ impl PvDatabase {
         if !matches!(fetch, LinkFetch::Value(_)) {
             return false;
         }
-        self.convert_link_value(record, link_field, link, request, fetch)
+        self.convert_link_value(record, link_field, link, request, fetch, render)
     }
 
     /// [`Self::convert_link_fetch_as`] past its gates: `fetch` holds a value
@@ -8268,6 +8319,7 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> bool {
         use crate::server::recgbl::simm::LinkFetch;
         use crate::server::record::LinkReadAs;
@@ -8299,7 +8351,7 @@ impl PvDatabase {
                 // type; only `Double` (and `Enum`'s unwritten buffer) is the
                 // numeric funnel's.
                 let raw = !matches!(read_as, LinkReadAs::Double | LinkReadAs::Enum);
-                match self.apply_link_read_as(link, read_as, value) {
+                match self.apply_link_read_as(link, read_as, value, render) {
                     Some(v) => {
                         *fetch = LinkFetch::Value(v);
                         raw
@@ -8363,10 +8415,18 @@ impl PvDatabase {
         Option<super::links::SourceAlarm>,
         bool,
     ) {
-        let (mut fetch, alarm) = self.read_link_with_alarm_at(link, target);
+        let (mut fetch, alarm, render) =
+            self.read_link_with_alarm_at(link, target, request.renders_at_source());
         let store_raw = {
             let instance = rec.read();
-            self.convert_link_fetch_as(&*instance.record, link_field, link, request, &mut fetch)
+            self.convert_link_fetch_as(
+                &*instance.record,
+                link_field,
+                link,
+                request,
+                &mut fetch,
+                render,
+            )
         };
         (fetch, alarm, store_raw)
     }
@@ -8431,12 +8491,15 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         use crate::server::record::InputLinkRequest;
         match request {
-            InputLinkRequest::As(read_as) => self.apply_link_read_as(link, read_as, value),
+            InputLinkRequest::As(read_as) => self.apply_link_read_as(link, read_as, value, render),
             InputLinkRequest::NotRead => None,
-            InputLinkRequest::FromSource => self.typed_input_value(rec, link_field, link, value),
+            InputLinkRequest::FromSource => {
+                self.typed_input_value(rec, link_field, link, value, render)
+            }
         }
     }
 
@@ -8446,9 +8509,10 @@ impl PvDatabase {
         link_field: &str,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         let read_as = self.input_link_read_as(rec, link_field, link)?;
-        self.apply_link_read_as(link, read_as, value)
+        self.apply_link_read_as(link, read_as, value, render)
     }
 
     /// C `dbDbGetValue`'s tail, applied to the reader: the ONE place a
@@ -9365,8 +9429,13 @@ impl PvDatabase {
             // failure. Converted to the record's declared request: stringin
             // reads SIOL with `DBR_STRING` (`stringinRecord.c:208`), lsi via
             // `dbGetLinkLS` (`lsiRecord.c:244`).
-            let fetch = self.db_get_link_in(rec, "SIOL", &siol_link);
-            let (fetch, _raw) = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch);
+            let render = rec
+                .read()
+                .record
+                .input_link_request("SIOL")
+                .renders_at_source();
+            let (fetch, render) = self.db_get_link_rendered_in(rec, "SIOL", &siol_link, render);
+            let (fetch, _raw) = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch, render);
             // Resolved before the write guard below, which reaches
             // `sim_process_tail`'s posts — see the same resolve at the head of
             // `process_record_with_links_body`.

@@ -1929,7 +1929,7 @@ pub(crate) fn json_const_value(s: &str) -> Option<&str> {
     let inner = s[1..s.len() - 1].trim_start();
     let (key, rest) = inner.split_once(':')?;
     let key = key.trim().trim_matches('"');
-    if !key.eq_ignore_ascii_case("const") {
+    if key != "const" {
         return None;
     }
     Some(rest.trim().trim_end_matches(',').trim())
@@ -2076,9 +2076,9 @@ fn key_before(prefix: &str) -> Option<String> {
 
 /// The refusal for a link type key this port does not serve.
 fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
+    // `dbFindLinkSup` is a `gphFind`: the type name matches case-sensitively.
     let key = key.as_ref();
-    let lower = key.to_ascii_lowercase();
-    if UNPORTED_C_JSON_LINK_TYPES.contains(&lower.as_str()) {
+    if UNPORTED_C_JSON_LINK_TYPES.contains(&key) {
         return Some(
             format!(
                 "dbJLinkInit: Link type '{key}' is registered by epics-base but not \
@@ -2087,7 +2087,7 @@ fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
             .into(),
         );
     }
-    if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == lower) {
+    if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == key) {
         return Some(LinkRefusal::printed(format!(
             "dbJLinkInit: Link type '{key}' not found"
         )));
@@ -2140,6 +2140,11 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
     if let Some(refusal) = unknown_link_type(key) {
         return JsonLinkParse::Rejected(refusal);
     }
+    if key == "const"
+        && let Some(refusal) = const_link_refusal(s)
+    {
+        return JsonLinkParse::Rejected(refusal);
+    }
     // The body reader splits on `:` and matches barewords too, so it needs the
     // same normalized text; `s` is kept only for the diagnostics below.
     match try_parse_json_link_body(&normalized) {
@@ -2155,6 +2160,159 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
             format!("dbJLinkInit: Link type '{key}' rejected its value in {s}").into(),
         ),
     }
+}
+
+/// The shape C `lnkConst`'s callbacks (`lnkConst.c:91-262`) have built so
+/// far: its `type` with the element kind folded to number or string, which is
+/// all that decides a refusal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstShape {
+    S0,
+    Scalar,
+    A0,
+    Numbers,
+    Strings,
+}
+
+/// `lnkConstIf`'s parse half. A boolean is `lnkConst_integer`; `parse_null`
+/// and `parse_start_map` are NULL, so they stop without a word.
+struct LnkConstParse {
+    shape: ConstShape,
+    said: Option<&'static str>,
+}
+
+impl LnkConstParse {
+    fn mixed(&mut self) -> bool {
+        self.said = Some("lnkConst: Mixed data types in array\n");
+        false
+    }
+
+    fn number(&mut self) -> bool {
+        match self.shape {
+            ConstShape::S0 => self.shape = ConstShape::Scalar,
+            ConstShape::A0 | ConstShape::Numbers => self.shape = ConstShape::Numbers,
+            ConstShape::Strings => return self.mixed(),
+            ConstShape::Scalar => return false,
+        }
+        true
+    }
+}
+
+impl crate::server::db_convert_json::Callbacks for LnkConstParse {
+    fn null(&mut self) -> bool {
+        false
+    }
+    fn boolean(&mut self, _value: bool) -> bool {
+        self.number()
+    }
+    fn integer(&mut self, _value: i64) -> bool {
+        self.number()
+    }
+    fn double(&mut self, _value: f64) -> bool {
+        self.number()
+    }
+    fn string(&mut self, _bytes: &[u8]) -> bool {
+        match self.shape {
+            ConstShape::S0 => self.shape = ConstShape::Scalar,
+            ConstShape::A0 | ConstShape::Strings => self.shape = ConstShape::Strings,
+            ConstShape::Numbers => return self.mixed(),
+            ConstShape::Scalar => return false,
+        }
+        true
+    }
+    fn start_map(&mut self) -> bool {
+        false
+    }
+    fn start_array(&mut self) -> bool {
+        if self.shape != ConstShape::S0 {
+            self.said = Some("lnkConst: Embedded array value\n");
+            return false;
+        }
+        self.shape = ConstShape::A0;
+        true
+    }
+}
+
+/// The byte after the `:` that ends a link's first key in `s` — where
+/// yajl starts the link type's value.
+fn first_value_offset(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b':' => return Some(i + 1),
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += s[i + 2..].find("*/").map_or(b.len(), |e| e + 3);
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i += s[i..].find('\n').unwrap_or(b.len());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// C's parse of a `{const:…}` link, as far as it can refuse: yajl over the
+/// whole text with the value handed to `lnkConst`'s callbacks, then
+/// `dbjl_end_map` — or a second key, which `dbjl_map_key` refuses
+/// (`dbJLink.c:234-238`). A callback's stop prints only what the callback
+/// said; a yajl error prints `dbJLinkInit: ` and yajl's verbose block
+/// (`dbJLink.c:424-428`).
+fn const_link_refusal(s: &str) -> Option<LinkRefusal> {
+    use crate::server::db_convert_json::{Parser, Status};
+
+    let txt = s.as_bytes();
+    let start = first_value_offset(s)?;
+    let mut parser = Parser::new(LnkConstParse {
+        shape: ConstShape::S0,
+        said: None,
+    });
+    let mut status = parser.parse_value_at(txt, start);
+    if status == Status::Ok && !parser.complete() {
+        status = parser.finish();
+    }
+    match status {
+        Status::ClientCanceled => {
+            let detail = format!("dbJLinkInit: lnkConst refused its value in {s}");
+            return Some(match parser.ctx.said {
+                Some(line) => LinkRefusal::with_report(detail, line.to_string()),
+                None => detail.into(),
+            });
+        }
+        Status::Error => {}
+        Status::Ok => {
+            let end = parser.consumed();
+            let rest = &s[end..];
+            let after = rest.trim_start();
+            let at = end + (rest.len() - after.len());
+            match after.strip_prefix(',').map(str::trim_start) {
+                None if after == "}" => return None,
+                // JSON5 lets a map end in a comma.
+                Some("}") => return None,
+                Some(key) => {
+                    let key = key.split(':').next().unwrap_or("").trim();
+                    let key = key.trim_matches(|c| c == '"' || c == '\'');
+                    return Some(LinkRefusal::printed(format!(
+                        "dbJLinkInit: Illegal second link key '{key}'"
+                    )));
+                }
+                None => parser.fail_at(at, "after key and value, inside map, I expect ',' or '}'"),
+            }
+        }
+    }
+    let rendered = parser.render_error(txt);
+    Some(LinkRefusal::with_report(
+        format!("dbJLinkInit: {s} is not a JSON link"),
+        format!("dbJLinkInit: {rendered}\n"),
+    ))
 }
 
 /// C `dbParseLink`'s JSON arm as a validation gate: `Err` exactly when the
@@ -2179,9 +2337,9 @@ pub fn check_json_link_text(text: &str) -> CaResult<()> {
 fn check_hw_link_text(text: &str) -> CaResult<()> {
     let text = text.trim();
     if text.starts_with('#') && try_parse_hw_link(text).is_none() {
-        return Err(CaError::InvalidValue(format!(
-            "dbParseLink: \"{text}\" names no hardware bus"
-        )));
+        return Err(CaError::BadLink(
+            format!("dbParseLink: \"{text}\" names no hardware bus").into(),
+        ));
     }
     Ok(())
 }
@@ -2202,8 +2360,8 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
         Some((k, r)) => (k.trim(), r.trim()),
         None => return None,
     };
-    let key = key_raw.trim_matches('"').to_ascii_lowercase();
-    match key.as_str() {
+    let key = key_raw.trim_matches('"');
+    match key {
         "const" => Some(ParsedLink::json_constant(rest.trim_end_matches(',').trim())),
         "ca" | "pva" => {
             // pvxs accepts the link value in two forms (pvxs/ioc/pvalink_jlif.cpp:24-31

@@ -52,6 +52,11 @@ async fn asub_db() -> PvDatabase {
     )
     .unwrap();
     db.add_record("WF", Box::new(wf)).await.unwrap();
+    let mut wf_f = WaveformRecord::new(2, DbFieldType::Float);
+    wf_f.put_field("VAL", EpicsValue::FloatArray(vec![0.1, 1.5].into()))
+        .unwrap();
+    wf_f.put_field("PREC", EpicsValue::Short(2)).unwrap();
+    db.add_record("WF_F", Box::new(wf_f)).await.unwrap();
     db.add_record("SEL", Box::new(StringoutRecord::new("rrt_connect")))
         .await
         .unwrap();
@@ -73,6 +78,10 @@ async fn asub_db() -> PvDatabase {
     rec.put_field("FTA", EpicsValue::Short(10)).unwrap(); // DOUBLE
     rec.put_field("NOA", EpicsValue::Long(8)).unwrap();
     rec.put_field("INPA", EpicsValue::String("WF".into()))
+        .unwrap();
+    rec.put_field("FTB", EpicsValue::Short(0)).unwrap(); // STRING
+    rec.put_field("NOB", EpicsValue::Long(2)).unwrap();
+    rec.put_field("INPB", EpicsValue::String("WF_F".into()))
         .unwrap();
     rec.put_field("FTC", EpicsValue::Short(0)).unwrap(); // STRING
     rec.put_field("INPC", EpicsValue::String("SEL".into()))
@@ -115,5 +124,21 @@ async fn string_source_lands_in_a_string_channel() {
         field(&db, "ASUB", "C").await,
         Some(EpicsValue::String("rrt_connect".into())),
         "a DBR_STRING read of the scalar source must reach C"
+    );
+}
+
+/// A float array source renders into an `FTx = STRING` channel at the
+/// SOURCE's precision (`getFloatString`), not the aSub's own PREC 0.
+#[epics_macros_rs::epics_test]
+async fn array_source_renders_at_its_own_precision_in_a_string_channel() {
+    let db = asub_db().await;
+
+    process(&db, "ASUB").await;
+
+    assert_eq!(
+        field(&db, "ASUB", "B").await,
+        Some(EpicsValue::StringArray(
+            vec!["0.10".into(), "1.50".into()].into()
+        ))
     );
 }

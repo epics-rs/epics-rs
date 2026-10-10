@@ -75,6 +75,11 @@ pub enum CaError {
     #[error("link error: {0}")]
     LinkError(String),
 
+    /// C `S_db_noSupport` ("RSET or DSXT routine not defined") — a runtime
+    /// device-link put whose device support has no extension table.
+    #[error("RSET or DSXT routine not defined")]
+    NoSupport,
+
     /// A `.db`/`.dbd` parse abort, carried as C `yyerror` prints it
     /// (`dbYacc.y:370-383`): the line, the sentence, and `yytext` — the token
     /// the lexer had matched when the parser rejected it, which is what C
@@ -197,6 +202,14 @@ impl LinkRefusal {
     pub(crate) fn printed(detail: String) -> Self {
         let report = Some(format!("{detail}\n"));
         Self { detail, report }
+    }
+
+    /// A refusal C reports with `report`, its own terminators included.
+    pub(crate) fn with_report(detail: String, report: String) -> Self {
+        Self {
+            detail,
+            report: Some(report),
+        }
     }
 
     /// The errlog line still owed for this refusal, if C prints one.

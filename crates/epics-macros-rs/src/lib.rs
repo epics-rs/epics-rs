@@ -590,6 +590,36 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // DLY0..DLYF and DO0..DOF — emit `Record::seq_group_cells`, keyed on the
+    // member names like `simm_cells`; all thirty-two or none.
+    const GROUPS: &str = "0123456789ABCDEF";
+    let group_cells: Vec<_> = GROUPS
+        .chars()
+        .map(|g| (cell(&format!("DLY{g}")), cell(&format!("DO{g}"))))
+        .collect();
+    let seq_group_cells_method = if group_cells.iter().all(|c| matches!(c, (None, None))) {
+        quote! {}
+    } else if group_cells.iter().all(|c| matches!(c, (Some(_), Some(_)))) {
+        let arms = group_cells.iter().enumerate().map(|(i, (dly, dov))| {
+            let (dly, dov) = (&dly.unwrap().ident, &dov.unwrap().ident);
+            quote! { #i => Some((self.#dly, self.#dov)), }
+        });
+        quote! {
+            fn seq_group_cells(&self, group: usize) -> Option<(f64, f64)> {
+                match group {
+                    #(#arms)*
+                    _ => None,
+                }
+            }
+        }
+    } else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "EpicsRecord: a record carrying any of DLY0..DLYF/DO0..DOF must carry all \
+             thirty-two (they back `Record::seq_group_cells`)",
+        ));
+    };
+
     // `#[record(constant_init = "LINK:TARGET,...")]` — the record's C
     // `recGblInitConstantLink` table. Omitted entirely when the record declares
     // none, so the trait default (no constant seeds) applies.
@@ -872,6 +902,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #menu_method
             #link_text_method
             #simm_cells_method
+            #seq_group_cells_method
         }
     };
 

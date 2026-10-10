@@ -23,7 +23,8 @@ pub use link_set::{
     LinkSetRegistry, PostBacking, PutAdmission, RemoteAlarm,
 };
 pub(crate) use links::{
-    multi_output_dispatch_owned, posts_software_event, reads_sell, resolves_subroutine_from_link,
+    multi_out_rows, multi_output_dispatch_owned, posts_software_event, reads_sell,
+    resolves_subroutine_from_link,
 };
 pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts, PostItem, PostRule, ProcStack};
 pub(crate) use record_lock::{FrameGate, InFrame, LockRecord, SetGuard};

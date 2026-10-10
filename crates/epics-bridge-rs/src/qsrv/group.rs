@@ -1463,9 +1463,9 @@ impl GroupChannel {
     }
 
     /// [`Self::member_process_it`], applied — the atomic-PUT entry. This
-    /// transaction already owns every member-record gate via `lock_records`
-    /// (the gate is not reentrant), so the transition below MUST use
-    /// the `_already_locked` entry. Synchronous: after H6,
+    /// transaction already owns every member-record gate via `lock_records`,
+    /// so the transition below MUST use the `_already_locked` entry, which
+    /// runs under that hold instead of taking and settling its own. Synchronous: after H6,
     /// `put_driven_process_already_locked` is a plain `fn`, so this reaches
     /// the end of the atomic PUT's
     /// `lock_records` window with zero `.await`s (§1.1 H9, §5 step 6).
@@ -1966,9 +1966,9 @@ impl GroupChannel {
             // `atomic_write_lock`-only design left open.
             //
             // The member writes below MUST use the `_already_locked`
-            // helper variants: this transaction already owns every
-            // member-record gate, and the per-record gate is
-            // not reentrant. From here to the end of this block is
+            // helper variants: the gate re-enters on this thread, but only
+            // they defer each put's settle until the whole set drops.
+            // From here to the end of this block is
             // synchronous — zero `.await`s reached while the member
             // gates are held.
             // The database holds every member gate across the closure and

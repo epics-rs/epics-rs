@@ -766,7 +766,7 @@ enum State {
 
 /// `yajl_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Status {
+pub(crate) enum Status {
     Ok,
     Error,
     ClientCanceled,
@@ -797,6 +797,24 @@ enum Numbers {
     Refused,
 }
 
+/// A `yajl_callbacks` table. Each returns C's `int`, and `false` cancels the
+/// parse through `_CC_CHK`; a slot C leaves NULL is written as the refusal it
+/// stands for, so every table writes all of them.
+pub(crate) trait Callbacks {
+    fn null(&mut self) -> bool;
+    fn boolean(&mut self, value: bool) -> bool;
+    fn integer(&mut self, value: i64) -> bool;
+    fn double(&mut self, value: f64) -> bool;
+    fn string(&mut self, bytes: &[u8]) -> bool;
+    fn start_map(&mut self) -> bool;
+    fn start_array(&mut self) -> bool;
+    /// `Some` when the table fills `yajl_number`, which takes a number raw
+    /// before yajl would parse (and overflow-check) it.
+    fn number(&mut self, _text: &[u8]) -> Option<bool> {
+        None
+    }
+}
+
 impl Context {
     /// A callback that returns 0 after saying why. Every one of these is a
     /// `_CC_CHK` cancellation upstream, so the caller sees this line AND
@@ -815,14 +833,16 @@ impl Context {
         }
         true
     }
+}
 
+impl Callbacks for Context {
     /// `dbcj_null` (`dbConvertJSON.c:30-33`).
     fn null(&mut self) -> bool {
         self.refuse("dbConvertJSON: Null objects not supported\n".into())
     }
 
     /// `dbcj_boolean` (`:35-38`).
-    fn boolean(&mut self) -> bool {
+    fn boolean(&mut self, _value: bool) -> bool {
         self.refuse("dbConvertJSON: Boolean not supported\n".into())
     }
 
@@ -852,12 +872,15 @@ impl Context {
         self.store(Token::Double(value))
     }
 
-    /// `dblsj_number` (`:65-69`).
-    fn number(&mut self, text: &[u8]) -> bool {
+    /// `dblsj_number` (`:65-69`), the slot only `dblsj_callbacks` fills.
+    fn number(&mut self, text: &[u8]) -> Option<bool> {
+        if self.numbers == Numbers::Parsed {
+            return None;
+        }
         let shown = String::from_utf8_lossy(text);
-        self.refuse(format!(
+        Some(self.refuse(format!(
             "dbLSConvertJSON: Numeric value {shown} provided, string expected\n"
-        ))
+        )))
     }
 
     /// `dbcj_string` (`:71-93`): a string is legal ONLY into a `DBF_STRING`
@@ -880,16 +903,16 @@ impl Context {
 }
 
 /// C's `struct yajl_handle_t` reduced to the fields a `dbcj` parse touches.
-struct Parser {
+pub(crate) struct Parser<C> {
     lexer: Lexer,
     stack: Vec<State>,
     bytes_consumed: usize,
     parse_error: Option<&'static str>,
-    ctx: Context,
+    pub(crate) ctx: C,
 }
 
-impl Parser {
-    fn new(ctx: Context) -> Self {
+impl<C: Callbacks> Parser<C> {
+    pub(crate) fn new(ctx: C) -> Self {
         Self {
             lexer: Lexer::default(),
             stack: vec![State::Start],
@@ -921,9 +944,47 @@ impl Parser {
 
     /// C `yajl_do_parse` (`yajl_parser.c:207-524`), minus the map arms.
     fn do_parse(&mut self, txt: &[u8]) -> Status {
-        self.bytes_consumed = 0;
+        self.do_parse_from(txt, 0, false)
+    }
+
+    /// One value of `txt` starting at byte `start`, as a jlink's callbacks see
+    /// it inside the link's map: the parse stops where the value completes,
+    /// at [`Self::consumed`], and the `}` or `,` after it is the caller's.
+    /// Offsets stay `txt`'s, so a rendered caret points into the whole text.
+    /// `Ok` with the value incomplete is text that ran out first, which
+    /// [`Self::finish`] turns into yajl's `premature EOF`.
+    pub(crate) fn parse_value_at(&mut self, txt: &[u8], start: usize) -> Status {
+        self.do_parse_from(txt, start, true)
+    }
+
+    /// Whether the value [`Self::parse_value_at`] read is whole.
+    pub(crate) fn complete(&self) -> bool {
+        self.state() == State::ParseComplete
+    }
+
+    /// `hand->bytesConsumed`.
+    pub(crate) fn consumed(&self) -> usize {
+        self.bytes_consumed
+    }
+
+    /// `yajl_complete_parse`.
+    pub(crate) fn finish(&mut self) -> Status {
+        self.do_finish()
+    }
+
+    /// A parse error the caller's own state machine raises at `offset`, for
+    /// [`Self::render_error`] to print as yajl would.
+    pub(crate) fn fail_at(&mut self, offset: usize, error: &'static str) {
+        self.set(State::ParseError);
+        self.parse_error = Some(error);
+        self.bytes_consumed = offset;
+    }
+
+    fn do_parse_from(&mut self, txt: &[u8], start: usize, one_value: bool) -> Status {
+        self.bytes_consumed = start;
         loop {
             match self.state() {
+                State::ParseComplete if one_value => return Status::Ok,
                 State::ParseComplete => {
                     // Neither `yajl_allow_multiple_values` nor
                     // `yajl_allow_trailing_garbage` is set on an EPICS handle.
@@ -955,16 +1016,14 @@ impl Parser {
                             let decoded = string_decode(&buf);
                             self.ctx.string(&decoded)
                         }
-                        Tok::Bool => self.ctx.boolean(),
+                        Tok::Bool => self.ctx.boolean(buf.first() == Some(&b't')),
                         Tok::Null => self.ctx.null(),
                         Tok::LeftBrace => self.ctx.start_map(),
                         Tok::LeftBracket => {
                             push_array = true;
                             self.ctx.start_array()
                         }
-                        Tok::Integer | Tok::Double if self.ctx.numbers == Numbers::Refused => {
-                            self.ctx.number(&buf)
-                        }
+                        Tok::Integer | Tok::Double if let Some(ok) = self.ctx.number(&buf) => ok,
                         Tok::Integer => match parse_integer(&buf) {
                             Ok(value) => self.ctx.integer(value),
                             Err(()) => {
@@ -1065,7 +1124,7 @@ impl Parser {
     /// The window is emitted as bytes and only then read as text, so a caret
     /// that lands mid-codepoint costs a replacement character here where C
     /// writes the partial byte; nothing else differs.
-    fn render_error(&self, txt: &[u8]) -> String {
+    pub(crate) fn render_error(&self, txt: &[u8]) -> String {
         let (kind, detail) = match self.state() {
             State::ParseError => ("parse", self.parse_error),
             State::LexicalError => ("lexical", Some(self.lexer.error.text())),

@@ -1564,6 +1564,10 @@ impl Record for WaveformRecord {
     /// process reload uses, so link delivery and constant reload cannot drift
     /// apart.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // `dbGetLink` runs the GET table into `bptr`, not the put one VAL's
+        // own put applies: a `DBF_CHAR` source read at FTVL STRING is one
+        // decimal string per byte (`getCharString`), never the joined text.
+        let value = value.get_convert(self.ftvl_element_type())?;
         if matches!(self.kind, ArrayKind::SubArray) {
             return self.sa_load_and_subset(value);
         }

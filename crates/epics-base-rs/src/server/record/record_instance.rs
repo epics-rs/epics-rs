@@ -1272,6 +1272,11 @@ mod link_cache {
     #[derive(Debug, Default)]
     pub(crate) struct LinkSlots(Vec<LinkSlot>);
 
+    /// Sixteen slotted links by slot index. The slots are in the type's
+    /// declaration order, so a row is settled once, when the instance is built.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct LinkRow([u8; 16]);
+
     #[derive(Debug)]
     struct LinkSlot {
         /// [`field_key`] of `field`: the scan compares one word per entry.
@@ -1429,14 +1434,28 @@ mod link_cache {
             &self.0[i].parsed
         }
 
-        /// What a field with no slot reads as: no link.
-        pub(super) fn none() -> &'static Arc<ParsedLink> {
-            &NONE
+        /// `fields`' slots, `None` unless every one has a slot.
+        pub(super) fn row(&self, fields: &[&str; 16]) -> Option<LinkRow> {
+            let mut row = [0; 16];
+            for (slot, field) in row.iter_mut().zip(fields) {
+                *slot = u8::try_from(self.position(field)?).ok()?;
+            }
+            Some(LinkRow(row))
+        }
+
+        /// Slot index of link `i` of `row`.
+        pub(super) fn row_slot(row: LinkRow, i: usize) -> usize {
+            usize::from(row.0[i])
         }
 
         #[cfg(debug_assertions)]
         pub(super) fn field_at(&self, i: usize) -> &'static str {
             self.0[i].field
+        }
+
+        /// What a field with no slot reads as: no link.
+        pub(super) fn none() -> &'static Arc<ParsedLink> {
+            &NONE
         }
 
         #[cfg(debug_assertions)]
@@ -1526,7 +1545,7 @@ mod link_cache {
 
 pub use link_cache::LinkCache;
 pub(crate) use link_cache::{
-    CycleLink, CycleLinkSlots, LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks,
+    CycleLink, CycleLinkSlots, LinkRow, LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks,
 };
 
 /// How one process cycle of one record instance runs, resolved from the
@@ -1870,31 +1889,47 @@ pub(crate) struct FieldAddr {
     /// hand ([`FieldAddr::resolve_in`]). A read at a slot goes to the typed
     /// accessor and skips the by-name chain.
     pub(crate) slot: Option<super::record_trait::FieldSlot>,
+    /// The name carried C's `$` modifier: `dbNameToAddr` re-made the address
+    /// a `DBF_CHAR` array (`dbAccess.c:682-701`), which every read takes
+    /// through [`char_view`](crate::server::database::char_view::char_view).
+    pub(crate) char_view: bool,
 }
 
 impl FieldAddr {
-    /// `field` is upper-case already.
-    pub(crate) fn resolve(rdes: &RecordDesc, field: &str) -> Self {
+    /// This address under the `$` modifier. The field's typed slot is not
+    /// the char array it now names, so the address keeps none.
+    pub(crate) fn viewed_as_chars(self) -> Self {
         FieldAddr {
-            declared: declares_field(rdes.record_type, field),
-            desc: field_desc_in(rdes.fields, field),
             slot: None,
+            char_view: true,
+            ..self
         }
     }
 
-    /// [`Self::resolve`] with the record's slot for the field — for an
-    /// address that is kept and read through. Takes no lock: the slots were
-    /// settled with the cell ([`RecordCell::field_slot`]), so a record may
-    /// resolve a link to itself while it is held for writing.
+    /// `field` (upper-case already) resolved against the cell's settled
+    /// declaration and slots. Takes no lock, so a record may resolve a link
+    /// to itself while it is held for writing.
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
-        let mut addr = Self::resolve(rec.rdes(), field);
-        let slot = rec.field_slot(field);
+        // One scan of the type's own list answers both the desc and, by the
+        // same index, the slot; only a miss falls to `dbCommon`.
+        let named = |f: &FieldDesc| f.name.eq_ignore_ascii_case(field);
+        let fields = rec.rdes().fields;
+        let at = fields.iter().position(named);
+        let addr = FieldAddr {
+            declared: declares_field(rec.rdes().record_type, field),
+            desc: at.map(|i| &fields[i]).or_else(|| {
+                super::dbd_generated::DB_COMMON_FIELDS
+                    .iter()
+                    .find(|f| named(f))
+            }),
+            slot: at.and_then(|i| rec.slots[i]),
+            char_view: false,
+        };
         debug_assert!(
-            slot.is_none() || (addr.declared && addr.desc.is_some_and(|d| !d.unreadable())),
+            addr.slot.is_none() || (addr.declared && addr.desc.is_some_and(|d| !d.unreadable())),
             "{}.{field}: a field slot must name a declared, readable field",
             rec.rdes().record_type
         );
-        addr.slot = slot;
         addr
     }
 }
@@ -2069,9 +2104,6 @@ impl RecordCell {
         &self.name
     }
 
-    /// [`Record::field_slot`] for `field` (upper-case), answered from the
-    /// table settled at construction: a slot names a field of the type's
-    /// own list, and `dbCommon` fields have none.
     /// The slot the fetch stores multi-input link `index`'s value through,
     /// when the type hands one out.
     #[inline(always)]
@@ -2080,14 +2112,6 @@ impl RecordCell {
         index: usize,
     ) -> Option<super::record_trait::FieldSlot> {
         self.multi_input_val_slots[index]
-    }
-
-    pub(crate) fn field_slot(&self, field: &str) -> Option<super::record_trait::FieldSlot> {
-        self.rdes
-            .fields
-            .iter()
-            .position(|f| f.name.eq_ignore_ascii_case(field))
-            .and_then(|i| self.slots[i])
     }
 
     /// The record's `BKPT` byte, without taking its lock set.
@@ -2772,6 +2796,10 @@ pub struct RecordInstance {
     /// from the database* and *destroyed* are one event for both target
     /// kinds and a server can sweep them with one uniform test.
     destroyed: bool,
+    /// C `ellCount(&precord->rdes->devList) > 0`, read once here: the menus
+    /// are registered before any record is built, and the INP/OUT put asks
+    /// this under the record's write hold.
+    has_device_list: bool,
     // Link parse cache
     pub parsed_inp: LinkCache,
     /// The parsed form of each [`Record::multi_input_links`] slot the record
@@ -2806,6 +2834,10 @@ pub struct RecordInstance {
     dol_mode: (i16, i16),
     /// `SELM` menu index (sel), kept the same way for the NVL gate.
     selm: i16,
+    /// The rows of `link_slots` the multi-output dispatch reads by index
+    /// ([`crate::server::database::multi_out_rows`]): the output row, and
+    /// seq's DOL row.
+    link_rows: (Option<LinkRow>, Option<LinkRow>),
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
@@ -3267,6 +3299,62 @@ pub(crate) fn declared_field_type_of<R: Record + ?Sized>(
 ) -> Option<DbFieldType> {
     let desc = field_desc_of(record, field)?;
     (!desc.runtime_typed).then_some(desc.dbf_type)
+}
+
+/// The source record's part of a `DBR_STRING` link read — C's
+/// `[field_type][DBR_STRING]` conversion state — captured by
+/// [`RecordInstance::source_render_of`] under the read's hold and applied
+/// after it is released.
+#[derive(Debug)]
+pub(crate) struct SourceRender {
+    long_string: bool,
+    /// `getDoubleString`'s precision; a float value only.
+    precision: Option<u16>,
+    /// The state label of an index value whose field has a string source.
+    label: Option<PvString>,
+}
+
+impl SourceRender {
+    /// The value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it: one
+    /// element, so an array source converts its element 0 (none, at NORD 0,
+    /// is a failed read).
+    pub(crate) fn dbr_string(self, value: EpicsValue) -> Option<PvString> {
+        let value = if value.is_array() && !self.long_string {
+            value.first_element()?
+        } else {
+            value
+        };
+        if let Some(prec) = self.precision
+            && let Some(EpicsValue::String(s)) =
+                crate::types::codec::dbr_string_at_precision(&value, prec)
+        {
+            return Some(s);
+        }
+        if matches!(value, EpicsValue::Enum(_) | EpicsValue::Short(_))
+            && let Some(label) = self.label
+        {
+            return Some(label);
+        }
+        value_as_dbr_string(&value)
+    }
+
+    /// [`Self::dbr_string`] for every element of an array value, as `dbGet`
+    /// converts `nRequest > 1` elements into a `DBR_STRING` buffer.
+    /// A long-string field is one element, so `n_request` cuts only a real
+    /// array.
+    pub(crate) fn dbr_strings(self, mut value: EpicsValue, n_request: usize) -> Option<EpicsValue> {
+        if !value.is_array() || self.long_string {
+            return self.dbr_string(value).map(EpicsValue::String);
+        }
+        value.truncate(n_request);
+        match self
+            .precision
+            .and_then(|prec| crate::types::codec::dbr_string_at_precision(&value, prec))
+        {
+            Some(rendered) => Some(rendered),
+            None => value.get_convert(DbFieldType::String).ok(),
+        }
+    }
 }
 
 pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
@@ -3919,6 +4007,28 @@ impl RecordInstance {
             .map(|i| self.link_slots.at(i))
     }
 
+    /// Link `i` of the type's output row (fanout/seq `LNKn`, dfanout `OUTn`),
+    /// read by slot index. The load refused a record of these types whose
+    /// row is not all slotted links ([`Self::has_link_slot`]).
+    #[inline]
+    pub(crate) fn out_row_link(&self, i: usize) -> &Arc<ParsedLink> {
+        self.row_link(self.link_rows.0, i)
+    }
+
+    /// Link `i` of seq's `DOLn` row; see [`Self::out_row_link`].
+    #[inline]
+    pub(crate) fn dol_row_link(&self, i: usize) -> &Arc<ParsedLink> {
+        self.row_link(self.link_rows.1, i)
+    }
+
+    fn row_link(&self, row: Option<LinkRow>, i: usize) -> &Arc<ParsedLink> {
+        let Some(row) = row else {
+            debug_assert!(false, "{}: no link row", self.name);
+            return LinkSlots::none();
+        };
+        self.slot_link(LinkSlots::row_slot(row, i))
+    }
+
     /// The text of a link field, `None` when the link is unset.
     ///
     /// A declared link is unset far more often than set — a `calc` declares 21
@@ -4006,6 +4116,8 @@ impl RecordInstance {
             "int64in" | "int64out" => Some(AnalogAlarmConfig::int64()),
             _ => None,
         };
+        let has_device_list = super::dbd_generated::device_menu(rtype).is_some()
+            || super::has_contributed_device_menu(rtype);
         let mut common = CommonFields::default();
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
@@ -4016,9 +4128,15 @@ impl RecordInstance {
             menu_index_of(&*record, "OIF"),
         );
         let selm = menu_index_of(&*record, "SELM");
+        let (out_row, dol_row) = crate::server::database::multi_out_rows(record.record_type());
+        let link_rows = (
+            out_row.and_then(|fields| link_slots.row(fields)),
+            dol_row.and_then(|fields| link_slots.row(fields)),
+        );
 
         Self {
             destroyed: false,
+            has_device_list,
             name,
             record,
             common,
@@ -4036,6 +4154,7 @@ impl RecordInstance {
             cycle_links,
             dol_mode,
             selm,
+            link_rows,
             device: None,
             subroutine: None,
             init_subroutines: None,
@@ -5119,6 +5238,12 @@ impl RecordInstance {
         menu_choices_of(self.record.as_ref(), field)
     }
 
+    /// C `ellCount(&precord->rdes->devList) > 0`: the loaded `.dbd` set
+    /// declares a `device()` for this type, statically or contributed.
+    fn has_device_list(&self) -> bool {
+        self.has_device_list
+    }
+
     /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
     /// the record type, in `.dbd` declaration order.
     ///
@@ -5158,9 +5283,7 @@ impl RecordInstance {
         // this type. A type base declares none for but asyn does (structurally
         // possible, though none of asyn's are such) is therefore present, not
         // None; a type neither declares for (calc) stays None.
-        if super::dbd_generated::device_menu(record_type).is_none()
-            && super::contributed_device_menu(record_type).is_empty()
-        {
+        if !self.has_device_list() {
             return None;
         }
         // `merged_device_menu` = declared + contributed, the SAME source the
@@ -5330,33 +5453,86 @@ impl RecordInstance {
     /// never disagree about its string.
     pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
         let value = self.resolve_field(field)?;
-        // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
-        // render through the field's string source. A short field that is
-        // neither has no source and stays the plain number C converts it to.
-        let idx = match value {
-            EpicsValue::Enum(v) => Some(v),
-            EpicsValue::Short(v) => u16::try_from(v).ok(),
-            _ => None,
-        };
-        if let Some(idx) = idx
-            && let Some(form) = self.enum_string_form_for(field)
-        {
-            return Some(form.render(idx));
-        }
-        if let Some(EpicsValue::String(s)) = self.dbr_string_at_precision(&value) {
-            return Some(s);
-        }
-        value_as_dbr_string(&value)
+        self.source_render_of(field, &value).dbr_string(value)
     }
 
-    /// A float/double `value` read from this record as `DBR_STRING`: C's
-    /// `getDoubleString` renders at the SOURCE record's precision. `None`
-    /// for every other type, which carries none.
-    pub(crate) fn dbr_string_at_precision(&self, value: &EpicsValue) -> Option<EpicsValue> {
-        crate::types::codec::dbr_string_at_precision(
-            value,
-            super::record_trait::put_string_precision(&*self.record),
-        )
+    /// What [`SourceRender`] needs of this record to render `value`, just read
+    /// from `field`, as `DBR_STRING`: taken under the read's hold, so the
+    /// render after it never goes back for the record.
+    ///
+    /// C `dbGetLink` converts at the source, through `dbConvert.c`'s
+    /// `[field_type][DBR_STRING]` table, inside `dbGet`: a float field renders
+    /// at its own precision (`getDoubleString`), a `DBF_ENUM`/`DBF_MENU` index
+    /// as its state label (`getEnumString`/`getMenuString`), and a long-string
+    /// field is `DBF_STRING` to C's `cvt_dbaddr`, not an array. The label goes
+    /// through [`Self::enum_string_form_for`], the owner the CA/PVA encoders
+    /// use, so a link read and a `caget -t` of one field cannot disagree.
+    pub(crate) fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
+        let long_string = self
+            .record
+            .long_string_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field));
+        let mut render = SourceRender {
+            long_string,
+            precision: None,
+            label: None,
+        };
+        let head = if value.is_array() && !long_string {
+            value.first_element()
+        } else {
+            None
+        };
+        match head.as_ref().unwrap_or(value) {
+            EpicsValue::Double(_) | EpicsValue::Float(_) => {
+                render.precision = Some(self.dbr_string_precision(field, value));
+            }
+            // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
+            // render through the field's string source. A short field that is
+            // neither has no source and stays the plain number C converts it to.
+            &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
+            &EpicsValue::Short(v) => {
+                render.label = u16::try_from(v)
+                    .ok()
+                    .and_then(|idx| self.label_of(field, idx));
+            }
+            _ => {}
+        }
+        render
+    }
+
+    /// [`Self::enum_string_form_for`]'s label for `idx`; a menu's is cloned
+    /// from its choices, without building the form under the read's hold.
+    fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
+        if !field.eq_ignore_ascii_case("DTYP")
+            && let Some(choices) = self.menu_choices_for(field)
+        {
+            return Some(match choices.get(idx as usize) {
+                Some(choice) => PvString::from(*choice),
+                None => PvString::from(idx.to_string().as_str()),
+            });
+        }
+        self.enum_string_form_for(field)
+            .map(|form| form.render(idx))
+    }
+
+    /// C `getDoubleString`'s precision for `field` holding `value`: seeded 6
+    /// and overwritten by the rset's `get_precision` — the answer the
+    /// DBR_STRING encoder reads off [`Snapshot::precision`].
+    ///
+    /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
+    fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
+        let support = self
+            .record
+            .property_support()
+            .narrowed_to_field(value.db_field_type(), false);
+        if !support.precision {
+            return 6;
+        }
+        self.record
+            .field_metadata_override(field)
+            .and_then(|ov| ov.precision)
+            .unwrap_or_else(|| self.metadata_limit("PREC") as i16) as u16
     }
 
     /// The field's declaration — its `dbFldDes`, in C's terms.
@@ -6373,6 +6549,35 @@ impl RecordInstance {
         self.put_common_field_with(name, value, MenuBound::DbLoad, link)
     }
 
+    /// C `dbPutFieldLink`'s `isDevLink` arm (`dbAccess.c:1127,1191-1193`): a
+    /// runtime INP/OUT put re-takes `dset` from the CURRENT DTYP, so a DTYP put
+    /// made after init takes effect only once the device link is written. The
+    /// loader's puts are bound at init instead (`dbInitRecord`).
+    fn rebind_device_link(&mut self, bound: MenuBound) {
+        if matches!(bound, MenuBound::DbPut) && self.has_device_list() {
+            self.common.dtyp.rebind();
+        }
+    }
+
+    /// C `dbPutFieldLink`'s refusal (`dbAccess.c:1149-1153`) of a runtime
+    /// INP/OUT put whose DTYP names a device with no extension table
+    /// (`dsxt`): `S_db_noSupport` before the link moves, so INP and the bound
+    /// dset stay. A `CONSTANT` device has `devSoft_DSXT` (`dbInitDevSup`);
+    /// the other base devices that have one are the `devExtend` callers. A
+    /// device no vendored `.dbd` declares is not judged
+    /// ([`declared_link_type`](super::declared_link_type)).
+    fn refuse_unextended_device_link(&self, field: &str, bound: MenuBound) -> CaResult<()> {
+        if !matches!(bound, MenuBound::DbPut) || !self.has_device_list() {
+            return Ok(());
+        }
+        let dtyp = self.common.dtyp.as_str();
+        match super::declared_link_type(self.record.record_type(), Some(dtyp), field) {
+            Some(super::DbLinkType::Constant) | None => Ok(()),
+            Some(_) if matches!(dtyp, "Soft Timestamp" | "stdio" | "Db State" | "getenv") => Ok(()),
+            Some(_) => Err(CaError::NoSupport),
+        }
+    }
+
     fn put_common_field_with(
         &mut self,
         name: &str,
@@ -6558,14 +6763,17 @@ impl RecordInstance {
                     return Err(CaError::FieldNotFound("INP".to_string()));
                 }
                 if let Some(link) = link {
+                    self.refuse_unextended_device_link("INP", bound)?;
                     std::mem::swap(&mut self.common.inp, &mut link.text);
                     if !self.record_declares_field("INP") {
                         self.swap_link_cache("INP", &mut link.parsed);
                     }
+                    self.rebind_device_link(bound);
                 }
             }
             "OUT" => {
                 if let Some(link) = link {
+                    self.refuse_unextended_device_link("OUT", bound)?;
                     std::mem::swap(&mut self.common.out, &mut link.text);
                     // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
                     // link processes its target only on an explicit
@@ -6575,6 +6783,7 @@ impl RecordInstance {
                     if !self.record_declares_field("OUT") {
                         self.swap_link_cache("OUT", &mut link.parsed);
                     }
+                    self.rebind_device_link(bound);
                     // `special(OUT, true)` (longout's OOCH hook among them)
                     // is the tail's, once the link has moved.
                 }

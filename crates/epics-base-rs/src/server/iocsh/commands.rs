@@ -5767,12 +5767,21 @@ fn apply_fields_one_at_a_time<T: db_loader::LoadTarget + ?Sized>(
         // C's lexer names the line; the parse is over by the time this runs, so
         // the element's own recorded line takes that seat — as in the screen.
         faults.seek(f.line, ")");
-        faults.report(db_loader::DbDiagnostic::new(format!(
-            "{ERL_ERROR}: Can't set '{record_name}.{}' to '{}' {e}",
-            f.name,
-            f.value.as_str_lossy(),
-        )));
+        // `dbParseLink` prints while `dbPutString` runs, before
+        // `dbRecordField` reports the status it returned.
         e.emit_put_report();
+        let value = f.value.as_str_lossy();
+        let line = match e {
+            // `S_dbLib_badField` with no `pdbentry->message`.
+            crate::error::CaError::BadLink(_) => {
+                db_loader::cant_set_line(record_name, &f.name, &value, "", "Bad Field value")
+            }
+            e => format!(
+                "{ERL_ERROR}: Can't set '{record_name}.{}' to '{value}' {e}",
+                f.name
+            ),
+        };
+        faults.report(db_loader::DbDiagnostic::new(line));
     }
 }
 

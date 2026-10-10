@@ -88,6 +88,16 @@ pub(crate) fn contributed_device_menu(record_type: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether any choice was contributed for `record_type`.
+pub(crate) fn has_contributed_device_menu(record_type: &str) -> bool {
+    CONTRIBUTED.get().is_some_and(|lock| {
+        lock.read()
+            .expect("device-menu registry lock poisoned")
+            .get(record_type)
+            .is_some_and(|list| list.iter().any(|slice| !slice.is_empty()))
+    })
+}
+
 /// The full DTYP menu for `record_type` — the static `device()` declarations
 /// (base's build-time `dbd`) followed by every runtime-contributed device
 /// support, in C `dbDeviceMenu` load order — or an empty `Vec` when the type

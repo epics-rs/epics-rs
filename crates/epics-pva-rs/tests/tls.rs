@@ -307,6 +307,55 @@ async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
     server.stop();
 }
 
+/// Each interface gets a TLS listener on `tls_port`, not on the interface
+/// entry's own (plaintext) port, which keeps its plaintext listener.
+#[tokio::test]
+async fn tls_listener_on_every_interface_uses_tls_port() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (cert, key) = generate_self_signed();
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
+    });
+    let free = |ip: &str| {
+        std::net::TcpListener::bind((ip, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    };
+    let (a, b, tls) = (
+        free("127.0.0.1"),
+        free("127.0.0.2"),
+        free("127.0.0.1").port(),
+    );
+    let cfg = PvaServerConfig {
+        interfaces: vec![a, b],
+        tls_port: tls,
+        tls: Some(server_tls),
+        ..PvaServerConfig::isolated()
+    };
+    let server = epics_pva_rs::server_native::PvaServer::start(Arc::new(StaticSource::new()), cfg)
+        .expect("server start");
+    assert_eq!(server.report().tls_port, tls);
+    for addr in [
+        a,
+        b,
+        std::net::SocketAddr::new(a.ip(), tls),
+        std::net::SocketAddr::new(b.ip(), tls),
+    ] {
+        assert!(
+            std::net::TcpStream::connect(addr).is_ok(),
+            "nothing listens on {addr}"
+        );
+    }
+    server.stop();
+}
+
 /// With `disable_plaintext` set the server must REFUSE a plaintext peer
 /// (anti-downgrade) while still serving a TLS client. pvxs carries
 /// `tls_disable_plaintext` in the shared config and refuses the downgrade

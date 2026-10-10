@@ -1734,12 +1734,6 @@ async fn serve_ca_pva_qsrv(
     let reactor = tokio::runtime::Handle::try_current()
         .expect("serve_ca_pva_qsrv is awaited on the IOC's reactor");
     let ca_port = config.port;
-    // pvxs owns the PVA port, and it is NOT the CA rule: `PickOne` reads the
-    // server-specific `EPICS_PVAS_SERVER_PORT` before the shared
-    // `EPICS_PVA_SERVER_PORT` (config.cpp:402-408), and `0` is a legitimate
-    // ephemeral-bind request rather than a value to reject. A strict `parse()`
-    // here honoured neither.
-    let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     // ── QSRV bridge ──
     // Built by `build_qsrv_mount` at `initHookAfterInitDatabase` — the one
@@ -1818,7 +1812,7 @@ async fn serve_ca_pva_qsrv(
     // ── PVA server (foreground with iocsh) ──
     let pva_server = epics_pva_rs::server::PvaServer::from_parts(
         db,
-        pva_port,
+        None,
         config.acf,
         config.autosave_config,
         config.autosave_manager,

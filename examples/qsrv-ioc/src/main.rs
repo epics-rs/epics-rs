@@ -62,7 +62,8 @@ async fn main() -> CaResult<()> {
     // pvxs `PickOne` semantics (config.cpp:402-408): the server-specific
     // `EPICS_PVAS_SERVER_PORT` wins over the shared `EPICS_PVA_SERVER_PORT`,
     // and `0` means "bind an ephemeral port". Not the CA rule above — pvxs has
-    // no 5000 floor and no out-of-range diagnostic.
+    // no 5000 floor and no out-of-range diagnostic. For the banner only: the
+    // server is handed `None` and reads the same variables itself.
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     epics_base_rs::runtime::env::set_default("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
@@ -111,7 +112,7 @@ async fn main() -> CaResult<()> {
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
     let ca_server =
         CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await?;
-    let pva_server = PvaServer::from_parts(db, pva_port, acf, None, None);
+    let pva_server = PvaServer::from_parts(db, None, acf, None, None);
 
     // CA runs in background, PVA runs with iocsh (shell exit stops everything)
     let ca_handle = reactor.clone().spawn(async move { ca_server.run().await });

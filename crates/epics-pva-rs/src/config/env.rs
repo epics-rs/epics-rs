@@ -1026,7 +1026,7 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 }
 
 /// Resolve a `EPICS_PVA*_INTF_ADDR_LIST` value to a deduplicated list of
-/// bind `IpAddr`s.
+/// bind addresses, each with its token's own port, 0 when it names none.
 ///
 /// pvxs parses interface lists through the SAME `split_addr_into` /
 /// `SockEndpoint` path as every other address list (config.cpp:151-183,
@@ -1040,25 +1040,32 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 ///
 /// Routes each whitespace-separated token (pvxs `split_addr_into` splits on
 /// whitespace; the comma is endpoint syntax, never a list separator)
-/// through the shared [`resolve_token_addr`] resolver — literal IP /
-/// `ip:port` / hostname / `host:port`, IPv4-preferred DNS — and keeps the
-/// resolved `IpAddr`; the port is irrelevant for a bind interface, so the
-/// default port is `0`. Unresolvable tokens are dropped with a `warn` so an
-/// operator sees a mistyped interface. Duplicates are collapsed after
-/// resolution, preserving first-appearance order (pvxs normalizes then
-/// `removeDups`). One owner for both the client and server interface lists
-/// so the family cannot drift back to dropping hostnames at one site.
-fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
+/// through [`Endpoint::parse`], so a `,ttl` / `@iface` token survives, and
+/// its address through the shared [`resolve_token_addr`] resolver — literal
+/// IP / `ip:port` / hostname / `host:port`, IPv4-preferred DNS. Unresolvable tokens are dropped with a `warn` so an
+/// operator sees a mistyped interface. One owner for both the client and
+/// server interface lists so the family cannot drift back to dropping
+/// hostnames at one site.
+///
+/// The list comes back in pvxs's order: `split_addr_into` prints each
+/// endpoint with `default_port` filled in and sorts and dedups those strings
+/// (`config.cpp:166-182`), keyed by [`sock_endpoint_text`]. That order is
+/// load-bearing on the server, whose first interface is the one that may fall
+/// back (`server.cpp:476-486`). The port stays 0 in the entry itself, so the
+/// bind fills it from the port the server ends up with, an explicit one
+/// included.
+pub fn resolve_intf_addr_list(value: &str, default_port: u16) -> Vec<SocketAddr> {
     // PVA-466: expand $(VAR) / ${VAR} refs before tokenising.
     let value = expand_dollar_vars(value);
-    let mut out: Vec<IpAddr> = Vec::new();
+    let mut printed: Vec<(String, SocketAddr, SocketAddr)> = Vec::new();
     for token in value.split_whitespace() {
-        match resolve_token_addr(token, 0) {
-            Some(sa) => {
-                let ip = sa.ip();
-                if !out.contains(&ip) {
-                    out.push(ip);
+        match Endpoint::parse(token, 0) {
+            Some(ep) => {
+                let mut key = ep.clone();
+                if key.addr.port() == 0 {
+                    key.addr.set_port(default_port);
                 }
+                printed.push((sock_endpoint_text(&key), key.addr, ep.addr));
             }
             None => tracing::warn!(
                 token = %token,
@@ -1066,7 +1073,49 @@ fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
             ),
         }
     }
+    printed.sort();
+    let mut keys: Vec<SocketAddr> = Vec::new();
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for (_, key, addr) in printed {
+        if !keys.contains(&key) {
+            keys.push(key);
+            out.push(addr);
+        }
+    }
     out
+}
+
+/// pvxs `SockEndpoint`'s text (`config.cpp:125-135`): the modifiers print
+/// for a multicast address only, and an unset TTL is pvxs's `-1`
+/// (`osiSockExt.h:142`), so `pvxsr` shows a bare `224.0.2.3` as
+/// `224.0.2.3,-1`; a TTL of 0 prints nothing.
+pub(crate) fn sock_endpoint_text(ep: &Endpoint) -> String {
+    let mut text = sock_addr_text(ep.addr);
+    if ep.addr.ip().is_multicast() {
+        match ep.ttl {
+            Some(0) => {}
+            Some(ttl) => text.push_str(&format!(",{ttl}")),
+            None => text.push_str(",-1"),
+        }
+        if let Some(iface) = &ep.iface {
+            text.push_str(&format!("@{iface}"));
+        }
+    }
+    text
+}
+
+/// pvxs `SockAddr`'s text (`util.cpp:660-690`): `[v6]%scope`, and no port
+/// when it is 0.
+pub(crate) fn sock_addr_text(addr: SocketAddr) -> String {
+    let mut text = match addr {
+        SocketAddr::V4(a) => a.ip().to_string(),
+        SocketAddr::V6(a) if a.scope_id() != 0 => format!("[{}]%{}", a.ip(), a.scope_id()),
+        SocketAddr::V6(a) => format!("[{}]", a.ip()),
+    };
+    if addr.port() != 0 {
+        text.push_str(&format!(":{}", addr.port()));
+    }
+    text
 }
 
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
@@ -1074,33 +1123,41 @@ fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
 /// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
 /// `resolve_intf_addr_list`.
 pub fn list_intf_addresses() -> Vec<IpAddr> {
-    std::env::var("EPICS_PVA_INTF_ADDR_LIST")
-        .ok()
-        .map(|s| resolve_intf_addr_list(&s))
-        .unwrap_or_default()
-}
-
-/// Parse `EPICS_PVAS_INTF_ADDR_LIST` — server-side interface bind list.
-/// Falls back to `EPICS_PVA_INTF_ADDR_LIST` when unset; if both are
-/// empty, returns an empty list (caller should bind 0.0.0.0).
-/// Presence-aware [`server_intf_addr_list`] — `None` when neither
-/// `EPICS_PVAS_INTF_ADDR_LIST` nor `EPICS_PVA_INTF_ADDR_LIST` is set, so
-/// `with_env` preserves a caller-supplied `interfaces`.
-pub fn server_intf_addr_list_opt() -> Option<Vec<IpAddr>> {
-    let present = std::env::var("EPICS_PVAS_INTF_ADDR_LIST").is_ok()
-        || std::env::var("EPICS_PVA_INTF_ADDR_LIST").is_ok();
-    present.then(server_intf_addr_list)
-}
-
-pub fn server_intf_addr_list() -> Vec<IpAddr> {
-    if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
-        // Same hostname-resolving path as the client list — see
-        // [`resolve_intf_addr_list`]. A DNS NIC name (`ioc-public-nic`)
-        // must resolve to its IPv4 address, not be dropped, so the server
-        // binds the named interface instead of falling back to wildcard.
-        return resolve_intf_addr_list(&s);
+    let addrs = std::env::var("EPICS_PVA_INTF_ADDR_LIST")
+        .map(|s| resolve_intf_addr_list(&s, 0))
+        .unwrap_or_default();
+    let mut out: Vec<IpAddr> = Vec::new();
+    for ip in addrs.iter().map(SocketAddr::ip) {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
     }
-    list_intf_addresses()
+    out
+}
+
+/// Presence-aware [`server_intf_addr_list`] — `None` when
+/// `EPICS_PVAS_INTF_ADDR_LIST` is unset, so `with_env` preserves a
+/// caller-supplied `interfaces`.
+pub fn server_intf_addr_list_opt() -> Option<Vec<SocketAddr>> {
+    std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
+        .is_ok()
+        .then(server_intf_addr_list)
+}
+
+/// Parse `EPICS_PVAS_INTF_ADDR_LIST` — server-side interface bind list, a
+/// port-less entry left at 0 for the bind to fill from `tcp_port`; empty
+/// when unset (caller binds the wildcard). The server has no
+/// `EPICS_PVA_INTF_ADDR_LIST` fallback: pvxs reads that one for the client
+/// only (`config.cpp:418` vs `592`), and softIocPVX 1.5.3 with only
+/// `EPICS_PVA_INTF_ADDR_LIST=10.99.99.99` serves on the wildcard.
+pub fn server_intf_addr_list() -> Vec<SocketAddr> {
+    // Same hostname-resolving path as the client list — see
+    // [`resolve_intf_addr_list`]. A DNS NIC name (`ioc-public-nic`) must
+    // resolve to its IPv4 address, not be dropped, so the server binds the
+    // named interface instead of falling back to wildcard.
+    std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
+        .map(|s| resolve_intf_addr_list(&s, pvas_server_port()))
+        .unwrap_or_default()
 }
 
 /// PVX-82: presence-and-validity-aware server INTF resolver. pvxs parses
@@ -1116,31 +1173,42 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
 /// over-broad bind without failing on every benign typo in a partly-valid
 /// list:
 ///
-/// - `Ok(None)` — neither var set, or the value is whitespace-only ⟹
+/// - `Ok(None)` — the var is unset, or the value is whitespace-only ⟹
 ///   the operator wants the wildcard ("no addresses isn't interesting",
 ///   `config.cpp:492-494`).
 /// - `Ok(Some(addrs))` — at least one token resolved.
 /// - `Err(msg)` — non-blank token(s) present but **none** resolved ⟹ the
 ///   requested restriction is empty; fail loudly instead of binding all
 ///   interfaces.
-pub fn server_intf_addr_list_checked() -> Result<Option<Vec<IpAddr>>, String> {
-    let raw = std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_INTF_ADDR_LIST").ok());
-    let Some(raw) = raw else {
+pub fn server_intf_addr_list_checked() -> Result<Option<Vec<SocketAddr>>, String> {
+    let Ok(raw) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") else {
         return Ok(None);
     };
+    // The server reads `EPICS_PVAS_SERVER_PORT` before the interface list
+    // (`config.cpp:402-419`), so that port is in the strings it sorts.
+    resolve_server_intf_addr_list(&raw, pvas_server_port())
+}
+
+/// [`server_intf_addr_list_checked`] on a given value: a server interface
+/// list from somewhere other than the environment (pva-gateway-rs's
+/// `interface`) resolves, sorts and refuses exactly as the env list does.
+/// `default_port` goes into the sort key only; the entries keep 0 so the
+/// server's resolved port still reaches the bind.
+pub fn resolve_server_intf_addr_list(
+    raw: &str,
+    default_port: u16,
+) -> Result<Option<Vec<SocketAddr>>, String> {
     // `resolve_intf_addr_list` expands `$(VAR)` internally; expand here too
     // so the "did the operator name any interface" test sees the same text
     // (an env-ref that expands to nothing counts as unset → wildcard).
-    let had_token = expand_dollar_vars(&raw).split_whitespace().next().is_some();
+    let had_token = expand_dollar_vars(raw).split_whitespace().next().is_some();
     if !had_token {
         return Ok(None);
     }
-    let addrs = resolve_intf_addr_list(&raw);
+    let addrs = resolve_intf_addr_list(raw, default_port);
     if addrs.is_empty() {
         Err(format!(
-            "EPICS_PVA[S]_INTF_ADDR_LIST=\"{raw}\" named interface(s) but none \
+            "EPICS_PVAS_INTF_ADDR_LIST=\"{raw}\" named interface(s) but none \
              resolved; refusing to silently bind the wildcard 0.0.0.0 (every \
              interface). Fix the interface list, or unset it to bind all \
              interfaces intentionally."
@@ -1577,7 +1645,10 @@ impl Config {
             tcp_port: pvas_server_port(),
             auto_addr_list: false,
             auto_beacon: auto_beacon_addr_list_enabled(),
-            interfaces: intf_endpoints(server_intf_addr_list()),
+            interfaces: server_intf_addr_list()
+                .into_iter()
+                .map(Endpoint::from)
+                .collect(),
             address_list: Vec::new(),
             name_servers: Vec::new(),
             beacon_destinations: server_beacon_endpoints_opt().unwrap_or_default(),
@@ -2207,7 +2278,7 @@ mod tests {
         );
         assert_eq!(
             server,
-            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
             "EPICS_PVAS_INTF_ADDR_LIST ${{VAR}} must expand"
         );
         assert_eq!(
@@ -2249,7 +2320,7 @@ mod tests {
         );
         assert_eq!(
             server,
-            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
             "EPICS_PVAS_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
         );
     }
@@ -2260,6 +2331,53 @@ mod tests {
     /// security-relevant one — a typo'd bind restriction must surface as an
     /// error so the server refuses to start, NOT silently fall back to
     /// listening on every interface (`0.0.0.0`).
+    /// The server list is `EPICS_PVAS_INTF_ADDR_LIST` alone: softIocPVX
+    /// 1.5.3 with only `EPICS_PVA_INTF_ADDR_LIST=10.99.99.99` listens on
+    /// `*:5291` with no bind error, and `pvxsr` shows
+    /// `EPICS_PVAS_INTF_ADDR_LIST=0.0.0.0`.
+    /// pvxs parses interface tokens as `SockEndpoint`s (`config.cpp:32-61`),
+    /// so a `,ttl` token is an interface, not an unresolvable name.
+    #[test]
+    fn intf_list_keeps_multicast_modifier_tokens() {
+        assert_eq!(
+            resolve_intf_addr_list("224.0.2.3,5 10.0.0.1", 0),
+            vec![
+                SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 0),
+                SocketAddr::new(Ipv4Addr::new(224, 0, 2, 3).into(), 0),
+            ]
+        );
+    }
+
+    /// The sort key is pvxs's `SockEndpoint` text: softIocPVX 1.5.3 with
+    /// `EPICS_PVAS_INTF_ADDR_LIST="224.0.2.30 224.0.2.3"` shows
+    /// `224.0.2.3,-1 224.0.2.30,-1 0.0.0.0` in `pvxsr`.
+    #[test]
+    fn sock_endpoint_text_prints_pvxs_multicast_modifiers() {
+        let text = |t| sock_endpoint_text(&Endpoint::parse(t, 0).unwrap());
+        assert_eq!(text("224.0.2.3"), "224.0.2.3,-1");
+        assert_eq!(text("224.0.2.3,5@lo"), "224.0.2.3,5@lo");
+        assert_eq!(text("224.0.2.3,0"), "224.0.2.3");
+        assert_eq!(text("10.0.0.1,5@lo"), "10.0.0.1");
+    }
+
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn server_intf_list_ignores_the_client_variable() {
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "10.99.99.99");
+        }
+        let got = (
+            server_intf_addr_list_checked(),
+            server_intf_addr_list_opt(),
+            server_intf_addr_list(),
+            list_intf_addresses(),
+        );
+        unsafe { std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST") };
+        let client = IpAddr::V4(Ipv4Addr::new(10, 99, 99, 99));
+        assert_eq!(got, (Ok(None), None, Vec::new(), vec![client]));
+    }
+
     #[test]
     #[serial_test::serial(epics_env)]
     fn server_intf_checked_errors_when_all_tokens_unresolvable() {
@@ -2282,7 +2400,7 @@ mod tests {
         }
         assert_eq!(
             server_intf_addr_list_checked(),
-            Ok(Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]))
+            Ok(Some(vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)]))
         );
 
         // Named interface(s) that all fail to resolve (RFC 6761 reserves

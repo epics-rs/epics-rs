@@ -451,9 +451,15 @@ pub fn effective_server_config_string() -> String {
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(" ");
+    // pvxs prints each entry with the server port filled in.
     let interfaces = config::server_intf_addr_list()
-        .iter()
-        .map(|a| a.to_string())
+        .into_iter()
+        .map(|mut a| {
+            if a.port() == 0 {
+                a.set_port(config::env::pvas_server_port());
+            }
+            config::env::sock_addr_text(a)
+        })
         .collect::<Vec<_>>()
         .join(" ");
     // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is

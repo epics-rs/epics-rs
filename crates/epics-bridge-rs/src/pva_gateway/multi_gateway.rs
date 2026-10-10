@@ -415,7 +415,7 @@ impl MultiTenantPvaGatewayBuilder {
                     }
                 }
             }
-            let server = PvaServer::start(composite, ds.config)?;
+            let server = PvaServer::start(composite, ds.config).map_err(GwError::Downstream)?;
             servers.push(DownstreamHandle {
                 label: ds.label,
                 server,

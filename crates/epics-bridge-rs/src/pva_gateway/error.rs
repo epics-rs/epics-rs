@@ -8,8 +8,12 @@ pub enum GwError {
         "upstream PV {0:?} did not deliver an initial monitor event before the connect timeout"
     )]
     UpstreamTimeout(String),
+    // No `#[from]`: a `PvaError` comes from either side, and only its call
+    // site knows which.
     #[error("upstream PVA error: {0}")]
-    Upstream(#[from] epics_pva_rs::error::PvaError),
+    Upstream(epics_pva_rs::error::PvaError),
+    #[error("downstream PVA server error: {0}")]
+    Downstream(epics_pva_rs::error::PvaError),
     #[error("gateway not running")]
     NotRunning,
     #[error("channel cache full (cap = {0})")]

@@ -197,14 +197,13 @@ async fn main() -> ExitCode {
     let db = ioc.database().clone();
     let _scan_owner = ioc.run().await;
 
-    // Flag > EPICS environment > compiled default. `from_parts` takes a
-    // literal port, so the environment fallback is resolved here.
+    // Flag > EPICS environment > compiled default. `CaServer::from_parts`
+    // takes a literal port, so its fallback is resolved here;
+    // `PvaServer::from_parts` resolves its own from `None`.
     let ca_port = args
         .ca_port
         .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
-    let pva_port = args
-        .pva_port
-        .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port);
+    let pva_port = args.pva_port;
 
     // One live policy cell for both protocol servers, so an ACF
     // (re)load gates CA and PVA together.
@@ -232,7 +231,7 @@ async fn main() -> ExitCode {
     } else {
         let server = PvaServer::from_parts(db.clone(), pva_port, acf, None, None);
         Some(tokio::spawn(async move {
-            tracing::info!(port = pva_port, "PVA listener starting");
+            tracing::info!(port = ?pva_port, "PVA listener starting");
             server.run().await
         }))
     };

@@ -69,6 +69,9 @@ mod reverse_complex_types;
 #[path = "interop_pvxs_mods/rpc_and_get_field.rs"]
 mod rpc_and_get_field;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/server_ports_env.rs"]
+mod server_ports_env;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
 #[cfg(all(unix, feature = "tls"))]

@@ -959,7 +959,8 @@ impl ChannelCache {
         let addr =
             epics_base_rs::runtime::task::timeout(connect_timeout, self.client.pvconnect(pv_name))
                 .await
-                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
+                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))?
+                .map_err(GwError::Upstream)?;
         // Record / refresh the connection admission (poked recent).
         self.entries
             .lock()

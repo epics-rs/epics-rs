@@ -222,11 +222,13 @@ pub struct PvaServerConfig {
     /// Auto-discover per-NIC broadcast addresses for beacons. From
     /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` (default true).
     pub auto_beacon: bool,
-    /// Interfaces to bind UDP responder on. When empty, bind 0.0.0.0.
-    /// From `EPICS_PVAS_INTF_ADDR_LIST`.
-    pub interfaces: Vec<std::net::IpAddr>,
+    /// Interfaces to bind the TCP listeners and UDP responder on. When empty,
+    /// bind `bind_ip`. Each TCP listener binds its own entry's port; a port
+    /// of 0 takes `tcp_port`, then the first listener's bound port
+    /// (`server.cpp:476-486`). From `EPICS_PVAS_INTF_ADDR_LIST`.
+    pub interfaces: Vec<std::net::SocketAddr>,
     /// PVX-82: deferred config error set by [`Self::with_env`] when
-    /// `EPICS_PVA[S]_INTF_ADDR_LIST` named interface(s) that all failed to
+    /// `EPICS_PVAS_INTF_ADDR_LIST` named interface(s) that all failed to
     /// resolve. `PvaServer::start` refuses to bind in that case rather than
     /// silently promoting the (now-empty) `interfaces` to the wildcard
     /// `0.0.0.0`. `None` on any programmatically-built config — an empty

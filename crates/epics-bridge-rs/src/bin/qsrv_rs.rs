@@ -47,7 +47,8 @@ struct Args {
     #[arg(long = "macro", value_parser = parse_macro)]
     macros: Vec<(String, String)>,
 
-    /// TCP port for pvAccess (UDP is port + 1). Omit to take
+    /// TCP port for pvAccess; the search (UDP) port is
+    /// `EPICS_PVAS_BROADCAST_PORT`'s whatever this is. Omit to take
     /// `EPICS_PVAS_SERVER_PORT`, then `EPICS_PVA_SERVER_PORT`, then 5075.
     /// `--port 0` binds an ephemeral port.
     #[arg(long)]
@@ -109,7 +110,6 @@ async fn run(args: Args) -> Result<(), String> {
         .collect();
     let port = args.port;
     run_qsrv_ioc_app(app, group_files, move |config, mount| async move {
-        let port = port.unwrap_or_else(epics_pva_rs::config::env::pvas_server_port);
         PvaServer::from_parts(
             config.db,
             port,

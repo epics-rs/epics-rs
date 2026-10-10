@@ -176,7 +176,7 @@ filter = 'package(ad-plugins-rs) and test(file_magick::)'
 test-group = 'ndarray_io'
 
 [[profile.default.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
+filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo) | binary(run_pva_ioc_env_ports)'
 test-group = 'pva_listener'
 
 # Serialised IOC spawners. These four are the group's original membership

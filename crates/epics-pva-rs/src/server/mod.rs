@@ -52,11 +52,15 @@ pub async fn run_pva_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication
 /// [`run_pva_ioc_app`] rather than `.run(run_pva_ioc)`, for the reason given
 /// there: this runner is dispatched after the startup script, so `pvxsr`
 /// registered from here reaches only the interactive shell.
+///
+/// The TCP port is pvxs's server port (`EPICS_PVAS_SERVER_PORT`, then
+/// `EPICS_PVA_SERVER_PORT`, then 5075, `config.cpp:402-408`), not
+/// `IocRunConfig::port`, which is the CA server port.
 #[cfg(tokio_backend)]
 pub async fn run_pva_ioc(config: IocRunConfig) -> CaResult<()> {
     let server = PvaServer::from_parts(
         config.db,
-        config.port,
+        None,
         config.acf,
         config.autosave_config,
         config.autosave_manager,

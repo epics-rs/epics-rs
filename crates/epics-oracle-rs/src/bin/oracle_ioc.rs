@@ -200,7 +200,7 @@ async fn serve_pva(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server = PvaServer::from_parts(
         db,
-        0,
+        Some(0),
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
         None,

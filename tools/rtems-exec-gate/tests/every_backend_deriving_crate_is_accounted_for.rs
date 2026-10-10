@@ -134,6 +134,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/caput_long_string_readback.rs"),
     ("epics-ca-rs", "tests/caput_old_read_never_aborts.rs"),
     ("epics-ca-rs", "tests/caput_readback_timeout.rs"),
+    ("epics-ca-rs", "tests/channel_field_spelling.rs"),
     ("epics-ca-rs", "tests/channel_filters.rs"),
     ("epics-ca-rs", "tests/cli_cainfo_host.rs"),
     ("epics-ca-rs", "tests/cli_caput_enum_order.rs"),

@@ -3054,6 +3054,15 @@ pub(crate) async fn dispatch_message(
                         )
                     }
                     PvEntry::Record(rec) => {
+                        // `field` is upper-cased; C finds only the spelling
+                        // declared.
+                        let spelled = epics_base_rs::server::database::parse_pv_name(record_path).1;
+                        if !epics_base_rs::server::database::filters::spells_a_field(spelled) {
+                            let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                            fail.cid = client_cid;
+                            writer.push(fail.to_bytes().to_vec());
+                            return Ok(());
+                        }
                         let instance = rec.read();
                         // `client_field_value` = resolve_field (3-level
                         // priority) with a DBF_MENU field promoted to its
@@ -9572,6 +9581,62 @@ mod non_graceful_disconnect_teardown_tests {
             hdr.cmmd, CA_PROTO_CREATE_CH_FAIL,
             "`$` on a non-string SimplePv must be rejected with CREATE_CH_FAIL"
         );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// A CREATE_CHAN that skipped the search still finds a field by its
+    /// declared spelling only (C `dbFindFieldPart`'s `strncmp`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lower_case_field_fails_create_chan() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("spell:rec", Box::new(StringinRecord::new("abc")))
+            .await
+            .expect("add stringin record");
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55226".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        for (cid, name, cmmd) in [
+            (0xB0, "spell:rec.VAL", CA_PROTO_CREATE_CHAN),
+            (0xB1, "spell:rec.val", CA_PROTO_CREATE_CH_FAIL),
+            (0xB2, "spell:rec.val$", CA_PROTO_CREATE_CH_FAIL),
+        ] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .expect("create_chan");
+            client.flush().await.expect("flush create_chan");
+            let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+            assert_eq!(hdr.cmmd, cmmd, "{name}");
+        }
 
         drop(client);
         handle.abort();

@@ -2005,7 +2005,10 @@ impl PutAddr {
 /// `prev_bit`: the field's bit in [`Record::prev_compared_inputs`], settled
 /// with the entry so the walk never searches that list. `name`: the declared
 /// name when it is the key exactly, so a post borrows it instead of copying
-/// the key.
+/// the key. `posted`: the field's membership in
+/// [`Record::process_posted_fields`], with the list it was settled against —
+/// trusted only while the record answers that same list, since aSub's
+/// changes with EFLG.
 #[derive(Debug)]
 struct Published {
     value: EpicsValue,
@@ -2013,6 +2016,18 @@ struct Published {
     name: Option<&'static str>,
     upper: bool,
     prev_bit: Option<u8>,
+    posted: Option<(&'static [&'static str], bool)>,
+}
+
+/// `field` spelled as the record's tables spell it, upper-case: borrowed
+/// unless the name has a lower-case letter, so a declared name or an
+/// upper-case key is never copied on a post.
+fn upper_field(field: &str) -> Cow<'_, str> {
+    if field.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(field.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(field)
+    }
 }
 
 /// Whether `record_type`'s `.dbd` declares `field` — C `dbFindField` on the
@@ -3409,18 +3424,19 @@ const MONITOR_TRACKER_FIELDS: [&str; 8] = [
 /// [`RecordInstance::walk_skips`] (which keeps these fields out of
 /// `last_posted`) ask here, so the gate and the walk cannot disagree.
 ///
-/// The deadband field and SEVR/STAT/AMSG/ACKS are posted by the caller with
-/// their own C masks (recGbl.c:202-222); a change-detected copy would
-/// double-post. No C `monitor()` posts UDF or a [`MONITOR_TRACKER_FIELDS`]
-/// entry at all. [`Record::event_posted_fields`] post from their own event
-/// path. A `caput` to any of them still posts, through the put path.
-#[inline(always)]
+/// The deadband field is posted by the caller with its own C mask. No C
+/// `monitor()` posts a `dbCommon` field: SEVR/STAT/AMSG/ACKS come from
+/// recGbl.c:202-222 alone, and LCNT, UDF and the rest from nowhere outside
+/// the dbAccess.c put paths. Nor does it post a [`MONITOR_TRACKER_FIELDS`]
+/// entry. [`Record::event_posted_fields`] post from their own event path. A
+/// `caput` to any of them still posts, through the put path.
 fn walk_skip_term(field: &str, deadband_field: &str, event_posted: &[&str]) -> bool {
     field == deadband_field
-        || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field)
-        || field == "UDF"
         || MONITOR_TRACKER_FIELDS.contains(&field)
         || event_posted.contains(&field)
+        || super::dbd_generated::DB_COMMON_FIELDS
+            .iter()
+            .any(|d| d.name == field)
 }
 
 impl RecordInstance {
@@ -3495,7 +3511,7 @@ impl RecordInstance {
     /// `PROCESS_POSTED` pays this one bit test; the engine's arm asks its
     /// own plan instead.
     #[inline(always)]
-    pub(crate) fn emit_process_posts(&mut self) {
+    fn emit_process_posts(&mut self) {
         if self
             .monitor_plan
             .hooks
@@ -3505,10 +3521,23 @@ impl RecordInstance {
         }
     }
 
+    /// [`Record::process`](crate::server::record::Record::process) and the
+    /// drain of what it posted, as one step: a cycle path calls this, never
+    /// `record.process()` alone, so a `PROCESS_POSTED` type cannot process
+    /// without its posts being taken.
+    #[inline(always)]
+    pub(crate) fn process_and_drain(
+        &mut self,
+    ) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
+        let outcome = self.record.process()?;
+        self.emit_process_posts();
+        Ok(outcome)
+    }
+
     /// The table names are upper-case, so the read skips `resolve_field`'s
     /// normalising copy.
     #[inline(never)]
-    pub(crate) fn emit_process_posts_marked(&mut self) {
+    fn emit_process_posts_marked(&mut self) {
         use crate::server::recgbl::EventMask;
         use crate::server::record::CyclePostMask;
         for (field, mask) in self.record.take_process_posted_fields() {
@@ -4537,16 +4566,26 @@ impl RecordInstance {
     /// The deadband field is the exception: its published value is MLST/ALST,
     /// which [`Self::deadband_post`] owns, so a post of it stores nothing.
     pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
-        let walk_skip = self.walk_skips(field);
-        self.record_value_post_as(field, walk_skip, value);
+        self.record_value_post_as(field, |inst| inst.walk_skips(field), value);
     }
 
-    /// [`Self::record_value_post`] with `walk_skip` = [`Self::walk_skips`]`(field)`.
-    fn record_value_post_as(&mut self, field: &str, walk_skip: bool, value: EpicsValue) {
+    /// [`Self::record_value_post`] with `walk_skip` answering
+    /// [`Self::walk_skips`]`(field)`. `last_posted` holds no skipped field, so
+    /// only a field it does not hold asks.
+    fn record_value_post_as(
+        &mut self,
+        field: &str,
+        walk_skip: impl FnOnce(&Self) -> bool,
+        value: EpicsValue,
+    ) {
         if field == self.record.monitor_deadband_field() {
             return;
         }
-        if walk_skip {
+        if let Some(slot) = self.last_posted.get_mut(field) {
+            slot.value = value;
+            return;
+        }
+        if walk_skip(self) {
             if let Some(slot) = self
                 .skipped_posted
                 .iter_mut()
@@ -4558,19 +4597,20 @@ impl RecordInstance {
             }
             return;
         }
-        if let Some(slot) = self.last_posted.get_mut(field) {
-            slot.value = value;
-        } else {
-            let desc = self.field_desc(field);
-            let published = Published {
-                value,
-                desc,
-                name: desc.map(|d| d.name).filter(|name| *name == field),
-                upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
-                prev_bit: self.prev_compared_bit(field),
-            };
-            self.last_posted.insert(field.to_string(), published);
-        }
+        let desc = self.field_desc(field);
+        let posted = self
+            .record
+            .process_posted_fields()
+            .map(|allowed| (allowed, allowed.contains(&field)));
+        let published = Published {
+            value,
+            desc,
+            name: desc.map(|d| d.name).filter(|name| *name == field),
+            upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
+            prev_bit: self.prev_compared_bit(field),
+            posted,
+        };
+        self.last_posted.insert(field.to_string(), published);
     }
 
     /// Invalidate the metadata cache. Called after writing any
@@ -4605,7 +4645,7 @@ impl RecordInstance {
     ///
     /// Field name is automatically uppercased.
     pub fn notify_field_written(&self, field: &str) {
-        let upper = field.to_ascii_uppercase();
+        let upper = upper_field(field);
         if is_metadata_cache_source(&upper) {
             self.invalidate_metadata_cache();
         }
@@ -4638,7 +4678,7 @@ impl RecordInstance {
         prev: Option<&EpicsValue>,
         backing: LinkBacking<'_>,
     ) {
-        let upper = field.to_ascii_uppercase();
+        let upper = upper_field(field);
         let desc = self.field_desc(&upper);
         self.written_if_changed(
             &upper,
@@ -5104,7 +5144,7 @@ impl RecordInstance {
     /// a name: C likewise reads `precord->inp` directly when it wants the
     /// link and `dbGet` when it wants what a client would see.
     pub fn resolve_field(&self, name: &str) -> Option<EpicsValue> {
-        self.resolve_field_upper(&name.to_ascii_uppercase())
+        self.resolve_field_upper(&upper_field(name))
     }
 
     /// [`Self::resolve_field`] for a name the caller has already normalised
@@ -5763,8 +5803,7 @@ impl RecordInstance {
     /// metadata — C's `get_linkNumber` question, asked before any lock is
     /// dropped so `PvDatabase` knows whether it has to resolve at all.
     pub(crate) fn link_backed_metadata_field_of(&self, field: &str) -> Option<String> {
-        self.record
-            .link_backed_metadata_field(&field.to_ascii_uppercase())
+        self.record.link_backed_metadata_field(&upper_field(field))
     }
 
     /// The value a channel bound to `field` serves, through the `$` view
@@ -6171,22 +6210,21 @@ impl RecordInstance {
     /// `default:` arm).
     fn units_from_egu(&self, rtype: &str, field: &str) -> bool {
         use crate::types::DbFieldType as T;
-        let f = field.to_ascii_uppercase();
+        let f: &str = &upper_field(field);
         // The link arm is NOT here: `route_field_metadata` asks
         // [`Record::link_backed_metadata_field`] first and only falls through
         // to this EGU question for a field no link backs. This function
         // answers C's `else strncpy(units, prec->egu, ...)` branch alone.
-        let own = |t: T| self.static_field_type(&f) == Some(t);
+        let own = |t: T| self.static_field_type(f) == Some(t);
         match rtype {
-            "ai" => own(T::Double) && !matches!(f.as_str(), "ASLO" | "AOFF" | "SMOO"),
-            "ao" => own(T::Double) && !matches!(f.as_str(), "ASLO" | "AOFF"),
+            "ai" => own(T::Double) && !matches!(f, "ASLO" | "AOFF" | "SMOO"),
+            "ao" => own(T::Double) && !matches!(f, "ASLO" | "AOFF"),
             "calc" | "calcout" | "sub" | "sel" | "dfanout" => own(T::Double),
             "longin" | "longout" => own(T::Long),
             "int64in" | "int64out" => own(T::Int64),
             "compress" => own(T::Double) || f == "VAL",
             "waveform" | "aai" | "aao" | "subArray" => {
-                matches!(f.as_str(), "HOPR" | "LOPR")
-                    || (f == "VAL" && !self.ftvl_is_string_or_enum())
+                matches!(f, "HOPR" | "LOPR") || (f == "VAL" && !self.ftvl_is_string_or_enum())
             }
             "histogram" | "seq" | "bo" | "table" | "aSub" => false,
             _ => true,
@@ -7488,10 +7526,9 @@ impl RecordInstance {
     ///
     /// The rules, in order:
     ///
-    /// * The deadband field (default VAL), the
-    ///   [`recgbl::RECGBL_POSTED_ALARM_FIELDS`](crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS)
-    ///   (SEVR/STAT/AMSG/ACKS) and UDF are emitted by the caller with their own
-    ///   C masks and are skipped here, as are the [`MONITOR_TRACKER_FIELDS`].
+    /// * The deadband field (default VAL) is emitted by the caller with its own
+    ///   C mask and is skipped here, as are every `dbCommon` field and the
+    ///   [`MONITOR_TRACKER_FIELDS`] ([`walk_skip_term`]).
     /// * [`Record::event_posted_fields`] post from their own event path
     ///   (waveform HASH) — never from change detection.
     /// * [`Record::process_posted_fields`], when declared, is the closed set of
@@ -7656,10 +7693,15 @@ impl RecordInstance {
                     .map(|field| (field, None)),
             );
         for (field, published) in tracked {
-            // `walk_skip_term` can only fire on a SUBSCRIBED field now:
+            // `walk_skip_term` can only fire on a field never published:
             // `skipped_posted`, not `last_posted`, holds what it rejects.
-            if walk_skip_term(field, deadband_field, event_posted)
-                || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
+            let closed_out =
+                process_posted.is_some_and(|allowed| match published.and_then(|p| p.posted) {
+                    Some((settled, posted)) if std::ptr::eq(settled, allowed) => !posted,
+                    _ => !allowed.contains(&field.as_str()),
+                });
+            if closed_out
+                || published.is_none() && walk_skip_term(field, deadband_field, event_posted)
             {
                 continue;
             }
@@ -8006,8 +8048,7 @@ impl RecordInstance {
         // (`db.process_record`); without this a record driven through it
         // (e.g. QSRV group-process members) would not see UDF/TSE.
         self.push_process_context();
-        let outcome = self.record.process()?;
-        self.emit_process_posts();
+        let outcome = self.process_and_drain()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
         // handled by the full process_record_with_links() path in processing.rs.
@@ -8318,7 +8359,7 @@ impl RecordInstance {
             !backing.is_unresolved()
                 || self
                     .record
-                    .link_backed_metadata_field(&field.to_ascii_uppercase())
+                    .link_backed_metadata_field(&upper_field(field))
                     .is_none(),
             "{}: monitor post of link-backed field {field} with nothing resolved \
              — the poster must call PvDatabase::resolve_link_backed_metadata \
@@ -8331,7 +8372,7 @@ impl RecordInstance {
         if backing.is_declined()
             && self
                 .record
-                .link_backed_metadata_field(&field.to_ascii_uppercase())
+                .link_backed_metadata_field(&upper_field(field))
                 .is_some()
         {
             return None;
@@ -8464,14 +8505,14 @@ impl RecordInstance {
         // straight (`native_source.rs:226`) under its own leaf mask.
         let slots = self.record.property_support();
         let rtype = self.record.record_type();
-        let f = field.to_ascii_uppercase();
+        let f: &str = &upper_field(field);
 
         // C's `get_linkNumber` question, asked ONCE per snapshot: which of this
         // record's own link fields, if any, supplies this field's metadata.
         // Four of the six slots consult it — `aSubRecord.c:306-404` is the
         // complete specimen — and control does not, because
         // `dbGetControlLimits` has no caller anywhere in base.
-        let link_backed = self.record.link_backed_metadata_field(&f);
+        let link_backed = self.record.link_backed_metadata_field(f);
         // Resolved for THIS build and handed in — see [`LinkBacking`]. Reading
         // a value the record had stored is what made a `caput SRC.EGU` invisible
         // to a passive source's clients until the source next processed.
@@ -8492,7 +8533,7 @@ impl RecordInstance {
                     .and_then(|m| m.units.as_deref())
                     .map(crate::types::PvString::from)
                     .unwrap_or_default();
-            } else if !self.units_from_egu(rtype, &f) {
+            } else if !self.units_from_egu(rtype, f) {
                 snap.display.get_or_insert_with(Default::default).units = Default::default();
             }
         }
@@ -8532,7 +8573,7 @@ impl RecordInstance {
                 Some(crate::types::DbFieldType::Float | crate::types::DbFieldType::Double)
             ) && !Self::precision_explicit_field(
                 rtype,
-                &f,
+                f,
                 link_backed.is_some(),
                 link_precision.is_some(),
             ) {
@@ -8724,21 +8765,21 @@ impl RecordInstance {
         if crate::server::database::is_value_field(field) {
             return true;
         }
-        let f = field.to_ascii_uppercase();
+        let f: &str = &upper_field(field);
         let bands: &[&str] = match rtype {
             "dfanout" => &["LALM", "ALST", "MLST"],
             "acalcout" | "scalcout" | "epid" => &["HIHI", "HIGH", "LOW", "LOLO"],
             "waveform" | "aai" | "aao" | "compress" | "histogram" | "subArray" | "motor" => &[],
             _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
         };
-        if bands.contains(&f.as_str()) {
+        if bands.contains(&f) {
             return true;
         }
         match rtype {
             // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
-            "sel" => Self::calc_arg_field(&f, 12),
+            "sel" => Self::calc_arg_field(f, 12),
             "acalcout" | "scalcout" => {
-                Self::calc_arg_field(&f, 12)
+                Self::calc_arg_field(f, 12)
                     || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
             }
             "epid" => f == "CVAL",
@@ -8851,7 +8892,7 @@ impl RecordInstance {
         if crate::server::database::is_value_field(field) {
             return true;
         }
-        let f = field.to_ascii_uppercase();
+        let f: &str = &upper_field(field);
         let bands: &[&str] = match rtype {
             "acalcout" | "scalcout" | "epid" => &["HIHI", "HIGH", "LOW", "LOLO"],
             // `swaitRecord.c:597-606` is a bare `pfield == &pwait->val` test,
@@ -8860,18 +8901,18 @@ impl RecordInstance {
             "swait" => &[],
             _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
         };
-        if bands.contains(&f.as_str()) {
+        if bands.contains(&f) {
             return true;
         }
         match rtype {
             "ai" | "longin" | "int64in" => f == "SVAL",
-            "ao" => matches!(f.as_str(), "OVAL" | "PVAL" | "IVOV"),
-            "compress" => matches!(f.as_str(), "IHIL" | "ILIL"),
+            "ao" => matches!(f, "OVAL" | "PVAL" | "IVOV"),
+            "compress" => matches!(f, "IHIL" | "ILIL"),
             // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
-            "sel" => Self::calc_arg_field(&f, 12),
+            "sel" => Self::calc_arg_field(f, 12),
             // A..L and PA..PL, both to HOPR/LOPR.
             "acalcout" | "scalcout" => {
-                Self::calc_arg_field(&f, 12)
+                Self::calc_arg_field(f, 12)
                     || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
             }
             // `epidRecord.c:238-248` names CVAL alongside VAL and the four
@@ -8967,10 +9008,10 @@ impl RecordInstance {
             // `default:` (`motorRecord.cc:3319-3335`).
             return !matches!(rtype, "aSub" | "mca" | "seq" | "histogram" | "motor");
         }
-        let f = field.to_ascii_uppercase();
+        let f: &str = &upper_field(field);
         match rtype {
             // `case VAL: case OVAL: case PVAL: break;` (`aoRecord.c:305-312`).
-            "ao" => matches!(f.as_str(), "OVAL" | "PVAL"),
+            "ao" => matches!(f, "OVAL" | "PVAL"),
             // `if (fieldIndex == VAL || fieldIndex == CVAL) return 0;`
             // (`epidRecord.c:231-232`).
             "epid" => f == "CVAL",
@@ -8981,15 +9022,15 @@ impl RecordInstance {
             // `prec->prec` before the switch — so C answers `dbAccess.c:387`'s
             // zeroed buffer there, not a clamped PREC; `SDLY` is histogram's
             // only such field and carries its own `Some(0)` override.
-            "histogram" => matches!(f.as_str(), "ULIM" | "LLIM" | "SGNL" | "SVAL" | "WDTH"),
+            "histogram" => matches!(f, "ULIM" | "LLIM" | "SGNL" | "SVAL" | "WDTH"),
             // `BPTR` returns, and the four calibration fields answer a literal
             // 6 (`mcaRecord.c:898-905`).
-            "mca" => matches!(f.as_str(), "BPTR" | "CALO" | "CALS" | "CALQ" | "TTH"),
+            "mca" => matches!(f, "BPTR" | "CALO" | "CALS" | "CALQ" | "TTH"),
             // `case RRBV: case RMP: case REP: *precision = 0; break;` and
             // `case VERS: *precision = 2; break;` — both `break` past the
             // switch to the bare `return`, never to `recGblGetPrec`
             // (`motorRecord.cc:3322-3330`).
-            "motor" => matches!(f.as_str(), "RRBV" | "RMP" | "REP" | "VERS"),
+            "motor" => matches!(f, "RRBV" | "RMP" | "REP" | "VERS"),
             // `sel` is deliberately absent: its `A`..`L` / `LA`..`LL` loop
             // compares `paddr->pfield` against `&pvalue` and `&plvalue` — the
             // addresses of the two LOCAL pointers, not the fields they walk
@@ -9250,7 +9291,6 @@ impl RecordInstance {
         // With no subscriber the post is value-class (the return above), and
         // the value goes straight to the owner.
         if !subscribed {
-            let walk_skip = walk_skip(self);
             self.record_value_post_as(field, walk_skip, value);
             return;
         }
@@ -9308,7 +9348,6 @@ impl RecordInstance {
         // advanced by the cycle that ran, so the post, not the delivery, is
         // what counts.
         if let Some(value) = posted {
-            let walk_skip = walk_skip(self);
             self.record_value_post_as(field, walk_skip, value);
         }
     }

@@ -5498,13 +5498,7 @@ impl PvDatabase {
                 }
 
                 // Process
-                let mut outcome = instance.record.process()?;
-                if plan
-                    .hooks
-                    .has(crate::server::record::CycleHooks::PROCESS_POSTED)
-                {
-                    instance.emit_process_posts_marked();
-                }
+                let mut outcome = instance.process_and_drain()?;
                 // Merge deferred device actions into process outcome actions
                 if let Some(deferred) = deferred_device_actions {
                     outcome.actions.extend(deferred);
@@ -9551,16 +9545,19 @@ impl PvDatabase {
                     // diverging for negative bipolar-ADC raw values
                     // (sval=-1.5 → C: -2, Rust as-cast: -1).
                     // Floor explicitly when narrowing a float to
-                    // an integer RVAL.
+                    // an integer RVAL; `(long)` then `epicsInt32` is
+                    // `f64_to_c_long`'s low 32 bits, not a saturation.
                     let coerced = match (&siol_val, rval_type) {
                         (EpicsValue::Double(d), crate::types::DbFieldType::Long) => {
-                            EpicsValue::Long(d.floor() as i32)
+                            EpicsValue::Long(crate::types::c_cast::f64_to_c_long(d.floor()) as i32)
                         }
                         (EpicsValue::Double(d), crate::types::DbFieldType::Int64) => {
                             EpicsValue::Int64(d.floor() as i64)
                         }
                         (EpicsValue::Float(d), crate::types::DbFieldType::Long) => {
-                            EpicsValue::Long((*d as f64).floor() as i32)
+                            EpicsValue::Long(crate::types::c_cast::f64_to_c_long(
+                                (*d as f64).floor(),
+                            ) as i32)
                         }
                         (EpicsValue::Float(d), crate::types::DbFieldType::Int64) => {
                             EpicsValue::Int64((*d as f64).floor() as i64)
@@ -9572,7 +9569,7 @@ impl PvDatabase {
                     };
                     let _ = instance.record.put_field("RVAL", coerced);
                     instance.push_process_context();
-                    let _ = instance.record.process();
+                    let _ = instance.process_and_drain();
                 } else {
                     // Records without RVAL fall back to SIMM=YES semantics: the
                     // SIOL value lands where C's `readValue` lands it — VAL for

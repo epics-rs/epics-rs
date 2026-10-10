@@ -7293,29 +7293,71 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
 
+    /// An async record with a change-detected auxiliary field. A `dbCommon`
+    /// field will not do: C's `monitor()` posts none of them.
+    struct AsyncAuxRecord {
+        aux: f64,
+    }
+    impl Record for AsyncAuxRecord {
+        fn record_type(&self) -> &'static str {
+            "async_test"
+        }
+        fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+            Ok(ProcessOutcome::async_pending())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" => Some(EpicsValue::Double(0.0)),
+                "AUX" => Some(EpicsValue::Double(self.aux)),
+                _ => None,
+            }
+        }
+        fn put_field(
+            &mut self,
+            name: &str,
+            value: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            match (name, value) {
+                ("AUX", EpicsValue::Double(v)) => {
+                    self.aux = v;
+                    Ok(())
+                }
+                _ => Err(CaError::FieldNotFound(name.into())),
+            }
+        }
+        fn declared_fields(&self) -> &'static [FieldDesc] {
+            static FIELDS: [FieldDesc; 2] = [
+                FieldDesc::new("VAL", DbFieldType::Double, false),
+                FieldDesc::new("AUX", DbFieldType::Double, false),
+            ];
+            &FIELDS
+        }
+    }
+    // The record changes AUX itself, as device support would: no put path
+    // posts it, so only the cycle's change detection can.
+    let set_aux = |db: &PvDatabase, v: f64| {
+        let rec = db.get_record("ASYNC_GATE").unwrap();
+        rec.write()
+            .record
+            .put_field("AUX", EpicsValue::Double(v))
+            .unwrap();
+    };
+
     let db = PvDatabase::new();
-    db.add_record("ASYNC_GATE", Box::new(AsyncRecord { val: 0.0 }))
+    db.add_record("ASYNC_GATE", Box::new(AsyncAuxRecord { aux: 1.0 }))
         .await
         .unwrap();
 
-    // Seed DESC to a known value so add_subscriber's last_posted
-    // initialiser captures it.
-    if let Some(rec) = db.get_record("ASYNC_GATE") {
+    let mut aux_rx = if let Some(rec) = db.get_record("ASYNC_GATE") {
         let mut inst = rec.write();
-        inst.put_common_field("DESC", EpicsValue::String("alpha".into()))
-            .unwrap();
-    }
-
-    let mut desc_rx = if let Some(rec) = db.get_record("ASYNC_GATE") {
-        let mut inst = rec.write();
-        inst.add_subscriber("DESC", 7, DbFieldType::String, EventMask::VALUE.bits())
+        inst.add_subscriber("AUX", 7, DbFieldType::Double, EventMask::VALUE.bits())
     } else {
         None
     }
-    .expect("DESC subscription must be accepted");
+    .expect("AUX subscription must be accepted");
 
     // Drive process → AsyncPending early-return, then async completion.
-    // DESC value unchanged since subscription, so the gate must
+    // AUX value unchanged since subscription, so the gate must
     // suppress the event.
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_GATE", &mut visited)
@@ -7324,28 +7366,24 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     db.complete_async_record("ASYNC_GATE").await.unwrap();
 
     assert!(
-        desc_rx.try_recv().is_err(),
-        "DESC unchanged across async-completion → must NOT post a duplicate event"
+        aux_rx.try_recv().is_err(),
+        "AUX unchanged across async-completion → must NOT post a duplicate event"
     );
 
-    // Change DESC, re-run process+complete. The new value must flow.
-    if let Some(rec) = db.get_record("ASYNC_GATE") {
-        let mut inst = rec.write();
-        inst.put_common_field("DESC", EpicsValue::String("beta".into()))
-            .unwrap();
-    }
+    // Change AUX, re-run process+complete. The new value must flow.
+    set_aux(&db, 2.0);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
     db.complete_async_record("ASYNC_GATE").await.unwrap();
 
-    let event = desc_rx
+    let event = aux_rx
         .try_recv()
-        .expect("DESC change must produce a post-completion event");
+        .expect("AUX change must produce a post-completion event");
     assert!(
-        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "beta"),
-        "DESC event payload should reflect post-change value, got {:?}",
+        matches!(event.snapshot.value, EpicsValue::Double(v) if v == 2.0),
+        "AUX event payload should reflect post-change value, got {:?}",
         event.snapshot.value
     );
 
@@ -7356,8 +7394,8 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
         .unwrap();
     db.complete_async_record("ASYNC_GATE").await.unwrap();
     assert!(
-        desc_rx.try_recv().is_err(),
-        "DESC stable after the change → no further events"
+        aux_rx.try_recv().is_err(),
+        "AUX stable after the change → no further events"
     );
 }
 

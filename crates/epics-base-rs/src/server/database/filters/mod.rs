@@ -42,7 +42,7 @@ pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
 pub use parser::{
     ChannelName, FilterParseError, ParsedChannelName, parse_channel_name, parse_filter_chain,
-    split_channel_name, try_parse_filter_chain,
+    spells_a_field, split_channel_name, try_parse_filter_chain,
 };
 pub use sync::{DbState, DbStateRegistry, SyncFilter, SyncMode, db_state_registry};
 pub use ts::TimestampFilter;

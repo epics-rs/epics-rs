@@ -27,6 +27,7 @@ fn camonitor_line(pv: &str, snap: &Snapshot, enums: &[String]) -> String {
     let value = match &snap.value {
         EpicsValue::Double(v) if v.fract() == 0.0 => format!("{}", *v as i64),
         EpicsValue::Double(v) => format!("{v}"),
+        EpicsValue::UChar(v) => format!("{v}"),
         EpicsValue::Enum(i) => enums[*i as usize].clone(),
         EpicsValue::String(s) => s.to_string(),
         other => panic!("{pv}: no camonitor rendering for {other:?}"),
@@ -129,6 +130,10 @@ async fn softioc_pin(case: &str, drive: Drive) {
     };
     for step in lines.take(steps) {
         let mut words = step.split_whitespace();
+        if let Some(secs) = step.strip_prefix("sleep ") {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(secs.parse().unwrap())).await;
+            continue;
+        }
         assert_eq!(words.next(), Some("caput"));
         let pv = words.next().unwrap();
         let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
@@ -170,6 +175,15 @@ async fn alarm_fields_post_ahead_of_val_in_monitor_order() {
 #[epics_macros_rs::epics_test]
 async fn a_max_lock_refusal_posts_its_alarm_fields_ahead_of_val() {
     softioc_pin("refusal", Drive::Steps).await;
+}
+
+/// A watched LCNT: the refusals count it to 11, and the cycle that finishes
+/// clears it, but C posts it from neither — no `monitor()` posts a `dbCommon`
+/// field. The finishing cycle drops SCAN_ALARM as any cycle drops an alarm,
+/// and a second round of eleven refusals raises it again, INVALID as before.
+#[epics_macros_rs::epics_test]
+async fn a_refused_record_never_posts_its_lock_count() {
+    softioc_pin("relock", Drive::Steps).await;
 }
 
 /// The same refusal reached through `process_local`: it posts what softIoc

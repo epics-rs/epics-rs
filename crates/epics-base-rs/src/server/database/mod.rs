@@ -3833,9 +3833,9 @@ impl PvDatabase {
         // syntax (`dbChannel.c:486-505`): eligible only on a `DBF_STRING`
         // or link field, and `dbChannelTest` refuses it anywhere else.
         match field.strip_suffix('$') {
-            Some(core) => instance
-                .resolve_string_view_field(&core.to_ascii_uppercase())
-                .is_some(),
+            Some(core) => {
+                filters::spells_a_field(core) && instance.resolve_string_view_field(core).is_some()
+            }
             None => {
                 // Existence is the DECLARED-name question, not the
                 // has-a-value question: `dbNameToAddr` resolves any field
@@ -3850,17 +3850,18 @@ impl PvDatabase {
                 // the `DBF_NOACCESS` internals the generated tables drop —
                 // record-own (`BPTR`, from `record_noaccess_fields`) and
                 // `dbCommon` (`MLOK`) alike.
-                let upper = field.to_ascii_uppercase();
-                instance.resolve_field(&upper).is_some()
-                    || instance.field_desc(&upper).is_some()
-                    || instance.resolves_noaccess_name(&upper)
+                (filters::spells_a_field(field)
+                    && (instance.resolve_field(field).is_some()
+                        || instance.field_desc(field).is_some()
+                        || instance.resolves_noaccess_name(field)))
                     // ... and the record type's attributes, which
                     // `pvNameLookup` reaches through `dbGetAttributePart`
                     // once the declared list has missed
-                    // (`dbChannel.c:326-327`). Shadowing needs no test
-                    // here: a declared name has already answered above.
+                    // (`dbChannel.c:326-327`), by `strcmp` as well. Shadowing
+                    // needs no test here: a declared name has already
+                    // answered above.
                     || self
-                        .record_type_attribute(instance.record.record_type(), &upper)
+                        .record_type_attribute(instance.record.record_type(), field)
                         .is_some()
             }
         }

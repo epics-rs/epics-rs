@@ -230,6 +230,15 @@ pub struct ChannelName {
     pub json_suffix: Option<String>,
 }
 
+/// Whether a channel's field text can name a field at all. C
+/// `dbFindFieldPart` finds the declaration with `strncmp` (and
+/// `dbGetRecordAttribute` the attribute with `strcmp`), so the spelling must be
+/// the declared one exactly, and every declared name is upper-case: `REC.val`
+/// is "not found" where the port's case-blind lookups would answer it.
+pub fn spells_a_field(field: &str) -> bool {
+    !field.bytes().any(|b| b.is_ascii_lowercase())
+}
+
 /// Resolve a raw CA/PVA channel name the way C `dbChannelCreate` does
 /// (`dbChannel.c:440-530`): peel the `{json}` / `[range]` filter suffix,
 /// then the `$` long-string modifier, then split `record.FIELD`.

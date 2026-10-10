@@ -436,7 +436,7 @@ impl McaRecord {
     /// leaving a buffer narrower than the channel advertising it.
     fn land_buffer(&self, value: EpicsValue) -> CaResult<(EpicsValue, usize)> {
         let cap = self.capacity();
-        let converted = value.convert_to(self.element_type());
+        let converted = value.into_type(self.element_type());
         macro_rules! land {
             ($src:expr, $variant:ident, $zero:expr) => {{
                 let mut arr = $src;

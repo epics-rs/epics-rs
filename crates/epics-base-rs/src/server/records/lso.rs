@@ -163,6 +163,12 @@ impl Record for LsoRecord {
         &["VAL", "OVAL"]
     }
 
+    /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
+    /// `lsoRecord.c:183`), whatever LEN holds.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        self.long_string_fields().contains(&field).then_some(1)
+    }
+
     /// C `lsoRecord.c::process:131-140` (`menuIvoaSet_output_to_IVOV`) writes
     /// the record's OWN value and nothing else: `strncpy(prec->val,
     /// prec->ivov, prec->sizv - 1)`, terminate, `prec->len = strlen(prec->val)

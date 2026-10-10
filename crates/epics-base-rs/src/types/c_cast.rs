@@ -40,6 +40,12 @@
 //! off 2026-07-14; Tier 1 is untouched, because a `DBF_LONG` field carries 32
 //! bits on the wire regardless of which 32 bits we chose.
 //!
+//! The unsigned 32- and 64-bit casts are DEFINED on x86-64 below 2^63:
+//! both convert through `(long) d` ([`f64_to_c_long`], the one switch point
+//! of the policy) and keep its bits, so softIoc lands -1.0 in a `DBF_ULONG`
+//! as 4294967295 and 5e9 as 705032704. aarch64's `fcvtzu` would give 0 and
+//! `u32::MAX`; the port follows x86 here because no UB is involved.
+//!
 //! The widths narrower than 32 bits take one more, DEFINED step. Both
 //! targets compile `(epicsInt8) d` / `(epicsUInt16) d` as a 32-bit convert
 //! followed by a truncation to the low bits (x86-64 `cvttsd2si %eax` then
@@ -75,9 +81,17 @@ pub fn f64_to_i32(v: f64) -> i32 {
     v as i32
 }
 
-/// C `(epicsInt64) d`, saturated: clamps to `i64`'s range, NaN -> 0.
-pub fn f64_to_i64(v: f64) -> i64 {
+/// C `(long) d` on LP64, the 64-bit `cvttsd2si` every wider-than-32-bit
+/// cast goes through. Saturated: clamps to `i64`'s range, NaN -> 0. This body
+/// is the one switch point should x86-64's integer-indefinite `i64::MIN` be
+/// chosen instead.
+pub fn f64_to_c_long(v: f64) -> i64 {
     v as i64
+}
+
+/// C `(epicsInt64) d`: `(long) d` on LP64.
+pub fn f64_to_i64(v: f64) -> i64 {
+    f64_to_c_long(v)
 }
 
 /// The 32-bit step of a narrow cast, x86-64 `cvttsd2si`: truncated toward
@@ -111,16 +125,20 @@ pub fn f64_to_u16(v: f64) -> u16 {
     narrow_step(v) as u16
 }
 
-/// C `(epicsUInt32) d`, saturated: clamps to `u32`'s range, negatives and
-/// NaN -> 0.
+/// C `(epicsUInt32) d`: x86-64 converts through `(long) d` and keeps the low
+/// 32 bits, so -1.0 is 4294967295 and 5e9 is 705032704.
 pub fn f64_to_u32(v: f64) -> u32 {
-    v as u32
+    f64_to_c_long(v) as u32
 }
 
-/// C `(epicsUInt64) d`, saturated: clamps to `u64`'s range, negatives and
-/// NaN -> 0.
+/// C `(epicsUInt64) d`: below 2^63 x86-64 converts through `(long) d` and
+/// reinterprets, so -1.0 is `u64::MAX`; from 2^63 up it converts unsigned.
 pub fn f64_to_u64(v: f64) -> u64 {
-    v as u64
+    if v >= 9_223_372_036_854_775_808.0 {
+        v as u64
+    } else {
+        f64_to_c_long(v) as u64
+    }
 }
 
 /// C `epicsConvertDoubleToFloat` (`epicsConvert.c:19-34`), verbatim.
@@ -166,7 +184,8 @@ pub fn f64_to_f32(v: f64) -> f32 {
 mod tests {
     use super::*;
 
-    /// A 32-bit-or-wider dest saturates and sends NaN to 0 (CBUG-E2); a
+    /// A signed 32-bit-or-wider dest saturates and sends NaN to 0 (CBUG-E2);
+    /// an unsigned one wraps the saturated `(long) d`; a
     /// narrower one wraps x86-64's 32-bit step, whose out-of-range answer
     /// `INT_MIN` cuts to 0.
     #[test]
@@ -178,9 +197,20 @@ mod tests {
             (2.2, 2, 2, 2, 2, 2, 2, 2, 2),
             (-0.5, 0, 0, 0, 0, 0, 0, 0, 0),
             // Truncation is toward zero; a narrow dest takes the low bits of
-            // the 32-bit result (softIoc: -2.7 -> DBF_USHORT 65534).
-            (-3.9, -3, 253, -3, 65533, -3, 0, -3, 0),
-            (-1.0, -1, 255, -1, 65535, -1, 0, -1, 0),
+            // the 32-bit result (softIoc: -2.7 -> DBF_USHORT 65534), an
+            // unsigned wide one the bits of the 64-bit result.
+            (
+                -3.9,
+                -3,
+                253,
+                -3,
+                65533,
+                -3,
+                4294967293,
+                -3,
+                18446744073709551613,
+            ),
+            (-1.0, -1, 255, -1, 65535, -1, u32::MAX, -1, u64::MAX),
             (127.0, 127, 127, 127, 127, 127, 127, 127, 127),
             (255.9, -1, 255, 255, 255, 255, 255, 255, 255),
             (32767.5, -1, 255, 32767, 32767, 32767, 32767, 32767, 32767),
@@ -200,7 +230,29 @@ mod tests {
                 3000000000,
                 3000000000,
             ),
-            (-3.0e9, 0, 0, 0, 0, i32::MIN, 0, -3000000000, 0),
+            (
+                -3.0e9,
+                0,
+                0,
+                0,
+                0,
+                i32::MIN,
+                1294967296,
+                -3000000000,
+                18446744070709551616,
+            ),
+            // An unsigned 32-bit dest keeps the low 32 bits of `(long) d`.
+            (
+                5.0e9,
+                0,
+                0,
+                0,
+                0,
+                i32::MAX,
+                705032704,
+                5000000000,
+                5000000000,
+            ),
             (
                 2147483647.5,
                 -1,
@@ -234,7 +286,7 @@ mod tests {
                 i64::MAX,
                 10000000000000000000,
             ),
-            (-1.0e19, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
+            (-1.0e19, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 1 << 63),
             (1.0e300, 0, 0, 0, 0, i32::MAX, u32::MAX, i64::MAX, u64::MAX),
             (
                 f64::INFINITY,
@@ -247,7 +299,17 @@ mod tests {
                 i64::MAX,
                 u64::MAX,
             ),
-            (f64::NEG_INFINITY, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
+            (
+                f64::NEG_INFINITY,
+                0,
+                0,
+                0,
+                0,
+                i32::MIN,
+                0,
+                i64::MIN,
+                1 << 63,
+            ),
             // NaN is 0 in every destination: x86's INT_MIN in the narrow ones.
             (f64::NAN, 0, 0, 0, 0, 0, 0, 0, 0),
         ];
@@ -268,6 +330,6 @@ mod tests {
     #[test]
     fn saturation_is_rusts_native_as() {
         assert_eq!(f64_to_i32(3.0e9), 3.0e9 as i32);
-        assert_eq!(f64_to_u32(-1.0), -1.0_f64 as u32);
+        assert_eq!(f64_to_i64(-1.0e19), -1.0e19 as i64);
     }
 }

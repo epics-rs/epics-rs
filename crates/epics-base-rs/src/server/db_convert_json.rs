@@ -1235,7 +1235,7 @@ pub fn db_put_convert_json(
     capacity: usize,
 ) -> Result<EpicsValue, ConvertJsonError> {
     if json.is_empty() {
-        return Ok(EpicsValue::DoubleArray(Vec::new().into()).convert_to(target));
+        return Ok(EpicsValue::DoubleArray(Vec::new().into()).into_type(target));
     }
 
     let txt = json.as_bytes();
@@ -1273,7 +1273,7 @@ pub fn db_put_convert_json(
             Some(ints) => EpicsValue::Int64Array(ints.into()),
             None => EpicsValue::DoubleArray(tokens.iter().map(Token::real).collect()),
         }
-        .convert_to(target),
+        .into_type(target),
     )
 }
 

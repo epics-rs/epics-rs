@@ -5283,6 +5283,55 @@ ASG(PLAIN) {
         assert_eq!(long_string_put_len(41).await, 40.0);
     }
 
+    /// The record answers its long-string VAL's capacity as C's `cvt_dbaddr`
+    /// does, one element; the channel must still take pvxs's long-string
+    /// shape and serve the whole text as one `pvString`.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_val_with_one_dbaddr_element_is_served_as_its_text() {
+        use epics_base_rs::server::record::FieldDeclaration;
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lso, "LS:G") { field(SIZV, "64") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            "LS:G",
+            "VAL",
+            EpicsValue::CharArray(
+                b"a string past forty characters, served whole\0"
+                    .to_vec()
+                    .into(),
+            ),
+        )
+        .await
+        .unwrap();
+        {
+            let rec = db.get_record("LS:G").unwrap();
+            let inst = rec.read();
+            assert_eq!(inst.record.field_native_count("VAL"), Some(1));
+            assert!(
+                crate::channel_shape::ChannelShape::of_record_channel(&inst, "VAL").is_array(),
+                "pvxs's long-string channel is a char array"
+            );
+        }
+        let source = PvDatabaseSource::new(db);
+        let value = source.get_value("LS:G").await.expect("a value");
+        let PvField::Structure(s) = &value else {
+            panic!("expected an NTScalar structure, got {value:?}");
+        };
+        assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::String(
+                "a string past forty characters, served whole".into()
+            ))),
+        );
+    }
+
     /// `$` on a field that is not a string is `S_dbLib_fieldNotFound`, which
     /// aborts channel creation (C `dbChannel.c:486-505`) — the eligibility
     /// rule is the record's (`resolve_string_view_field`), not this source's.

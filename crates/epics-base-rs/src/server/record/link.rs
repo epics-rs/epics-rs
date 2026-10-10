@@ -385,11 +385,7 @@ impl LnkConst {
             Self::Empty => return Err(ConstLoadError::BadField),
         };
         loaded.truncate(nreq);
-        Ok(if dbr_type == row {
-            loaded
-        } else {
-            loaded.convert_to(dbr_type)
-        })
+        Ok(loaded.into_type(dbr_type))
     }
 }
 
@@ -398,7 +394,7 @@ fn integers_into(row: DbFieldType, v: &[i64]) -> EpicsValue {
     if row == DbFieldType::String {
         return EpicsValue::StringArray(v.iter().map(|i| PvString::from(i.to_string())).collect());
     }
-    EpicsValue::Int64Array(v.to_vec().into()).convert_to(row)
+    EpicsValue::Int64Array(v.to_vec().into()).into_type(row)
 }
 
 /// `cvt_d_*`; `cvt_d_st` finds no rset under the NULL `paddr` and keeps its
@@ -411,7 +407,7 @@ fn doubles_into(row: DbFieldType, v: &[f64]) -> EpicsValue {
                 .collect(),
         );
     }
-    EpicsValue::DoubleArray(v.to_vec().into()).convert_to(row)
+    EpicsValue::DoubleArray(v.to_vec().into()).into_type(row)
 }
 
 /// `cvt_st_*`, and whether every element converted; a refused element is 0.

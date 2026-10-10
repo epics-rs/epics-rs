@@ -9176,6 +9176,50 @@ mod tests {
         }
     }
 
+    /// A long-string VAL is one `DBF_STRING` to every capacity reader
+    /// (`cvt_dbaddr`'s `no_elements = 1`), whatever LEN a `$` put left.
+    /// Oracle — softIoc R7.0.10, `record(lso,"LSO"){field(SIZV,"40")}`:
+    ///
+    /// ```text
+    /// dbpf LSO.VAL$ hi         -> DBF_CHAR[3]:        "hi"
+    /// dbpf LSO dbpf-string     -> DBF_STRING:         "dbpf-string"
+    /// dbgf LSO.LEN             -> DBF_ULONG:          12 = 0xc
+    /// dba LSO / gft LSO        -> No Elements: 1
+    /// dba LSO.VAL$             -> No Elements: 40
+    /// ```
+    #[test]
+    fn a_long_string_val_has_one_element_after_a_dollar_put() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        std::fs::write(&path, "record(lso, \"LSO\") { field(SIZV, \"40\") }\n").unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["LSO.VAL$", "hi"]),
+            "DBF_CHAR[3]:        \"hi\"      \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["LSO", "dbpf-string"]),
+            "DBF_STRING:         \"dbpf-string\"       \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LSO.LEN"]),
+            "DBF_ULONG:          12 = 0xc  \n"
+        );
+        for (cmd, pv, n) in [
+            ("dba", "LSO", 1),
+            ("dba", "LSO.VAL$", 40),
+            ("gft", "LSO", 1),
+        ] {
+            let out = run_cmd(&ctx, cmd, &[pv]);
+            assert!(
+                out.lines().any(|l| l.trim() == format!("No Elements: {n}")),
+                "{cmd} {pv}:\n{out}"
+            );
+        }
+    }
+
     /// An empty long-string VAL is `get_array_info`'s zero elements, a
     /// stringin's is one empty string. Oracle — softIoc 7.0.10.1-DEV, nothing
     /// written:

@@ -29,9 +29,9 @@ pub struct MbbiDirectRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
-    // SVAL is `DBF_LONG` (mbbiDirectRecord.dbd.pod:203-205) — the BUFFER C's
-    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
-    // &prec->sval)`, mbbiDirectRecord.c:283) before publishing `val = sval`.
+    // SVAL is `DBF_LONG` (mbbiDirectRecord.dbd.pod:173) — the BUFFER C's
+    // `readValue` reads SIOL into as `DBR_ULONG` (mbbiDirectRecord.c:260), so
+    // it holds the u32's bits, before publishing `val = sval`.
     pub sval: i32,
     pub sims: i16,
     pub sdly: f64,
@@ -168,6 +168,14 @@ impl Record for MbbiDirectRecord {
         if self.raw_soft_dset {
             self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
         }
+    }
+
+    /// `mbbiDirectRecord.c:260` `dbGetLink(&prec->siol, DBR_ULONG, &prec->sval)`.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "SIOL" => crate::server::record::LinkReadAs::ULong,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {

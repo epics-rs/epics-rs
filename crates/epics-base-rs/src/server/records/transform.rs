@@ -8,7 +8,7 @@ use crate::types::EpicsValue;
 use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
 
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 
@@ -140,6 +140,10 @@ pub struct TransformRecord {
     /// cycle of a record nobody has written finds every channel unchanged and
     /// a `DBE_LOG` archiver takes no initial sample.
     first_calc_posted: bool,
+    /// The channels `monitor()` posts this cycle (`:797-806`), bit `i` for
+    /// channel `i`, decided where `l* = *` is committed and TAKEN by
+    /// [`Record::take_cycle_posted_fields`].
+    posts: u16,
 }
 
 impl Default for TransformRecord {
@@ -168,6 +172,7 @@ impl Default for TransformRecord {
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             first_calc_posted: false,
+            posts: 0,
         }
     }
 }
@@ -381,7 +386,7 @@ impl TransformRecord {
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
-    fn refresh_link_status(&self) {
+    fn refresh_link_status(&self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, String)> = Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
             links.push((IAV_FIELD_NAMES[i], self.inp_links[i].clone()));
@@ -393,6 +398,7 @@ impl TransformRecord {
             &self.link_gen,
             links,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            posts,
         );
     }
 
@@ -531,7 +537,7 @@ impl Record for TransformRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::FIRST_MONITOR
+        crate::server::record::CycleHooks::CYCLE_POSTED
             .union(crate::server::record::CycleHooks::CONTEXT)
     }
 
@@ -770,6 +776,17 @@ impl Record for TransformRecord {
         // that path (`:554-560`) runs checkAlarms/recGblResetAlarms and returns
         // WITHOUT calling `monitor()`, so LA..LP keep the values from the last
         // cycle that did.
+        // C's own test, `*pnew != *pprev || firstCalcPosted == 0`: against LA,
+        // not against what was last published, so a pp put to A posts from
+        // dbPut and again from its cycle.
+        let mut posts = 0u16;
+        for i in 0..NUM_CHANNELS {
+            if self.vals[i] != self.lvals[i] || !self.first_calc_posted {
+                posts |= 1 << i;
+            }
+        }
+        self.posts = posts;
+        self.first_calc_posted = true;
         self.lvals = self.vals;
 
         Ok(ProcessOutcome::complete_with(actions))
@@ -945,7 +962,7 @@ impl Record for TransformRecord {
         // before any process. Both link tables are transform-owned fields,
         // already applied by the time `add_record` runs, so one refresh here
         // covers what C's init loop does.
-        self.refresh_link_status();
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
     /// S5 — set C's `map` bit for a value channel `A..P` written by an
@@ -966,9 +983,15 @@ impl Record for TransformRecord {
                 self.map[i] = true;
             }
             // C `transformRecord.c:709-742` re-classifies the link a put just
-            // re-pointed, over the whole INPA..OUTP range.
-            if Self::inp_field_index(field).is_some() || Self::out_field_index(field).is_some() {
-                self.refresh_link_status();
+            // re-pointed, over the whole INPA..OUTP range, and posts that
+            // link's status alone.
+            let status = match (Self::inp_field_index(field), Self::out_field_index(field)) {
+                (Some(i), _) => Some(IAV_FIELD_NAMES[i]),
+                (_, Some(i)) => Some(OAV_FIELD_NAMES[i]),
+                _ => None,
+            };
+            if let Some(status) = status {
+                self.refresh_link_status(LinkStatusPosts::Put(status));
             }
         }
         Ok(())
@@ -1071,26 +1094,20 @@ impl Record for TransformRecord {
         Some(CHANNEL_FIELDS)
     }
 
-    /// The `firstCalcPosted == 0` half of C's post condition
-    /// (`transformRecord.c:798`): on the first process cycle of the IOC every
-    /// channel posts whether or not it moved, and the flag is set
-    /// unconditionally afterwards (`:807`) so no later cycle can.
-    ///
-    /// `take_first_monitor_cycle`, not `take_cycle_posted_fields`: iocInit
-    /// drains the per-cycle marks and would consume this flag before any
-    /// process cycle ran. Both are called once per process cycle by
-    /// `collect_subscriber_posts`, subscribers or not, exactly as C runs
-    /// `monitor()` every cycle — so a client that connects after the record
-    /// has processed sees what C shows it, nothing. The mask is C's own
-    /// `monitor_mask = DBE_VALUE|DBE_LOG` (`:794`), which overwrites
-    /// `recGblResetAlarms`'s: no alarm bit reaches these posts.
-    fn take_first_monitor_cycle(&mut self) -> crate::server::record::CycleMarks {
+    /// `monitor()`'s A..P posts, with C's literal `DBE_VALUE|DBE_LOG` (`:794`)
+    /// overwriting `recGblResetAlarms`'s mask.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         static CHANNEL_POSTS: [(&str, CyclePostMask); CHANNEL_FIELDS.len()] =
             crate::server::record::uniform_post_table(CHANNEL_FIELDS, CyclePostMask::ValueLog);
-        if std::mem::replace(&mut self.first_calc_posted, true) {
-            return crate::server::record::CycleMarks::NONE;
-        }
-        crate::server::record::CycleMarks::of(&CHANNEL_POSTS, (1 << CHANNEL_POSTS.len()) - 1)
+        crate::server::record::CycleMarks::of(
+            &CHANNEL_POSTS,
+            std::mem::take(&mut self.posts) as u64,
+        )
+    }
+
+    /// C keeps LA..LP and never compares against the published value.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        CHANNEL_FIELDS
     }
 
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every

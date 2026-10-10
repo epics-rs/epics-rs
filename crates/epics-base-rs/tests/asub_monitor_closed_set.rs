@@ -276,3 +276,25 @@ async fn asub_on_change_compares_vala_against_ovla() {
     process(&db, "Y").await;
     assert_eq!(count(&mut rx), 0, "VALA 1.5 == OVLA 1.5: silent");
 }
+
+/// A runtime `EFLG` put changes the closed set mid-life: a `VALA` subscribed
+/// under `NEVER` must post once `ALWAYS` takes over, so no membership settled
+/// against the old list may outlive the switch.
+#[epics_macros_rs::epics_test]
+async fn asub_eflg_put_reopens_the_output_pairs() {
+    let db = asub_reading_a_waveform(EFLG_NEVER).await;
+    let mut vala_rx = subscribe(&db, "X", "VALA", 4);
+    drive(&db, vec![1.0]).await;
+    process(&db, "X").await;
+    assert!(vala_rx.try_recv().is_err(), "aSubEFLG_NEVER posts nothing");
+    db.put_record_field_from_ca("X", "EFLG", EpicsValue::Short(EFLG_ALWAYS))
+        .await
+        .unwrap();
+    while vala_rx.try_recv().is_ok() {}
+    drive(&db, vec![4.0, 5.0]).await;
+    process(&db, "X").await;
+    assert!(
+        vala_rx.try_recv().is_ok(),
+        "after EFLG=ALWAYS the moved VALA posts"
+    );
+}

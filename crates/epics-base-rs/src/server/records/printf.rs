@@ -921,6 +921,12 @@ impl Record for PrintfRecord {
         &["VAL"]
     }
 
+    /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
+    /// `printfRecord.c:416`), whatever LEN holds.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        self.long_string_fields().contains(&field).then_some(1)
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }
@@ -1423,12 +1429,12 @@ mod tests {
     /// 40000 where C prints the `epicsInt16` conversion.
     /// A double source reaches an integer conversion through the DBR read C
     /// makes for it (`dbFastLinkConv.c` `cvt_d_*`), a cast that is UB once
-    /// the value is past 32 bits or negative into unsigned. softIoc R7.0.10.1
-    /// on x86-64 prints the `cvttsd2si` result there (INT_MIN for `%d` of 3e9);
-    /// the port takes `c_cast`'s rule, the one owner every field, link and wire
-    /// conversion shares: a 32-bit width saturates, and a narrower one wraps
-    /// x86's step, so it prints 0 there as softIoc does (`%hhd` of 300 is 44,
-    /// `%hu` of -2.7 is 65534). Columns:
+    /// the value is past its width. softIoc R7.0.10.1 on x86-64 prints the
+    /// `cvttsd2si` result there (INT_MIN for `%d` of 3e9); the port takes
+    /// `c_cast`'s rule, the one owner every field, link and wire conversion
+    /// shares: a signed 32-bit width saturates, an unsigned one keeps the bits
+    /// of `(long) d` as x86 does (`%x` of -200 is ffffff38), and a narrower one
+    /// wraps x86's step (`%hhd` of 300 is 44, `%hu` of -2.7 is 65534). Columns:
     /// `%d %x %u %hd %hhd %ld %lld %llu %hhu %hu %o %X`, then the stars.
     #[test]
     fn double_sources_saturate_where_c_x86_64_prints_int_min_by_ub() {
@@ -1448,51 +1454,51 @@ mod tests {
                 -200.0,
                 [
                     "-200",
-                    "0",
-                    "0",
+                    "ffffff38",
+                    "4294967096",
                     "-200",
                     "56",
                     "4294967096",
                     "-200",
-                    "0",
+                    "18446744073709551416",
                     "56",
                     "65336",
-                    "0",
-                    "0",
+                    "37777777470",
+                    "FFFFFF38",
                 ],
             ),
             (
                 -1.0,
                 [
                     "-1",
-                    "0",
-                    "0",
+                    "ffffffff",
+                    "4294967295",
                     "-1",
                     "-1",
                     "4294967295",
                     "-1",
-                    "0",
+                    "18446744073709551615",
                     "255",
                     "65535",
-                    "0",
-                    "0",
+                    "37777777777",
+                    "FFFFFFFF",
                 ],
             ),
             (
                 -2.7,
                 [
                     "-2",
-                    "0",
-                    "0",
+                    "fffffffe",
+                    "4294967294",
                     "-2",
                     "-2",
                     "4294967294",
                     "-2",
-                    "0",
+                    "18446744073709551614",
                     "254",
                     "65534",
-                    "0",
-                    "0",
+                    "37777777776",
+                    "FFFFFFFE",
                 ],
             ),
             (
@@ -1523,25 +1529,25 @@ mod tests {
                 -3e9,
                 [
                     "-2147483648",
-                    "0",
-                    "0",
+                    "4d2fa200",
+                    "1294967296",
                     "0",
                     "0",
                     "2147483648",
                     "-3000000000",
+                    "18446744070709551616",
                     "0",
                     "0",
-                    "0",
-                    "0",
-                    "0",
+                    "11513721000",
+                    "4D2FA200",
                 ],
             ),
             (
                 5e9,
                 [
                     "2147483647",
-                    "ffffffff",
-                    "4294967295",
+                    "2a05f200",
+                    "705032704",
                     "0",
                     "0",
                     "2147483647",
@@ -1549,8 +1555,8 @@ mod tests {
                     "5000000000",
                     "0",
                     "0",
-                    "37777777777",
-                    "FFFFFFFF",
+                    "5201371000",
+                    "2A05F200",
                 ],
             ),
             (
@@ -1580,7 +1586,7 @@ mod tests {
                     "0",
                     "2147483648",
                     "-9223372036854775808",
-                    "0",
+                    "9223372036854775808",
                     "0",
                     "0",
                     "0",
@@ -1638,7 +1644,7 @@ mod tests {
             (9.3e18, "9300000000000000000"),
             (1.8e19, "18000000000000000000"),
             (2e19, U64),
-            (-9.3e18, "0"),
+            (-9.3e18, "9223372036854775808"),
         ] {
             let mut rec = rec_with("%llu");
             rec.set_input(0, EpicsValue::Double(src));
@@ -2085,9 +2091,8 @@ mod tests {
             (
                 "[% .1f|%+x|%+e|%+g|% 6g]",
                 "[ 1.0|1|+1.000000e+00|+1|     1]",
-                // `%+x` of -3.5 is C's UB `(epicsUInt32)` cast (x86-64
-                // softIoc prints fffffffd); c_cast saturates to 0.
-                "[-3.5|0|-3.500000e+00|-3.5|  -3.5]",
+                // `%+x` of -3.5 is C's `(epicsUInt32)` cast through `(long)`.
+                "[-3.5|fffffffd|-3.500000e+00|-3.5|  -3.5]",
             ),
         ];
         for (fmt, pos, neg) in cases {

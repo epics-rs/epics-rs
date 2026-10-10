@@ -69,11 +69,11 @@ impl ChannelShape {
         resolved: Option<&EpicsValue>,
     ) -> Self {
         // A long-string field is never a scalar channel. C's `cvt_dbaddr`
-        // gives it `no_elements = SIZV` (`lsiRecord.c:127-134`), never 1, and
-        // pvxs reaches its long-string arms (`putLongString`,
-        // `iocsource.cpp:602-603`) precisely BECAUSE the channel is not
-        // scalar-shaped. This port models that storage as a `String` — count
-        // 1 — so the count is not what can answer here; the declaration is.
+        // gives it `no_elements = 1`, but pvxs reshapes a `DBF_STRING` wider
+        // than `MAX_STRING_SIZE` into a `SIZV`-element `DBF_CHAR` channel
+        // (`ioc/channel.cpp:58-67`) and reaches its long-string arms
+        // (`putLongString`, `iocsource.cpp:602-603`) BECAUSE of that, so the
+        // count is not what can answer here; the declaration is.
         if is_long_string(record, field_upper) {
             return ChannelShape::Array;
         }
@@ -97,6 +97,9 @@ impl ChannelShape {
         instance: &epics_base_rs::server::record::RecordInstance,
         field_upper: &str,
     ) -> Self {
+        if is_long_string(&*instance.record, field_upper) {
+            return ChannelShape::Array;
+        }
         match instance.record.field_native_count(field_upper) {
             Some(1) => ChannelShape::Scalar,
             Some(_) => ChannelShape::Array,

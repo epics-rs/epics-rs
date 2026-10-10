@@ -2,7 +2,9 @@ use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::calc_compile;
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, post_link_status};
+use super::link_status::{
+    LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, LinkStatusPosts, post_link_status,
+};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
@@ -570,6 +572,7 @@ impl CalcoutRecord {
             &self.link_gen,
             links,
             crate::server::recgbl::EventMask::VALUE,
+            LinkStatusPosts::All,
         );
     }
 }
@@ -657,7 +660,7 @@ impl Record for CalcoutRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     fn has_array_monitor_post(&self) -> bool {

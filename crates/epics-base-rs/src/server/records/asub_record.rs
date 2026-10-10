@@ -372,7 +372,7 @@ fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> ChannelDelivery {
     let ftype = channel_ftype(ft);
     let elem = ftype.element_type();
     if no > 1 {
-        let converted = value.convert_to(elem);
+        let converted = value.into_type(elem);
         let mut arr = if converted.is_array() {
             converted
         } else {
@@ -392,7 +392,7 @@ fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> ChannelDelivery {
             None if value.is_array() => return ChannelDelivery::Empty,
             None => value,
         };
-        let converted = scalar.convert_to(elem);
+        let converted = scalar.into_type(elem);
         // `convert_to` has one array-producing scalar arm (String into a
         // CHAR target yields the byte buffer); a one-element cell keeps
         // element 0 of it. The source still delivered its one element, so

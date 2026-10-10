@@ -416,14 +416,7 @@ impl WaveformRecord {
     fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
         let cap = self.val_capacity();
         let target = self.ftvl_element_type();
-        // `convert_to` borrows, so a source already at FTVL's type would be
-        // cloned only to drop the original; move it instead. The NTEnum
-        // carrier reports `Enum` but must still collapse in `convert_to`.
-        let converted = match value {
-            EpicsValue::EnumWithChoices { .. } => value.convert_to(target),
-            v if v.db_field_type() == target => v,
-            v => v.convert_to(target),
-        };
+        let converted = value.into_type(target);
         // NORD is capped at the capacity (C bounds every request to the
         // allocated element count). The buffer the record holds is at least
         // NORD long and at most the capacity; the CA channel element count
@@ -765,7 +758,7 @@ impl WaveformRecord {
         // (`readValue`) is `pre_input_link_actions`.
         let n_request = (i64::from(self.indx as u32) + i64::from(self.nelm as u32))
             .min(i64::from(self.malm.max(1))) as i32;
-        let mut src = source.convert_to(self.ftvl_element_type());
+        let mut src = source.into_type(self.ftvl_element_type());
         src.truncate(n_request as usize);
         let loaded = src.count() as i32;
         self.land_val_in_buffer(src)?;

@@ -1012,6 +1012,17 @@ impl EpicsValue {
         }
     }
 
+    /// [`Self::convert_to`] by value: a value already of `target` moves through
+    /// untouched, as C's same-type put is a plain copy, so an owned put pays
+    /// no clone. The NTEnum carrier reports `Enum` but still collapses.
+    #[inline]
+    pub fn into_type(self, target: DbFieldType) -> EpicsValue {
+        if self.db_field_type() == target && !matches!(self, Self::EnumWithChoices { .. }) {
+            return self;
+        }
+        self.convert_to(target)
+    }
+
     /// [`Self::convert_to`] for every row but a numeric scalar into a numeric
     /// field, which stays out of line so that row carries no frame for these.
     #[inline(never)]
@@ -2073,6 +2084,33 @@ mod enum_with_choices_tests {
             carrier(2).convert_to(DbFieldType::Enum),
             EpicsValue::Enum(2)
         );
+        assert_eq!(carrier(2).into_type(DbFieldType::Enum), EpicsValue::Enum(2));
+    }
+
+    /// `into_type` moves a value already of the target through with its own
+    /// buffer, and converts anything else exactly as `convert_to` does.
+    #[test]
+    fn into_type_moves_a_same_type_value() {
+        let s = EpicsValue::String("train".into());
+        let EpicsValue::String(ref inner) = s else {
+            unreachable!()
+        };
+        let ptr = inner.as_bytes().as_ptr();
+        match s.into_type(DbFieldType::String) {
+            EpicsValue::String(out) => assert_eq!(out.as_bytes().as_ptr(), ptr),
+            other => panic!("{other:?}"),
+        }
+        for (v, t) in [
+            (EpicsValue::Short(7), DbFieldType::String),
+            (EpicsValue::Double(3e9), DbFieldType::Long),
+            (EpicsValue::String("12".into()), DbFieldType::Double),
+            (
+                EpicsValue::DoubleArray(vec![-1.0, 300.0].into()),
+                DbFieldType::Char,
+            ),
+        ] {
+            assert_eq!(v.clone().into_type(t), v.convert_to(t), "{v:?} -> {t:?}");
+        }
     }
 
     /// `enum_index_label` is the shared label/fallback helper.

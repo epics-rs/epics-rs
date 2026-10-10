@@ -3212,7 +3212,7 @@ pub fn apply_fields<T: LoadTarget + ?Sized>(
                 // `caput` of the same text would be refused for. Projected onto
                 // the carrier the record actually holds, which for a numeric
                 // field is the declared width itself.
-                v.convert_to(dbf_type)
+                v.into_type(dbf_type)
             } else {
                 // BYTES, not text: a DBF_STRING is a byte string with a 40-byte
                 // budget, and `field(VAL,"h\xffz")` is 3 bytes in C (R19-68).

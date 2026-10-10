@@ -337,21 +337,25 @@ pub(crate) fn put_drives_processing_of(
 
 /// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`](crate::server::record::Record::take_cycle_posted_fields))
 /// into monitor posts — the put-path counterpart of the `db_post_events` calls a
-/// C `special()` makes by hand.
-///
-/// One owner, so the two put-path drains (the normal tail, and the failing
-/// `special()` above) cannot disagree about the mask mapping.
-fn emit_cycle_posts(
+/// C `special()` makes by hand. Its callers are the two after-pass owners,
+/// [`special_after_put`] and [`put_common`], and the link read that lands in
+/// a record field. Only a type whose `cycle_hooks` says `WRITE_POSTED` is asked.
+#[inline]
+pub(crate) fn emit_cycle_posts(
     instance: &mut crate::server::record::RecordInstance,
     backing: crate::server::database::LinkBacking<'_>,
 ) {
-    use crate::server::record::{CyclePostMask, EventMask};
+    use crate::server::record::{CycleHooks, CyclePostMask, EventMask};
+    if !instance.cycle_hooks().has(CycleHooks::WRITE_POSTED) {
+        return;
+    }
     for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
         let mask = match cycle_mask {
-            CyclePostMask::Value => EventMask::VALUE,
             // No `monitor_mask` exists on a put path (no alarm transition is
-            // being resolved), so both LOG-carrying variants reduce to C's
-            // literal `DBE_VALUE|DBE_LOG`.
+            // being resolved), so each `Monitor*` variant reduces to its
+            // literal bits.
+            CyclePostMask::Value | CyclePostMask::MonitorValue => EventMask::VALUE,
+            CyclePostMask::MonitorLog => EventMask::LOG,
             CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
                 EventMask::VALUE | EventMask::LOG
             }
@@ -457,18 +461,20 @@ fn collect_after_gate(instance: &mut RecordInstance, after: &mut Option<AfterGat
 }
 
 /// [`RecordInstance::put_common_field_prepared`], whose `special(_, true)`
-/// runs inside it, with the work that pass left for after the gate. `link`
-/// is the `dbCommon` link parse made before the hold, and takes the old one
-/// back.
+/// runs inside it, with the work and the posts that pass left, drained as
+/// [`special_after_put`] drains them. `link` is the `dbCommon` link parse
+/// made before the hold, and takes the old one back.
 fn put_common(
     instance: &mut RecordInstance,
     field: &str,
     value: EpicsValue,
     link: &mut Option<PreparedCommonLink>,
     after: &mut Option<AfterGate>,
+    backing: crate::server::database::LinkBacking<'_>,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let put = instance.put_common_field_prepared(field, value, link);
     collect_after_gate(instance, after);
+    emit_cycle_posts(instance, backing);
     put
 }
 
@@ -522,15 +528,13 @@ fn special_after_put(
     if instance.record.take_udf_clear() {
         instance.common.udf = 0;
     }
-    if status.is_err() {
-        // The POSTS `special()` made are drained on the failing path for the same
-        // reason its ACTIONS are: C's `special()` calls `db_post_events` BEFORE it
-        // returns nonzero — aCalcout's NUSE arm posts the clamped value with
-        // `DBE_VALUE` and only then `return (-1)` (`aCalcoutRecord.c:495-499`) —
-        // and `dbPut`'s `goto done` skips only dbPut's OWN post. A refused put
-        // that repaired a field must still tell the subscribers what it repaired.
-        emit_cycle_posts(instance, backing);
-    }
+    // The posts `special()` made are drained here, on every `dbPut` route and
+    // whatever the status, for the same reason its actions are: C's `special()`
+    // calls `db_post_events` itself, before `dbPut`'s own field post
+    // (`dbAccess.c:1398` vs `:1408`) and before a nonzero return — aCalcout's
+    // NUSE arm posts the clamped value and only then `return (-1)`
+    // (`aCalcoutRecord.c:495-499`), and `goto done` skips only dbPut's post.
+    emit_cycle_posts(instance, backing);
     status?;
 
     // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:373-378`,
@@ -1901,7 +1905,7 @@ impl PvDatabase {
                             result
                         }
                         Err(CaError::FieldNotFound(_)) => {
-                            put_common(&mut instance, field, value, &mut None, after)?
+                            put_common(&mut instance, field, value, &mut None, after, link_backing)?
                         }
                         // A refused store does NOT skip the pass above:
                         // C runs it either way (`dbAccess.c:1398`) and lets
@@ -2245,9 +2249,14 @@ impl PvDatabase {
                                 clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
-                            Err(CaError::FieldNotFound(_)) => {
-                                put_common(&mut instance, &field, value, &mut None, after)?
-                            }
+                            Err(CaError::FieldNotFound(_)) => put_common(
+                                &mut instance,
+                                &field,
+                                value,
+                                &mut None,
+                                after,
+                                link_backing,
+                            )?,
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
                             // its status win, then `goto done` — the `return`.
@@ -3245,7 +3254,14 @@ impl PvDatabase {
                 };
                 if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write();
-                    match put_common(&mut guard, "PROC", value, &mut None, after) {
+                    match put_common(
+                        &mut guard,
+                        "PROC",
+                        value,
+                        &mut None,
+                        after,
+                        crate::server::database::LinkBacking::none(),
+                    ) {
                         Ok(_) => {
                             guard.notify_field(
                                 "PROC",
@@ -3412,9 +3428,14 @@ impl PvDatabase {
                                 clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
-                            Err(CaError::FieldNotFound(_)) => {
-                                put_common(&mut instance, &field, value, &mut common_link, after)?
-                            }
+                            Err(CaError::FieldNotFound(_)) => put_common(
+                                &mut instance,
+                                &field,
+                                value,
+                                &mut common_link,
+                                after,
+                                link_backing,
+                            )?,
                             // A refused store does NOT skip the pass above:
                             // C runs it either way (`dbAccess.c:1398`) and lets
                             // its status win, then `goto done` — the `return`.
@@ -3516,16 +3537,6 @@ impl PvDatabase {
                     };
                     instance.notify_field(sf, mask | side_effect_alarm_mask);
                 }
-
-                // The same `special()` posts, but named by the WRITER instead of
-                // by a static table: a record whose put handler re-derived a
-                // partner field marks it — with the mask of the C call site that
-                // posts it, and only when that field's own comparison moved
-                // (sseq `special()` posts the re-rendered `STRn` after a `DOn`
-                // put, `DBE_VALUE`, `only if (strcmp(str, plinkGroup->s))`,
-                // sseqRecord.c:1108-1116). A static field-name list cannot
-                // express "only if it changed", so it over-posts; the mark can.
-                emit_cycle_posts(&mut instance, link_backing);
 
                 Ok(common_result)
             })(
@@ -3971,6 +3982,7 @@ impl PvDatabase {
                                         v,
                                         &mut common_link,
                                         after,
+                                        link_backing,
                                     )?);
                                     None
                                 }
@@ -4000,6 +4012,7 @@ impl PvDatabase {
                                     value,
                                     &mut common_link,
                                     after,
+                                    link_backing,
                                 )?);
                                 None
                             }
@@ -4046,10 +4059,6 @@ impl PvDatabase {
                 // Invalidate metadata cache only if the metadata-class
                 // field actually changed (faac1df1).
                 instance.notify_field_written_if_changed_at(&field, &at, prev_value, link_backing);
-                // The drain of the posts the after pass queued — `special()`
-                // and its post are ONE step, so a mark cannot outlive the put
-                // that made it and be emitted by some later cycle.
-                emit_cycle_posts(&mut instance, link_backing);
                 result
             };
 

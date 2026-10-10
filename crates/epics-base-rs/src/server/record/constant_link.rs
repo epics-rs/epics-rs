@@ -52,11 +52,11 @@ fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> 
     if integral {
         if let Some(v) = value.to_f64() {
             if v.is_finite() {
-                return EpicsValue::Int64(v.trunc() as i64).convert_to(target);
+                return EpicsValue::Int64(v.trunc() as i64).into_type(target);
             }
         }
     }
-    value.convert_to(target)
+    value.into_type(target)
 }
 
 /// C `recGblInitConstantLink(plink, DBF_x, pvalue)` for ONE link → field pair,

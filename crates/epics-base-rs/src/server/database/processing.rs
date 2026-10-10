@@ -2809,7 +2809,8 @@ impl PvDatabase {
     /// [`Self::post_fields_with_mask`], asking `current` under the record
     /// write lock and posting nothing when it says no. A check made before
     /// the lock is taken can be overtaken by a put that holds it; asked under
-    /// the lock, it sees every put that ran before this post.
+    /// the lock, it sees every put that ran before this post. `current` runs
+    /// before any item's [`PostItem::rule`] is read.
     pub(crate) fn post_fields_with_mask_if<P: PostItem>(
         &self,
         name: &str,
@@ -5498,6 +5499,12 @@ impl PvDatabase {
 
                 // Process
                 let mut outcome = instance.record.process()?;
+                if plan
+                    .hooks
+                    .has(crate::server::record::CycleHooks::PROCESS_POSTED)
+                {
+                    instance.emit_process_posts_marked();
+                }
                 // Merge deferred device actions into process outcome actions
                 if let Some(deferred) = deferred_device_actions {
                     outcome.actions.extend(deferred);
@@ -7066,6 +7073,9 @@ impl PvDatabase {
                 if let Some((ms, alarm)) = inheritance {
                     super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
                 }
+                // sseq's `processCallback` posts each read as it lands
+                // (sseqRecord.c:668-681), under the alarm the record still holds.
+                super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
                 true
             }
             LinkFetch::Failed => {
@@ -9503,7 +9513,7 @@ impl PvDatabase {
                 && instance.record.get_field("RVAL").is_some();
             let raw_value = match landed {
                 Fetched::Direct(v) => Some(v),
-                Fetched::Sval if target_supports_raw => instance.record.get_field("SVAL"),
+                Fetched::Sval if target_supports_raw => instance.record.sval_as_rval(),
                 Fetched::Sval => {
                     let _ = instance.record.land_sval();
                     None

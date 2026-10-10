@@ -798,9 +798,8 @@ fn coerce_common_field(
     };
     let EpicsValue::String(s) = &value else {
         // Already typed: project onto the stored type through the one
-        // value-coercion owner. `convert_to` short-circuits a value that is
-        // already `dbf`, so the common case costs nothing.
-        return Ok(Converted::Stored(value.convert_to(dbf)));
+        // value-coercion owner; a value already `dbf` moves through.
+        return Ok(Converted::Stored(value.into_type(dbf)));
     };
     let text = s.as_str_lossy();
     // A `DBF_MENU` common field resolves its label against THAT field's own
@@ -856,7 +855,7 @@ fn coerce_common_field(
     // `scan_int`/`strtod` skip leading `isspace` themselves, and `epicsParse*`
     // is called with a non-NULL `units` pointer, so trailing text is legal.
     Ok(match c_parse::put_string(name, target, &text)? {
-        c_parse::Converted::Stored(parsed) => Converted::Stored(parsed.convert_to(dbf)),
+        c_parse::Converted::Stored(parsed) => Converted::Stored(parsed.into_type(dbf)),
         c_parse::Converted::Unchanged => Converted::Unchanged,
     })
 }
@@ -3367,7 +3366,7 @@ pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
                 .cloned()
                 .unwrap_or_else(|| PvString::from(index.to_string())),
         ),
-        other => match other.clone().convert_to(DbFieldType::String) {
+        other => match other.convert_to(DbFieldType::String) {
             EpicsValue::String(s) => Some(s),
             _ => None,
         },
@@ -3481,6 +3480,66 @@ impl RecordInstance {
     /// record's multi-input link list, in that same order. See the field.
     pub(crate) fn link_backed_metadata_input_slots(&self) -> &[Option<usize>] {
         &self.link_backed_metadata_input_slot
+    }
+
+    /// The record type's [`Record::cycle_hooks`](crate::server::record::Record::cycle_hooks),
+    /// as asked once at load.
+    #[inline(always)]
+    pub(crate) fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        self.monitor_plan.hooks
+    }
+
+    /// Post what the record's `process()` posted itself
+    /// ([`Record::take_process_posted_fields`](crate::server::record::Record::take_process_posted_fields)),
+    /// before the cycle stamps the record or resets its alarm. A type without
+    /// `PROCESS_POSTED` pays this one bit test; the engine's arm asks its
+    /// own plan instead.
+    #[inline(always)]
+    pub(crate) fn emit_process_posts(&mut self) {
+        if self
+            .monitor_plan
+            .hooks
+            .has(crate::server::record::CycleHooks::PROCESS_POSTED)
+        {
+            self.emit_process_posts_marked();
+        }
+    }
+
+    /// The table names are upper-case, so the read skips `resolve_field`'s
+    /// normalising copy.
+    #[inline(never)]
+    pub(crate) fn emit_process_posts_marked(&mut self) {
+        use crate::server::recgbl::EventMask;
+        use crate::server::record::CyclePostMask;
+        for (field, mask) in self.record.take_process_posted_fields() {
+            // No change detector reads a marked-only field's published value,
+            // so with no subscriber C's `db_post_events` leaves nothing to do —
+            // and an entry in `last_posted` would have the walk read the
+            // whole array every later cycle.
+            if !self.subscribers.contains_key(field)
+                && self
+                    .record
+                    .fields_posted_only_when_marked()
+                    .contains(&field)
+            {
+                continue;
+            }
+            let mask = match mask {
+                CyclePostMask::Value | CyclePostMask::MonitorValue => EventMask::VALUE,
+                CyclePostMask::MonitorLog => EventMask::LOG,
+                CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
+                    EventMask::VALUE | EventMask::LOG
+                }
+            };
+            self.post_field(
+                field,
+                mask,
+                0,
+                LinkBacking::none(),
+                |inst| inst.resolve_field_upper(field),
+                |inst| inst.walk_skips(field),
+            );
+        }
     }
 
     /// Hand the record the framework-owned common state it reads during
@@ -5611,12 +5670,12 @@ impl RecordInstance {
     /// destination type, and only `convert_to` knows that table.
     ///
     /// Idempotent: a value already of its declared type is short-circuited by
-    /// `convert_to`, and re-projecting a projected value is a no-op. That is
+    /// `into_type`, and re-projecting a projected value is a no-op. That is
     /// what lets the CA path derive the native type from the value it is about
     /// to serve.
     pub fn project_to_declared_type(&self, field: &str, value: EpicsValue) -> EpicsValue {
         match self.declared_field_type(field) {
-            Some(declared) => value.convert_to(declared),
+            Some(declared) => value.into_type(declared),
             None => value,
         }
     }
@@ -7469,7 +7528,7 @@ impl RecordInstance {
         if deadband_mask.is_empty()
             && !self.monitor_plan.forced_secondary
             && !marked
-            && !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::FIRST_MONITOR))
+            && !hooks.has(CycleHooks::CYCLE_POSTED)
             && self.subscribers.is_empty()
             && self.last_posted.is_empty()
         {
@@ -7483,20 +7542,10 @@ impl RecordInstance {
         } else {
             CycleMarks::NONE
         };
-        // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
-        // iocInit's per-cycle drain must not be able to eat. Read beside the
-        // per-cycle marks so both reach the same branch with the same mask
-        // mapping.
-        let first_marks = if hooks.has(CycleHooks::FIRST_MONITOR) {
-            self.record.take_first_monitor_cycle()
-        } else {
-            CycleMarks::NONE
-        };
-        let cycle_posted = || cycle_marks.chain(first_marks);
         let value_masked = self.monitor_plan.value_masked;
         // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
         // `OnChangeForced` fields sit behind, which the record may open on a
-        // cycle where VAL's own mask is shut. TAKEn, like `cycle_posted`, so
+        // cycle where VAL's own mask is shut. TAKEn, like `cycle_marks`, so
         // this loop may run only once per cycle. Only an `OnChangeForced` gate
         // reads the widening, so a type without one has nothing to take.
         let secondary_guard = if self.monitor_plan.forced_secondary {
@@ -7668,16 +7717,18 @@ impl RecordInstance {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                 snapshot.push((name(), val.clone(), aux_mask));
-            } else if cycle_posted().any(|(name, _)| name == field) {
+            } else if { cycle_marks }.any(|(name, _)| name == field) {
                 // One event per MARK, each with the mask of the C call site that
                 // made it (`CyclePostMask`) — a field marked twice (aCalcout's
                 // AMASK `afterCalc` post AND its NEWM `monitor()` post) is posted
                 // twice, exactly as C posts it from both loops.
-                for (_, cycle_mask) in cycle_posted().filter(|(name, _)| *name == field) {
+                for (_, cycle_mask) in { cycle_marks }.filter(|(name, _)| *name == field) {
                     let mask = match cycle_mask {
                         CyclePostMask::Value => EventMask::VALUE,
                         CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
                         CyclePostMask::MonitorValueLog => aux_mask,
+                        CyclePostMask::MonitorValue => deadband_mask | EventMask::VALUE,
+                        CyclePostMask::MonitorLog => deadband_mask | EventMask::LOG,
                     };
                     snapshot.push((name(), val.clone(), mask));
                 }
@@ -7956,6 +8007,7 @@ impl RecordInstance {
         // (e.g. QSRV group-process members) would not see UDF/TSE.
         self.push_process_context();
         let outcome = self.record.process()?;
+        self.emit_process_posts();
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
         // handled by the full process_record_with_links() path in processing.rs.

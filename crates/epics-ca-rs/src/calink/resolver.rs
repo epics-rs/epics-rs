@@ -1276,7 +1276,7 @@ impl LinkSet for CaLinkResolver {
         // construction rather than by a second bound inside the client.
         let value = match (channel.native_field_type(), channel.element_count()) {
             (Ok(native), Ok(nelements)) => {
-                let mut converted = value.convert_to(native);
+                let mut converted = value.into_type(native);
                 converted.truncate(nelements as usize);
                 converted
             }

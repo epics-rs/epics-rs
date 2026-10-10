@@ -825,6 +825,12 @@ pub enum CyclePostMask {
     /// `monitor_mask | DBE_VALUE | DBE_LOG` — C's usual `monitor()` shape
     /// (aCalcout `monitor()`, `aCalcoutRecord.c:1034`).
     MonitorValueLog,
+    /// `monitor_mask | DBE_VALUE` — an array whose own MDEL crossing fired and
+    /// whose ADEL did not (aCalcout AVAL/OAV, `aCalcoutRecord.c:996-1000`).
+    /// `monitor_mask` is VAL's, its deadband classes included.
+    MonitorValue,
+    /// `monitor_mask | DBE_LOG` — the ADEL-only counterpart.
+    MonitorLog,
 }
 
 /// One take's marks: a bit per entry of the record type's static post table,
@@ -1784,15 +1790,18 @@ impl CycleHooks {
     pub const PRE_INPUT: Self = Self(1);
     /// [`Record::take_cycle_posted_fields`].
     pub const CYCLE_POSTED: Self = Self(2);
-    /// [`Record::take_first_monitor_cycle`].
-    pub const FIRST_MONITOR: Self = Self(4);
     /// [`Record::set_process_context`].
-    pub const CONTEXT: Self = Self(8);
+    pub const CONTEXT: Self = Self(4);
+    /// [`Record::take_cycle_posted_fields`] outside `monitor()`: a put's
+    /// `special()` or a link read marks posts the write's owner drains.
+    pub const WRITE_POSTED: Self = Self(8);
+    /// [`Record::take_process_posted_fields`].
+    pub const PROCESS_POSTED: Self = Self(16);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every hook is asked — the default, so a type that never says
     /// otherwise pays the call and never loses an action.
-    pub const ALL: Self = Self(15);
+    pub const ALL: Self = Self(31);
 
     /// Both sets together.
     pub const fn union(self, other: Self) -> Self {
@@ -3765,23 +3774,14 @@ pub trait Record: Send + Sync + 'static {
         CycleMarks::NONE
     }
 
-    /// Fields this record posts on its FIRST monitor cycle whether or not they
-    /// changed — C's `|| (prpvt->firstCalcPosted == 0)` term
-    /// (`transformRecord.c:798`), which `monitor()` disarms unconditionally
-    /// afterwards (`:807`) so it fires once per IOC lifetime.
-    ///
-    /// Deliberately NOT [`Self::take_cycle_posted_fields`], which carries marks
-    /// the RUNNING cycle made and which iocInit drops wholesale
-    /// (`seed_record_after_init`, so a seed put's mark cannot become a late
-    /// event). This flag is initial record state, made by no put, so it has to
-    /// survive the seed — putting it on the per-cycle channel would let the
-    /// init drain consume it and the first cycle would post nothing.
-    ///
-    /// Same TAKE semantics and same masks: called once per process cycle, and
-    /// the record clears what it answered from.
+    /// Posts the record's C `process()` makes itself, ahead of
+    /// `recGblGetTimeStamp` and `monitor()` — aCalcout's `afterCalc` array
+    /// posts (`aCalcoutRecord.c:294-298`). Drained as soon as `process()`
+    /// returns, so they carry the previous cycle's stamp and the alarm
+    /// `recGblResetAlarms` has not yet committed. TAKE semantics.
     ///
     /// Default: empty.
-    fn take_first_monitor_cycle(&mut self) -> CycleMarks {
+    fn take_process_posted_fields(&mut self) -> CycleMarks {
         CycleMarks::NONE
     }
 
@@ -5422,6 +5422,13 @@ pub trait Record: Send + Sync + 'static {
         }
     }
 
+    /// The RVAL a `SIMM=RAW` cycle lands from SVAL — C `readValue`'s
+    /// `prec->rval = prec->sval` (`mbbiRecord.c:394`). The default copies SVAL;
+    /// a record whose C arm casts it overrides.
+    fn sval_as_rval(&self) -> Option<EpicsValue> {
+        self.get_field("SVAL")
+    }
+
     /// Whether the record's C `switch (prec->simm)` carries a `default:` arm
     /// that REFUSES a SIMM value outside its own menu:
     ///
@@ -6327,7 +6334,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         }
         // Carrier with no known target field: collapse to a bare index (the prior
         // fallback) rather than letting it reach storage.
-        None if is_enum_carrier => value.convert_to(DbFieldType::Long),
+        None if is_enum_carrier => value.into_type(DbFieldType::Long),
         _ => value,
     };
     record.put_field(name, value)
@@ -6552,7 +6559,7 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
     {
         return Ok(Converted::Stored(rendered));
     }
-    Ok(Converted::Stored(value.convert_to(target)))
+    Ok(Converted::Stored(value.into_type(target)))
 }
 
 /// C's `prset->get_precision` answer for a **`DBF_STRING`** destination — the
@@ -7071,8 +7078,12 @@ mod tests {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
             "compress" | "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
-            "acalcout" | "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
-            "transform" => CycleHooks::FIRST_MONITOR.union(CycleHooks::CONTEXT),
+            "acalcout" => CycleHooks::CYCLE_POSTED
+                .union(CycleHooks::WRITE_POSTED)
+                .union(CycleHooks::PROCESS_POSTED),
+            "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
+            "calcout" => CycleHooks::WRITE_POSTED,
+            "transform" => CycleHooks::CYCLE_POSTED.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,
             _ => CycleHooks::NONE,
         };
@@ -7085,11 +7096,11 @@ mod tests {
             if !hooks.has(CycleHooks::PRE_INPUT) {
                 assert!(r.pre_input_link_actions(true).is_empty(), "{record_type}");
             }
-            if !hooks.has(CycleHooks::CYCLE_POSTED) {
+            if !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::WRITE_POSTED)) {
                 assert!(r.take_cycle_posted_fields().is_empty(), "{record_type}");
             }
-            if !hooks.has(CycleHooks::FIRST_MONITOR) {
-                assert!(r.take_first_monitor_cycle().is_empty(), "{record_type}");
+            if !hooks.has(CycleHooks::PROCESS_POSTED) {
+                assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
             }
         }
     }
@@ -8057,7 +8068,7 @@ pub(crate) fn seed_trackers_from_val<R: Record + ?Sized>(rec: &mut R) {
         let Some(current) = rec.get_field(field) else {
             continue;
         };
-        let coerced = seed.to_epics_value().convert_to(current.db_field_type());
+        let coerced = seed.to_epics_value().into_type(current.db_field_type());
         let _ = rec.put_field(field, coerced);
     }
 }

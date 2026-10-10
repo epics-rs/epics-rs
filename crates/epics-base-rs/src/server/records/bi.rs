@@ -328,6 +328,11 @@ impl Record for BiRecord {
         Some(Ok(()))
     }
 
+    /// `biRecord.c:332` `prec->rval = (unsigned short) prec->sval`.
+    fn sval_as_rval(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::ULong(u32::from(self.sval as u16)))
+    }
+
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
         match link_field {
             "SIML" => Some(&self.siml),

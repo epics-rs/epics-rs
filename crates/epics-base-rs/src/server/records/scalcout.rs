@@ -7,7 +7,9 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, post_link_status};
+use super::link_status::{
+    LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, LinkStatusPosts, post_link_status,
+};
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
@@ -536,7 +538,7 @@ impl ScalcoutRecord {
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
     /// mirroring C `sCalcoutRecord.c::init_record` (254-288) and the
     /// `special()` re-classification (508-569). No-op without an async context.
-    fn refresh_link_status(&self) {
+    fn refresh_link_status(&self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, String)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((SCALCOUT_INAV_NAMES[i], self.inp_links[i].clone()));
@@ -549,6 +551,7 @@ impl ScalcoutRecord {
             &self.link_gen,
             links,
             crate::server::recgbl::EventMask::VALUE,
+            posts,
         );
     }
 }
@@ -682,12 +685,15 @@ impl Record for ScalcoutRecord {
             _ => {}
         }
         // C `sCalcoutRecord.c:481-569` re-classifies the link a put just
-        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together.
-        if Self::inp_index(field).is_some()
-            || Self::str_inp_index(field).is_some()
-            || field == "OUT"
-        {
-            self.refresh_link_status();
+        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together — and
+        // posts that link's status alone.
+        let status = match (Self::inp_index(field), Self::str_inp_index(field)) {
+            (Some(i), _) => Some(SCALCOUT_INAV_NAMES[i]),
+            (_, Some(i)) => Some(SCALCOUT_IAAV_NAMES[i]),
+            _ => (field == "OUT").then_some("OUTV"),
+        };
+        if let Some(status) = status {
+            self.refresh_link_status(LinkStatusPosts::Put(status));
         }
         Ok(())
     }
@@ -697,7 +703,7 @@ impl Record for ScalcoutRecord {
         // C `init_record` (sCalcoutRecord.c:254-288) classifies all 25 links
         // before any process. Every one of them is a scalcout-owned field
         // (OUT included), already applied when `add_record` runs.
-        self.refresh_link_status();
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
     /// C posts the validity field explicitly from `special()`

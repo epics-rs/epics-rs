@@ -309,6 +309,12 @@ impl Record for LsiRecord {
         &["VAL", "OVAL"]
     }
 
+    /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
+    /// `lsiRecord.c:141`), whatever LEN holds.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        self.long_string_fields().contains(&field).then_some(1)
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

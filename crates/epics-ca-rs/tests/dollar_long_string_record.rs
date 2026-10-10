@@ -9,6 +9,8 @@
 //! caput -S LSO.VAL$ ABCDEFGHIJKLMNOPQRS  -> VAL ABCDEFGHIJKLMNOPQRS, LEN 20
 //! caput -a LSO.VAL$ 20 65 .. 84       -> VAL ABCDEFGHIJKLMNOPQRS, LEN 20
 //! caput -a LSO.VAL$ 3 120 121 122     -> VAL xyz, LEN 4
+//! caput -a LSO.VAL$ 1 65              -> VAL A, LEN 2
+//! cainfo LSO                          -> DBF_STRING, Element count: 1
 //! caput -S LI.VAL$ <39|40|41|49 chars> -> LEN 40|41|42|50   (lsi, SIZV 50)
 //! cainfo AI.INP$                      -> DBF_CHAR, Element count: 1024
 //! caput -S AI.INP$ 2.5                -> AI.INP 2.5
@@ -73,6 +75,10 @@ async fn dollar_channels_serve_the_dbr_char_address() {
     }
     let client = CaClient::new().await.expect("client");
 
+    let whole = connect(&client, "LSO").await;
+    assert_eq!(whole.native_field_type().unwrap(), DbFieldType::String);
+    assert_eq!(whole.element_count().unwrap(), 1, "cvt_dbaddr no_elements");
+
     let val = connect(&client, "LSO.VAL$").await;
     assert_eq!(val.native_field_type().unwrap(), DbFieldType::Char);
     assert_eq!(val.element_count().unwrap(), 20, "no_elements = SIZV");
@@ -82,6 +88,7 @@ async fn dollar_channels_serve_the_dbr_char_address() {
         (&b"ABCDEFGHIJKLMNOPQRS\0"[..], "ABCDEFGHIJKLMNOPQRS", 20.0),
         (&b"ABCDEFGHIJKLMNOPQRST"[..], "ABCDEFGHIJKLMNOPQRS", 20.0),
         (&b"xyz"[..], "xyz", 4.0),
+        (&b"A"[..], "A", 2.0),
     ] {
         val.put(&chars(written)).await.expect("put LSO.VAL$");
         assert_eq!(
@@ -98,7 +105,7 @@ async fn dollar_channels_serve_the_dbr_char_address() {
         );
     }
     let snap = val.get_with_dbr_type(DBR_CHAR, 20).await.expect("get");
-    let mut want = b"xyz".to_vec();
+    let mut want = b"A".to_vec();
     want.resize(20, 0);
     assert_eq!(snap.value, EpicsValue::UCharArray(want.into()));
 

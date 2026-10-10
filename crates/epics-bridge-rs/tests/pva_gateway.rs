@@ -79,28 +79,9 @@ fn spawn_upstream(pv_name: &str, initial: f64) -> (PvaServer, SocketAddr, Shared
     let source = SharedSource::new();
     source.add(pv_name, pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(source), cfg).expect("test server must start");
+    let bound = server.tcp_addr();
     (server, bound, pv)
 }
 
@@ -115,23 +96,7 @@ async fn gateway_get_forwards_upstream_value() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -174,23 +139,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -295,23 +244,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -423,23 +356,7 @@ async fn gateway_control_prefix_cache_size() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -528,23 +445,7 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let gw = MultiTenantPvaGatewayBuilder::new()
         .add_upstream("A", client_a)
@@ -613,23 +514,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let acl = epics_bridge_rs::pva_gateway::AclConfig::default()
         .deny_regex(r"SECRET:.*")
@@ -686,23 +571,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let gw = MultiTenantPvaGatewayBuilder::new()
         .add_upstream("U", upstream)
@@ -737,25 +606,9 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
 /// Build a gateway config pinned at `upstream` with an isolated
 /// random-port downstream server.
 fn gateway_cfg(upstream: Arc<PvaClient>) -> PvaGatewayConfig {
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
     PvaGatewayConfig {
         upstream_client: Some(upstream),
-        server_config: PvaServerConfig {
-            tcp_port: pick(),
-            udp_port: pick_udp(),
-            ..PvaServerConfig::isolated()
-        },
+        server_config: PvaServerConfig::isolated(),
         cleanup_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
@@ -934,28 +787,9 @@ async fn br_r6_gateway_typed_put_passthrough() {
     let source = SharedSource::new();
     source.add("BR:R6:PV", pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -1087,28 +921,9 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let source = SharedSource::new();
     source.add("BR:R41:PV", pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -1796,30 +1611,11 @@ impl ChannelSource for UpstreamArraySource {
 }
 
 /// Spawn an upstream PvaServer serving `source` on a random loopback port;
-/// return (server, addr). Mirrors `spawn_upstream`'s port-pick / isolation.
+/// return (server, addr). Mirrors `spawn_upstream`'s isolation.
 fn spawn_upstream_source<S: ChannelSource + 'static>(source: S) -> (PvaServer, SocketAddr) {
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(source), cfg).expect("upstream array server must start");
+    let bound = server.tcp_addr();
     (server, bound)
 }
 
@@ -2094,28 +1890,9 @@ fn spawn_recording_upstream(
     initial: f64,
 ) -> (PvaServer, SocketAddr, RecordingDoublingSource) {
     let src = RecordingDoublingSource::new(pv_name, initial);
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let bound = server.tcp_addr();
     (server, bound, src)
 }
 
@@ -2195,8 +1972,8 @@ async fn gateway_put_get_forwards_through_composite_with_control_prefix() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    // gateway_cfg picks fresh ports; override control_prefix so the
-    // CompositeSource + ControlSource wrap the layered gateway source.
+    // Override control_prefix so the CompositeSource + ControlSource wrap
+    // the layered gateway source.
     let cfg = PvaGatewayConfig {
         control_prefix: Some("gw".into()),
         ..gateway_cfg(upstream_client)
@@ -2318,35 +2095,16 @@ impl ChannelSource for PartialReadSource {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
     let pv = "GW:PARTIAL:PV";
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
 
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(
         Arc::new(PartialReadSource {
             pv_name: pv.to_string(),
         }),
         us_cfg,
     )
     .expect("upstream must start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -2358,11 +2116,7 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
         &test_reactor(),
         PvaGatewayConfig {
             upstream_client: Some(upstream_client.clone()),
-            server_config: PvaServerConfig {
-                tcp_port: pick(),
-                udp_port: pick_udp(),
-                ..PvaServerConfig::isolated()
-            },
+            server_config: PvaServerConfig::isolated(),
             cleanup_interval: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(2),
             max_cache_entries: 1024,

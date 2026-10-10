@@ -283,9 +283,28 @@ fn every_crate_that_derives_the_backend_is_accounted_for() {
     let drifted = rtems_exec_gate::derivation_breaches(&root);
     assert!(drifted.is_empty(), "{}", drifted.join("\n\n"));
 
-    for (_, dir) in &declaring {
-        rtems_exec_gate::assert_crate_is_accounted_for(dir.to_str().expect("crate path is UTF-8"));
-    }
+    // Every crate is judged before any verdict, so one crate's breach cannot
+    // hide another's.
+    let breaches: Vec<String> = declaring
+        .iter()
+        .filter_map(|(_, dir)| {
+            let dir = dir.to_str().expect("crate path is UTF-8");
+            std::panic::catch_unwind(|| rtems_exec_gate::assert_crate_is_accounted_for(dir))
+                .err()
+                .map(|p| match p.downcast::<String>() {
+                    Ok(msg) => *msg,
+                    Err(p) => p
+                        .downcast_ref::<&str>()
+                        .map_or_else(|| format!("{dir}: non-string panic"), |s| s.to_string()),
+                })
+        })
+        .collect();
+    assert!(
+        breaches.is_empty(),
+        "{} crate(s) breach the census:\n\n{}",
+        breaches.len(),
+        breaches.join("\n\n")
+    );
     // Measured through the same function the `scope-gated` binary prints from.
     // Filling this constant in is a merge-time step performed by reading a tree
     // (see that binary's docs), and a reading that could disagree with the

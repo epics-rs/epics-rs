@@ -30,6 +30,11 @@ pub struct IocBuilder {
     /// holding the source C would quote in `ERROR: Failed to load '%s'`.
     /// The file name is known only here, never to the record itself.
     sources: Vec<String>,
+    /// The lexer state of each text, parallel to [`IocBuilder::sources`]:
+    /// its bound source lines and `yyFailed`. The per-record refusals are
+    /// raised in `build`, after the parse, and can only name their line
+    /// through the same `DbFaults` that parsed the text.
+    load_faults: Vec<db_loader::DbFaults>,
     /// Each `.db` definition, tagged with its [`IocBuilder::sources`]
     /// index.
     db_defs: Vec<(usize, db_loader::DbRecordDef)>,
@@ -51,7 +56,7 @@ pub struct IocBuilder {
     /// each tagged with the [`IocBuilder::sources`] index that carried it.
     /// Resolved at `build` against the accumulated definitions, which is
     /// this builder's stand-in for C's `savedPdbbase`.
-    db_aliases: Vec<(usize, String, String)>,
+    db_aliases: Vec<(usize, String, String, u32)>,
     /// `breaktable(...)` definitions parsed from the loaded `.db`/`.dbd` text,
     /// used to populate the breakpoint-table registry for `ai`/`ao` records
     /// with `LINR >= 3`.
@@ -85,6 +90,7 @@ impl IocBuilder {
             pvs: Vec::new(),
             records: Vec::new(),
             sources: Vec::new(),
+            load_faults: Vec::new(),
             db_defs: Vec::new(),
             failed_loads: Vec::new(),
             boot_past_failed_loads: false,
@@ -131,7 +137,11 @@ impl IocBuilder {
     /// `yyerrorAbort` — fails here.
     pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
         let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
-        let parsed = db_loader::parse_db_with_breaktables(&content, macros)?;
+        // The file's name goes in with its text: `yyerror` quotes it in
+        // ` in file "<f>" line N`, and a text read without one is C's
+        // "standard input".
+        let (expanded, source) = db_loader::db_read_lines(&content, macros, Some(path));
+        let parsed = db_loader::parse_db_expanded(&expanded, source)?;
         self.absorb_parsed(path, parsed);
         Ok(self)
     }
@@ -153,12 +163,13 @@ impl IocBuilder {
     /// per-record refusals as well and then fail once, with the name C
     /// quotes. Returning here instead would end the load at the first
     /// diagnostic and let the caller's own error stand in for C's tail.
-    fn absorb_parsed(&mut self, source: &str, parsed: db_loader::ParsedDb) {
+    fn absorb_parsed(&mut self, source: &str, mut parsed: db_loader::ParsedDb) {
         let load = self.sources.len();
         self.sources.push(source.to_string());
         if !parsed.faults.is_empty() {
             self.failed_loads.push(load);
         }
+        self.load_faults.push(std::mem::take(&mut parsed.faults));
         self.db_defs
             .extend(parsed.records.into_iter().map(|def| (load, def)));
         self.breaktables.extend(parsed.breaktables);
@@ -166,7 +177,7 @@ impl IocBuilder {
             parsed
                 .unresolved_aliases
                 .into_iter()
-                .map(|(target, alias)| (load, target, alias)),
+                .map(|(target, alias, line)| (load, target, alias, line)),
         );
     }
 
@@ -327,6 +338,7 @@ impl IocBuilder {
         // The diagnostic is printed by whichever site refuses, and C prints
         // at the refusal.
         let mut failed_loads = self.failed_loads;
+        let mut load_faults = self.load_faults;
         let mut aborted_loads: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (load, mut def) in self.db_defs {
             if aborted_loads.contains(&load) {
@@ -337,23 +349,44 @@ impl IocBuilder {
                 &self.record_factories,
             ) {
                 Ok(record) => record,
-                Err(e) => {
-                    // C names the record TYPE as well as the name, and picks
-                    // between two texts by cause — `Record type '%s' for
-                    // record '%s' not found` when `dbFindRecordType` misses,
-                    // `Can't create %s record '%s'` when `dbCreateRecord`
-                    // itself fails. The port has one construction step for
-                    // both, so it prints C's generic line and lets the
-                    // reason say which happened.
-                    eprintln!(
-                        "{ERL_ERROR}: Can't create {} record '{}': {e}",
-                        def.record_type, def.name
-                    );
+                Err(_) => {
+                    // C's two texts for a type it cannot instantiate, and
+                    // `yyerrorAbort`: the rest of this load is not read.
+                    // (The factory's `register_record_type` hint is not C
+                    // output and no longer shares the diagnostic's stream.)
+                    let miss = db_loader::record_type_miss(&def.record_type, &def.name);
+                    if let Some(line) = miss.stdout {
+                        println!("{line}");
+                    }
+                    if let Some(line) = &miss.errlog {
+                        crate::runtime::log::errlog_printf(line);
+                    }
+                    load_faults[load]
+                        .abort_at(def.line, db_loader::DbDiagnostic::new(miss.message));
                     failed_loads.push(load);
                     aborted_loads.insert(load);
                     continue;
                 }
             };
+
+            // C `dbCreateRecord` (`dbLexRoutines.c:1173-1180`): a name that
+            // is already a record of ANOTHER type is refused before any
+            // field is read, and the body is dropped. The sentence names the
+            // type being loaded first and the type already there last.
+            if let Some(existing) = db.get_record(&def.name) {
+                let existing_type = existing.read().record.record_type().to_string();
+                if existing_type != def.record_type {
+                    load_faults[load].report_at(
+                        def.line,
+                        db_loader::DbDiagnostic::new(format!(
+                            "{ERL_ERROR}: {} record '{}' already exists, can't load {} record",
+                            def.record_type, def.name, existing_type
+                        )),
+                    );
+                    failed_loads.push(load);
+                    continue;
+                }
+            }
 
             // Resolve a `LINR` field that names a loaded breakpoint table to the
             // numeric `menuConvert` index that selects it (before apply_fields,
@@ -391,15 +424,14 @@ impl IocBuilder {
                 ) else {
                     return true;
                 };
-                if let Some(notice) = refusal.notice {
-                    eprintln!("{notice}");
-                }
-                eprintln!("{}", refusal.line);
-                // C's `dbPutStringSuggest` (`dbLexRoutines.c:1414`) follows
-                // the refusal it explains and leaves the status alone.
-                if let Some(suggestion) = refusal.suggestion {
-                    eprintln!("{suggestion}");
-                }
+                // Same seat and same call as the iocsh `dbLoadRecords`
+                // path, so both print `yyerror`'s location and echo.
+                load_faults[load].seek(f.line, ")");
+                load_faults[load].report(db_loader::DbDiagnostic {
+                    notice: refusal.notice,
+                    message: refusal.line,
+                    suggestion: refusal.suggestion,
+                });
                 screen_refused = true;
                 false
             });
@@ -407,12 +439,22 @@ impl IocBuilder {
                 failed_loads.push(load);
             }
 
+            // As C dbLoadRecords: a refused field keeps the record loaded; only build()'s Err carries the status.
             let mut common_fields = Vec::new();
-            if let Err(e) = db_loader::apply_fields(&mut record, &def.fields, &mut common_fields) {
-                eprintln!("{ERL_ERROR}: Can't load record '{}': {e}", def.name);
-                e.emit_put_report();
+            // One field at a time, as C's parser does: a refused field costs
+            // that field and the load's status, never the record.
+            if db_loader::apply_fields_one_at_a_time(
+                &mut record,
+                &def.name,
+                &def.fields,
+                &mut common_fields,
+                |f, e, line| {
+                    load_faults[load].seek(f.line, ")");
+                    e.emit_put_report();
+                    load_faults[load].report(db_loader::DbDiagnostic::new(line));
+                },
+            ) {
                 failed_loads.push(load);
-                continue;
             }
 
             // The record and its whole loaded field set enter the database
@@ -420,7 +462,7 @@ impl IocBuilder {
             // and only then runs C's `iocInit` passes — so the initial UDF
             // severity is evaluated against the `.db`'s final UDF/STAT/UDFS
             // (C `dbLoadRecords` → `iocInit`, not the reverse).
-            if let Err(e) = db
+            if db
                 .add_loaded_record(
                     &def.name,
                     record,
@@ -430,21 +472,37 @@ impl IocBuilder {
                     },
                 )
                 .await
+                .is_err()
             {
-                eprintln!("{ERL_ERROR}: Can't load record '{}': {e}", def.name);
+                // `dbCreateRecord` failing for any other reason is
+                // `yyerrorAbort` (`dbLexRoutines.c:1189-1194`), as in the
+                // `dbLoadRecords` path.
+                load_faults[load].abort_at(
+                    def.line,
+                    db_loader::DbDiagnostic::new(format!(
+                        "{ERL_ERROR}: Can't create {} record '{}'",
+                        def.record_type, def.name
+                    )),
+                );
                 failed_loads.push(load);
+                aborted_loads.insert(load);
                 continue;
             }
 
             // alias(...) directives. C `dbRecordAlias` reports the rejection
             // and calls `yyerror(NULL)` (`dbLexRoutines.c:1496`), so the
             // record keeps its place and the load's status goes non-zero.
-            for alias in &def.aliases {
-                if let Err(e) = db.add_alias(alias, &def.name).await {
-                    eprintln!(
-                        "alias({alias}) for {target} rejected: {e}",
-                        target = def.name
-                    );
+            for (alias, &alias_line) in def.aliases.iter().zip(&def.alias_lines) {
+                if db_loader::create_alias(
+                    &db,
+                    alias,
+                    &def.name,
+                    alias_line,
+                    crate::server::iocsh::db_records_once_only(),
+                    &mut load_faults[load],
+                )
+                .await
+                {
                     failed_loads.push(load);
                 }
             }
@@ -465,12 +523,25 @@ impl IocBuilder {
         // leaves the records that did load in place.
         // Both arms are `yyerror(NULL)` in C `dbAlias`
         // (`dbLexRoutines.c:1509-1517`), so both fail the load.
-        for (load, target, alias) in self.db_aliases {
-            if db.get_record(&target).is_none() {
-                eprintln!("{}", db_loader::unknown_alias_message(&alias, &target));
-                failed_loads.push(load);
-            } else if let Err(e) = db.add_alias(&alias, &target).await {
-                eprintln!("alias({alias}) for {target} rejected: {e}");
+        for (load, target, alias, line) in self.db_aliases {
+            let refused = if db.get_record(&target).is_none() {
+                load_faults[load].report_at(
+                    line,
+                    db_loader::DbDiagnostic::new(db_loader::unknown_alias_message(&alias, &target)),
+                );
+                true
+            } else {
+                db_loader::create_alias(
+                    &db,
+                    &alias,
+                    &target,
+                    line,
+                    crate::server::iocsh::db_records_once_only(),
+                    &mut load_faults[load],
+                )
+                .await
+            };
+            if refused {
                 failed_loads.push(load);
             }
         }

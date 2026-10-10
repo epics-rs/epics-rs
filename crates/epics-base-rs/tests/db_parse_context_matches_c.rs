@@ -170,25 +170,13 @@ ERROR: Failed to load 'bad5.db'
 /// type: 'nosuchtype'` — on STDOUT, where a `2>` startup log never saw
 /// it, in this port's own words, naming a position it did not have.
 ///
-/// Two things C prints here that this assertion does not, both deliberate:
-///
-/// 1. the position (` at or before ')' … line 1` and the source echo).
-///    C's lexer is still parked on the record head; this port checks the
-///    type in the install loop, after the text is gone, and
-///    `DbRecordDef` carries no line the way `DbFieldDef` does. Naming a
-///    line it does not hold would be a guess, so it names none —
-///    `db_loader`'s struct is where that line would have to start.
-/// 2. a SECOND `ERROR: syntax error` with the same source line echoed
-///    under it again. That is bison unwinding its stack after `yyAbort`,
-///    not a second thing wrong with the file, and this port has no bison
-///    stack to unwind. Same for C's `WARNING: dbReadCOM: Parser stack
-///    dirty w/o error. 1` (`dbLexRoutines.c:303-306`), which reports
-///    `ellCount(&tempList)` — a C parser-internal list with no
-///    counterpart here.
+/// C's `WARNING: dbReadCOM: Parser stack dirty w/o error. 1`
+/// (`dbLexRoutines.c:303-306`) reports `ellCount(&tempList)`, a C
+/// parser-internal list with no counterpart here, and is not reproduced.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn an_unknown_record_type_gets_cs_sentence_on_cs_stream() {
-    let (out, err, _dir) = load(
+    let (out, err, dir) = load(
         "bad4.db",
         "record(nosuchtype, \"A4\") {\n    field(VAL, \"1\")\n}\n",
     );
@@ -198,10 +186,20 @@ async fn an_unknown_record_type_gets_cs_sentence_on_cs_stream() {
     );
     assert_eq!(
         err,
-        "\
+        format!(
+            "\
 ERROR: Record type 'nosuchtype' for record 'A4' not found
+ERROR:  at or before ')' in path \"{dir}\"  file \"bad4.db\" line 1
+
+ 1 | record(nosuchtype, \"A4\") {{
+
+ERROR: syntax error
+
+ 1 | record(nosuchtype, \"A4\") {{
+
 ERROR: Failed to load 'bad4.db'
 "
+        )
     );
 }
 
@@ -213,8 +211,9 @@ ERROR: Failed to load 'bad4.db'
 ///
 /// ```text
 /// stdout: \t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***
-/// stderr: dbAllocRecord(Z1) with zzz rec_size = 0
-///         ERROR: Can't create zzz record 'Z1'
+/// stderr: ERROR: Can't create zzz record 'Z1'
+///         ERROR:  at or before ')' … line 1, then `syntax error`
+///         dbAllocRecord(Z1) with zzz rec_size = 0
 /// ```
 ///
 /// `swait` is this port's version of that state: `stdRecords.dbd` does not
@@ -230,7 +229,7 @@ ERROR: Failed to load 'bad4.db'
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn a_declared_but_unregistered_record_type_is_cs_rec_size_zero() {
-    let (out, err, _dir) = load(
+    let (out, err, dir) = load(
         "unreg.db",
         "record(swait, \"Z1\") {\n    field(SCAN, \"Passive\")\n}\n",
     );
@@ -240,10 +239,20 @@ async fn a_declared_but_unregistered_record_type_is_cs_rec_size_zero() {
     );
     assert_eq!(
         err,
-        "\
+        format!(
+            "\
 dbAllocRecord(Z1) with swait rec_size = 0
 ERROR: Can't create swait record 'Z1'
+ERROR:  at or before ')' in path \"{dir}\"  file \"unreg.db\" line 1
+
+ 1 | record(swait, \"Z1\") {{
+
+ERROR: syntax error
+
+ 1 | record(swait, \"Z1\") {{
+
 ERROR: Failed to load 'unreg.db'
 "
+        )
     );
 }

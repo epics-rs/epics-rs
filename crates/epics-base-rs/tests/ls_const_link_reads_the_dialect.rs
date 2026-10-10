@@ -11,10 +11,16 @@
 //! `load_link_ls` read the raw text instead, so a comment inside the link body
 //! made the whole const load vanish — LEN stayed at the empty-string 1 and no
 //! diagnostic said why.
+//!
+//! The comment forms are handed to `load_link_ls` directly: they cannot come
+//! from a `.db`, whose `JSON` start condition refuses `/` before
+//! `dbJLinkParse` sees the text (`dbLex.l:143-155`; see
+//! `json_state_invalid_character_is_a_lexer_error`).
 
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{LsLoad, load_link_ls};
 use epics_base_rs::types::EpicsValue;
 
 async fn val_len(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> (String, i64) {
@@ -40,10 +46,6 @@ async fn a_comment_inside_a_const_link_does_not_erase_the_long_string_load() {
     let db_text = concat!(
         r#"record(lsi,"LS:PLAIN") { field(INP,{const:"hi there"}) }"#,
         "\n",
-        r#"record(lsi,"LS:BLOCK") { field(INP,{const:/*which*/"hi there"}) }"#,
-        "\n",
-        r#"record(lsi,"LS:KEYCMT") { field(INP,{/*t*/const:"hi there"}) }"#,
-        "\n",
     );
     let (db, _) = IocBuilder::new()
         .db_string(db_text, &HashMap::new())
@@ -58,14 +60,14 @@ async fn a_comment_inside_a_const_link_does_not_erase_the_long_string_load() {
         ("hi there".to_string(), 9),
         "measured on softIoc 7.0.10: VAL \"hi there\", LEN 9"
     );
-    assert_eq!(
-        val_len(&db, "LS:BLOCK").await,
-        plain,
-        "a comment is whitespace to yajl, so the value is the same string"
-    );
-    assert_eq!(
-        val_len(&db, "LS:KEYCMT").await,
-        plain,
-        "a comment before the key is whitespace too"
-    );
+    for text in [
+        r#"{const:/*which*/"hi there"}"#,
+        r#"{/*t*/const:"hi there"}"#,
+    ] {
+        assert_eq!(
+            load_link_ls(text),
+            Some(LsLoad::Text("hi there".into())),
+            "a comment is whitespace to yajl, so the value is the same string: {text}"
+        );
+    }
 }

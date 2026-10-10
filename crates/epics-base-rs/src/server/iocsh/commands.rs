@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// C tests the flag with a bare `if`, so any non-zero value sets it.
 static DB_RECORDS_ONCE_ONLY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn db_records_once_only() -> bool {
+pub(crate) fn db_records_once_only() -> bool {
     DB_RECORDS_ONCE_ONLY.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
@@ -58,45 +58,6 @@ fn db_quiet_macro_warnings_var() -> super::vars::VarDef {
             get: || i64::from(db_loader::db_quiet_macro_warnings()),
             set: |v| db_loader::set_db_quiet_macro_warnings(v != 0),
         },
-    }
-}
-
-/// C `createAlias` (`dbLexRoutines.c:1450-1481`) — the one place an
-/// `alias(...)` reaches the database, from a record body or from the file
-/// scope.
-///
-/// An alias name that ALREADY names this same record is not an error and
-/// not a re-creation: C compares `precnode->aliasedRecnode` after
-/// de-aliasing the target and, when they match, leaves `status` at 0 and
-/// creates nothing. Only `dbRecordsOnceOnly` turns that into an error. The
-/// port used to hand every repeat to `add_alias`, whose name-free check
-/// rejected it — a diagnostic C does not print at its own default.
-async fn install_alias(
-    ctx: &CommandContext,
-    alias: &str,
-    target: &str,
-    faults: &mut db_loader::DbFaults,
-) {
-    let canonical = ctx
-        .db()
-        .resolve_alias(target)
-        .unwrap_or_else(|| target.to_string());
-    if ctx
-        .db()
-        .resolve_alias(alias)
-        .is_some_and(|already| already == canonical)
-    {
-        if db_records_once_only() {
-            faults.recoverable(format!(
-                "{ERL_ERROR}: Alias '{alias}' already defined; dbRecordsOnceOnly is set."
-            ));
-        }
-        return;
-    }
-    if let Err(e) = ctx.db().add_alias(alias, target).await {
-        faults.recoverable(format!(
-            "dbLoadRecords: alias '{alias}' for '{target}' rejected: {e}"
-        ));
     }
 }
 
@@ -5671,21 +5632,14 @@ fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
 /// `pdbbase`. So a type C would call "not found" (no `.dbd` loaded) is
 /// "declared, unsupported" here whenever the crate vendors its `.dbd`.
 fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) -> RecordFault {
-    if crate::server::record::dbd_generated::record_fields(record_type).is_some() {
-        // C's `printf`, on stdout, tab included.
-        ctx.println("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***");
-        // C's `epicsPrintf`, which is errlog and therefore the error
-        // stream, and which carries its own terminator.
-        crate::runtime::log::errlog_printf(&format!(
-            "dbAllocRecord({name}) with {record_type} rec_size = 0\n"
-        ));
-        return RecordFault::Fatal(format!(
-            "{ERL_ERROR}: Can't create {record_type} record '{name}'"
-        ));
+    let miss = db_loader::record_type_miss(record_type, name);
+    if let Some(line) = miss.stdout {
+        ctx.println(line);
     }
-    RecordFault::Fatal(format!(
-        "{ERL_ERROR}: Record type '{record_type}' for record '{name}' not found"
-    ))
+    if let Some(line) = &miss.errlog {
+        crate::runtime::log::errlog_printf(line);
+    }
+    RecordFault::Fatal(miss.message)
 }
 
 /// Put each field the way C's parser does — one element at a time, so a value
@@ -5720,10 +5674,8 @@ fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) 
 /// unparsable value, a link the syntax check rejects — do the same, rather than
 /// each apply site deciding for itself how much of the file a bad field costs.
 ///
-/// The sentence is C's, built from what this site holds: the record, the field
-/// and the value. C's two remaining slots, `pdbentry->message` and
-/// `errSymLookup(status)`, are produced inside `db_loader` and reach here as a
-/// single `CaError` blob, so the port's own text stands in for both.
+/// The loop and the sentence are `db_loader::apply_fields_one_at_a_time`'s,
+/// shared with `IocBuilder`; this site only decides where the report goes.
 fn apply_fields_one_at_a_time<T: db_loader::LoadTarget + ?Sized>(
     record: &mut T,
     record_name: &str,
@@ -5731,29 +5683,22 @@ fn apply_fields_one_at_a_time<T: db_loader::LoadTarget + ?Sized>(
     common_fields: &mut Vec<(String, EpicsValue)>,
     faults: &mut db_loader::DbFaults,
 ) {
-    for f in fields {
-        let Err(e) = db_loader::apply_fields(record, std::slice::from_ref(f), common_fields) else {
-            continue;
-        };
-        // C's lexer names the line; the parse is over by the time this runs, so
-        // the element's own recorded line takes that seat — as in the screen.
-        faults.seek(f.line, ")");
-        // `dbParseLink` prints while `dbPutString` runs, before
-        // `dbRecordField` reports the status it returned.
-        e.emit_put_report();
-        let value = f.value.as_str_lossy();
-        let line = match e {
-            // `S_dbLib_badField` with no `pdbentry->message`.
-            crate::error::CaError::BadLink(_) => {
-                db_loader::cant_set_line(record_name, &f.name, &value, "", "Bad Field value")
-            }
-            e => format!(
-                "{ERL_ERROR}: Can't set '{record_name}.{}' to '{value}' {e}",
-                f.name
-            ),
-        };
-        faults.report(db_loader::DbDiagnostic::new(line));
-    }
+    db_loader::apply_fields_one_at_a_time(
+        record,
+        record_name,
+        fields,
+        common_fields,
+        |f, e, line| {
+            // C's lexer names the line; the parse is over by the time this
+            // runs, so the element's own recorded line takes that seat — as
+            // in the screen.
+            faults.seek(f.line, ")");
+            // `dbParseLink` prints while `dbPutString` runs, before
+            // `dbRecordField` reports the status it returned.
+            e.emit_put_report();
+            faults.report(db_loader::DbDiagnostic::new(line));
+        },
+    );
 }
 
 /// How C classifies a per-record `.db` failure. `dbRecordHead` and
@@ -5784,7 +5729,7 @@ enum RecordFault {
 async fn install_record_defs(
     ctx: &CommandContext,
     defs: Vec<db_loader::DbRecordDef>,
-    unresolved_aliases: Vec<(String, String)>,
+    unresolved_aliases: Vec<(String, String, u32)>,
     breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
@@ -6010,8 +5955,16 @@ async fn install_record_defs(
             // don't abort the load — the record is already in.
             // For a merge, aliases declared in the new block
             // are also registered (C parser appends).
-            for alias in &def.aliases {
-                install_alias(ctx, alias, &def.name, faults).await;
+            for (alias, &alias_line) in def.aliases.iter().zip(&def.alias_lines) {
+                db_loader::create_alias(
+                    ctx.db(),
+                    alias,
+                    &def.name,
+                    alias_line,
+                    db_records_once_only(),
+                    faults,
+                )
+                .await;
             }
 
             // A record created during THIS load — fresh, or a merge whose
@@ -6135,7 +6088,9 @@ async fn install_record_defs(
             // the `iocshSetError` equivalent, so a startup script fails),
             // but the records already installed stay and the ones after
             // this record are still read.
-            Err(RecordFault::Recoverable(msg)) => faults.recoverable(msg),
+            Err(RecordFault::Recoverable(msg)) => {
+                faults.report_at(def.line, db_loader::DbDiagnostic::new(msg))
+            }
             Err(RecordFault::Fatal(msg)) => {
                 // C `yyerrorAbort(NULL)` (`dbYacc.y:385-389`) is
                 // `yyerror(NULL)` plus `yyAbort = TRUE`: the sentence is
@@ -6147,7 +6102,7 @@ async fn install_record_defs(
                 // without the file, line and source echo the rest carry.
                 // This arm used to `ctx.println` the message instead:
                 // stdout, unframed, and invisible to a `2>` startup log.
-                faults.recoverable(msg);
+                faults.abort_at(def.line, db_loader::DbDiagnostic::new(msg));
                 return Err(DbReadFailure::Rejected);
             }
         }
@@ -6159,12 +6114,23 @@ async fn install_record_defs(
     // means this file's own records are equally visible. A target
     // nothing owns gets C's diagnostic and fails the call's status
     // through the fault owner, leaving every record that parsed installed.
-    for (target, alias) in unresolved_aliases {
+    for (target, alias, alias_line) in unresolved_aliases {
         if ctx.db().get_record(&target).is_none() {
-            faults.recoverable(db_loader::unknown_alias_message(&alias, &target));
+            faults.report_at(
+                alias_line,
+                db_loader::DbDiagnostic::new(db_loader::unknown_alias_message(&alias, &target)),
+            );
             continue;
         }
-        install_alias(ctx, &alias, &target, faults).await;
+        db_loader::create_alias(
+            ctx.db(),
+            &alias,
+            &target,
+            alias_line,
+            db_records_once_only(),
+            faults,
+        )
+        .await;
     }
 
     if faults.is_empty() {
@@ -13552,6 +13518,58 @@ record(ai, "R4") { field(SCAN, "1 second") }
         );
         for name in ["R1", "R2", "R3", "R4"] {
             assert!(exists(&db, &ctx, name), "C's dbl lists {name}");
+        }
+    }
+
+    /// Every refusal class prints C's `dbRecordField` sentence from one
+    /// formatter. The oracle is softIoc R7.0.10.1-DEV's stderr for this very
+    /// file, one class per record: a numeric value `dbPutString` cannot parse
+    /// (C1), an illegal menu choice with its suggestion (C2), a JSON link type
+    /// that is not registered (C3), an lso `VAL` (C4, `DBF_NOACCESS`) and a
+    /// link type spelled in the wrong case (C5, the JSON link table is
+    /// case-sensitive). Every record still loads, the one after them too.
+    #[test]
+    fn every_refused_field_class_prints_c_text_from_one_formatter() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        write_file(
+            dir.path(),
+            "all.db",
+            r#"record(ai, "C1") { field(PREC, "xyz") }
+record(ai, "C2") { field(SCAN, "Passiv") }
+record(ai, "C3") { field(INP, {nosuch:{x:1}}) }
+record(lso, "C4") { field(VAL, "abc") }
+record(ai, "C5") { field(INP, {"CONST":3}) }
+record(ai, "C6") { field(DESC, "ok") }
+"#,
+        );
+        let mut faults = db_loader::DbFaults::default();
+        let read = db_read_database(
+            &ctx,
+            &dir.path().join("all.db").to_string_lossy(),
+            "",
+            "",
+            &mut faults,
+        );
+        assert!(matches!(read, Err(DbReadFailure::Rejected)));
+        let e = ERL_ERROR;
+        assert_eq!(
+            faults.messages(),
+            [
+                format!("{e}: Can't set 'C1.PREC' to 'xyz'  : No digits to convert"),
+                format!(
+                    "{e}: Can't set 'C2.SCAN' to 'Passiv' using menu menuScan : Illegal choice"
+                ),
+                format!("{e}: Can't set 'C3.INP' to '{{nosuch:{{x:1}}}}'  : Bad Field value"),
+                format!(
+                    "{e}: Can't set 'C4.VAL' to 'abc' Can't set array field before iocInit() : Bad Field value"
+                ),
+                format!("{e}: Can't set 'C5.INP' to '{{\"CONST\":3}}'  : Bad Field value"),
+            ]
+        );
+        for name in ["C1", "C2", "C3", "C4", "C5", "C6"] {
+            assert!(exists(&db, &ctx, name), "C keeps {name}");
         }
     }
 

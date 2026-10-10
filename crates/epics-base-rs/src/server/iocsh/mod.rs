@@ -5,6 +5,7 @@ mod access_commands;
 pub(crate) use access_commands::as_init;
 mod breakpoint_commands;
 mod commands;
+pub(crate) use commands::db_records_once_only;
 /// TAB completion for the interactive editor. Host-only, for the same
 /// reason `run_repl_interactive` is: it is built on `rustyline`.
 #[cfg(not(epics_embedded_target))]

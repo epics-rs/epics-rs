@@ -32,7 +32,7 @@ pub fn parse_db_file(
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
     let parsed = parse_db_file_with_breaktables(path, macros, config)?;
-    for (target, alias) in &parsed.unresolved_aliases {
+    for (target, alias, _) in &parsed.unresolved_aliases {
         eprintln!("{}", super::unknown_alias_message(alias, target));
     }
     Ok(parsed.records)

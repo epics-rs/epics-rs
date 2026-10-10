@@ -1502,13 +1502,21 @@ impl IocBuild {
                 .await;
             if total > 0 {
                 if connected == total {
-                    eprintln!("iocInit: {connected}/{total} external links connected");
+                    tracing::info!(
+                        target: "epics_base_rs::ioc_app",
+                        connected,
+                        total,
+                        "iocInit: external links connected"
+                    );
                 } else {
                     let unconnected = db.unconnected_external_links().await;
-                    eprintln!(
-                        "iocInit: {connected}/{total} external links connected after \
-                         {link_wait_secs}s — proceeding without: {}",
-                        unconnected.join(", ")
+                    tracing::info!(
+                        target: "epics_base_rs::ioc_app",
+                        connected,
+                        total,
+                        link_wait_secs,
+                        unconnected = %unconnected.join(", "),
+                        "iocInit: proceeding without unconnected external links"
                     );
                 }
             }

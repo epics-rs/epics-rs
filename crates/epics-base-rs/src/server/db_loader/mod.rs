@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, JsonLexFault};
 use crate::runtime::log::ERL_ERROR;
 use crate::server::record::{FieldDesc, Record, check_link_text};
 use crate::types::{DbfCode, EpicsValue, PvString};
 
 mod include;
+mod json_lex;
 mod source;
 mod substitution;
 #[cfg(test)]
@@ -799,6 +800,11 @@ pub struct DbRecordDef {
     /// Mirrors epics-base PR #336 — alias names are validated with
     /// the same rules as record names.
     pub aliases: Vec<String>,
+    /// The line each of [`Self::aliases`] was read on (C's
+    /// `pinputFileNow->line_num` when `dbRecordAlias` reduces), index for
+    /// index. Pushed only beside `aliases`, at the two places the parser
+    /// adds one, so the vectors cannot drift.
+    pub alias_lines: Vec<u32>,
     /// `info(tag, value)` pairs declared inside the record body.
     /// Mirrors `info` directives in EPICS db files; common tags include
     /// `asyn:READBACK` (asyn upstream PRs #60 / #208), `Q:form`, etc.
@@ -1075,6 +1081,37 @@ impl DbFaults {
                 // is what the two lines below say properly.
                 message.clone()
             }
+            CaError::DbJsonValue {
+                line,
+                faults,
+                syntax_token,
+            } => {
+                // One `yyerrorAbort` per refusal, all parked on the line the
+                // lexer still holds; ` at or before` quotes the first one's
+                // `yytext` and `yy_failed` keeps the later ones to the echo.
+                // The grammar's own `syntax error` is last, and is the
+                // message that is recorded.
+                self.park = Some((*line as u32, syntax_token.clone()));
+                for fault in faults {
+                    let (token, messages) = match fault {
+                        JsonLexFault::Invalid(c) => (c.to_string(), invalid_character_messages(*c)),
+                        JsonLexFault::BadString(text) => (
+                            text.clone(),
+                            vec!["Bad character in JSON string".to_string()],
+                        ),
+                        JsonLexFault::NewlineInString(text) => (
+                            text.clone(),
+                            vec!["Newline in string, closing quote missing".to_string()],
+                        ),
+                    };
+                    for message in messages {
+                        self.park = Some((*line as u32, token.clone()));
+                        self.yyerror(Some(&message));
+                        self.messages.push(message);
+                    }
+                }
+                SYNTAX_ERROR.to_string()
+            }
             _ => {
                 self.park = None;
                 err.to_string()
@@ -1116,6 +1153,26 @@ impl DbFaults {
         }
         self.yyerror(None);
         self.messages.push(message);
+    }
+
+    /// [`Self::report`] for a diagnostic raised after the parse, at a
+    /// line the parse recorded: C's lexer was parked there when the
+    /// action ran. The position is dropped again afterwards, so a later
+    /// diagnostic that seeks for itself is never given this one.
+    pub fn report_at(&mut self, line: u32, diagnostic: DbDiagnostic) {
+        self.seek(line, ")");
+        self.report(diagnostic);
+        self.seek_end();
+    }
+
+    /// C `yyerrorAbort(NULL)`: [`Self::report_at`], then the `syntax error`
+    /// the grammar draws at the EOF the abort makes of the next line read.
+    pub fn abort_at(&mut self, line: u32, diagnostic: DbDiagnostic) {
+        self.seek(line, ")");
+        self.report(diagnostic);
+        self.yyerror(Some(SYNTAX_ERROR));
+        self.messages.push(SYNTAX_ERROR.to_string());
+        self.seek_end();
     }
 
     /// C `yyerror` itself (`dbYacc.y:371-383`), both of its arms.
@@ -1198,6 +1255,11 @@ impl DbFaults {
     /// tests there is now no way to obtain the string at all, so the second
     /// print is unwritable rather than merely discouraged. What production
     /// is allowed to learn is [`Self::is_empty`]: whether the load failed.
+    #[cfg(test)]
+    pub fn messages(&self) -> &[String] {
+        &self.messages
+    }
+
     #[cfg(test)]
     pub fn first_diagnostic(&self) -> Option<String> {
         match self.messages.split_first() {
@@ -1322,7 +1384,7 @@ pub struct ParsedDb {
     /// the target up in `savedPdbbase` — the whole accumulated database
     /// — so only a caller that owns that database can resolve them, and
     /// the parser must not decide their fate on its own.
-    pub unresolved_aliases: Vec<(String, String)>,
+    pub unresolved_aliases: Vec<(String, String, u32)>,
     /// Recoverable failures this text produced (C `yyerror(NULL)`). The
     /// records above are everything that parsed in spite of them; the
     /// caller turns a non-empty set into the load's non-zero status.
@@ -1365,6 +1427,83 @@ pub fn unknown_alias_message(alias: &str, target: &str) -> String {
     format!("{ERL_ERROR}: Alias '{alias}' names an unknown record '{target}'")
 }
 
+/// C `createAlias` (`dbLexRoutines.c:1450-1481`) — the one place an
+/// `alias(...)` reaches the database, from a record body or from the file
+/// scope. `record` is the name C quotes as `dbGetRecordName(pdbentry)`.
+/// Returns true when the alias was refused (C's `yyerror(NULL)`).
+///
+/// An alias name that ALREADY names this same record is neither an error
+/// nor a re-creation: C compares `precnode->aliasedRecnode` after
+/// de-aliasing the target and, when they match, leaves `status` at 0 and
+/// creates nothing. Only `dbRecordsOnceOnly` turns that into an error.
+pub(crate) async fn create_alias(
+    db: &crate::server::database::PvDatabase,
+    alias: &str,
+    record: &str,
+    line: u32,
+    once_only: bool,
+    faults: &mut DbFaults,
+) -> bool {
+    let canonical = db
+        .resolve_alias(record)
+        .unwrap_or_else(|| record.to_string());
+    let refusal = match db.resolve_alias(alias) {
+        Some(already) if already == canonical => {
+            once_only.then(|| format!("Alias '{alias}' already defined; dbRecordsOnceOnly is set."))
+        }
+        Some(other) => Some(format!(
+            "Alias '{alias}' for record '{record}' already aliases '{other}'"
+        )),
+        None if db.get_record_no_resolve(alias).is_some() => Some(format!(
+            "Alias '{alias}' for record '{record}' is already a record name."
+        )),
+        None => db
+            .add_alias(alias, record)
+            .await
+            .err()
+            .map(|e| format!("Alias '{alias}' for record '{record}' rejected: {e}")),
+    };
+    let Some(message) = refusal else {
+        return false;
+    };
+    faults.report_at(line, DbDiagnostic::new(format!("{ERL_ERROR}: {message}")));
+    true
+}
+
+/// What C writes when a record type cannot be instantiated for
+/// `record(type, name)`, and which of its two texts it is.
+pub struct RecordTypeMiss {
+    /// C's `printf` (stdout), tab included.
+    pub stdout: Option<&'static str>,
+    /// C's `epicsPrintf`: errlog, terminator included.
+    pub errlog: Option<String>,
+    /// The `yyerrorAbort` sentence.
+    pub message: String,
+}
+
+/// `dbFindRecordType` failing is `Record type '%s' for record '%s' not
+/// found`; a type the `.dbd` declares but no `recordType` registrar
+/// installed reaches `dbAllocRecord` with `rec_size = 0` and ends in
+/// `Can't create %s record '%s'` (`dbLexRoutines.c:1162-1194`). This port
+/// resolves types from a compile-time table, so "declared" means the
+/// crate vendors the `.dbd`.
+pub fn record_type_miss(record_type: &str, name: &str) -> RecordTypeMiss {
+    if crate::server::record::dbd_generated::record_fields(record_type).is_some() {
+        return RecordTypeMiss {
+            stdout: Some("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***"),
+            errlog: Some(format!(
+                "dbAllocRecord({name}) with {record_type} rec_size = 0\n"
+            )),
+            message: format!("{ERL_ERROR}: Can't create {record_type} record '{name}'"),
+        };
+    }
+    RecordTypeMiss {
+        stdout: None,
+        errlog: None,
+        message: format!("{ERL_ERROR}: Record type '{record_type}' for record '{name}' not found"),
+    }
+}
+
 /// Parse an EPICS .db file with macro substitution.
 ///
 /// The records-only entry point: it has no database to resolve a
@@ -1374,7 +1513,7 @@ pub fn unknown_alias_message(alias: &str, target: &str) -> String {
 /// take [`ParsedDb::unresolved_aliases`] instead and resolve them.
 pub fn parse_db(input: &str, macros: impl Into<MacroDefs>) -> CaResult<Vec<DbRecordDef>> {
     let parsed = parse_db_with_breaktables(input, macros)?.load_status(DB_STRING_SOURCE)?;
-    for (target, alias) in &parsed.unresolved_aliases {
+    for (target, alias, _) in &parsed.unresolved_aliases {
         eprintln!("{}", unknown_alias_message(alias, target));
     }
     Ok(parsed.records)
@@ -1572,7 +1711,7 @@ pub(crate) fn parse_db_expanded(expanded: &str, source: DbSource) -> CaResult<Pa
 struct DbItems {
     records: Vec<DbRecordDef>,
     breaktables: Vec<crate::server::cvt_bpt::BrkTable>,
-    unresolved_aliases: Vec<(String, String)>,
+    unresolved_aliases: Vec<(String, String, u32)>,
     dbd: DbdDefs,
 }
 
@@ -1593,7 +1732,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
     // Standalone `alias("record","newname")` directives (dbYacc.y:275).
     // Resolved against the record list after the full file is parsed
     // so the alias target may appear before or after the directive.
-    let mut global_aliases: Vec<(String, String)> = Vec::new();
+    let mut global_aliases: Vec<(String, String, u32)> = Vec::new();
     let chars: Vec<char> = expanded.chars().collect();
     let mut pos = 0;
     let mut line = 1;
@@ -1654,7 +1793,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
             validate_record_name(&alias_name, line, col)?;
-            global_aliases.push((target, alias_name));
+            global_aliases.push((target, alias_name, line as u32));
             continue;
         }
 
@@ -1840,6 +1979,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         let mut fields = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        let mut alias_lines: Vec<u32> = Vec::new();
         let mut info_tags: Vec<(String, String)> = Vec::new();
         // C `dbYacc.y:237-241`: `record_body: /* empty */` is the FIRST
         // alternative, ahead of `'{' '}'` and `'{' record_field_list '}'`,
@@ -1892,6 +2032,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     expect_char(&chars, &mut pos, &mut col, ')', line)?;
                     validate_record_name(&alias_name, line, col)?;
                     aliases.push(alias_name);
+                    alias_lines.push(line as u32);
                     continue;
                 }
                 if kw == "info" {
@@ -2003,6 +2144,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             name,
             fields,
             aliases,
+            alias_lines,
             info_tags,
             line: head_line,
         });
@@ -2014,10 +2156,13 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
     // `savedPdbbase`, so an earlier `dbLoadRecords` may own it. Hand it
     // to the caller, which is the only party that can see the database.
     let mut unresolved_aliases = Vec::new();
-    for (target, alias_name) in global_aliases {
+    for (target, alias_name, alias_line) in global_aliases {
         match records.iter_mut().find(|r| r.name == target) {
-            Some(rec) => rec.aliases.push(alias_name),
-            None => unresolved_aliases.push((target, alias_name)),
+            Some(rec) => {
+                rec.aliases.push(alias_name);
+                rec.alias_lines.push(alias_line);
+            }
+            None => unresolved_aliases.push((target, alias_name, alias_line)),
         }
     }
 
@@ -2520,65 +2665,26 @@ fn read_json_string(
     ))
 }
 
-/// A brace-delimited JSON field value, returned verbatim (braces included).
-/// Braces inside a JSON string do not nest the value, and a `\` escapes the
-/// next character inside a string.
-fn read_json_value(
-    chars: &[char],
-    pos: &mut usize,
-    line: &mut usize,
-    col: &mut usize,
-) -> CaResult<String> {
-    let start_line = *line;
-    let close = if chars.get(*pos) == Some(&'[') {
-        ']'
-    } else {
-        '}'
-    };
-    let mut s = String::new();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while *pos < chars.len() {
-        let c = chars[*pos];
-        s.push(c);
-        *pos += 1;
-        if c == '\n' {
-            *line += 1;
-            *col = 0;
-        } else {
-            *col += 1;
-        }
-
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' | '[' => depth += 1,
-            '}' | ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(s);
-                }
-            }
-            _ => {}
-        }
+/// The message C's catch-all rule writes for one refused character
+/// (`dbLex.l:143-152`): the character when printable, else its byte as
+/// `%2.2x` of a signed `char` promoted to `int`. A multi-byte character is
+/// several bytes to the lexer and so several messages.
+pub(crate) fn invalid_character_messages(c: char) -> Vec<String> {
+    if c.is_ascii_graphic() || c == ' ' {
+        return vec![format!("Invalid character '{c}'")];
     }
-
-    Err(CaError::DbParseError {
-        line: start_line,
-        token: String::new(),
-        message: format!("unterminated JSON value (missing '{close}')"),
-    })
+    let mut buf = [0u8; 4];
+    c.encode_utf8(&mut buf)
+        .as_bytes()
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                format!("Invalid character '{}'", b as char)
+            } else {
+                format!("Invalid character 0x{:02x}", b as i8 as i32 as u32)
+            }
+        })
+        .collect()
 }
 
 /// A C `tokenSTRING` — the ONE reader for every grammar position `dbYacc.y`
@@ -2646,7 +2752,19 @@ fn read_field_value(
     col: &mut usize,
 ) -> CaResult<PvString> {
     if matches!(chars.get(*pos), Some('"' | '\'')) {
-        return read_json_string(chars, pos, line, col);
+        let at = (*pos, *line, *col);
+        return match read_json_string(chars, pos, line, col) {
+            Ok(v) => json_lex::after_value(chars, pos, line, col).map(|()| v),
+            Err(refused) => {
+                // The string reader names what is wrong with the string; C's
+                // lexer, in `JSON` state, names what it refuses, one fault per
+                // character, and goes on.
+                (*pos, *line, *col) = at;
+                json_lex::read_json_value(chars, pos, line, col)?;
+                (*pos, *line, *col) = at;
+                Err(refused)
+            }
+        };
     }
 
     // JSON value: C's dbLex tokenizes a brace- or bracket-delimited field
@@ -2662,7 +2780,7 @@ fn read_field_value(
     if matches!(chars.get(*pos), Some('{' | '[')) {
         // The brace text is JSON source — ASCII/UTF-8 by construction, and the
         // escapes inside it belong to yajl, not to the `.db` lexer (R19-67).
-        return read_json_value(chars, pos, line, col).map(PvString::from);
+        return json_lex::read_json_value(chars, pos, line, col).map(PvString::from);
     }
 
     // Unquoted value: a C `bareword` (dbLex.l:21) —
@@ -2682,6 +2800,9 @@ fn read_field_value(
         s.push(chars[*pos]);
         *pos += 1;
         *col += 1;
+    }
+    if !s.is_empty() {
+        json_lex::after_value(chars, pos, line, col)?;
     }
     // Skip trailing whitespace before the delimiter.
     while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t' | '\r' | '\n') {
@@ -3119,6 +3240,73 @@ impl LoadTarget for crate::server::record::RecordInstance {
     fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.put_merged_field(field, value)
     }
+}
+
+/// The `dbRecordField` sentence for a field `apply_fields` refused
+/// (`dbLexRoutines.c:1406-1413` @`R7.0.10`), from the one formatter every
+/// refusal class prints through — [`cant_set_line`], as the menu screen does.
+///
+/// C's `pdbentry->message` and `errSymLookup(status)` slots, per class:
+/// a `DBF_NOACCESS` field is `Can't set array field before iocInit()` with
+/// `Bad Field value` (`dbStaticLib.c:2646-2650`), a link `dbParseLink` refused
+/// is `S_dbLib_badField` with no message, and the port's own text stands in
+/// for anything else the applier raises.
+fn field_refusal_line(
+    target: &(impl LoadTarget + ?Sized),
+    record_name: &str,
+    field: &DbFieldDef,
+    err: &CaError,
+) -> String {
+    let upper = field.name.to_uppercase();
+    let record = target.record();
+    let spec = crate::server::record::record_instance::field_desc_of(record, upper.as_str());
+    let detail = if is_declared_no_access(record.record_type(), &upper, spec) {
+        "Can't set array field before iocInit()".to_string()
+    } else if matches!(err, CaError::BadLink(_)) {
+        String::new()
+    } else {
+        err.to_string()
+    };
+    cant_set_line(
+        record_name,
+        &field.name,
+        &field.value.as_str_lossy(),
+        &detail,
+        "Bad Field value",
+    )
+}
+
+/// Put each field the way C's parser does — one element at a time, so a value
+/// the applier refuses costs that FIELD and nothing else.
+///
+/// C reduces one `field(NAME,"value")` at a time, and every failure arm of
+/// `dbRecordField` ends in `yyerror(NULL)` and `return`
+/// (`dbLexRoutines.c:1405-1416`): the record stays, its remaining fields still
+/// load, and only the file's status goes non-zero. `apply_fields` over the
+/// whole slice made the FIRST refusal cost the record and every field behind
+/// it. Splitting the call is sound because `apply_fields` carries nothing
+/// between fields — `check_link_syntax` is per field and `common_fields` is
+/// append-only.
+///
+/// `refused` gets the field, the error and C's sentence for it. Returns
+/// whether any field was refused.
+pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
+    target: &mut T,
+    record_name: &str,
+    fields: &[DbFieldDef],
+    common_fields: &mut Vec<(String, EpicsValue)>,
+    mut refused: impl FnMut(&DbFieldDef, &CaError, String),
+) -> bool {
+    let mut any = false;
+    for f in fields {
+        let Err(e) = apply_fields(target, std::slice::from_ref(f), common_fields) else {
+            continue;
+        };
+        let line = field_refusal_line(target, record_name, f, &e);
+        refused(f, &e, line);
+        any = true;
+    }
+    any
 }
 
 pub fn apply_fields<T: LoadTarget + ?Sized>(
@@ -3658,7 +3846,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
     "#;
         assert!(matches!(
             parse_db(input, &HashMap::new()),
-            Err(CaError::DbParseError { .. })
+            Err(CaError::DbJsonValue { .. })
         ));
     }
 
@@ -3677,14 +3865,16 @@ record(calc, "C:THREE") { field(CALC, "3") }
 
     #[test]
     fn test_quoted_string_newline_aborts() {
-        // a literal newline inside a quoted string (missing
-        // closing quote) is a hard parse error in C (dbLex.l:131-133).
+        // A VALUE is lexed in the `JSON` state, which has no newline rule:
+        // softIoc prints `Invalid character '"'` and `syntax error`
+        // (`dbLex.l:143-155`); `Newline in string` (`:131-133`) is the
+        // `INITIAL` rule for names.
         let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\nline2\")\n}\n";
         let res = parse_db(input, &HashMap::new());
         assert!(
-            matches!(res, Err(CaError::DbParseError { ref message, .. })
-                if message.contains("Newline in string")),
-            "expected newline-in-string abort, got {res:?}"
+            matches!(res, Err(CaError::DbJsonValue { ref faults, .. })
+                if faults == &[JsonLexFault::Invalid('"')]),
+            "expected one Invalid character '\"', got {res:?}"
         );
     }
 
@@ -4816,7 +5006,7 @@ record(ai, "EMPTY") { }
         let parsed = parse_db_with_breaktables(src, &HashMap::new()).unwrap();
         assert_eq!(
             parsed.unresolved_aliases,
-            vec![("NOSUCH".to_string(), "X".to_string())]
+            vec![("NOSUCH".to_string(), "X".to_string(), 2)]
         );
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].name, "KEPT");
@@ -4848,10 +5038,11 @@ record(ai, "EMPTY") { }
 
     #[test]
     fn parse_db_unquoted_value_with_illegal_char_rejected() {
-        // `*` is outside the C bareword set.
+        // `*` is outside the C bareword set: softIoc prints `Invalid character
+        // '*'` then `syntax error`.
         let src = r#"record(ai, "REC") { field(DESC, a*b) }"#;
         let res = parse_db(src, &HashMap::new());
-        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+        assert!(matches!(res, Err(CaError::DbJsonValue { .. })), "{res:?}");
     }
 
     #[test]

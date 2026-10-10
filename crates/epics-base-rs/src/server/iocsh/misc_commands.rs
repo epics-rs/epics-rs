@@ -26,6 +26,7 @@
 //! `iocRun` the second, `iocInit` both.
 
 use super::registry::*;
+use crate::runtime::version::EPICS_RELEASE_VERSION;
 
 /// Register the `miscIocRegister.c` command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
@@ -161,14 +162,11 @@ fn cmd_core_release() -> CommandDef {
 /// The banner lines themselves, so the shell command and the build print one
 /// text.
 ///
-/// C prints five lines: a `#` rule, `epicsReleaseVersion` ("EPICS
-/// R7.0.10.1-DEV"), the two `epicsVCS.h` revision lines, and the rule again.
-/// This port drops the release-version line. epics-rs's release is not the
-/// EPICS Base version, and branding that line `## epics-rs R7.0.10.1-DEV` read
-/// as if the port claimed to BE that C dev build; the base level this tree
-/// tracks is named by `EPICS_VERSION_STRING` (every tool's `-V` banner)
-/// instead. What coreRelease keeps is this build's own revision and date — the
-/// port's real release identity.
+/// C prints five lines: a `#` rule, `epicsReleaseVersion`, the two
+/// `epicsVCS.h` revision lines, and the rule again. The release line is the
+/// C base level this tree ports ([`EPICS_RELEASE_VERSION`]), which is what an
+/// operator or a tool reading the banner compares against; the revision
+/// lines are this build's own stamp.
 ///
 /// C has one `coreRelease()` and calls it from both places — the iocsh
 /// command and `iocBuild_1` (`iocInit.c:147`) — and the port had the wording
@@ -176,10 +174,11 @@ fn cmd_core_release() -> CommandDef {
 /// without a second copy. The command still renders through the iocsh
 /// context so a redirection applies to it; the build writes stdout, as C's
 /// `printf` does.
-pub(crate) fn core_release_block() -> [String; 4] {
+pub(crate) fn core_release_block() -> [String; 5] {
     let rule = "#".repeat(76);
     [
         rule.clone(),
+        format!("## {EPICS_RELEASE_VERSION}"),
         format!("## Rev. {VCS_VERSION}"),
         format!("## Rev. Date {VCS_VERSION_DATE}"),
         rule,
@@ -394,31 +393,24 @@ mod tests {
 
     /// C `coreRelease` prints five lines: a 76-`#` rule, `epicsReleaseVersion`,
     /// the two revision lines, and the rule again (`misc/epicsRelease.c:23-27`).
-    /// This port drops the `epicsReleaseVersion` line — epics-rs's release is
-    /// not the base version — so coreRelease prints four: the rule, the two
-    /// revision lines, the rule.
+    /// The release line is C's `## EPICS R7.0.10.1-DEV` (softIoc 8f5015b66).
     #[test]
-    fn core_release_prints_four_lines_without_the_base_version() {
+    fn core_release_prints_five_lines() {
         let ctx = make_ctx();
         let (out, failed) = run(&ctx, "coreRelease", &[]);
         assert!(!failed, "coreRelease never fails in C");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4, "the base-version line is dropped: {out:?}");
+        assert_eq!(lines.len(), 5, "{out:?}");
         assert_eq!(lines[0], "#".repeat(76));
-        assert_eq!(lines[3], "#".repeat(76));
-        assert_eq!(lines[1], format!("## Rev. {VCS_VERSION}"));
-        assert_eq!(lines[2], format!("## Rev. Date {VCS_VERSION_DATE}"));
-        // No remaining line states a release version: the dropped line was the
-        // only "epics-rs …" identity line, and no line carries the base token.
-        assert!(
-            !out.contains("epics-rs") && !out.contains("R7.0.10"),
-            "the base-version identity line is gone: {out:?}"
-        );
+        assert_eq!(lines[4], "#".repeat(76));
+        assert_eq!(lines[1], "## EPICS R7.0.10.1-DEV");
+        assert_eq!(lines[2], format!("## Rev. {VCS_VERSION}"));
+        assert_eq!(lines[3], format!("## Rev. Date {VCS_VERSION_DATE}"));
         // The stamp reaches the line: neither renders as a bare label the
         // way `## Rev. Date ` did before `build.rs` filled the pair.
-        assert!(lines[1].len() > "## Rev. ".len(), "empty revision: {out:?}");
+        assert!(lines[2].len() > "## Rev. ".len(), "empty revision: {out:?}");
         assert!(
-            lines[2].len() > "## Rev. Date ".len(),
+            lines[3].len() > "## Rev. Date ".len(),
             "empty date: {out:?}"
         );
     }

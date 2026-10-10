@@ -344,9 +344,11 @@ impl CaServerBuilder {
         // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
         // via cas_server_port() at builder construction.
         let tcp_port = self.tcp_port.unwrap_or(self.port);
+        let ephemeral_requested = self.port == 0 || tcp_port == 0;
         let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
         let server = CaServer {
             db,
+            ephemeral_requested,
             port: udp.port(),
             tcp_port: tcp.port(),
             tcp,
@@ -475,6 +477,10 @@ async fn bind_sockets(
 
 pub struct CaServer {
     db: Arc<PvDatabase>,
+    /// A port of 0 was asked for outright (`softioc-rs --port 0`), which C
+    /// cannot express; the bound numbers are then the caller's only way to
+    /// learn them and `run()` reports them.
+    ephemeral_requested: bool,
     /// UDP discovery port actually bound by the search responders in
     /// `udp` — the port clients SEARCH on. Equal to the configured port,
     /// or the kernel-assigned one when 0 was requested.
@@ -1281,14 +1287,16 @@ impl CaServer {
         let tcp_abort = tcp_handle.abort_handle();
 
         let udp_cfg = addr_list::from_env()?;
-        // C's RSRV announces nothing here, so this line is the port's own —
-        // and it goes through the errlog for the same reason every C boot
-        // line does: `eltc 0` must be able to silence the console. As a raw
-        // `eprintln!` it survived `eltc 0` where every C line vanished.
-        epics_base_rs::runtime::log::errlog_printf(&format!(
-            "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
-            udp_cfg.beacon_addrs.len()
-        ));
+        // C's RSRV announces nothing here, so a configured port stays silent
+        // and stderr carries only C's own lines. `--port 0` has no C
+        // counterpart and a caller must be able to read the ports it got;
+        // that report goes through the errlog so `eltc 0` silences it.
+        if self.ephemeral_requested {
+            epics_base_rs::runtime::log::errlog_printf(&format!(
+                "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
+                udp_cfg.beacon_addrs.len()
+            ));
+        }
 
         // mDNS announce: held for the lifetime of run(). Drops when
         // the function returns, deregistering us from the network.

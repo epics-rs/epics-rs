@@ -101,20 +101,16 @@ fn run(script_body: &str) -> (String, String) {
     )
 }
 
-/// The banner's two `Rev.` lines carry this tree's own VCS stamp, as C's carry
-/// C's, so its shape is what can be asserted. The port drops C's
-/// `epicsReleaseVersion` line — epics-rs's release is not the base version —
-/// so four lines print where C prints five.
+/// The banner is C's five lines: the rule, the release line, the two `Rev.`
+/// lines (this tree's own VCS stamp, as C's carry C's), the rule. The release
+/// line is softIoc 8f5015b66's `## EPICS R7.0.10.1-DEV`.
 fn assert_banner(lines: &[&str], out: &str) {
-    assert_eq!(lines.len(), 4, "stdout was {out:?}");
+    assert_eq!(lines.len(), 5, "stdout was {out:?}");
     assert!(lines[0].starts_with("###"), "stdout was {out:?}");
-    assert!(lines[1].starts_with("## Rev. "), "stdout was {out:?}");
-    assert!(lines[2].starts_with("## Rev. Date "), "stdout was {out:?}");
-    assert!(lines[3].starts_with("###"), "stdout was {out:?}");
-    assert!(
-        !lines.iter().any(|l| l.contains("epics-rs")),
-        "the base-version identity line is dropped: {out:?}"
-    );
+    assert_eq!(lines[1], "## EPICS R7.0.10.1-DEV", "stdout was {out:?}");
+    assert!(lines[2].starts_with("## Rev. "), "stdout was {out:?}");
+    assert!(lines[3].starts_with("## Rev. Date "), "stdout was {out:?}");
+    assert!(lines[4].starts_with("###"), "stdout was {out:?}");
 }
 
 /// `iocBuild` then `iocRun`: C's banner lands between the two echoes and the

@@ -101,6 +101,7 @@ fn a_record_built_by_hand_has_no_line() {
         name: "R1".into(),
         fields: vec![DbFieldDef::new("DESC", "x")],
         aliases: Vec::new(),
+        alias_lines: Vec::new(),
         info_tags: Vec::new(),
         line: 0,
     };

@@ -184,12 +184,11 @@ fn max_search_period_below_lower_limit_is_named() {
 #[test]
 fn beacon_period_reject_is_diagnosed_once_per_process() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .args(["-S", "--pv", "R16-18:PV:double:1.0"])
+        .args(["-S", "--port", "0", "--pv", "R16-18:PV:double:1.0"])
         // Keep the IOC off the network: loopback interface, loopback beacon
         // target, and a port the harness picks nothing else on.
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CAS_BEACON_PERIOD", "garbage")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

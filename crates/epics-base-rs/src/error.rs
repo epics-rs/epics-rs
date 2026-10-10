@@ -1,5 +1,19 @@
 use thiserror::Error;
 
+/// One `yyerrorAbort` from the `.db` lexer's `JSON` start condition
+/// (`dbLex.l:136-155`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonLexFault {
+    /// `Invalid character '%c'`; carries the character.
+    Invalid(char),
+    /// `Bad character in JSON string`; carries the whole string, quotes included.
+    BadString(String),
+    /// `Newline in string, closing quote missing` (`dbLex.l:131-133`), the
+    /// `INITIAL`-state rule the lookahead token after a value can draw; carries
+    /// the text through the newline it consumed.
+    NewlineInString(String),
+}
+
 #[derive(Error, Debug)]
 pub enum CaError {
     #[error("I/O error: {0}")]
@@ -90,6 +104,19 @@ pub enum CaError {
         line: usize,
         token: String,
         message: String,
+    },
+
+    /// A field value the `.db` lexer's `JSON` start condition or the
+    /// `json_value` grammar refused. `faults` are the `yyerrorAbort`s in the
+    /// order the lexer met them, all on `line`; `syntax_token` is `yytext` of
+    /// the token the grammar rejected, and is only quoted when no fault
+    /// came first. C then prints `syntax error`. Rendered by
+    /// [`crate::server::db_loader::DbFaults::abort`].
+    #[error("DB parse error at line {line}: invalid JSON value")]
+    DbJsonValue {
+        line: usize,
+        faults: Vec<JsonLexFault>,
+        syntax_token: String,
     },
 
     /// C `dbLoadRecords` returning non-zero after `yyerror(NULL)`

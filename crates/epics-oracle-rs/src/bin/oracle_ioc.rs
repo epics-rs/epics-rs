@@ -57,6 +57,18 @@ struct Args {
     /// so a reading is always attributable to the server that answered it.
     #[arg(long)]
     pva: bool,
+
+    /// A `NAME=VALUE` substitution for the `.db`, repeatable — the macro
+    /// string the C oracle's `st-*.cmd` hands `dbLoadRecords` (`P=`).
+    #[arg(long = "macro", value_parser = parse_macro)]
+    macros: Vec<(String, String)>,
+}
+
+fn parse_macro(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=VALUE"))?;
+    Ok((name.to_string(), value.to_string()))
 }
 
 #[cfg(tokio_backend)]
@@ -78,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db_path = args.db.to_string_lossy().to_string();
-    let macros: HashMap<String, String> = HashMap::new();
+    let macros: HashMap<String, String> = args.macros.into_iter().collect();
 
     // Register the asyn port BEFORE `build()`. The asyn record's `init_record`
     // (pass 0) runs `connectDevice`, which resolves PORT ("ORACLEASYN") out of

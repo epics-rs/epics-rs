@@ -17,6 +17,8 @@ epics-pva-rs = { workspace = true }
 # The asyn record + a null port so the oracle's asyn reproducer has a named
 # port to attach to (C's asynRecord refuses to init against an empty PORT).
 asyn-rs = { workspace = true }
+# optics' `table` record, which the C side loads into oracleTableIoc.
+optics-rs = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

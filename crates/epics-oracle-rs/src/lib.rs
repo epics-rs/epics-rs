@@ -236,10 +236,10 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
 ///
 /// `asyn` is routed to asyn-rs's full `AsynRecord` rather than epics-base-rs's
 /// CNCT-only display stub; see [`register_port_ioc_devices`] for why that
-/// record type's two halves must stay together. The other six are synApps
+/// record type's two halves must stay together. The next six are synApps
 /// `calc`'s (`aCalcout`, `sCalcout`, `sseq`, `swait`, `transform`) and busy's,
 /// implemented in `epics-base-rs` but outside `stdRecords.dbd`, so base leaves
-/// them to the application. Registering them here is what keeps the oracle's
+/// them to the application; `table` is optics-rs's, as in `oracleTableIoc`. Registering them here is what keeps the oracle's
 /// denominator the fat IOC's record set instead of bare base's — the boot probe
 /// reports any type the port cannot build, so dropping one shows up as
 /// "unimplemented", not as silent agreement.
@@ -250,6 +250,7 @@ pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
     };
 
     let (asyn_type, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
+    let (table_type, table_factory) = optics_rs::table_record_factory();
     epics_base_rs::server::ioc_builder::IocBuilder::new()
         .register_record_type(asyn_type, asyn_factory)
         .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
@@ -257,6 +258,7 @@ pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .register_record_type("sseq", || Box::new(SseqRecord::default()))
         .register_record_type("swait", || Box::new(SwaitRecord::default()))
+        .register_record_type(table_type, table_factory)
         .register_record_type("transform", || Box::new(TransformRecord::default()))
 }
 

@@ -13,8 +13,10 @@
 //! ```
 //!
 //! then W1-W3 LINK/INVALID, A.SUBL and C.INPA still "", WF.NELM 4. Each line
-//! is the OUT link's, made inside W's cycle; the port prints it once the
-//! put's hold is down.
+//! is the OUT link's, printed inside W's cycle. A cycle that refuses twice
+//! prints both: `ao W5 OUT "WF.NELM" FLNK W6`, `ao W6 OUT "A.SUBL"`,
+//! `dfanout DF OUTA "WF.NELM" OUTB "A.SUBL"` and `seq SQ` (SELM All, LNK1
+//! `WF.NELM`, LNK2 `A.SUBL`) each print the WF.NELM line, then A.SUBL's.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -47,6 +49,14 @@ record(waveform, "WF") { field(NELM, "4") }
 record(ao, "W3") { field(OUT, "WF.NELM") }
 record(bo, "B") { field(ZNAM, "Off") field(ONAM, "On") }
 record(stringout, "W4") { field(OUT, "B.VAL") }
+record(ao, "W6") { field(OUT, "A.SUBL") }
+record(ao, "W5") { field(OUT, "WF.NELM") field(FLNK, "W6") }
+record(dfanout, "DF") { field(OUTA, "WF.NELM") field(OUTB, "A.SUBL") }
+record(seq, "SQ") {
+    field(SELM, "All")
+    field(DOL1, "7") field(LNK1, "WF.NELM")
+    field(DOL2, "8") field(LNK2, "A.SUBL")
+}
 "#,
             &HashMap::new(),
         )
@@ -99,12 +109,28 @@ record(stringout, "W4") { field(OUT, "B.VAL") }
     assert_eq!(heard(), [CHOICE]);
     assert_eq!(db.get_pv("B.VAL").unwrap().to_f64(), Some(0.0), "B kept");
 
-    // A scan's cycle: the frame that took the gate prints once it is down.
+    // A scan's cycle prints the same line.
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W3", &mut visited)
         .await
         .unwrap();
     assert_eq!(heard(), [NOMOD]);
+
+    for (rec, field, v) in [("W5", "VAL", 5.0), ("DF", "VAL", 6.0), ("SQ", "PROC", 1.0)] {
+        db.put_record_field_from_ca(rec, field, EpicsValue::Double(v))
+            .await
+            .unwrap();
+        // seq writes its links from a callback, after the put returns.
+        let mut said = heard();
+        for _ in 0..100 {
+            if said.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            said.extend(heard());
+        }
+        assert_eq!(said, [NOMOD.to_string(), line("A.SUBL")], "{rec}");
+    }
 
     // The other `dbPut` body answers the same status and print.
     for pv in ["A.SUBL", "C.INPA"] {

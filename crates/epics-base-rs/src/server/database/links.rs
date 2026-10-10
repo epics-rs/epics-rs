@@ -2515,9 +2515,9 @@ impl PvDatabase {
         // tail (`recGblFwdLink` → `dbNotifyCompletion`), so a target whose park
         // this releases replays on its next cycle and an NPP link — `gate` is
         // `None` below — leaves it parked, exactly as C does.
-        // A cycle's write has no put gate to drop: a refusal's report is owed
-        // to the chain's hold owner, and `special()`'s after-gate work is
-        // discarded.
+        // A cycle's write has no put gate to drop: a refusal's report prints
+        // here, under the cycle's hold as in C, and `special()`'s after-gate
+        // work is discarded.
         let mut tail = super::field_io::PutTail::default();
         let put_result = match (&addr, shadow) {
             (Some(at), _) => {
@@ -2530,13 +2530,9 @@ impl PvDatabase {
             }
             (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut tail),
         };
-        if let Some(report) = tail.take_report() {
+        if tail.has_report() {
             let record = addr.as_ref().map_or(target.record.as_str(), |at| &at.name);
-            visited.owe_report(super::field_io::CycleReport::new(
-                record,
-                &target.field,
-                report,
-            ));
+            self.emit_cycle_report(record, &target.field, tail);
         }
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE

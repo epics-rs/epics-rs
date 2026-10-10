@@ -539,47 +539,15 @@ fn report_add_record_refusal(link: &mut Option<PreparedCommonLink>, record_name:
 /// for a print C makes under `dbScanLock`. Every put entry keeps one on its
 /// frame, hands it to the body, and settles it through
 /// `PvDatabase::settle_put`, the one place that runs the work and prints the
-/// report. A put inside a process cycle has no gate of its own to drop: its
-/// report goes to the chain's [`CycleReport`] slot and its work is discarded.
+/// report. A put inside a process cycle has no gate to drop: it prints the
+/// report in place ([`PvDatabase::emit_cycle_report`]) and discards the work.
 #[derive(Default)]
 pub(crate) struct PutTail {
     after: Option<AfterGate>,
     report: Option<PutReport>,
-    /// What the cycle this put drove left in its chain's slot.
-    cycle: Option<CycleReport>,
-}
-
-/// A refused `dbPut` made by a DB OUT link inside a process cycle, which C
-/// prints under the cycle's lock: the target as the link addressed it, and the
-/// report. Fixed-size, so the store under the hold allocates nothing.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CycleReport {
-    record: crate::server::recgbl::ReportText,
-    field: crate::server::recgbl::ReportString,
-    report: PutReport,
-}
-
-impl CycleReport {
-    pub(crate) fn new(record: &str, field: &str, report: PutReport) -> Self {
-        Self {
-            record: crate::server::recgbl::ReportText::new(record),
-            field: crate::server::recgbl::ReportString::new(field),
-            report,
-        }
-    }
 }
 
 impl PutTail {
-    /// Take the report the cycle this put drove left in `visited`.
-    pub(crate) fn owe_cycle(&mut self, visited: &mut crate::server::database::ProcStack) {
-        self.cycle = visited.take_report();
-    }
-
-    /// The put's report, for a cycle's link `dbPut` to move into its chain.
-    pub(crate) fn take_report(&mut self) -> Option<PutReport> {
-        self.report.take()
-    }
-
     /// Store the put's report. C's `dbPut` reports once (see [`PutReport`]),
     /// so a second one is a maker's bug.
     fn report(&mut self, report: PutReport) {
@@ -589,6 +557,11 @@ impl PutTail {
             self.report
         );
         self.report = Some(report);
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_report(&self) -> bool {
+        self.report.is_some()
     }
 }
 
@@ -2665,9 +2638,6 @@ impl PvDatabase {
         if let Some(report) = tail.report {
             self.emit_put_report(record_name, field, report);
         }
-        if let Some(cycle) = tail.cycle {
-            self.emit_cycle_report(cycle);
-        }
         if ok {
             if link_text
                 && self.get_record(record_name).is_some_and(|rec| {
@@ -2685,6 +2655,16 @@ impl PvDatabase {
         }
     }
 
+    /// Print the report of a put made inside a process cycle, under the
+    /// cycle's hold, as C prints it under `dbScanLock`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn emit_cycle_report(&self, record_name: &str, field: &str, tail: PutTail) {
+        if let Some(report) = tail.report {
+            self.emit_put_report(record_name, field, report);
+        }
+    }
+
     /// Print the report a put made under its hold, naming the record as C's
     /// `prec->name` does: canonical, whatever alias the put used.
     #[cold]
@@ -2693,14 +2673,6 @@ impl PvDatabase {
         let canonical = self.lookup_record(record_name).map(|(name, _)| name);
         let name = canonical.as_deref().unwrap_or(record_name);
         report.emit(name, &field.to_ascii_uppercase());
-    }
-
-    /// Print what a cycle's link `dbPut` refused, once its chain's hold is
-    /// down.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn emit_cycle_report(&self, cycle: CycleReport) {
-        self.emit_put_report(cycle.record.as_str(), cycle.field.as_str(), cycle.report);
     }
 
     /// The one router for an EXTERNAL client PUT that carries pvxs's
@@ -2917,20 +2889,14 @@ impl PvDatabase {
         // on a slot it did not fill, `take` this client's wait-set and `leave`
         // it -- firing a `block=true` completion for a cycle the client never
         // requested, and leaving this one to run unarmed.
-        let mut tail = PutTail::default();
         let installed = {
             let _record_gate = self.acquire_put_gate(record_name, "", None);
             self.install_notify_and_process_already_locked(
                 record_name,
                 completion_tx,
                 NotifyArrival::Fresh,
-                &mut tail,
             )
-        };
-        if let Some(cycle) = tail.cycle {
-            self.emit_cycle_report(cycle);
-        }
-        let installed = installed?;
+        }?;
         // The wait-set fires the oneshot only after the whole FLNK/OUT chain
         // (sync + async) settles. Already-completed ==> fully synchronous ==>
         // report immediate success. Queued (`None`) or still pending ==> hand
@@ -2987,28 +2953,13 @@ impl PvDatabase {
     /// The PACT (RPRO) branch is success, as it is in C: `dbPutField` returns
     /// the `dbProcess` status only on the branch that ran it.
     pub async fn put_driven_process(&self, record_name: &str) -> CaResult<()> {
-        let mut tail = PutTail::default();
-        let processed = {
-            let _record_gate = self.acquire_put_gate(record_name, "", None);
-            self.put_driven_process_into(record_name, &mut tail)
-        };
-        if let Some(cycle) = tail.cycle {
-            self.emit_cycle_report(cycle);
-        }
-        processed
+        let _record_gate = self.acquire_put_gate(record_name, "", None);
+        self.put_driven_process_already_locked(record_name)
     }
 
     /// [`Self::put_driven_process`] for a caller that already owns the
-    /// record's advisory write gate. The gate-held body — no `.await`. The
-    /// caller's hold outlives this call, so a report the cycle owes is
-    /// discarded.
+    /// record's advisory write gate. The gate-held body — no `.await`.
     pub fn put_driven_process_already_locked(&self, record_name: &str) -> CaResult<()> {
-        self.put_driven_process_into(record_name, &mut PutTail::default())
-    }
-
-    /// [`Self::put_driven_process_already_locked`] for a put that settles
-    /// `tail` once its gate is down.
-    fn put_driven_process_into(&self, record_name: &str, tail: &mut PutTail) -> CaResult<()> {
         {
             let Some(rec) = self.get_record(record_name) else {
                 return Ok(());
@@ -3021,9 +2972,7 @@ impl PvDatabase {
             instance.common.putf = true;
         }
         let mut visited = crate::server::database::ProcStack::new();
-        let processed = self.process_record_with_links_already_locked(record_name, &mut visited);
-        tail.owe_cycle(&mut visited);
-        processed
+        self.process_record_with_links_already_locked(record_name, &mut visited)
     }
 
     /// C `restartCheck` (dbNotify.c:149-170) plus the restarted
@@ -3077,17 +3026,11 @@ impl PvDatabase {
                 // alone. The gate is already held, so this takes the
                 // already-locked entry.
                 crate::server::record::DeferredNotify::Process { completion } => {
-                    let mut tail = PutTail::default();
                     let _ = self.install_notify_and_process_already_locked(
                         record_name,
                         completion,
                         NotifyArrival::Replay,
-                        &mut tail,
                     );
-                    drop(_record_gate);
-                    if let Some(cycle) = tail.cycle {
-                        self.emit_cycle_report(cycle);
-                    }
                     return;
                 }
             }
@@ -3117,7 +3060,6 @@ impl PvDatabase {
         record_name: &str,
         completion: crate::runtime::sync::oneshot::Sender<()>,
         arrival: NotifyArrival,
-        tail: &mut PutTail,
     ) -> CaResult<Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>> {
         // Collect-then-act: clone the handle under a brief map read, drop the
         // map lock before taking the per-record write lock.
@@ -3149,9 +3091,7 @@ impl PvDatabase {
             }
         };
         let mut visited = crate::server::database::ProcStack::new();
-        let processed = self.process_record_with_links_already_locked(record_name, &mut visited);
-        tail.owe_cycle(&mut visited);
-        processed?;
+        self.process_record_with_links_already_locked(record_name, &mut visited)?;
         Ok(Some(notify))
     }
 
@@ -3495,7 +3435,7 @@ impl PvDatabase {
                     if let Some((c, _rx)) = claim.take() {
                         c.commit_without_waiting();
                     }
-                    let _ = self.put_driven_process_into(record_name, tail);
+                    let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
@@ -3516,7 +3456,7 @@ impl PvDatabase {
             // when `acquire_gate`, and the caller (an atomic group PUT) holds it
             // when not. The gate is not reentrant, so acquiring it again
             // here deadlocks every PROC put.
-            let _ = self.put_driven_process_into(record_name, tail);
+            let _ = self.put_driven_process_already_locked(record_name);
             // The wait-set fires the oneshot only after the whole
             // FLNK/OUT chain (sync + async) settles. If it has
             // already completed the chain was fully synchronous —
@@ -3794,7 +3734,7 @@ impl PvDatabase {
                     if let Some((c, _rx)) = claim.take() {
                         c.commit_without_waiting();
                     }
-                    let _ = self.put_driven_process_into(record_name, tail);
+                    let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
@@ -3922,7 +3862,7 @@ impl PvDatabase {
         // Process the record after field put — through the single owner of C's
         // `dbPutField:1268-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
-        let _ = self.put_driven_process_into(record_name, tail);
+        let _ = self.put_driven_process_already_locked(record_name);
 
         // Is the ORIGINATING record itself still async-pending? Its
         // wait-set membership is taken + `leave`d at its own completion
@@ -4931,8 +4871,7 @@ mod tests {
             db.install_notify_and_process_already_locked(
                 "REPLAY:TAKEN",
                 client_tx,
-                NotifyArrival::Replay,
-                &mut super::PutTail::default(),
+                NotifyArrival::Replay
             )
             .expect("the record is loaded")
             .is_none(),
@@ -5170,8 +5109,7 @@ mod tests {
             db.install_notify_and_process_already_locked(
                 "REPLAY:FREE",
                 client_tx,
-                NotifyArrival::Replay,
-                &mut super::PutTail::default(),
+                NotifyArrival::Replay
             )
             .expect("the record is loaded")
             .is_some(),

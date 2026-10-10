@@ -877,9 +877,9 @@ pub fn rec_gbl_bad_dbrtype(
 ///   [`ChoiceRefusal`](crate::error::ChoiceRefusal) and the put body moves it
 ///   into the put frame.
 ///
-/// A put made inside a process cycle (a DB OUT link's `dbPut`) has no hold of
-/// its own; its report is owed to the chain's hold owner as a
-/// `CycleReport`.
+/// A put made inside a process cycle (a DB OUT link's `dbPut`) has no hold to
+/// drop before the cycle ends; its report prints in place, under the cycle's
+/// hold, as C's does under `dbScanLock`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutReport {
     /// `recGblRecordError(status, prec, message)` (`recGbl.c:59-71`), then

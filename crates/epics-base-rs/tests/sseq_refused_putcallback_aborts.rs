@@ -34,6 +34,11 @@
 //! that never
 //! resolved a class takes C's `default:` arm instead, makes no put at all and
 //! raises nothing — that boundary is `sseq_unresolved_lnk_no_wait.rs`.
+//!
+//! The line is C's `printf`, on stdout: oracleIoc (calc 3-7-5 sseq) with LNK1
+//! `T1 CA` into a second IOC's `ASG RO` record prints, on `dbpf SQ.PROC 1`,
+//! `sseq:processCallback: dbCaPutLinkCallback for link 0 failed.  Aborting.`
+//! to stdout and nothing to stderr.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,6 +211,41 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
         EpicsValue::Short(0),
         "and `asyncFinish` clears it again"
     );
+}
+
+/// The refusal's line goes to stdout, as C's `printf` does.
+#[cfg(unix)]
+#[epics_macros_rs::epics_test]
+async fn the_refusal_is_printed_on_stdout() {
+    use std::os::fd::AsRawFd;
+
+    let db = PvDatabase::new();
+    three_step_sseq(&db, "SS_OUT", PutAdmission::Refused).await;
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let err = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs this test in its own process; nothing else holds
+    // fds 1 and 2 while they are swapped.
+    let saved = unsafe {
+        let saved = (libc::dup(1), libc::dup(2));
+        libc::dup2(out.as_file().as_raw_fd(), 1);
+        libc::dup2(err.as_file().as_raw_fd(), 2);
+        saved
+    };
+    kick(&db, "SS_OUT").await;
+    poll_short(&db, "SS_OUT.BUSY", 0, "the aborted sequence must finish").await;
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    // SAFETY: restoring the descriptors this test replaced.
+    unsafe {
+        libc::dup2(saved.0, 1);
+        libc::dup2(saved.1, 2);
+        libc::close(saved.0);
+        libc::close(saved.1);
+    }
+    let line = "sseq:processCallback: dbCaPutLinkCallback for link 0 failed.  Aborting.";
+    let out = std::fs::read_to_string(out.path()).unwrap();
+    let err = std::fs::read_to_string(err.path()).unwrap();
+    assert!(out.lines().any(|l| l == line), "stdout: {out:?}");
+    assert!(!err.contains(line), "stderr: {err:?}");
 }
 
 /// The counter-boundary, so the fix cannot be "never dispatch": the same

@@ -875,7 +875,7 @@ impl SseqRecord {
         if !admitted {
             self.abort = 1;
             live.push(("ABORT".to_string(), EpicsValue::Short(1)));
-            eprintln!("sseq:processCallback: dbCaPutLinkCallback for link {i} failed.  Aborting.");
+            println!("sseq:processCallback: dbCaPutLinkCallback for link {i} failed.  Aborting.");
             return false;
         }
         self.steps[i].waiting = 1;

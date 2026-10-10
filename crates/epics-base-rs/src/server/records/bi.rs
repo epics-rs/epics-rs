@@ -260,10 +260,10 @@ impl Record for BiRecord {
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
     /// is the LABEL list's, not this read's.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::binary_enum_string_form(
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Binary([
             &self.znam, &self.onam,
-        ))
+        ]))
     }
 
     /// `devBiSoft.c:50` reads INP as `DBR_USHORT`, `devBiSoftRaw.c:50` as

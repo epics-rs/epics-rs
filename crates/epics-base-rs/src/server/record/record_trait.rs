@@ -7,6 +7,43 @@ use super::alarm::{AlarmLimit, AlarmSeverity};
 use super::scan::ScanType;
 use crate::server::device_support::DsetInit;
 
+/// A `DBF_ENUM` `VAL`'s `get_enum_str` slots, borrowed from the record. The
+/// variant carries C's out-of-range sentinel, whose spelling differs by class
+/// (`boRecord.c:320-339` vs `mbbiRecord.c:235-255`).
+#[derive(Debug, Clone, Copy)]
+pub enum EnumSlots<'a> {
+    /// `ZNAM`, `ONAM`: bi, bo, busy.
+    Binary([&'a PvString; 2]),
+    /// `ZRST`..`FFST`: mbbi, mbbo.
+    Multibit([&'a PvString; 16]),
+}
+
+impl<'a> EnumSlots<'a> {
+    fn parts(&self) -> (&[&'a PvString], &'static str) {
+        match self {
+            Self::Binary(slots) => (slots, "Illegal_Value"),
+            Self::Multibit(slots) => (slots, "Illegal Value"),
+        }
+    }
+
+    /// The slot at `idx`, empty or not; past the slots, the sentinel.
+    pub fn label(self, idx: u16) -> &'a [u8] {
+        let (slots, sentinel) = self.parts();
+        match slots.get(idx as usize) {
+            Some(slot) => slot.as_bytes(),
+            None => sentinel.as_bytes(),
+        }
+    }
+
+    pub fn form(self) -> crate::server::snapshot::EnumStringForm {
+        let (slots, sentinel) = self.parts();
+        crate::server::snapshot::EnumStringForm::states(
+            slots.iter().map(|slot| (*slot).clone()).collect(),
+            PvString::from(sentinel),
+        )
+    }
+}
+
 /// Which of a `devXxxSoftRaw` dset's two entry points is delivering a value to
 /// [`Record::raw_soft_input`]. They are not the same function in C, and they do
 /// not agree about `MASK`.
@@ -2956,12 +2993,16 @@ pub trait Record: Send + Sync + 'static {
     /// `mbbi` with `ZRST`/`ONST` set answers `caget -t` with `""` at `VAL=5` and
     /// `"Illegal Value"` at `VAL=20`.
     ///
+    /// The slots, borrowed, are the one overridable answer: the CA form
+    /// ([`EnumSlots::form`]) and a link read's label ([`EnumSlots::label`]) are
+    /// both derived from them, so the two cannot disagree.
+    ///
     /// `None` — the record leaves the rset slot NULL (`#define get_enum_str
     /// NULL`), which is every record but `bi`/`bo`/`mbbi`/`mbbo`. A field on
     /// such a record renders from its menu instead; see
     /// `RecordInstance::enum_string_form_for`,
     /// the single owner that picks between the two.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+    fn enum_slots(&self) -> Option<EnumSlots<'_>> {
         None
     }
 

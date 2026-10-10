@@ -528,8 +528,8 @@ impl Record for MbbiRecord {
     /// non-empty state because `no_str` says how many labels are meaningful —
     /// that trim must never reach this read, or an undefined state comes back
     /// as its index, which no C IOC emits.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::multibit_enum_string_form([
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Multibit([
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,

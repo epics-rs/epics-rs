@@ -21,8 +21,8 @@ use super::common_fields::{BkptFlag, CommonFields};
 use super::link::{LinkFieldType, ParsedLink, parse_link_field, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
-    AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, InputLinkRequest, LinkReadAs,
-    ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, EnumSlots, FieldDeclaration, FieldDesc, InputLinkRequest,
+    LinkReadAs, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -5642,7 +5642,7 @@ impl RecordInstance {
     ///   whose `VAL` is an enum (`bo.OMSL`) must render its menu's choices, not
     ///   the record's `ZNAM`/`ONAM`.
     /// * `DBF_ENUM` `VAL` -> `getEnumString` -> the record's `get_enum_str`
-    ///   rset ([`Record::enum_string_form`]).
+    ///   rset ([`Record::enum_slots`]).
     ///
     /// `None` when the field has neither — C answers `S_db_noRSET`, an error;
     /// the port renders empty.
@@ -5663,7 +5663,7 @@ impl RecordInstance {
             ));
         }
         if field.eq_ignore_ascii_case("VAL") {
-            return self.record.enum_string_form();
+            return self.record.enum_slots().map(EnumSlots::form);
         }
         None
     }
@@ -5776,8 +5776,9 @@ impl RecordInstance {
         render
     }
 
-    /// [`Self::enum_string_form_for`]'s label for `idx`; a menu's is cloned
-    /// from its choices, without building the form under the read's hold.
+    /// [`Self::enum_string_form_for`]'s label for `idx`; a menu's or a `VAL`
+    /// state's is cloned from where it lives, without building the form under
+    /// the read's hold.
     fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
         if !field.eq_ignore_ascii_case("DTYP")
             && let Some(choices) = self.menu_choices_for(field)
@@ -5786,6 +5787,12 @@ impl RecordInstance {
                 Some(choice) => PvString::from(*choice),
                 None => PvString::from(idx.to_string().as_str()),
             });
+        }
+        if field.eq_ignore_ascii_case("VAL") {
+            return self
+                .record
+                .enum_slots()
+                .map(|slots| PvString::from(slots.label(idx)));
         }
         self.enum_string_form_for(field)
             .map(|form| form.render(idx))
@@ -6445,7 +6452,7 @@ impl RecordInstance {
     /// renders from its label list, which is what C's absent slot amounts to.
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         if let Some(strings) = self.record.enum_state_strings() {
-            snap.enums = Some(match self.record.enum_string_form() {
+            snap.enums = Some(match self.record.enum_slots().map(EnumSlots::form) {
                 Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
                 None => super::super::snapshot::EnumInfo::new(strings),
             });

@@ -67,7 +67,7 @@ pub(crate) use record_instance::{
 pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
     ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
-    CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME,
+    CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
     FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses, MonitorValueGate,
     OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot,

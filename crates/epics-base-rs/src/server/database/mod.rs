@@ -562,9 +562,8 @@ impl CpRegistry {
 struct ScanKey {
     phas: i16,
     /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
-    /// vendored `.dbd` declares sorts after every one that is declared, which
-    /// is where C puts it too — a module `.dbd` is included after `base.dbd`,
-    /// so its types join `recordTypeList` behind base's.
+    /// vendored `.dbd` declares sorts after every one that is declared; C
+    /// places it by name among them.
     record_type: u32,
     load_order: u64,
     /// An `Arc` and not a `String` because the cursor hands this name out once
@@ -3464,19 +3463,43 @@ impl PvDatabase {
         )
     }
 
-    /// Run every record's OWED init — C's `initDatabase` per-record pass — for
-    /// the records the LOAD phase deferred, in database load order.
+    /// Run every record's OWED init — C's `initDatabase` — for the records the
+    /// LOAD phase deferred.
     ///
-    /// The walk is C's `initDatabase` walk: every record, in load order, each
-    /// asked whether its init is still owed. [`RecordCell::claim_owed_init`]
-    /// hands that debt to exactly one caller, so a second call is a no-op —
-    /// the build lifecycle calls this BEFORE `setup_io_intr`, and
-    /// [`Self::ioc_init`] calls it again as a catch-all.
+    /// C's `initDatabase` is three whole-database walks, `doInitRecord0`, then
+    /// `doResolveLinks`, then `doInitRecord1` (`iocInit.c:576-578`), each in
+    /// `iterateRecords` order, so every pass-0 report precedes every pass-1
+    /// report and a record's pass 1 runs after every record's pass 0.
+    /// [`RecordCell::claim_owed_init`] hands each debt to exactly one caller,
+    /// so a second call is a no-op — the build lifecycle calls this BEFORE
+    /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
     pub(crate) fn drain_deferred_record_inits(&self) {
-        for (name, rec_arc) in self.records_in_load_order() {
-            if rec_arc.claim_owed_init() {
-                self.init_deferred_record(&name, &rec_arc);
+        let resolver = self.inner.device_support_resolver.load();
+        let owed: Vec<_> = self
+            .iterate_records()
+            .into_iter()
+            .filter(|(_, rec_arc)| rec_arc.claim_owed_init())
+            .map(|(name, rec_arc)| {
+                let mut guard = rec_arc.write();
+                let instance = &mut *guard;
+                crate::server::ioc_app::attach_device_support(instance, &name, resolver.as_deref());
+                instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
+                let reached = instance.run_init_pass0(&name);
+                drop(guard);
+                (name, rec_arc, reached)
+            })
+            .collect();
+        for (name, rec_arc, reached) in &owed {
+            if *reached {
+                let add_record_input =
+                    crate::server::builtin_devices::soft_callback::add_record_input_of(
+                        self, rec_arc, None,
+                    );
+                rec_arc.write().run_add_record(name, add_record_input);
             }
+        }
+        for (name, rec_arc, reached) in &owed {
+            self.init_deferred_record(name, rec_arc, *reached);
         }
     }
 
@@ -3489,12 +3512,11 @@ impl PvDatabase {
         self.get_record(name).is_some_and(|rec| rec.init_owed())
     }
 
-    /// Run the OWED init half of [`Self::add_loaded_record`] for a record whose
-    /// creation was deferred to `iocInit` (the LOAD-phase arm). The record is
-    /// already published, its `.db` load applied and its load-order sequence
-    /// assigned; what runs here is C's `doInitRecord0`/`init_record` half —
-    /// bind the dset, arm subroutines, run the passes, seed constant links —
-    /// then the scan-index insert, the `recGblInitSimm`/`wdogInit` tail, and
+    /// Run the rest of the OWED init half of [`Self::add_loaded_record`] for a
+    /// record whose creation was deferred to `iocInit` (the LOAD-phase arm),
+    /// once [`Self::drain_deferred_record_inits`] has run pass 0 and
+    /// `add_record` over every owed record: pass 1 when pass 0 `reached` the
+    /// record's body, the constant-link seed, then the scan-index insert, the `recGblInitSimm`/`wdogInit` tail, and
     /// the checkLinks / constant-INP seed the two loaders used to run right
     /// after `add_loaded_record`. All in the same order the eager path ran them
     /// across `add_loaded_record` and its caller.
@@ -3508,19 +3530,13 @@ impl PvDatabase {
     /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
-    fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>) {
-        let add_record_input =
-            crate::server::builtin_devices::soft_callback::add_record_input_of(self, rec_arc, None);
+    fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>, reached: bool) {
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
-            crate::server::ioc_app::attach_device_support(
-                instance,
-                name,
-                self.inner.device_support_resolver.load().as_deref(),
-            );
-            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            instance.run_init_passes(name, add_record_input);
+            if reached {
+                instance.run_init_pass1(name);
+            }
             super::database::processing::seed_constant_links(instance);
             (
                 instance.common.scan,

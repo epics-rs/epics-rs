@@ -86,6 +86,25 @@ impl<T: Clone> SharedArray<T> {
         Arc::make_mut(&mut self.buf)
     }
 
+    /// Write access to `n` elements, the served length set to `n`: in place
+    /// while this is the only holder and the buffer holds `n`, else in one
+    /// fresh buffer of the larger of `n` and the old capacity, its new tail
+    /// `fill`.
+    #[inline]
+    pub fn make_mut_resized(&mut self, n: usize, fill: T) -> &mut [T] {
+        if n > self.buf.len() {
+            let grow = n - self.buf.len();
+            self.buf = self
+                .buf
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_n(fill, grow))
+                .collect();
+        }
+        self.len = n;
+        &mut Arc::make_mut(&mut self.buf)[..n]
+    }
+
     /// Resize to `n` elements, filling with `value`; growth copies.
     pub fn resize(&mut self, n: usize, value: T) {
         if n <= self.len {
@@ -273,6 +292,20 @@ mod tests {
         let p = a.as_ptr();
         a.make_mut()[1] = 8.0;
         assert_eq!(a.as_ptr(), p, "the sole holder writes in place");
+    }
+
+    #[test]
+    fn make_mut_resized_copies_only_a_shared_or_short_buffer() {
+        let mut a: SharedArray<u8> = vec![1, 2, 3].into();
+        let p = a.as_ptr();
+        assert_eq!(a.make_mut_resized(1, 0), &mut [1][..]);
+        assert_eq!((&*a, a.as_ptr()), (&[1][..], p));
+        assert_eq!(a.make_mut_resized(3, 0), &mut [1, 2, 3][..]);
+        assert_eq!(a.as_ptr(), p);
+        assert_eq!(a.make_mut_resized(4, 0), &mut [1, 2, 3, 0][..]);
+        let b = a.clone();
+        a.make_mut_resized(2, 0)[0] = 9;
+        assert_eq!((&*a, &*b), (&[9, 2][..], &[1, 2, 3, 0][..]));
     }
 
     #[test]

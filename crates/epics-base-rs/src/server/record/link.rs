@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::error::{CaError, CaResult, LinkRefusal};
+use crate::error::{CaError, CaResult, LinkRefusal, LinkWhy};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
 use crate::types::{DbFieldType, DbfLinkClass, EpicsValue, PvString};
 
@@ -2075,17 +2075,13 @@ fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
     // `dbFindLinkSup` is a `gphFind`: the type name matches case-sensitively.
     let key = key.as_ref();
     if UNPORTED_C_JSON_LINK_TYPES.contains(&key) {
-        return Some(
-            format!(
-                "dbJLinkInit: Link type '{key}' is registered by epics-base but not \
-                 implemented by this port"
-            )
-            .into(),
-        );
+        return Some(LinkRefusal::new(LinkWhy::Unported(
+            crate::server::recgbl::ReportString::new(key),
+        )));
     }
     if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == key) {
-        return Some(LinkRefusal::printed(format!(
-            "dbJLinkInit: Link type '{key}' not found"
+        return Some(LinkRefusal::new(LinkWhy::NotFound(
+            crate::server::recgbl::ReportString::new(key),
         )));
     }
     None
@@ -2109,7 +2105,7 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
     // Read the link type from the NORMALIZED text. A comment is whitespace in
     // this dialect, so `{/*which*/calc:{…}}` names the type `calc`, but
     // `json_link_key` splits on the first `:` and would take the comment as
-    // part of the key. Diagnostics below keep quoting the original `s`.
+    // part of the key.
     let normalized = match crate::json5::relaxed_to_strict(s) {
         Ok(normalized) => normalized,
         Err(e) => {
@@ -2119,18 +2115,14 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
             if let Some(refusal) = key_before(&s[..offset]).and_then(unknown_link_type) {
                 return JsonLinkParse::Rejected(refusal);
             }
-            return JsonLinkParse::Rejected(
-                format!("dbJLinkInit: {s} is not a JSON link — {e}").into(),
-            );
+            return JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::UnterminatedComment(offset)));
         }
     };
     let key = match json_link_key(&normalized) {
         JsonLinkKey::Named(key) => key,
         JsonLinkKey::Empty => return JsonLinkParse::Parsed(ParsedLink::None),
         JsonLinkKey::Malformed => {
-            return JsonLinkParse::Rejected(
-                format!("dbJLinkInit: {s} is not a JSON link — no link type key").into(),
-            );
+            return JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::NoTypeKey));
         }
     };
     if let Some(refusal) = unknown_link_type(key) {
@@ -2142,7 +2134,7 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
         return JsonLinkParse::Rejected(refusal);
     }
     // The body reader splits on `:` and matches barewords too, so it needs the
-    // same normalized text; `s` is kept only for the diagnostics below.
+    // same normalized text.
     match try_parse_json_link_body(&normalized) {
         Some(parsed) => JsonLinkParse::Parsed(parsed),
         // DEVIATION, deliberate. A registered type whose jlif merely IGNORES a
@@ -2152,9 +2144,9 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
         // text asked for, and the only other outcome reachable from here is the
         // PV-name link this whole function exists to prevent, so it refuses and
         // says which type refused.
-        None => JsonLinkParse::Rejected(
-            format!("dbJLinkInit: Link type '{key}' rejected its value in {s}").into(),
-        ),
+        None => JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::ValueRejected(
+            crate::server::recgbl::ReportString::new(key),
+        ))),
     }
 }
 
@@ -2277,11 +2269,7 @@ fn const_link_refusal(s: &str) -> Option<LinkRefusal> {
     }
     match status {
         Status::ClientCanceled => {
-            let detail = format!("dbJLinkInit: lnkConst refused its value in {s}");
-            return Some(match parser.ctx.said {
-                Some(line) => LinkRefusal::with_report(detail, line.to_string()),
-                None => detail.into(),
-            });
+            return Some(LinkRefusal::new(LinkWhy::ConstStop(parser.ctx.said)));
         }
         Status::Error => {}
         Status::Ok => {
@@ -2296,19 +2284,15 @@ fn const_link_refusal(s: &str) -> Option<LinkRefusal> {
                 Some(key) => {
                     let key = key.split(':').next().unwrap_or("").trim();
                     let key = key.trim_matches(|c| c == '"' || c == '\'');
-                    return Some(LinkRefusal::printed(format!(
-                        "dbJLinkInit: Illegal second link key '{key}'"
+                    return Some(LinkRefusal::new(LinkWhy::SecondKey(
+                        crate::server::recgbl::ReportString::new(key),
                     )));
                 }
                 None => parser.fail_at(at, "after key and value, inside map, I expect ',' or '}'"),
             }
         }
     }
-    let rendered = parser.render_error(txt);
-    Some(LinkRefusal::with_report(
-        format!("dbJLinkInit: {s} is not a JSON link"),
-        format!("dbJLinkInit: {rendered}\n"),
-    ))
+    Some(LinkRefusal::new(LinkWhy::Yajl(parser.error(txt))))
 }
 
 /// C `dbParseLink`'s JSON arm as a validation gate: `Err` exactly when the
@@ -2333,9 +2317,7 @@ pub fn check_json_link_text(text: &str) -> CaResult<()> {
 fn check_hw_link_text(text: &str) -> CaResult<()> {
     let text = text.trim();
     if text.starts_with('#') && try_parse_hw_link(text).is_none() {
-        return Err(CaError::BadLink(
-            format!("dbParseLink: \"{text}\" names no hardware bus").into(),
-        ));
+        return Err(CaError::BadLink(LinkRefusal::new(LinkWhy::NoBus)));
     }
     Ok(())
 }

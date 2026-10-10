@@ -55,9 +55,10 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 ];
 /// The posts [`SseqRecord::mark_value_write`] can owe: step `i`'s written
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
-/// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`.
-static VALUE_WRITE_POSTS: [(&str, CyclePostMask); 4 * NUM_STEPS] = {
-    let mut table = [("", CyclePostMask::Value); 4 * NUM_STEPS];
+/// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
+/// a `DLYn` put's DLY1 post at [`DLY1_POST`].
+static VALUE_WRITE_POSTS: [(&str, CyclePostMask); DLY1_POST + 1] = {
+    let mut table = [("", CyclePostMask::Value); DLY1_POST + 1];
     let mut i = 0;
     while i < NUM_STEPS {
         table[4 * i] = (DO_FIELDS[i], CyclePostMask::ValueLog);
@@ -66,8 +67,10 @@ static VALUE_WRITE_POSTS: [(&str, CyclePostMask); 4 * NUM_STEPS] = {
         table[4 * i + 3] = (DO_FIELDS[i], CyclePostMask::Value);
         i += 1;
     }
+    table[DLY1_POST] = ("DLY1", CyclePostMask::Value);
     table
 };
+const DLY1_POST: usize = 4 * NUM_STEPS;
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -1245,21 +1248,6 @@ impl Record for SseqRecord {
         Ok(())
     }
 
-    /// C `special()` re-quantizes on a put to any `DLYn` and posts DLY1 — see
-    /// `special()` for the C quirk that makes it DLY1 and not the field written.
-    ///
-    /// The other `special()` side effect — the partner view of a `DOn`/`STRn`
-    /// put — is NOT here: a static field-name list cannot say "only if it
-    /// changed", and C posts the partner only when its own comparison moved. The
-    /// writer reports that instead (`mark_value_write` →
-    /// [`Record::take_cycle_posted_fields`]).
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match Self::step_index_from_suffix(put_field) {
-            Some((_, "DLY")) => &["DLY1"],
-            _ => &[],
-        }
-    }
-
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
     /// (`mark_value_write`), with that C call site's mask and comparison.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
@@ -1435,8 +1423,7 @@ impl Record for SseqRecord {
         // contract. (Every DLYn IS quantized — at init, see `init_record`.)
         if Self::step_index_from_suffix(field).is_some_and(|(_, p)| p == "DLY") {
             self.steps[0].dly = crate::runtime::time::quantize_to_sleep_quantum(self.steps[0].dly);
-            // The DBE_VALUE post of DLY1 is the framework's, via
-            // `monitor_side_effect_fields` + `value_only_change_fields`.
+            self.pending_posts |= 1 << DLY1_POST;
             return Ok(());
         }
         // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics
@@ -2446,10 +2433,14 @@ mod tests {
             "a STRn put posts only the derived DOn = atof(s)"
         );
 
-        // The DLY quirk is a genuine static side effect and stays one.
-        assert_eq!(rec.monitor_side_effect_fields("DLY3"), &["DLY1"]);
-        assert!(rec.monitor_side_effect_fields("DO1").is_empty());
-        assert!(rec.monitor_side_effect_fields("LNK1").is_empty());
+        // C's DLYn special posts DLY1 whichever DLY was written.
+        rec.special("DLY3", true).unwrap();
+        assert_eq!(
+            rec.take_cycle_posted_fields().collect::<Vec<_>>(),
+            vec![("DLY1", CyclePostMask::Value)],
+        );
+        rec.special("LNK1", true).unwrap();
+        assert!(rec.take_cycle_posted_fields().is_empty());
     }
 
     /// The `processCallback` link-read arms owe BOTH posts — no put path ran, so

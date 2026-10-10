@@ -188,6 +188,8 @@ pub struct SwaitRecord {
     // OUT + posts OEVT exactly once after the delay.
     output_wait: bool,
     pending_output: bool,
+    /// The CLCV/CALC/CLCV posts owed by a CALC `special()`.
+    calc_post: bool,
 }
 
 impl Default for SwaitRecord {
@@ -232,6 +234,7 @@ impl Default for SwaitRecord {
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
+            calc_post: false,
         }
     }
 }
@@ -253,9 +256,19 @@ impl SwaitRecord {
         // returns 0 from `special()`, so the put SUCCEEDS and the client reads
         // the verdict back from CLCV (the calcout/scalcout/acalcout disposition,
         // not calcRecord's S_db_badField rejection).
-        let compiled = calc_compile::postfix("swait", "CALC", &self.calc);
+        let compiled = calc_compile::postfix(&self.calc);
         self.clcv = compiled.status;
         self.compiled_calc = compiled.program;
+    }
+
+    /// C `recGblRecordError(S_db_badField, pwait, pmessage)` on a CALC
+    /// `postfix()` refused (swaitRecord.c:305-307, :562-564); swait writes no
+    /// `calcErrorStr` line.
+    fn report_bad_calc(&self, pmessage: &str) {
+        if self.clcv != 0 {
+            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+            crate::server::recgbl::rec_gbl_record_error("Illegal field value", name, pmessage);
+        }
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
@@ -449,7 +462,7 @@ impl Record for SwaitRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     /// C `swaitRecord.c::init_record` (:266-) ends without touching
@@ -500,6 +513,7 @@ impl Record for SwaitRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.recompile();
+            self.report_bad_calc("swait:init_record: Illegal CALC field");
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
             self.initialized = true;
         }
@@ -532,7 +546,28 @@ impl Record for SwaitRecord {
         if Self::is_pv_name_field(field) {
             self.refresh_link_status();
         }
+        self.calc_post = field == "CALC";
+        if self.calc_post {
+            self.report_bad_calc("swaitRecord:special: Illegal CALC field");
+        }
         Ok(())
+    }
+
+    /// C `special(SPC_CALC)` posts CLCV, CALC, CLCV, each a literal
+    /// `DBE_VALUE` (swaitRecord.c:566-568), and does not process.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static CALC_POSTS: [(&str, CyclePostMask); 3] = [
+            ("CLCV", CyclePostMask::Value),
+            ("CALC", CyclePostMask::Value),
+            ("CLCV", CyclePostMask::Value),
+        ];
+        let bits = if std::mem::take(&mut self.calc_post) {
+            0b111
+        } else {
+            0
+        };
+        CycleMarks::of(&CALC_POSTS, bits)
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -804,16 +839,6 @@ impl Record for SwaitRecord {
             &[("DOLN", "DOLD")]
         } else {
             &[]
-        }
-    }
-
-    /// C posts CLCV explicitly from `special()` (`db_post_events(pwait,
-    /// &pwait->clcv, DBE_VALUE)`, swaitRecord.c:566) — CLCV is not `pp(TRUE)`,
-    /// so nothing else would post it. Same shape as scalcout/acalcout.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            _ => &[],
         }
     }
 

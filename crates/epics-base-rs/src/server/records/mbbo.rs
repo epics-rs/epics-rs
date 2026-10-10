@@ -93,6 +93,8 @@ pub struct MbboRecord {
     /// `processMbbo` sets `rval`/`val` from the callback and returns without
     /// re-converting (devAsynInt32.c:1310-1330 / devAsynUInt32Digital.c:945-962).
     skip_convert: bool,
+    /// `special()` re-labelled the state VAL sits on; the put drains it.
+    label_post: bool,
 }
 
 impl Default for MbboRecord {
@@ -169,6 +171,7 @@ impl Default for MbboRecord {
             sdly: -1.0,
             soft_alarm: false,
             skip_convert: false,
+            label_post: false,
         }
     }
 }
@@ -400,7 +403,7 @@ impl Record for MbboRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     fn record_type(&self) -> &'static str {
@@ -433,11 +436,22 @@ impl Record for MbboRecord {
     /// fall outside the index range and post nothing. What they DO reach is
     /// `init_common`, whose `sdef` this port derives on demand
     /// (`Self::sdef`) rather than caching, so that half needs no hook.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match crate::server::record::multibit_state_string_index(put_field) {
-            Some(state) if state == self.val => &["VAL"],
-            _ => &[],
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        // Every state string is `??ST`; a VAL put skips the name scan.
+        if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
+            self.label_post =
+                crate::server::record::multibit_state_string_index(field) == Some(self.val);
         }
+        Ok(())
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        static VAL_POST: [(&str, crate::server::record::CyclePostMask); 1] =
+            [("VAL", crate::server::record::CyclePostMask::ValueLog)];
+        crate::server::record::CycleMarks::of(
+            &VAL_POST,
+            u64::from(std::mem::take(&mut self.label_post)),
+        )
     }
 
     /// C `mbboRecord.c:199-215`: `process()` clears `udf` to FALSE only when a

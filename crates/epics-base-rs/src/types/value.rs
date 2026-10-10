@@ -302,6 +302,27 @@ impl Num {
 }
 
 impl EpicsValue {
+    /// The `dbrType` C passes `dbPut` for this value: the DBR code of its own
+    /// storage type, numbered as `DBF_*` (`dbFldTypes.h`), not as the older
+    /// CA wire type [`Self::dbr_type`] answers.
+    pub const fn dbr_code(&self) -> crate::types::DbfCode {
+        use crate::types::DbfCode;
+        match self {
+            Self::String(_) | Self::StringArray(_) => DbfCode::String,
+            Self::Char(_) | Self::CharArray(_) => DbfCode::Char,
+            Self::UChar(_) | Self::UCharArray(_) => DbfCode::UChar,
+            Self::Short(_) | Self::ShortArray(_) => DbfCode::Short,
+            Self::UShort(_) | Self::UShortArray(_) => DbfCode::UShort,
+            Self::Long(_) | Self::LongArray(_) => DbfCode::Long,
+            Self::ULong(_) | Self::ULongArray(_) => DbfCode::ULong,
+            Self::Int64(_) | Self::Int64Array(_) => DbfCode::Int64,
+            Self::UInt64(_) | Self::UInt64Array(_) => DbfCode::UInt64,
+            Self::Float(_) | Self::FloatArray(_) => DbfCode::Float,
+            Self::Double(_) | Self::DoubleArray(_) => DbfCode::Double,
+            Self::Enum(_) | Self::EnumWithChoices { .. } | Self::EnumArray(_) => DbfCode::Enum,
+        }
+    }
+
     /// The label for an enum `index` against its `choices`:
     /// `choices[index]` when in range, else the decimal index — pvxs
     /// `pvxs/ioc/pvalink_lset.cpp:347-354` (`strncpy(choices[index])` with an

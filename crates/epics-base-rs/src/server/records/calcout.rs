@@ -32,6 +32,9 @@ const CALCOUT_LINK_VALUE_FIELDS: [&str; 22] = [
     "T", "U", "OVAL",
 ];
 
+/// Where CLCV's post sits in calcout's put-post table, after every link's.
+const CLCV_POST: usize = 2 * CALCOUT_LINK_VALUE_FIELDS.len();
+
 /// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
 /// `get_precision` serves for `ODLY`, the output-delay field.
 static CALCOUT_ODLY_PRECISION: AtomicI32 = AtomicI32::new(2);
@@ -222,10 +225,10 @@ pub struct CalcoutRecord {
     // The common OUT-link text as `init_links` saw it at load, for the init
     // classification; a runtime OUT put classifies nothing.
     out: crate::server::record::SparseText,
-    // The link index (0..=21, INPA..INPU then OUT) whose put `special()` just
-    // marked Constant, owing C's two `DBE_VALUE` posts (calcoutRecord.c:377,404).
-    // One slot, so a mark no put path drains is overwritten, never queued.
-    link_put_post: Option<u8>,
+    // The posts the last `special()` owes, a bit per put-post table entry:
+    // one put's worth, so a mark no put path drains is overwritten, never
+    // queued.
+    put_posts: u64,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
     async_ctx: Option<(String, AsyncDbHandle)>,
@@ -342,7 +345,7 @@ impl Default for CalcoutRecord {
             in_status: [LINK_CON; 21],
             out_status: LINK_CON,
             out: crate::server::record::SparseText::default(),
-            link_put_post: None,
+            put_posts: 0,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
         }
@@ -350,6 +353,18 @@ impl Default for CalcoutRecord {
 }
 
 impl CalcoutRecord {
+    /// C `init_record`'s report of a CALC/OCAL `postfix()` refused
+    /// (calcoutRecord.c:192-197, :200-205): `recGblRecordError(S_db_badField)`
+    /// then the `calcErrorStr` line, both naming the record.
+    fn report_bad_expr(&self, compiled: &calc_compile::CalcCompile, field: &str, expr: &str) {
+        let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+        let pmessage = match field {
+            "CALC" => "calcout: init_record: Illegal CALC field",
+            _ => "calcout: init_record: Illegal OCAL field",
+        };
+        compiled.report_in_expression(name, pmessage, field, expr);
+    }
+
     /// The 21 `LX` advances as one step. C reaches them in `monitor`
     /// (`calcoutRecord.c:679-685`), which `process` calls at `:306` — below
     /// the ODLY early return at `:282`, so both the immediate cycle and the
@@ -773,11 +788,17 @@ impl Record for CalcoutRecord {
             // depended on whether the value arrived from the db file or from a
             // later put, which is not a distinction C makes. The compile is the
             // single owner of CLCV/RPCL on both paths.
-            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+            let compiled = calc_compile::postfix(&self.calc);
+            self.report_bad_expr(&compiled, "CALC", &self.calc);
             self.clcv = compiled.status;
             self.rpcl = compiled.program;
 
-            let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+            // C reports a bad OCAL only under DOPT "Use OCAL" (`:200`); OCLV is
+            // -1 either way.
+            let compiled = calc_compile::postfix(&self.ocal);
+            if self.dopt == 1 {
+                self.report_bad_expr(&compiled, "OCAL", &self.ocal);
+            }
             self.oclv = compiled.status;
             self.orpc = compiled.program;
             self.pval = self.val;
@@ -1572,7 +1593,7 @@ impl Record for CalcoutRecord {
         // A load-time `special()` marked posts nobody could watch; this full
         // classification supersedes them, so the first runtime put must not
         // drain them.
-        self.link_put_post = None;
+        self.put_posts = 0;
         self.refresh_link_status();
     }
 
@@ -1590,15 +1611,17 @@ impl Record for CalcoutRecord {
         // calc carries it in the put status.
         match field {
             "CALC" => {
-                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+                let compiled = calc_compile::postfix(&self.calc);
                 self.clcv = compiled.status;
                 self.rpcl = compiled.program;
+                self.put_posts = 1 << CLCV_POST;
                 return Ok(());
             }
             "OCAL" => {
-                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+                let compiled = calc_compile::postfix(&self.ocal);
                 self.oclv = compiled.status;
                 self.orpc = compiled.program;
+                self.put_posts = 1 << (CLCV_POST + 1);
                 return Ok(());
             }
             _ => {}
@@ -1614,19 +1637,21 @@ impl Record for CalcoutRecord {
                 None => self.out_status = LINK_CON,
             }
             self.link_gen.next();
-            self.link_put_post = Some(idx as u8);
+            self.put_posts = 0b11 << (2 * idx);
         }
         Ok(())
     }
 
-    /// The link put's value and status posts, both a literal `DBE_VALUE`
-    /// (calcoutRecord.c:377,404). calcout declares no `CYCLE_POSTED` hook, so
-    /// only the put path drains this.
+    /// The posts `special()` makes, each a literal `DBE_VALUE`: a link put's
+    /// value and status (calcoutRecord.c:377,404), and CLCV/OCLV after a
+    /// CALC/OCAL put (`:335`, `:344`). calcout declares no `CYCLE_POSTED`
+    /// hook, so only the put path drains this.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
-        /// Link `i`'s value then status at `2i`, `2i + 1`; OUT's status is OUTV.
-        static LINK_PUT_POSTS: [(&str, CyclePostMask); 2 * CALCOUT_LINK_VALUE_FIELDS.len()] = {
-            let mut table = [("", CyclePostMask::Value); 2 * CALCOUT_LINK_VALUE_FIELDS.len()];
+        /// Link `i`'s value then status at `2i`, `2i + 1`; OUT's status is
+        /// OUTV. CLCV and OCLV follow at [`CLCV_POST`].
+        static PUT_POSTS: [(&str, CyclePostMask); CLCV_POST + 2] = {
+            let mut table = [("", CyclePostMask::Value); CLCV_POST + 2];
             let mut i = 0;
             while i < CALCOUT_LINK_VALUE_FIELDS.len() {
                 table[2 * i].0 = CALCOUT_LINK_VALUE_FIELDS[i];
@@ -1637,23 +1662,11 @@ impl Record for CalcoutRecord {
                 };
                 i += 1;
             }
+            table[CLCV_POST].0 = "CLCV";
+            table[CLCV_POST + 1].0 = "OCLV";
             table
         };
-        match self.link_put_post.take() {
-            Some(idx) => CycleMarks::of(&LINK_PUT_POSTS, 0b11 << (2 * idx as usize)),
-            None => CycleMarks::NONE,
-        }
-    }
-
-    /// C posts the validity field explicitly from `special()`
-    /// (`db_post_events(prec, &prec->clcv, DBE_VALUE)`, calcoutRecord.c:335,344)
-    /// — CLCV/OCLV are not `pp(TRUE)`, so nothing else would post them.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            "OCAL" => &["OCLV"],
-            _ => &[],
-        }
+        CycleMarks::of(&PUT_POSTS, std::mem::take(&mut self.put_posts))
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.

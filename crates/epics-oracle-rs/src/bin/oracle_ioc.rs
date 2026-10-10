@@ -93,8 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reports record types unimplemented that the run measures perfectly well.
     let _devices = register_port_ioc_devices()?;
 
+    // The C side loads its `.db` from an st.cmd, so a refused field fails the
+    // load, the script goes on, and iocInit boots the record anyway.
     let (db, _autosave) = port_ioc_builder()
         .db_file(&db_path, &macros)?
+        .boot_past_failed_loads()
         .build()
         .await?;
 

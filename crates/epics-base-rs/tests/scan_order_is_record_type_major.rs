@@ -12,8 +12,8 @@
 //! so at `iocInit` every `ai` is `scanAdd`ed before every `calc`, whatever
 //! order the `.db` declared them in. `addToList` (`:1081-1087`) then appends
 //! after the last element whose `phas <=` the new record's, which preserves
-//! that feed order within a PHAS. Record-type order is DBD include order
-//! (`dbd/stdRecords.dbd`, `aiRecord.dbd` before `calcRecord.dbd`).
+//! that feed order within a PHAS. Record-type order is name order (see
+//! `scan_order_follows_record_type_list.rs`), `ai` before `calc`.
 //!
 //! The port keyed the list `(PHAS, load_order, name)` — the FIFO was stable,
 //! but over the wrong feed order, so every same-PHAS reader/writer pair whose
@@ -45,7 +45,7 @@ async fn order(db: &str) -> Vec<String> {
 
 /// BOUNDARY: same PHAS, declaration order contradicts DBD order. The brief's
 /// case — `ai` reads `calc`, `calc` is declared first, and C still scans the
-/// `ai` first because `aiRecord.dbd` precedes `calcRecord.dbd`.
+/// `ai` first because `ai` precedes `calc` in `recordTypeList`.
 #[epics_macros_rs::epics_test]
 async fn record_type_order_beats_declaration_order() {
     let got = order(

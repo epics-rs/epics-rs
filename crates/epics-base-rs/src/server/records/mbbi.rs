@@ -87,6 +87,8 @@ pub struct MbbiRecord {
     /// written only by a conversion that stores, so a read that stores nothing
     /// (a state name, NORD=0) hands back the last delivered value, not VAL.
     async_buffer: u16,
+    /// `special()` re-labelled the state VAL sits on; the put drains it.
+    label_post: bool,
 }
 
 impl Default for MbbiRecord {
@@ -160,6 +162,7 @@ impl Default for MbbiRecord {
             sdly: -1.0,
             skip_convert: false,
             async_buffer: 0,
+            label_post: false,
         }
     }
 }
@@ -336,7 +339,7 @@ impl Record for MbbiRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     /// `mbbiRecord.c:133-140` keeps the dset status for the return and seeds
@@ -382,11 +385,13 @@ impl Record for MbbiRecord {
     /// fall outside the index range and post nothing. What they DO reach is
     /// `init_common`, whose `sdef` this port derives on demand
     /// (`Self::sdef`) rather than caching, so that half needs no hook.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match crate::server::record::multibit_state_string_index(put_field) {
-            Some(state) if state == self.val => &["VAL"],
-            _ => &[],
-        }
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        static VAL_POST: [(&str, crate::server::record::CyclePostMask); 1] =
+            [("VAL", crate::server::record::CyclePostMask::ValueLog)];
+        crate::server::record::CycleMarks::of(
+            &VAL_POST,
+            u64::from(std::mem::take(&mut self.label_post)),
+        )
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the
@@ -442,6 +447,11 @@ impl Record for MbbiRecord {
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after && field == "INP" {
             self.async_buffer = 0;
+        }
+        // Every state string is `??ST`; a VAL put skips the name scan.
+        if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
+            self.label_post =
+                crate::server::record::multibit_state_string_index(field) == Some(self.val);
         }
         Ok(())
     }

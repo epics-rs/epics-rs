@@ -507,6 +507,8 @@ pub struct AcalcoutRecord {
     /// [`array_mem`].
     mem: ArrayMem,
     newm: u32,
+    /// CLCV (bit 0) / OCLV (bit 1) owed by the last CALC/OCAL `special()`.
+    calc_posts: u64,
 
     // --- process flags ---
     calc_alarm: bool,
@@ -593,6 +595,7 @@ impl Default for AcalcoutRecord {
             aval_oav_posts: 0,
             mem: ArrayMem::default(),
             newm: 0,
+            calc_posts: 0,
             calc_alarm: false,
             fetch_gate_failed: false,
             cached_should_output: false,
@@ -992,14 +995,14 @@ impl AcalcoutRecord {
     /// not the CALC_ERR_* code. An empty CALC is a valid empty program with
     /// status 0 (aCalcPostfix.c:439-441).
     fn recompile_calc(&mut self) {
-        let compiled = calc_compile::acalc_postfix("acalcout", "CALC", &self.calc);
+        let compiled = calc_compile::acalc_postfix(&self.calc);
         self.clcv = compiled.status;
         self.compiled_calc = compiled.program;
     }
 
     /// C `aCalcoutRecord.c::special:483-490` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self) {
-        let compiled = calc_compile::acalc_postfix("acalcout", "OCAL", &self.ocal);
+        let compiled = calc_compile::acalc_postfix(&self.ocal);
         self.oclv = compiled.status;
         self.compiled_ocal = compiled.program;
     }
@@ -1187,8 +1190,14 @@ impl Record for AcalcoutRecord {
             return Ok(());
         }
         match field {
-            "CALC" => self.recompile_calc(),
-            "OCAL" => self.recompile_ocal(),
+            "CALC" => {
+                self.recompile_calc();
+                self.calc_posts = 0b01;
+            }
+            "OCAL" => {
+                self.recompile_ocal();
+                self.calc_posts = 0b10;
+            }
             // C `aCalcoutRecord.c:494-501`:
             //
             //   case acalcoutRecordNUSE:
@@ -1233,17 +1242,6 @@ impl Record for AcalcoutRecord {
         // before any process. Every one of them is an acalcout-owned field
         // (OUT included), already applied when `add_record` runs.
         self.refresh_link_status(LinkStatusPosts::All);
-    }
-
-    /// C posts the validity field explicitly from `special()`
-    /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
-    /// aCalcoutRecord.c:478,490).
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            "OCAL" => &["OCLV"],
-            _ => &[],
-        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -2498,10 +2496,10 @@ impl Record for AcalcoutRecord {
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         /// NUSE then AMEM, one entry per mask (`CyclePostMask` order), then
         /// each array's NEWM post, then `monitor()`'s AVAL and OAV, one entry
-        /// per [`AVAL_OAV_MASKS`] row.
-        static POSTS: [(&str, CyclePostMask); 12 + ARR_NAMES.len()] = {
+        /// per [`AVAL_OAV_MASKS`] row, then `special()`'s CLCV and OCLV.
+        static POSTS: [(&str, CyclePostMask); 14 + ARR_NAMES.len()] = {
             use CyclePostMask::{MonitorValueLog, Value, ValueLog};
-            let mut table = [("NUSE", Value); 12 + ARR_NAMES.len()];
+            let mut table = [("NUSE", Value); 14 + ARR_NAMES.len()];
             table[1] = ("NUSE", ValueLog);
             table[2] = ("NUSE", MonitorValueLog);
             table[3] = ("AMEM", Value);
@@ -2518,6 +2516,8 @@ impl Record for AcalcoutRecord {
                 table[9 + ARR_NAMES.len() + j] = ("OAV", AVAL_OAV_MASKS[j]);
                 j += 1;
             }
+            table[12 + ARR_NAMES.len()] = ("CLCV", Value);
+            table[13 + ARR_NAMES.len()] = ("OCLV", Value);
             table
         };
         fn slot(mask: CyclePostMask) -> u32 {
@@ -2525,8 +2525,11 @@ impl Record for AcalcoutRecord {
                 CyclePostMask::Value => 0,
                 CyclePostMask::ValueLog => 1,
                 CyclePostMask::MonitorValueLog => 2,
-                CyclePostMask::MonitorValue | CyclePostMask::MonitorLog => {
-                    unreachable!("NUSE and AMEM post no one-sided mask")
+                CyclePostMask::MonitorValue
+                | CyclePostMask::MonitorLog
+                | CyclePostMask::ResetValueLog
+                | CyclePostMask::ResetValueLogOnAlarm => {
+                    unreachable!("NUSE and AMEM post no one-sided or reset mask")
                 }
             }
         }
@@ -2552,6 +2555,8 @@ impl Record for AcalcoutRecord {
         bits |= u64::from(newm & ((1 << ARR_NAMES.len()) - 1)) << 6;
         // C `monitor()` (`:1000`, `:1017`), marked by `complete_cycle`.
         bits |= u64::from(std::mem::take(&mut self.aval_oav_posts)) << (6 + ARR_NAMES.len());
+        // C `special()` (`aCalcoutRecord.c:478`, `:490`), a literal DBE_VALUE.
+        bits |= std::mem::take(&mut self.calc_posts) << (12 + ARR_NAMES.len());
         CycleMarks::of(&POSTS, bits)
     }
 

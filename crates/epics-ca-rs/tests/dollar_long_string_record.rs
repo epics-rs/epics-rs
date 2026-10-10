@@ -46,20 +46,14 @@ async fn read(client: &CaClient, name: &str) -> EpicsValue {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dollar_channels_serve_the_dbr_char_address() {
-    let lso = LsoRecord {
-        sizv: 20,
-        ..Default::default()
-    };
+    let mut lso = LsoRecord::default();
+    lso.sizv = 20;
+    let mut li = LsiRecord::default();
+    li.sizv = 50;
     let server = CaServer::builder()
         .port(0)
         .record("LSO", lso)
-        .record(
-            "LI",
-            LsiRecord {
-                sizv: 50,
-                ..Default::default()
-            },
-        )
+        .record("LI", li)
         .record("SI", StringinRecord::new("hello"))
         .record("AI", AiRecord::new(0.0))
         .build()

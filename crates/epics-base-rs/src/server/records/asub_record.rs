@@ -13,12 +13,6 @@ const NUM_ARGS: usize = 21;
 /// `FTx`/`FTVx` to `DOUBLE`.
 const FTYPE_DOUBLE: i16 = 10;
 
-/// The per-channel suffix letters `A..U`.
-const SUFFIX: [char; NUM_ARGS] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
-    'T', 'U',
-];
-
 /// `EFLG` (`menu(aSubEFLG)`) — when the record posts output-array DB events.
 /// C `aSubRecord.c::monitor` (the `switch (prec->eflg)`).
 const EFLG_NEVER: i16 = 0;
@@ -64,14 +58,18 @@ fn asub_output_event_fields() -> &'static [&'static str] {
 /// it because the deadband post is a post and the framework routes it through
 /// the same gate; the `EFLG == NEVER` arm is `VAL` alone.
 fn asub_posted_fields() -> &'static [&'static str] {
-    use std::sync::OnceLock;
-    static FIELDS: OnceLock<Vec<&'static str>> = OnceLock::new();
-    FIELDS.get_or_init(|| {
-        std::iter::once("VAL")
-            .chain(asub_output_event_fields().iter().copied())
-            .collect()
-    })
+    &POSTED_FIELDS
 }
+
+static POSTED_FIELDS: [&str; 1 + 2 * NUM_ARGS] = {
+    let mut t = ["VAL"; 1 + 2 * NUM_ARGS];
+    let mut i = 0;
+    while i < 2 * NUM_ARGS {
+        t[i + 1] = OUTPUT_EVENT_FIELDS[i];
+        i += 1;
+    }
+    t
+};
 
 /// aSub (array subroutine) record.
 ///
@@ -180,19 +178,57 @@ pub struct ASubRecord {
 /// `OUTA..OUTU` -> `VALA..VALU`, the pairs C's push loop walks
 /// (`dbPutLink(&(&prec->outa)[i], ..., (&prec->vala)[i], (&prec->neva)[i])`).
 fn asub_output_links() -> &'static [(&'static str, &'static str)] {
-    use std::sync::OnceLock;
-    static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-    PAIRS.get_or_init(|| {
-        SUFFIX
-            .iter()
-            .map(|&c| {
-                let link: &'static str = Box::leak(format!("OUT{c}").into_boxed_str());
-                let val: &'static str = Box::leak(format!("VAL{c}").into_boxed_str());
-                (link, val)
-            })
-            .collect()
-    })
+    &OUTPUT_LINKS
 }
+
+static OUTPUT_LINKS: [(&str, &str); NUM_ARGS] = [
+    ("OUTA", "VALA"),
+    ("OUTB", "VALB"),
+    ("OUTC", "VALC"),
+    ("OUTD", "VALD"),
+    ("OUTE", "VALE"),
+    ("OUTF", "VALF"),
+    ("OUTG", "VALG"),
+    ("OUTH", "VALH"),
+    ("OUTI", "VALI"),
+    ("OUTJ", "VALJ"),
+    ("OUTK", "VALK"),
+    ("OUTL", "VALL"),
+    ("OUTM", "VALM"),
+    ("OUTN", "VALN"),
+    ("OUTO", "VALO"),
+    ("OUTP", "VALP"),
+    ("OUTQ", "VALQ"),
+    ("OUTR", "VALR"),
+    ("OUTS", "VALS"),
+    ("OUTT", "VALT"),
+    ("OUTU", "VALU"),
+];
+
+/// `INPA..INPU` -> `A..U`, [`Record::multi_input_links`].
+static INPUT_LINKS: [(&str, &str); NUM_ARGS] = [
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+    ("INPM", "M"),
+    ("INPN", "N"),
+    ("INPO", "O"),
+    ("INPP", "P"),
+    ("INPQ", "Q"),
+    ("INPR", "R"),
+    ("INPS", "S"),
+    ("INPT", "T"),
+    ("INPU", "U"),
+];
 
 impl Default for ASubRecord {
     fn default() -> Self {
@@ -984,18 +1020,7 @@ impl Record for ASubRecord {
     }
 
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
-        use std::sync::OnceLock;
-        static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-        PAIRS.get_or_init(|| {
-            SUFFIX
-                .iter()
-                .map(|&c| {
-                    let link: &'static str = Box::leak(format!("INP{c}").into_boxed_str());
-                    let val: &'static str = Box::leak(c.to_string().into_boxed_str());
-                    (link, val)
-                })
-                .collect()
-        })
+        &INPUT_LINKS
     }
 
     /// C `aSubRecord.c::fetch_values` (277-289) returns on the first failed

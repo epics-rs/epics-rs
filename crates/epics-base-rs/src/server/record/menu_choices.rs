@@ -397,13 +397,7 @@ pub fn resolve_menu_field_string(
 /// storing anything (`dbAccess.c:1362` `if (status) goto done`), so the field
 /// keeps its previous value and the record is not processed.
 fn bad_choice(field: &str, choices: &[&str], s: &str) -> CaError {
-    CaError::BadChoice(
-        format!(
-            "{field}: '{s}' is not one of {choices:?} nor an index below {}",
-            choices.len()
-        )
-        .into(),
-    )
+    CaError::BadChoice(crate::error::ChoiceRefusal::menu(field, s, choices.len()))
 }
 
 /// Resolve a `DBF_MENU` field's `.db` value — C `dbStaticRun.c::dbPutStringNum`
@@ -568,17 +562,10 @@ fn resolve_enum_state<R: crate::server::record::Record + ?Sized>(
     let index = enum_choice_parsed_by(record, &states, s, parse_index)
         .map(|(EnumChoice::Named(i) | EnumChoice::Index(i))| i)
         .ok_or_else(|| {
-            let from = s.as_str_lossy();
             CaError::BadChoice(crate::error::ChoiceRefusal::enum_state(
-                format!(
-                    "{field}: '{from}' is not one of {:?} nor an index below {}",
-                    states
-                        .iter()
-                        .map(|st| st.as_str_lossy().into_owned())
-                        .collect::<Vec<_>>(),
-                    states.len()
-                ),
-                &from,
+                field,
+                &s.as_str_lossy(),
+                states.len(),
             ))
         })?;
     Ok(EpicsValue::Enum(index))

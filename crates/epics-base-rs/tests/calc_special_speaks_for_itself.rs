@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// Everything the errlog carried, from before the IOC was built. Installed
@@ -200,5 +201,103 @@ async fn an_emptied_calc_is_reported_like_any_other_failure() {
     assert!(
         log.contains("P:C.CALC: NULL or empty input argument to postfix() in expression \"\""),
         "got {log:?}"
+    );
+}
+
+/// calcout `init_record` writes the same pair for CALC and, only under DOPT
+/// "Use OCAL", for OCAL (`calcoutRecord.c:191-205`). softIoc 8f5015b66, this
+/// db through a `dbLoadRecords` whose failure the script ignores: exactly
+/// these four lines at iocInit, then `dbgf` of CLCV/OCLV. OB0's bad OCAL is
+/// silent yet still OCLV -1.
+#[epics_macros_rs::epics_test]
+async fn calcout_init_reports_a_bad_calc_and_a_used_bad_ocal() {
+    let sink = listen();
+    let db = ioc(r#"
+record(calcout, "COB") { field(CALC, "A+") }
+record(calcout, "OB0") { field(CALC, "A") field(OCAL, "B+") }
+record(calcout, "OB1") { field(CALC, "A") field(OCAL, "B+") field(DOPT, "Use OCAL") }
+record(calcout, "GOOD") { field(CALC, "A") field(OCAL, "B") field(DOPT, "Use OCAL") }
+record(calcout, "DEF") {}
+"#)
+    .await;
+
+    assert_eq!(
+        heard(&sink),
+        [
+            "recGblRecordError: calcout: init_record: Illegal CALC field Illegal field value PV: COB\n",
+            "COB.CALC: Incomplete expression, operand missing in expression \"A+\"\n",
+            "recGblRecordError: calcout: init_record: Illegal OCAL field Illegal field value PV: OB1\n",
+            "OB1.OCAL: Incomplete expression, operand missing in expression \"B+\"\n",
+        ]
+        .join("\n")
+    );
+    let lv = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+    let got: Vec<_> = ["COB", "OB0", "OB1", "GOOD", "DEF"]
+        .iter()
+        .map(|r| (lv(&format!("{r}.CLCV")), lv(&format!("{r}.OCLV"))))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, -1.0),
+            (0.0, 0.0),
+            (0.0, 0.0)
+        ]
+    );
+}
+
+/// scalcout `init_record` reports a bad CALC and a bad OCAL whatever DOPT says
+/// (`sCalcoutRecord.c:290-302`), with no `calcErrorStr` line: its second line
+/// is `sCalcPostfix returns: N` on stdout, outside the errlog. oracleSwaitIoc,
+/// this db: these four errlog lines at iocInit, then CLCV/OCLV by `dbgf`.
+#[epics_macros_rs::epics_test]
+async fn scalcout_init_reports_a_bad_calc_and_any_bad_ocal() {
+    let sink = listen();
+    let db = IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .db_string(
+            r#"
+record(scalcout, "SB0") { field(CALC, "A+") }
+record(scalcout, "SB1") { field(CALC, "A") field(OCAL, "B*") field(DOPT, "Use OCAL") }
+record(scalcout, "SB2") { field(CALC, "A") field(OCAL, "B*") }
+record(scalcout, "SG") { field(CALC, "A+1") field(OCAL, "B") }
+record(scalcout, "SE") {}
+record(scalcout, "SB3") { field(CALC, "(A") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    assert_eq!(
+        heard(&sink),
+        [
+            "recGblRecordError: scalcout: init_record: Illegal CALC field Illegal field value PV: SB0\n",
+            "recGblRecordError: scalcout: init_record: Illegal OCAL field Illegal field value PV: SB1\n",
+            "recGblRecordError: scalcout: init_record: Illegal OCAL field Illegal field value PV: SB2\n",
+            "recGblRecordError: scalcout: init_record: Illegal CALC field Illegal field value PV: SB3\n",
+        ]
+        .join("\n")
+    );
+    let lv = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+    let got: Vec<_> = ["SB0", "SB1", "SB2", "SG", "SE", "SB3"]
+        .iter()
+        .map(|r| (lv(&format!("{r}.CLCV")), lv(&format!("{r}.OCLV"))))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, -1.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (-1.0, 0.0)
+        ]
     );
 }

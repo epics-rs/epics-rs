@@ -95,6 +95,9 @@ pub struct CalcRecord {
     // record knows it, which is why C prints its bad-CALC report from
     // `init_record`/`special` and not from `postfix()`.
     name: Option<String>,
+    // The refused CALC put's report, made by `special` under the put's hold
+    // and taken by the put's owner through `take_put_report`.
+    put_report: Option<crate::server::recgbl::PutReport>,
 }
 
 impl Default for CalcRecord {
@@ -144,6 +147,7 @@ impl Default for CalcRecord {
             afvl: 0.0,
             rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
             name: None,
+            put_report: None,
         }
     }
 }
@@ -159,29 +163,19 @@ impl CalcRecord {
             calc: calc.to_string(),
             ..Default::default()
         };
-        rec.rpcl = calc_compile::postfix("calc", "CALC", &rec.calc).program;
+        rec.rpcl = calc_compile::postfix(&rec.calc).program;
         rec
     }
 
-    /// The record's own report of a CALC it could not compile
-    /// (`calcRecord.c:105-110` from `init_record`, `:145-151` from `special`).
-    /// Two errlog records, differing only in the `pmessage` C passes.
-    ///
-    /// This is the counter-example to "a refused `dbpf` is silent": `dbpf`
-    /// prints nothing but its read-back, and the words the user sees come from
-    /// the record. They must carry `prec->name`, which is why C prints them
-    /// here rather than inside `postfix()` — and why `calc_compile` cannot.
-    fn report_bad_calc(&self, pmessage: &str, why: &str) {
+    /// The record's own report of a CALC it could not compile from
+    /// `init_record` (`calcRecord.c:105-110`); `special` makes the same pair
+    /// as a put report. It carries `prec->name`,
+    /// which is why C prints it here rather than inside `postfix()`.
+    fn report_bad_calc(&self, compiled: &calc_compile::CalcCompile, pmessage: &str) {
         // C `precord ? precord->name : "Unknown"`, reached here only if a
         // record compiled before `set_async_context` ran.
         let name = self.name.as_deref().unwrap_or("Unknown");
-        // `S_db_badField` is `M_dbAccess|15`, positive, so C's `errSymLookup`
-        // fills the slot (`dbAccessDefs.h:184`).
-        crate::server::recgbl::rec_gbl_record_error("Illegal field value", name, pmessage);
-        crate::runtime::log::errlog_printf(&format!(
-            "{name}.CALC: {why} in expression \"{}\"\n",
-            self.calc
-        ));
+        compiled.report_in_expression(name, pmessage, "CALC", &self.calc);
     }
 
     /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
@@ -382,10 +376,8 @@ impl Record for CalcRecord {
             // there, and the empty program it leaves in RPCL is what makes the
             // record alarm on every process. Skipping the compile for an empty
             // CALC left the port with no program and no alarm.
-            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-            if let Some(why) = compiled.error_str() {
-                self.report_bad_calc("calc: init_record: Illegal CALC field", why);
-            }
+            let compiled = calc_compile::postfix(&self.calc);
+            self.report_bad_calc(&compiled, "calc: init_record: Illegal CALC field");
             self.rpcl = compiled.program;
             if !self.calc.is_empty() {
                 self.mlst = self.val;
@@ -406,14 +398,19 @@ impl Record for CalcRecord {
         if !after || !field.eq_ignore_ascii_case("CALC") {
             return Ok(());
         }
-        let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-        let why = compiled.error_str();
+        let compiled = calc_compile::postfix(&self.calc);
+        self.put_report =
+            compiled.put_report_in_expression("calc: Illegal CALC field", "CALC", &self.calc);
+        let failed = compiled.error_str().is_some();
         self.rpcl = compiled.program;
-        if let Some(why) = why {
-            self.report_bad_calc("calc: Illegal CALC field", why);
+        if failed {
             return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
         Ok(())
+    }
+
+    fn take_put_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        self.put_report.take()
     }
 
     /// C hands the record its own name at `dbDefineRecord`; the port hands it

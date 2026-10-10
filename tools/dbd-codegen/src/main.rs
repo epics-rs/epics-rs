@@ -217,10 +217,8 @@ struct Parsed {
     menus: BTreeMap<String, parse::Menu>,
     records: Vec<parse::RecordType>,
     devices: Vec<parse::Device>,
-    /// Record type names in DBD **load** order — the order C's
-    /// `pdbbase->recordTypeList` holds, which `buildScanLists` walks
-    /// record-type-major (`dbScan.c:1054-1076`). Distinct from `records`,
-    /// which is sorted by name so the generated table has a stable shape.
+    /// Record type names in the order C's `pdbbase->recordTypeList` holds,
+    /// which `buildScanLists` walks record-type-major (`dbScan.c:1054-1076`).
     order: Vec<String>,
     /// Every `variable()` declaration, from every `.dbd` in the directory.
     variables: Vec<parse::Variable>,
@@ -245,16 +243,8 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
         order: Vec::new(),
         variables: Vec::new(),
     };
-    let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
     for path in &paths {
         let dbd = parse::parse_file(path, common)?;
-        by_file.push((
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            dbd.records.iter().map(|r| r.name.clone()).collect(),
-        ));
         out.devices.extend(dbd.devices);
         out.variables.extend(dbd.variables);
         for (name, menu) in dbd.menus {
@@ -275,53 +265,24 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
         out.records.extend(dbd.records);
     }
     out.records.sort_by(|a, b| a.name.cmp(&b.name));
-    out.order = load_order(dbd_dir, &by_file);
+    out.order = record_type_list_order(&out.records);
     Ok(out)
 }
 
-/// Record types in the order a C IOC would have loaded their declarations.
+/// Record types in the order a C IOC's `recordTypeList` holds them.
 ///
-/// The order comes from `stdRecords.dbd`, which is base's own generated include
-/// list and is vendored beside the `.dbd` files it names — so it is base's
-/// answer, not a list maintained here. A record type declared by a `.dbd` that
-/// list does not name (the synApps and asyn types this port also vendors, and
-/// every downstream target, which has no such list at all) sorts after all of
-/// them, in the walk's own filename order. That mirrors where those types sit
-/// in C — a module's `.dbd` is included after `base.dbd`, so its record types
-/// join `recordTypeList` behind base's — but their order *among themselves* is
-/// the application's include order in C, which the port has no source for.
-fn load_order(dbd_dir: &Path, by_file: &[(String, Vec<String>)]) -> Vec<String> {
-    let mut order: Vec<String> = Vec::new();
-    let push = |names: &[String], order: &mut Vec<String>| {
-        for n in names {
-            if !order.contains(n) {
-                order.push(n.clone());
-            }
-        }
-    };
-    if let Ok(src) = std::fs::read_to_string(dbd_dir.join("stdRecords.dbd")) {
-        for include in dbd_includes(&src) {
-            if let Some((_, names)) = by_file.iter().find(|(f, _)| *f == include) {
-                push(names, &mut order);
-            }
-        }
-    }
-    for (_, names) in by_file {
-        push(names, &mut order);
-    }
+/// `dbRecordtypeHead` appends each type as its declaration loads
+/// (`dbLexRoutines.c:810`), and an IOC loads its expanded `.dbd`, whose
+/// record types `dbdExpand.pl` writes name-sorted across base and every module
+/// (`DBD/Output.pm:61`):
+/// softIoc.dbd opens `aSub, aai, aao, ai`, and an IOC built with std puts
+/// `epid` between `dfanout` and `event`. So the order is `strcmp` over every
+/// declared name.
+fn record_type_list_order(records: &[parse::RecordType]) -> Vec<String> {
+    let mut order: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+    order.sort();
+    order.dedup();
     order
-}
-
-/// The quoted arguments of a `.dbd`'s top-level `include` lines, in order.
-fn dbd_includes(src: &str) -> Vec<String> {
-    src.lines()
-        .filter_map(|line| line.trim().strip_prefix("include"))
-        .filter_map(|rest| {
-            let inner = rest.trim().strip_prefix('"')?;
-            let end = inner.find('"')?;
-            Some(inner[..end].to_string())
-        })
-        .collect()
 }
 
 /// The `cvt_dbaddr.types` of one target, or an empty map when it has none.
@@ -376,8 +337,6 @@ fn generate(
         devices: &parsed.devices,
         records: &parsed.records,
         // The scan lists are base's, and so is the one table that orders them.
-        // A downstream target's record types are unknown to it by construction
-        // — the same way C's `recordTypeList` holds them behind base's.
         order: if target.is_base() { &parsed.order } else { &[] },
         variables: &parsed.variables,
         // `dbCommon` is modelled once, by base, and emitted once, into base's

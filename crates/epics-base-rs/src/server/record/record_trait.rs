@@ -838,6 +838,16 @@ pub enum CyclePostMask {
     MonitorValue,
     /// `monitor_mask | DBE_LOG` — the ADEL-only counterpart.
     MonitorLog,
+    /// A `monitor()` that `special()` runs (compress SPC_RESET,
+    /// `compressRecord.c:101-111`): the put's drain commits the alarm
+    /// (`recGblResetAlarms`) before the first such post and ORs its
+    /// `DBE_ALARM` into `DBE_VALUE | DBE_LOG`. A cycle has already committed
+    /// its alarm, so there it is [`Self::MonitorValueLog`].
+    ResetValueLog,
+    /// [`Self::ResetValueLog`], posted only when that commit moved the alarm:
+    /// the `alarm_mask ||` half of compress's NUSE condition (`:105`), marked
+    /// when the record's own half did not fire.
+    ResetValueLogOnAlarm,
 }
 
 /// One take's marks: a bit per entry of the record type's static post table,
@@ -1804,9 +1814,13 @@ impl CycleHooks {
     pub const WRITE_POSTED: Self = Self(8);
     /// [`Record::take_process_posted_fields`].
     pub const PROCESS_POSTED: Self = Self(16);
+    /// [`Record::take_put_report`] after a `special(_, true)` that returned
+    /// `Ok`: a put-only hook, outside [`Self::ALL`], declared by the type
+    /// whose `special()` reports and still accepts the put.
+    pub const PUT_REPORT: Self = Self(32);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
-    /// Every hook is asked — the default, so a type that never says
+    /// Every per-cycle hook is asked — the default, so a type that never says
     /// otherwise pays the call and never loses an action.
     pub const ALL: Self = Self(31);
 
@@ -4059,7 +4073,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// `Some(list)` closes it by construction: a field outside the list is
     /// never posted by a process cycle — its only monitors come from its own
-    /// put and from [`Self::monitor_side_effect_fields`]. The list is a
+    /// put and from the posts its `special()` marks. The list is a
     /// whitelist, not a blacklist, so a field added to the record later stays
     /// silent unless C posts it.
     ///
@@ -4849,6 +4863,17 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// The [`PutReport`](crate::server::recgbl::PutReport) the last
+    /// `special(_, true)` made in place of printing under the hold, taken by
+    /// the put path and printed once the put's gate drops. Asked after a
+    /// refused `special()`, and after an accepted one only for a type that
+    /// declares [`CycleHooks::PUT_REPORT`].
+    ///
+    /// Default: none.
+    fn take_put_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        None
+    }
+
     /// A `special()`/`put_field` pass that ended on C's `prec->udf = FALSE`.
     ///
     /// UDF is a common field, so a record method cannot write it — the same
@@ -4868,19 +4893,6 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
-    /// Other fields whose monitors must be posted because a put to
-    /// `put_field` changed them as a side effect, without driving a full
-    /// process cycle.
-    ///
-    /// Mirrors the explicit `db_post_events` calls a C `special()` makes:
-    /// e.g. `compressRecord.c::reset` (invoked on a `SPC_RESET` write to
-    /// `RES`) posts `NUSE` and `VAL` even though `RES` is not `pp(TRUE)`
-    /// and so does not process. The framework posts a `VALUE|LOG` monitor
-    /// for each returned field after the put. Default: none.
-    fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {
-        &[]
-    }
-
     /// True iff the C `special()` for a put to `put_field` runs the record's
     /// own `monitor()` — whose first act is `recGblResetAlarms(prec)`, which
     /// commits `nsta`/`nsev` into `stat`/`sevr` and clears the born-UDF alarm.
@@ -4891,12 +4903,10 @@ pub trait Record: Send + Sync + 'static {
     /// `recGblResetAlarms`. A born-UDF compress record therefore transitions to
     /// NO_ALARM the moment one of those fields is put, with no process cycle.
     ///
-    /// The framework already posts the `db_post_events` half of that `monitor()`
-    /// through [`Record::monitor_side_effect_fields`]; this hook is the
-    /// `recGblResetAlarms` half. When it returns true, the put owner
-    /// (`field_io`'s `dbPut` paths) runs `rec_gbl_reset_alarms` and posts the
-    /// resulting STAT/SEVR/AMSG/ACKS transition. Default: false (a `special()`
-    /// that does not run the record's `monitor()`).
+    /// `special()` marks that `monitor()`'s posts as
+    /// [`CyclePostMask::ResetValueLog`], whose drain commits the alarm; this
+    /// hook only makes the CA route run `special()` on a rejected conversion
+    /// too (`dbAccess.c:1398`). Default: false.
     fn special_commits_alarms(&self, _put_field: &str) -> bool {
         false
     }
@@ -7060,12 +7070,13 @@ mod tests {
     fn a_type_that_overrides_a_cycle_hook_says_so() {
         use crate::server::record::dbd_generated::RECORD_TYPES;
         let expected = |t: &str| match t {
-            "compress" | "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
+            "waveform" | "aai" | "aao" | "subArray" => CycleHooks::PRE_INPUT,
+            "compress" => CycleHooks::PRE_INPUT.union(CycleHooks::WRITE_POSTED),
             "acalcout" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::PROCESS_POSTED),
             "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
-            "calcout" => CycleHooks::WRITE_POSTED,
+            "calcout" | "mbbi" | "mbbo" | "lso" | "lsi" | "swait" => CycleHooks::WRITE_POSTED,
             "transform" => CycleHooks::CYCLE_POSTED.union(CycleHooks::CONTEXT),
             "sseq" | "scalcout" => CycleHooks::ALL,
             _ => CycleHooks::NONE,

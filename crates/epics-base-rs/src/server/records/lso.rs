@@ -47,6 +47,9 @@ pub struct LsoRecord {
     /// DBE_LOG (archive) mask (C `lsoRecord.dbd.pod` APST, monitor:
     /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
     pub apst: i16,
+    /// LEN owed by `special()` on a VAL put, or by `monitor()`'s
+    /// `len != olen` on the cycle it ran; `take_cycle_posted_fields` takes it.
+    len_marked: bool,
 }
 
 impl Default for LsoRecord {
@@ -71,6 +74,7 @@ impl Default for LsoRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            len_marked: false,
         }
     }
 }
@@ -97,7 +101,7 @@ impl Record for LsoRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     fn record_type(&self) -> &'static str {
@@ -213,9 +217,56 @@ impl Record for LsoRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval.copy_from(&self.val);
+            // Unchanged bytes have an unchanged length, and the take that
+            // `marked` guarantees has already cleared the mark.
+            self.len_marked = self.oval.copy_from(&self.val);
         }
         Some(changed)
+    }
+
+    /// C `lsoRecord.c:254-256`: `if (len != olen) { olen = len; db_post_events(&len,
+    /// DBE_VALUE | DBE_LOG); }`, marked by `monitor_value_changed` as it
+    /// commits OVAL, whose length is OLEN.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let changed = self.monitor_value_changed() == Some(true);
+        let (val_always, archive_always) = self.monitor_always_post();
+        crate::server::record::MonitorValueClasses {
+            value: changed || val_always,
+            archive: changed || archive_always,
+            hash_changed: false,
+            marked: self.len_marked,
+        }
+    }
+
+    /// C `special()` sets `len` and posts it on every VAL put (lsoRecord.c:239),
+    /// changed or not; `monitor()` posts it again only when `len != olen`.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && field == "VAL" {
+            self.len_marked = true;
+        }
+        Ok(())
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
+        CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u64)
+    }
+
+    /// LEN posts from `special()` and from `monitor()`'s `olen` compare, never
+    /// against what a subscriber was last sent.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["LEN"]
+    }
+
+    /// C `monitor()` posts VAL and LEN alone (lsoRecord.c:246-265); the
+    /// OVAL/OLEN copy it makes is never posted.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "LEN"])
     }
 
     fn stamps_after_write(&self) -> bool {

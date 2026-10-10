@@ -98,13 +98,9 @@ pub struct CompressRecord {
     /// source's capacity and its delivered length both change exactly when the
     /// source array is re-shaped).
     inpn: usize,
-    /// What C `monitor()` (:101-111) decided to post for the SPC_RESET put now
-    /// in flight. Written by [`Self::monitor`] — the only place that makes the
-    /// decision, and the only writer of `ouse` — and read back by
-    /// `monitor_side_effect_fields`, which the put owner calls immediately
-    /// after `special()`, for the same put. One meaning on every path: "the
-    /// field set the last `monitor()` posted".
-    monitor_posts: &'static [&'static str],
+    /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
+    /// [`RESET_POSTS`] entry, until the put drains them.
+    reset_posts: u64,
 }
 
 impl Default for CompressRecord {
@@ -139,7 +135,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
-            monitor_posts: &[],
+            reset_posts: 0,
         }
     }
 }
@@ -224,16 +220,12 @@ impl CompressRecord {
     /// of `process()` (`:365-371`, skipped on an accumulate-only cycle — which
     /// is why an accumulating compress does not re-post NUSE).
     ///
-    /// Returns the fields to post; `special()` hands them to the framework
-    /// through [`Record::monitor_side_effect_fields`] (the alarm-mask term is
-    /// the framework's — it posts on an alarm transition regardless).
-    fn monitor(&mut self) -> &'static [&'static str] {
-        if self.nuse != self.ouse {
-            self.ouse = self.nuse;
-            &["NUSE", "VAL"]
-        } else {
-            &["VAL"]
-        }
+    /// Returns whether NUSE moved against the OUSE latch, the record's half
+    /// of C's NUSE condition; `alarm_mask` is the framework's.
+    fn monitor(&mut self) -> bool {
+        let moved = self.nuse != self.ouse;
+        self.ouse = self.nuse;
+        moved
     }
 
     /// N, clamped to at least 1 **and written back** — the single owner of
@@ -567,10 +559,19 @@ const COMPRESS_BALG_CHOICES: &[&str] = &["FIFO Buffer", "LIFO Buffer"];
 /// RES (:396-400), ALG (:402-408), PBUF (:409-416), BALG (:417-423) and
 /// N (:431-437). C's `special()` (compressRecord.c:377-393) does not
 /// discriminate between them — any SPC_RESET write runs `reset(); monitor();` —
-/// so this list is both the [`Record::special`] trigger set and the
-/// [`Record::monitor_side_effect_fields`] key set. None of the five is
-/// `pp(TRUE)`, so the side-effect post is the only monitor the put produces.
+/// so this list is the [`Record::special`] trigger set.
 const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
+
+/// C `monitor()`'s posts (`compressRecord.c:105-110`): NUSE when it moved,
+/// NUSE when only the alarm did, then VAL.
+static RESET_POSTS: [(&str, crate::server::record::CyclePostMask); 3] = [
+    ("NUSE", crate::server::record::CyclePostMask::ResetValueLog),
+    (
+        "NUSE",
+        crate::server::record::CyclePostMask::ResetValueLogOnAlarm,
+    ),
+    ("VAL", crate::server::record::CyclePostMask::ResetValueLog),
+];
 
 impl Record for CompressRecord {
     fn acts_before_process(&self) -> bool {
@@ -579,6 +580,7 @@ impl Record for CompressRecord {
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::PRE_INPUT
+            .union(crate::server::record::CycleHooks::WRITE_POSTED)
     }
 
     fn has_array_monitor_post(&self) -> bool {
@@ -619,36 +621,24 @@ impl Record for CompressRecord {
     /// ```
     ///
     /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
-    /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone. The
-    /// `monitor()` half is [`Record::monitor_side_effect_fields`].
+    /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
             self.reset();
-            self.monitor_posts = self.monitor();
+            self.reset_posts = if self.monitor() { 0b101 } else { 0b110 };
         }
         Ok(())
     }
 
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        // The `monitor(prec)` half of C's SPC_RESET `special()`. Which fields
-        // that is, is `monitor()`'s decision, not this hook's: VAL always, NUSE
-        // only when it changed against the OUSE latch (compressRecord.c:104-108)
-        // — so a second RES put on an already-empty buffer re-posts VAL alone,
-        // as C does. Keyed on the same five fields as the reset itself; none of
-        // them is pp(TRUE), so this is the only monitor such a put produces.
-        if COMPRESS_SPC_RESET_FIELDS.contains(&put_field) {
-            self.monitor_posts
-        } else {
-            &[]
-        }
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        crate::server::record::CycleMarks::of(&RESET_POSTS, std::mem::take(&mut self.reset_posts))
     }
 
     /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`
     /// (compressRecord.c:103) — which `special()` invokes for every SPC_RESET
     /// write — opens with `recGblResetAlarms(prec)`, so a put to any of the five
     /// reset fields commits the record's pending alarm (clearing the born-UDF of
-    /// a never-processed compress) without a process cycle. Keyed on the same
-    /// five fields as [`Record::monitor_side_effect_fields`].
+    /// a never-processed compress) without a process cycle.
     fn special_commits_alarms(&self, put_field: &str) -> bool {
         COMPRESS_SPC_RESET_FIELDS.contains(&put_field)
     }
@@ -686,7 +676,7 @@ impl Record for CompressRecord {
         }
         // C `compressRecord.c:365-371`: the epilogue calls `monitor(prec)`,
         // which is where OUSE latches on a publishing cycle.
-        self.monitor_posts = self.monitor();
+        self.monitor();
         Ok(ProcessOutcome::complete())
     }
 

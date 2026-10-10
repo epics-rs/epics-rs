@@ -818,6 +818,215 @@ pub fn rec_gbl_dbaddr_error(status_text: &str, record_name: &str, field_name: &s
     ));
 }
 
+/// The `sprintf` prefix `dbGet` and `dbPut` hand `recGblDbaddrError` with
+/// `S_db_badDbrtype` (`dbAccess.c:959`, `:1343`). `dbr` and `field_type` are
+/// separate inputs: `dbgf` passes `addr.dbr_field_type` (`dbTest.c:380`), a DB
+/// link's `dbPut` the source's request type. `%.12s` is kept so the name is
+/// cut where C cuts it.
+pub fn bad_dbrtype_message(op: &str, dbr: DbfCode, field_type: DbfCode) -> String {
+    let ft_name = format!("DBF_{}", field_type.name());
+    format!(
+        "{op}: dbrType = {}, field_type = {ft_name:.12} ({}).",
+        dbr as i16, field_type as i16
+    )
+}
+
+/// `recGblDbaddrError(S_db_badDbrtype, paddr, message)` with
+/// [`bad_dbrtype_message`] as the message.
+pub fn rec_gbl_bad_dbrtype(
+    op: &str,
+    dbr: DbfCode,
+    field_type: DbfCode,
+    record_name: &str,
+    field_name: &str,
+) {
+    rec_gbl_dbaddr_error(
+        "Illegal Database Request Type",
+        record_name,
+        field_name,
+        &bad_dbrtype_message(op, dbr, field_type),
+    );
+}
+
+/// The console report of a put refused under the record hold, made there as
+/// data and printed by the put's owner once the hold is down.
+///
+/// C prints these from inside `dbPut`, under `dbScanLock`; the port does not
+/// format or print under a hold, so the maker stores one of these instead and
+/// the put frame carries it out. Nothing in it allocates: the messages are the
+/// C literals, the statuses their `errSymLookup` text (as
+/// [`rec_gbl_record_error`] takes them), and the record and field are the
+/// put's own, which the owner names when it prints.
+///
+/// One per put. C's `dbPut` reports at most once — its link-field and
+/// SPC_NOMOD refusals return before `special()` runs, and a `special()` that
+/// reports does so once, from the one pass that refuses.
+///
+/// Makers:
+/// - `special(_, true)` stores it in the record and answers it from
+///   [`Record::take_put_report`](crate::server::record::Record::take_put_report).
+///   A refused `special()` is always drained; a `special()` that reports and
+///   still returns `Ok` (calcout, scalcout, acalcout, `return 0` after the
+///   report) declares [`CycleHooks::PUT_REPORT`](crate::server::record::CycleHooks::PUT_REPORT).
+///   `CalcCompile::put_report_in_expression` builds calc's and calcout's;
+///   scalcout and acalcout pair `CalcCompile::error_number` with
+///   [`ReportTail::PostfixReturns`].
+/// - A `dbPut` gate in the put path (link-field type, SPC_NOMOD) stores it in
+///   the put frame directly.
+/// - A converter refusal (`putStringEnum`) rides out in
+///   [`ChoiceRefusal`](crate::error::ChoiceRefusal) and the put body moves it
+///   into the put frame.
+///
+/// A put made inside a process cycle (a DB OUT link's `dbPut`) has no hold of
+/// its own; its report is owed to the chain's hold owner as a
+/// `CycleReport`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutReport {
+    /// `recGblRecordError(status, prec, message)` (`recGbl.c:59-71`), then
+    /// `then`.
+    RecordError {
+        status: &'static str,
+        message: &'static str,
+        then: Option<ReportTail>,
+    },
+    /// `recGblDbaddrError(status, paddr, message)` (`recGbl.c:73-91`) naming
+    /// the put's field.
+    DbaddrError {
+        status: &'static str,
+        message: &'static str,
+    },
+    /// `dbPut`'s link-field refusal, [`rec_gbl_bad_dbrtype`] with `"dbPut"`
+    /// (`dbAccess.c:1340-1347`).
+    BadDbrtype { dbr: DbfCode, field_type: DbfCode },
+    /// `putStringEnum`'s `recGblRecordError(S_db_badChoice, precord, pfrom)`
+    /// (`dbConvert.c:1189`): the put's own string is the message.
+    IllegalChoice { from: ReportString },
+}
+
+/// The line a [`PutReport::RecordError`] is followed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportTail {
+    /// calc/calcout `errlogPrintf("%s.<field>: %s in expression \"%s\"\n",
+    /// prec->name, calcErrorStr(error_number), <expr>)` (`calcRecord.c:150`,
+    /// `calcoutRecord.c:53`, `:64`).
+    InExpression {
+        field: &'static str,
+        error: &'static str,
+        expr: ReportText,
+    },
+    /// scalcout/acalcout `printf("<routine> returns: %d\n", error_number)` on
+    /// stdout, not errlog (`sCalcoutRecord.c:55`, `aCalcoutRecord.c:56`).
+    PostfixReturns { routine: &'static str, number: i16 },
+}
+
+/// A record string copied into a report: C's `char[80]` CALC/OCAL, so the
+/// copy is fixed-size and C could not have printed more.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReportText {
+    buf: [u8; 80],
+    len: u8,
+}
+
+impl ReportText {
+    /// `text` cut to the 79 bytes C's `char[80]` holds, at a char boundary.
+    pub fn new(text: &str) -> Self {
+        let mut len = text.len().min(79);
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut buf = [0; 80];
+        buf[..len].copy_from_slice(&text.as_bytes()[..len]);
+        Self {
+            buf,
+            len: len as u8,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Cut at a char boundary of a `&str` in `new`.
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+/// A put's `DBR_STRING` copied into a report: C's `MAX_STRING_SIZE` buffer.
+/// Half a [`ReportText`], so a [`ChoiceRefusal`](crate::error::ChoiceRefusal)
+/// can carry it without growing every `CaResult`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReportString {
+    buf: [u8; 40],
+    len: u8,
+}
+
+impl ReportString {
+    /// `text` cut to the 39 bytes a `DBR_STRING` holds, at a char boundary.
+    pub fn new(text: &str) -> Self {
+        let mut len = text.len().min(39);
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut buf = [0; 40];
+        buf[..len].copy_from_slice(&text.as_bytes()[..len]);
+        Self {
+            buf,
+            len: len as u8,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Cut at a char boundary of a `&str` in `new`.
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ReportString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl std::fmt::Debug for ReportText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl PutReport {
+    /// Print the report for `record_name`.`field_name`, on C's streams. Only
+    /// the put's owner calls this, with the hold down.
+    pub(crate) fn emit(&self, record_name: &str, field_name: &str) {
+        match *self {
+            PutReport::RecordError {
+                status,
+                message,
+                then,
+            } => {
+                rec_gbl_record_error(status, record_name, message);
+                match then {
+                    Some(ReportTail::InExpression { field, error, expr }) => {
+                        crate::runtime::log::errlog_printf(&format!(
+                            "{record_name}.{field}: {error} in expression \"{}\"\n",
+                            expr.as_str()
+                        ));
+                    }
+                    Some(ReportTail::PostfixReturns { routine, number }) => {
+                        println!("{routine} returns: {number}");
+                    }
+                    None => {}
+                }
+            }
+            PutReport::DbaddrError { status, message } => {
+                rec_gbl_dbaddr_error(status, record_name, field_name, message);
+            }
+            PutReport::BadDbrtype { dbr, field_type } => {
+                rec_gbl_bad_dbrtype("dbPut", dbr, field_type, record_name, field_name);
+            }
+            PutReport::IllegalChoice { from } => {
+                rec_gbl_record_error("Illegal choice", record_name, from.as_str());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

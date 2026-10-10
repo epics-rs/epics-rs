@@ -43,6 +43,10 @@ pub struct IocBuilder {
     /// parse fault is recorded before an earlier file's records are even
     /// built — and only the load position orders them the way C does.
     failed_loads: Vec<usize>,
+    /// What a failed load does to the build: `false` is `softIoc -d`, which
+    /// exits before `iocInit`; `true` is a `dbLoadRecords` line in a startup
+    /// script, which reports and lets the script go on to `iocInit`.
+    boot_past_failed_loads: bool,
     /// File-scope aliases whose target no `.db` added so far declares,
     /// each tagged with the [`IocBuilder::sources`] index that carried it.
     /// Resolved at `build` against the accumulated definitions, which is
@@ -83,6 +87,7 @@ impl IocBuilder {
             sources: Vec::new(),
             db_defs: Vec::new(),
             failed_loads: Vec::new(),
+            boot_past_failed_loads: false,
             db_aliases: Vec::new(),
             breaktables: Vec::new(),
             device_factories,
@@ -222,6 +227,16 @@ impl IocBuilder {
     {
         self.subroutine_registry
             .insert(name.to_string(), Arc::new(Box::new(func)));
+        self
+    }
+
+    /// Load as a startup script's `dbLoadRecords` does rather than as
+    /// `softIoc -d`: a failed load prints C's `Failed to load` tail
+    /// (`dbAccess.c:808`) and the build still boots every record that
+    /// parsed, a refused field keeping whatever its `dbPutString` left
+    /// (`dbLexRoutines.c:1405-1415` is `yyerror(NULL)`, not an abort).
+    pub fn boot_past_failed_loads(mut self) -> Self {
+        self.boot_past_failed_loads = true;
         self
     }
 
@@ -464,8 +479,16 @@ impl IocBuilder {
         // `softMain` exits on the first `dbLoadRecords` that returns
         // non-zero (`softMain.cpp:198`), so the file named is the
         // earliest-loaded one that failed, and `iocInit` below never runs.
-        if let Some(&load) = failed_loads.iter().min() {
+        // A script instead prints each failed load's tail and goes on.
+        failed_loads.sort_unstable();
+        failed_loads.dedup();
+        if let Some(&load) = failed_loads.first()
+            && !self.boot_past_failed_loads
+        {
             return Err(CaError::DbLoadFailed(self.sources[load].clone()));
+        }
+        for load in failed_loads {
+            eprintln!("{ERL_ERROR}: Failed to load '{}'", self.sources[load]);
         }
 
         // 4. Autosave restore
@@ -600,6 +623,26 @@ record(ai, "A:ONE") {
             format!("Failed to load '{}'", path.display()),
             "the tail names the file, not the last record's own error",
         );
+    }
+
+    /// The same refusal under a startup script's `dbLoadRecords` boots: C
+    /// oracleSwaitIoc on `record(ai,"AI"){field(SCAN,"bogus") field(DESC,
+    /// "kept")}` prints `Failed to load` and iocInit runs, `dbgf AI.SCAN`
+    /// `"Passive"`, `AI.DESC` `"kept"`.
+    #[epics_macros_rs::epics_test]
+    async fn a_script_load_boots_past_its_refused_field() {
+        let (db, _) = IocBuilder::new()
+            .db_string(
+                "record(ai, \"AI\") { field(SCAN, \"bogus\") field(DESC, \"kept\") }\n",
+                &HashMap::new(),
+            )
+            .unwrap()
+            .boot_past_failed_loads()
+            .build()
+            .await
+            .expect("a script's failed load still boots");
+        assert_eq!(db.get_pv("AI.SCAN").unwrap().to_f64(), Some(0.0), "Passive");
+        assert_eq!(db.get_pv("AI.DESC").unwrap().to_string(), "kept");
     }
 
     /// C creates the record and only THEN puts its fields, so a value

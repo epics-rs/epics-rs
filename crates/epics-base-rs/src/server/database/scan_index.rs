@@ -621,7 +621,7 @@ impl PvDatabase {
     /// record was inspected serially.
     pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
         let mut result = Vec::new();
-        for (name, rec) in self.records_in_load_order() {
+        for (name, rec) in self.iterate_records() {
             if rec.read().common.pini == mode.to_u16() as i16 {
                 result.push(name);
             }
@@ -629,29 +629,35 @@ impl PvDatabase {
         result
     }
 
-    /// Every record, in database **load order** — the port's analogue of C's
-    /// `iterateRecords`, which walks the record-type / record-instance lists in
-    /// the order the `.db` declared them. That order is what makes two
-    /// same-`PHAS` records process deterministically; `load_order` is one of
-    /// the `scan_index` sort keys for the same reason (see `ScanKey`, which
-    /// also carries the record-type ordinal C's `iterateRecords` walks first —
-    /// this PINI sweep does not, and that is a separate gap).
+    /// Every record in C's `iterateRecords` order (`iocInit.c:484-506`): the
+    /// record types as `recordTypeList` holds them, each type's records in
+    /// `.db` load order. An IOC loads its expanded `.dbd`, whose record types
+    /// are name-sorted (see `contributed_dbd::record_types`), so the type
+    /// order is `strcmp` order — `aSub` before `aai` — for a type no vendored
+    /// `.dbd` declares as well.
     ///
     /// Snapshots the map under the records read lock and releases it before the
-    /// caller takes any per-record lock. The sort key travels with the record,
-    /// so the snapshot and the key come from that one read.
-    pub(super) fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
+    /// caller takes any per-record lock. Both sort keys live on the cell, so no
+    /// record lock is taken to sort.
+    pub(super) fn iterate_records(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
         let mut keyed: Vec<_> = {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(n, r)| (r.load_order(), n.to_string(), r.clone()))
+                .map(|(n, r)| {
+                    (
+                        r.rdes().record_type,
+                        r.load_order(),
+                        n.to_string(),
+                        r.clone(),
+                    )
+                })
                 .collect()
         };
-        keyed.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        keyed.sort_unstable_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
         keyed
             .into_iter()
-            .map(|(_seq, name, rec)| (name, rec))
+            .map(|(_, _, name, rec)| (name, rec))
             .collect()
     }
 
@@ -691,7 +697,7 @@ impl PvDatabase {
             // See `scan_list_once`: one set per sweep, emptied by each frame's
             // own unwind.
             let mut visited = crate::server::database::ProcStack::new();
-            for (name, rec) in self.records_in_load_order() {
+            for (name, rec) in self.iterate_records() {
                 let (pini, phas) = {
                     let instance = rec.read();
                     (instance.common.pini, i32::from(instance.common.phas))

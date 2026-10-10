@@ -22,6 +22,10 @@ pub struct ProcStack {
     head: Option<CellId>,
     /// Depth two and beyond.
     rest: Vec<CellId>,
+    /// The first refused link `dbPut` the chain made, which C prints under the
+    /// chain's lock: the owner of the chain's hold prints it once the hold is
+    /// down. One slot, so a chain's later refusals are not printed.
+    report: Option<super::field_io::CycleReport>,
 }
 
 /// A record cell's address, compared and never dereferenced. It stays unique
@@ -80,6 +84,17 @@ impl ProcStack {
     pub fn holds(&self, rec: &Arc<RecordCell>) -> bool {
         let id = CellId::of(rec);
         self.head == Some(id) || self.rest.contains(&id)
+    }
+
+    /// Owe `report` to the chain's hold owner, unless one is owed already.
+    #[cold]
+    pub(crate) fn owe_report(&mut self, report: super::field_io::CycleReport) {
+        self.report.get_or_insert(report);
+    }
+
+    /// The report the chain owes, for the owner of its hold.
+    pub(crate) fn take_report(&mut self) -> Option<super::field_io::CycleReport> {
+        self.report.take()
     }
 }
 
@@ -2373,7 +2388,22 @@ impl PvDatabase {
         // dbRec2Pvt(pdst)->procThread = NULL;` — after `dbProcess`, whatever
         // it returned.
         visited.release(&rec);
+        // The chain's outermost frame that took its gate owns the hold, so it
+        // prints what the chain owes once the gate is down. A frame under a
+        // caller's hold leaves the report in `visited` for that caller.
+        drop(record_gate);
+        if visited.report.is_some() && acquire_gate && visited.is_empty() {
+            self.settle_chain_report(visited);
+        }
         result
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_chain_report(&self, visited: &mut ProcStack) {
+        if let Some(cycle) = visited.take_report() {
+            self.emit_cycle_report(cycle);
+        }
     }
 
     /// One entry point processed by a breakpoint continuation thread — C

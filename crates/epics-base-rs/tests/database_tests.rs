@@ -8280,7 +8280,9 @@ async fn test_histogram_sdel_watchdog_posts_val() {
 /// Both fields were absent from the port, so a caget on either failed.
 #[epics_macros_rs::epics_test]
 async fn test_compress_ouse_and_inpn_fields() {
+    use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::compress::CompressRecord;
+    use epics_base_rs::types::DbFieldType;
 
     let db = PvDatabase::new();
     db.add_record("CMP_OUSE", Box::new(CompressRecord::new(4, 4)))
@@ -8319,6 +8321,16 @@ async fn test_compress_ouse_and_inpn_fields() {
     );
 
     // RES resets, and the SPC_RESET monitor() latches OUSE back to 0.
+    let mut nuse = rec
+        .write()
+        .add_subscriber(
+            "NUSE",
+            1,
+            DbFieldType::Long,
+            (EventMask::VALUE | EventMask::LOG).bits(),
+        )
+        .unwrap();
+    while nuse.try_recv().is_ok() {}
     db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
         .await
         .unwrap();
@@ -8327,27 +8339,19 @@ async fn test_compress_ouse_and_inpn_fields() {
 
     // The latch is what gates the NUSE post: that first RES moved NUSE 1 -> 0,
     // so it posted NUSE alongside VAL...
-    {
-        let inst = rec.read();
-        assert_eq!(
-            inst.record.monitor_side_effect_fields("RES"),
-            &["NUSE", "VAL"],
-            "NUSE changed against OUSE -> C posts NUSE too"
-        );
-    }
+    assert!(
+        nuse.try_recv().is_ok(),
+        "NUSE changed against OUSE -> C posts NUSE too"
+    );
     // ...while a second RES on an already-empty buffer leaves NUSE == OUSE, so
     // `monitor()` posts VAL alone.
     db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
         .await
         .unwrap();
-    {
-        let inst = rec.read();
-        assert_eq!(
-            inst.record.monitor_side_effect_fields("RES"),
-            &["VAL"],
-            "NUSE unchanged against OUSE -> C posts VAL only"
-        );
-    }
+    assert!(
+        nuse.try_recv().is_err(),
+        "NUSE unchanged against OUSE -> C posts VAL only"
+    );
 }
 
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect

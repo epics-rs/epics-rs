@@ -3605,9 +3605,10 @@ impl RecordInstance {
             let mask = match mask {
                 CyclePostMask::Value | CyclePostMask::MonitorValue => EventMask::VALUE,
                 CyclePostMask::MonitorLog => EventMask::LOG,
-                CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
-                    EventMask::VALUE | EventMask::LOG
-                }
+                CyclePostMask::ValueLog
+                | CyclePostMask::MonitorValueLog
+                | CyclePostMask::ResetValueLog
+                | CyclePostMask::ResetValueLogOnAlarm => EventMask::VALUE | EventMask::LOG,
             };
             self.post_field(
                 field,
@@ -4318,40 +4319,6 @@ impl RecordInstance {
         }
     }
 
-    /// **The owner of a record's init passes** — C `iocInit.c::doInitRecord0`
-    /// (`:508-536`) and `doInitRecord1`. Nothing else may call
-    /// `Record::init_record`.
-    ///
-    /// C runs a prologue on EVERY record before pass 0, and it is the reason
-    /// this is one function instead of two `init_record` calls at each caller:
-    ///
-    /// ```c
-    /// /* Reset the process active field */
-    /// precord->pact = FALSE;
-    ///
-    /// /* Initial UDF severity */
-    /// if (precord->udf && precord->stat == UDF_ALARM)
-    ///     precord->sevr = precord->udfs;
-    /// ```
-    ///
-    /// A record is born `udf = 1`, `stat = UDF_ALARM` (dbCommon.dbd
-    /// `initial("UDF")`), `udfs = INVALID` — so after `iocInit` a record that
-    /// has NEVER processed advertises `STAT=UDF SEVR=INVALID`, not
-    /// `NO_ALARM`. That is what makes an `MS` consumer inherit
-    /// `LINK`/`INVALID` from a not-yet-processed source, the IOC-startup
-    /// ordering case MS exists for (softIoc-verified). A record whose
-    /// `init_record` or device support defines the value clears UDF and the
-    /// severity goes away on its first process.
-    ///
-    /// `name` is used only for the init-failure diagnostics C sends to errlog.
-    ///
-    /// Crate-private on purpose: the passes must run against the record's FINAL
-    /// loaded field set (the initial UDF severity is a function of UDF/STAT/
-    /// UDFS, and a `.db` `field(VAL,…)` clears UDF at load — C
-    /// `dbStaticLib.c:2653-2661`). The one caller is the creation sink,
-    /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
-    /// the load and the record together so no path can init a half-loaded
-    /// record.
     /// Hand the record the function registry its pending init pass 1 resolves
     /// INAM/SNAM against. The creation sink's line; see [`Self::
     /// init_subroutines`].
@@ -4398,11 +4365,57 @@ impl RecordInstance {
         }
     }
 
+    /// **The owner of a record's init passes** — C `iocInit.c::doInitRecord0`
+    /// (`:508-536`) and `doInitRecord1`. Nothing else may call
+    /// `Record::init_record`.
+    ///
+    /// C runs a prologue on EVERY record before pass 0, and it is the reason
+    /// this is one function instead of two `init_record` calls at each caller:
+    ///
+    /// ```c
+    /// /* Reset the process active field */
+    /// precord->pact = FALSE;
+    ///
+    /// /* Initial UDF severity */
+    /// if (precord->udf && precord->stat == UDF_ALARM)
+    ///     precord->sevr = precord->udfs;
+    /// ```
+    ///
+    /// A record is born `udf = 1`, `stat = UDF_ALARM` (dbCommon.dbd
+    /// `initial("UDF")`), `udfs = INVALID` — so after `iocInit` a record that
+    /// has NEVER processed advertises `STAT=UDF SEVR=INVALID`, not
+    /// `NO_ALARM`. That is what makes an `MS` consumer inherit
+    /// `LINK`/`INVALID` from a not-yet-processed source, the IOC-startup
+    /// ordering case MS exists for (softIoc-verified). A record whose
+    /// `init_record` or device support defines the value clears UDF and the
+    /// severity goes away on its first process.
+    ///
+    /// `name` is used only for the init-failure diagnostics C sends to errlog.
+    ///
+    /// Crate-private on purpose: the passes must run against the record's FINAL
+    /// loaded field set (the initial UDF severity is a function of UDF/STAT/
+    /// UDFS, and a `.db` `field(VAL,…)` clears UDF at load — C
+    /// `dbStaticLib.c:2653-2661`). The callers are the creation sink,
+    /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
+    /// the load and the record together so no path can init a half-loaded
+    /// record, and the `iocInit` drain, which runs the three halves as C's
+    /// three whole-database walks: [`Self::run_init_pass0`] over every record,
+    /// then [`Self::run_add_record`], then [`Self::run_init_pass1`].
     pub(crate) fn run_init_passes(
         &mut self,
         name: &str,
         add_record_input: Option<crate::server::builtin_devices::soft_callback::AddRecordInput>,
     ) {
+        if self.run_init_pass0(name) {
+            self.run_add_record(name, add_record_input);
+            self.run_init_pass1(name);
+        }
+    }
+
+    /// C `doInitRecord0`: the prologue and `init_record(prec, 0)`. Returns
+    /// whether the record's `init_record` gets past its dset test, i.e.
+    /// whether the two later walks have anything to do for it.
+    pub(crate) fn run_init_pass0(&mut self, name: &str) -> bool {
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
         // restart list is empty.
@@ -4433,11 +4446,20 @@ impl RecordInstance {
         // see `RecordInstance::device`. Asking every record type to re-derive
         // the answer is the per-cell patch this replaces.
         if !self.init_record_reaches_body() {
-            return;
+            return false;
         }
         if let Err(e) = self.record.init_record(0) {
             eprintln!("init_record(0) failed for {name}: {e}");
         }
+        true
+    }
+
+    /// C `doResolveLinks`' device-support half, for a record pass 0 reached.
+    pub(crate) fn run_add_record(
+        &mut self,
+        name: &str,
+        add_record_input: Option<crate::server::builtin_devices::soft_callback::AddRecordInput>,
+    ) {
         // C `iocInit.c::doResolveLinks` (`:545-570`), the pass BETWEEN the two
         // `init_record` calls: for each device link the record type declares,
         // `pdsxt->add_record(precord)` and then `dbInitLink` for that same
@@ -4448,6 +4470,11 @@ impl RecordInstance {
         {
             refusal.report(name);
         }
+    }
+
+    /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
+    /// record pass 0 reached.
+    pub(crate) fn run_init_pass1(&mut self, name: &str) {
         if let Err(e) = self.record.init_record(1) {
             eprintln!("init_record(1) failed for {name}: {e}");
         }
@@ -7843,7 +7870,9 @@ impl RecordInstance {
                     let mask = match cycle_mask {
                         CyclePostMask::Value => EventMask::VALUE,
                         CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
-                        CyclePostMask::MonitorValueLog => aux_mask,
+                        CyclePostMask::MonitorValueLog
+                        | CyclePostMask::ResetValueLog
+                        | CyclePostMask::ResetValueLogOnAlarm => aux_mask,
                         CyclePostMask::MonitorValue => deadband_mask | EventMask::VALUE,
                         CyclePostMask::MonitorLog => deadband_mask | EventMask::LOG,
                     };

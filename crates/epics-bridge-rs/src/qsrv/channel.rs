@@ -718,7 +718,13 @@ impl BridgeChannel {
                 // which is capped at MAX_STRING_SIZE.
                 pvif::long_string_put_image(&text)
             } else {
-                EpicsValue::String(text)
+                // pvxs `putScalar`'s DBR_STRING buffer: `strncpy` of
+                // `MAX_STRING_SIZE - 1` (iocsource.cpp:499-500) before the
+                // `dbPut`, whose own bound is the field's SIZV.
+                let bytes = text.as_bytes();
+                EpicsValue::String(epics_base_rs::types::PvString::from_bytes(
+                    &bytes[..bytes.len().min(39)],
+                ))
             }
         } else {
             // Use typed conversion to match the bound field's actual DBF

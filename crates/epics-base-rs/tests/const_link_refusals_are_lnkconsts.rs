@@ -7,7 +7,7 @@ use epics_base_rs::server::record::check_json_link_text;
 
 fn report(text: &str) -> Option<String> {
     match check_json_link_text(text) {
-        Err(CaError::BadLink(refusal)) => refusal.report().map(str::to_string),
+        Err(CaError::BadLink(refusal)) => refusal.report(),
         other => panic!("{text} was not refused as a link: {other:?}"),
     }
 }

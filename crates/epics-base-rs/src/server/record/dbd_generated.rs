@@ -49539,25 +49539,25 @@ pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
         .map(|(_, lt)| *lt)
 }
 
-/// Every record type this port declares, in DBD **load** order — the order
-/// C's `pdbbase->recordTypeList` holds.
+/// Every record type this port declares, in the order C's
+/// `pdbbase->recordTypeList` holds: name order, because an IOC loads its
+/// expanded `.dbd` and `dbdExpand.pl` writes record types sorted.
 ///
 /// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` record-type-major:
 /// the outer loop walks `recordTypeList`, the inner one walks that type's
 /// instances in `.db` order. So this table, not `.db` declaration order alone,
 /// is what decides which of two same-`PHAS` records scans first.
-///
-/// Base's own types come from `stdRecords.dbd`, vendored beside the `.dbd`
-/// files it names; every other type this port vendors sorts after all of them,
-/// where a C IOC also puts a module `.dbd` included after `base.dbd`.
 pub static RECORD_TYPE_ORDER: &[&str] = &[
+    "aSub",
     "aai",
     "aao",
+    "acalcout",
     "ai",
     "ao",
-    "aSub",
+    "asyn",
     "bi",
     "bo",
+    "busy",
     "calc",
     "calcout",
     "compress",
@@ -49577,21 +49577,18 @@ pub static RECORD_TYPE_ORDER: &[&str] = &[
     "mbboDirect",
     "permissive",
     "printf",
+    "scalcout",
     "sel",
     "seq",
+    "sseq",
     "state",
     "stringin",
     "stringout",
     "sub",
     "subArray",
-    "waveform",
-    "acalcout",
-    "asyn",
-    "busy",
-    "scalcout",
-    "sseq",
     "swait",
     "transform",
+    "waveform",
 ];
 
 /// The record-own field table for a record type name, or `None` for a type

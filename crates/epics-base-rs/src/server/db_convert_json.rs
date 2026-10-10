@@ -1120,38 +1120,77 @@ impl<C: Callbacks> Parser<C> {
 
     /// C `yajl_render_error_string` with `verbose = 1`, which is what
     /// `dbPutConvertJSON` passes (`dbConvertJSON.c:172`).
-    ///
-    /// The window is emitted as bytes and only then read as text, so a caret
-    /// that lands mid-codepoint costs a replacement character here where C
-    /// writes the partial byte; nothing else differs.
     pub(crate) fn render_error(&self, txt: &[u8]) -> String {
-        let (kind, detail) = match self.state() {
-            State::ParseError => ("parse", self.parse_error),
-            State::LexicalError => ("lexical", Some(self.lexer.error.text())),
-            _ => ("unknown", None),
-        };
-        let mut out = format!("{kind} error");
-        if let Some(detail) = detail {
-            out.push_str(": ");
-            out.push_str(detail);
-        }
-        out.push('\n');
+        self.error(txt).to_string()
+    }
 
+    /// [`Self::render_error`] as data, for a caller that prints it later.
+    pub(crate) fn error(&self, txt: &[u8]) -> YajlError {
+        let kind = match self.state() {
+            State::ParseError => YajlErrorKind::Parse(self.parse_error),
+            State::LexicalError => YajlErrorKind::Lexical(self.lexer.error),
+            _ => YajlErrorKind::Unknown,
+        };
         // "append as many spaces as needed to make sure the error falls at
         // char 41" (`yajl_parser.c:131-132`).
         let offset = self.bytes_consumed;
         let spaces = if offset < 30 { 40 - offset } else { 10 };
         let start = offset.saturating_sub(30);
         let end = (offset + 30).min(txt.len()).max(start);
-        out.push_str(&" ".repeat(spaces));
-        let window: Vec<u8> = txt[start..end]
-            .iter()
-            .map(|&b| if b == b'\n' || b == b'\r' { b' ' } else { b })
-            .collect();
-        out.push_str(&String::from_utf8_lossy(&window));
-        out.push('\n');
-        out.push_str("                     (right here) ------^\n");
-        out
+        let mut window = [0; 60];
+        for (w, &b) in window.iter_mut().zip(&txt[start..end]) {
+            *w = if b == b'\n' || b == b'\r' { b' ' } else { b };
+        }
+        YajlError {
+            kind,
+            spaces: spaces as u8,
+            window,
+            len: (end - start) as u8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YajlErrorKind {
+    Parse(Option<&'static str>),
+    Lexical(LexError),
+    Unknown,
+}
+
+/// What `yajl_render_error_string` prints for one failed parse, fixed-size.
+///
+/// The window is emitted as bytes and only then read as text, so a caret
+/// that lands mid-codepoint costs a replacement character here where C
+/// writes the partial byte; nothing else differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct YajlError {
+    kind: YajlErrorKind,
+    spaces: u8,
+    window: [u8; 60],
+    len: u8,
+}
+
+impl std::fmt::Display for YajlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, detail) = match self.kind {
+            YajlErrorKind::Parse(detail) => ("parse", detail),
+            YajlErrorKind::Lexical(e) => ("lexical", Some(e.text())),
+            YajlErrorKind::Unknown => ("unknown", None),
+        };
+        f.write_str(kind)?;
+        f.write_str(" error")?;
+        if let Some(detail) = detail {
+            write!(f, ": {detail}")?;
+        }
+        writeln!(f)?;
+        let window = String::from_utf8_lossy(&self.window[..usize::from(self.len)]);
+        writeln!(
+            f,
+            "{:spaces$}{window}",
+            "",
+            spaces = usize::from(self.spaces)
+        )?;
+        f.write_str("                     (right here) ------^\n")
     }
 }
 

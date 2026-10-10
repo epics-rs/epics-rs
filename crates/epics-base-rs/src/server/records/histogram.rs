@@ -440,14 +440,30 @@ impl Record for HistogramRecord {
     /// the framework performs the `wdogInit` on its behalf, drained
     /// immediately after this returns (`take_special_actions`).
     ///
-    /// (SIMM's SPC_MOD pass is the framework's `recGblSaveSimm`/`CheckSimm`
-    /// owner; SGNL's SPC_MOD `add_count` stays on the `put_field` arm, which is
-    /// the only route C's `dbPutField` takes to it.)
+    /// CMD's SPC_CALC switch (:245-259) and SGNL's SPC_MOD `add_count`
+    /// (:261-263) live here too, not in `put_field`: the `.db` loader stores
+    /// those fields without calling `special()`. (SIMM's SPC_MOD pass is the
+    /// framework's `recGblSaveSimm`/`CheckSimm` owner.)
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
             return Ok(());
         }
         match field {
+            // An `if / else if` chain, not a catch-all: an over-max ordinal
+            // matches no branch and survives verbatim.
+            "CMD" => {
+                if self.cmd <= 1 {
+                    self.clear_histogram();
+                    self.cmd = 0;
+                } else if self.cmd == 2 {
+                    self.csta = true;
+                    self.cmd = 0;
+                } else if self.cmd == 3 {
+                    self.csta = false;
+                    self.cmd = 0;
+                }
+            }
+            "SGNL" => self.add_count(),
             "SDEL" => self.rearm_watchdog = true,
             "ULIM" | "LLIM" => {
                 self.recompute_wdth();
@@ -540,11 +556,8 @@ impl Record for HistogramRecord {
     }
 
     /// Internal (link / framework) delivery of a field value — C's
-    /// direct-to-memory write, which does NOT run `special()`. SGNL is the one
-    /// field where that distinction is observable on a histogram: its
-    /// `put_field` arm carries the SPC_MOD `add_count` (`histogramRecord.c:334`),
-    /// and routing a link read through it would count the sample twice (once
-    /// here, once in `process()`).
+    /// direct-to-memory write, which does NOT run `special()`, so SGNL's
+    /// SPC_MOD `add_count` does not run and `process()` bins the sample once.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if name.eq_ignore_ascii_case("SGNL") {
             self.sgnl = value
@@ -611,8 +624,8 @@ impl Record for HistogramRecord {
     /// and `process()` (`:218-219`) then bins it: `if (status == 0)
     /// add_count(prec);`. The framework calls this only on that same
     /// `status == 0`, so the bin increment belongs here — the assignment is a
-    /// plain store, NOT the `put_field("SGNL")` path, whose `add_count` is C's
-    /// SPC_MOD `special()` hook (`:260-263`) and would count the sample twice.
+    /// plain store, NOT a `dbPut` of SGNL, whose `add_count` is C's SPC_MOD
+    /// `special()` hook (`:260-263`) and would count the sample twice.
     fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
         self.sgnl = value.to_f64().unwrap_or(0.0);
         self.add_count();
@@ -724,13 +737,6 @@ impl Record for HistogramRecord {
             },
             "SGNL" => {
                 self.sgnl = value.to_f64().unwrap_or(0.0);
-                // C `special` SPC_MOD on SGNL → add_count. This is the
-                // `dbPutField` path ONLY — the link/device deliveries of SGNL
-                // (SVL read, SIOL simulation read) write `prec->sgnl` directly
-                // and never run `special()`, so they go through
-                // `put_field_internal` / `land_simulated_value` instead and let
-                // `process()` do the single bin increment.
-                self.add_count();
                 Ok(())
             }
             "SVL" => match value {
@@ -742,32 +748,7 @@ impl Record for HistogramRecord {
             },
             "CMD" => match value {
                 EpicsValue::Short(v) => {
-                    // Store the raw ordinal first — C `dbPut` writes `prec->cmd`
-                    // before `special()` runs.
                     self.cmd = v;
-                    // C `histogramRecord.c::special` SPC_CALC (:246-259) is an
-                    // `if / else if` chain, NOT a catch-all:
-                    //   cmd <= 1  → clear_histogram(); cmd = 0;
-                    //   cmd == 2  → csta = TRUE;        cmd = 0;
-                    //   cmd == 3  → csta = FALSE;       cmd = 0;
-                    // An out-of-range ordinal (cmd >= 4) matches no branch, so C
-                    // does NOTHING and the raw ordinal survives verbatim (no
-                    // action, no reset-to-0). The `_ => clear_histogram(); cmd=0`
-                    // the port had ran the Read/Clear arm for over-max ordinals
-                    // and then zeroed cmd, which is exactly the divergence: a
-                    // caput CMD '4' must read back CMD=4, not 0/"Read". (STAT=UDF
-                    // SEVR=INVALID come from the fresh record's undefined state /
-                    // the generic menu-put path, unchanged here.)
-                    if v <= 1 {
-                        self.clear_histogram();
-                        self.cmd = 0;
-                    } else if v == 2 {
-                        self.csta = true;
-                        self.cmd = 0;
-                    } else if v == 3 {
-                        self.csta = false;
-                        self.cmd = 0;
-                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CMD".into())),
@@ -1015,10 +996,12 @@ mod tests {
     fn cmd_start_stop_pauses_counting() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
         rec.put_field("CMD", EpicsValue::Short(3)).unwrap(); // stop
+        rec.special("CMD", true).unwrap();
         assert!(!rec.csta);
         rec.add_sample(1.0);
         assert_eq!(rec.val[0], 0, "stopped histogram must not count");
         rec.put_field("CMD", EpicsValue::Short(2)).unwrap(); // start
+        rec.special("CMD", true).unwrap();
         assert!(rec.csta);
         rec.add_sample(1.0);
         assert_eq!(rec.val[0], 1, "started histogram counts again");
@@ -1044,6 +1027,7 @@ mod tests {
         rec.add_sample(1.0);
         rec.add_sample(6.0);
         rec.put_field("CMD", EpicsValue::Short(1)).unwrap();
+        rec.special("CMD", true).unwrap();
         assert_eq!(rec.val, vec![0, 0]);
     }
 

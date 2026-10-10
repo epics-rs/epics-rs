@@ -1695,10 +1695,8 @@ async fn a_one_character_long_string_stays_a_long_string() {
 #[tokio::test]
 async fn a_dollar_put_is_bounded_by_sizv_not_40() {
     let db = Arc::new(PvDatabase::new());
-    let li = LsiRecord {
-        sizv: 50,
-        ..Default::default()
-    };
+    let mut li = LsiRecord::default();
+    li.sizv = 50;
     db.add_record("TEST:li", Box::new(li)).await.unwrap();
     let ch = BridgeChannel::new(db.clone(), "TEST:li.VAL$")
         .await

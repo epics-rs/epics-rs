@@ -2512,21 +2512,29 @@ impl PvDatabase {
         // tail (`recGblFwdLink` → `dbNotifyCompletion`), so a target whose park
         // this releases replays on its next cycle and an NPP link — `gate` is
         // `None` below — leaves it parked, exactly as C does.
-        // A cycle's write has no put gate to drop, so nothing settles a
-        // refusal's report or `special()`'s after-gate work here; both are
+        // A cycle's write has no put gate to drop: a refusal's report is owed
+        // to the chain's hold owner, and `special()`'s after-gate work is
         // discarded.
-        let mut after = None;
+        let mut tail = super::field_io::PutTail::default();
         let put_result = match (&addr, shadow) {
             (Some(at), _) => {
-                self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value, &mut after)
+                self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value, &mut tail)
             }
             // `put_pv_body`'s simple-PV arm, with the PV already settled.
             (None, Some(pv)) => {
                 pv.set(value);
                 Ok(())
             }
-            (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut after),
+            (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut tail),
         };
+        if let Some(report) = tail.take_report() {
+            let record = addr.as_ref().map_or(target.record.as_str(), |at| &at.name);
+            visited.owe_report(super::field_io::CycleReport::new(
+                record,
+                &target.field,
+                report,
+            ));
+        }
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
         // record's alarm into the destination via `recGblInheritSevrMsg`,
@@ -4425,7 +4433,7 @@ impl PvDatabase {
     /// edge never connects, so this pass is that event — once per link, not
     /// per holder, as C's two `X CP` inputs on one record process it twice.
     pub async fn process_cp_links_on_connect(&self) {
-        let links = self.cp_links_of(self.records_in_load_order().into_iter().map(|(h, _)| h));
+        let links = self.cp_links_of(self.iterate_records().into_iter().map(|(h, _)| h));
         self.set_cp_links(false, &links);
         self.inner.cp_links.update(|cp| cp.mark_connected());
         for (holder, _, edge) in links.iter().filter(|(_, _, e)| !e.external) {

@@ -185,6 +185,8 @@ pub struct ScalcoutRecord {
     /// calcout/transform use (see `link_status::post_link_status`).
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    /// CLCV (bit 0) / OCLV (bit 1) owed by the last CALC/OCAL `special()`.
+    calc_posts: u64,
 }
 
 impl Default for ScalcoutRecord {
@@ -218,6 +220,7 @@ impl Default for ScalcoutRecord {
             out_status: LINK_CON,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            calc_posts: 0,
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pa: [0.0; 12],
@@ -431,16 +434,27 @@ impl ScalcoutRecord {
     /// (sCalcPostfix.c:432-434) — unlike base `postfix()`, which calls it
     /// CALC_ERR_NULL_ARG.
     fn recompile_calc(&mut self) {
-        let compiled = calc_compile::scalc_postfix("scalcout", "CALC", &self.calc);
+        let compiled = calc_compile::scalc_postfix(&self.calc);
         self.clcv = compiled.status;
         self.compiled_calc = compiled.program;
     }
 
     /// C `sCalcoutRecord.c::special:474-481` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self) {
-        let compiled = calc_compile::scalc_postfix("scalcout", "OCAL", &self.ocal);
+        let compiled = calc_compile::scalc_postfix(&self.ocal);
         self.oclv = compiled.status;
         self.compiled_ocal = compiled.program;
+    }
+
+    /// C `init_record`'s report of a CALC/OCAL `sCalcPostfix()` refused
+    /// (sCalcoutRecord.c:291-302): `recGblRecordError`, then the raw
+    /// `error_number` on stdout, not through errlog.
+    fn report_bad_expr(&self, compiled: &calc_compile::CalcCompile, pmessage: &str) {
+        let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+        compiled.report_record_error(name, pmessage);
+        if let Some(n) = compiled.error_number() {
+            println!("sCalcPostfix returns: {n}");
+        }
     }
 
     fn var_index(name: &str) -> Option<usize> {
@@ -662,11 +676,17 @@ impl Record for ScalcoutRecord {
     /// stores the postfix status in CLCV/OCLV (sCalcoutRecord.c:290-304) —
     /// the load-time half of the compile owner. A put goes through
     /// `special()` instead; `put_field` only stores the string, as C's dbPut
-    /// does.
+    /// does. Unlike calcout, a bad OCAL is reported whatever DOPT says.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            self.recompile_calc();
-            self.recompile_ocal();
+            let compiled = calc_compile::scalc_postfix(&self.calc);
+            self.report_bad_expr(&compiled, "scalcout: init_record: Illegal CALC field");
+            self.clcv = compiled.status;
+            self.compiled_calc = compiled.program;
+            let compiled = calc_compile::scalc_postfix(&self.ocal);
+            self.report_bad_expr(&compiled, "scalcout: init_record: Illegal OCAL field");
+            self.oclv = compiled.status;
+            self.compiled_ocal = compiled.program;
         }
         Ok(())
     }
@@ -680,8 +700,14 @@ impl Record for ScalcoutRecord {
             return Ok(());
         }
         match field {
-            "CALC" => self.recompile_calc(),
-            "OCAL" => self.recompile_ocal(),
+            "CALC" => {
+                self.recompile_calc();
+                self.calc_posts = 0b01;
+            }
+            "OCAL" => {
+                self.recompile_ocal();
+                self.calc_posts = 0b10;
+            }
             _ => {}
         }
         // C `sCalcoutRecord.c:481-569` re-classifies the link a put just
@@ -708,14 +734,15 @@ impl Record for ScalcoutRecord {
 
     /// C posts the validity field explicitly from `special()`
     /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
-    /// sCalcoutRecord.c:470,481); CLCV/OCLV are not `pp(TRUE)`, so nothing
+    /// sCalcoutRecord.c:470,480); CLCV/OCLV are not `pp(TRUE)`, so nothing
     /// else would post them.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            "OCAL" => &["OCLV"],
-            _ => &[],
-        }
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static CALC_POSTS: [(&str, CyclePostMask); 2] = [
+            ("CLCV", CyclePostMask::Value),
+            ("OCLV", CyclePostMask::Value),
+        ];
+        CycleMarks::of(&CALC_POSTS, std::mem::take(&mut self.calc_posts))
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.

@@ -151,108 +151,194 @@ pub enum CaError {
     GetConvertFailed(String),
 }
 
-/// The payload of [`CaError::BadChoice`]. `report` is the errlog line C's
-/// converter prints with the refusal; it rides out in the error so the put
-/// entry emits it after the gate drops, never under the hold.
+/// The payload of [`CaError::BadChoice`], as data: the refusal is made under
+/// the put's hold and its text is formatted only when it is printed or shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChoiceRefusal {
-    detail: String,
-    /// The `pmessage` of C's `recGblRecordError`, until the record is named.
-    enum_from: Option<String>,
-    report: Option<String>,
+pub struct ChoiceRefusal(Choice);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Choice {
+    /// `from` names none of `field`'s `count` choices and is no index below
+    /// it. `reported` while the report C prints with it is still owed.
+    String {
+        field: ReportString,
+        from: ReportString,
+        count: u16,
+        reported: bool,
+    },
+    /// `index` is past `field`'s `count` choices.
+    Index {
+        field: ReportString,
+        index: i64,
+        count: u16,
+    },
+    Said(&'static str),
+    /// A `.db` load's refusal, made with no hold.
+    Text(String),
 }
+
+use crate::server::recgbl::ReportString;
 
 impl ChoiceRefusal {
     /// A refusal from `cvt_st_e` / `putStringEnum`, which report it with
     /// `recGblRecordError(status, precord, from)` (`dbFastLinkConv.c:279`,
     /// `dbConvert.c:1189`).
-    pub(crate) fn enum_state(detail: String, from: &str) -> Self {
-        Self {
-            enum_from: Some(from.to_string()),
-            ..detail.into()
+    pub(crate) fn enum_state(field: &str, from: &str, count: usize) -> Self {
+        Self(Choice::String {
+            field: ReportString::new(field),
+            from: ReportString::new(from),
+            count: count as u16,
+            reported: true,
+        })
+    }
+
+    /// `from` names no menu choice of `field` and is no index below `count`.
+    pub(crate) fn menu(field: &str, from: &str, count: usize) -> Self {
+        Self(Choice::String {
+            field: ReportString::new(field),
+            from: ReportString::new(from),
+            count: count as u16,
+            reported: false,
+        })
+    }
+
+    /// `index` is past `field`'s `count` menu choices.
+    pub(crate) fn index(field: &str, index: i64, count: usize) -> Self {
+        Self(Choice::Index {
+            field: ReportString::new(field),
+            index,
+            count: count as u16,
+        })
+    }
+
+    /// Move out the report C prints with this refusal, for the put's owner.
+    pub(crate) fn take_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        match &mut self.0 {
+            Choice::String { from, reported, .. } if *reported => {
+                *reported = false;
+                Some(crate::server::recgbl::PutReport::IllegalChoice { from: *from })
+            }
+            _ => None,
         }
-    }
-
-    /// Name the record C's report prints.
-    pub(crate) fn of_record(self, record_name: &str) -> Self {
-        let report = self
-            .enum_from
-            .as_ref()
-            .map(|from| format!("recGblRecordError: {from} Illegal choice PV: {record_name}\n"));
-        Self { report, ..self }
-    }
-
-    /// The errlog line still owed for this refusal, if C prints one.
-    pub fn report(&self) -> Option<&str> {
-        self.report.as_deref()
     }
 }
 
-/// The payload of [`CaError::BadLink`]. `report` is the line `dbJLinkInit`
-/// prints while it parses (`dbJLink.c:262-268`), carried out of the hold
-/// like [`ChoiceRefusal`]'s.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The payload of [`CaError::BadLink`]: why `dbParseLink` refused the text,
+/// and whether the line `dbJLinkInit` prints while it parses
+/// (`dbJLink.c:262-268`) is still owed. Carried out of the hold as data, like
+/// [`ChoiceRefusal`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkRefusal {
-    detail: String,
-    report: Option<String>,
+    why: LinkWhy,
+    owed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkWhy {
+    /// A link type C registers and this port does not serve. C prints
+    /// nothing of its own here.
+    Unported(ReportString),
+    /// `dbJLinkInit: Link type '%s' not found`.
+    NotFound(ReportString),
+    /// `dbJLinkInit: Illegal second link key '%s'`.
+    SecondKey(ReportString),
+    /// A `/*` with no `*/`, at this byte.
+    UnterminatedComment(usize),
+    NoTypeKey,
+    /// A served type's reader refused its value.
+    ValueRejected(ReportString),
+    /// `lnkConst` stopped the parse, printing what it said if anything.
+    ConstStop(Option<&'static str>),
+    /// yajl's verbose error block.
+    Yajl(crate::server::db_convert_json::YajlError),
+    /// A `#` link whose letters name no bus.
+    NoBus,
 }
 
 impl LinkRefusal {
-    /// A refusal C reports with exactly `detail` as its errlog line.
-    pub(crate) fn printed(detail: String) -> Self {
-        let report = Some(format!("{detail}\n"));
-        Self { detail, report }
-    }
-
-    /// A refusal C reports with `report`, its own terminators included.
-    pub(crate) fn with_report(detail: String, report: String) -> Self {
-        Self {
-            detail,
-            report: Some(report),
-        }
+    pub(crate) fn new(why: LinkWhy) -> Self {
+        let owed = matches!(
+            why,
+            LinkWhy::NotFound(_)
+                | LinkWhy::SecondKey(_)
+                | LinkWhy::ConstStop(Some(_))
+                | LinkWhy::Yajl(_)
+        );
+        Self { why, owed }
     }
 
     /// The errlog line still owed for this refusal, if C prints one.
-    pub fn report(&self) -> Option<&str> {
-        self.report.as_deref()
+    pub fn report(&self) -> Option<String> {
+        if !self.owed {
+            return None;
+        }
+        Some(match self.why {
+            LinkWhy::ConstStop(Some(said)) => said.to_string(),
+            LinkWhy::Yajl(e) => format!("dbJLinkInit: {e}\n"),
+            _ => format!("{self}\n"),
+        })
     }
-}
 
-impl From<String> for LinkRefusal {
-    fn from(detail: String) -> Self {
-        Self {
-            detail,
-            report: None,
+    /// Print [`Self::report`], with the hold down.
+    pub(crate) fn emit(&self) {
+        if let Some(line) = self.report() {
+            crate::runtime::log::errlog_printf(&line);
         }
     }
 }
 
 impl std::fmt::Display for LinkRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
+        match self.why {
+            LinkWhy::Unported(key) => write!(
+                f,
+                "dbJLinkInit: Link type '{}' is registered by epics-base but not \
+                 implemented by this port",
+                key.as_str()
+            ),
+            LinkWhy::NotFound(key) => {
+                write!(f, "dbJLinkInit: Link type '{}' not found", key.as_str())
+            }
+            LinkWhy::SecondKey(key) => {
+                write!(f, "dbJLinkInit: Illegal second link key '{}'", key.as_str())
+            }
+            LinkWhy::UnterminatedComment(offset) => write!(
+                f,
+                "dbJLinkInit: not a JSON link — unterminated block comment '/*' at byte {offset}"
+            ),
+            LinkWhy::NoTypeKey => f.write_str("dbJLinkInit: not a JSON link — no link type key"),
+            LinkWhy::ValueRejected(key) => write!(
+                f,
+                "dbJLinkInit: Link type '{}' rejected its value",
+                key.as_str()
+            ),
+            LinkWhy::ConstStop(_) => f.write_str("dbJLinkInit: lnkConst refused its value"),
+            LinkWhy::Yajl(_) => f.write_str("dbJLinkInit: not a JSON link"),
+            LinkWhy::NoBus => f.write_str("dbParseLink: the text names no hardware bus"),
+        }
     }
 }
 
 impl CaError {
-    /// Emit the errlog line a refused put still owes ([`ChoiceRefusal`],
-    /// [`LinkRefusal`]). Called by a put entry once its gate is down.
+    /// Emit the errlog line a refused put still owes ([`LinkRefusal`]). Called
+    /// by a put entry once its gate is down.
     pub(crate) fn emit_put_report(&self) {
-        let line = match self {
-            CaError::BadChoice(refusal) => refusal.report(),
-            CaError::BadLink(refusal) => refusal.report(),
-            _ => None,
-        };
-        if let Some(line) = line {
-            crate::runtime::log::errlog_printf(line);
+        if let CaError::BadLink(refusal) = self {
+            refusal.emit();
         }
     }
 
-    /// Move out the line [`Self::emit_put_report`] would print, for a put
-    /// whose error is handed back before its gate drops.
-    pub(crate) fn take_put_report(&mut self) -> Option<String> {
+    /// Move out what [`Self::emit_put_report`] would print, for a put whose
+    /// error is handed back before its gate drops.
+    pub(crate) fn take_put_report(&mut self) -> Option<LinkRefusal> {
         match self {
-            CaError::BadChoice(refusal) => refusal.report.take(),
-            CaError::BadLink(refusal) => refusal.report.take(),
+            CaError::BadLink(refusal) if refusal.owed => {
+                refusal.owed = false;
+                Some(LinkRefusal {
+                    owed: true,
+                    ..*refusal
+                })
+            }
             _ => None,
         }
     }
@@ -260,23 +346,35 @@ impl CaError {
 
 impl From<String> for ChoiceRefusal {
     fn from(detail: String) -> Self {
-        Self {
-            detail,
-            enum_from: None,
-            report: None,
-        }
+        Self(Choice::Text(detail))
     }
 }
 
-impl From<&str> for ChoiceRefusal {
-    fn from(detail: &str) -> Self {
-        detail.to_string().into()
+impl From<&'static str> for ChoiceRefusal {
+    fn from(said: &'static str) -> Self {
+        Self(Choice::Said(said))
     }
 }
 
 impl std::fmt::Display for ChoiceRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
+        match &self.0 {
+            Choice::String {
+                field, from, count, ..
+            } => write!(
+                f,
+                "{}: '{}' is no choice and no index below {count}",
+                field.as_str(),
+                from.as_str()
+            ),
+            Choice::Index {
+                field,
+                index,
+                count,
+            } => write!(f, "{}: {index} is no index below {count}", field.as_str()),
+            Choice::Said(said) => f.write_str(said),
+            Choice::Text(text) => f.write_str(text),
+        }
     }
 }
 

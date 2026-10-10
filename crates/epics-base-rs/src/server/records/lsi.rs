@@ -113,9 +113,14 @@ impl LongStringVal {
         }
     }
 
-    /// C's `memcpy(oval, val, len)` and `olen = len`.
-    pub fn copy_from(&mut self, src: &Self) {
+    /// C's `memcpy(oval, val, len)` and `olen = len`; true when OLEN moved.
+    /// Out of line: inlined, the fill's registers are saved on every
+    /// `monitor()`, the unchanged cycles that never copy included.
+    #[inline(never)]
+    pub fn copy_from(&mut self, src: &Self) -> bool {
+        let moved = self.0.len() != src.0.len();
         self.fill(src.0.len(), |b| b.copy_from_slice(&src.0));
+        moved
     }
 
     /// `*plen = strlen(pbuffer) + 1` over the buffer as it stands.
@@ -137,11 +142,13 @@ impl LongStringVal {
         }
     }
 
-    /// A VAL put of up to `capacity` bytes. A DBR_STRING put is already capped
-    /// at `MAX_STRING_SIZE` by C's dbConvert; a DBR_CHAR put ends at its NUL.
+    /// A VAL put of up to `capacity` (SIZV - 1) bytes: a DBR_STRING put is
+    /// `putStringString`'s `strncpy` into the SIZV-wide field, so only the
+    /// source (a CA wire string, a stringout VAL) caps it at
+    /// `MAX_STRING_SIZE`; a DBR_CHAR put ends at its NUL.
     pub fn put(&mut self, value: EpicsValue, capacity: usize) -> CaResult<()> {
         let text = match &value {
-            EpicsValue::String(s) => &s.as_bytes()[..s.len().min(MAX_STRING_SIZE - 1)],
+            EpicsValue::String(s) => s.as_bytes(),
             EpicsValue::CharArray(bytes) => {
                 &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
             }
@@ -159,18 +166,20 @@ impl LongStringVal {
         }
     }
 
-    /// `n` elements written by `write`: in place while no reader holds the
-    /// buffer and the count is unchanged, so a steady cycle allocates nothing.
+    /// `n` elements written by `write`, followed by a NUL where the buffer
+    /// runs past them (`strncpy`'s padding, which `terminate` reads). In
+    /// place while no reader holds the buffer, whatever the count, as C's
+    /// SIZV-wide VAL is; otherwise one fresh buffer at the old capacity, the
+    /// copy C's `db_field_log` makes for the reader.
     #[inline]
     fn fill(&mut self, n: usize, write: impl FnOnce(&mut [u8])) {
-        match self.0.get_mut() {
-            Some(buf) if buf.len() == n => write(buf),
-            _ => {
-                let mut buf = vec![0; n];
-                write(&mut buf);
-                self.0 = buf.into();
-            }
+        let capacity = self.0.buffer().len().max(n);
+        let (text, rest) = self.0.make_mut_resized(capacity, 0).split_at_mut(n);
+        write(text);
+        if let Some(pad) = rest.first_mut() {
+            *pad = 0;
         }
+        self.0.truncate(n);
     }
 }
 
@@ -195,6 +204,9 @@ pub struct LsiRecord {
     /// DBE_LOG (archive) mask (C `lsiRecord.dbd.pod` APST, monitor:
     /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
     pub apst: i16,
+    /// LEN owed by `special()` on a VAL put, or by `monitor()`'s
+    /// `len != olen` on the cycle it ran; `take_cycle_posted_fields` takes it.
+    len_marked: bool,
 }
 
 impl Default for LsiRecord {
@@ -215,6 +227,7 @@ impl Default for LsiRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            len_marked: false,
         }
     }
 }
@@ -251,7 +264,7 @@ impl Record for LsiRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::NONE
+        crate::server::record::CycleHooks::WRITE_POSTED
     }
 
     fn record_type(&self) -> &'static str {
@@ -381,9 +394,56 @@ impl Record for LsiRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval.copy_from(&self.val);
+            // Unchanged bytes have an unchanged length, and the take that
+            // `marked` guarantees has already cleared the mark.
+            self.len_marked = self.oval.copy_from(&self.val);
         }
         Some(changed)
+    }
+
+    /// C `lsiRecord.c:212-214`: `if (len != olen) { olen = len; db_post_events(&len,
+    /// DBE_VALUE | DBE_LOG); }`, marked by `monitor_value_changed` as it
+    /// commits OVAL, whose length is OLEN.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let changed = self.monitor_value_changed() == Some(true);
+        let (val_always, archive_always) = self.monitor_always_post();
+        crate::server::record::MonitorValueClasses {
+            value: changed || val_always,
+            archive: changed || archive_always,
+            hash_changed: false,
+            marked: self.len_marked,
+        }
+    }
+
+    /// C `special()` sets `len` and posts it on every VAL put (lsiRecord.c:197),
+    /// changed or not; `monitor()` posts it again only when `len != olen`.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && field == "VAL" {
+            self.len_marked = true;
+        }
+        Ok(())
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
+        CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u64)
+    }
+
+    /// LEN posts from `special()` and from `monitor()`'s `olen` compare, never
+    /// against what a subscriber was last sent.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["LEN"]
+    }
+
+    /// C `monitor()` posts VAL and LEN alone (lsiRecord.c:204-223); the
+    /// OVAL/OLEN copy it makes is never posted.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "LEN"])
     }
 
     fn monitor_always_post(&self) -> (bool, bool) {
@@ -554,5 +614,32 @@ mod tests {
         let mut empty = LongStringVal::default();
         empty.set_len_one();
         assert_eq!(empty.elements()[..], [0]);
+    }
+
+    /// A shorter write lands in the same buffer, NUL-padded as `strncpy`
+    /// pads it, so the empty read's `strlen` stops at the new text.
+    #[test]
+    fn a_shorter_write_reuses_the_buffer_and_pads_it() {
+        let mut v = LongStringVal::from_text(b"abcdef");
+        let p = v.elements().as_ptr();
+        v.set_text_strlen(b"ab");
+        assert_eq!(v.elements().as_ptr(), p);
+        v.terminate();
+        assert_eq!((v.text(), v.len()), (&b"ab"[..], 3));
+        v.set_text(b"abcd");
+        assert_eq!(v.elements().as_ptr(), p);
+    }
+
+    /// A buffer a reader still holds is left to it; the write takes one copy.
+    #[test]
+    fn a_write_under_a_reader_copies_once() {
+        let mut v = LongStringVal::from_text(b"abc");
+        let reader = v.elements().clone();
+        v.set_text(b"xy");
+        assert!(!v.elements().ptr_eq(&reader));
+        assert_eq!(
+            (&reader[..], &v.elements()[..]),
+            (&b"abc\0"[..], &b"xy\0"[..])
+        );
     }
 }

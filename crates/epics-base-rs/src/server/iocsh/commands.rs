@@ -1262,30 +1262,6 @@ fn c_field_size(code: DbfCode, declared_size: u16) -> Option<u16> {
 /// `DBF_NOACCESS` = 17 (`dbFldTypes.h:90`), so `dbr[17]` reads five past the
 /// end and R7.0.10 prints the adjacent `dbf[1]`, `DBF_CHAR`. The string C
 /// meant is in that table already, stranded at index 12. This prints it.
-/// C's `sprintf` inside `dbGet`'s validity gate (`dbAccess.c:955-960`):
-///
-/// ```c
-/// sprintf(message, "dbGet: dbrType = %d, field_type = %.12s (%d).",
-///         dbrType, dbGetFieldTypeString(field_type), field_type);
-/// ```
-///
-/// The two codes are separate inputs — `dbgf` passes `addr.dbr_field_type` as
-/// `dbrType` (`dbTest.c:380`) while `field_type` is the declaration's — and
-/// they coincide only because `mapDBFToDBR` is the identity on `DBF_NOACCESS`.
-/// The `%.12s` is kept so the port truncates wherever C would, and there is no
-/// trailing newline: `recGblDbaddrError`'s own format string owns the only one
-/// (`recGbl.c:87-90`), so the report is one console line.
-///
-/// A function rather than a `format!` at the raise site so the exact bytes can
-/// be pinned without capturing the log.
-fn dbget_bad_dbrtype_message(dbr: DbfCode, field_type: DbfCode) -> String {
-    let ft_name = format!("DBF_{}", field_type.name());
-    format!(
-        "dbGet: dbrType = {}, field_type = {ft_name:.12} ({}).",
-        dbr as i16, field_type as i16
-    )
-}
-
 fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
     let (field_type, dbr, field_name) = match addr.fld_des {
         Some(fd) => {
@@ -1295,12 +1271,7 @@ fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
         None => (DbfCode::NoAccess, DbfCode::NoAccess, addr.field.as_str()),
     };
     let rec_name = addr.record.as_str();
-    crate::server::recgbl::rec_gbl_dbaddr_error(
-        "Illegal Database Request Type",
-        rec_name,
-        field_name,
-        &dbget_bad_dbrtype_message(dbr, field_type),
-    );
+    crate::server::recgbl::rec_gbl_bad_dbrtype("dbGet", dbr, field_type, rec_name, field_name);
     for line in printbuffer_lines(dbr.name(), 1, None) {
         ctx.println(&line);
     }
@@ -7711,13 +7682,17 @@ mod tests {
     #[test]
     fn the_failed_read_reports_c_s_own_dbget_message() {
         assert_eq!(
-            dbget_bad_dbrtype_message(DbfCode::NoAccess, DbfCode::NoAccess),
+            crate::server::recgbl::bad_dbrtype_message(
+                "dbGet",
+                DbfCode::NoAccess,
+                DbfCode::NoAccess
+            ),
             "dbGet: dbrType = 17, field_type = DBF_NOACCESS (17)."
         );
         // The two codes are distinct inputs, so a renderer that printed one
         // twice would pass the case above and fail this one.
         assert_eq!(
-            dbget_bad_dbrtype_message(DbfCode::String, DbfCode::Device),
+            crate::server::recgbl::bad_dbrtype_message("dbGet", DbfCode::String, DbfCode::Device),
             "dbGet: dbrType = 0, field_type = DBF_DEVICE (13)."
         );
     }
@@ -9221,6 +9196,55 @@ mod tests {
             assert!(
                 out.lines().any(|l| l.trim() == format!("No Elements: {n}")),
                 "{cmd} {pv}:\n{out}"
+            );
+        }
+    }
+
+    /// A DBR_STRING put into a long-string VAL is `putStringString`'s
+    /// `strncpy` bounded by the field size, SIZV, not by `MAX_STRING_SIZE`.
+    /// Oracle — softIoc 7.0.10.1-DEV, `dbpf <rec>.VAL` of 70 `x`, then
+    /// `dbgf <rec>.LEN`: O41 41, O42 42, O65 65, O128 71, I128 71; an lso
+    /// whose `OUT` is `DST PP` carries all 70 into DST (LEN 71), a stringout
+    /// only its own 39 (LEN 40).
+    #[test]
+    fn a_long_string_val_put_is_bounded_by_sizv() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        std::fs::write(
+            &path,
+            r#"record(lso, "O41") { field(SIZV, "41") }
+record(lso, "O42") { field(SIZV, "42") }
+record(lso, "O65") { field(SIZV, "65") }
+record(lso, "O128") { field(SIZV, "128") }
+record(lsi, "I128") { field(SIZV, "128") }
+record(lso, "SRC") { field(SIZV, "128") field(OUT, "DST PP") }
+record(lso, "DST") { field(SIZV, "128") }
+record(stringout, "SO") { field(OUT, "SOD PP") }
+record(lso, "SOD") { field(SIZV, "128") }
+"#,
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let long = "x".repeat(70);
+        for rec in ["O41", "O42", "O65", "O128", "I128", "SRC", "SO"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.VAL"), &long]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for (rec, len) in [
+            ("O41", 41),
+            ("O42", 42),
+            ("O65", 65),
+            ("O128", 71),
+            ("I128", 71),
+            ("DST", 71),
+            ("SOD", 40),
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbgf", &[&format!("{rec}.LEN")]),
+                format!("DBF_ULONG:          {len} = {:<5}\n", format!("{len:#x}")),
+                "{rec}.LEN"
             );
         }
     }

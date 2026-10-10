@@ -1289,9 +1289,11 @@ impl Record for WaveformRecord {
                 // rejects it with `S_db_badChoice` and leaves the field alone,
                 // rather than storing an index whose `dbValueSize` is undefined.
                 let Some(ftvl) = Ftype::from_index(v) else {
-                    return Err(CaError::BadChoice(
-                        format!("FTVL: {v} is not one of {MENU_FTYPE:?}").into(),
-                    ));
+                    return Err(CaError::BadChoice(crate::error::ChoiceRefusal::index(
+                        "FTVL",
+                        v.into(),
+                        MENU_FTYPE.len(),
+                    )));
                 };
                 self.set_ftvl(ftvl);
                 Ok(())

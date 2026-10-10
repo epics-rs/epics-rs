@@ -1,11 +1,11 @@
 use std::any::Any;
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome,
+    Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -207,14 +207,14 @@ pub struct ScalerRecord {
 
     /// The `db_post_events` calls C's `special()` made on the put now in flight,
     /// handed to the framework by
-    /// [`Record::monitor_side_effect_fields`](crate::records::scaler::ScalerRecord).
+    /// [`Record::take_cycle_posted_fields`], which drains it on every put route.
     ///
     /// C `special()` posts these fields itself; none of them is `pp(TRUE)`, so no
     /// process cycle would otherwise post them. `special()` is the single writer:
     /// its `after == false` pre-pass — which the framework runs on EVERY put
     /// (`field_io.rs:937`) — retires the previous put's list, and each `after`
     /// arm records exactly what C's matching case posts.
-    side_effect_posts: &'static [&'static str],
+    side_effect_posts: &'static [(&'static str, CyclePostMask)],
 
     /// The forward-link decision C makes *inside* `process()`.
     ///
@@ -564,95 +564,73 @@ impl ScalerRecord {
     }
 }
 
-/// `S1..S{MAX_SCALER_CHANNELS}` field names, in channel order, for
-/// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-772`
-/// `monitor()` sweeps each active channel `S1..Snch` with a literal
-/// `DBE_LOG` on every idle process; this static is sliced to `nch` so
-/// the record can return the exact set without per-call allocation.
-static SN_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    (1..=MAX_SCALER_CHANNELS)
-        .map(|i| Box::leak(format!("S{}", i).into_boxed_str()) as &'static str)
-        .collect()
-});
-
-/// `[D{n}, G{n}]` per channel (0-based), the pair C's `special()` posts when a
-/// `PR{n}` write forces the channel on (`scalerRecord.c:702-706`).
-static DG_PAIR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| {
-    (1..=MAX_SCALER_CHANNELS)
-        .map(|i| {
-            let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-            let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-            Box::leak(vec![d, g].into_boxed_slice()) as &'static [&'static str]
-        })
-        .collect()
-});
-
-/// `[PR{n}]` per channel (0-based), the preset C's `special()` posts when a
-/// `G{n}` write defaults it to 1000 (`scalerRecord.c:717-719`).
-static PR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| {
-    (1..=MAX_SCALER_CHANNELS)
-        .map(|i| {
-            let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
-            Box::leak(vec![pr].into_boxed_slice()) as &'static [&'static str]
-        })
-        .collect()
-});
-
-/// Every scaler post outside the idle `monitor()` sweep carries a literal
-/// `DBE_VALUE` in C: the process/updateCounts posts
-/// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) and the
-/// `special()` posts (`:673-676` PR1/D1/G1, `:682-687` TP/D1/G1, `:692` TP,
-/// `:705-706` Dn/Gn, `:719` PRn). `DBE_LOG` appears ONLY in the `monitor()`
-/// sweep of `S1..Snch` (line 771, [`SN_FIELD_NAMES`]).
+/// The per-channel tables, every name a literal so nothing is built on first
+/// read: they are read from `special()` and the cycle hooks with the record
+/// locked.
 ///
-/// Returning a field here makes the framework strip the LOG bit from its
-/// change post and from its `special()` side-effect post, so a `DBE_LOG`-only
-/// subscriber sees `Sn` on the idle sweep alone — and never sees `PRn`/`Gn`/`Dn`
-/// at all, which is what C does with them.
+/// `SN_FIELD_NAMES` — `S1..S64`, sliced to `nch` by
+/// [`ScalerRecord::log_swept_fields`]: C `monitor()` sweeps `S1..Snch` with a
+/// literal `DBE_LOG` on every idle process (`scalerRecord.c:770-772`).
 ///
-/// Indexed by `nch`: entry `n` holds the five always-`DBE_VALUE` scalars, `PR1`
-/// (posted by process at `:425`/`:427` whatever `nch` is), and the per-channel
-/// `Sn`/`PRn`/`Gn`/`Dn` names for the `n` active channels. A table rather than a
-/// re-sliced flat static: the four per-channel groups cannot be contiguous for
-/// every `nch` at once.
-static VALUE_ONLY_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
-    (0..=MAX_SCALER_CHANNELS)
-        .map(|nch| {
-            let mut v: Vec<&'static str> = vec!["CNT", "T", "VAL", "PR1", "TP", "FREQ"];
-            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
-            for ch in 0..nch {
-                // PR1 is already in the fixed head.
-                if ch > 0 {
-                    v.push(PR_BY_CHANNEL[ch][0]);
-                }
-                v.extend_from_slice(DG_PAIR_BY_CHANNEL[ch]);
-            }
-            v
-        })
-        .collect()
-});
-
-/// Every `db_post_events` C's scaler makes from a PROCESS cycle, enumerated —
-/// [`ScalerRecord::process_posted_fields`]. `process()`: `CNT` (:372), `PR1`
-/// (:425, only when the count-start recompute moved it), `TP` (:427), `FREQ`
-/// (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T` (:588); `monitor()`:
-/// `S1..Snch` (:771). That is the whole list — C writes `D1..Dnch` in process
-/// (:413-414, :525-526) and posts none of them, and it posts `Gn`/`PRn`(n>1)
-/// only from `special()`.
+/// `DG_POSTS_BY_CHANNEL` — `Dn`/`Gn`, C's `special()` posts when a `PRn` write
+/// forces the channel on (`:702-706`); `PR_POSTS_BY_CHANNEL` — `PRn`, posted
+/// when a `Gn` write defaults it to 1000 (`:717-719`).
 ///
-/// Indexed by `nch`: the fixed head plus the `Sn` of the active channels, so
-/// the `Sn` of a channel the record does not have stays out of the set (C's
-/// post loops are bounded by `nch` too).
-static PROCESS_POSTED_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
-    (0..=MAX_SCALER_CHANNELS)
-        .map(|nch| {
-            let mut v: Vec<&'static str> = vec!["VAL", "T", "CNT", "PR1", "TP", "FREQ"];
-            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
-            v
-        })
-        .collect()
-});
+/// `VALUE_ONLY_FIELDS` — every scaler post outside the idle `monitor()` sweep
+/// carries a literal `DBE_VALUE` in C: the process/updateCounts posts
+/// (:316/322/329/334/372/425/427/430/478/530/582/588) and the `special()` posts
+/// (:673-676 PR1/D1/G1, :682-687 TP/D1/G1, :692 TP, :705-706 Dn/Gn, :719 PRn).
+/// `DBE_LOG` appears ONLY in the sweep (:771). Returning a field from
+/// [`ScalerRecord::value_only_change_fields`] makes the framework strip the
+/// LOG bit from its change post and its `special()` post, so a `DBE_LOG`-only
+/// subscriber sees `Sn` on the sweep alone and never `PRn`/`Gn`/`Dn`. The six
+/// fixed names (`PR1` among them: process posts it at :425/:427 whatever `nch`
+/// is), then one group per channel, so the first `nch` channels are a prefix.
+///
+/// `PROCESS_POSTED_FIELDS` — every `db_post_events` C's scaler makes from a
+/// PROCESS cycle, [`ScalerRecord::process_posted_fields`]: `process()` posts
+/// `CNT` (:372), `PR1` (:425, only when the count-start recompute moved it),
+/// `TP` (:427), `FREQ` (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T`
+/// (:588); `monitor()` posts `S1..Snch` (:771). C writes `D1..Dnch` in process
+/// (:413-414, :525-526) and posts none of them, and posts `Gn`/`PRn`(n>1) only
+/// from `special()`. Sliced to `nch`, so an absent channel's `Sn` stays out, as
+/// C's post loops are bounded by `nch`.
+macro_rules! channel_tables {
+    ($first:literal $($n:literal)*) => {
+        static SN_FIELD_NAMES: [&str; MAX_SCALER_CHANNELS] =
+            [concat!("S", $first) $(, concat!("S", $n))*];
+        static DG_POSTS_BY_CHANNEL: [[(&str, CyclePostMask); 2]; MAX_SCALER_CHANNELS] = [
+            [(concat!("D", $first), CyclePostMask::Value), (concat!("G", $first), CyclePostMask::Value)]
+            $(, [(concat!("D", $n), CyclePostMask::Value), (concat!("G", $n), CyclePostMask::Value)])*
+        ];
+        static PR_POSTS_BY_CHANNEL: [[(&str, CyclePostMask); 1]; MAX_SCALER_CHANNELS] =
+            [[(concat!("PR", $first), CyclePostMask::Value)] $(, [(concat!("PR", $n), CyclePostMask::Value)])*];
+        static VALUE_ONLY_FIELDS: [&str; 6 + 4 * MAX_SCALER_CHANNELS - 1] = [
+            "CNT", "T", "VAL", "PR1", "TP", "FREQ",
+            concat!("S", $first), concat!("D", $first), concat!("G", $first)
+            $(, concat!("S", $n), concat!("PR", $n), concat!("D", $n), concat!("G", $n))*
+        ];
+        static PROCESS_POSTED_FIELDS: [&str; 6 + MAX_SCALER_CHANNELS] = [
+            "VAL", "T", "CNT", "PR1", "TP", "FREQ",
+            concat!("S", $first) $(, concat!("S", $n))*
+        ];
+    };
+}
+channel_tables!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64);
 
+/// C's `special()` posts, every one a literal `DBE_VALUE`: TP's (`:673-676`),
+/// PR1's (`:682-687`, TP alone when TP came out 0), and per channel the
+/// `DG_POSTS_BY_CHANNEL` and `PR_POSTS_BY_CHANNEL` ones.
+static TP_POSTS: [(&str, CyclePostMask); 3] = [
+    ("PR1", CyclePostMask::Value),
+    ("D1", CyclePostMask::Value),
+    ("G1", CyclePostMask::Value),
+];
+static PR1_POSTS: [(&str, CyclePostMask); 3] = [
+    ("TP", CyclePostMask::Value),
+    ("D1", CyclePostMask::Value),
+    ("G1", CyclePostMask::Value),
+];
 /// C `scalerRecord.c:735` writes the literal `*precision = 2` for `VERS`, the
 /// record-support version number.
 const SCALER_VERS_PRECISION: i16 = 2;
@@ -1039,7 +1017,7 @@ impl Record for ScalerRecord {
             "TP" => {
                 self.tp_to_pr1();
                 // C:673-676 — PR1, D1 and G1 are posted unconditionally.
-                self.side_effect_posts = &["PR1", "D1", "G1"];
+                self.side_effect_posts = &TP_POSTS;
             }
             // C has NO special() case for TP1 or RAT1 — leave unchanged.
             "TP1" => {}
@@ -1069,22 +1047,22 @@ impl Record for ScalerRecord {
                         self.d[0] = 1;
                         self.g[0] = 1;
                         // C:682-687 — TP always, D1/G1 only when TP came out > 0.
-                        self.side_effect_posts = &["TP", "D1", "G1"];
+                        self.side_effect_posts = &PR1_POSTS;
                     } else {
-                        self.side_effect_posts = &["TP"];
+                        self.side_effect_posts = &PR1_POSTS[..1];
                     }
                 } else if let Some(i) = parse_indexed_field(field, "PR") {
                     if self.pr[i] > 0 {
                         self.d[i] = 1;
                         self.g[i] = 1;
                         // C:705-706 — the forced-on channel's Dn and Gn.
-                        self.side_effect_posts = DG_PAIR_BY_CHANNEL[i];
+                        self.side_effect_posts = &DG_POSTS_BY_CHANNEL[i];
                     }
                 } else if let Some(i) = parse_indexed_field(field, "G") {
                     if self.g[i] != 0 && self.pr[i] == 0 {
                         self.pr[i] = 1000;
                         // C:717-718 — the preset this write just defaulted.
-                        self.side_effect_posts = PR_BY_CHANNEL[i];
+                        self.side_effect_posts = &PR_POSTS_BY_CHANNEL[i];
                     }
                 }
             }
@@ -1358,32 +1336,29 @@ impl Record for ScalerRecord {
     /// into it (`:766`), and then posts with a literal `DBE_LOG` (`:771`) —
     /// `monitor_mask` is never read, so the alarm bit is dropped and a client
     /// subscribed to `Sn` with `DBE_ALARM` receives nothing on a severity
-    /// transition. Slicing the static `SN_FIELD_NAMES` to `nch`
-    /// avoids a per-call allocation; the unsafe `'static` re-view matches
-    /// `field_list` above (the `LazyLock` lives for the program and
-    /// `active_channels() <= SN_FIELD_NAMES.len()`).
+    /// transition.
     fn log_swept_fields(&self) -> &'static [&'static str] {
         if self.ss == SCALER_STATE_IDLE {
-            let names: &Vec<&'static str> = &SN_FIELD_NAMES;
-            unsafe { std::slice::from_raw_parts(names.as_ptr(), self.active_channels()) }
+            &SN_FIELD_NAMES[..self.active_channels()]
         } else {
             &[]
         }
     }
 
     /// Every C scaler post outside the idle `monitor()` sweep is a literal
-    /// `DBE_VALUE` — see `VALUE_ONLY_BY_NCH`, which lists them. The framework
-    /// strips the LOG bit from the change post (and from `VAL`'s deadband post,
-    /// and from the `special()` side-effect posts in
-    /// [`Self::monitor_side_effect_fields`]) of every field returned here, so a
+    /// `DBE_VALUE` — see `VALUE_ONLY_FIELDS`, which lists them. The framework
+    /// strips the LOG bit from the change post (and from `VAL`'s deadband
+    /// post) of every field returned here, so a
     /// `DBE_LOG`-only subscriber sees `Sn` on the idle sweep alone and never
     /// sees `PRn`/`Gn`/`Dn`, matching C.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
-        &VALUE_ONLY_BY_NCH[self.active_channels()]
+        // Channel 1's group is three long: its PR1 is in the fixed head.
+        let nch = self.active_channels();
+        &VALUE_ONLY_FIELDS[..6 + 4 * nch - nch.min(1)]
     }
 
     /// C's scaler posts a FIXED list from a process cycle (see
-    /// `PROCESS_POSTED_BY_NCH`) and leaves every other field it wrote silent.
+    /// `PROCESS_POSTED_FIELDS`) and leaves every other field it wrote silent.
     /// Declaring that list closes the spurious-event family the framework's
     /// generic "post whatever changed" rule opened:
     ///
@@ -1401,7 +1376,7 @@ impl Record for ScalerRecord {
     /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
     /// count-start preset recompute moved it.
     fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED_BY_NCH[self.active_channels()])
+        Some(&PROCESS_POSTED_FIELDS[..6 + self.active_channels()])
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that
@@ -1415,8 +1390,9 @@ impl Record for ScalerRecord {
     /// posted by the put itself (C `dbPut`, dbAccess.c:1411-1413). So `RATE`,
     /// whose clamp changes only `RATE`, contributes nothing; C posts an untouched
     /// `TP` there, which is CBUG-B18 (see the deviation note at that case).
-    fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {
-        self.side_effect_posts
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        let posts = std::mem::take(&mut self.side_effect_posts);
+        CycleMarks::of(posts, (1u64 << posts.len()) - 1)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
@@ -1535,5 +1511,48 @@ mod menu_choice_tests {
         let snap = inst.snapshot_for_field("G3").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["N", "Y"]);
+    }
+}
+
+#[cfg(test)]
+mod channel_table_tests {
+    use super::{MAX_SCALER_CHANNELS, SCALER_STATE_IDLE, ScalerRecord};
+    use epics_base_rs::server::record::Record;
+    use std::collections::BTreeSet;
+
+    /// Each `nch` slice holds exactly its channels' names: the empty record,
+    /// channel 1 (whose PR1 sits in the fixed head), and every count up to the
+    /// table's end.
+    #[test]
+    fn sliced_tables_hold_exactly_the_active_channels() {
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        for nch in 0..=MAX_SCALER_CHANNELS {
+            let rec = ScalerRecord {
+                nch: nch as i16,
+                ss: SCALER_STATE_IDLE,
+                ..Default::default()
+            };
+            let sn: Vec<String> = (1..=nch).map(|i| format!("S{i}")).collect();
+            let mut value_only = set(&["CNT", "T", "VAL", "PR1", "TP", "FREQ"]);
+            let mut posted = set(&["VAL", "T", "CNT", "PR1", "TP", "FREQ"]);
+            for i in 1..=nch {
+                value_only.extend([
+                    format!("S{i}"),
+                    format!("PR{i}"),
+                    format!("D{i}"),
+                    format!("G{i}"),
+                ]);
+                posted.insert(format!("S{i}"));
+            }
+            assert_eq!(rec.log_swept_fields(), sn, "nch {nch}");
+            let got = rec.value_only_change_fields();
+            assert_eq!(
+                (got.len(), set(got)),
+                (value_only.len(), value_only),
+                "nch {nch}"
+            );
+            let got = rec.process_posted_fields().unwrap();
+            assert_eq!((got.len(), set(got)), (posted.len(), posted), "nch {nch}");
+        }
     }
 }

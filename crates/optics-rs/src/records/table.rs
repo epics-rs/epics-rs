@@ -12,8 +12,8 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget, ProcessAction, ProcessActions,
-    ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget,
+    ProcessAction, ProcessActions, ProcessOutcome, Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -534,6 +534,9 @@ pub struct TableRecord {
 
     // --- Internal: previous yaw angle (for the YANG offset rotation) ---
     curr_yang: f64,
+
+    /// SET owed by an `SSET`/`SUSE` put; the put drains it.
+    set_marked: bool,
 }
 
 impl Default for TableRecord {
@@ -722,6 +725,7 @@ impl Default for TableRecord {
             async_ctx: None,
             curr_aunit: AngleUnit::Degrees,
             curr_yang: 0.0,
+            set_marked: false,
         }
     }
 }
@@ -3143,9 +3147,11 @@ impl Record for TableRecord {
             }
             "SSET" => {
                 self.set = SetMode::Set;
+                self.set_marked = true;
             }
             "SUSE" => {
                 self.set = SetMode::Use;
+                self.set_marked = true;
             }
             "SYNC" => {
                 self.sync = 1;
@@ -3214,16 +3220,11 @@ impl Record for TableRecord {
     }
 
     /// C `tableRecord.c::special()` flips SET mode on an `SSET`/`SUSE` write
-    /// and posts `SET` with `DBE_VALUE` (tableRecord.c:658-663). Neither
-    /// `SSET` nor `SUSE` is `pp(TRUE)`, so no process cycle posts `SET`; the
-    /// framework posts it here as a side effect of the put. `SET` is named in
-    /// `TABLE_VALUE_ONLY_FIELDS`, so the side-effect post carries
-    /// `DBE_VALUE` only — matching C's literal mask.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "SSET" | "SUSE" => &["SET"],
-            _ => &[],
-        }
+    /// and posts `SET` with a literal `DBE_VALUE` (tableRecord.c:658-663).
+    /// Neither is `pp(TRUE)`, so no process cycle posts it.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static SET_POST: [(&str, CyclePostMask); 1] = [("SET", CyclePostMask::Value)];
+        CycleMarks::of(&SET_POST, u64::from(std::mem::take(&mut self.set_marked)))
     }
 
     /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:
@@ -4135,21 +4136,16 @@ mod tests {
 
     #[test]
     fn test_sset_suse_post_set_as_side_effect() {
-        let t = TableRecord::new();
+        let mut t = TableRecord::new();
 
-        // C special() flips SET mode on SSET/SUSE and posts SET with
-        // DBE_VALUE; SSET/SUSE are not pp, so the SET monitor must come from
-        // the side-effect post, not a process cycle.
-        assert_eq!(t.monitor_side_effect_fields("SSET"), &["SET"]);
-        assert_eq!(t.monitor_side_effect_fields("SUSE"), &["SET"]);
-        // Unrelated puts trigger no side-effect post.
-        assert!(t.monitor_side_effect_fields("AX").is_empty());
-        assert!(t.monitor_side_effect_fields("SYNC").is_empty());
-
-        // SET is a value-only field, so the framework strips the LOG bit from
-        // the side-effect post — the SET monitor carries DBE_VALUE alone,
-        // matching C's literal db_post_events(set, DBE_VALUE).
-        assert!(t.value_only_change_fields().contains(&"SET"));
+        // C special() flips SET mode on SSET/SUSE and posts SET with a
+        // literal DBE_VALUE; SSET/SUSE are not pp, so the put drains the post.
+        for (field, marks) in [("SSET", 1), ("SUSE", 1), ("AX", 0), ("SYNC", 0)] {
+            t.on_put(field);
+            let posts: Vec<_> = t.take_cycle_posted_fields().collect();
+            let want: &[(&str, CyclePostMask)] = &[("SET", CyclePostMask::Value)][..marks];
+            assert_eq!(posts, want, "{field}");
+        }
     }
 
     #[test]

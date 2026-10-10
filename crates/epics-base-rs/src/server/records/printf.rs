@@ -1004,9 +1004,8 @@ impl Record for PrintfRecord {
             // and `apply_fmt` overwrites what was stored, which is why the
             // compiled softIoc accepts `caput PRF.VAL 7` and still reads back
             // the formatted result; refusing the put was the divergence.
-            // Same shape as the `lsi`/`lso` VAL arms: a DBR_STRING source is
-            // already capped at `MAX_STRING_SIZE` by dbConvert, a DBR_CHAR
-            // long-string source is bounded only by SIZV.
+            // Same shape as the `lsi`/`lso` VAL arms: SIZV bounds a DBR_STRING
+            // and a DBR_CHAR source alike.
             "VAL" => {
                 self.val
                     .put(value, (self.sizv as usize).saturating_sub(1))?;

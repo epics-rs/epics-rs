@@ -230,6 +230,15 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
     })
 }
 
+/// The soft scaler ports this process configured — C's asyn port registry
+/// for `drvScalerSoftConfigure`, which is process-global in C as well.
+#[cfg(feature = "scaler")]
+pub fn scaler_soft_ports() -> &'static scaler_rs::device_support::soft_port::SoftScalerPorts {
+    static PORTS: std::sync::LazyLock<scaler_rs::device_support::soft_port::SoftScalerPorts> =
+        std::sync::LazyLock::new(Default::default);
+    &PORTS
+}
+
 /// The per-builder half of the port IOC's configuration: the record types the
 /// C side we diff against gets from loading module `.dbd`s, and which
 /// `epics-base-rs` therefore does not register by default.
@@ -251,7 +260,28 @@ pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
 
     let (asyn_type, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
     let (table_type, table_factory) = optics_rs::table_record_factory();
-    epics_base_rs::server::ioc_builder::IocBuilder::new()
+    let builder = epics_base_rs::server::ioc_builder::IocBuilder::new();
+    #[cfg(feature = "scaler")]
+    let builder = {
+        let (scaler_type, scaler_factory) = scaler_rs::scaler_record_factory();
+        builder
+            .register_record_type(scaler_type, scaler_factory)
+            .register_dynamic_device_support(|ctx| {
+                // C `scalerSupport.dbd`: `device(scaler,INST_IO,devScalerAsyn,
+                // "Asyn Scaler")`, whose `init_record` parses OUT's `@asyn(port
+                // ..)` and connects to that port.
+                if ctx.record_type != "scaler" || ctx.dtyp != "Asyn Scaler" {
+                    return None;
+                }
+                let link = asyn_rs::adapter::parse_asyn_link(ctx.out).ok()?;
+                let dset = scaler_soft_ports().device_support(&link.port_name)?;
+                Some(Box::new(dset)
+                    as Box<
+                        dyn epics_base_rs::server::device_support::DeviceSupport,
+                    >)
+            })
+    };
+    builder
         .register_record_type(asyn_type, asyn_factory)
         .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
         .register_record_type("busy", || Box::new(BusyRecord::default()))

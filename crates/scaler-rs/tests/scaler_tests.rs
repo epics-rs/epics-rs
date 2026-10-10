@@ -548,6 +548,36 @@ fn test_soft_driver_preset_done() {
     assert!(driver.done());
 }
 
+/// C `int32ArrayRead` runs `checkAcquireDone` before `dbGetField`
+/// (`drvScalerSoft.c:409-424`): the read that fetches the preset count does
+/// not latch done; the next one does.
+#[test]
+fn test_soft_driver_done_is_seen_one_read_later() {
+    let mut driver = SoftScalerDriver::new(8);
+    driver.write_preset(0, 1000).unwrap();
+    driver.arm(true).unwrap();
+    driver.shared_counts().lock().unwrap()[0] = 1000;
+
+    let mut counts = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut counts).unwrap();
+    assert_eq!(counts[0], 1000, "the read fetched the preset count");
+    // `done()` is itself a read: it judges what the previous read fetched.
+    assert!(driver.done(), "the next read latches done");
+}
+
+/// The first poll after the count arrives fetches it and is not yet done; the
+/// next poll is. Reading first, as the port did, finished on the first.
+#[test]
+fn test_soft_driver_first_poll_after_the_count_is_not_done() {
+    let mut driver = SoftScalerDriver::new(8);
+    driver.write_preset(0, 1000).unwrap();
+    driver.arm(true).unwrap();
+    driver.shared_counts().lock().unwrap()[0] = 1000;
+
+    assert!(!driver.done(), "this poll fetched the count");
+    assert!(driver.done(), "this one judged it");
+}
+
 /// C `devScalerAsyn.c:292-301` `scaler_done()` is read-and-clear: it
 /// returns 1 exactly once per completed count, then `pPvt->done` is 0
 /// so the next poll returns 0. `ScalerDriver::done` must consume the

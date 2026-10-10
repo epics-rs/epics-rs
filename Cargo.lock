@@ -1169,6 +1169,7 @@ dependencies = [
  "epics-ca-rs",
  "epics-pva-rs",
  "optics-rs",
+ "scaler-rs",
  "serde",
  "serde_json",
  "tokio",

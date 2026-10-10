@@ -19,6 +19,9 @@ epics-pva-rs = { workspace = true }
 asyn-rs = { workspace = true }
 # optics' `table` record, which the C side loads into oracleTableIoc.
 optics-rs = { workspace = true }
+# The scaler record and its `Asyn Scaler` soft port, as oracleScalerIoc
+# loads them from scalerSupport.dbd.
+scaler-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -26,6 +29,8 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
 [features]
+default = ["scaler"]
+scaler = ["dep:scaler-rs"]
 
 [[bin]]
 name = "oracle"

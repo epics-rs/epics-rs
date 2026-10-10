@@ -6,42 +6,74 @@ use epics_base_rs::error::CaResult;
 use super::scaler_asyn::ScalerDriver;
 use crate::records::scaler::MAX_SCALER_CHANNELS;
 
-/// Software scaler driver for testing and simulation.
-///
-/// Ported from `drvScalerSoft.c`. Implements `ScalerDriver` without
-/// requiring real hardware. Counter values can be set externally
-/// (e.g., from PV links or test code).
-///
-/// In the C implementation, this reads from template-based PV names.
-/// In Rust, the counters are directly accessible for external updating.
-pub struct SoftScalerDriver {
+/// Where a soft scaler's counters come from: C `drvScalerSoft`'s input PVs
+/// ([`super::soft_port::PvCounts`]) or an in-process array standing in for
+/// them ([`SharedCounts`]).
+pub trait CountSource: Send + Sync + 'static {
+    /// C `dbGetField` of every input (`drvScalerSoft.c:421-423`).
+    fn sample(&mut self, counts: &mut [u32; MAX_SCALER_CHANNELS]) -> CaResult<()>;
+    /// C `dbPutField` of `0` to every input (`drvScalerSoft.c:319-322`).
+    fn clear(&mut self) -> CaResult<()>;
+    /// What `reset` does to the source; C touches no input (`:303-313`).
+    fn reset(&mut self) {}
+}
+
+/// An in-process count source, written directly by tests.
+pub struct SharedCounts(Arc<Mutex<[u32; MAX_SCALER_CHANNELS]>>);
+
+impl CountSource for SharedCounts {
+    fn sample(&mut self, counts: &mut [u32; MAX_SCALER_CHANNELS]) -> CaResult<()> {
+        *counts = *self.0.lock().unwrap();
+        Ok(())
+    }
+
+    fn clear(&mut self) -> CaResult<()> {
+        *self.0.lock().unwrap() = [0; MAX_SCALER_CHANNELS];
+        Ok(())
+    }
+
+    /// Unlike C, zeroes the array too, so a fresh test run starts clean.
+    fn reset(&mut self) {
+        *self.0.lock().unwrap() = [0; MAX_SCALER_CHANNELS];
+    }
+}
+
+/// Software scaler driver — C `drvScalerSoft.c`, over a [`CountSource`].
+pub struct SoftScalerDriver<S: CountSource = SharedCounts> {
     num_channels: usize,
     counts: [u32; MAX_SCALER_CHANNELS],
     presets: [u32; MAX_SCALER_CHANNELS],
     armed: bool,
     done_flag: bool,
     start_time: Option<Instant>,
-    /// Shared reference for external counter updates.
-    shared_counts: Arc<Mutex<[u32; MAX_SCALER_CHANNELS]>>,
+    source: S,
 }
 
 impl SoftScalerDriver {
     pub fn new(num_channels: usize) -> Self {
-        let num_channels = num_channels.min(MAX_SCALER_CHANNELS);
-        Self {
+        Self::with_source(
             num_channels,
+            SharedCounts(Arc::new(Mutex::new([0; MAX_SCALER_CHANNELS]))),
+        )
+    }
+
+    /// Get a shared handle to the counter values for external updating.
+    pub fn shared_counts(&self) -> Arc<Mutex<[u32; MAX_SCALER_CHANNELS]>> {
+        Arc::clone(&self.source.0)
+    }
+}
+
+impl<S: CountSource> SoftScalerDriver<S> {
+    pub fn with_source(num_channels: usize, source: S) -> Self {
+        Self {
+            num_channels: num_channels.min(MAX_SCALER_CHANNELS),
             counts: [0; MAX_SCALER_CHANNELS],
             presets: [0; MAX_SCALER_CHANNELS],
             armed: false,
             done_flag: false,
             start_time: None,
-            shared_counts: Arc::new(Mutex::new([0; MAX_SCALER_CHANNELS])),
+            source,
         }
-    }
-
-    /// Get a shared handle to the counter values for external updating.
-    pub fn shared_counts(&self) -> Arc<Mutex<[u32; MAX_SCALER_CHANNELS]>> {
-        Arc::clone(&self.shared_counts)
     }
 
     /// Port of C `checkAcquireDone()` (drvScalerSoft.c:588-600): the
@@ -59,39 +91,37 @@ impl SoftScalerDriver {
     }
 }
 
-impl SoftScalerDriver {
-    /// Copy the external count source and run `checkAcquireDone`
-    /// (drvScalerSoft.c:588-600), as C's `int32Read`/`int32ArrayRead` do.
-    fn sample(&mut self) {
-        self.counts = *self.shared_counts.lock().unwrap();
+impl<S: CountSource> SoftScalerDriver<S> {
+    /// C `int32ArrayRead` (`drvScalerSoft.c:409-424`): `checkAcquireDone`
+    /// first, on the counts the previous read left, then the inputs. A count
+    /// that reaches its preset is therefore seen done one read after the read
+    /// that fetched it.
+    fn sample(&mut self) -> CaResult<()> {
         if self.armed && self.check_presets() {
             self.done_flag = true;
             self.armed = false;
         }
+        self.source.sample(&mut self.counts)
     }
 }
 
-impl ScalerDriver for SoftScalerDriver {
+impl<S: CountSource> ScalerDriver for SoftScalerDriver<S> {
     /// C `drvScalerSoft.c:303-313` — `scalerResetCommand`: stop
     /// acquiring (`acquiring = prevAcquiring = 0`) and **clear all
-    /// presets** (`presetCounts[i] = 0`). The original C does not zero
-    /// `counts` here — but since the soft driver's counts are sourced
-    /// from external PVs, the port keeps the previous behaviour of also
-    /// zeroing its local/shared count buffers so a fresh test run starts
-    /// clean. The load-bearing C-parity fix is clearing `presets`.
+    /// presets** (`presetCounts[i] = 0`). What happens to the counters
+    /// is the source's ([`CountSource::reset`]).
     fn reset(&mut self) -> CaResult<()> {
         self.counts = [0; MAX_SCALER_CHANNELS];
         self.presets = [0; MAX_SCALER_CHANNELS];
         self.done_flag = false;
         self.armed = false;
         self.start_time = None;
-        let mut shared = self.shared_counts.lock().unwrap();
-        *shared = [0; MAX_SCALER_CHANNELS];
+        self.source.reset();
         Ok(())
     }
 
     fn read(&mut self, counts: &mut [u32; MAX_SCALER_CHANNELS]) -> CaResult<()> {
-        self.sample();
+        self.sample()?;
         *counts = self.counts;
         Ok(())
     }
@@ -116,9 +146,8 @@ impl ScalerDriver for SoftScalerDriver {
     /// On arm the clear stops a stale count from making the scaler
     /// report "done" immediately; on disarm it zeroes the counts a
     /// subsequent idle read returns, so a disarmed scaler reads `0`
-    /// rather than its last value. The port's `shared_counts` is the
-    /// external count source standing in for those input PVs, so both
-    /// the local buffer and the shared source are zeroed.
+    /// rather than its last value. An unconnected source refuses, and C
+    /// then leaves `acquiring` alone (`:318`).
     ///
     /// Note: a normal preset-reached completion disarms inside `read()`
     /// (`self.armed = false`, no count clear), NOT via an arm command —
@@ -128,11 +157,8 @@ impl ScalerDriver for SoftScalerDriver {
     /// clears them.
     fn arm(&mut self, start: bool) -> CaResult<()> {
         // C:319-322 — clear scaler data on arm AND disarm.
+        self.source.clear()?;
         self.counts = [0; MAX_SCALER_CHANNELS];
-        {
-            let mut shared = self.shared_counts.lock().unwrap();
-            *shared = [0; MAX_SCALER_CHANNELS];
-        }
         self.armed = start;
         if start {
             self.done_flag = false;
@@ -147,12 +173,14 @@ impl ScalerDriver for SoftScalerDriver {
     /// completed count is reported exactly once, then the flag is
     /// cleared so the next poll returns `false`.
     ///
-    /// C reaches `scaler_done()` only after the read that ran
-    /// `checkAcquireDone` raised the done interrupt (`acquireDoneCallbacks`),
-    /// so the poll samples the source first: the count that reached its
-    /// preset completes on this cycle, not on the next display refresh.
+    /// C reaches `scaler_done()` only after a read's `checkAcquireDone`
+    /// raised the done interrupt (`acquireDoneCallbacks`); the poll is that
+    /// read. It judges the counts the previous read fetched, so the count
+    /// completes on the refresh after the one that displayed it, as C's
+    /// interrupt-driven process does.
     fn done(&mut self) -> bool {
-        self.sample();
+        // An unreadable source leaves the done latch as the last read left it.
+        let _ = self.sample();
         let was_done = self.done_flag;
         self.done_flag = false;
         was_done

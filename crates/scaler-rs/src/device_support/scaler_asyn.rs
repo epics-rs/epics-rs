@@ -72,6 +72,12 @@ impl ScalerAsynDeviceSupport {
         }
     }
 
+    /// Device support on a driver other records may share — one asyn port
+    /// serving several scaler records.
+    pub fn shared(driver: Arc<Mutex<Box<dyn ScalerDriver>>>) -> Self {
+        Self { driver }
+    }
+
     pub fn driver(&self) -> Arc<Mutex<Box<dyn ScalerDriver>>> {
         Arc::clone(&self.driver)
     }

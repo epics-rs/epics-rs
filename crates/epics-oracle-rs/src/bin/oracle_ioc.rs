@@ -62,6 +62,28 @@ struct Args {
     /// string the C oracle's `st-*.cmd` hands `dbLoadRecords` (`P=`).
     #[arg(long = "macro", value_parser = parse_macro)]
     macros: Vec<(String, String)>,
+
+    /// `PORT,MAXCHANS,TEMPLATE`, repeatable — C st.cmd's
+    /// `drvScalerSoftConfigure("PORT", MAXCHANS, "TEMPLATE")`. The template
+    /// takes `--macro` substitutions as the st.cmd line takes iocsh's
+    /// (`$(P=)c%d`), and the channel number at `%d`.
+    #[cfg(feature = "scaler")]
+    #[arg(long = "scaler-soft", value_parser = parse_scaler_soft)]
+    scaler_soft: Vec<(String, usize, String)>,
+}
+
+#[cfg(feature = "scaler")]
+fn parse_scaler_soft(text: &str) -> Result<(String, usize, String), String> {
+    let mut parts = text.splitn(3, ',');
+    let (Some(port), Some(chans), Some(template)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("{text:?} is not PORT,MAXCHANS,TEMPLATE"));
+    };
+    let chans = chans
+        .trim()
+        .parse()
+        .map_err(|e| format!("MAXCHANS {chans:?}: {e}"))?;
+    Ok((port.trim().to_string(), chans, template.trim().to_string()))
 }
 
 fn parse_macro(text: &str) -> Result<(String, String), String> {
@@ -105,6 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reports record types unimplemented that the run measures perfectly well.
     let _devices = register_port_ioc_devices()?;
 
+    // C st-scaler.cmd configures the ports before `dbLoadRecords`, because
+    // `devScalerAsyn`'s `init_record` connects to them.
+    #[cfg(feature = "scaler")]
+    for (port, chans, template) in &args.scaler_soft {
+        let template = epics_base_rs::runtime::mac_lib::substitute_macros(template, &macros);
+        epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
+    }
+
     // The C side loads its `.db` from an st.cmd, so a refused field fails the
     // load, the script goes on, and iocInit boots the record anyway.
     let (db, _autosave) = port_ioc_builder()
@@ -112,6 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boot_past_failed_loads()
         .build()
         .await?;
+
+    // C `connectPVs`, which waits for `interruptAccept`: the inputs are
+    // records of the database just loaded. A port missing an input fails on
+    // its own; the IOC keeps running.
+    #[cfg(feature = "scaler")]
+    epics_oracle_rs::scaler_soft_ports().connect(&db);
 
     if args.pva {
         return serve_pva(db).await;

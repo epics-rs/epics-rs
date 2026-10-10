@@ -15,23 +15,23 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
 
 #![allow(clippy::all)]
 
@@ -121,7 +121,7 @@ pub static VARIABLES: &[(&str, &str)] = &[];
 // modelled separately (see the module docs).
 // ---------------------------------------------------------------------
 
-/// `recordtype(mca)` — 317 CA-visible own fields from `dbd/mcaRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mca)` — 320 CA-visible own fields from `dbd/mcaRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MCA_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
@@ -156,13 +156,34 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *val"),
         menu: None,
         initial: None,
         interest: 0,
         prop: false,
         prompt: Some("Value"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *bptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -178,13 +199,55 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *bg"),
         menu: None,
         initial: None,
         interest: 0,
         prop: false,
         prompt: Some("Background"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PBG",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *pbg"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Background buffer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PSTATUS",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *pstatus"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Status buffer"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -6786,7 +6849,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mca)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MCA_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MCA_NOACCESS: &[&str] = &["BPTR", "PBG", "PSTATUS"];
+pub static MCA_NOACCESS: &[&str] = &[];
 
 /// `recordtype(mca)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static MCA_DBADDR: &[&str] = &["VAL", "BG"];

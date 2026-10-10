@@ -169,6 +169,11 @@ impl Record for LsoRecord {
         self.field_is_long_string(field).then_some(1)
     }
 
+    /// `cvt_dbaddr` stores `field_size = prec->sizv`.
+    fn dbaddr_element_size(&self, field: &str) -> Option<u16> {
+        self.field_is_long_string(field).then_some(self.sizv)
+    }
+
     /// C `lsoRecord.c::process:131-140` (`menuIvoaSet_output_to_IVOV`) writes
     /// the record's OWN value and nothing else: `strncpy(prec->val,
     /// prec->ivov, prec->sizv - 1)`, terminate, `prec->len = strlen(prec->val)

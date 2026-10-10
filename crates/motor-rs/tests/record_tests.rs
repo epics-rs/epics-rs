@@ -1303,7 +1303,7 @@ fn test_field_list_coverage() {
     let ungettable: Vec<&str> = rec
         .field_list()
         .iter()
-        .filter(|fd| rec.get_field(fd.name).is_none())
+        .filter(|fd| !fd.unreadable() && rec.get_field(fd.name).is_none())
         .map(|fd| fd.name)
         .collect();
     assert_eq!(ungettable, UNIMPLEMENTED);

@@ -21,8 +21,8 @@ use crate::parse::{Device, Field, Menu, RecordType, Variable};
 /// * `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` are served as `DBR_STRING`
 ///   (the link's `dbGetLinkStr` rendering).
 /// * `DBF_NOACCESS` is a C-internal pointer (`RSET`, `DPVT`, `MLOK`, `BPTR`,
-///   ...). It is not CA-visible and has no port representation; the caller
-///   drops it.
+///   ...). It is not CA-visible and has no served type; the caller carries it
+///   as raw bytes ([`internal_width`]) or drops it to a name.
 pub fn dbf_to_rust(dbf: &str) -> Option<&'static str> {
     Some(match dbf {
         "DBF_STRING" => "String",
@@ -88,6 +88,25 @@ pub fn is_internal(f: &Field) -> bool {
     f.dbf == "DBF_NOACCESS" && f.special.as_deref() != Some("SPC_DBADDR")
 }
 
+/// The width of the C struct member an `extra("...")` declaration names.
+#[derive(Clone, Copy)]
+pub enum Width {
+    Bytes(u16),
+    /// `sizeof(void *)` of the target, which no `.dbd` states and which a
+    /// 32-bit RTEMS build does not share with a 64-bit host.
+    Pointer,
+}
+
+impl Width {
+    /// The `FieldDesc::size` initializer.
+    fn tokens(self) -> String {
+        match self {
+            Width::Bytes(n) => n.to_string(),
+            Width::Pointer => "core::mem::size_of::<*const ()>() as u16".to_string(),
+        }
+    }
+}
+
 /// The byte width of the C struct member an `extra("...")` declaration names.
 ///
 /// No `.dbd` spells this. A C IOC's generated `<rec>RecordSizeOffset` writes
@@ -97,24 +116,29 @@ pub fn is_internal(f: &Field) -> bool {
 ///
 /// `None` for a member this port cannot state a width for, and the test is on
 /// the DECLARATOR, not just the type name: only a plain scalar member has a
-/// width the type alone gives. A pointer (`*`) is refused because C prints its
-/// ADDRESS (`PTR %p`), which no two IOCs agree on. An array (`[`) is refused
-/// because its width is the bound, not the element — `calc.RPCL` is
+/// width the type alone gives. A `*` declarator without a `[` is a pointer —
+/// including a function pointer, `long (*cadr)(...)` — and its width is
+/// `sizeof(void *)`, which is what `dbpr`'s `PTR %p` arm tests
+/// (`dbTest.c:1239`). An array (`[`) is refused because its width is the
+/// bound, not the element — `calc.RPCL` is
 /// `extra("char rpcl[INFIX_TO_POSTFIX_SIZE(160)]")`, whose size is that C
 /// macro expanded, and reading the leading `char` would carry the row at one
 /// byte and print a one-byte `dbpr` line where C prints the whole buffer.
-fn extra_width(extra: &str) -> Option<u16> {
-    if extra.contains('*') || extra.contains('[') {
+fn extra_width(extra: &str) -> Option<Width> {
+    if extra.contains('[') {
         return None;
     }
+    if extra.contains('*') {
+        return Some(Width::Pointer);
+    }
     match extra.split_whitespace().next()? {
-        "epicsInt8" | "epicsUInt8" | "char" => Some(1),
-        "epicsInt16" | "epicsUInt16" | "short" => Some(2),
-        "epicsInt32" | "epicsUInt32" | "epicsFloat32" => Some(4),
-        "epicsInt64" | "epicsUInt64" | "epicsFloat64" => Some(8),
+        "epicsInt8" | "epicsUInt8" | "char" => Some(Width::Bytes(1)),
+        "epicsInt16" | "epicsUInt16" | "short" => Some(Width::Bytes(2)),
+        "epicsInt32" | "epicsUInt32" | "epicsFloat32" => Some(Width::Bytes(4)),
+        "epicsInt64" | "epicsUInt64" | "epicsFloat64" => Some(Width::Bytes(8)),
         // `epicsTimeStamp` is two `epicsUInt32` (`epicsTime.h`), which is
         // what `dbCommon.TIME` stands for.
-        "epicsTimeStamp" => Some(8),
+        "epicsTimeStamp" => Some(Width::Bytes(8)),
         _ => None,
     }
 }
@@ -127,8 +151,21 @@ fn extra_width(extra: &str) -> Option<u16> {
 /// both need the declaration, not just proof that the name exists. So the row
 /// is kept exactly when the port can say how wide it is; everything else stays
 /// a name.
-pub fn internal_width(f: &Field) -> Option<u16> {
+pub fn internal_width(f: &Field) -> Option<Width> {
     if !is_internal(f) {
+        return None;
+    }
+    extra_width(f.extra.as_deref()?)
+}
+
+/// The width of any `DBF_NOACCESS` declaration, `SPC_DBADDR` rows included.
+///
+/// `FieldDesc::size` is `sizeof(prec->member)` whatever the row's `special`:
+/// `dbpr` tests it (`dbTest.c:1239`) for the rows `cvt_dbaddr` re-types, such
+/// as `waveform.VAL` — `void *val` — whose descriptor must keep the pointer
+/// width or the row prints as nothing.
+fn declared_width(f: &Field) -> Option<Width> {
+    if f.dbf != "DBF_NOACCESS" {
         return None;
     }
     extra_width(f.extra.as_deref()?)
@@ -365,23 +402,23 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
          //!   into every record table would double-declare them. Base's table emits\n\
          //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled\n\
          //!   (and so a `dbCommon` addition is a diff, not a silent gap).\n\
-         //! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an\n\
-         //!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps\n\
-         //!   `sizeof` the struct member in `pdbFldDes->size`, and neither a\n\
-         //!   pointer (whose C value is an address no two IOCs agree on) nor an\n\
-         //!   array (whose width is its bound, not its element) has one this port\n\
-         //!   can state, so the *descriptor* is dropped rather than invented —\n\
-         //!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`\n\
-         //!   resolves them, so a SEARCH for `REC.BPTR` is answered and the\n\
-         //!   refusal lands at channel creation, and the search gate needs the\n\
-         //!   names to do the same.\n\
+         //! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type\n\
+         //!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,\n\
+         //!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and\n\
+         //!   an array's width is its bound, not its element, so the *descriptor*\n\
+         //!   is dropped rather than invented — but the NAME is kept\n\
+         //!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a\n\
+         //!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel\n\
+         //!   creation, and the search gate needs the names to do the same.\n\
          //!\n\
          //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`\n\
-         //!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`\n\
-         //!   prints its bytes and `dba` reports its `Field Size` and both read\n\
-         //!   the declaration. Carried is not servable: `FieldDesc::unreadable`\n\
-         //!   is what refuses the read, so the SEARCH is answered off the\n\
-         //!   descriptor instead of off the name list.\n",
+         //!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is\n\
+         //!   CARRIED, descriptor and width both, because `dbpr` prints it and\n\
+         //!   `dba` reports its `Field Size` and both read the declaration. A\n\
+         //!   pointer's width is `sizeof(void *)` of the build, as C's is.\n\
+         //!   Carried is not servable: `FieldDesc::unreadable` is what refuses\n\
+         //!   the read, so the SEARCH is answered off the descriptor instead of\n\
+         //!   off the name list.\n",
         input.dbd_dir
     )
     .unwrap();
@@ -1136,7 +1173,7 @@ fn emit_field(
     writeln!(
         s,
         "        size: {},",
-        kept_internal.unwrap_or_else(|| f.size.unwrap_or(0) as u16)
+        declared_width(f).map_or_else(|| f.size.unwrap_or(0).to_string(), Width::tokens)
     )
     .unwrap();
     // C's loader requires `extra` on every DBF_NOACCESS row and `size` on

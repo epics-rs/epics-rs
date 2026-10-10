@@ -15,23 +15,23 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
 
 #![allow(clippy::all)]
 
@@ -1089,7 +1089,7 @@ pub static VARIABLES: &[(&str, &str)] = &[
 // modelled separately (see the module docs).
 // ---------------------------------------------------------------------
 
-/// `recordtype(aSub)` — 241 CA-visible own fields from `dbd/aSubRecord.dbd` (23 `DBF_NOACCESS` internals dropped).
+/// `recordtype(aSub)` — 264 CA-visible own fields from `dbd/aSubRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -1236,6 +1236,48 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         prop: false,
         prompt: Some("Old Subr. Name"),
         promptgroup: Some("30 - Action"),
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "SADR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("long (*sadr)(struct aSubRecord *)"),
+        menu: None,
+        initial: None,
+        interest: 2,
+        prop: false,
+        prompt: Some("Subroutine Address"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "CADR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void (*cadr)(struct aSubRecord *)"),
+        menu: None,
+        initial: None,
+        interest: 2,
+        prop: false,
+        prompt: Some("Subroutine Cleanup Address"),
+        promptgroup: None,
         base: Base::Decimal,
     },
     FieldDesc {
@@ -1754,7 +1796,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *a"),
         menu: None,
         initial: None,
@@ -1776,7 +1818,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *b"),
         menu: None,
         initial: None,
@@ -1798,7 +1840,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *c"),
         menu: None,
         initial: None,
@@ -1820,7 +1862,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *d"),
         menu: None,
         initial: None,
@@ -1842,7 +1884,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *e"),
         menu: None,
         initial: None,
@@ -1864,7 +1906,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *f"),
         menu: None,
         initial: None,
@@ -1886,7 +1928,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *g"),
         menu: None,
         initial: None,
@@ -1908,7 +1950,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *h"),
         menu: None,
         initial: None,
@@ -1930,7 +1972,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *i"),
         menu: None,
         initial: None,
@@ -1952,7 +1994,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *j"),
         menu: None,
         initial: None,
@@ -1974,7 +2016,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *k"),
         menu: None,
         initial: None,
@@ -1996,7 +2038,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *l"),
         menu: None,
         initial: None,
@@ -2018,7 +2060,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *m"),
         menu: None,
         initial: None,
@@ -2040,7 +2082,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *n"),
         menu: None,
         initial: None,
@@ -2062,7 +2104,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *o"),
         menu: None,
         initial: None,
@@ -2084,7 +2126,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *p"),
         menu: None,
         initial: None,
@@ -2106,7 +2148,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *q"),
         menu: None,
         initial: None,
@@ -2128,7 +2170,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *r"),
         menu: None,
         initial: None,
@@ -2150,7 +2192,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *s"),
         menu: None,
         initial: None,
@@ -2172,7 +2214,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *t"),
         menu: None,
         initial: None,
@@ -2194,7 +2236,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *u"),
         menu: None,
         initial: None,
@@ -3980,7 +4022,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vala"),
         menu: None,
         initial: None,
@@ -4002,7 +4044,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valb"),
         menu: None,
         initial: None,
@@ -4024,7 +4066,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valc"),
         menu: None,
         initial: None,
@@ -4046,7 +4088,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vald"),
         menu: None,
         initial: None,
@@ -4068,7 +4110,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vale"),
         menu: None,
         initial: None,
@@ -4090,7 +4132,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valf"),
         menu: None,
         initial: None,
@@ -4112,7 +4154,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valg"),
         menu: None,
         initial: None,
@@ -4134,7 +4176,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valh"),
         menu: None,
         initial: None,
@@ -4156,7 +4198,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vali"),
         menu: None,
         initial: None,
@@ -4178,7 +4220,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valj"),
         menu: None,
         initial: None,
@@ -4200,7 +4242,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valk"),
         menu: None,
         initial: None,
@@ -4222,7 +4264,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vall"),
         menu: None,
         initial: None,
@@ -4244,7 +4286,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valm"),
         menu: None,
         initial: None,
@@ -4266,7 +4308,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valn"),
         menu: None,
         initial: None,
@@ -4288,7 +4330,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valo"),
         menu: None,
         initial: None,
@@ -4310,7 +4352,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valp"),
         menu: None,
         initial: None,
@@ -4332,7 +4374,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valq"),
         menu: None,
         initial: None,
@@ -4354,7 +4396,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valr"),
         menu: None,
         initial: None,
@@ -4376,7 +4418,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *vals"),
         menu: None,
         initial: None,
@@ -4398,7 +4440,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valt"),
         menu: None,
         initial: None,
@@ -4420,13 +4462,454 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *valu"),
         menu: None,
         initial: None,
         interest: 2,
         prop: false,
         prompt: Some("Output value U"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLA",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovla"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output A"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLB",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlb"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output B"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLC",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlc"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output C"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLD",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovld"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output D"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLE",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovle"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output E"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLF",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlf"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output F"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLG",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlg"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output G"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLH",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlh"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output H"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLI",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovli"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output I"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLJ",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlj"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output J"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLK",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlk"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output K"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLL",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovll"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output L"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLM",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlm"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output M"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLN",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovln"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output N"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLO",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlo"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output O"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLP",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlp"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output P"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLQ",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlq"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output Q"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output R"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLS",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovls"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output S"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output T"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "OVLU",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *ovlu"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Old Output U"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -6198,10 +6681,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(aSub)` — the `DBF_NOACCESS` internal names dropped from
 /// [`A_SUB_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static A_SUB_NOACCESS: &[&str] = &[
-    "SADR", "CADR", "OVLA", "OVLB", "OVLC", "OVLD", "OVLE", "OVLF", "OVLG", "OVLH", "OVLI", "OVLJ",
-    "OVLK", "OVLL", "OVLM", "OVLN", "OVLO", "OVLP", "OVLQ", "OVLR", "OVLS", "OVLT", "OVLU",
-];
+pub static A_SUB_NOACCESS: &[&str] = &[];
 
 /// `recordtype(aSub)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static A_SUB_DBADDR: &[&str] = &[
@@ -6242,7 +6722,7 @@ pub static A_SUB_DECL: &[&str] = &[
     "ONVU",
 ];
 
-/// `recordtype(aai)` — 19 CA-visible own fields from `dbd/aaiRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(aai)` — 21 CA-visible own fields from `dbd/aaiRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static AAI_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
     FieldDesc {
@@ -6256,7 +6736,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\t\tval"),
         menu: None,
         initial: None,
@@ -6435,6 +6915,27 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\t\tbptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
@@ -6582,6 +7083,27 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -6648,7 +7170,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(aai)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AAI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static AAI_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+pub static AAI_NOACCESS: &[&str] = &[];
 
 /// `recordtype(aai)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static AAI_DBADDR: &[&str] = &["VAL"];
@@ -6665,7 +7187,7 @@ pub static AAI_DECL: &[&str] = &[
     "SIMM", "SIMS", "SIOL", "OLDSIMM", "SSCN", "SDLY", "SIMPVT", "MPST", "APST", "HASH",
 ];
 
-/// `recordtype(aao)` — 21 CA-visible own fields from `dbd/aaoRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(aao)` — 23 CA-visible own fields from `dbd/aaoRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static AAO_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
     FieldDesc {
@@ -6679,7 +7201,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\t\tval"),
         menu: None,
         initial: None,
@@ -6900,6 +7422,27 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\t\tbptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
@@ -7047,6 +7590,27 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -7113,7 +7677,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(aao)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AAO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static AAO_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+pub static AAO_NOACCESS: &[&str] = &[];
 
 /// `recordtype(aao)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static AAO_DBADDR: &[&str] = &["VAL"];
@@ -7131,7 +7695,7 @@ pub static AAO_DECL: &[&str] = &[
     "HASH",
 ];
 
-/// `recordtype(acalcout)` — 132 CA-visible own fields from `dbd/aCalcoutRecord.dbd` (6 `DBF_NOACCESS` internals dropped).
+/// `recordtype(acalcout)` — 136 CA-visible own fields from `dbd/aCalcoutRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
@@ -7151,6 +7715,27 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         interest: 0,
         prop: false,
         prompt: Some("Code Version"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -7187,7 +7772,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *aval"),
         menu: None,
         initial: None,
@@ -7257,6 +7842,27 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         interest: 0,
         prop: false,
         prompt: Some("Previous Value"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PAVL",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: false,
+        special: Special::None,
+        declared_special: Special::None,
+        pp: true,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double *pavl"),
+        menu: None,
+        initial: None,
+        interest: 0,
+        prop: false,
+        prompt: Some("Prev. Array Value"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -9141,7 +9747,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *aa"),
         menu: None,
         initial: None,
@@ -9163,7 +9769,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *bb"),
         menu: None,
         initial: None,
@@ -9185,7 +9791,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *cc"),
         menu: None,
         initial: None,
@@ -9207,7 +9813,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *dd"),
         menu: None,
         initial: None,
@@ -9229,7 +9835,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *ee"),
         menu: None,
         initial: None,
@@ -9251,7 +9857,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *ff"),
         menu: None,
         initial: None,
@@ -9273,7 +9879,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *gg"),
         menu: None,
         initial: None,
@@ -9295,7 +9901,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *hh"),
         menu: None,
         initial: None,
@@ -9317,7 +9923,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *ii"),
         menu: None,
         initial: None,
@@ -9339,7 +9945,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *jj"),
         menu: None,
         initial: None,
@@ -9361,7 +9967,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *kk"),
         menu: None,
         initial: None,
@@ -9383,13 +9989,34 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *ll"),
         menu: None,
         initial: None,
         interest: 0,
         prop: false,
         prompt: Some("Value of array input"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PAA",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: false,
+        special: Special::None,
+        declared_special: Special::None,
+        pp: false,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double *paa"),
+        menu: None,
+        initial: None,
+        interest: 0,
+        prop: false,
+        prompt: Some("Prev Val of array input"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -9447,8 +10074,29 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("double *oav"),
+        menu: None,
+        initial: None,
+        interest: 0,
+        prop: false,
+        prompt: Some("Output array value"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "POAV",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: false,
+        special: Special::None,
+        declared_special: Special::None,
+        pp: true,
+        asl: Asl::Asl0,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double *poav"),
         menu: None,
         initial: None,
         interest: 0,
@@ -9923,7 +10571,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(acalcout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`ACALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static ACALCOUT_NOACCESS: &[&str] = &["RPVT", "PAVL", "PAA", "POAV", "RPCL", "ORPC"];
+pub static ACALCOUT_NOACCESS: &[&str] = &["RPCL", "ORPC"];
 
 /// `recordtype(acalcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static ACALCOUT_DBADDR: &[&str] = &[
@@ -9951,7 +10599,7 @@ pub static ACALCOUT_DECL: &[&str] = &[
     "MLST", "RPCL", "ORPC", "CACT", "CSTAT", "AMASK", "SIZE", "AMEM", "PMEM",
 ];
 
-/// `recordtype(ai)` — 43 CA-visible own fields from `dbd/aiRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(ai)` — 45 CA-visible own fields from `dbd/aiRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -10605,6 +11253,27 @@ pub static AI_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "PBRK",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *   pbrk"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Ptrto brkTable"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "INIT",
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
@@ -10856,11 +11525,32 @@ pub static AI_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(ai)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static AI_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
+pub static AI_NOACCESS: &[&str] = &[];
 
 /// `recordtype(ai)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static AI_DBADDR: &[&str] = &[];
@@ -10879,7 +11569,7 @@ pub static AI_DECL: &[&str] = &[
     "ORAW", "SIOL", "SVAL", "SIML", "SIMM", "SIMS", "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(ao)` — 52 CA-visible own fields from `dbd/aoRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(ao)` — 54 CA-visible own fields from `dbd/aoRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -11722,6 +12412,27 @@ pub static AO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "PBRK",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *   pbrk"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Ptrto brkTable"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "INIT",
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
@@ -11911,6 +12622,27 @@ pub static AO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -11977,7 +12709,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(ao)` — the `DBF_NOACCESS` internal names dropped from
 /// [`AO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static AO_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
+pub static AO_NOACCESS: &[&str] = &[];
 
 /// `recordtype(ao)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static AO_DBADDR: &[&str] = &[];
@@ -11997,7 +12729,7 @@ pub static AO_DECL: &[&str] = &[
     "OLDSIMM", "SSCN", "SDLY", "SIMPVT", "IVOA", "IVOV", "OMOD",
 ];
 
-/// `recordtype(asyn)` — 76 CA-visible own fields from `dbd/asynRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(asyn)` — 78 CA-visible own fields from `dbd/asynRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -12379,6 +13111,27 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "OPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *optr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Output buffer pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "OMAX",
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
@@ -12544,6 +13297,27 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
         interest: 0,
         prop: false,
         prompt: Some("Input binary data"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "IPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *iptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Input buffer pointer"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -13567,7 +14341,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *errs"),
         menu: None,
         initial: None,
@@ -13602,7 +14376,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(asyn)` — the `DBF_NOACCESS` internal names dropped from
 /// [`ASYN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static ASYN_NOACCESS: &[&str] = &["OPTR", "IPTR"];
+pub static ASYN_NOACCESS: &[&str] = &[];
 
 /// `recordtype(asyn)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static ASYN_DBADDR: &[&str] = &["BOUT", "BINP", "ERRS"];
@@ -13625,7 +14399,7 @@ pub static ASYN_DECL: &[&str] = &[
     "CNCT", "ENBL", "ERRS", "AQR",
 ];
 
-/// `recordtype(bi)` — 22 CA-visible own fields from `dbd/biRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(bi)` — 23 CA-visible own fields from `dbd/biRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
@@ -14089,11 +14863,32 @@ pub static BI_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(bi)` — the `DBF_NOACCESS` internal names dropped from
 /// [`BI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static BI_NOACCESS: &[&str] = &["SIMPVT"];
+pub static BI_NOACCESS: &[&str] = &[];
 
 /// `recordtype(bi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static BI_DBADDR: &[&str] = &[];
@@ -14111,7 +14906,7 @@ pub static BI_DECL: &[&str] = &[
     "SIMPVT",
 ];
 
-/// `recordtype(bo)` — 26 CA-visible own fields from `dbd/boRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
+/// `recordtype(bo)` — 29 CA-visible own fields from `dbd/boRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -14320,6 +15115,48 @@ pub static BO_FIELDS: &[FieldDesc] = &[
         interest: 1,
         prop: false,
         prompt: Some("Hardware Mask"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *  rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "WDPT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\twdpt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Watch Dog Timer ID"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -14618,6 +15455,27 @@ pub static BO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -14663,7 +15521,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(bo)` — the `DBF_NOACCESS` internal names dropped from
 /// [`BO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static BO_NOACCESS: &[&str] = &["RPVT", "WDPT", "SIMPVT"];
+pub static BO_NOACCESS: &[&str] = &[];
 
 /// `recordtype(bo)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static BO_DBADDR: &[&str] = &[];
@@ -14681,7 +15539,7 @@ pub static BO_DECL: &[&str] = &[
     "OLDSIMM", "SSCN", "SDLY", "SIMPVT", "IVOA", "IVOV",
 ];
 
-/// `recordtype(busy)` — 24 CA-visible own fields from `dbd/busyRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(busy)` — 26 CA-visible own fields from `dbd/busyRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -14912,6 +15770,48 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
         prop: false,
         prompt: Some("Hardware Mask"),
         promptgroup: Some("GUI_OUTPUT"),
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *  rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "WDPT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\twdpt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Watch Dog Timer ID"),
+        promptgroup: None,
         base: Base::Decimal,
     },
     FieldDesc {
@@ -15191,7 +16091,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(busy)` — the `DBF_NOACCESS` internal names dropped from
 /// [`BUSY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static BUSY_NOACCESS: &[&str] = &["RPVT", "WDPT"];
+pub static BUSY_NOACCESS: &[&str] = &[];
 
 /// `recordtype(busy)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static BUSY_DBADDR: &[&str] = &[];
@@ -17022,8 +17922,29 @@ pub static CALC_DECL: &[&str] = &[
     "ALST", "MLST", "RPCL",
 ];
 
-/// `recordtype(calcout)` — 119 CA-visible own fields from `dbd/calcoutRecord.dbd` (4 `DBF_NOACCESS` internals dropped).
+/// `recordtype(calcout)` — 120 CA-visible own fields from `dbd/calcoutRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
 pub static CALCOUT_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct rpvtStruct *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
@@ -19527,7 +20448,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(calcout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`CALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static CALCOUT_NOACCESS: &[&str] = &["RPVT", "EPVT", "RPCL", "ORPC"];
+pub static CALCOUT_NOACCESS: &[&str] = &["EPVT", "RPCL", "ORPC"];
 
 /// `recordtype(calcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static CALCOUT_DBADDR: &[&str] = &[];
@@ -19552,7 +20473,7 @@ pub static CALCOUT_DECL: &[&str] = &[
     "ALST", "MLST", "RPCL", "ORPC",
 ];
 
-/// `recordtype(compress)` — 20 CA-visible own fields from `dbd/compressRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
+/// `recordtype(compress)` — 23 CA-visible own fields from `dbd/compressRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types.
     FieldDesc {
@@ -19566,7 +20487,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\t\tval"),
         menu: None,
         initial: None,
@@ -19913,6 +20834,69 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double\t\t*bptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "SPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double\t\t*sptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Summing Buffer Ptr"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "WPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("double\t\t*wptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Working Buffer Ptr"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
@@ -19979,7 +20963,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(compress)` — the `DBF_NOACCESS` internal names dropped from
 /// [`COMPRESS_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static COMPRESS_NOACCESS: &[&str] = &["BPTR", "SPTR", "WPTR"];
+pub static COMPRESS_NOACCESS: &[&str] = &[];
 
 /// `recordtype(compress)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static COMPRESS_DBADDR: &[&str] = &["VAL"];
@@ -20903,7 +21887,7 @@ pub static DFANOUT_DECL: &[&str] = &[
     "ADEL", "MDEL", "LALM", "ALST", "MLST", "IVOA", "IVOV",
 ];
 
-/// `recordtype(event)` — 10 CA-visible own fields from `dbd/eventRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(event)` — 11 CA-visible own fields from `dbd/eventRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -21115,11 +22099,32 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(event)` — the `DBF_NOACCESS` internal names dropped from
 /// [`EVENT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static EVENT_NOACCESS: &[&str] = &["EPVT", "SIMPVT"];
+pub static EVENT_NOACCESS: &[&str] = &["EPVT"];
 
 /// `recordtype(event)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static EVENT_DBADDR: &[&str] = &[];
@@ -21621,7 +22626,7 @@ pub static FANOUT_DECL: &[&str] = &[
     "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
 ];
 
-/// `recordtype(histogram)` — 23 CA-visible own fields from `dbd/histogramRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
+/// `recordtype(histogram)` — 26 CA-visible own fields from `dbd/histogramRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     // DBF_ULONG from cvt_dbaddr.types.
     FieldDesc {
@@ -21635,7 +22640,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\tval"),
         menu: None,
         initial: None,
@@ -21832,6 +22837,48 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         prop: false,
         prompt: Some("Signal Value Location"),
         promptgroup: Some("40 - Input"),
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsUInt32 *bptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "WDOG",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *  wdog"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Watchdog callback"),
+        promptgroup: None,
         base: Base::Decimal,
     },
     FieldDesc {
@@ -22066,6 +23113,27 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
@@ -22111,7 +23179,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(histogram)` — the `DBF_NOACCESS` internal names dropped from
 /// [`HISTOGRAM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static HISTOGRAM_NOACCESS: &[&str] = &["BPTR", "WDOG", "SIMPVT"];
+pub static HISTOGRAM_NOACCESS: &[&str] = &[];
 
 /// `recordtype(histogram)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static HISTOGRAM_DBADDR: &[&str] = &["VAL"];
@@ -22129,7 +23197,7 @@ pub static HISTOGRAM_DECL: &[&str] = &[
     "SDLY", "SIMPVT", "HOPR", "LOPR",
 ];
 
-/// `recordtype(int64in)` — 29 CA-visible own fields from `dbd/int64inRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(int64in)` — 30 CA-visible own fields from `dbd/int64inRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -22740,11 +23808,32 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(int64in)` — the `DBF_NOACCESS` internal names dropped from
 /// [`INT64IN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static INT64IN_NOACCESS: &[&str] = &["SIMPVT"];
+pub static INT64IN_NOACCESS: &[&str] = &[];
 
 /// `recordtype(int64in)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static INT64IN_DBADDR: &[&str] = &[];
@@ -22762,7 +23851,7 @@ pub static INT64IN_DECL: &[&str] = &[
     "SIML", "SIMM", "SIMS", "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(int64out)` — 32 CA-visible own fields from `dbd/int64outRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(int64out)` — 33 CA-visible own fields from `dbd/int64outRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -23395,6 +24484,27 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -23440,7 +24550,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(int64out)` — the `DBF_NOACCESS` internal names dropped from
 /// [`INT64OUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static INT64OUT_NOACCESS: &[&str] = &["SIMPVT"];
+pub static INT64OUT_NOACCESS: &[&str] = &[];
 
 /// `recordtype(int64out)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static INT64OUT_DBADDR: &[&str] = &[];
@@ -23458,7 +24568,7 @@ pub static INT64OUT_DECL: &[&str] = &[
     "SIOL", "SIML", "SIMM", "SIMS", "OLDSIMM", "SSCN", "SDLY", "SIMPVT", "IVOA", "IVOV",
 ];
 
-/// `recordtype(longin)` — 29 CA-visible own fields from `dbd/longinRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(longin)` — 30 CA-visible own fields from `dbd/longinRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -24069,11 +25179,32 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(longin)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LONGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static LONGIN_NOACCESS: &[&str] = &["SIMPVT"];
+pub static LONGIN_NOACCESS: &[&str] = &[];
 
 /// `recordtype(longin)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static LONGIN_DBADDR: &[&str] = &[];
@@ -24091,7 +25222,7 @@ pub static LONGIN_DECL: &[&str] = &[
     "SIML", "SIMM", "SIMS", "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(longout)` — 35 CA-visible own fields from `dbd/longoutRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(longout)` — 36 CA-visible own fields from `dbd/longoutRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -24724,6 +25855,27 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback       *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -24832,7 +25984,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(longout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LONGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static LONGOUT_NOACCESS: &[&str] = &["SIMPVT", "OUTPVT"];
+pub static LONGOUT_NOACCESS: &[&str] = &["OUTPVT"];
 
 /// `recordtype(longout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static LONGOUT_DBADDR: &[&str] = &[];
@@ -24851,7 +26003,7 @@ pub static LONGOUT_DECL: &[&str] = &[
     "OUTPVT", "OOCH", "OOPT",
 ];
 
-/// `recordtype(lsi)` — 15 CA-visible own fields from `dbd/lsiRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(lsi)` — 16 CA-visible own fields from `dbd/lsiRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static LSI_FIELDS: &[FieldDesc] = &[
     // DBF_STRING from cvt_dbaddr.types.
     FieldDesc {
@@ -24865,7 +26017,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *val"),
         menu: None,
         initial: None,
@@ -24887,7 +26039,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *oval"),
         menu: None,
         initial: None,
@@ -25170,11 +26322,32 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(lsi)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LSI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static LSI_NOACCESS: &[&str] = &["SIMPVT"];
+pub static LSI_NOACCESS: &[&str] = &[];
 
 /// `recordtype(lsi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static LSI_DBADDR: &[&str] = &["VAL", "OVAL"];
@@ -25191,7 +26364,7 @@ pub static LSI_DECL: &[&str] = &[
     "SIOL", "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(lso)` — 19 CA-visible own fields from `dbd/lsoRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(lso)` — 20 CA-visible own fields from `dbd/lsoRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static LSO_FIELDS: &[FieldDesc] = &[
     // DBF_STRING from cvt_dbaddr.types.
     FieldDesc {
@@ -25205,7 +26378,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *val"),
         menu: None,
         initial: None,
@@ -25227,7 +26400,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *oval"),
         menu: None,
         initial: None,
@@ -25594,11 +26767,32 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(lso)` — the `DBF_NOACCESS` internal names dropped from
 /// [`LSO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static LSO_NOACCESS: &[&str] = &["SIMPVT"];
+pub static LSO_NOACCESS: &[&str] = &[];
 
 /// `recordtype(lso)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static LSO_DBADDR: &[&str] = &["VAL", "OVAL"];
@@ -25615,7 +26809,7 @@ pub static LSO_DECL: &[&str] = &[
     "APST", "SIML", "SIMM", "SIMS", "SIOL", "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(mbbi)` — 70 CA-visible own fields from `dbd/mbbiRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mbbi)` — 71 CA-visible own fields from `dbd/mbbiRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -27087,11 +28281,32 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(mbbi)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MBBI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MBBI_NOACCESS: &[&str] = &["SIMPVT"];
+pub static MBBI_NOACCESS: &[&str] = &[];
 
 /// `recordtype(mbbi)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static MBBI_DBADDR: &[&str] = &[];
@@ -27113,7 +28328,7 @@ pub static MBBI_DECL: &[&str] = &[
     "SIMPVT",
 ];
 
-/// `recordtype(mbbiDirect)` — 48 CA-visible own fields from `dbd/mbbiDirectRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mbbiDirect)` — 49 CA-visible own fields from `dbd/mbbiDirectRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -27449,6 +28664,27 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
         prop: false,
         prompt: Some("Sim. Mode Async Delay"),
         promptgroup: Some("90 - Simulate"),
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
         base: Base::Decimal,
     },
     FieldDesc {
@@ -28127,7 +29363,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mbbiDirect)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MBBI_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MBBI_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
+pub static MBBI_DIRECT_NOACCESS: &[&str] = &[];
 
 /// `recordtype(mbbiDirect)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static MBBI_DIRECT_DBADDR: &[&str] = &[];
@@ -28146,7 +29382,7 @@ pub static MBBI_DIRECT_DECL: &[&str] = &[
     "B16", "B17", "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
 ];
 
-/// `recordtype(mbbo)` — 73 CA-visible own fields from `dbd/mbboRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mbbo)` — 74 CA-visible own fields from `dbd/mbboRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MBBO_FIELDS: &[FieldDesc] = &[
     // DBF_USHORT from cvt_dbaddr.types; re-typed at runtime by `SDEF`.
     FieldDesc {
@@ -29641,6 +30877,27 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -29686,7 +30943,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mbbo)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MBBO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MBBO_NOACCESS: &[&str] = &["SIMPVT"];
+pub static MBBO_NOACCESS: &[&str] = &[];
 
 /// `recordtype(mbbo)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static MBBO_DBADDR: &[&str] = &["VAL"];
@@ -29708,7 +30965,7 @@ pub static MBBO_DECL: &[&str] = &[
     "SDLY", "SIMPVT", "IVOA", "IVOV",
 ];
 
-/// `recordtype(mbboDirect)` — 54 CA-visible own fields from `dbd/mbboDirectRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mbboDirect)` — 55 CA-visible own fields from `dbd/mbboDirectRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -30128,6 +31385,27 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
         prop: false,
         prompt: Some("Sim. Mode Async Delay"),
         promptgroup: Some("90 - Simulate"),
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
         base: Base::Decimal,
     },
     FieldDesc {
@@ -30848,7 +32126,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mbboDirect)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MBBO_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MBBO_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
+pub static MBBO_DIRECT_NOACCESS: &[&str] = &[];
 
 /// `recordtype(mbboDirect)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static MBBO_DIRECT_DBADDR: &[&str] = &[];
@@ -31009,7 +32287,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *val"),
         menu: None,
         initial: None,
@@ -31355,7 +32633,7 @@ pub static PRINTF_DECL: &[&str] = &[
     "INP5", "INP6", "INP7", "INP8", "INP9",
 ];
 
-/// `recordtype(scalcout)` — 137 CA-visible own fields from `dbd/sCalcoutRecord.dbd` (4 `DBF_NOACCESS` internals dropped).
+/// `recordtype(scalcout)` — 139 CA-visible own fields from `dbd/sCalcoutRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
@@ -31375,6 +32653,27 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         interest: 0,
         prop: false,
         prompt: Some("Code Version"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -33332,6 +34631,27 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "STRS",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: false,
+        special: Special::None,
+        declared_special: Special::None,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("char **strs"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Array of string pointers"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "AA",
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
@@ -33595,7 +34915,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *paa"),
         menu: None,
         initial: None,
@@ -33617,7 +34937,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pbb"),
         menu: None,
         initial: None,
@@ -33639,7 +34959,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pcc"),
         menu: None,
         initial: None,
@@ -33661,7 +34981,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pdd"),
         menu: None,
         initial: None,
@@ -33683,7 +35003,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pee"),
         menu: None,
         initial: None,
@@ -33705,7 +35025,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pff"),
         menu: None,
         initial: None,
@@ -33727,7 +35047,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pgg"),
         menu: None,
         initial: None,
@@ -33749,7 +35069,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *phh"),
         menu: None,
         initial: None,
@@ -33771,7 +35091,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pii"),
         menu: None,
         initial: None,
@@ -33793,7 +35113,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pjj"),
         menu: None,
         initial: None,
@@ -33815,7 +35135,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pkk"),
         menu: None,
         initial: None,
@@ -33837,7 +35157,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: false,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("char *pll"),
         menu: None,
         initial: None,
@@ -34250,7 +35570,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(scalcout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SCALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static SCALCOUT_NOACCESS: &[&str] = &["RPVT", "STRS", "RPCL", "ORPC"];
+pub static SCALCOUT_NOACCESS: &[&str] = &["RPCL", "ORPC"];
 
 /// `recordtype(scalcout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static SCALCOUT_DBADDR: &[&str] = &[
@@ -40078,7 +41398,7 @@ pub static STATE_DECL: &[&str] = &[
     "FLNK", "VAL", "OVAL",
 ];
 
-/// `recordtype(stringin)` — 13 CA-visible own fields from `dbd/stringinRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(stringin)` — 14 CA-visible own fields from `dbd/stringinRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -40353,11 +41673,32 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
         promptgroup: Some("90 - Simulate"),
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(stringin)` — the `DBF_NOACCESS` internal names dropped from
 /// [`STRINGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static STRINGIN_NOACCESS: &[&str] = &["SIMPVT"];
+pub static STRINGIN_NOACCESS: &[&str] = &[];
 
 /// `recordtype(stringin)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static STRINGIN_DBADDR: &[&str] = &[];
@@ -40374,7 +41715,7 @@ pub static STRINGIN_DECL: &[&str] = &[
     "OLDSIMM", "SSCN", "SDLY", "SIMPVT",
 ];
 
-/// `recordtype(stringout)` — 16 CA-visible own fields from `dbd/stringoutRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(stringout)` — 17 CA-visible own fields from `dbd/stringoutRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -40671,6 +42012,27 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -40716,7 +42078,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(stringout)` — the `DBF_NOACCESS` internal names dropped from
 /// [`STRINGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static STRINGOUT_NOACCESS: &[&str] = &["SIMPVT"];
+pub static STRINGOUT_NOACCESS: &[&str] = &[];
 
 /// `recordtype(stringout)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static STRINGOUT_DBADDR: &[&str] = &[];
@@ -42546,7 +43908,7 @@ pub static SUB_DECL: &[&str] = &[
     "LALM", "ALST", "MLST",
 ];
 
-/// `recordtype(subArray)` — 12 CA-visible own fields from `dbd/subArrayRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(subArray)` — 13 CA-visible own fields from `dbd/subArrayRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
     FieldDesc {
@@ -42560,7 +43922,7 @@ pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\t\tval"),
         menu: None,
         initial: None,
@@ -42801,11 +44163,32 @@ pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
         promptgroup: None,
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\t\tbptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
 ];
 
 /// `recordtype(subArray)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SUB_ARRAY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static SUB_ARRAY_NOACCESS: &[&str] = &["BPTR"];
+pub static SUB_ARRAY_NOACCESS: &[&str] = &[];
 
 /// `recordtype(subArray)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static SUB_ARRAY_DBADDR: &[&str] = &["VAL"];
@@ -42822,7 +44205,7 @@ pub static SUB_ARRAY_DECL: &[&str] = &[
     "NORD", "BPTR",
 ];
 
-/// `recordtype(swait)` — 87 CA-visible own fields from `dbd/swaitRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(swait)` — 88 CA-visible own fields from `dbd/swaitRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
@@ -42905,6 +44288,27 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
         interest: 3,
         prop: false,
         prompt: Some("Initialized?"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "CBST",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *         cbst"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Pointer to cbStruct"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -44655,7 +46059,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(swait)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SWAIT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static SWAIT_NOACCESS: &[&str] = &["CBST", "RPCL"];
+pub static SWAIT_NOACCESS: &[&str] = &["RPCL"];
 
 /// `recordtype(swait)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static SWAIT_DBADDR: &[&str] = &[];
@@ -44677,7 +46081,7 @@ pub static SWAIT_DECL: &[&str] = &[
     "DOLD", "OEVT", "ADEL", "MDEL", "ALST", "MLST", "SIOL", "SVAL", "SIML", "SIMM", "SIMS",
 ];
 
-/// `recordtype(transform)` — 151 CA-visible own fields from `dbd/transformRecord.dbd` (17 `DBF_NOACCESS` internals dropped).
+/// `recordtype(transform)` — 152 CA-visible own fields from `dbd/transformRecord.dbd` (16 `DBF_NOACCESS` internals dropped).
 pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
@@ -44697,6 +46101,27 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
         interest: 0,
         prop: false,
         prompt: Some("Code Version"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *         rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
         promptgroup: None,
         base: Base::Decimal,
     },
@@ -47855,8 +49280,8 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
 /// `recordtype(transform)` — the `DBF_NOACCESS` internal names dropped from
 /// [`TRANSFORM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static TRANSFORM_NOACCESS: &[&str] = &[
-    "RPVT", "RPCA", "RPCB", "RPCC", "RPCD", "RPCE", "RPCF", "RPCG", "RPCH", "RPCI", "RPCJ", "RPCK",
-    "RPCL", "RPCM", "RPCN", "RPCO", "RPCP",
+    "RPCA", "RPCB", "RPCC", "RPCD", "RPCE", "RPCF", "RPCG", "RPCH", "RPCI", "RPCJ", "RPCK", "RPCL",
+    "RPCM", "RPCN", "RPCO", "RPCP",
 ];
 
 /// `recordtype(transform)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
@@ -47886,7 +49311,7 @@ pub static TRANSFORM_DECL: &[&str] = &[
     "OPV",
 ];
 
-/// `recordtype(waveform)` — 21 CA-visible own fields from `dbd/waveformRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
+/// `recordtype(waveform)` — 23 CA-visible own fields from `dbd/waveformRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
     FieldDesc {
@@ -47900,7 +49325,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl0,
-        size: 0,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *\t\tval"),
         menu: None,
         initial: None,
@@ -48121,6 +49546,27 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *\t\tbptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
@@ -48268,6 +49714,27 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "SIMPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("epicsCallback            *simpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Sim. Mode Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -48334,7 +49801,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(waveform)` — the `DBF_NOACCESS` internal names dropped from
 /// [`WAVEFORM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static WAVEFORM_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
+pub static WAVEFORM_NOACCESS: &[&str] = &[];
 
 /// `recordtype(waveform)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static WAVEFORM_DBADDR: &[&str] = &["VAL"];
@@ -48352,7 +49819,7 @@ pub static WAVEFORM_DECL: &[&str] = &[
     "HASH",
 ];
 
-/// `dbCommon.dbd` — the 36 CA-visible fields every record type carries.
+/// `dbCommon.dbd` — the 45 CA-visible fields every record type carries.
 ///
 /// The port serves these from
 /// [`CommonFields`](crate::server::record::CommonFields), not from a
@@ -48948,6 +50415,195 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "ASP",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct asgMember    *asp"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Access Security Pvt"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PPN",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct processNotify *ppn"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("pprocessNotify"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PPNR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct processNotifyRecord *ppnr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("pprocessNotifyRecord"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "SPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct scan_element *spvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Scan Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RSET",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct typed_rset   *rset"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Address of RSET"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "DSET",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("unambiguous_dset    *dset"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("DSET address"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "DPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void                *dpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Device Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "RDES",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct dbRecordType *rdes"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Address of dbRecordType"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "LSET",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("struct lockRecord   *lset"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Lock Set"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "PRIO",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -49120,9 +50776,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
 /// The `DBF_NOACCESS` internals of `dbCommon.dbd`, dropped from
 /// [`DB_COMMON_FIELDS`]: resolvable (a SEARCH is answered), never
 /// servable — see `record_noaccess_fields` for the record-own twins.
-pub static DB_COMMON_NOACCESS: &[&str] = &[
-    "MLOK", "MLIS", "BKLNK", "ASP", "PPN", "PPNR", "SPVT", "RSET", "DSET", "DPVT", "RDES", "LSET",
-];
+pub static DB_COMMON_NOACCESS: &[&str] = &["MLOK", "MLIS", "BKLNK"];
 
 // ---------------------------------------------------------------------
 // Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration

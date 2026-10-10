@@ -263,6 +263,9 @@ pub struct FieldDesc {
     ///
     /// 0 for every other declaration, where C carries `sizeof` the member and
     /// no reader in this port asks.
+    ///
+    /// This is `dbFldDes.size` only. The served element's width, which is what
+    /// a put caps at and `dba` prints, is [`Self::element_size`].
     pub size: u16,
     /// `extra("...")` — the C struct member a `DBF_NOACCESS` field stands for,
     /// verbatim, and `None` for a field declaring none.
@@ -387,6 +390,29 @@ impl FieldDesc {
     /// stored copy is a second answer that can drift from the declaration.
     pub const fn unreadable(&self) -> bool {
         self.no_access() && !matches!(self.declared_special, Special::DbAddr)
+    }
+
+    /// The width of one element as C's `paddr->field_size` holds it, for a
+    /// field served as `served`.
+    ///
+    /// [`Self::size`] is `sizeof(prec->member)` on every row — a string's
+    /// `size(N)`, a pointer's 8 for an aSub `A`..`U`. `dbNameToAddr` copies it
+    /// into `field_size`, except that `cvt_dbaddr` of a `SPC_DBADDR` field
+    /// overwrites it with `dbValueSize(field_type)` (`dbAccess.c:640-647`):
+    /// the width of the element it serves, 40 for a string. A put's string
+    /// cap and `dba`'s `Field Size` read this, never `size` directly.
+    pub fn element_size(&self, served: DbfCode) -> u16 {
+        if !matches!(self.declared_special, Special::DbAddr) {
+            return self.size;
+        }
+        match served {
+            DbfCode::String => 40,
+            DbfCode::Char | DbfCode::UChar => 1,
+            DbfCode::Short | DbfCode::UShort | DbfCode::Enum | DbfCode::Menu | DbfCode::Device => 2,
+            DbfCode::Long | DbfCode::ULong | DbfCode::Float => 4,
+            DbfCode::Double | DbfCode::Int64 | DbfCode::UInt64 => 8,
+            _ => self.size,
+        }
     }
 }
 
@@ -4255,6 +4281,20 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// The `paddr->field_size` this record's `cvt_dbaddr` stores for the
+    /// `SPC_DBADDR` field `field`, when it is not the declaration's own
+    /// ([`FieldDesc::element_size`]). `None` (the default) is every record
+    /// whose `cvt_dbaddr` sets `dbValueSize(field_type)` or `sizeof` — aSub
+    /// `A`..`U`, waveform/aai/aao/subArray `VAL`, compress, histogram — which
+    /// the declaration and the served type already answer.
+    ///
+    /// lso/lsi `VAL`/`OVAL` and printf `VAL` answer `SIZV`
+    /// (`lsoRecord.c:186`, `lsiRecord.c:144`, `printfRecord.c:420`): the width
+    /// is the record's own and varies per instance.
+    fn dbaddr_element_size(&self, _field: &str) -> Option<u16> {
+        None
+    }
+
     /// Whether this record stores the `SPC_DBADDR` field `field` as a single
     /// element rather than a buffer (`mbbo.VAL`, an `aSub` channel at count 1).
     /// [`FieldDeclaration::field_stores_array`] reads it so a put can learn
@@ -4991,6 +5031,15 @@ pub trait Record: Send + Sync + 'static {
     /// Downcast to concrete type for device support init injection.
     /// Override in record types that need device support to inject state (e.g., MotorRecord).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
+    /// C's `*(void **)pfield` for a `DBF_NOACCESS` pointer member that only
+    /// this record type's own state can answer (`dbpr`'s `PTR %p` arm,
+    /// `dbTest.c:1239-1242`): the address of the object the record holds for
+    /// `field`, `None` where it holds none. Everything a record holds in the
+    /// framework (`RSET`, `DSET`, `LSET`, ...) is answered by `dbpr` itself.
+    fn held_pointer(&self, _field: &str) -> Option<usize> {
         None
     }
 
@@ -6440,6 +6489,11 @@ fn put_string_array_row<R: Record + ?Sized>(
     // value over unchanged rather than falling through to the SCALAR numeric
     // row below, which would parse `printf.VAL`'s `"7"` into the number 7.
     if record.field_is_long_string(field) {
+        // `putStringString` into `field_size = SIZV`: the same cap, one owner.
+        let value = match value {
+            EpicsValue::String(s) => EpicsValue::String(cap_string_to_field_size(record, field, s)),
+            other => other,
+        };
         return Ok(Ok(Converted::Stored(value)));
     }
     // A scalar-held destination has `no_elements` 1, so `dbPut` clamps the
@@ -6455,6 +6509,22 @@ fn put_string_array_row<R: Record + ?Sized>(
             .map(|v| Ok(Converted::Stored(v)));
     }
     let Some(numeric) = c_parse::NumericField::of(target) else {
+        // `putStringString` per element: each is cut at `field_size - 1`.
+        if target == DbFieldType::String {
+            let capped = match value {
+                EpicsValue::String(s) => {
+                    EpicsValue::String(cap_string_to_field_size(record, field, s))
+                }
+                EpicsValue::StringArray(a) => EpicsValue::StringArray(
+                    a.iter()
+                        .map(|s| cap_string_to_field_size(record, field, s.clone()))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                other => other,
+            };
+            return Ok(Ok(Converted::Stored(capped)));
+        }
         return Ok(Ok(Converted::Stored(value)));
     };
     match first {
@@ -6662,13 +6732,36 @@ pub(crate) fn put_string_precision<R: Record + ?Sized>(record: &R) -> u16 {
 /// declaration) is left uncapped beyond the wire's own `MAX_STRING_SIZE - 1`.
 fn cap_string_to_field_size<R: Record + ?Sized>(record: &R, field: &str, s: PvString) -> PvString {
     match super::record_instance::field_desc_of(record, field) {
-        Some(desc) if desc.size > 0 && s.len() >= desc.size as usize => {
-            let mut bytes = s.into_bytes();
-            bytes.truncate(desc.size as usize - 1);
-            PvString::from_bytes(bytes)
+        // C caps at `paddr->field_size`: the member's `size(N)`, or for a
+        // `cvt_dbaddr` field the served element's width (40 for FTx=STRING,
+        // SIZV for lso/lsi/printf).
+        Some(desc) if !desc.unreadable() => {
+            let width = served_element_size(record, desc, DbfCode::String) as usize;
+            if width > 0 && s.len() >= width {
+                let mut bytes = s.into_bytes();
+                bytes.truncate(width - 1);
+                PvString::from_bytes(bytes)
+            } else {
+                s
+            }
         }
         _ => s,
     }
+}
+
+/// The served element width of `desc` on `record` — the one owner of C's
+/// `paddr->field_size` after `cvt_dbaddr`: the record's own answer
+/// ([`Record::dbaddr_element_size`]), else the declaration's
+/// ([`FieldDesc::element_size`]). A put's string cap, `dba` and the `$` view
+/// all read this.
+pub(crate) fn served_element_size<R: Record + ?Sized>(
+    record: &R,
+    desc: &FieldDesc,
+    served: DbfCode,
+) -> u16 {
+    record
+        .dbaddr_element_size(desc.name)
+        .unwrap_or_else(|| desc.element_size(served))
 }
 
 /// Subroutine function type for `sub`/`aSub` records.

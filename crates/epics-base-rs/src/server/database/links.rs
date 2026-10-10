@@ -1280,7 +1280,7 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<PvString> {
         self.dbr_string_rendered(link, value, render)
-            .map(cap_dbr_string)
+            .map(crate::types::codec::cap_dbr_string)
     }
 
     /// [`Self::dbr_string_of`] for every element of an array source: `dbGet`
@@ -1300,10 +1300,13 @@ impl PvDatabase {
             }
         };
         Some(match rendered {
-            EpicsValue::StringArray(a) => {
-                EpicsValue::StringArray(a.iter().cloned().map(cap_dbr_string).collect())
-            }
-            EpicsValue::String(s) => EpicsValue::String(cap_dbr_string(s)),
+            EpicsValue::StringArray(a) => EpicsValue::StringArray(
+                a.iter()
+                    .cloned()
+                    .map(crate::types::codec::cap_dbr_string)
+                    .collect(),
+            ),
+            EpicsValue::String(s) => EpicsValue::String(crate::types::codec::cap_dbr_string(s)),
             other => other,
         })
     }
@@ -4614,17 +4617,6 @@ pub(crate) type RenderedFetch = (
     Option<SourceAlarm>,
     Option<crate::server::record::record_instance::SourceRender>,
 );
-
-/// C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as `getStringString`
-/// copies (`dbConvert.c`), whatever the source holds.
-fn cap_dbr_string(s: PvString) -> PvString {
-    const MAX: usize = 39;
-    if s.len() > MAX {
-        PvString::from_bytes(&s.as_bytes()[..MAX])
-    } else {
-        s
-    }
-}
 
 #[cfg(test)]
 mod out_link_put_fail_tests {

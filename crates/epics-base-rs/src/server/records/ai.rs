@@ -167,6 +167,17 @@ fn raise_bpt_error(common: &mut crate::server::record::CommonFields) {
 }
 
 impl Record for AiRecord {
+    fn held_pointer(&self, field: &str) -> Option<usize> {
+        match field {
+            // C `pbrk`, the table `cvtRawToEngBpt`/`cvtEngToRawBpt` found.
+            "PBRK" => self
+                .bpt_table
+                .as_ref()
+                .map(|t| std::sync::Arc::as_ptr(t) as usize),
+            _ => None,
+        }
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

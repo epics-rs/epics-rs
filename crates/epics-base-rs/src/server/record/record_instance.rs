@@ -3124,6 +3124,10 @@ pub struct RecordInstance {
     /// post mask. False for every record without the MPST/APST/HASH
     /// mechanism.
     pub(crate) array_hash_changed: bool,
+    /// C `prec->simpvt`: the callback a simulating record allocates the first
+    /// time it defers on `SDLY >= 0` (`aiRecord.c:501-504`, one per SIMM
+    /// type) and never frees. Only `dbpr` reads it.
+    pub(crate) simpvt: bool,
     /// One-shot "skip the registered subroutine this cycle" signal for aSub
     /// `LFLG=READ`. The async processing path resolves the `SUBL` link before
     /// taking this lock; when the resolved name is bad (C `fetch_values` ->
@@ -4412,6 +4416,7 @@ impl RecordInstance {
             udf_alarm,
             monitor_plan,
             array_hash_changed: false,
+            simpvt: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watchdog_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5269,6 +5274,12 @@ impl RecordInstance {
     /// which is the accounting [`NotifyWaitSet`] exists to keep.
     pub fn has_notify(&self) -> bool {
         self.notify.is_some()
+    }
+
+    /// Whether a restarted put-notify waits behind this record — C
+    /// `precord->ppnr != NULL`, what `dbpr` prints as `PPNR`.
+    pub(crate) fn has_notify_restart(&self) -> bool {
+        !self.notify_restart_list.is_empty()
     }
 
     pub fn queue_notify_put(&mut self, put: DeferredNotify) {

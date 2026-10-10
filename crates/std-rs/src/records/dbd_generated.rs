@@ -15,23 +15,23 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
 
 #![allow(clippy::all)]
 
@@ -1291,7 +1291,7 @@ pub static EPID_DECL: &[&str] = &[
     "MLST",
 ];
 
-/// `recordtype(throttle)` — 21 CA-visible own fields from `dbd/throttleRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(throttle)` — 22 CA-visible own fields from `dbd/throttleRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static THROTTLE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -1546,6 +1546,27 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "STS",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
@@ -1738,7 +1759,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(throttle)` — the `DBF_NOACCESS` internal names dropped from
 /// [`THROTTLE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static THROTTLE_NOACCESS: &[&str] = &["RPVT"];
+pub static THROTTLE_NOACCESS: &[&str] = &[];
 
 /// `recordtype(throttle)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
 pub static THROTTLE_DBADDR: &[&str] = &[];

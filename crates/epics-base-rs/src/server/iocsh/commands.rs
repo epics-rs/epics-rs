@@ -10,7 +10,7 @@ use crate::server::database::char_view::{
 use crate::server::database::filters::sync::DbState;
 use crate::server::database::{DbNode, RecordLoad, parse_pv_name};
 use crate::server::db_loader;
-use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special};
+use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special, served_element_size};
 use crate::types::{DbFieldType, DbfCode, EpicsValue};
 use std::sync::Arc;
 
@@ -1163,7 +1163,9 @@ fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsVa
                 EpicsValue::StringArray(Vec::new().into())
             } else {
                 let text: Vec<u8> = b.iter().copied().take_while(|&c| c != 0).collect();
-                EpicsValue::String(crate::types::PvString::from_bytes(text))
+                EpicsValue::String(crate::types::codec::cap_dbr_string(
+                    crate::types::PvString::from_bytes(text),
+                ))
             }
         }
         _ => val.clone(),
@@ -1280,9 +1282,12 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
         .field_native_count(field)
         .or_else(|| inst.record.get_field(field).map(|v| v.count()))
         .unwrap_or(1);
-    let mut field_size = addr
-        .fld_des
-        .and_then(|fd| c_field_size(field_type, fd.size));
+    let mut field_size = addr.fld_des.and_then(|fd| {
+        c_field_size(
+            field_type,
+            served_element_size(&*inst.record, fd, field_type),
+        )
+    });
     // The `$` modifier's re-typing (`dbAccess.c:682-701`).
     if let Some(view) = view {
         field_type = view.field_type;
@@ -2067,6 +2072,14 @@ fn cmd_dbpr() -> CommandDef {
 /// compare `pfield == &paddr->precord->time`; the port has no addresses to
 /// compare, so it keys on the name the same declaration carries.
 ///
+/// A pointer member — `size == sizeof(void *)` and a `*` in `extra(...)`,
+/// `:1239` — prints `PTR %p` of what the record HOLDS in it: the address of the
+/// object the port keeps for that member, and `(nil)` where it keeps none, as
+/// C's is when the member is NULL. Where the port has no generic address for
+/// the object (an array's storage, a record's private block) the record's own
+/// address stands in; like C's it is non-zero, fixed for the record's life, and
+/// no two IOCs agree on it.
+///
 /// Everything else is `size` raw bytes as `%02x ` (`:1249-1262`), trailing
 /// space included — C builds `"00 "` and lets the tab packer absorb it.
 ///
@@ -2076,6 +2089,7 @@ fn cmd_dbpr() -> CommandDef {
 fn dbpr_no_access(
     inst: &crate::server::record::RecordInstance,
     d: &crate::server::record::FieldDesc,
+    held: &DbprHeld,
 ) -> Option<String> {
     if d.name == "TIME" {
         // C `epicsTimeToStrftime(time_buf, 40, "%Y-%m-%d %H:%M:%S.%09f", ...)`
@@ -2088,6 +2102,14 @@ fn dbpr_no_access(
             ),
         );
     }
+    if usize::from(d.size) == std::mem::size_of::<*const ()>()
+        && d.extra.is_some_and(|e| e.contains('*'))
+    {
+        return Some(match dbpr_held_pointer(inst, d.name, held) {
+            Some(addr) => format!("PTR {addr:#x}"),
+            None => "PTR (nil)".to_string(),
+        });
+    }
     let bkpt = inst.common.bkpt.get();
     let bytes: &[u8] = match d.name {
         "BKPT" => std::slice::from_ref(&bkpt),
@@ -2098,6 +2120,126 @@ fn dbpr_no_access(
         out.push_str(&format!("{b:02x} "));
     }
     Some(out)
+}
+
+/// What `dbpr` reads about a record that is not on the record itself: the
+/// registries are asked before the record guard is taken, as the link
+/// locality is, because none of them is a lock this crate holds under one.
+struct DbprHeld {
+    /// C `precord->lset`: the lock set's mutex.
+    lset: Option<usize>,
+    /// C `precord->asp`: set once access security has a policy.
+    asp: Option<usize>,
+    /// C `precord->spvt`: the record is on a scan list.
+    on_scan_list: bool,
+}
+
+impl DbprHeld {
+    async fn of(ctx: &CommandContext, name: &str, scan: crate::server::record::ScanType) -> Self {
+        let db = ctx.db();
+        let on_scan_list = scan.scan_list().is_some()
+            && (db.records_for_scan(scan).await.iter().any(|n| n == name)
+                || db
+                    .event_lists()
+                    .iter()
+                    .any(|(_, recs)| recs.iter().any(|n| n == name)));
+        Self {
+            lset: db
+                .lock_set_of(name)
+                .and_then(|set| set.mutex)
+                .map(|m| m.addr()),
+            asp: ctx
+                .acf()
+                .load_full()
+                .map(|cfg| std::sync::Arc::as_ptr(&cfg) as usize),
+            on_scan_list,
+        }
+    }
+}
+
+/// The address behind one `DBF_NOACCESS` pointer member, `None` for NULL.
+/// Rows are named for what C stores there; the C source that sets each is
+/// beside it.
+fn dbpr_held_pointer(
+    inst: &crate::server::record::RecordInstance,
+    name: &str,
+    held: &DbprHeld,
+) -> Option<usize> {
+    let rtype = inst.record.record_type();
+    let record_addr = std::ptr::from_ref::<dyn crate::server::record::Record>(&*inst.record)
+        .cast::<u8>() as usize;
+    let field_is = |field: &str, f: &dyn Fn(&EpicsValue) -> bool| {
+        inst.resolve_field(field).is_some_and(|v| f(&v))
+    };
+    let int_of = |v: &EpicsValue| v.to_f64();
+    match (rtype, name) {
+        // `rset`, `rdes`: the record type's own tables, one per type.
+        (_, "RSET") => Some(rtype.as_ptr() as usize),
+        (_, "RDES") => Some(inst.record.field_list().as_ptr() as usize),
+        // `dset`: bound by `DTYP`, so a type with no device menu has none, and
+        // a DTYP that names no device support leaves it NULL.
+        (_, "DSET") => {
+            if let Some(dev) = inst.device.as_ref() {
+                return Some(
+                    std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
+                        .cast::<u8>() as usize,
+                );
+            }
+            let dtyp = inst.common.dtyp.as_str();
+            let bound = inst.device_choices().is_some()
+                && (dtyp.is_empty()
+                    || crate::server::record::merged_device_menu(rtype).contains(&dtyp));
+            bound.then(|| std::ptr::from_ref(&inst.common.dtyp) as usize)
+        }
+        (_, "LSET") => held.lset,
+        (_, "ASP") => held.asp,
+        // `spvt`: `scanAdd` allocates the scan element.
+        (_, "SPVT") => held
+            .on_scan_list
+            .then(|| std::ptr::from_ref(&inst.common.scan) as usize),
+        (_, "PPN") => inst
+            .notify
+            .as_ref()
+            .map(|n| std::sync::Arc::as_ptr(n) as *const u8 as usize),
+        (_, "PPNR") => inst.has_notify_restart().then_some(record_addr),
+        (_, "SIMPVT") => inst.simpvt.then_some(record_addr),
+        // The six array records keep their buffer in `bptr`; `val` is never
+        // assigned (`aaiRecord.c`, `compressRecord.c`, ...).
+        ("aai" | "aao" | "compress" | "subArray" | "histogram" | "waveform", "VAL") => None,
+        ("aai" | "aao" | "compress" | "subArray" | "histogram" | "waveform", "BPTR") => {
+            Some(record_addr)
+        }
+        // lsi/lso/printf's `val` and `oval` are allocated at init.
+        (_, "VAL" | "OVAL") => Some(record_addr),
+        // `compressRecord.c:93`: the Average accumulator, allocated at init.
+        ("compress", "SPTR") => field_is("ALG", &|v| int_of(v) == Some(3.0)).then_some(record_addr),
+        // `histogramRecord.c:127`: allocated only for `SDEL > 0`.
+        ("histogram", "WDOG") => {
+            field_is("SDEL", &|v| int_of(v).is_some_and(|n| n > 0.0)).then_some(record_addr)
+        }
+        // `boRecord.c:150`, `calcoutRecord.c:140`: the callback block.
+        ("bo" | "calcout", "RPVT") => Some(record_addr),
+        // `aSubRecord.c:117-123`: `initFields` allocates the input, output and
+        // old-output buffers of every argument whatever its `NOx`.
+        ("aSub", n)
+            if n.len() == 1 || (n.len() == 4 && (n.starts_with("VAL") || n.starts_with("OVL"))) =>
+        {
+            Some(record_addr)
+        }
+        // `aSubRecord.c:151-156`: resolved at init only for `LFLG=IGNORE`.
+        ("aSub", "SADR") => (field_is("LFLG", &|v| int_of(v) == Some(0.0))
+            && !field_is(
+                "SNAM",
+                &|v| matches!(v, EpicsValue::String(s) if s.is_empty()),
+            ))
+        .then(|| {
+            inst.subroutine
+                .as_ref()
+                .map(|s| std::sync::Arc::as_ptr(s) as *const u8 as usize)
+        })
+        .flatten(),
+        _ => inst.record.held_pointer(name),
+    }
 }
 
 pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool {
@@ -2140,21 +2282,23 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // was never read and a field C shows at level 0 could be
     // missing at level 2.
     let (fields, extras): (Vec<(String, String)>, Vec<(String, String)>) = ctx.block_on(async {
-        let rec_name = { rec.read().name.clone() };
+        let (rec_name, scan) = {
+            let inst = rec.read();
+            (inst.name.clone(), inst.common.scan)
+        };
         let aliases = ctx.db().aliases_for_record(&rec_name);
+        let held = DbprHeld::of(ctx, &rec_name, scan).await;
 
         let inst = rec.read();
-        // DELIBERATE NON-MATCH, measured at level 4: C's walk is over
-        // `papFldDes`, so it reaches the fourteen `dbCommon` `DBF_NOACCESS`
-        // internals too and prints `ASP : PTR (nil)`,
-        // `MLIS: ELL 0 [(nil) .. (nil)]`, `MLOK: 50 83 b8 61 03 58 00 00`,
-        // `DSET: PTR 0x7de2e55c3aa0` and the rest (`dbTest.c:1228-1266`).
-        // Every one of those is a C storage fact — a `void *` read at a struct
-        // offset, an `ELLLIST` header, a raw byte dump of an `epicsMutexId` —
-        // and this port carries those rows by NAME only, with no width and no
-        // pointer, so the walk below has nothing to print for them. They are
-        // resolvable and `dba` reports them ([`DbAddr::fld_des`]); what is
-        // absent is a value, not the field.
+        // DELIBERATE NON-MATCH, measured at level 4: C's walk reaches the
+        // `dbCommon` `DBF_NOACCESS` internals whose value is not a pointer —
+        // `MLIS`/`BKLNK` (`ELL 0 [(nil) .. (nil)]`, an `ELLLIST` header) and
+        // `MLOK` (`50 83 b8 61 03 58 00 00`, a raw dump of an `epicsMutexId`)
+        // — and the record-own array members (`RPCL`, `ORPC`). The port keeps
+        // no `ELLLIST` or mutex id behind them and carries them by NAME only,
+        // with no width, so the walk has nothing to print. They are resolvable
+        // and `dba` reports them ([`DbAddr::fld_des`]); what is absent is a
+        // value, not the field. Pointer members are carried and printed.
         let mut descs: Vec<&crate::server::record::FieldDesc> =
             crate::server::record::dbd_generated::DB_COMMON_FIELDS
                 .iter()
@@ -2179,7 +2323,7 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                 // `dbf_type` — a "served as" answer these rows do not have —
                 // out of the walk: the declaration alone renders them.
                 if d.no_access() {
-                    return dbpr_no_access(&inst, d).map(|t| (d.name.to_string(), t, None));
+                    return dbpr_no_access(&inst, d, &held).map(|t| (d.name.to_string(), t, None));
                 }
                 let value = inst.resolve_field(d.name)?;
                 let link = crate::types::link_class_of(d).map(|class| {
@@ -3306,7 +3450,10 @@ impl CaChannel {
                 .field_native_count(&field)
                 .or_else(|| inst.record.get_field(&field).map(|v| v.count()))
                 .unwrap_or(1),
-            field_size: c_field_size(snap.value.db_field_type().dbf_code(), fd.size),
+            field_size: {
+                let served = snap.value.db_field_type().dbf_code();
+                c_field_size(served, served_element_size(&*inst.record, fd, served))
+            },
             string_precision: snap.precision().unwrap_or(6),
             address: Arc::as_ptr(&rec) as *const () as usize,
             snap,
@@ -9123,6 +9270,87 @@ mod tests {
         }
     }
 
+    /// `dbgf` of a long-string VAL is a `DBR_STRING` get with one element, so
+    /// it is C's 40-byte buffer: 39 characters, the same cut a CA
+    /// `DBR_STRING` get makes. Oracle — softIoc R7.0.10.1-DEV, `lsi` SIZV 100
+    /// holding 70 digits: `dbgf LGL.VAL` -> `DBF_STRING:` + `"0123…8"` (39
+    /// characters), `dbgf LGL.VAL$` -> `DBF_CHAR[71]` with all 70.
+    #[test]
+    fn dbgf_cuts_a_long_string_val_to_the_dbr_string_buffer() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lgl.db");
+        let digits: String = (0..70).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
+        std::fs::write(
+            &path,
+            format!(
+                "record(lsi, \"LGL\") {{ field(SIZV, \"100\") field(INP, {{const:\"{digits}\"}}) }}\n"
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["LGL.PROC", "1"]);
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LGL.VAL"]),
+            format!("DBF_STRING:         \"{}\"         \n", &digits[..39])
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LGL.VAL$"]),
+            format!("DBF_CHAR[71]:       \n\"{digits}\"        \n")
+        );
+    }
+
+    /// `dbpr <rec> 2` prints a pointer member as `PTR %p`
+    /// (`dbTest.c:1239-1242`), after `UDFS` in name order. Oracle — softIoc
+    /// R7.0.10.1-DEV (address masked): lsi `LGS`, SIZV 40, `TSEL: CONSTANT
+    /// UDF : 0 UDFS: INVALID` then `VAL : PTR 0x…` on a line of its own;
+    /// printf `PF`, the same line ending `UDFS: INVALID       VAL : PTR 0x…`.
+    #[test]
+    fn dbpr_prints_a_long_string_val_as_a_pointer() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ptr.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LGS\") { field(SIZV, \"40\") field(INP, {const:\"short\"}) }\n\
+             record(lso, \"LSO\") { field(SIZV, \"40\") }\n\
+             record(printf, \"PF\") { field(SIZV, \"100\") field(FMT, \"%s\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let mask = |out: String| -> Vec<String> {
+            out.lines()
+                .map(|l| match l.find("PTR 0x") {
+                    Some(at) => {
+                        let hex_end = l[at + 6..]
+                            .find(|c: char| !c.is_ascii_hexdigit())
+                            .map_or(l.len(), |n| at + 6 + n);
+                        let pad = l.len() - hex_end;
+                        format!("{}PTR 0xADDR{}", &l[..at], " ".repeat(pad))
+                    }
+                    None => l.to_string(),
+                })
+                .collect()
+        };
+        for rec in ["LGS", "LSO", "PF"] {
+            let lines = mask(run_cmd(&ctx, "dbpr", &[rec, "2"]));
+            let ptr: Vec<&String> = lines.iter().filter(|l| l.contains("PTR")).collect();
+            assert_eq!(ptr.len(), 1, "{rec}: {lines:#?}");
+            assert!(ptr[0].contains("VAL : PTR 0xADDR"), "{rec}: {ptr:?}");
+            assert_eq!(lines.last(), Some(ptr[0]), "{rec}: VAL sorts last");
+        }
+        let lgs = mask(run_cmd(&ctx, "dbpr", &["LGS", "2"]));
+        assert_eq!(
+            lgs[lgs.len() - 2..],
+            [
+                "TSEL: CONSTANT      UDF : 0             UDFS: INVALID       ".to_string(),
+                "VAL : PTR 0xADDR                ".to_string(),
+            ]
+        );
+    }
+
     /// A long-string VAL is one `DBF_STRING` to every capacity reader
     /// (`cvt_dbaddr`'s `no_elements = 1`), whatever LEN a `$` put left.
     /// Oracle — softIoc R7.0.10, `record(lso,"LSO"){field(SIZV,"40")}`:
@@ -11447,6 +11675,167 @@ record(bo, "$(P)_calc_ctrl") {{
             .unwrap_or(rest.len())
             .min(rest.find('\n').unwrap_or(rest.len()));
         rest[..end].to_string()
+    }
+
+    /// `dbpr`'s pointer members, against `softIoc` R7.0.10 on the same
+    /// records: `PTR (nil)` where the record holds no object and `PTR 0x...`
+    /// where it does. The table is nil-ness only, since no two IOCs agree on
+    /// an address, measured at level 4 (level 2 prints `VAL` alone, and it
+    /// is the same cell). `ASP` is the one row C answers from a policy: nil
+    /// here, an address once `-a` loaded an ACF.
+    #[test]
+    fn dbpr_prints_a_pointer_member_as_nil_where_the_record_holds_none() {
+        const DB: &str = r#"record(aai,"AAI"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(aao,"AAO"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(compress,"CMP"){field(NSAM,"4")}
+record(compress,"CMPA"){field(NSAM,"4")field(ALG,"Average")}
+record(subArray,"SUB"){field(MALM,"4")field(FTVL,"DOUBLE")}
+record(histogram,"HIS"){field(NELM,"4")}
+record(histogram,"HISD"){field(NELM,"4")field(SDEL,"1")}
+record(waveform,"WF"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(aSub,"ASUB"){field(FTA,"DOUBLE")field(NOA,"3")}
+record(bo,"BO"){}
+record(calcout,"CO"){}
+record(ai,"AI"){}
+record(ai,"AIS"){field(SCAN,"1 second")}
+record(lsi,"LSI"){field(SIZV,"20")}
+record(lso,"LSO"){field(SIZV,"20")}
+record(stringout,"SO"){}
+record(calc,"CAL"){}
+"#;
+        // `<record> <ROW>=<addr|(nil)>...`, from `dbpr <record> 4` on softIoc.
+        const C: &str = "\
+AAI ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+AAO ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+CMP ASP=(nil) BPTR=addr DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPTR=(nil) SPVT=(nil) VAL=(nil) WPTR=(nil)
+CMPA ASP=(nil) BPTR=addr DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPTR=addr SPVT=(nil) VAL=(nil) WPTR=(nil)
+SUB ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPVT=(nil) VAL=(nil)
+HIS ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil) WDOG=(nil)
+HISD ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil) WDOG=addr
+WF ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+ASUB A=addr ASP=(nil) CADR=(nil) DPVT=(nil) DSET=(nil) LSET=addr OVLA=addr OVLU=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SADR=(nil) SPVT=(nil) U=addr VALA=addr VALU=addr
+BO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RPVT=addr RSET=addr SIMPVT=(nil) SPVT=(nil) WDPT=(nil)
+CO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RPVT=addr RSET=addr SPVT=(nil)
+AI ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PBRK=(nil) PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil)
+AIS ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PBRK=(nil) PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=addr
+LSI ASP=(nil) DPVT=(nil) DSET=addr LSET=addr OVAL=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=addr
+LSO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr OVAL=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=addr
+SO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil)
+CAL ASP=(nil) DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPVT=(nil)";
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, DB).expect(".db must load");
+        ctx.block_on(db.ioc_init());
+
+        let mut wrong = Vec::new();
+        for line in C.lines() {
+            let mut cells = line.split(' ');
+            let rec = cells.next().unwrap();
+            for level in [2, 4] {
+                let printed = capture(&ctx, || {
+                    dbpr_report(&ctx, rec, level);
+                });
+                for cell in line.split(' ').skip(1) {
+                    let (row, want) = cell.split_once('=').unwrap();
+                    let interest = if row == "VAL" { 0 } else { 4 };
+                    if interest > level && !printed.contains(&format!("{row:<4}: ")) {
+                        continue;
+                    }
+                    let got = dbpr_field(&printed, row);
+                    let ok = match want {
+                        "(nil)" => got == "PTR (nil)",
+                        _ => got.starts_with("PTR 0x") && got != "PTR 0x0",
+                    };
+                    if !ok {
+                        wrong.push(format!("dbpr {rec} {level} {row}: C {want}, port {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// `SIMPVT` against `softIoc` R7.0.10, `dbpr <rec> 4` around `dbpf
+    /// <rec>.PROC 1`: AIS (SIMM YES, SDLY 0) nil, then an address; AIN
+    /// (SDLY -1, the synchronous branch) nil after its process too.
+    #[test]
+    fn dbpr_prints_simpvt_once_a_simulation_has_deferred() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "AIS") { field(SIMM, "YES") field(SIOL, "5") field(SDLY, "0") }
+record(ai, "AIN") { field(SIMM, "YES") field(SIOL, "5") field(SDLY, "-1") }"#,
+        )
+        .expect(".db must load");
+        ctx.block_on(db.ioc_init());
+        let simpvt = |rec: &str| {
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, rec, 4);
+                }),
+                "SIMPVT",
+            )
+        };
+        assert_eq!(simpvt("AIS"), "PTR (nil)");
+        run_cmd(&ctx, "dbpf", &["AIS.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AIN.PROC", "1"]);
+        assert!(simpvt("AIS").starts_with("PTR 0x"), "{:?}", simpvt("AIS"));
+        assert_eq!(simpvt("AIN"), "PTR (nil)");
+    }
+
+    /// `WPTR` against `softIoc` R7.0.10, `dbpr <rec> 4` around `dbpf
+    /// CMP.PROC 1`: CMP nil, then an address once it has read its INP; CMP0,
+    /// never processed, nil.
+    #[test]
+    fn dbpr_prints_wptr_once_a_compress_has_read_its_input() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "2") }
+record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(N, "2") field(NSAM, "4") }
+record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
+        )
+        .expect(".db must load");
+        ctx.block_on(db.ioc_init());
+        let wptr = |rec: &str| {
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, rec, 4);
+                }),
+                "WPTR",
+            )
+        };
+        assert_eq!(wptr("CMP"), "PTR (nil)");
+        run_cmd(&ctx, "dbpf", &["CMP.PROC", "1"]);
+        assert!(wptr("CMP").starts_with("PTR 0x"), "{:?}", wptr("CMP"));
+        assert_eq!(wptr("CMP0"), "PTR (nil)");
+    }
+
+    /// `ASP` once an ACF is loaded: C's `asAddMember` has run for the record.
+    #[test]
+    fn dbpr_prints_asp_once_a_policy_is_loaded() {
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, r#"record(ai, "A:AI") {}"#).expect("ai .db must load");
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, "A:AI", 4);
+                }),
+                "ASP"
+            ),
+            "PTR (nil)"
+        );
+        ctx.acf().store(Some(std::sync::Arc::new(
+            crate::server::access_security::parse_acf("ASG(DEFAULT) { RULE(1,READ) }")
+                .expect("acf"),
+        )));
+        let asp = dbpr_field(
+            &capture(&ctx, || {
+                dbpr_report(&ctx, "A:AI", 4);
+            }),
+            "ASP",
+        );
+        assert!(asp.starts_with("PTR 0x"), "{asp:?}");
     }
 
     /// `dbpr`'s `DBF_NOACCESS` rows, against `softIoc` R7.0.10 on the same

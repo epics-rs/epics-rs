@@ -1027,6 +1027,11 @@ mod tests {
         let framework_owned = ["INP", "SIOL", "SIML"];
         let mut unowned: Vec<&str> = Vec::new();
         for f in rec.field_list() {
+            // `BPTR`, `PBG`, `PSTATUS`: pointer members C resolves by name
+            // and `dbGet` refuses, so no owner has a value to serve.
+            if f.unreadable() {
+                continue;
+            }
             if rec.get_field(f.name).is_none() && !framework_owned.contains(&f.name) {
                 unowned.push(f.name);
             }

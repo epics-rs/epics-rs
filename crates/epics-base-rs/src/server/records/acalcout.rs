@@ -2696,9 +2696,10 @@ mod tests {
 
     #[test]
     fn test_acalcout_field_list_count() {
-        // 138 dbd record fields minus 6 DBF_NOACCESS internal pointer/scratch
-        // fields (RPVT, PAVL, PAA, POAV, RPCL, ORPC) = 132 modeled fields.
-        assert_eq!(AcalcoutRecord::default().field_list().len(), 132);
+        // 138 dbd record fields minus the 2 DBF_NOACCESS internals the
+        // generator cannot describe (RPCL, ORPC: sized array members) = 136;
+        // RPVT, PAVL, PAA, POAV are carried as pointer rows for `dbpr`.
+        assert_eq!(AcalcoutRecord::default().field_list().len(), 136);
     }
 
     #[test]

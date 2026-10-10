@@ -5,7 +5,9 @@
 //! take the modifier, how many elements the view has, or what a put stores.
 
 use crate::server::database::filters::FilterChain;
-use crate::server::record::{FieldDesc, RecordInstance, Special};
+use crate::server::record::{
+    FieldDeclaration, FieldDesc, RecordInstance, Special, served_element_size,
+};
 use crate::types::{DbfCode, EpicsValue};
 
 /// C `dbEntryToAddr`'s two type words for one field (`dbAccess.c:627-649`):
@@ -83,7 +85,19 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
     // `no_elements = field_size`, and `dbGet`'s count is
     // `get_array_info`'s where the field is `SPC_DBADDR`.
     let (count, capacity) = match value.as_ref()? {
-        EpicsValue::String(_) => (usize::from(desc.size), usize::from(desc.size)),
+        // A `SPC_DBADDR` string element serves `get_array_info`'s count
+        // (aSub `NOB`) in a `field_size` buffer; a plain string field's count
+        // is its own width.
+        EpicsValue::String(_) => {
+            let width = usize::from(served_element_size(&*inst.record, desc, DbfCode::String));
+            match desc.declared_special {
+                Special::DbAddr => (
+                    inst.record.field_native_count(desc.name).unwrap_or(1) as usize,
+                    width,
+                ),
+                _ => (width, width),
+            }
+        }
         EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => {
             (long_string_len(inst), long_string_sizv(inst))
         }

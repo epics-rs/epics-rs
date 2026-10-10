@@ -78,7 +78,8 @@ pub use record_trait::{
     put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{
-    SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, seed_trackers_from_val, value_gate,
+    SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, seed_trackers_from_val,
+    served_element_size, value_gate,
 };
 pub use scan::{ScanList, ScanType, SimModeScan};
 pub use sparse_text::SparseText;

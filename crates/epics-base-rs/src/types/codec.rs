@@ -198,6 +198,19 @@ fn convert_value_to_dbr_string(
     })
 }
 
+/// C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as `getStringString`
+/// copies (`dbConvert.c`), whatever the source holds. The one cut a
+/// `DBR_STRING` read of a string longer than a `DBF_STRING` applies — a
+/// db-link read and `dbgf`.
+pub(crate) fn cap_dbr_string(s: PvString) -> PvString {
+    const MAX: usize = 39;
+    if s.len() > MAX {
+        PvString::from_bytes(&s.as_bytes()[..MAX])
+    } else {
+        s
+    }
+}
+
 /// The float/double rows of C's `DBR_STRING` column, **in both directions**.
 ///
 /// `getFloatString`/`getDoubleString` (`dbConvert.c:735`/`:772`),

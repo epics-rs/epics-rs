@@ -4984,7 +4984,9 @@ mod tests {
     #[test]
     fn test_field_list_count() {
         let rec = AsynRecord::default();
-        assert_eq!(rec.field_list().len(), 76);
+        // 76 served fields plus the two `DBF_NOACCESS` pointers `OPTR` and
+        // `IPTR`, carried for `dbpr` like every pointer member.
+        assert_eq!(rec.field_list().len(), 78);
     }
 
     /// Every asynRecord `DBF_MENU` field must (a) serve enum choice strings,

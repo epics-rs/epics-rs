@@ -925,6 +925,11 @@ impl Record for PrintfRecord {
         self.field_is_long_string(field).then_some(1)
     }
 
+    /// `cvt_dbaddr` stores `field_size = prec->sizv`.
+    fn dbaddr_element_size(&self, field: &str) -> Option<u16> {
+        self.field_is_long_string(field).then_some(self.sizv)
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

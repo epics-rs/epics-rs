@@ -574,6 +574,12 @@ static RESET_POSTS: [(&str, crate::server::record::CyclePostMask); 3] = [
 ];
 
 impl Record for CompressRecord {
+    /// C allocates `wptr` with the first `inpn` latch and never frees it
+    /// (compressRecord.c:334-339).
+    fn held_pointer(&self, field: &str) -> Option<usize> {
+        (field == "WPTR" && self.inpn > 0).then(|| std::ptr::from_ref(&self.inpn) as usize)
+    }
+
     fn acts_before_process(&self) -> bool {
         false
     }

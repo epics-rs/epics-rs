@@ -4937,7 +4937,8 @@ impl PvDatabase {
                 // that releases it, the same construction-time invariant as
                 // the `ReprocessAfter` ODLY defers.
                 {
-                    let instance = rec.write();
+                    let mut instance = rec.write();
+                    instance.simpvt = true;
                     instance.enter_pact();
                 }
                 self.schedule_delayed_reprocess(name, rec, delay);

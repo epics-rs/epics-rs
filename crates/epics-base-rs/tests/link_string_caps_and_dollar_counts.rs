@@ -47,7 +47,7 @@ async fn a_string_read_caps_at_39_and_a_dollar_source_reads_its_whole_text() {
         if text(&db, "T") == "abc" {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(text(&db, "AS.A"), "0123456789abcdefghijklmnopqrstuvwxyzABC");
     // A long string is one element to `dbGet`, whatever NOA asks for.

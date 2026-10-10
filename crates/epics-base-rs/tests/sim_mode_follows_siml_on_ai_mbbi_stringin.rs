@@ -85,7 +85,7 @@ async fn run(db: &PvDatabase, r: &str, want: &[(&str, &str)]) {
     put(db, &format!("{r}.SDLY"), EpicsValue::Double(0.4)).await;
     proc(db, r).await;
     check("sdly fresh", state(db, r).await);
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(900)).await;
     check("sdly done", state(db, r).await);
     let want: Vec<(String, String)> = want
         .iter()

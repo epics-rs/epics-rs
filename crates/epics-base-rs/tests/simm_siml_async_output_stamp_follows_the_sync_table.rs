@@ -44,7 +44,7 @@ async fn the_async_output_stamps_like_the_sync_one() {
         db.process_record_with_links("A_AO", &mut visited)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         let t = cell.read().common.time;
         got.push(if t == stale {
             'U'

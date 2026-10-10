@@ -50,7 +50,7 @@ async fn softioc_pin(case: &str) {
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
     let steps = read("steps.txt");
     let mut lines = steps.lines();
     let monitor = lines.next().unwrap().strip_prefix("monitor ").unwrap();
@@ -89,7 +89,7 @@ async fn softioc_pin(case: &str) {
             .await
             .unwrap();
         // The CP target processes off the put; let it land before the next.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
     }
     let mut got = String::new();
     for (pv, mut out, mut rx, enums) in subs {

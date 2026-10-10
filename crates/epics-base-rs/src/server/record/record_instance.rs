@@ -3656,6 +3656,15 @@ impl RecordInstance {
     fn process_hooked(&mut self) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
         self.push_process_context();
         let result = self.process_record();
+        self.drain_process_posts();
+        result
+    }
+
+    /// The drain of what a processing step posted: a type without
+    /// `PROCESS_POSTED` pays this one bit test. Private: the callers are
+    /// [`Self::process_hooked`] and [`Self::apply_invalid_output_value_and_drain`].
+    #[inline(always)]
+    fn drain_process_posts(&mut self) {
         if self
             .monitor_plan
             .hooks
@@ -3663,7 +3672,21 @@ impl RecordInstance {
         {
             self.emit_process_posts_marked();
         }
-        result
+    }
+
+    /// [`Record::apply_invalid_output_value`](crate::server::record::Record::apply_invalid_output_value)
+    /// and the drain of what it posted. A record's hook may re-run its own
+    /// `process()` (ao's IVOA=Set_output_to_IVOV does, to reproduce C's
+    /// `convert()`), so the hook is as much a processing step as
+    /// [`Self::process_and_drain`] and is called only through here.
+    #[inline(always)]
+    pub(crate) fn apply_invalid_output_value_and_drain(
+        &mut self,
+        ivov: crate::types::EpicsValue,
+    ) -> crate::error::CaResult<()> {
+        let applied = self.record.apply_invalid_output_value(ivov);
+        self.drain_process_posts();
+        applied
     }
 
     /// The table names are upper-case, so the read skips `resolve_field`'s

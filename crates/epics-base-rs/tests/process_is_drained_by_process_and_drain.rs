@@ -6,60 +6,162 @@
 //! `PROCESS_POSTED` type's marks to the next cycle (SIMM=RAW in
 //! `simulate_or_resolve` did). The helper is the one place both happen.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
+/// Every non-test source file of every workspace `src` directory, as
+/// (path, production text): `source_guard::production_str` is the one rule
+/// for what a `#[cfg(test)]` item is, comments stripped. `*_tests.rs`,
+/// `tests.rs` and anything under a `tests` directory are test modules and are
+/// not scanned.
+fn production_sources() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for dir in workspace_src_dirs() {
+        for (label, text) in source_guard::rust_sources(&dir) {
+            let name = label.rsplit('/').next().unwrap();
+            if name == "tests.rs"
+                || name.ends_with("_tests.rs")
+                || label.split('/').any(|c| c == "tests")
+            {
+                continue;
+            }
+            out.push((
+                format!("{}/{label}", dir.display()),
+                source_guard::production_str(text, source_guard::Comments::Strip),
+            ));
         }
     }
+    out
 }
 
-/// The file's non-test text: `#[cfg(test)]` items run to the end of the file
-/// in this crate, and `*_tests.rs` / `tests.rs` files are test modules.
-fn non_test_text(path: &Path) -> Option<String> {
-    let name = path.file_name().unwrap().to_str().unwrap();
-    if name == "tests.rs" || name.ends_with("_tests.rs") {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).unwrap();
-    let end = text.find("\n#[cfg(test)]").unwrap_or(text.len());
-    Some(text[..end].to_string())
-}
-
-#[test]
-fn no_cycle_path_processes_without_the_drain() {
-    let mut files = Vec::new();
-    sources(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
-    let mut bypasses = Vec::new();
-    for path in files {
-        let Some(text) = non_test_text(&path) else {
-            continue;
-        };
-        // Whitespace-free, so `inst.record\n    .process()` is one match.
-        let squeezed: String = text.split_whitespace().collect();
-        for needle in [".record.process()", "record_mut().process()"] {
-            for (at, _) in squeezed.match_indices(needle) {
-                let before = &squeezed[at.saturating_sub(40)..at];
-                bypasses.push(format!("{}: ..{before}{needle}", path.display()));
+/// Every `src` directory of every workspace member (`crates/*`, `examples/*`,
+/// `tools/*`), not only this crate's.
+fn workspace_src_dirs() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut dirs = Vec::new();
+    for group in ["crates", "examples", "tools"] {
+        for member in std::fs::read_dir(root.join(group)).unwrap() {
+            let src = member.unwrap().path().join("src");
+            if src.is_dir() {
+                dirs.push(src);
             }
         }
     }
-    // The helper's own call is the one allowed site.
+    dirs
+}
+
+/// The body of every `fn <name>(` in `text` — signature to the closing brace
+/// at the signature's indentation — and the text with those lines blanked. A
+/// declaration ending in `;` has no body and is left alone.
+fn split_out_fns(text: &str, name: &str) -> (Vec<String>, String) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut bodies = Vec::new();
+    let mut rest = Vec::new();
+    let mut k = 0;
+    while k < lines.len() {
+        if lines[k].trim_start().contains(&format!("fn {name}(")) {
+            let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
+            let head_end = (k..lines.len()).find(|&j| {
+                let t = lines[j].trim_end();
+                t.ends_with('{') || t.ends_with(';')
+            });
+            if let Some(h) = head_end.filter(|&h| lines[h].trim_end().ends_with('{')) {
+                let close_marker = format!("{indent}}}");
+                if let Some(close) = (h..lines.len()).find(|&j| lines[j] == close_marker) {
+                    bodies.push(lines[k..=close].join("\n"));
+                    k = close + 1;
+                    continue;
+                }
+            }
+        }
+        rest.push(lines[k]);
+        k += 1;
+    }
+    (bodies, rest.join("\n"))
+}
+
+/// Whitespace-free, so `inst.record\n    .process()` is one match.
+fn hits(text: &str, needles: &[&str]) -> Vec<String> {
+    let squeezed: String = text.split_whitespace().collect();
+    let mut out = Vec::new();
+    for needle in needles {
+        for (at, _) in squeezed.match_indices(needle) {
+            let before = &squeezed[at.saturating_sub(40)..at];
+            out.push(format!("..{before}{needle}"));
+        }
+    }
+    out
+}
+
+/// `RecordInstance` is the one owner of processing a record:
+///
+/// * `Record::process` is called only from `process_record`, and that only
+///   from `process_and_drain` and `process_hooked`;
+/// * a record's `apply_invalid_output_value` hook may call its own
+///   `self.process()` (ao's IVOA=Set_output_to_IVOV does), and that is the one
+///   place a record does. The hook is called only from
+///   `apply_invalid_output_value_and_drain`, so its process is drained there
+///   by construction rather than by a list of records that happen to be safe.
+///
+/// Each allowance is the body of a function, so a second call elsewhere in the
+/// same file is still a bypass.
+#[test]
+fn no_cycle_path_processes_without_the_drain() {
+    const PROCESS: &[&str] = &[".record.process()", "record_mut().process()"];
+    const HOOK_CALL: &[&str] = &[".record.apply_invalid_output_value("];
+    const SELF_PROCESS: &[&str] = &["self.process()"];
+    const CALLER: &[&str] = &["self.process_record()"];
+
+    let mut bypasses = Vec::new();
+    let mut owner_process = Vec::new();
+    let mut callers = Vec::new();
+    let mut owner_hook = Vec::new();
+    for (path, text) in production_sources() {
+        let tag = |h: String| format!("{path}: {h}");
+        let mut rest = text;
+        // Only `RecordInstance`'s own: a same-named function elsewhere is not
+        // the owner and would blank a bypass.
+        if path.ends_with("src/server/record/record_instance.rs") {
+            let (bodies, r) = split_out_fns(&rest, "process_record");
+            owner_process.extend(bodies.iter().flat_map(|b| hits(b, PROCESS)).map(tag));
+            rest = r;
+            for caller in ["process_and_drain", "process_hooked"] {
+                let (bodies, r) = split_out_fns(&rest, caller);
+                callers.extend(bodies.iter().flat_map(|b| hits(b, CALLER)).map(tag));
+                rest = r;
+            }
+            bypasses.extend(hits(&rest, CALLER).into_iter().map(tag));
+            let (bodies, r) = split_out_fns(&rest, "apply_invalid_output_value_and_drain");
+            owner_hook.extend(bodies.iter().flat_map(|b| hits(b, HOOK_CALL)).map(tag));
+            rest = r;
+        }
+        // The hook's own body: the one place a record calls `self.process()`.
+        let (_, rest) = split_out_fns(&rest, "apply_invalid_output_value");
+        bypasses.extend(
+            hits(&rest, &[PROCESS, HOOK_CALL, SELF_PROCESS].concat())
+                .into_iter()
+                .map(tag),
+        );
+    }
     assert_eq!(
-        bypasses.len(),
+        owner_process.len(),
         1,
-        "Record::process outside RecordInstance::process_and_drain: {bypasses:#?}"
+        "RecordInstance::process_record must call Record::process exactly \
+         once: {owner_process:#?}"
+    );
+    assert_eq!(
+        callers.len(),
+        2,
+        "process_and_drain and process_hooked must each call process_record \
+         once: {callers:#?}"
+    );
+    assert_eq!(
+        owner_hook.len(),
+        1,
+        "RecordInstance::apply_invalid_output_value_and_drain must call the hook \
+         exactly once: {owner_hook:#?}"
     );
     assert!(
-        bypasses[0].contains("record_instance.rs"),
-        "the one call is not in the helper: {bypasses:#?}"
+        bypasses.is_empty(),
+        "processing a record outside RecordInstance's drained entries: {bypasses:#?}"
     );
 }

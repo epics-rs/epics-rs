@@ -131,7 +131,10 @@ async fn softioc_pin(case: &str, drive: Drive) {
     for step in lines.take(steps) {
         let mut words = step.split_whitespace();
         if let Some(secs) = step.strip_prefix("sleep ") {
-            tokio::time::sleep(std::time::Duration::from_secs_f64(secs.parse().unwrap())).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_secs_f64(
+                secs.parse().unwrap(),
+            ))
+            .await;
             continue;
         }
         assert_eq!(words.next(), Some("caput"));
@@ -142,7 +145,7 @@ async fn softioc_pin(case: &str, drive: Drive) {
             .await
             .unwrap();
         // Outlasts the 0.1 s ODLY the refusal case's first cycle runs.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(250)).await;
     }
     if let Drive::LocalRefusal { record, .. } = drive {
         let cell = db.get_record(record).unwrap();

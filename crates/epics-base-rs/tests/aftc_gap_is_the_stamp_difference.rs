@@ -40,7 +40,7 @@ async fn a_pause_reaches_the_filter_as_the_stamp_gap_birecord_259() {
         );
     }
     // alpha = 2 / (0.5 + 2) = 0.8: AFVL 1.6 floors to MINOR; a zero gap keeps 2.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500)).await;
     put("PS", "VAL", EpicsValue::Long(0)).await;
     for rec in ["P", "PSIM"] {
         put(rec, "PROC", EpicsValue::Short(1)).await;

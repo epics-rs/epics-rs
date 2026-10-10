@@ -6171,7 +6171,7 @@ impl PvDatabase {
                             // Loud in test/debug; release behaviour unchanged,
                             // because C has no alarm for this case to copy.
                             if let Some(ivov) = instance.record.get_field("IVOV") {
-                                let applied = instance.record.apply_invalid_output_value(ivov);
+                                let applied = instance.apply_invalid_output_value_and_drain(ivov);
                                 debug_assert!(
                                     applied.is_ok(),
                                     "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
@@ -7634,39 +7634,40 @@ impl PvDatabase {
                 // IVOA check — on the PENDING severity, which is what C's
                 // `writeValue` call site tests (`if (prec->nsev < INVALID_ALARM)`,
                 // aoRecord.c:196).
-                let skip_out =
-                    if instance.common.nsev == crate::server::record::AlarmSeverity::Invalid {
-                        let ivoa = instance
-                            .record
-                            .get_field("IVOA")
-                            .and_then(|v| v.to_menu_index())
-                            .unwrap_or(0);
-                        match ivoa {
-                            1 => true,
-                            2 => {
-                                // See the IVOA=2 comment in
-                                // `process_record_with_links_inner` — IVOA=2
-                                // delegates to the per-record
-                                // `apply_invalid_output_value` so OVAL/RVAL/VAL
-                                // get the C-convention values.
-                                // The same "cannot fail in C" contract as the
-                                // sync arm above; see its note.
-                                if let Some(ivov) = instance.record.get_field("IVOV") {
-                                    let applied = instance.record.apply_invalid_output_value(ivov);
-                                    debug_assert!(
-                                        applied.is_ok(),
-                                        "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
-                                        instance.record.record_type(),
-                                        applied.err()
-                                    );
-                                }
-                                false
+                let skip_out = if instance.common.nsev
+                    == crate::server::record::AlarmSeverity::Invalid
+                {
+                    let ivoa = instance
+                        .record
+                        .get_field("IVOA")
+                        .and_then(|v| v.to_menu_index())
+                        .unwrap_or(0);
+                    match ivoa {
+                        1 => true,
+                        2 => {
+                            // See the IVOA=2 comment in
+                            // `process_record_with_links_inner` — IVOA=2
+                            // delegates to the per-record
+                            // `apply_invalid_output_value` so OVAL/RVAL/VAL
+                            // get the C-convention values.
+                            // The same "cannot fail in C" contract as the
+                            // sync arm above; see its note.
+                            if let Some(ivov) = instance.record.get_field("IVOV") {
+                                let applied = instance.apply_invalid_output_value_and_drain(ivov);
+                                debug_assert!(
+                                    applied.is_ok(),
+                                    "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
+                                    instance.record.record_type(),
+                                    applied.err()
+                                );
                             }
-                            _ => false,
+                            false
                         }
-                    } else {
-                        false
-                    };
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
 
                 // OEVT: queue the output event when the output fires — same
                 // IVOA-gated event-twin of the OUT write as

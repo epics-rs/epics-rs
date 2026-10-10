@@ -437,7 +437,7 @@ fn test_val_set_on_completion() {
     rec.pcnt = 1;
     rec.s[0] = 10_000_000; // 1 second of clock ticks
 
-    // Device support's read() marks counting done before process() runs.
+    // No dset bound: `set_done` stands in for `done()` returning true.
     rec.set_done();
 
     rec.process().unwrap();
@@ -995,29 +995,6 @@ impl ScalerDriver for QuantizingDriver {
     }
 }
 
-/// Dispatch the actions a record's process() returned through device
-/// support, mirroring `Database::execute_process_actions`' handling of
-/// `ProcessAction::DeviceCommand` (processing.rs DeviceCommand arm).
-///
-/// Returns the accumulated record-field names every `handle_command`
-/// reported as changed — these are exactly the fields the framework
-/// posts `DBE_VALUE` monitor events for (C `db_post_events`,
-/// `scalerRecord.c:425-430`).
-fn run_device_commands(
-    support: &mut dyn epics_base_rs::server::device_support::DeviceSupport,
-    rec: &mut ScalerRecord,
-    actions: &[epics_base_rs::server::record::ProcessAction],
-) -> Vec<&'static str> {
-    use epics_base_rs::server::record::ProcessAction;
-    let mut posted = Vec::new();
-    for action in actions {
-        if let ProcessAction::DeviceCommand { command, args } = action {
-            posted.extend(support.handle_command(rec, command, args).unwrap());
-        }
-    }
-    posted
-}
-
 /// C scalerRecord.c:405-432 — REQSTART: after the per-channel
 /// write_preset loop, a driver that quantized preset 0 leaves
 /// `save_pr1 != pr1`, so the record recalculates PR1 from TP/FREQ,
@@ -1045,13 +1022,10 @@ fn test_reqstart_reconciles_pr1_tp_freq_with_adjusting_driver() {
     rec.special("CNT", true).unwrap();
     assert_eq!(rec.us, 2, "CNT request -> REQSTART");
 
-    let outcome = rec.process().unwrap();
-    // process() left us/ss in COUNTING and emitted CMD_RESET + CMD_START_COUNT.
+    // process() runs the count start through the bound dset (C:391-433).
+    rec.process().unwrap();
     assert_eq!(rec.ss, 2, "COUNTING");
     assert_eq!(rec.us, 3, "COUNTING");
-
-    // Dispatch the device commands — this runs run_start_count.
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
 
     // The driver adopted its own clock frequency.
     assert_eq!(
@@ -1119,10 +1093,8 @@ fn test_autocount_restores_user_pr1_after_driver_adjustment() {
 
     rec.cont = 1; // CONT mode
     rec.dly1 = 0.0; // start immediately
-    let outcome = rec.process().unwrap();
+    rec.process().unwrap();
     assert_eq!(rec.ss, 2, "auto-count COUNTING");
-
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
 
     // C:532 — user's channel-1 preset is restored.
     assert_eq!(
@@ -1165,9 +1137,7 @@ fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
 
     rec.cnt = 1;
     rec.special("CNT", true).unwrap();
-    let outcome = rec.process().unwrap();
-
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
+    rec.process().unwrap();
 
     // SoftScalerDriver returns the preset unchanged and reports no
     // clock, so PR1 stays NINT(1.0 * 1e7) and FREQ/TP are untouched.
@@ -1626,46 +1596,49 @@ fn flaky_scaler() -> (
     (state, dev)
 }
 
-/// F5: `processing` raises READ_ALARM/INVALID only on an `Err` from device
-/// support, so a swallowed driver read error left the record showing the
-/// previous scan's counts at NO_ALARM.
-#[test]
-fn test_asyn_device_support_read_error_reaches_the_record() {
-    use epics_base_rs::server::device_support::DeviceSupport;
-
-    let (_state, mut dev) = flaky_scaler();
-    let mut rec = ScalerRecord::default();
-    rec.s[0] = 7;
-
-    assert!(
-        dev.read(&mut rec).is_err(),
-        "a failed driver read must reach the record as an error"
-    );
-    assert_eq!(rec.s[0], 7, "a failed read must not publish counts");
-}
-
-/// F5: `done()` is read-and-clear — it reports a completed count exactly once —
-/// so the failing scan must not consume it, or the completion is lost and no
-/// later scan can re-deliver it.
-#[test]
-fn test_asyn_device_support_read_error_does_not_consume_the_done_latch() {
+/// A user count whose completing cycle cannot read the counters.
+fn completing_with_flaky_read() -> (
+    std::sync::Arc<std::sync::Mutex<FlakyScalerState>>,
+    ScalerRecord,
+) {
     use epics_base_rs::server::device_support::DeviceSupport;
 
     let (state, mut dev) = flaky_scaler();
     let mut rec = ScalerRecord::default();
+    dev.init(&mut rec).unwrap();
+    rec.freq = 1e7;
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.s[0] = 7;
+    (state, rec)
+}
 
-    let _ = dev.read(&mut rec);
+/// C ignores the dset read status (`scalerRecord.c:572`): a failed read
+/// raises no alarm and the count still completes.
+#[test]
+fn test_asyn_read_error_raises_no_alarm() {
+    let (_state, mut rec) = completing_with_flaky_read();
+    rec.process().unwrap();
+    assert_eq!(rec.s[0], 7, "a failed read must not publish counts");
+    assert_eq!((rec.ss, rec.us, rec.cnt), (0, 0, 0), "the count completed");
+
+    let mut common = epics_base_rs::server::record::CommonFields::default();
+    rec.check_alarms(&mut common);
     assert_eq!(
-        state.lock().unwrap().done_reads,
-        0,
-        "the read-and-clear done latch must survive the failed scan"
+        common.nsev,
+        epics_base_rs::server::record::AlarmSeverity::NoAlarm
     );
+}
 
-    // Next scan, the link is back: the completion is still there to deliver.
-    state.lock().unwrap().fail_read = false;
-    assert!(dev.read(&mut rec).is_ok());
-    assert_eq!(rec.s[0], 4242);
-    let st = state.lock().unwrap();
-    assert_eq!(st.done_reads, 1);
-    assert!(!st.done, "the completion was delivered exactly once");
+/// C asks `done()` at `:366`, ahead of the `:453` read, so the read-and-clear
+/// latch is taken by the cycle that acts on it: the count completes even when
+/// that cycle's read fails.
+#[test]
+fn test_asyn_read_error_still_completes_the_count() {
+    let (state, mut rec) = completing_with_flaky_read();
+    rec.process().unwrap();
+    assert_eq!(state.lock().unwrap().done_reads, 1);
+    assert_eq!((rec.ss, rec.us, rec.cnt), (0, 0, 0), "the count completed");
 }

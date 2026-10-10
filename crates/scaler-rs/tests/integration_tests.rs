@@ -291,10 +291,7 @@ impl ScalerDriver for QuantizingDriver {
 ///
 /// A count-start whose driver adjusts the channel-0 preset (and adopts
 /// its own clock) must produce `DBE_VALUE` monitor events on `.PR1`,
-/// `.TP`, and `.FREQ`. `run_start_count` runs inside
-/// `DeviceSupport::handle_command`, AFTER the process snapshot was
-/// built and notified; pre-fix the framework never posted those fields
-/// so CA/PVA clients subscribed to PR1/TP/FREQ stayed stale.
+/// `.TP`, and `.FREQ`.
 #[tokio::test]
 async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     let db = PvDatabase::new();
@@ -337,8 +334,8 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
         (pr1, tp, freq)
     };
 
-    // Drive CNT=1 -> REQSTART, then process: the CNT block emits
-    // CMD_RESET + CMD_START_COUNT, which the framework dispatches.
+    // Drive CNT=1 -> REQSTART, then process: the count start runs through
+    // the bound dset inside process().
     {
         let rec = db.get_record("TEST:SCMON").unwrap();
         let mut inst = rec.write();

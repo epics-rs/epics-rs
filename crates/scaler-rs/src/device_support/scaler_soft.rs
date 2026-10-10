@@ -59,6 +59,18 @@ impl SoftScalerDriver {
     }
 }
 
+impl SoftScalerDriver {
+    /// Copy the external count source and run `checkAcquireDone`
+    /// (drvScalerSoft.c:588-600), as C's `int32Read`/`int32ArrayRead` do.
+    fn sample(&mut self) {
+        self.counts = *self.shared_counts.lock().unwrap();
+        if self.armed && self.check_presets() {
+            self.done_flag = true;
+            self.armed = false;
+        }
+    }
+}
+
 impl ScalerDriver for SoftScalerDriver {
     /// C `drvScalerSoft.c:303-313` — `scalerResetCommand`: stop
     /// acquiring (`acquiring = prevAcquiring = 0`) and **clear all
@@ -79,16 +91,7 @@ impl ScalerDriver for SoftScalerDriver {
     }
 
     fn read(&mut self, counts: &mut [u32; MAX_SCALER_CHANNELS]) -> CaResult<()> {
-        // Copy from shared state (externally updated)
-        let shared = self.shared_counts.lock().unwrap();
-        self.counts = *shared;
-
-        // Check if any preset reached
-        if self.armed && self.check_presets() {
-            self.done_flag = true;
-            self.armed = false;
-        }
-
+        self.sample();
         *counts = self.counts;
         Ok(())
     }
@@ -143,7 +146,13 @@ impl ScalerDriver for SoftScalerDriver {
     /// C `devScalerAsyn.c:292-301` `scaler_done()` — read-and-clear: a
     /// completed count is reported exactly once, then the flag is
     /// cleared so the next poll returns `false`.
+    ///
+    /// C reaches `scaler_done()` only after the read that ran
+    /// `checkAcquireDone` raised the done interrupt (`acquireDoneCallbacks`),
+    /// so the poll samples the source first: the count that reached its
+    /// preset completes on this cycle, not on the next display refresh.
     fn done(&mut self) -> bool {
+        self.sample();
         let was_done = self.done_flag;
         self.done_flag = false;
         was_done

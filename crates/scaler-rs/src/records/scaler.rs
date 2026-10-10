@@ -1,7 +1,9 @@
 use std::any::Any;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::dbd_generated;
+use crate::device_support::scaler_asyn::ScalerDriver;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome,
@@ -31,26 +33,9 @@ const USER_STATE_COUNTING: i16 = 3;
 /// `scalerRecord.c:489-490`).
 const SCALER_WAIT_TIME: f64 = 10.0;
 
-/// Device command names used in ProcessAction::DeviceCommand.
-pub const CMD_RESET: &str = "scaler_reset";
-pub const CMD_ARM: &str = "scaler_arm";
-pub const CMD_WRITE_PRESET: &str = "scaler_write_preset";
-/// Count-start command — runs the full REQSTART driver sequence
-/// (write per-channel presets, reconcile PR1/TP/FREQ with what the
-/// driver actually programmed, then arm). C `scalerRecord.c:405-432`.
-/// This sequence cannot be split into independent `DeviceCommand`s
-/// because the reconciliation must observe the driver's adjustment
-/// *between* the preset writes and the arm — exactly as the C
-/// `write_preset` calls run synchronously inside `process()`.
-pub const CMD_START_COUNT: &str = "scaler_start_count";
-/// Auto-count start command — the auto-count analogue of
-/// `CMD_START_COUNT`. C `scalerRecord.c:508-535`: writes the auto
-/// presets, applies the `save_pr1 != pr1` driver-adjustment re-write
-/// (`:514-522`), then **restores the user's PR1** (`:532` —
-/// "Don't let autocount disturb user's channel-1 preset") and arms.
-/// Unlike REQSTART it does not recompute `TP`; it only adopts a
-/// driver-changed `FREQ`.
-pub const CMD_AUTOCOUNT: &str = "scaler_autocount";
+/// The scaler's dset: C `pscal->dset`, bound by device support at init and
+/// called by `process()` at the points C calls it.
+pub type ScalerDset = Arc<Mutex<Box<dyn ScalerDriver>>>;
 
 /// Scaler record — up to 64-channel 32-bit counter with preset and auto-count.
 ///
@@ -65,12 +50,11 @@ pub const CMD_AUTOCOUNT: &str = "scaler_autocount";
 ///
 /// Channel 1 (S1/PR1) is the time-base channel: T = S1 / FREQ.
 ///
-/// **Driver integration**: The record does NOT hold a direct driver reference.
-/// - `check_done()` and `read_counts()` are performed by device support's
-///   `read()` BEFORE process(), writing results into the record's fields.
-/// - `reset`, `write_preset`, `arm` commands are sent as
-///   `ProcessAction::DeviceCommand` and executed by the framework via
-///   `DeviceSupport::handle_command()` AFTER process().
+/// **Driver integration**: `process()` calls the bound [`ScalerDset`]
+/// synchronously, in C's order — `done` (:366), `arm(0)` (:384, :447),
+/// `reset`/`write_preset`/`arm(1)` (:391-433), `read` (:453), and the
+/// auto-count sequence (:508-535) — so the `:453` read sees the counters
+/// the same cycle's reset and arm left.
 ///
 /// **DLY/DLY1:** Implemented via `ProcessAction::ReprocessAfter`.
 ///
@@ -176,9 +160,10 @@ pub struct ScalerRecord {
     /// link. Read once, with `pending_reentry`, at the top of `process()`.
     continuation: bool,
 
-    // --- Done flag (set by device support read, consumed by process) ---
-    /// Set by device support's read() when counting has completed.
-    /// process() checks and clears this flag.
+    /// The dset `process()` calls; `None` until device support binds one.
+    dset: Option<ScalerDset>,
+
+    /// The `done()` answer of a record with no dset bound ([`Self::set_done`]).
     pub(crate) done_flag: bool,
 
     /// Channel-1 preset captured by `process()` at the start of a
@@ -228,18 +213,26 @@ pub struct ScalerRecord {
     /// the single owner: it clears this flag on entry and sets it at
     /// exactly C's `recGblFwdLink` line; the hook only reports it.
     fire_fwd_link: bool,
+
+    /// C `scalerRecord.c:372` — `db_post_events(pscal,&(pscal->cnt),DBE_VALUE)`
+    /// from inside `process()`, ahead of the `monitor()` whose
+    /// `recGblResetAlarms` (`:764`) commits the cycle's alarm, so the post
+    /// carries the alarm still standing. Set where C posts, taken by
+    /// [`Record::take_process_posted_fields`].
+    cnt_posted: bool,
 }
 
 impl ScalerRecord {
-    /// Mark counting as complete.
-    ///
-    /// C parity: this is the equivalent of device support's `done()`
-    /// dset entry returning true (`scalerRecord.c:367`). Device support
-    /// (`ScalerAsynDeviceSupport::read`) calls this before `process()`
-    /// when the driver reports acquisition has finished; `process()`
-    /// then consumes and clears the flag.
+    /// Mark counting as complete, for a record with no dset bound: the
+    /// next `process()` takes it as `(*pdset->done)(pscal)` returning true
+    /// (`scalerRecord.c:366`).
     pub fn set_done(&mut self) {
         self.done_flag = true;
+    }
+
+    /// Bind the dset `process()` calls (C `pscal->dset`).
+    pub fn bind_dset(&mut self, dset: ScalerDset) {
+        self.dset = Some(dset);
     }
 }
 
@@ -292,11 +285,13 @@ impl Default for ScalerRecord {
             count_delay: None,
             pending_reentry: None,
             continuation: false,
+            dset: None,
             done_flag: false,
             reqstart_old_pr1: 0,
             special_actions: Vec::new(),
             side_effect_posts: &[],
             fire_fwd_link: false,
+            cnt_posted: false,
         }
     }
 }
@@ -325,19 +320,28 @@ impl ScalerRecord {
 
     /// Port of C `updateCounts()` (scalerRecord.c:549-601).
     ///
-    /// The framework's device support `read()` already filled `s[]` with
-    /// the hardware counts before `process()` ran. This method:
-    /// - C:571-575 — while `us == USER_STATE_WAITING` the displayed
-    ///   counts are forced to 0 (the count has not started yet).
+    /// - C:571-575 — read the counters through the dset, except while
+    ///   `us == USER_STATE_WAITING`, when the display is forced to 0 (the
+    ///   count has not started yet).
     /// - C:586-588 — recompute elapsed time `T = S1 / FREQ`.
     /// - C:590-596 — while `ss == SCALER_STATE_COUNTING`, return the
     ///   interval after which the record should reprocess to refresh the
     ///   display: `1 / rate`, where `rate` is the user `RATE` while the
     ///   user is counting and the auto `RAT1` otherwise. The callback is
     ///   only scheduled when that rate is `> 0.1` Hz.
-    fn update_counts(&mut self) -> Option<std::time::Duration> {
+    fn update_counts(
+        &mut self,
+        dset: Option<&mut dyn ScalerDriver>,
+    ) -> Option<std::time::Duration> {
         if self.us == USER_STATE_WAITING {
             self.s = [0; MAX_SCALER_CHANNELS];
+        } else if let Some(dset) = dset {
+            let mut counts = [0u32; MAX_SCALER_CHANNELS];
+            // C ignores the read status (:572) and posts whatever its stack
+            // `counts[]` holds; the previous counts stand in for that.
+            if dset.read(&mut counts).is_ok() {
+                self.s = counts;
+            }
         }
         self.update_time();
 
@@ -461,98 +465,109 @@ impl ScalerRecord {
         }
     }
 
-    /// Whether counting has completed.
-    ///
-    /// C parity: `scalerRecord.c:367` `process()` calls `(*pdset->done)`
-    /// unconditionally; the *record* never inspects presets itself —
-    /// preset/done detection lives entirely in device support (e.g.
-    /// `drvScalerSoft.c::checkAcquireDone`). `done_flag` is the
-    /// equivalent of the dset `done()` return; the framework's device
-    /// support `read()` sets it before `process()` runs.
-    fn check_done(&self) -> bool {
-        self.done_flag
-    }
-
-    /// Build DeviceCommand actions for a count start sequence.
-    ///
-    /// C parity — `scalerRecord.c:392-432`: the REQSTART block runs
-    /// `reset()`, then the per-channel `write_preset` loop, then the
-    /// `save_pr1 != pr1` / `old_pr1 != pr1` / `old_freq != freq`
-    /// reconciliation, then `arm(1)` — all synchronously inside
-    /// `process()`. In the Rust port `process()` returns before any
-    /// `DeviceCommand` is dispatched, so the reconciliation cannot be
-    /// expressed as separate post-process `write_preset` actions: the
-    /// record would never see the driver's adjustment. The whole
-    /// write-presets + reconcile + arm sequence is therefore a single
-    /// `CMD_START_COUNT` executed by device support, which holds both
-    /// the driver and a `&mut ScalerRecord` and reproduces
-    /// `scalerRecord.c:408-432` in `handle_command`.
-    fn build_start_actions(&self) -> Vec<ProcessAction> {
-        vec![
-            ProcessAction::DeviceCommand {
-                command: CMD_RESET,
-                args: vec![],
-            },
-            ProcessAction::DeviceCommand {
-                command: CMD_START_COUNT,
-                args: vec![],
-            },
-        ]
-    }
-
-    /// Build DeviceCommand action to disarm.
-    fn build_disarm_action() -> ProcessAction {
-        ProcessAction::DeviceCommand {
-            command: CMD_ARM,
-            args: vec![EpicsValue::Long(0)],
+    /// C `(*pdset->done)(pscal)` (`scalerRecord.c:366`), read-and-clear.
+    fn dset_done(&mut self, dset: Option<&mut dyn ScalerDriver>) -> bool {
+        match dset {
+            Some(dset) => dset.done(),
+            None => std::mem::take(&mut self.done_flag),
         }
     }
 
-    /// Build actions for auto-count start.
+    /// C `(*pdset->arm)(pscal, 0)` (`scalerRecord.c:384`, `:447`). C ignores
+    /// the dset status at every call site; so does the port.
+    fn dset_disarm(dset: Option<&mut dyn ScalerDriver>) {
+        if let Some(dset) = dset {
+            let _ = dset.arm(false);
+        }
+    }
+
+    /// REQSTART count start — C `scalerRecord.c:391-433`: reset, the
+    /// gated preset writes, the PR1/TP/FREQ reconciliation against what the
+    /// driver programmed, then arm. `old_pr1` is `reqstart_old_pr1`, taken
+    /// before the `:409-410` guard, so a guard-only PR1 change still
+    /// recomputes TP (`:424`). The PR1/TP/FREQ posts (`:425-430`) are this
+    /// cycle's change detection.
+    fn dset_start_count(&mut self, dset: Option<&mut dyn ScalerDriver>) {
+        let Some(dset) = dset else { return };
+        let _ = dset.reset();
+        let old_pr1 = self.reqstart_old_pr1;
+        let save_pr1 = self.pr[0];
+        for i in 0..self.active_channels() {
+            if self.g[i] != 0 {
+                // C `write_preset` mutates `pscal->pr1` in place.
+                let programmed = dset.write_preset(i, self.pr[i]).unwrap_or(self.pr[i]);
+                if i == 0 {
+                    self.pr[0] = programmed;
+                }
+            }
+        }
+        // C:399-403 — a driver that owns its clock reports the one it chose.
+        if let Some(freq) = dset.actual_frequency() {
+            self.freq = freq;
+        }
+        // C:420-423.
+        if let Some(rewrite) = self.count_start_rewrite_preset(save_pr1) {
+            self.pr[0] = dset.write_preset(0, rewrite).unwrap_or(rewrite);
+        }
+        // C:424-428.
+        self.count_start_finalize_tp(old_pr1);
+        let _ = dset.arm(true);
+    }
+
+    /// Auto-count start — C `scalerRecord.c:508-535`. Unlike REQSTART the
+    /// user's PR1 is restored afterwards (`:532`) and TP is left alone; only a
+    /// driver-changed FREQ is adopted (posted by change detection, `:530`).
     ///
-    /// C parity — `scalerRecord.c:508-535`: like REQSTART the
-    /// auto-count `reset()` + `write_preset` + reconcile + `arm(1)`
-    /// sequence runs synchronously inside `process()`, so it cannot be
-    /// split into post-process `write_preset` actions without losing
-    /// the `save_pr1 != pr1` driver-adjustment re-write
-    /// (`scalerRecord.c:514-522`). It is dispatched as a single
-    /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
-    /// `scalerRecord.c:510-535`.
-    ///
-    /// The `D` fields are the record's, not the driver's: C sets them here in
-    /// `process()` (`:525`), exactly as it does at REQSTART (`:413`), so the
-    /// copy stays with the record and only the preset writes are dispatched.
-    fn build_autocount_actions(&mut self) -> Vec<ProcessAction> {
+    /// The `D` fields are the record's: C sets them here (`:525`) as it does
+    /// at REQSTART (`:413`).
+    fn dset_start_autocount(&mut self, dset: Option<&mut dyn ScalerDriver>) -> Vec<ProcessAction> {
         // C `scalerRecord.c:524-528` — below a millisecond, auto-count falls
         // back on the *user's* per-channel presets, so the gates decide which
-        // channels count and the directions follow them:
-        //     for (i=0; i<pscal->nch; i++) {
-        //         pdir[i] = pgate[i];
-        //         if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
-        //     }
-        // The copy is unconditional; only the preset write is gated. The
-        // `tp1 >= 1ms` branch (`:512-523`) programs channel 0 from `tp1*freq`
-        // "regardless of any presets the user may have set" (`:506-507`) and
-        // never touches `pdir`.
+        // channels count and the directions follow them. The `tp1 >= 1ms`
+        // branch (`:512-523`) programs channel 0 from `tp1*freq` "regardless
+        // of any presets the user may have set" (`:506-507`) and never touches
+        // `pdir`.
         if self.tp1 < 1.0e-3 {
             self.copy_gates_to_directions();
         }
-        let mut actions = vec![
-            ProcessAction::DeviceCommand {
-                command: CMD_RESET,
-                args: vec![],
-            },
-            ProcessAction::DeviceCommand {
-                command: CMD_AUTOCOUNT,
-                args: vec![],
-            },
-        ];
+        if let Some(dset) = dset {
+            let old_pr1 = self.pr[0];
+            let _ = dset.reset();
+            if self.tp1 >= 1.0e-3 {
+                // C:513-514 — truncating cast, not NINT.
+                let save_pr1 = self.pr[0];
+                let auto_pr1 = Self::pr1_trunc(self.tp1, self.freq);
+                self.pr[0] = dset.write_preset(0, auto_pr1).unwrap_or(auto_pr1);
+                // C:515-522 — the driver adjusted the preset (it picked a
+                // different clock): recalc from tp1 at that clock, re-write.
+                if save_pr1 != self.pr[0] {
+                    if let Some(freq) = dset.actual_frequency() {
+                        self.freq = freq;
+                    }
+                    let recalc = Self::pr1_trunc(self.tp1, self.freq);
+                    self.pr[0] = dset.write_preset(0, recalc).unwrap_or(recalc);
+                }
+            } else {
+                for i in 0..self.active_channels() {
+                    if self.g[i] != 0 {
+                        let _ = dset.write_preset(i, self.pr[i]);
+                    }
+                }
+            }
+            if let Some(freq) = dset.actual_frequency() {
+                self.freq = freq;
+            }
+            // C:532 — "Don't let autocount disturb user's channel-1 preset".
+            self.pr[0] = old_pr1;
+            let _ = dset.arm(true);
+        }
         // C scalerRecord.c:537-538 — once autocount is armed and
         // `ss = SCALER_STATE_COUNTING`, the record schedules the first
         // periodic display update via `callbackRequestDelayed(pupdateCallback,
         // 1.0/rat1)` when `rat1 > .1`. `update_counts()` has already run
         // earlier this process cycle (scalerRecord.c:453) and saw `ss !=
         // COUNTING`, so it could not queue this — emit it here directly.
+        let mut actions = Vec::new();
         if self.rat1 > 0.1 {
             let refresh = self.arm_reentry(
                 ReentryKind::DisplayRefresh,
@@ -589,12 +604,13 @@ impl ScalerRecord {
 ///
 /// `PROCESS_POSTED_FIELDS` — every `db_post_events` C's scaler makes from a
 /// PROCESS cycle, [`ScalerRecord::process_posted_fields`]: `process()` posts
-/// `CNT` (:372), `PR1` (:425, only when the count-start recompute moved it),
+/// `PR1` (:425, only when the count-start recompute moved it),
 /// `TP` (:427), `FREQ` (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T`
 /// (:588); `monitor()` posts `S1..Snch` (:771). C writes `D1..Dnch` in process
 /// (:413-414, :525-526) and posts none of them, and posts `Gn`/`PRn`(n>1) only
 /// from `special()`. Sliced to `nch`, so an absent channel's `Sn` stays out, as
-/// C's post loops are bounded by `nch`.
+/// C's post loops are bounded by `nch`. `CNT` (:372) is the one process post
+/// outside the set: it is never change-detected, only marked (`cnt_posted`).
 macro_rules! channel_tables {
     ($first:literal $($n:literal)*) => {
         static SN_FIELD_NAMES: [&str; MAX_SCALER_CHANNELS] =
@@ -610,8 +626,8 @@ macro_rules! channel_tables {
             concat!("S", $first), concat!("D", $first), concat!("G", $first)
             $(, concat!("S", $n), concat!("PR", $n), concat!("D", $n), concat!("G", $n))*
         ];
-        static PROCESS_POSTED_FIELDS: [&str; 6 + MAX_SCALER_CHANNELS] = [
-            "VAL", "T", "CNT", "PR1", "TP", "FREQ",
+        static PROCESS_POSTED_FIELDS: [&str; 5 + MAX_SCALER_CHANNELS] = [
+            "VAL", "T", "PR1", "TP", "FREQ",
             concat!("S", $first) $(, concat!("S", $n))*
         ];
     };
@@ -695,21 +711,25 @@ impl Record for ScalerRecord {
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
 
+        // The dset is held for the cycle, as C's `pdset` is.
+        let dset_cell = self.dset.clone();
+        let mut dset_guard = dset_cell.as_ref().map(|d| d.lock().unwrap());
+        let mut dset = dset_guard.as_deref_mut().map(|d| &mut **d);
+
         // C scalerRecord.c:346 — dbPutNotify completions also force the
         // long autocount hold time. The port has no putNotify plumbing
         // yet, so this stays false; kept named for C-structure parity.
         let put_notify_operation = false;
 
-        // C scalerRecord.c:367 — the record asks device support whether
+        // C scalerRecord.c:366 — the record asks device support whether
         // counting has finished (`(*pdset->done)(pscal)`) UNCONDITIONALLY,
-        // every process cycle. `done_flag` is the dset `done()` return,
-        // set by device support's read() before process() runs.
-        if self.check_done() {
-            self.done_flag = false;
+        // every process cycle.
+        if self.dset_done(dset.as_deref_mut()) {
             self.ss = SCALER_STATE_IDLE;
             // C:370 — an auto-count cycle is NOT allowed to reset CNT.
             if self.us == USER_STATE_COUNTING {
                 self.cnt = 0;
+                self.cnt_posted = true;
                 self.us = USER_STATE_IDLE;
                 just_finished_user_count = true;
             }
@@ -745,9 +765,9 @@ impl Record for ScalerRecord {
         if self.cnt != self.pcnt {
             let mut handled = false;
             if self.cnt != 0 && (self.us == USER_STATE_REQSTART || self.us == USER_STATE_WAITING) {
-                // Stop any existing auto-count via DeviceCommand
+                // C:383-386 — stop an auto-count in progress.
                 if self.ss == SCALER_STATE_COUNTING {
-                    actions.push(Self::build_disarm_action());
+                    Self::dset_disarm(dset.as_deref_mut());
                     self.ss = SCALER_STATE_IDLE;
                 }
 
@@ -772,8 +792,8 @@ impl Record for ScalerRecord {
                     // Set directions from gates (C `scalerRecord.c:413-414`)
                     self.copy_gates_to_directions();
 
-                    // Queue reset → write_presets → arm via DeviceCommands
-                    actions.extend(self.build_start_actions());
+                    // C:391-433 — reset, write presets, reconcile, arm.
+                    self.dset_start_count(dset.as_deref_mut());
                     self.ss = SCALER_STATE_COUNTING;
                     self.us = USER_STATE_COUNTING;
                     just_started_user_count = true;
@@ -781,7 +801,7 @@ impl Record for ScalerRecord {
                 }
             } else if self.cnt == 0 {
                 if self.ss != SCALER_STATE_IDLE {
-                    actions.push(Self::build_disarm_action());
+                    Self::dset_disarm(dset.as_deref_mut());
                 }
                 self.ss = SCALER_STATE_IDLE;
                 self.us = USER_STATE_IDLE;
@@ -796,7 +816,7 @@ impl Record for ScalerRecord {
         // C scalerRecord.c:453 — read and display scalers. updateCounts()
         // zeroes the display while us==WAITING, recomputes T from S1/FREQ,
         // and (while counting) schedules the next periodic update.
-        if let Some(reprocess) = self.update_counts() {
+        if let Some(reprocess) = self.update_counts(dset.as_deref_mut()) {
             let refresh = self.arm_reentry(ReentryKind::DisplayRefresh, reprocess);
             actions.push(refresh);
         }
@@ -868,7 +888,7 @@ impl Record for ScalerRecord {
                     .unwrap_or(f64::MAX);
                 if elapsed >= self.autocount_delay {
                     self.delay_start = None;
-                    actions.extend(self.build_autocount_actions());
+                    actions.extend(self.dset_start_autocount(dset.as_deref_mut()));
                     self.ss = SCALER_STATE_COUNTING;
                 } else {
                     let remaining = self.autocount_delay - elapsed;
@@ -881,7 +901,7 @@ impl Record for ScalerRecord {
                 }
             } else {
                 // dly_sec <= 0 and not WAITING: start immediately.
-                actions.extend(self.build_autocount_actions());
+                actions.extend(self.dset_start_autocount(dset));
                 self.ss = SCALER_STATE_COUNTING;
             }
         }
@@ -1376,7 +1396,12 @@ impl Record for ScalerRecord {
     /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
     /// count-start preset recompute moved it.
     fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED_FIELDS[..6 + self.active_channels()])
+        Some(&PROCESS_POSTED_FIELDS[..5 + self.active_channels()])
+    }
+
+    fn take_process_posted_fields(&mut self) -> CycleMarks {
+        static CNT_POST: [(&str, CyclePostMask); 1] = [("CNT", CyclePostMask::Value)];
+        CycleMarks::of(&CNT_POST, std::mem::take(&mut self.cnt_posted) as u64)
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that

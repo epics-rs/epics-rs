@@ -31,7 +31,7 @@ scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full st
 ### Device Support
 - **Device support** (`scaler_asyn.rs`) — bridges the scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm`, `done` operations, and exports the seven asyn `drvInfo` strings (`SCALER_RESET`, `SCALER_READ`, …) a port driver would match on. It implements `epics_base_rs`'s `DeviceSupport` directly; the crate does not depend on `asyn-rs`
 - **Software scaler** (`scaler_soft.rs`) — pure Rust simulation driver for testing (configurable count rates per channel)
-- **DeviceCommand actions** — record expresses commands as data (Reset, Arm, WritePreset) which the framework dispatches to the driver
+- **Synchronous dset** — device support binds the driver to the record at init; `process()` calls `done`/`arm`/`reset`/`write_preset`/`read` at the points C's `scalerRecord.c` does
 
 ### Database Templates (bundled)
 - `scaler.db` — base scaler record (64-channel)

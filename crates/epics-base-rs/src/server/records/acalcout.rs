@@ -107,6 +107,7 @@ use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{LINK_CON, LinkStatusGen, LinkStatusPosts, post_link_status};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
@@ -453,6 +454,9 @@ pub struct AcalcoutRecord {
     /// calcout/scalcout/transform use (see `link_status::post_link_status`).
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    // A refused CALC/OCAL put's report, made by `special()` under the put's
+    // hold and printed by the put's owner after it.
+    put_report: Option<PutReport>,
 
     // --- output link + options ---
     out: String,
@@ -559,6 +563,7 @@ impl Default for AcalcoutRecord {
             outv: LINK_CON,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             out: String::new(),
             oopt: 0,
             odly: 0.0,
@@ -994,17 +999,41 @@ impl AcalcoutRecord {
     /// which is **-1** on failure (aCalcPostfix.c:801-809), not a generic 1 and
     /// not the CALC_ERR_* code. An empty CALC is a valid empty program with
     /// status 0 (aCalcPostfix.c:439-441).
-    fn recompile_calc(&mut self) {
+    ///
+    /// Both callers, `init_record` (`:245-252`) and `special()`, follow a
+    /// refused compile with `recGblRecordError(S_db_badField, pcalc,
+    /// pmessage)`, whatever DOPT says; the `printf` after it is behind
+    /// `aCalcoutRecordDebug >= 10`. The report is returned, not printed:
+    /// `special()` runs under the put's hold.
+    fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
         let compiled = calc_compile::acalc_postfix(&self.calc);
         self.clcv = compiled.status;
         self.compiled_calc = compiled.program;
+        Self::bad_expr_report(self.clcv, pmessage)
     }
 
     /// C `aCalcoutRecord.c::special:483-490` — same, into ORPC/OCLV.
-    fn recompile_ocal(&mut self) {
+    fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
         let compiled = calc_compile::acalc_postfix(&self.ocal);
         self.oclv = compiled.status;
         self.compiled_ocal = compiled.program;
+        Self::bad_expr_report(self.oclv, pmessage)
+    }
+
+    fn bad_expr_report(status: i32, pmessage: &'static str) -> Option<PutReport> {
+        (status != 0).then_some(PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: None,
+        })
+    }
+
+    /// `init_record` is not under a put's hold, so it prints at once.
+    fn init_report(&self, report: Option<PutReport>) {
+        if let Some(report) = report {
+            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+            report.emit(name, "");
+        }
     }
 
     fn num_index(name: &str) -> Option<usize> {
@@ -1132,6 +1161,11 @@ impl Record for AcalcoutRecord {
         crate::server::record::CycleHooks::CYCLE_POSTED
             .union(crate::server::record::CycleHooks::WRITE_POSTED)
             .union(crate::server::record::CycleHooks::PROCESS_POSTED)
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
     }
 
     /// C `aCalcoutRecord.c::init_record` (:171-281) ends without touching
@@ -1159,8 +1193,10 @@ impl Record for AcalcoutRecord {
             // autosave restore can name NUSE > NELM, and the record must not
             // enter its first cycle holding it.
             self.clamp_nuse(CyclePostMask::ValueLog);
-            self.recompile_calc();
-            self.recompile_ocal();
+            let report = self.recompile_calc("acalcout: init_record: Illegal CALC field");
+            self.init_report(report);
+            let report = self.recompile_ocal("acalcout: init_record: Illegal OCAL field");
+            self.init_report(report);
         }
         Ok(())
     }
@@ -1191,11 +1227,11 @@ impl Record for AcalcoutRecord {
         }
         match field {
             "CALC" => {
-                self.recompile_calc();
+                self.put_report = self.recompile_calc("acalcout: special(): Illegal CALC field");
                 self.calc_posts = 0b01;
             }
             "OCAL" => {
-                self.recompile_ocal();
+                self.put_report = self.recompile_ocal("acalcout: special(): Illegal OCAL field");
                 self.calc_posts = 0b10;
             }
             // C `aCalcoutRecord.c:494-501`:

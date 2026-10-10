@@ -4512,14 +4512,13 @@ impl RecordInstance {
             eprintln!("post_init_finalize_undef failed for {name}: {e}");
         }
         self.common.udf = udf as u8;
-        // C `init_record` that ends in `prec->udf = 0; recGblResetAlarms(prec)`
-        // — the asyn record, defined and no-alarm the moment it loads. The born
-        // `UDF`/`INVALID` (and the UDF-severity derivation above) are overwritten
-        // here: at init `nsta`/`nsev` are 0, so `rec_gbl_reset_alarms` transfers
-        // `STAT`/`SEVR` to `NO_ALARM`. Runs after `post_init_finalize_undef` so
-        // it is the final word on this record's initial alarm state.
+        // C `init_record` that calls `recGblResetAlarms(prec)` (asyn, table).
+        // The born `UDF`/`INVALID` (and the UDF-severity derivation above) are
+        // overwritten here: at init `nsta`/`nsev` are 0, so
+        // `rec_gbl_reset_alarms` transfers `STAT`/`SEVR` to `NO_ALARM`. UDF is
+        // left to `post_init_finalize_undef`; table keeps UDF=1. Runs after it
+        // so it is the final word on this record's initial alarm state.
         if self.record.init_resets_alarms() {
-            self.common.udf = 0;
             let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common);
         }
         // C `init_record` can park a record it cannot process with `prec->pact

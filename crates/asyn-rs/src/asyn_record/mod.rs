@@ -4712,12 +4712,16 @@ impl Record for AsynRecord {
         true
     }
 
-    /// C `asynRecord.c` init_record pass 0: `pasynRec->udf = 0;
-    /// recGblResetAlarms(pasynRec)` — set unconditionally, before any connect,
-    /// so a freshly loaded asyn record is defined and no-alarm even against a
-    /// disconnected port. Without this the record shows the born
-    /// UDF/INVALID/UDF (a device-config record has no undefined-value state to
-    /// justify it). The init owner performs the reset — see
+    /// C `asynRecord.c` init_record pass 0: `pasynRec->udf = 0;` (`:303`) —
+    /// set unconditionally, before any connect, so a freshly loaded asyn
+    /// record is defined even against a disconnected port.
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        *udf = false;
+        Ok(())
+    }
+
+    /// C `asynRecord.c:304`: `recGblResetAlarms(pasynRec)`, so the record is
+    /// no-alarm at load. The init owner performs the reset — see
     /// [`Record::init_resets_alarms`].
     fn init_resets_alarms(&self) -> bool {
         true
@@ -6384,7 +6388,8 @@ mod tests {
     /// reads UDF=0 / STAT=NO_ALARM / SEVR=NO_ALARM, C `asynRecord.c`
     /// init_record pass 0's `pasynRec->udf = 0; recGblResetAlarms(pasynRec)`.
     /// Built through `IocBuilder` so the init owner's `run_init_passes` (where
-    /// [`Record::init_resets_alarms`] is honoured) actually runs — the record
+    /// `post_init_finalize_undef` and [`Record::init_resets_alarms`] are
+    /// honoured) actually runs — the record
     /// struct alone cannot reach the common UDF/STAT/SEVR fields.
     #[tokio::test]
     async fn init_resets_alarms_to_defined_no_alarm() {

@@ -4153,20 +4153,17 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Whether this record type's C `init_record` resets the record to a
-    /// defined, no-alarm state — `prec->udf = 0; recGblResetAlarms(prec)` — so
-    /// a freshly loaded, never-processed record reads `UDF=0`,
-    /// `STAT=NO_ALARM`, `SEVR=NO_ALARM` instead of the born `UDF`/`INVALID`/`1`.
+    /// Whether this record type's C `init_record` calls `recGblResetAlarms`,
+    /// so a freshly loaded, never-processed record reads `STAT=NO_ALARM`,
+    /// `SEVR=NO_ALARM` instead of the born `UDF`/`INVALID`.
     ///
     /// Almost no record does this: a not-yet-processed record is normally left
-    /// `UDF` so an `MS` consumer inherits `INVALID` at IOC startup (see
-    /// `RecordInstance::run_init_passes`). The asyn record is the exception —
-    /// `asynRecord.c` `init_record` pass 0 does `pasynRec->udf = 0;
-    /// recGblResetAlarms(pasynRec)` unconditionally, because a device-config
-    /// record is defined the moment it loads, even against a disconnected port.
-    /// `UDF` is a common field `init_record` cannot reach, so the record
-    /// declares the fact here and the init owner performs the reset. Default
-    /// `false`.
+    /// in alarm so an `MS` consumer inherits `INVALID` at IOC startup (see
+    /// `RecordInstance::run_init_passes`). asyn does (`asynRecord.c:303-304`,
+    /// after `udf = 0`), and so does table, whose init-time `monitor()`
+    /// (`tableRecord.c:405`) runs `recGblResetAlarms` (`:882`) with UDF left
+    /// at 1. This hook is the alarm reset only; a record that also clears UDF
+    /// says so through [`Record::post_init_finalize_undef`]. Default `false`.
     fn init_resets_alarms(&self) -> bool {
         false
     }
@@ -7074,11 +7071,18 @@ mod tests {
             "compress" => CycleHooks::PRE_INPUT.union(CycleHooks::WRITE_POSTED),
             "acalcout" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
-                .union(CycleHooks::PROCESS_POSTED),
+                .union(CycleHooks::PROCESS_POSTED)
+                .union(CycleHooks::PUT_REPORT),
             "mbbiDirect" | "mbboDirect" => CycleHooks::CYCLE_POSTED,
-            "calcout" | "mbbi" | "mbbo" | "lso" | "lsi" | "swait" => CycleHooks::WRITE_POSTED,
-            "transform" => CycleHooks::CYCLE_POSTED.union(CycleHooks::CONTEXT),
-            "sseq" | "scalcout" => CycleHooks::ALL,
+            "calcout" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
+            "swait" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
+            "mbbi" | "mbbo" | "lso" | "lsi" => CycleHooks::WRITE_POSTED,
+            "transform" => CycleHooks::CYCLE_POSTED
+                .union(CycleHooks::WRITE_POSTED)
+                .union(CycleHooks::CONTEXT)
+                .union(CycleHooks::PUT_REPORT),
+            "sseq" => CycleHooks::ALL,
+            "scalcout" => CycleHooks::ALL.union(CycleHooks::PUT_REPORT),
             _ => CycleHooks::NONE,
         };
         for record_type in RECORD_TYPES {

@@ -7,6 +7,7 @@ use super::link_status::{
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
@@ -232,6 +233,9 @@ pub struct CalcoutRecord {
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
     async_ctx: Option<(String, AsyncDbHandle)>,
+    // A refused CALC/OCAL put's report, made by `special()` under the put's
+    // hold and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     // Monotonic generation guarding the link-status refresh. Each refresh
     // classifies a *snapshot* of the link strings off-thread; a later
     // refresh (an INP/OUT re-point) must win over an earlier one regardless
@@ -347,22 +351,44 @@ impl Default for CalcoutRecord {
             out: crate::server::record::SparseText::default(),
             put_posts: 0,
             async_ctx: None,
+            put_report: None,
             link_gen: LinkStatusGen::default(),
         }
     }
 }
 
 impl CalcoutRecord {
-    /// C `init_record`'s report of a CALC/OCAL `postfix()` refused
-    /// (calcoutRecord.c:192-197, :200-205): `recGblRecordError(S_db_badField)`
-    /// then the `calcErrorStr` line, both naming the record.
-    fn report_bad_expr(&self, compiled: &calc_compile::CalcCompile, field: &str, expr: &str) {
-        let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-        let pmessage = match field {
-            "CALC" => "calcout: init_record: Illegal CALC field",
-            _ => "calcout: init_record: Illegal OCAL field",
-        };
-        compiled.report_in_expression(name, pmessage, field, expr);
+    /// C's CALC compile, the same in `init_record` (calcoutRecord.c:191-197)
+    /// and `special()` (`:325-333`): a refused `postfix()` writes
+    /// `recGblRecordError(S_db_badField, prec, pmessage)` then the
+    /// `calcErrorStr` line, both naming the record. Returned, not printed:
+    /// `special()` runs under the put's hold.
+    fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::postfix(&self.calc);
+        let report = compiled.put_report_in_expression(pmessage, "CALC", &self.calc);
+        self.clcv = compiled.status;
+        self.rpcl = compiled.program;
+        report
+    }
+
+    /// The OCAL half (`:199-205`, `:336-342`): reported only under DOPT
+    /// "Use OCAL"; OCLV is -1 either way.
+    fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::postfix(&self.ocal);
+        let report = compiled
+            .put_report_in_expression(pmessage, "OCAL", &self.ocal)
+            .filter(|_| self.dopt == 1);
+        self.oclv = compiled.status;
+        self.orpc = compiled.program;
+        report
+    }
+
+    /// `init_record` is not under a put's hold, so it prints at once.
+    fn init_report(&self, report: Option<PutReport>) {
+        if let Some(report) = report {
+            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+            report.emit(name, "");
+        }
     }
 
     /// The 21 `LX` advances as one step. C reaches them in `monitor`
@@ -676,6 +702,11 @@ impl Record for CalcoutRecord {
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
     }
 
     fn has_array_monitor_post(&self) -> bool {
@@ -788,19 +819,10 @@ impl Record for CalcoutRecord {
             // depended on whether the value arrived from the db file or from a
             // later put, which is not a distinction C makes. The compile is the
             // single owner of CLCV/RPCL on both paths.
-            let compiled = calc_compile::postfix(&self.calc);
-            self.report_bad_expr(&compiled, "CALC", &self.calc);
-            self.clcv = compiled.status;
-            self.rpcl = compiled.program;
-
-            // C reports a bad OCAL only under DOPT "Use OCAL" (`:200`); OCLV is
-            // -1 either way.
-            let compiled = calc_compile::postfix(&self.ocal);
-            if self.dopt == 1 {
-                self.report_bad_expr(&compiled, "OCAL", &self.ocal);
-            }
-            self.oclv = compiled.status;
-            self.orpc = compiled.program;
+            let report = self.recompile_calc("calcout: init_record: Illegal CALC field");
+            self.init_report(report);
+            let report = self.recompile_ocal("calcout: init_record: Illegal OCAL field");
+            self.init_report(report);
             self.pval = self.val;
             self.mlst = self.val;
             self.alst = self.val;
@@ -1611,16 +1633,12 @@ impl Record for CalcoutRecord {
         // calc carries it in the put status.
         match field {
             "CALC" => {
-                let compiled = calc_compile::postfix(&self.calc);
-                self.clcv = compiled.status;
-                self.rpcl = compiled.program;
+                self.put_report = self.recompile_calc("calcout: special(): Illegal CALC field");
                 self.put_posts = 1 << CLCV_POST;
                 return Ok(());
             }
             "OCAL" => {
-                let compiled = calc_compile::postfix(&self.ocal);
-                self.oclv = compiled.status;
-                self.orpc = compiled.program;
+                self.put_report = self.recompile_ocal("calcout: special(): Illegal OCAL field");
                 self.put_posts = 1 << (CLCV_POST + 1);
                 return Ok(());
             }

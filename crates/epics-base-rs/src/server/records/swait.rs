@@ -4,6 +4,7 @@ use crate::calc::NumericInputs;
 use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
@@ -180,6 +181,9 @@ pub struct SwaitRecord {
     // one issued may publish.
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    // A refused CALC put's report, made by `special()` under the put's hold
+    // and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -231,6 +235,7 @@ impl Default for SwaitRecord {
             simulation_active: false,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
@@ -263,12 +268,14 @@ impl SwaitRecord {
 
     /// C `recGblRecordError(S_db_badField, pwait, pmessage)` on a CALC
     /// `postfix()` refused (swaitRecord.c:305-307, :562-564); swait writes no
-    /// `calcErrorStr` line.
-    fn report_bad_calc(&self, pmessage: &str) {
-        if self.clcv != 0 {
-            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-            crate::server::recgbl::rec_gbl_record_error("Illegal field value", name, pmessage);
-        }
+    /// `calcErrorStr` line. Returned, not printed: `special()` runs under the
+    /// put's hold.
+    fn bad_calc_report(&self, pmessage: &'static str) -> Option<PutReport> {
+        (self.clcv != 0).then_some(PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: None,
+        })
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
@@ -463,6 +470,11 @@ impl Record for SwaitRecord {
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
     }
 
     /// C `swaitRecord.c::init_record` (:266-) ends without touching
@@ -513,7 +525,11 @@ impl Record for SwaitRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.recompile();
-            self.report_bad_calc("swait:init_record: Illegal CALC field");
+            // Not under a put's hold, so it prints at once.
+            if let Some(report) = self.bad_calc_report("swait:init_record: Illegal CALC field") {
+                let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+                report.emit(name, "");
+            }
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
             self.initialized = true;
         }
@@ -548,7 +564,7 @@ impl Record for SwaitRecord {
         }
         self.calc_post = field == "CALC";
         if self.calc_post {
-            self.report_bad_calc("swaitRecord:special: Illegal CALC field");
+            self.put_report = self.bad_calc_report("swaitRecord:special: Illegal CALC field");
         }
         Ok(())
     }

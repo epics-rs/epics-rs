@@ -14,6 +14,7 @@ use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::{PutReport, ReportTail};
 
 /// Code version reported by `VERS` (C `sCalcoutRecord.c:55 #define VERSION 4.1`).
 const VERSION: f64 = 4.1;
@@ -185,6 +186,9 @@ pub struct ScalcoutRecord {
     /// calcout/transform use (see `link_status::post_link_status`).
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    // A refused CALC/OCAL put's report, made by `special()` under the put's
+    // hold and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     /// CLCV (bit 0) / OCLV (bit 1) owed by the last CALC/OCAL `special()`.
     calc_posts: u64,
 }
@@ -220,6 +224,7 @@ impl Default for ScalcoutRecord {
             out_status: LINK_CON,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             calc_posts: 0,
             num_vals: [0.0; 12],
             str_vals: Default::default(),
@@ -433,27 +438,44 @@ impl ScalcoutRecord {
     /// status in CLCV. An empty CALC compiles to an empty program with status 0
     /// (sCalcPostfix.c:432-434) — unlike base `postfix()`, which calls it
     /// CALC_ERR_NULL_ARG.
-    fn recompile_calc(&mut self) {
+    fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
         let compiled = calc_compile::scalc_postfix(&self.calc);
+        let report = Self::bad_expr_report(compiled.error_number(), pmessage);
         self.clcv = compiled.status;
         self.compiled_calc = compiled.program;
+        report
     }
 
     /// C `sCalcoutRecord.c::special:474-481` — same, into ORPC/OCLV.
-    fn recompile_ocal(&mut self) {
+    fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
         let compiled = calc_compile::scalc_postfix(&self.ocal);
+        let report = Self::bad_expr_report(compiled.error_number(), pmessage);
         self.oclv = compiled.status;
         self.compiled_ocal = compiled.program;
+        report
     }
 
-    /// C `init_record`'s report of a CALC/OCAL `sCalcPostfix()` refused
-    /// (sCalcoutRecord.c:291-302): `recGblRecordError`, then the raw
-    /// `error_number` on stdout, not through errlog.
-    fn report_bad_expr(&self, compiled: &calc_compile::CalcCompile, pmessage: &str) {
-        let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
-        compiled.report_record_error(name, pmessage);
-        if let Some(n) = compiled.error_number() {
-            println!("sCalcPostfix returns: {n}");
+    /// C's report of a CALC/OCAL `sCalcPostfix()` refused, the same in
+    /// `init_record` (sCalcoutRecord.c:291-302) and `special()` (`:465-480`)
+    /// whatever DOPT says: `recGblRecordError`, then the raw
+    /// `error_number` on stdout, not through errlog. Returned, not printed:
+    /// `special()` runs under the put's hold.
+    fn bad_expr_report(error_number: Option<i16>, pmessage: &'static str) -> Option<PutReport> {
+        error_number.map(|number| PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: Some(ReportTail::PostfixReturns {
+                routine: "sCalcPostfix",
+                number,
+            }),
+        })
+    }
+
+    /// `init_record` is not under a put's hold, so it prints at once.
+    fn init_report(&self, report: Option<PutReport>) {
+        if let Some(report) = report {
+            let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+            report.emit(name, "");
         }
     }
 
@@ -657,6 +679,14 @@ impl Record for ScalcoutRecord {
         "scalcout"
     }
 
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::ALL.union(crate::server::record::CycleHooks::PUT_REPORT)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
+
     /// The link-status menus (INAV..INLV, IAAV..ILLV, OUTV) are served read-only
     /// by `get_field`, but the record owns no WRITE path for them — they are
     /// `SPC_NOMOD`, derived from the link (see `Self::is_link_status_field`).
@@ -679,14 +709,10 @@ impl Record for ScalcoutRecord {
     /// does. Unlike calcout, a bad OCAL is reported whatever DOPT says.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            let compiled = calc_compile::scalc_postfix(&self.calc);
-            self.report_bad_expr(&compiled, "scalcout: init_record: Illegal CALC field");
-            self.clcv = compiled.status;
-            self.compiled_calc = compiled.program;
-            let compiled = calc_compile::scalc_postfix(&self.ocal);
-            self.report_bad_expr(&compiled, "scalcout: init_record: Illegal OCAL field");
-            self.oclv = compiled.status;
-            self.compiled_ocal = compiled.program;
+            let report = self.recompile_calc("scalcout: init_record: Illegal CALC field");
+            self.init_report(report);
+            let report = self.recompile_ocal("scalcout: init_record: Illegal OCAL field");
+            self.init_report(report);
         }
         Ok(())
     }
@@ -701,11 +727,11 @@ impl Record for ScalcoutRecord {
         }
         match field {
             "CALC" => {
-                self.recompile_calc();
+                self.put_report = self.recompile_calc("scalcout: special(): Illegal CALC field");
                 self.calc_posts = 0b01;
             }
             "OCAL" => {
-                self.recompile_ocal();
+                self.put_report = self.recompile_ocal("scalcout: special(): Illegal OCAL field");
                 self.calc_posts = 0b10;
             }
             _ => {}

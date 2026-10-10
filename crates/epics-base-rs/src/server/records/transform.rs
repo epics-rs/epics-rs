@@ -11,6 +11,7 @@ use super::link_status::{
     LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -18,6 +19,14 @@ const NUM_CHANNELS: usize = 16; // A-P
 /// walks (`transformRecord.c:797-806`) and the only fields it posts.
 const CHANNEL_FIELDS: &[&str] = &[
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+];
+
+/// [`CHANNEL_FIELDS`], then the sixteen CLCx compile statuses `special()`
+/// posts (`transformRecord.c:691-693`): the post table, bit `i` per entry.
+const POSTED_FIELDS: &[&str] = &[
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "CAV", "CBV",
+    "CCV", "CDV", "CEV", "CFV", "CGV", "CHV", "CIV", "CJV", "CKV", "CLV", "CMV", "CNV", "COV",
+    "CPV",
 ];
 
 /// C `transformRecord.c:210` `#define COMMENT_SIZE 39` — the `CMTx` field width
@@ -131,6 +140,9 @@ pub struct TransformRecord {
     /// refresh, because their field sets are not one enum per link.
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    /// A refused CLCx's report, made by `recompile` and printed by
+    /// `init_record` or, for a put, by the put's owner after the hold.
+    put_report: Option<PutReport>,
     /// C `transformRecord.c:807` `prpvt->firstCalcPosted`. `rpvt` is
     /// `calloc`'d in `init_record`, `monitor()` sets this to 1
     /// UNCONDITIONALLY after its post loop (`:807`), and nothing ever clears
@@ -142,8 +154,12 @@ pub struct TransformRecord {
     first_calc_posted: bool,
     /// The channels `monitor()` posts this cycle (`:797-806`), bit `i` for
     /// channel `i`, decided where `l* = *` is committed and TAKEN by
-    /// [`Record::take_cycle_posted_fields`].
-    posts: u16,
+    /// [`Record::take_cycle_posted_fields`]; bit `16 + i` is CLCx's status.
+    posts: u32,
+    /// CAV..CPV, C's `pcalcInvalid`: `sCalcPostfix()`'s 0/-1 for each CLCx,
+    /// 0 for an empty one. Written by [`Self::recompile`] and by a client put
+    /// (the fields carry no `special`).
+    cav: [i32; NUM_CHANNELS],
 }
 
 impl Default for TransformRecord {
@@ -171,8 +187,10 @@ impl Default for TransformRecord {
             out_status: [LINK_CON; NUM_CHANNELS],
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             first_calc_posted: false,
             posts: 0,
+            cav: [0; NUM_CHANNELS],
         }
     }
 }
@@ -192,13 +210,38 @@ impl TransformRecord {
     /// C's `postfix_ok = *pclcbuf && (*prpcbuf != BAD_EXPRESSION)` (`:585`): an
     /// EMPTY CLCx is not compiled and not evaluated — which is why the empty
     /// case is `None` rather than sCalc's empty-but-valid program.
-    fn recompile(&mut self, idx: usize) {
-        if self.calcs[idx].is_empty() {
+    ///
+    /// Both callers, `init_record` (`:481-487`) and `special()` (`:684-689`),
+    /// follow a refused non-empty CLCx with `recGblRecordError(S_db_badField,
+    /// ptran, pmessage)`, left in `put_report` rather than printed because
+    /// `special()` runs under the put's hold. The status lands in CAV..CPV
+    /// (`:476-482`, `:676-692`); returns whether it changed, which
+    /// `special()` posts.
+    fn recompile(&mut self, idx: usize, pmessage: &'static str) -> bool {
+        let status = if self.calcs[idx].is_empty() {
             self.compiled[idx] = None;
+            0
         } else {
             let converted = self.convert_expression(&self.calcs[idx]);
             self.compiled[idx] = scalc_compile(&converted).ok();
-        }
+            if self.compiled[idx].is_some() {
+                0
+            } else {
+                self.put_report = Some(PutReport::RecordError {
+                    status: "Illegal field value",
+                    message: pmessage,
+                    then: None,
+                });
+                -1
+            }
+        };
+        std::mem::replace(&mut self.cav[idx], status) != status
+    }
+
+    fn calc_valid_index(name: &str) -> Option<usize> {
+        POSTED_FIELDS[NUM_CHANNELS..]
+            .iter()
+            .position(|f| *f == name)
     }
 
     /// C `convertExpression` (`transformRecord.c:384-390`): shortcuts first,
@@ -538,7 +581,13 @@ impl Record for TransformRecord {
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::CYCLE_POSTED
+            .union(crate::server::record::CycleHooks::WRITE_POSTED)
             .union(crate::server::record::CycleHooks::CONTEXT)
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
     }
 
     /// The one field C's `get_precision` names. Every other field takes
@@ -564,15 +613,18 @@ impl Record for TransformRecord {
     /// C compiles every CLCx in `init_record`, AFTER the whole record has
     /// loaded and after one `getMacros` over the final CMTx set
     /// (`transformRecord.c:426`, then `convertExpression`/`sCalcPostfix` per
-    /// channel at `:481-482`). `put_field` compiling on the way in — the port's
-    /// stand-in for C's `special()` — is correct for a runtime put but makes
-    /// the LOAD order-dependent: a `.db` naming `CLCB` above `CMTA` would
-    /// compile the expression before its macro exists. Re-establishing the
-    /// whole set here, once, is what makes the order irrelevant, as it is on C.
+    /// channel at `:481-482`), so a `.db` naming `CLCB` above `CMTA` still
+    /// sees the macro. `put_field` only stores; a runtime put compiles in
+    /// `special()`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
             for i in 0..NUM_CHANNELS {
-                self.recompile(i);
+                self.recompile(i, "transform: init_record: Illegal CALC field");
+                // Not under a put's hold, so it prints at once.
+                if let Some(report) = self.put_report.take() {
+                    let name = self.async_ctx.as_ref().map_or("Unknown", |(n, _)| n);
+                    report.emit(name, "");
+                }
             }
         }
         Ok(())
@@ -779,7 +831,7 @@ impl Record for TransformRecord {
         // C's own test, `*pnew != *pprev || firstCalcPosted == 0`: against LA,
         // not against what was last published, so a pp put to A posts from
         // dbPut and again from its cycle.
-        let mut posts = 0u16;
+        let mut posts = 0u32;
         for i in 0..NUM_CHANNELS {
             if self.vals[i] != self.lvals[i] || !self.first_calc_posted {
                 posts |= 1 << i;
@@ -830,6 +882,9 @@ impl Record for TransformRecord {
         }
         if let Some(idx) = Self::cmt_field_index(name) {
             return Some(EpicsValue::String(self.cmts[idx].clone().into()));
+        }
+        if let Some(idx) = Self::calc_valid_index(name) {
+            return Some(EpicsValue::Long(self.cav[idx]));
         }
         if let Some(idx) = Self::inp_field_index(name) {
             return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
@@ -899,12 +954,21 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::calc_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
+                    // Stored only: C compiles in `special()`, after `dbPut`
+                    // has stored the string, and `init_record` compiles the
+                    // loaded set.
                     self.calcs[idx] = s.as_str_lossy().into_owned();
-                    self.recompile(idx);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
             }
+        }
+        if let Some(idx) = Self::calc_valid_index(name) {
+            self.cav[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                as i32;
+            return Ok(());
         }
         if let Some(idx) = Self::cmt_field_index(name) {
             match value {
@@ -981,6 +1045,11 @@ impl Record for TransformRecord {
             // so a put to VAL marks nothing — it is not a channel.
             if let Some(i) = Self::channel_index(field) {
                 self.map[i] = true;
+            }
+            if let Some(i) = Self::calc_field_index(field)
+                && self.recompile(i, "transform:special: Illegal CALC field")
+            {
+                self.posts |= 1 << (NUM_CHANNELS + i);
             }
             // C `transformRecord.c:709-742` re-classifies the link a put just
             // re-pointed, over the whole INPA..OUTP range, and posts that
@@ -1095,14 +1164,12 @@ impl Record for TransformRecord {
     }
 
     /// `monitor()`'s A..P posts, with C's literal `DBE_VALUE|DBE_LOG` (`:794`)
-    /// overwriting `recGblResetAlarms`'s mask.
+    /// overwriting `recGblResetAlarms`'s mask, and `special()`'s CAV..CPV post
+    /// (`:693`), the same mask.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
-        static CHANNEL_POSTS: [(&str, CyclePostMask); CHANNEL_FIELDS.len()] =
-            crate::server::record::uniform_post_table(CHANNEL_FIELDS, CyclePostMask::ValueLog);
-        crate::server::record::CycleMarks::of(
-            &CHANNEL_POSTS,
-            std::mem::take(&mut self.posts) as u64,
-        )
+        static POSTS: [(&str, CyclePostMask); POSTED_FIELDS.len()] =
+            crate::server::record::uniform_post_table(POSTED_FIELDS, CyclePostMask::ValueLog);
+        crate::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut self.posts) as u64)
     }
 
     /// C keeps LA..LP and never compares against the published value.
@@ -1215,6 +1282,12 @@ mod tests {
     use crate::server::record::CommonFields;
     use crate::server::record::FieldDeclaration;
 
+    /// A CLCx `dbPut`: the store, then `special(field, 1)`, which compiles.
+    fn put_calc(rec: &mut TransformRecord, field: &str, value: EpicsValue) {
+        rec.put_field(field, value).unwrap();
+        rec.special(field, true).unwrap();
+    }
+
     #[test]
     fn link_status_fields_read_derived_constant_and_reject_put() {
         use crate::server::record::RecordInstance;
@@ -1263,8 +1336,7 @@ mod tests {
         rec.put_field("INPA", EpicsValue::String("2".into()))
             .unwrap();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCA", EpicsValue::String("A+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("A+1".into()));
         ioc_init(&mut rec);
         rec.process().unwrap();
         assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
@@ -1338,8 +1410,7 @@ mod tests {
     #[test]
     fn r9_63_calc_failure_raises_calc_alarm_and_udf() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()));
         rec.process().unwrap();
 
         assert!(
@@ -1369,13 +1440,11 @@ mod tests {
     #[test]
     fn r9_63_calc_success_clears_the_previous_failure() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()));
         rec.process().unwrap();
         assert!(rec.value_is_undefined());
 
-        rec.put_field("CLCA", EpicsValue::String("5".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("5".into()));
         rec.process().unwrap();
         assert!(
             !rec.value_is_undefined(),
@@ -1410,8 +1479,7 @@ mod tests {
     #[test]
     fn test_transform_put_get_calc() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("B+C".into()));
         assert_eq!(
             rec.get_field("CLCA"),
             Some(EpicsValue::String("B+C".into()))
@@ -1444,10 +1512,8 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("B", EpicsValue::Double(1.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(100.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("VAL*2".into()))
-            .unwrap();
-        rec.put_field("CLCC", EpicsValue::String("VAL+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("VAL*2".into()));
+        put_calc(&mut rec, "CLCC", EpicsValue::String("VAL+1".into()));
         ioc_init(&mut rec);
 
         // Each CLCx evaluates against its own channel's value: a single
@@ -1465,8 +1531,7 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("B", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(4.0)).unwrap();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("B+C".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 7.0); // A = B+C = 3+4 = 7
     }
@@ -1475,10 +1540,8 @@ mod tests {
     fn test_transform_process_chain() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
-            .unwrap();
-        rec.put_field("CLCC", EpicsValue::String("B+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*3".into()));
+        put_calc(&mut rec, "CLCC", EpicsValue::String("B+1".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0); // B = A*3 = 6
         assert_eq!(rec.vals[2], 7.0); // C = B+1 = 7 (uses updated B)
@@ -1511,8 +1574,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(5.0)).unwrap();
         rec.put_field("IVLA", EpicsValue::Short(0)).unwrap();
         // CLCA has no valid calc (empty), CLCB evaluates
-        rec.put_field("CLCB", EpicsValue::String("A+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A+1".into()));
         ioc_init(&mut rec);
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // A unchanged
@@ -1558,14 +1620,12 @@ mod tests {
     fn test_transform_recompile_on_calc_change() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*2".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*2".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 4.0);
 
         // Change calc expression
-        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*3".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0);
     }
@@ -1581,8 +1641,7 @@ mod tests {
     #[test]
     fn r9_62_val_is_a_constant_zero_dummy_not_channel_a() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("42".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("42".into()));
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("A"),
@@ -1609,8 +1668,7 @@ mod tests {
             Some(EpicsValue::Double(0.0)),
             "a put to VAL must not land in channel A"
         );
-        rec.put_field("CLCA", EpicsValue::String("3".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("3".into()));
         rec.process().unwrap();
         assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
         assert_eq!(

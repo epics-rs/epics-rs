@@ -3355,6 +3355,13 @@ impl Record for TableRecord {
         Ok(())
     }
 
+    /// C `init_record` ends in `monitor(ptbl)` (`tableRecord.c:405`), whose
+    /// `recGblResetAlarms` (`:882`) clears the born UDF/INVALID with no
+    /// `checkAlarms` before it; UDF stays 1 until `process()` (`:437`).
+    fn init_resets_alarms(&self) -> bool {
+        true
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }
@@ -5424,6 +5431,37 @@ mod menu_choice_tests {
         );
         assert_eq!(menu("AUNIT"), Some(&["degrees", "ur"][..]));
         assert_eq!(menu("VAL"), None);
+    }
+}
+
+#[cfg(test)]
+mod init_alarm_tests {
+    use super::TableRecord;
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::types::EpicsValue;
+    use std::collections::HashMap;
+
+    /// oracleTableIoc `table.db` (one default table): after iocInit `T.UDF`
+    /// reads 1 and `T.STAT`/`T.SEVR` read NO_ALARM, and a `caput T.SSET 1`
+    /// leaves them so — `init_record`'s `monitor()` (`tableRecord.c:405`)
+    /// runs `recGblResetAlarms` (`:882`) without `checkAlarms`.
+    #[tokio::test]
+    async fn init_resets_alarms_but_keeps_udf() {
+        let (db, _autosave) = IocBuilder::new()
+            .register_record_type("table", || Box::new(TableRecord::default()))
+            .db_string("record(table, \"T\") {}\n", &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("T", "SSET", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        let rec = db.get_record("T").expect("table record loaded");
+        let inst = rec.read();
+        assert_eq!(inst.get_common_field("UDF"), Some(EpicsValue::UChar(1)));
+        assert_eq!(inst.get_common_field("STAT"), Some(EpicsValue::Short(0)));
+        assert_eq!(inst.get_common_field("SEVR"), Some(EpicsValue::Short(0)));
     }
 }
 

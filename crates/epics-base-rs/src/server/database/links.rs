@@ -2493,8 +2493,8 @@ impl PvDatabase {
         // OUTPUT-side twin of the `read_db_link_value` locality fallback.
         if addr.is_none() && !self.has_name_no_resolve(&target.record) {
             let external = link.pvname();
-            if let Err(e) = self.write_external_pv(&external, value, src.notify) {
-                eprintln!("OUT-link write to external PV '{external}' failed: {e}");
+            if let Err(refusal) = self.write_external_pv(&external, value, src.notify) {
+                refusal.report(&external);
                 return true;
             }
             return false;
@@ -2621,25 +2621,23 @@ impl PvDatabase {
     fn external_put_gate<'a>(
         &self,
         name: &'a str,
-    ) -> Result<(super::link_put_queue::LinkTarget, &'a str), String> {
+    ) -> Result<(super::link_put_queue::LinkTarget, &'a str), ExternalPutRefusal> {
         use super::link_put_queue::LinkTarget;
         use super::link_set::PutAdmission;
 
         let (target, body, lsets) = if let Some(rest) = name.strip_prefix("pva://") {
-            let lset = self
-                .inner
-                .link_sets
-                .load()
-                .get("pva")
-                .ok_or_else(|| format!("no 'pva' link set registered for '{name}'"))?;
+            let lset = self.inner.link_sets.load().get("pva").ok_or_else(|| {
+                ExternalPutRefusal::Unserviceable(format!(
+                    "no 'pva' link set registered for '{name}'"
+                ))
+            })?;
             (LinkTarget::Scheme("pva".to_string()), rest, vec![lset])
         } else if let Some(rest) = name.strip_prefix("ca://") {
-            let lset = self
-                .inner
-                .link_sets
-                .load()
-                .get("ca")
-                .ok_or_else(|| format!("no 'ca' link set registered for '{name}'"))?;
+            let lset = self.inner.link_sets.load().get("ca").ok_or_else(|| {
+                ExternalPutRefusal::Unserviceable(format!(
+                    "no 'ca' link set registered for '{name}'"
+                ))
+            })?;
             (LinkTarget::Scheme("ca".to_string()), rest, vec![lset])
         } else {
             // Bare name — every registered lset is a candidate, first
@@ -2647,7 +2645,9 @@ impl PvDatabase {
             // bare-name path).
             let lsets = self.registered_link_sets();
             if lsets.is_empty() {
-                return Err(format!("no link set registered for external link '{name}'"));
+                return Err(ExternalPutRefusal::Unserviceable(format!(
+                    "no link set registered for external link '{name}'"
+                )));
             }
             (LinkTarget::Any, name, lsets)
         };
@@ -2663,11 +2663,11 @@ impl PvDatabase {
         // worker unconditionally and blocks until it has started
         // (`db/dbCa.c:322` (`dbCaLinkInitImpl`), `:342`, `:344`; R7.0.10).
         if self.inner.link_puts.network().is_none() {
-            return Err(format!(
+            return Err(ExternalPutRefusal::Unserviceable(format!(
                 "external link '{name}' refused the write: this database was \
                  built with no tokio runtime, so no link set can reach the \
                  network"
-            ));
+            )));
         }
 
         // A link that is known-down refuses the put and stages nothing, so the
@@ -2688,18 +2688,14 @@ impl PvDatabase {
             }
         }
         if admission == PutAdmission::Refused {
-            return Err(format!(
-                "external link '{name}' refused the write: not connected, or \
-                 connected without write access (db/dbCa.c:529-532 \
-                 (dbCaPutLinkCallback))"
-            ));
+            return Err(ExternalPutRefusal::NotConnected);
         }
         Ok((target, body))
     }
 
     /// Ask [`Self::external_put_gate`] on its own, staging nothing: `Ok` iff a
     /// put to `name` would be issued right now.
-    pub(crate) fn external_put_admitted(&self, name: &str) -> Result<(), String> {
+    pub(crate) fn external_put_admitted(&self, name: &str) -> Result<(), ExternalPutRefusal> {
         self.external_put_gate(name).map(|_| ())
     }
 
@@ -2763,7 +2759,7 @@ impl PvDatabase {
         name: &str,
         value: EpicsValue,
         src_notify: Option<&Arc<NotifyWaitSet>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExternalPutRefusal> {
         let op = Self::external_put_op(src_notify);
         use super::link_put_queue::LinkKey;
 
@@ -3197,8 +3193,8 @@ impl PvDatabase {
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 match self.write_external_pv(&name, value, src.notify) {
                     Ok(()) => false,
-                    Err(e) => {
-                        eprintln!("OUT-link write to external PV '{name}' failed: {e}");
+                    Err(refusal) => {
+                        refusal.report(&name);
                         true
                     }
                 }
@@ -5601,7 +5597,7 @@ mod no_reactor_gate_tests {
             .external_put_admitted("ca://SOME:PV")
             .expect_err("a database with no reactor must refuse the external put");
         assert!(
-            err.contains("no tokio runtime"),
+            err.to_string().contains("no tokio runtime"),
             "the refusal must name the missing reactor, got: {err}"
         );
     }
@@ -6231,4 +6227,36 @@ fn external_cp_key(pv: &str) -> &str {
     pv.strip_prefix("ca://")
         .or_else(|| pv.strip_prefix("pva://"))
         .unwrap_or(pv)
+}
+/// Why [`PvDatabase::write_external_pv`] staged nothing.
+#[derive(Debug)]
+pub(crate) enum ExternalPutRefusal {
+    /// The link is down or read-only: C `dbCaPutLinkCallback`'s silent `-1`
+    /// (`db/dbCa.c:558-560`). The record's LINK alarm is the whole report.
+    NotConnected,
+    /// No link set or reactor can carry the write, a state C cannot reach.
+    Unserviceable(String),
+}
+
+impl ExternalPutRefusal {
+    /// What the refusal owes the errlog: nothing for a down link, as in C.
+    pub(crate) fn report(&self, name: &str) {
+        if let Self::Unserviceable(why) = self {
+            crate::runtime::log::errlog_printf(&format!(
+                "OUT-link write to external PV '{name}' failed: {why}\n"
+            ));
+        }
+    }
+}
+
+impl std::fmt::Display for ExternalPutRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str(
+                "not connected, or connected without write access \
+                 (db/dbCa.c:558-560 (dbCaPutLinkCallback))",
+            ),
+            Self::Unserviceable(why) => f.write_str(why),
+        }
+    }
 }

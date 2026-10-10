@@ -627,7 +627,7 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
          tokio runtime, so no link set can reach the network",
         key.name
     );
-    eprintln!("dbCa: {msg}");
+    crate::runtime::log::errlog_printf(&format!("dbCa: {msg}\n"));
     if let Some(c) = staged.completion {
         c.resolve(Err(msg));
     }
@@ -664,9 +664,16 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
     // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
     // (`dbCa.c:1161-1183`). The record has already returned; its alarm came
-    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does.
-    if let Err(e) = &result {
-        eprintln!("dbCa: external link put to '{}' failed: {e}", key.name);
+    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does. A link
+    // that went down after staging says nothing: the task skips it with
+    // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
+    if let Err(e) = &result
+        && lsets.iter().any(|lset| lset.is_connected(&key.name))
+    {
+        crate::runtime::log::errlog_printf(&format!(
+            "dbCa: external link put to '{}' failed: {e}\n",
+            key.name
+        ));
     }
     if let Some(c) = completion {
         c.resolve(result);

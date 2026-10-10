@@ -73,14 +73,23 @@ pub fn epid_record_factory() -> (&'static str, epics_base_rs::server::RecordFact
 
 /// Hand std's generated `.dbd` to base, C's `dbLoadDatabase` of it: the
 /// record types and menus the dbStatic reports walk, and the `device()` menus
-/// base's DTYP choice lists append. Idempotent: base dedups a repeat.
+/// of std's own record types. Idempotent: base dedups a repeat.
+///
+/// The `device()` lines std adds to base's types (`devTimeOfDay.dbd`'s ai and
+/// stringin) arrive with the factories that serve them instead, because a
+/// type's DTYP index is the order its lines arrive: registered here, they
+/// would land before asyn's whenever the record types are registered first.
 pub fn register_std_dbd() {
-    use records::dbd_generated::{DBD, DEVICE_MENU_RECORD_TYPES, device_link_types};
+    use records::dbd_generated::{DBD, RECORD_TYPES};
     epics_base_rs::server::record::register_contributed_dbd(&DBD);
-    for &record_type in DEVICE_MENU_RECORD_TYPES {
-        if let Some(rows) = device_link_types(record_type) {
-            epics_base_rs::server::record::register_device_menu(record_type, rows);
-        }
+    for &record_type in RECORD_TYPES {
+        register_std_device_rows(record_type);
+    }
+}
+
+fn register_std_device_rows(record_type: &str) {
+    if let Some(rows) = records::dbd_generated::device_link_types(record_type) {
+        epics_base_rs::server::record::register_device_menu(record_type, rows);
     }
 }
 
@@ -121,6 +130,7 @@ pub fn register_std_record_types() {
 pub fn sec_past_epoch_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory)
 {
     register_std_dbd();
+    register_std_device_rows("ai");
     (
         "Sec Past Epoch",
         Box::new(|| Box::new(SecPastEpochDeviceSupport::new())),
@@ -131,6 +141,7 @@ pub fn sec_past_epoch_device_factory() -> (&'static str, epics_base_rs::server::
 /// `devTimeOfDay.c` (`devSiTodString`) for injection into a builder.
 pub fn time_of_day_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory) {
     register_std_dbd();
+    register_std_device_rows("stringin");
     (
         "Time of Day",
         Box::new(|| Box::new(TimeOfDayStringDeviceSupport::new())),

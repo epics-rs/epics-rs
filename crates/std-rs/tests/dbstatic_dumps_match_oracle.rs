@@ -14,6 +14,8 @@ use epics_base_rs::server::iocsh::IocShell;
 // feeds `BlockingBridge::capture` for the shell; no CA server is built.
 fn shell() -> IocShell {
     std_rs::register_std_dbd();
+    // devTimeOfDay.dbd's ai/stringin lines arrive with the supports it serves.
+    let _ = std_rs::std_device_supports();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bridge = {
         let _guard = rt.enter();

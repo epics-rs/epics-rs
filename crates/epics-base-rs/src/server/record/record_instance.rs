@@ -2028,26 +2028,107 @@ impl PutAddr {
     }
 }
 
-/// A `last_posted` entry: the value last published to the field, and the
-/// field's declaration, settled when the field was first published so the
-/// monitor walk reads it without a name scan. `upper`: the key is already
-/// upper-case, as [`RecordInstance::resolve_field_upper_at`] needs.
-/// `prev_bit`: the field's bit in [`Record::prev_compared_inputs`], settled
-/// with the entry so the walk never searches that list. `name`: the declared
-/// name when it is the key exactly, so a post borrows it instead of copying
-/// the key. `posted`: the field's membership in
-/// [`Record::process_posted_fields`], with the list it was settled against —
-/// trusted only while the record answers that same list, since aSub's
-/// changes with EFLG.
-#[derive(Debug)]
-struct Published {
-    value: EpicsValue,
-    desc: Option<&'static FieldDesc>,
-    name: Option<&'static str>,
-    upper: bool,
-    prev_bit: Option<u8>,
-    posted: Option<(&'static [&'static str], bool)>,
+/// The one owner of every `last_posted` entry's `posted`: [`PostedSet`]
+/// alone writes the bit. Readers settle first through
+/// [`RecordInstance::settle_posted`]; a proof value carried into the walk's
+/// per-entry read cost ao's monitor_cycle 5 instructions per cycle.
+mod posted {
+    use super::*;
+
+    /// A `last_posted` entry: the value last published to the field, and the
+    /// field's declaration, settled when the field was first published so the
+    /// monitor walk reads it without a name scan. `upper`: the key is already
+    /// upper-case, as [`RecordInstance::resolve_field_upper_at`] needs.
+    /// `prev_bit`: the field's bit in [`Record::prev_compared_inputs`], settled
+    /// with the entry so the walk never searches that list. `name`: the
+    /// declared name when it is the key exactly, so a post borrows it instead
+    /// of copying the key.
+    #[derive(Debug)]
+    pub(super) struct Published {
+        pub(super) value: EpicsValue,
+        pub(super) desc: Option<&'static FieldDesc>,
+        pub(super) name: Option<&'static str>,
+        pub(super) upper: bool,
+        pub(super) prev_bit: Option<u8>,
+        posted: bool,
+    }
+
+    impl Published {
+        /// The field's membership in the list of the last settle.
+        #[inline(always)]
+        pub(super) fn posted(&self) -> bool {
+            self.posted
+        }
+    }
+
+    /// The [`Record::process_posted_fields`] answer every entry's `posted` was
+    /// settled against, and the deadband field's membership in it, which
+    /// [`RecordInstance::deadband_post`] reads; that field keeps no
+    /// `last_posted` entry.
+    #[derive(Debug)]
+    pub(super) struct PostedSet {
+        list: Option<&'static [&'static str]>,
+        deadband: bool,
+    }
+
+    impl PostedSet {
+        pub(super) const fn new() -> Self {
+            Self {
+                list: None,
+                deadband: true,
+            }
+        }
+
+        /// A new entry, its membership taken from the list every other entry
+        /// was settled against, so the next settle moves it with them.
+        pub(super) fn publish(
+            &self,
+            field: &str,
+            value: EpicsValue,
+            desc: Option<&'static FieldDesc>,
+            prev_bit: Option<u8>,
+        ) -> Published {
+            Published {
+                value,
+                desc,
+                name: desc.map(|d| d.name).filter(|name| *name == field),
+                upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
+                prev_bit,
+                posted: self.list.is_some_and(|list| list.contains(&field)),
+            }
+        }
+
+        /// Whether every entry is already settled against `list`, the
+        /// record's answer now.
+        #[inline(always)]
+        pub(super) fn is_settled(&self, list: Option<&'static [&'static str]>) -> bool {
+            match (list, self.list) {
+                (Some(list), Some(posted)) => std::ptr::eq(list, posted),
+                (list, posted) => list.is_none() && posted.is_none(),
+            }
+        }
+
+        /// Settle `entries` and the deadband membership against `list`.
+        pub(super) fn resettle(
+            &mut self,
+            list: Option<&'static [&'static str]>,
+            deadband_field: &'static str,
+            entries: &mut HashMap<String, Published>,
+        ) {
+            for (field, published) in entries {
+                published.posted = list.is_some_and(|list| list.contains(&field.as_str()));
+            }
+            self.deadband = list.is_none_or(|list| list.contains(&deadband_field));
+            self.list = list;
+        }
+
+        /// The deadband field's membership in the list of the last settle.
+        pub(super) fn deadband(&self) -> bool {
+            self.deadband
+        }
+    }
 }
+use posted::{PostedSet, Published};
 
 /// `field` spelled as the record's tables spell it, upper-case: borrowed
 /// unless the name has a lower-case letter, so a declared name or an
@@ -2984,6 +3065,8 @@ pub struct RecordInstance {
     /// differ only in whether the walk can act on the field, which is what the
     /// gate asks. Linear, because the set is the static skip list.
     skipped_posted: Vec<(String, EpicsValue)>,
+    /// Owner of every `last_posted` entry's `posted`; see [`PostedSet`].
+    posted: PostedSet,
     /// The live store for a field the record's `.dbd` DECLARES but the record
     /// struct has no `put_field` arm / no storage for — the WRITE analog of the
     /// read-side [`Self::declared_default`] fallback.
@@ -4299,6 +4382,7 @@ impl RecordInstance {
             notify_restart_list: std::collections::VecDeque::new(),
             last_posted: HashMap::new(),
             skipped_posted: Vec::new(),
+            posted: PostedSet::new(),
             declared_overrides: HashMap::new(),
             link_backed_metadata_links,
             link_backed_metadata_input_slot,
@@ -4649,6 +4733,28 @@ impl RecordInstance {
         self.record_value_post_as(field, |inst| inst.walk_skips(field), value);
     }
 
+    /// The record's [`Record::process_posted_fields`], with every
+    /// `last_posted` entry's `posted` and the deadband membership settled
+    /// against it.
+    #[inline]
+    fn settle_posted(&mut self) -> Option<&'static [&'static str]> {
+        let list = self.record.process_posted_fields();
+        if !self.posted.is_settled(list) {
+            self.resettle_posted(list);
+        }
+        list
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resettle_posted(&mut self, list: Option<&'static [&'static str]>) {
+        self.posted.resettle(
+            list,
+            self.monitor_plan.deadband_field,
+            &mut self.last_posted,
+        );
+    }
+
     /// [`Self::record_value_post`] with `walk_skip` answering
     /// [`Self::walk_skips`]`(field)`. `last_posted` holds no skipped field, so
     /// only a field it does not hold asks.
@@ -4678,18 +4784,9 @@ impl RecordInstance {
             return;
         }
         let desc = self.field_desc(field);
-        let posted = self
-            .record
-            .process_posted_fields()
-            .map(|allowed| (allowed, allowed.contains(&field)));
-        let published = Published {
-            value,
-            desc,
-            name: desc.map(|d| d.name).filter(|name| *name == field),
-            upper: !field.bytes().any(|b| b.is_ascii_lowercase()),
-            prev_bit: self.prev_compared_bit(field),
-            posted,
-        };
+        let published = self
+            .posted
+            .publish(field, value, desc, self.prev_compared_bit(field));
         self.last_posted.insert(field.to_string(), published);
     }
 
@@ -7768,7 +7865,7 @@ impl RecordInstance {
         // copy exists to compare against).
         let marked_only = self.record.fields_posted_only_when_marked();
         let event_posted = self.record.event_posted_fields();
-        let process_posted = self.record.process_posted_fields();
+        let process_posted = self.settle_posted();
         let prev_changed = self.record.prev_compared_inputs().1;
 
         // The walk covers every field whose published value is tracked — each
@@ -7796,11 +7893,10 @@ impl RecordInstance {
         for (field, published) in tracked {
             // `walk_skip_term` can only fire on a field never published:
             // `skipped_posted`, not `last_posted`, holds what it rejects.
-            let closed_out =
-                process_posted.is_some_and(|allowed| match published.and_then(|p| p.posted) {
-                    Some((settled, posted)) if std::ptr::eq(settled, allowed) => !posted,
-                    _ => !allowed.contains(&field.as_str()),
-                });
+            let closed_out = process_posted.is_some_and(|allowed| match published {
+                Some(p) => !p.posted(),
+                None => !allowed.contains(&field.as_str()),
+            });
             if closed_out
                 || published.is_none() && walk_skip_term(field, deadband_field, event_posted)
             {
@@ -8333,7 +8429,7 @@ impl RecordInstance {
     /// secondaries ride: C posts them inside the same `if (monitor_mask)`.
     #[inline(always)]
     pub(crate) fn deadband_post(
-        &self,
+        &mut self,
         snapshot: &mut ProcessSnapshot,
         alarm_bits: EventMask,
         include_val: bool,
@@ -8363,13 +8459,10 @@ impl RecordInstance {
         // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
         // C never sends. Gating here rather than at each builder keeps the
         // single owner of the deadband post the single enforcer of the set.
-        if mask.is_empty()
-            || !(alarm_alone_posts_value || include_val || include_archive)
-            || !self
-                .record
-                .process_posted_fields()
-                .is_none_or(|allowed| allowed.contains(&field))
-        {
+        if mask.is_empty() || !(alarm_alone_posts_value || include_val || include_archive) || {
+            self.settle_posted();
+            !self.posted.deadband()
+        } {
             return mask;
         }
         if self.subscribers.is_empty() {
@@ -12727,5 +12820,77 @@ mod walk_post_name_tests {
             matches!(&posts[..], [Cow::Owned(name)] if name == "hopr"),
             "{posts:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod posted_settle_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::records::asub_record::ASubRecord;
+    use crate::types::DbFieldType;
+
+    fn walk(inst: &mut RecordInstance) {
+        let mut snapshot = ProcessSnapshot::new();
+        inst.collect_subscriber_posts(
+            &mut snapshot,
+            EventMask::NONE,
+            EventMask::NONE,
+            false,
+            false,
+        );
+    }
+
+    fn posted(inst: &mut RecordInstance, field: &str) -> bool {
+        inst.settle_posted();
+        inst.last_posted[field].posted()
+    }
+
+    /// An EFLG put moves aSub's closed list both ways; each walk after it
+    /// re-settles every entry against the list it now answers, the field it
+    /// closes out (VALA under NEVER, which never posts again) included.
+    #[test]
+    fn an_eflg_put_resettles_every_published_membership() {
+        let mut inst = RecordInstance::new("AS".to_string(), ASubRecord::default());
+        let _rx = inst
+            .add_subscriber("VALA", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("VALA subscriber");
+        for (eflg, member) in [(1, true), (0, false), (2, true)] {
+            inst.record
+                .put_field("EFLG", EpicsValue::Short(eflg))
+                .unwrap();
+            walk(&mut inst);
+            assert_eq!(posted(&mut inst, "VALA"), member, "EFLG {eflg}");
+        }
+    }
+
+    /// The deadband post reads its field's membership from the same settle:
+    /// transform's closed list leaves VAL out, aSub's keeps it.
+    #[test]
+    fn the_deadband_post_reads_the_settled_membership() {
+        use crate::server::records::transform::TransformRecord;
+        let mut transform = RecordInstance::new("T".to_string(), TransformRecord::default());
+        let mut asub = RecordInstance::new("AS".to_string(), ASubRecord::default());
+        for (inst, member) in [(&mut transform, false), (&mut asub, true)] {
+            let _rx = inst
+                .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::ALARM.bits())
+                .expect("VAL subscriber");
+            let mut snapshot = ProcessSnapshot::new();
+            inst.deadband_post(&mut snapshot, EventMask::ALARM, true, true);
+            inst.settle_posted();
+            assert_eq!(inst.posted.deadband(), member, "{}", inst.name);
+            assert_eq!(snapshot.len(), usize::from(member), "{}", inst.name);
+        }
+    }
+
+    /// A field first published while the instance still holds the old list
+    /// reads the current membership: the read settles first.
+    #[test]
+    fn a_field_published_before_the_first_settle_reads_settled() {
+        let mut inst = RecordInstance::new("AS".to_string(), ASubRecord::default());
+        let _rx = inst
+            .add_subscriber("VALA", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("VALA subscriber");
+        assert!(posted(&mut inst, "VALA"));
     }
 }

@@ -1,8 +1,7 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the exec-backend
-// suite; the two v6 co-bind sites were run under
-// `EPICS_RS_BUILD_EXEC_BACKEND=thread` before being counted.
+// RTEMS-EXEC-MODEL-ALLOW(17): this file does not build on the exec backend -
+// server_native/mod.rs declares it under #[cfg(tokio_backend)] mod runtime;.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 

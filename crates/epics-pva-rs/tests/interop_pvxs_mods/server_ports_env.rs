@@ -7,6 +7,9 @@
 //! `EPICS_PVA_BROADCAST_PORT=5287` and through
 //! `EPICS_PVA_NAME_SERVERS=127.0.0.1:5281`; a search on 5076 times out.
 
+// `server::PvaServer` exists only on the tokio backend.
+#![cfg(tokio_backend)]
+
 use super::interop_helpers::{PVXGET, pick_localhost_port, pvxs_command, require_pvxs};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;

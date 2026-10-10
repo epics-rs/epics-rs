@@ -189,6 +189,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/interop_pvxs_mods/rpc_and_get_field.rs",
     ),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/server_ports_env.rs",
+    ),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tcp_search_r11.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_interop.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_mtls.rs"),
@@ -202,6 +206,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-pva-rs", "tests/multi_pv_streaming.rs"),
     ("epics-pva-rs", "tests/put_two_phase.rs"),
     ("epics-pva-rs", "tests/report_info.rs"),
+    ("epics-pva-rs", "tests/run_pva_ioc_env_ports.rs"),
     ("epics-pva-rs", "tests/rpc_empty_reply.rs"),
     ("epics-pva-rs", "tests/rpc_pvrequest.rs"),
     ("epics-pva-rs", "tests/server_info.rs"),

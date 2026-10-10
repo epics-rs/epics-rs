@@ -2,8 +2,8 @@
 //!
 //! Built on top of the native runtime in [`crate::server_native`].
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
-// suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend -
+// server/mod.rs declares it under #[cfg(tokio_backend)] mod pva_server;.
 use std::collections::HashMap;
 use std::sync::Arc;
 

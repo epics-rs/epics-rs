@@ -3505,13 +3505,43 @@ impl RecordInstance {
         self.monitor_plan.hooks
     }
 
-    /// Post what the record's `process()` posted itself
+    /// The record's context push, [`Record::process`](crate::server::record::Record::process)
+    /// and the drain of what it posted
     /// ([`Record::take_process_posted_fields`](crate::server::record::Record::take_process_posted_fields)),
-    /// before the cycle stamps the record or resets its alarm. A type without
-    /// `PROCESS_POSTED` pays this one bit test; the engine's arm asks its
-    /// own plan instead.
+    /// as one step: a cycle path calls this, never `record.process()` alone,
+    /// so a `PROCESS_POSTED` type cannot process without its posts being
+    /// taken, before the cycle stamps the record or resets its alarm.
+    ///
+    /// The context push already tested the type's hooks; asking both hooks in
+    /// that one test is what keeps a type with neither paying nothing for the
+    /// drain.
     #[inline(always)]
-    fn emit_process_posts(&mut self) {
+    pub(crate) fn process_and_drain(
+        &mut self,
+    ) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
+        use crate::server::record::CycleHooks;
+        if self
+            .monitor_plan
+            .hooks
+            .has(CycleHooks::CONTEXT.union(CycleHooks::PROCESS_POSTED))
+        {
+            return self.process_hooked();
+        }
+        self.process_record()
+    }
+
+    /// The one `Record::process` call, private to the two paths above.
+    #[inline(always)]
+    fn process_record(&mut self) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
+        self.record.process()
+    }
+
+    /// [`Self::process_and_drain`] for a type with either hook. The drain
+    /// runs on `Err` too: C posts from inside `process()` whatever it returns.
+    #[inline(never)]
+    fn process_hooked(&mut self) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
+        self.push_process_context();
+        let result = self.process_record();
         if self
             .monitor_plan
             .hooks
@@ -3519,19 +3549,7 @@ impl RecordInstance {
         {
             self.emit_process_posts_marked();
         }
-    }
-
-    /// [`Record::process`](crate::server::record::Record::process) and the
-    /// drain of what it posted, as one step: a cycle path calls this, never
-    /// `record.process()` alone, so a `PROCESS_POSTED` type cannot process
-    /// without its posts being taken.
-    #[inline(always)]
-    pub(crate) fn process_and_drain(
-        &mut self,
-    ) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
-        let outcome = self.record.process()?;
-        self.emit_process_posts();
-        Ok(outcome)
+        result
     }
 
     /// The table names are upper-case, so the read skips `resolve_field`'s
@@ -8042,12 +8060,11 @@ impl RecordInstance {
         if self.soft_input_skips_convert() {
             self.record.set_device_did_compute(true);
         }
-        // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so the
+        // `process_and_drain` pushes framework-owned common state (UDF/PHAS/TSE/TSEL) so the
         // record's process() can see it — same as the processing.rs link
         // path. `process_local` is the foreign-call path
         // (`db.process_record`); without this a record driven through it
         // (e.g. QSRV group-process members) would not see UDF/TSE.
-        self.push_process_context();
         let outcome = self.process_and_drain()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are

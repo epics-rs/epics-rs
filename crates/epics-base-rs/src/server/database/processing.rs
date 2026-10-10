@@ -5423,9 +5423,12 @@ impl PvDatabase {
 
                 // TPRO: trace processing (C EPICS dbProcess prints context when TPRO>0)
                 if instance.common.tpro != 0 {
+                    // `as_str`: the record's address, which `process_and_drain`'s
+                    // hooked path takes, is then not computed for this branch
+                    // ahead of the test.
                     eprintln!(
                         "[TPRO] {}: process (SCAN={:?}, PACT={})",
-                        instance.name,
+                        instance.name.as_str(),
                         instance.common.scan,
                         instance.is_processing()
                     );
@@ -5457,12 +5460,6 @@ impl PvDatabase {
                     super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
                 }
 
-                // Push framework-owned common state (UDF/UDFS/NSEV/PHAS/TSE/TSEL) so
-                // the record's process() can see it — C records read
-                // `dbCommon` directly (`epidRecord.c:195` checks
-                // `pepid->udf`, `timestampRecord.c:90` checks `tse`,
-                // `transformRecord.c:554` checks `ptran->nsev`).
-                instance.push_process_context();
                 // Tell the record whether this is its own scheduled re-entry
                 // (the `ReprocessAfter` timer, a put-notify completion) or a
                 // fresh cycle. Only this path can be a continuation; the
@@ -5497,7 +5494,11 @@ impl PvDatabase {
                     instance.run_registered_subroutine()?;
                 }
 
-                // Process
+                // Process, after pushing framework-owned common state
+                // (UDF/UDFS/NSEV/PHAS/TSE/TSEL) so the record's process() can
+                // see it — C records read `dbCommon` directly
+                // (`epidRecord.c:195` checks `pepid->udf`, `timestampRecord.c:90`
+                // checks `tse`, `transformRecord.c:554` checks `ptran->nsev`).
                 let mut outcome = instance.process_and_drain()?;
                 // Merge deferred device actions into process outcome actions
                 if let Some(deferred) = deferred_device_actions {
@@ -9568,7 +9569,6 @@ impl PvDatabase {
                         _ => siol_val,
                     };
                     let _ = instance.record.put_field("RVAL", coerced);
-                    instance.push_process_context();
                     let _ = instance.process_and_drain();
                 } else {
                     // Records without RVAL fall back to SIMM=YES semantics: the

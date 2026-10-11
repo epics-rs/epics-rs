@@ -87,6 +87,8 @@ pub struct Device {
     /// `INST_IO` device a constant `INP` is rejected. Dropping it here is what
     /// let the port accept such a `.db`.
     pub link_type: String,
+    /// The dset symbol: C's `devSup::name`, which `dbDumpDevice` prints.
+    pub dset: String,
     pub name: String,
 }
 
@@ -300,18 +302,13 @@ pub fn parse_str(src: &str, source: &str, common: &[Field]) -> Result<Dbd, Strin
             Tok::Ident(kw) if kw == "device" => {
                 p.next();
                 let args = p.paren_args()?;
-                // `device(rectype, link_type, dset, "choice")`. Three of the
-                // four are kept: the record type it extends, the link type it
-                // demands, and the DTYP string a `.db` names it by. The `dset`
-                // is a C symbol — the name of a `struct dset` the IOC links
-                // against — and has no referent in the port, which dispatches
-                // device support by DTYP string rather than by C symbol. It is
-                // the one argument with no consumer, so it is the one dropped.
-                let [record, link_type, _dset, name] = <[String; 4]>::try_from(args)
+                // `device(rectype, link_type, dset, "choice")`.
+                let [record, link_type, dset, name] = <[String; 4]>::try_from(args)
                     .map_err(|a| format!("device() takes 4 arguments, found {}", a.len()))?;
                 dbd.devices.push(Device {
                     record,
                     link_type: link_type.to_ascii_uppercase(),
+                    dset,
                     name,
                 });
             }

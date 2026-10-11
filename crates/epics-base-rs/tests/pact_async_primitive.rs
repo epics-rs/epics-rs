@@ -354,7 +354,10 @@ struct NotifySourceRecord {
 
 static NOTIFY_SRC_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Long, false),
-    FieldDesc::new("LNK", DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Outlink,
+        ..FieldDesc::new("LNK", DbFieldType::String, false)
+    },
 ];
 
 impl Record for NotifySourceRecord {

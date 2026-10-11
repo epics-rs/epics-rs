@@ -42,9 +42,20 @@ async fn ioc(records: &str) -> Arc<PvDatabase> {
     db
 }
 
+/// An `Async Soft Channel` read lands in the pass its `dbProcessNotify`
+/// completion re-enters, which clears PACT; a record left active stays so.
+async fn settle(db: &PvDatabase, name: &str) {
+    let rec = db.get_record(name).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while rec.read().is_processing() && std::time::Instant::now() < until {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Process `name` and return `fields` and its STAT.
 async fn read_after_process(db: &PvDatabase, name: &str, fields: &[&str]) -> Vec<EpicsValue> {
     db.process_record(name).await.unwrap();
+    settle(db, name).await;
     let rec = db.get_record(name).unwrap();
     let inst = rec.read();
     let mut out: Vec<_> = fields
@@ -167,6 +178,7 @@ record(ai, "ASYNC") {
     .await;
     for (name, stat, amsg) in [("PLAIN", 14, "field INP"), ("ASYNC", 1, "")] {
         db.process_record(name).await.unwrap();
+        settle(&db, name).await;
         let rec = db.get_record(name).unwrap();
         let inst = rec.read();
         assert_eq!(

@@ -20,8 +20,8 @@ record(stringin, "STR") { field(DTYP, "Time of Day") }
 record(ai, "PLAIN") { }
 "#;
     let mut builder = IocBuilder::new();
-    for (dtyp, factory) in std_rs::std_device_supports() {
-        builder = builder.register_device_support(dtyp, factory);
+    for (record_type, devsup, factory) in std_rs::std_device_supports() {
+        builder = builder.register_device_support(record_type, devsup, factory);
     }
     let (db, _) = builder
         .db_string(db_content, &HashMap::new())

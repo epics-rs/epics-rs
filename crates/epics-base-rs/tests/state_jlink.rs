@@ -37,6 +37,10 @@ record(stringout, "S:STR") { field(OUT, "{state:\"WORD\"}") }
 record(ai,  "S:WGET")  { field(INP, "{state:\"WORD\"}") }
 record(ai,  "S:EMPTY") { field(INP, "{state:\"\"}") }
 record(ai,  "S:BANG")  { field(INP, "{state:\"!\"}") }
+record(aao, "A:D") { field(FTVL, "DOUBLE") field(NELM, "4") field(OUT, "{state:\"AD\"}") }
+record(aao, "A:E") { field(FTVL, "ENUM")   field(NELM, "4") field(OUT, "{state:\"AE\"}") }
+record(aao, "A:S") { field(FTVL, "STRING") field(NELM, "4") field(OUT, "{state:\"AS\"}") }
+record(aao, "A:Z") { field(FTVL, "DOUBLE") field(NELM, "4") field(OUT, "{state:\"AZ\"}") }
 "#;
 
 async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
@@ -189,4 +193,43 @@ async fn a_state_link_reports_itself_as_a_json_link() {
         parsed.db_link_type(),
         epics_base_rs::server::record::DbLinkType::JsonLink
     );
+}
+
+/// An array put is decided by its element 0 alone, and an empty one writes
+/// nothing: `lnkState_putValue` reads `*pbuffer` whatever `nRequest` is past
+/// its `nRequest == 0` return (`lnkState.c:154-155`), and has no `DBR_ENUM`
+/// arm, so an `FTVL=ENUM` aao is `S_db_badDbrtype`.
+///
+/// softIoc, `aao` with `OUT {state:…}`:
+/// NORD 0 → NO_ALARM and a set state stays set; DOUBLE `[0,1]` → 0,
+/// `[2,0]` → 1; STRING `["x","0"]` → 1, `["0","x"]` → 0, both NO_ALARM;
+/// ENUM `[1]` → LINK/INVALID and the state stays 0.
+#[epics_macros_rs::epics_test]
+async fn an_array_put_is_its_element_zero_and_an_empty_one_writes_nothing() {
+    let db = build().await;
+    let state = |name: &str| db_state_registry().get(name);
+    let stat = |rec: &str| db.get_pv(&format!("{rec}.STAT")).unwrap().to_f64();
+
+    db_state_registry().set("AZ", true);
+    process(&db, "A:Z").await;
+    assert!(state("AZ"), "NORD 0 writes nothing");
+    assert_eq!(stat("A:Z"), Some(0.0), "and is not an error");
+
+    for (put, expect) in [([0.0, 1.0], false), ([2.0, 0.0], true)] {
+        write(&db, "A:D", EpicsValue::DoubleArray(put.to_vec().into())).await;
+        assert_eq!(state("AD"), expect, "DOUBLE {put:?}");
+        assert_eq!(stat("A:D"), Some(0.0));
+    }
+
+    for (put, expect) in [(["x", "0"], true), (["0", "x"], false)] {
+        let put: Vec<_> = put.iter().map(|s| (*s).into()).collect();
+        write(&db, "A:S", EpicsValue::StringArray(put.into())).await;
+        assert_eq!(state("AS"), expect);
+        assert_eq!(stat("A:S"), Some(0.0));
+    }
+
+    write(&db, "A:E", EpicsValue::EnumArray(vec![1].into())).await;
+    assert!(!state("AE"), "DBR_ENUM has no arm");
+    assert_eq!(stat("A:E"), Some(14.0), "LINK");
+    assert_eq!(db.get_pv("A:E.SEVR").unwrap().to_f64(), Some(3.0));
 }

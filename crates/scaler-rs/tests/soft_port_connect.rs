@@ -12,8 +12,17 @@ use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use scaler_rs::MAX_SCALER_CHANNELS;
 use scaler_rs::device_support::soft_port::SoftScalerPorts;
+
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static ASYN_SCALER: DevSup = DevSup {
+    name: "devScalerAsyn",
+    choice: "Asyn Scaler",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(7, &[2, 4, 5, 6], false),
+};
 
 const DB: &str = r#"
 record(scaler, "SC") {
@@ -36,7 +45,7 @@ async fn connect_waits_for_an_input_record_without_holding_the_input_state() {
     let dsets = Arc::clone(&ports);
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
-        .register_device_support("Asyn Scaler", move || {
+        .register_device_support("scaler", &ASYN_SCALER, move || {
             Box::new(dsets.device_support("P").expect("P is configured"))
         })
         .db_string(DB, &HashMap::new())

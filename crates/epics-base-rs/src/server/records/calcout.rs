@@ -182,6 +182,10 @@ pub struct CalcoutRecord {
     // cycle decided on, not re-evaluate should_output() against the
     // (by then stale) pval/val.
     pending_output: bool,
+    /// `prec->pact` at `process()` entry: C takes the delayed-output arm only
+    /// with PACT held, so a re-entry after a device-link put cleared it
+    /// (`dbAccess.c:1194`) is a fresh cycle.
+    pact: bool,
     // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
     // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
     // owner of this record's alarm transitions — consumes it, so it cannot
@@ -336,6 +340,7 @@ impl Default for CalcoutRecord {
             dlya: 0,
             oevt: String::new(),
             pending_output: false,
+            pact: false,
             calc_alarm: None,
             fetch_gate_failed: false,
             value_computed: false,
@@ -831,6 +836,14 @@ impl Record for CalcoutRecord {
         Ok(())
     }
 
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.input_changes = 0;
         // ODLY continuation: this is the delayed re-process scheduled by a
@@ -839,7 +852,7 @@ impl Record for CalcoutRecord {
         // arm re-enters below them — but `execOutput` DOES run here, and the
         // DOPT switch is its first half, so OVAL is computed now, from the
         // A..U present at expiry.
-        if self.dlya == 1 {
+        if self.pact && self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;

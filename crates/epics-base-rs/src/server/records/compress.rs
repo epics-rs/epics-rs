@@ -955,6 +955,7 @@ impl Record for CompressRecord {
     fn pre_input_link_actions(
         &mut self,
         _dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
     ) -> crate::server::record::ProcessActions {
         // The per-cycle ingest/emit facts, cleared before the framework's input
         // stage can set them. If no value arrives (link not connected, or a

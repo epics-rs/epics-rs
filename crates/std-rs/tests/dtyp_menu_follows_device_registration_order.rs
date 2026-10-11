@@ -1,8 +1,8 @@
 //! A record type's DTYP menu is its `device()` lines in the order they arrive,
 //! so std's devTimeOfDay choices sit after asyn's when the IOC wires asyn's
 //! devices before std's, even with std's record types registered first.
-//! Ground truth: `oracleIoc.dbd` (`~/work/epics-modules/oracle-ioc`: base,
-//! asyn, std, calc), lines 4983-4993 (ai) and 21980-21988 (stringin).
+//! Ground truth: `oracleIoc` (`~/work/epics-modules/oracle-ioc`: base, asyn,
+//! std, calc), its `dbDumpDevice` of ai and stringin, addresses masked.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,51 +12,11 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::types::EpicsValue;
 
-const AI: &str = "recordtype(ai)
-\tchoice:    Soft Channel
-\tlink_type: 0
-\tchoice:    Raw Soft Channel
-\tlink_type: 0
-\tchoice:    Async Soft Channel
-\tlink_type: 0
-\tchoice:    Soft Timestamp
-\tlink_type: 12
-\tchoice:    General Time
-\tlink_type: 12
-\tchoice:    asynInt32
-\tlink_type: 12
-\tchoice:    asynInt32Average
-\tlink_type: 12
-\tchoice:    asynFloat64
-\tlink_type: 12
-\tchoice:    asynFloat64Average
-\tlink_type: 12
-\tchoice:    asynInt64
-\tlink_type: 12
-\tchoice:    Sec Past Epoch
-\tlink_type: 0
-";
+mod common;
+use common::masked;
 
-const STRINGIN: &str = "recordtype(stringin)
-\tchoice:    Soft Channel
-\tlink_type: 0
-\tchoice:    Async Soft Channel
-\tlink_type: 0
-\tchoice:    Soft Timestamp
-\tlink_type: 12
-\tchoice:    General Time
-\tlink_type: 12
-\tchoice:    getenv
-\tlink_type: 12
-\tchoice:    asynOctetCmdResponse
-\tlink_type: 12
-\tchoice:    asynOctetWriteRead
-\tlink_type: 12
-\tchoice:    asynOctetRead
-\tlink_type: 12
-\tchoice:    Time of Day
-\tlink_type: 0
-";
+const AI: &str = include_str!("oracle/oracleIoc_dbDumpDevice_ai.txt");
+const STRINGIN: &str = include_str!("oracle/oracleIoc_dbDumpDevice_stringin.txt");
 
 /// The pin IOC's order: std's record types, then asyn's devices, then std's.
 fn pin_ioc_builder() -> IocBuilder {
@@ -65,8 +25,8 @@ fn pin_ioc_builder() -> IocBuilder {
         builder = builder.register_record_type(name, move || factory());
     }
     builder = asyn_rs::adapter::register_asyn_device_support_for_builder(builder);
-    for (dtyp, factory) in std_rs::std_device_supports() {
-        builder = builder.register_device_support(dtyp, factory);
+    for (record_type, devsup, factory) in std_rs::std_device_supports() {
+        builder = builder.register_device_support(record_type, devsup, factory);
     }
     builder
 }
@@ -96,8 +56,8 @@ fn dump(record_type: &str) -> String {
 #[test]
 fn device_dump_lists_std_after_asyn_as_oracle_ioc_dbd() {
     let _builder = pin_ioc_builder();
-    assert_eq!(dump("ai"), AI);
-    assert_eq!(dump("stringin"), STRINGIN);
+    assert_eq!(masked(&dump("ai")), masked(AI));
+    assert_eq!(masked(&dump("stringin")), masked(STRINGIN));
 }
 
 #[tokio::test]

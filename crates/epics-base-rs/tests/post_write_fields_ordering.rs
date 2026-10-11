@@ -67,7 +67,10 @@ static SRC_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Long, false),
     FieldDesc::new("FLAG", DbFieldType::Short, false),
     FieldDesc::new("REJECT", DbFieldType::Short, false),
-    FieldDesc::new("LNK", DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Outlink,
+        ..FieldDesc::new("LNK", DbFieldType::String, false)
+    },
 ];
 
 const CLEAR: (&str, EpicsValue) = ("FLAG", EpicsValue::Short(0));

@@ -14,7 +14,7 @@ use epics_base_rs::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
     WriteCompletion,
 };
-use epics_base_rs::server::record::{Record, ScanType};
+use epics_base_rs::server::record::{DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
 use crate::error::{AsynError, AsynStatus};
@@ -3259,7 +3259,7 @@ pub fn universal_asyn_factory(
     // never invokes write(), so the record loaded, computed OVAL and wrote
     // nothing to the driver).
     if !asyn_device_menu(ctx.record_type)
-        .is_some_and(|menu| menu.iter().any(|&(choice, _)| choice == ctx.dtyp))
+        .is_some_and(|menu| menu.iter().any(|row| row.choice == ctx.dtyp))
     {
         return None;
     }
@@ -3467,17 +3467,19 @@ static ASYN_DEVICE_MENU_RECORD_TYPES: &[&str] = &{
 /// "asynInt32")`), so it is added here rather than in the generated table.
 /// The binding itself is the universal factory + the unconditional readback
 /// forced in `init` (devBusyAsyn.c parity).
-fn asyn_device_menu(
-    record_type: &str,
-) -> Option<&'static [(&'static str, epics_base_rs::server::record::DbLinkType)]> {
+fn asyn_device_menu(record_type: &str) -> Option<&'static [DevSup]> {
     if record_type == "busy" {
-        return Some(&[(
-            "asynInt32",
-            epics_base_rs::server::record::DbLinkType::InstIo,
-        )]);
+        return Some(BUSY_DEVICES);
     }
-    crate::dbd_generated::device_link_types(record_type)
+    crate::dbd_generated::devices(record_type)
 }
+
+static BUSY_DEVICES: &[DevSup] = &[DevSup {
+    name: "asynBusyInt32",
+    choice: "asynInt32",
+    link_type: epics_base_rs::server::record::DbLinkType::InstIo,
+    dset: crate::dsets::ASYNBUSYINT32,
+}];
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
 /// installs the universal asyn factory on the pure-Rust build path
@@ -8156,20 +8158,19 @@ mod tests {
     #[test]
     fn asyn_device_menu_is_the_generated_table_plus_busy() {
         for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
-            assert_eq!(
-                asyn_device_menu(rt),
-                crate::dbd_generated::device_link_types(rt)
-            );
+            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::devices(rt));
             assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&rt));
         }
+        let busy = asyn_device_menu("busy").unwrap();
         assert_eq!(
-            asyn_device_menu("busy"),
-            Some(
-                &[(
-                    "asynInt32",
-                    epics_base_rs::server::record::DbLinkType::InstIo
-                )][..]
-            )
+            busy.iter()
+                .map(|row| (row.name, row.choice, row.link_type))
+                .collect::<Vec<_>>(),
+            [(
+                "asynBusyInt32",
+                "asynInt32",
+                epics_base_rs::server::record::DbLinkType::InstIo
+            )]
         );
         assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&"busy"));
         assert_eq!(

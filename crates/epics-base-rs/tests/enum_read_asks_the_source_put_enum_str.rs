@@ -94,10 +94,21 @@ fn state(db: &PvDatabase, name: &str) -> (EpicsValue, u16, u8) {
     )
 }
 
+/// An `Async Soft Channel` read lands in the pass its `dbProcessNotify`
+/// completion re-enters, which clears PACT; a record left active stays so.
+async fn settle(db: &PvDatabase, name: &str) {
+    let rec = db.get_record(name).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while rec.read().is_processing() && std::time::Instant::now() < until {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Process both readers of `source` and check each against `(val, stat)`.
 async fn read_both(db: &PvDatabase, source: &str, val: u16, stat: u16) {
     for reader in ["HELD", "GENERAL"] {
         db.process_record(reader).await.unwrap();
+        settle(db, reader).await;
         let (v, s, _) = state(db, reader);
         assert_eq!(
             (v, s),
@@ -255,6 +266,7 @@ async fn put_enum_str_scans_the_slots_c_scans() {
     for (src, _, stat, val) in SLOT_READS {
         let reader = format!("R_{src}");
         db.process_record(&reader).await.unwrap();
+        settle(&db, &reader).await;
         assert_eq!(state(&db, &reader).1, stat, "{reader}");
         assert_eq!(state(&db, src).0, EpicsValue::Enum(val), "{src}");
     }
@@ -325,6 +337,7 @@ record({reader}, "R_{name}") {{
     for (_, name, _, udf) in sources {
         assert_eq!(state(&db, name).2, 1, "{name} starts undefined");
         db.process_record(&format!("R_{name}")).await.unwrap();
+        settle(&db, &format!("R_{name}")).await;
         let (val, _, got) = state(&db, name);
         assert_eq!((val, got), (EpicsValue::Enum(1), udf), "{name}");
     }
@@ -354,6 +367,7 @@ async fn an_inp_put_restarts_the_buffer_and_a_dtyp_put_does_not() {
         db.put_pv("W2", strings(&[])).await.unwrap();
         for (reader, val) in [("HELD", 0), ("GENERAL", 1)] {
             db.process_record(reader).await.unwrap();
+            settle(&db, reader).await;
             let (v, s, _) = state(&db, reader);
             assert_eq!(
                 (v, s),

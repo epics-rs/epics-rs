@@ -842,7 +842,11 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             let entry = proc_macro2::Ident::new(entry, proc_macro2::Span::call_site());
             let ty = proc_macro2::Ident::new(ty, proc_macro2::Span::call_site());
             quote! {
-                fn #entry(&mut self, value: #ty) -> #krate::error::CaResult<()> {
+                fn #entry(
+                    &mut self,
+                    value: #ty,
+                    _dpvt: &mut #krate::server::device_support::Dpvt,
+                ) -> #krate::error::CaResult<()> {
                     self.put_cycle_cell(#record::CycleCell::Val, #record::CycleValue::#carrier(value))
                 }
             }

@@ -596,6 +596,18 @@ pub enum ParsedLink {
     None,
     /// Shared for the same reason as `Db`: the link is immutable once parsed.
     Constant(std::sync::Arc<ConstantLink>),
+    /// C `dbRemoveLink` left the field with no `lset` and nothing added it
+    /// back (`dbAccess.c:1167-1188`): `dbLinkIsDefined` is false and
+    /// `dbLinkIsConstant` true (`dbLink.c:215-225`), a read is `dbGetLink`'s
+    /// silent -1 and a put `S_db_noLSET` (`dbLink.c:336-337`, `:440-441`).
+    /// The record keeps the text, and `plink->type` is what the remove left:
+    /// `PV_LINK` for a DB or CA link (`dbDbLink.c:132`, `dbCa.c:441`), the
+    /// parsed type for any other. No parse makes this. Declared beside
+    /// `None` and `Constant`, so the three `dbLinkIsConstant` variants take
+    /// adjacent niche values and [`is_constant`] stays one range compare.
+    ///
+    /// [`is_constant`]: crate::server::recgbl::simm::is_constant
+    Removed(DbLinkType),
     /// Shared, not owned: a parsed DB link is immutable after `parse_link_v2`
     /// and the cycle clones the record's `parsed_inp` every process, so the
     /// clone is one atomic increment instead of the link's three heap copies,
@@ -689,28 +701,53 @@ impl StateLink {
         self.invert ^ value
     }
 
-    /// C `lnkState_putValue`'s truth test (`lnkState.c:157-190`), or `None`
-    /// for a value C answers `S_db_badDbrtype` to.
+    /// What C `lnkState_putValue` (`lnkState.c:153-203`) does with `value`.
     ///
-    /// Every numeric DBR is `!!value`. `DBR_STRING` is deliberately NOT
-    /// numeric — C's own comment is "Only \"\" and \"0\" are FALSE" — so
-    /// `"hello"` and `"0.0"` are both TRUE where a numeric read of them
-    /// would be `0`. Routing the string through a parse is the one way to
-    /// get this arm wrong.
+    /// An array is its element 0 alone: past the `nRequest == 0` return the
+    /// arms read `*pbuffer`. `DBR_STRING` is textual — "Only \"\" and \"0\"
+    /// are FALSE" — so `"0.0"` is TRUE. A scalar `Enum` is TRUE when nonzero:
+    /// it is what bo and mbbo hand over, and C passes those as `DBR_USHORT`.
+    /// Only an `FTVL=ENUM` array reaches C as `DBR_ENUM`, which has no arm.
     #[must_use]
-    pub fn truth_of(value: &crate::types::EpicsValue) -> Option<bool> {
+    pub fn put_of(value: &crate::types::EpicsValue) -> StatePut {
         use crate::types::EpicsValue as V;
-        match value {
-            V::String(s) => {
-                let text = s.as_str_lossy();
-                Some(!text.is_empty() && text != "0")
-            }
-            // `lnkState_putValue` has no array arm: it reads element 0 of
-            // whatever buffer it is handed, and `nRequest == 0` writes
-            // nothing at all (`lnkState.c:154-155`).
-            other => other.to_f64().map(|v| v != 0.0),
+        if value.is_empty_array() {
+            return StatePut::Nothing;
         }
+        if matches!(value, V::EnumArray(_)) {
+            return StatePut::BadDbrType;
+        }
+        // Borrowed: the put runs under the writer's hold.
+        let text = match value {
+            V::String(s) => Some(s),
+            V::StringArray(a) => a.first(),
+            _ => None,
+        };
+        if let Some(s) = text {
+            let b = s.as_bytes();
+            let (b0, b1) = (b.first().copied(), b.get(1).copied());
+            return StatePut::Truth(
+                b0.is_some_and(|c| c != 0) && (b0 != Some(b'0') || b1.is_some_and(|c| c != 0)),
+            );
+        }
+        let element = value.first_element();
+        element
+            .as_ref()
+            .unwrap_or(value)
+            .to_f64()
+            .map_or(StatePut::BadDbrType, |v| StatePut::Truth(v != 0.0))
     }
+}
+
+/// [`StateLink::put_of`]: the three ways C `lnkState_putValue` leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatePut {
+    /// Drive the bit from this truth value, before `invert`.
+    Truth(bool),
+    /// `nRequest == 0` (`lnkState.c:154-155`): status 0, nothing written.
+    Nothing,
+    /// No arm for the DBR class: `S_db_badDbrtype`.
+    BadDbrType,
 }
 
 /// A single JLink option value, preserving the JSON value KIND parsed
@@ -1207,6 +1244,14 @@ impl DbLink {
         &self.channel
     }
 
+    /// [`Self::target`]'s field as the link text spells it: `ChannelName`
+    /// upper-cases its `field`, and `dbFindFieldPart` compares the name as
+    /// written. The `$` modifier is not part of the name.
+    pub(crate) fn field_as_written(&self) -> &str {
+        let field = crate::server::database::parse_pv_name(&self.channel.record_path).1;
+        field.strip_suffix('$').unwrap_or(field)
+    }
+
     /// Whether [`Self::target`]'s field is `VAL` (see `target_is_val`).
     pub(crate) fn target_is_val(&self) -> bool {
         self.target_is_val
@@ -1557,6 +1602,7 @@ impl ParsedLink {
     pub fn db_link_type(&self) -> DbLinkType {
         match self {
             ParsedLink::None | ParsedLink::Constant(_) => DbLinkType::Constant,
+            ParsedLink::Removed(ty) => *ty,
             ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_) => DbLinkType::PvLink,
             ParsedLink::PvaJson(_) | ParsedLink::Calc(_) | ParsedLink::State(_) => {
                 DbLinkType::JsonLink
@@ -1621,6 +1667,7 @@ impl ParsedLink {
             // set it (`dbLink.c:92-130` only re-types `PV_LINK`), so the bus
             // the identifier letters named is what `dbpr` prints.
             ParsedLink::Hw(hw) => hw.kind().db_link_type(),
+            ParsedLink::Removed(ty) => *ty,
         }
     }
 
@@ -1628,7 +1675,8 @@ impl ParsedLink {
     /// `prec->xxx.type` analogue. See [`LinkType`] for the C mapping.
     pub fn link_type(&self) -> LinkType {
         match self {
-            ParsedLink::None => LinkType::Empty,
+            // A removed link, like an empty one, has no value and no target.
+            ParsedLink::None | ParsedLink::Removed(_) => LinkType::Empty,
             ParsedLink::Constant(_) => LinkType::Constant,
             ParsedLink::Db(_) => LinkType::Db,
             ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => LinkType::Ca,
@@ -3250,6 +3298,10 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
 /// channel, losing lock-set atomicity, `PP` target processing and `MS`
 /// severity inheritance.
 ///
+/// The field keeps its case: `dbFindFieldPart` compares with `strncmp`
+/// (`dbStaticLib.c:1822`), so `SRC.desc` names no field and the link falls
+/// through to CA.
+///
 /// Returns `None` when there is no `.` or the remainder is not a field name,
 /// which is C's "absent field name" case (the link addresses `VAL`). Keeping
 /// the whole string as the record name in that case is also what preserves a
@@ -3265,7 +3317,7 @@ fn split_record_field(link_part: &str) -> Option<(&str, String)> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
-    Some((rec, field.to_ascii_uppercase()))
+    Some((rec, field.to_string()))
 }
 
 /// Parse a `DBF_OUTLINK` (record `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…,
@@ -4433,18 +4485,48 @@ mod json_link_tests {
     #[test]
     fn a_string_is_false_only_when_it_is_empty_or_exactly_zero() {
         use crate::types::EpicsValue as V;
-        let f = |s: &str| StateLink::truth_of(&V::String(s.into()));
-        assert_eq!(f(""), Some(false));
-        assert_eq!(f("0"), Some(false));
-        assert_eq!(f("0.0"), Some(true));
-        assert_eq!(f("00"), Some(true));
-        assert_eq!(f("hello"), Some(true));
+        let t = |v: V| match StateLink::put_of(&v) {
+            StatePut::Truth(t) => t,
+            other => panic!("{v:?} is a truth put, got {other:?}"),
+        };
+        let f = |s: &str| t(V::String(s.into()));
+        assert!(!f(""));
+        assert!(!f("0"));
+        assert!(f("0.0"));
+        assert!(f("00"));
+        assert!(f("hello"));
+        // C reads the C string, so a NUL ends it.
+        assert!(!f("0\0x"));
+        assert!(!f("\0x"));
         // The numeric arms are plain `!!value`.
-        assert_eq!(StateLink::truth_of(&V::Short(0)), Some(false));
-        assert_eq!(StateLink::truth_of(&V::Short(-1)), Some(true));
-        assert_eq!(StateLink::truth_of(&V::Double(0.0)), Some(false));
-        assert_eq!(StateLink::truth_of(&V::Double(-0.5)), Some(true));
-        assert_eq!(StateLink::truth_of(&V::Char(0)), Some(false));
+        assert!(!t(V::Short(0)));
+        assert!(t(V::Short(-1)));
+        assert!(!t(V::Double(0.0)));
+        assert!(!t(V::Double(-0.0)));
+        assert!(t(V::Double(-0.5)));
+        assert!(t(V::Double(f64::NAN)));
+        assert!(!t(V::Char(0)));
+        assert!(t(V::Enum(1)));
+    }
+
+    /// Element 0 decides an array, an empty one is `nRequest == 0`, and an
+    /// `FTVL=ENUM` array is the one `DBR_ENUM` put: `lnkState.c:154-190`.
+    #[test]
+    fn an_array_put_is_element_zero_empty_is_nothing_enum_is_refused() {
+        use crate::types::EpicsValue as V;
+        let p = StateLink::put_of;
+        assert_eq!(
+            p(&V::DoubleArray(vec![0.0, 1.0].into())),
+            StatePut::Truth(false)
+        );
+        assert_eq!(p(&V::LongArray(vec![2, 0].into())), StatePut::Truth(true));
+        assert_eq!(
+            p(&V::StringArray(vec!["0".into(), "x".into()].into())),
+            StatePut::Truth(false)
+        );
+        assert_eq!(p(&V::DoubleArray(Vec::new().into())), StatePut::Nothing);
+        assert_eq!(p(&V::EnumArray(Vec::new().into())), StatePut::Nothing);
+        assert_eq!(p(&V::EnumArray(vec![1].into())), StatePut::BadDbrType);
     }
 
     /// `dbDumpLink` reads the registry, and `dbGetString` reads the stored

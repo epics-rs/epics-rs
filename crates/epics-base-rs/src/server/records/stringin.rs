@@ -96,7 +96,11 @@ impl Record for StringinRecord {
 
     /// `devSiSoft.c:53` reads straight into VAL: the `putStringString` row
     /// `set_val` reaches for a String, without its field lookups.
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         match value {
             Some(EpicsValue::String(s)) => {
                 self.val = truncate_string(s);
@@ -363,7 +367,8 @@ mod tests {
         for text in texts {
             let value = EpicsValue::String(PvString::from_bytes(text.to_vec()));
             let mut read = StringinRecord::new("old");
-            read.soft_input_read(Some(value.clone())).unwrap();
+            read.soft_input_read(Some(value.clone()), &mut Default::default())
+                .unwrap();
             let mut put = StringinRecord::new("old");
             put.set_val(value).unwrap();
             assert_eq!(read.val, put.val, "{text:?}");

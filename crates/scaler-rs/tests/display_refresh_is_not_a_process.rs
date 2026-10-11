@@ -59,7 +59,10 @@ fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
 
 /// The record's own scheduled re-entry, as the framework runs it.
 fn fire_timer(rec: &mut ScalerRecord) -> Vec<ProcessAction> {
-    rec.set_process_continuation(true);
+    rec.set_process_continuation(
+        true,
+        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
+    );
     rec.process().unwrap().actions
 }
 

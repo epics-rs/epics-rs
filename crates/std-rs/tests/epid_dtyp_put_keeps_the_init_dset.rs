@@ -31,11 +31,6 @@ record(epid, "PID") {{
         .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
-        .register_device_support("Async Soft Channel", || {
-            Box::new(
-                std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
-            )
-        })
         .db_string(&db_str, &HashMap::new())
         .unwrap()
         .build()

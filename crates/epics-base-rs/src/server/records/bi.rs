@@ -45,10 +45,6 @@ pub struct BiRecord {
     pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
-    /// `devBiSoftCallback`'s private `devPvt->buffer.value`: calloc'd 0 and
-    /// written only by a conversion that stores, so a read that stores nothing
-    /// (a state name, NORD=0) hands back the last delivered value, not VAL.
-    async_buffer: u16,
 }
 
 impl Default for BiRecord {
@@ -74,7 +70,6 @@ impl Default for BiRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
-            async_buffer: 0,
         }
     }
 }
@@ -288,32 +283,33 @@ impl Record for BiRecord {
 
     /// The Async dset copies its buffer into VAL; the other soft dsets never
     /// read `async_buffer`, so taking every delivered value is exact for it.
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         match value {
             None => return Ok(()),
-            Some(EpicsValue::EnumArray(a)) if a.is_empty() => {
-                self.set_val(EpicsValue::Enum(self.async_buffer))?
-            }
+            // A read that stores nothing (a state name, NORD=0) hands back
+            // the devPvt buffer, not VAL; with no devPvt C never read.
+            Some(EpicsValue::EnumArray(a)) if a.is_empty() => match dpvt.callback_buffer() {
+                Some(buffer) => self.set_val(EpicsValue::Enum(buffer))?,
+                None => return Ok(()),
+            },
             Some(value) => self.set_val(value)?,
         }
-        self.async_buffer = self.val;
+        dpvt.keep_buffer(self.val);
         Ok(())
     }
 
     /// The Plain dset's `DBR_USHORT` read: VAL is that state index.
-    fn soft_input_read_u16(&mut self, value: u16) -> CaResult<()> {
+    fn soft_input_read_u16(
+        &mut self,
+        value: u16,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         self.val = value;
-        self.async_buffer = value;
-        Ok(())
-    }
-
-    /// `dbPutFieldLink` rebinds the dset on every INP put (`del_record`, then
-    /// `add_record`'s fresh calloc'd devPvt, `dbAccess.c:1158-1197`), so the
-    /// Async buffer restarts at 0; a DTYP put alone rebinds nothing.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if after && field == "INP" {
-            self.async_buffer = 0;
-        }
+        dpvt.keep_buffer(value);
         Ok(())
     }
 

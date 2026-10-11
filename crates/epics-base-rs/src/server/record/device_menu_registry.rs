@@ -22,80 +22,179 @@
 //! too, loading `asyn.dbd` extends the `dbDeviceMenu` of every `ai`, whether or
 //! not that particular record binds an asyn DTYP.
 
-use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{OnceLock, RwLock};
 
 use super::DbLinkType;
 
-/// One contributed device menu: the `(choice, link_type)` `device()` lines a
-/// downstream crate's `.dbd` declares for a record type — a generated
-/// `device_link_types()` table.
-type DeviceMenu = &'static [(&'static str, DbLinkType)];
+/// What `dbDumpDevice` reads of a C `dset`: `number` entry points, which of
+/// them are non-NULL (slot indices, `report` = 0), and whether its `init`
+/// calls `devExtend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dset {
+    pub number: u8,
+    pub funcs: &'static [u8],
+    pub extends: bool,
+}
 
-/// The contributed menus, keyed by record type, one entry per contributing
-/// crate in registration order. Kept as a list (rather than a flattened
-/// `Vec`) so re-registering the SAME menu is idempotent (see
-/// [`register_device_menu`]): a second `IocApplication` built in one process, or
-/// a helper called twice, must not double the menu.
-static CONTRIBUTED: OnceLock<RwLock<HashMap<String, Vec<DeviceMenu>>>> = OnceLock::new();
+impl Dset {
+    pub const fn new(number: u8, funcs: &'static [u8], extends: bool) -> Self {
+        Self {
+            number,
+            funcs,
+            extends,
+        }
+    }
+}
 
-/// The record types with a contributed choice, as an immutable list that a
-/// registration adding a type republishes (leaking the old one: one per such
-/// type, at startup). [`has_contributed_device_menu`] is asked on the INP/OUT
-/// put under the record's write hold, so it reads this with one load instead
-/// of taking [`CONTRIBUTED`]'s lock.
-static CONTRIBUTED_TYPES: AtomicPtr<Vec<&'static str>> = AtomicPtr::new(std::ptr::null_mut());
+/// One `device(rectype, link_type, name, "choice")` line: C's `devSup`, a
+/// row of the record type's `dbDeviceMenu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevSup {
+    /// The dset symbol.
+    pub name: &'static str,
+    /// The `DTYP` string.
+    pub choice: &'static str,
+    pub link_type: DbLinkType,
+    pub dset: Dset,
+}
 
-fn registry() -> &'static RwLock<HashMap<String, Vec<DeviceMenu>>> {
-    CONTRIBUTED.get_or_init(|| RwLock::new(HashMap::new()))
+impl DevSup {
+    /// `dbInitDevSup` gives every `CONSTANT` device the soft `dsxt`; any
+    /// other has one only if its `init` calls `devExtend`.
+    pub fn has_dsxt(&self) -> bool {
+        self.link_type == DbLinkType::Constant || self.dset.extends
+    }
+
+    /// The dset's `get_ioint_info` (slot 3) is non-NULL.
+    pub fn has_get_ioint_info(&self) -> bool {
+        self.dset.funcs.contains(&3)
+    }
+}
+
+/// One contributed device menu: the `device()` lines a downstream crate's
+/// `.dbd` declares for a record type — a generated `DEVICES_*` table.
+type DeviceMenu = &'static [DevSup];
+
+/// The contributed menus by record type, one entry per contributing crate in
+/// registration order. Kept as a list (rather than a flattened `Vec`) so
+/// re-registering the SAME menu is idempotent (see [`register_device_menu`]):
+/// a second `IocApplication` built in one process, or a helper called twice,
+/// must not double the menu.
+///
+/// An immutable snapshot that a registration replaces, leaking the old one
+/// (registration is startup work), because [`dev_sup_of`] is asked on the
+/// INP/OUT put under the record's write hold: one load, no lock, no
+/// allocation.
+type Contributed = Vec<(&'static str, Vec<DeviceMenu>)>;
+static CONTRIBUTED: AtomicPtr<Contributed> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Serialises the registrations' copy-and-publish of [`CONTRIBUTED`]; no
+/// reader takes it.
+static PUBLISH: Mutex<()> = Mutex::new(());
+
+fn contributed() -> &'static [(&'static str, Vec<DeviceMenu>)] {
+    let menus = CONTRIBUTED.load(Ordering::Acquire);
+    // SAFETY: a non-null pointer came from `Box::into_raw` and is never freed.
+    unsafe { menus.as_ref() }.map_or(&[], Vec::as_slice)
+}
+
+/// The menus contributed for `record_type`, in registration order.
+fn menus_of(record_type: &str) -> &'static [DeviceMenu] {
+    contributed()
+        .iter()
+        .find(|(t, _)| *t == record_type)
+        .map_or(&[], |(_, menus)| menus.as_slice())
+}
+
+/// Publish `contributed()` with each row of `rows` whose choice
+/// `record_type`'s menu does not list yet appended, as C's `dbDevice`
+/// (dbLexRoutines.c:843-846) skips a `device()` line for a choice already
+/// loaded. The one writer of the menu.
+fn publish_rows(record_type: &str, rows: &'static [DevSup]) {
+    let _publish = PUBLISH.lock().expect("device-menu registry lock poisoned");
+    let declared = super::dbd_generated::devices(record_type).unwrap_or_default();
+    let mut next = contributed().to_vec();
+    let at = match next.iter().position(|(t, _)| *t == record_type) {
+        Some(at) => at,
+        None => {
+            next.push((Box::leak(record_type.into()), Vec::new()));
+            next.len() - 1
+        }
+    };
+    let menus = &mut next[at].1;
+    let before = menus.len();
+    for row in rows {
+        let listed = declared
+            .iter()
+            .chain(menus.iter().flat_map(|menu| menu.iter()))
+            .any(|d| d.choice == row.choice);
+        if !listed {
+            menus.push(std::slice::from_ref(row));
+        }
+    }
+    if menus.len() != before {
+        CONTRIBUTED.store(Box::into_raw(Box::new(next)), Ordering::Release);
+    }
 }
 
 /// Contribute a device-support DTYP menu for `record_type` — the choices a
 /// downstream crate's device support adds to that record type's `DTYP` list,
 /// in the crate's `.dbd` declaration order. Pass the generated
-/// `device_link_types(record_type)` table; `dbDumpDevice` prints each
-/// choice's `link_type`.
+/// `devices(record_type)` table.
 ///
 /// The choices are appended AFTER base's declared menu and after any menu
 /// registered by an earlier call, matching C's load-order `dbDeviceMenu`
-/// concatenation. Registering a menu already present for this record type
-/// (by content) is a no-op, so wiring the same support twice in one process is
-/// safe.
-pub fn register_device_menu(record_type: &str, menu: &'static [(&'static str, DbLinkType)]) {
-    let mut map = registry()
-        .write()
-        .expect("device-menu registry lock poisoned");
-    let list = map.entry(record_type.to_string()).or_default();
-    if !list.contains(&menu) {
-        list.push(menu);
-    }
-    if !menu.is_empty() && !has_contributed_device_menu(record_type) {
-        // Published under the write lock, so publishers are serialised.
-        let mut types = contributed_types().to_vec();
-        types.push(Box::leak(record_type.into()));
-        CONTRIBUTED_TYPES.store(Box::into_raw(Box::new(types)), Ordering::Release);
-    }
+/// concatenation. A choice the menu already lists is skipped, so wiring the
+/// same support twice in one process is safe.
+pub fn register_device_menu(record_type: &str, menu: &'static [DevSup]) {
+    publish_rows(record_type, menu);
 }
 
-fn contributed_types() -> &'static [&'static str] {
-    let types = CONTRIBUTED_TYPES.load(Ordering::Acquire);
+/// The row a registered device support brings: appended to `record_type`'s
+/// menu unless the menu already lists its choice, so every support that can
+/// be bound is a `DTYP` choice by construction.
+pub fn register_device_row(record_type: &str, row: &'static DevSup) {
+    publish_rows(record_type, std::slice::from_ref(row));
+}
+
+/// The rows registered together with a device object, by address: the row
+/// [`dev_sup_of`] finds for a choice is the one C binds, and a registration
+/// whose choice the menu already listed added no row of its own.
+static OBJECT_ROWS: AtomicPtr<Vec<&'static DevSup>> = AtomicPtr::new(std::ptr::null_mut());
+
+fn object_rows() -> &'static [&'static DevSup] {
+    let rows = OBJECT_ROWS.load(Ordering::Acquire);
     // SAFETY: a non-null pointer came from `Box::into_raw` and is never freed.
-    unsafe { types.as_ref() }.map_or(&[], Vec::as_slice)
+    unsafe { rows.as_ref() }.map_or(&[], Vec::as_slice)
 }
 
-/// The contributed `(choice, link_type)` rows for `record_type`, flattened in
-/// registration order.
-pub(crate) fn contributed_device_rows(record_type: &str) -> Vec<(&'static str, DbLinkType)> {
-    match CONTRIBUTED.get() {
-        Some(lock) => lock
-            .read()
-            .expect("device-menu registry lock poisoned")
-            .get(record_type)
-            .map(|list| list.iter().flat_map(|menu| menu.iter().copied()).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
+/// [`register_device_row`] for a support that also registers the device
+/// object serving `row`.
+pub fn register_device_object_row(record_type: &str, row: &'static DevSup) {
+    publish_rows(record_type, std::slice::from_ref(row));
+    let _publish = PUBLISH.lock().expect("device-menu registry lock poisoned");
+    if object_rows().iter().any(|r| std::ptr::eq(*r, row)) {
+        return;
     }
+    let mut next = object_rows().to_vec();
+    next.push(row);
+    OBJECT_ROWS.store(Box::into_raw(Box::new(next)), Ordering::Release);
+}
+
+/// Whether the row `dtyp` selects for `record_type` is served by a
+/// registered device object, whatever its choice is called.
+pub(crate) fn has_device_object(record_type: &str, dtyp: &str) -> bool {
+    dev_sup_of(record_type, dtyp)
+        .is_some_and(|row| object_rows().iter().any(|r| std::ptr::eq(*r, row)))
+}
+
+/// The contributed rows for `record_type`, flattened in registration order.
+pub(crate) fn contributed_device_rows(record_type: &str) -> Vec<&'static DevSup> {
+    menus_of(record_type)
+        .iter()
+        .flat_map(|menu| menu.iter())
+        .collect()
 }
 
 /// The choices contributed for `record_type`, flattened in registration order,
@@ -104,13 +203,13 @@ pub(crate) fn contributed_device_rows(record_type: &str) -> Vec<(&'static str, D
 pub(crate) fn contributed_device_menu(record_type: &str) -> Vec<&'static str> {
     contributed_device_rows(record_type)
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|row| row.choice)
         .collect()
 }
 
 /// Whether any choice was contributed for `record_type`.
 pub(crate) fn has_contributed_device_menu(record_type: &str) -> bool {
-    contributed_types().contains(&record_type)
+    menus_of(record_type).iter().any(|menu| !menu.is_empty())
 }
 
 /// The full DTYP menu for `record_type` — the static `device()` declarations
@@ -134,22 +233,62 @@ pub(crate) fn merged_device_menu(record_type: &str) -> Vec<&'static str> {
     names
 }
 
+/// [`merged_device_menu`] without collecting it: what a put under the
+/// record's hold may walk.
+pub(crate) fn device_menu_choices(record_type: &str) -> impl Iterator<Item = &'static str> {
+    super::dbd_generated::device_menu(record_type)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .chain(
+            menus_of(record_type)
+                .iter()
+                .flat_map(|menu| menu.iter().map(|row| row.choice)),
+        )
+}
+
+/// C `prec->dset`'s row: the devSup `dtyp` names in `record_type`'s device
+/// menu, declared rows first. An empty DTYP is menu index 0, as in C.
+pub(crate) fn dev_sup_of(record_type: &str, dtyp: &str) -> Option<&'static DevSup> {
+    let declared = super::dbd_generated::devices(record_type).unwrap_or_default();
+    let contributed = menus_of(record_type).iter().flat_map(|menu| menu.iter());
+    let mut rows = declared.iter().chain(contributed);
+    if dtyp.is_empty() {
+        rows.next()
+    } else {
+        rows.find(|row| row.choice == dtyp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const fn row(choice: &'static str) -> DevSup {
+        DevSup {
+            name: choice,
+            choice,
+            link_type: DbLinkType::Constant,
+            dset: Dset::new(5, &[], false),
+        }
+    }
+
     /// The lock-free answer flips with the first non-empty menu for a type and
-    /// for no other: an empty menu contributes no `device()` line.
+    /// for no other: an empty menu contributes no `device()` line, and a
+    /// registered support's row is one.
     #[test]
     fn has_contributed_device_menu_follows_non_empty_registration() {
-        static EMPTY: &[(&str, DbLinkType)] = &[];
-        static M: &[(&str, DbLinkType)] = &[("devC", DbLinkType::Constant)];
+        static EMPTY: &[DevSup] = &[];
+        static M: &[DevSup] = &[row("devC")];
         assert!(!has_contributed_device_menu("regtest_has"));
         register_device_menu("regtest_has", EMPTY);
         assert!(!has_contributed_device_menu("regtest_has"));
         register_device_menu("regtest_has", M);
         assert!(has_contributed_device_menu("regtest_has"));
         assert!(!has_contributed_device_menu("regtest_has_other"));
+        static ROW: DevSup = row("devR");
+        register_device_row("regtest_has_row", &ROW);
+        assert!(has_contributed_device_menu("regtest_has_row"));
     }
 
     /// Registering a menu makes its choices visible, appended in registration
@@ -158,10 +297,7 @@ mod tests {
     fn register_is_idempotent_per_slice() {
         // A record type name no other test touches, so the process-global
         // registry cannot cross-contaminate this assertion.
-        static M: &[(&str, DbLinkType)] = &[
-            ("devA", DbLinkType::Constant),
-            ("devB", DbLinkType::Constant),
-        ];
+        static M: &[DevSup] = &[row("devA"), row("devB")];
         assert!(contributed_device_menu("regtest_idem").is_empty());
         register_device_menu("regtest_idem", M);
         register_device_menu("regtest_idem", M);
@@ -171,13 +307,48 @@ mod tests {
         );
     }
 
+    /// A registered support adds its row once, and none for a choice the
+    /// record type's menu already lists.
+    #[test]
+    fn register_device_row_adds_only_a_missing_choice() {
+        static NEW: DevSup = row("regtest_row_new");
+        static SOFT: DevSup = row("Soft Channel");
+        register_device_row("ai", &SOFT);
+        register_device_row("regtest_row", &NEW);
+        register_device_row("regtest_row", &NEW);
+        assert!(!contributed_device_menu("ai").contains(&"Soft Channel"));
+        assert_eq!(
+            contributed_device_menu("regtest_row"),
+            vec!["regtest_row_new"]
+        );
+    }
+
+    /// One choice registered through both entry points is one menu entry,
+    /// whichever comes first.
+    #[test]
+    fn a_choice_registered_by_row_and_menu_is_listed_once() {
+        static ROW: DevSup = row("regtest_both");
+        static MENU: &[DevSup] = &[row("regtest_both"), row("regtest_both_2")];
+        register_device_row("regtest_row_first", &ROW);
+        register_device_menu("regtest_row_first", MENU);
+        assert_eq!(
+            contributed_device_menu("regtest_row_first"),
+            vec!["regtest_both", "regtest_both_2"]
+        );
+        register_device_menu("regtest_menu_first", MENU);
+        register_device_row("regtest_menu_first", &ROW);
+        assert_eq!(
+            contributed_device_menu("regtest_menu_first"),
+            vec!["regtest_both", "regtest_both_2"]
+        );
+    }
+
     /// Distinct slices for one record type concatenate in registration order —
     /// two crates each adding device support to the same type.
     #[test]
     fn distinct_contributions_concatenate() {
-        static A: &[(&str, DbLinkType)] = &[("a1", DbLinkType::Constant)];
-        static B: &[(&str, DbLinkType)] =
-            &[("b1", DbLinkType::Constant), ("b2", DbLinkType::Constant)];
+        static A: &[DevSup] = &[row("a1")];
+        static B: &[DevSup] = &[row("b1"), row("b2")];
         register_device_menu("regtest_concat", A);
         register_device_menu("regtest_concat", B);
         assert_eq!(

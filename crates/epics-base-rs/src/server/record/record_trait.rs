@@ -553,6 +553,10 @@ pub struct OutTarget {
     /// (`RecordInstance::field_puts_as_string`); a record's
     /// [`Record::multi_output_buffer`] just reads the answer.
     pub puts_as_string: bool,
+    /// C `plink->type == CONSTANT`, the test `tableRecord.c:2321` makes —
+    /// not `dbLinkIsConstant`, which a removed link also answers: its type
+    /// stays `PV_LINK` (`dbDbLink.c:132`) while it has no target.
+    pub constant_type: bool,
 }
 
 impl OutTarget {
@@ -565,6 +569,7 @@ impl OutTarget {
         element_count: 1,
         is_ca_link: false,
         puts_as_string: false,
+        constant_type: true,
     };
 }
 
@@ -762,13 +767,17 @@ impl SoftReading {
 
     /// The record's soft dset entry for this request.
     #[inline(always)]
-    pub(crate) fn apply(self, record: &mut dyn Record) -> CaResult<()> {
+    pub(crate) fn apply(
+        self,
+        record: &mut dyn Record,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         match self {
-            Self::Double(v) => record.soft_input_read_f64(v),
-            Self::Long(v) => record.soft_input_read_i32(v),
-            Self::UShort(v) => record.soft_input_read_u16(v),
-            Self::ULong(v) => record.soft_input_read_u32(v),
-            Self::Int64(v) => record.soft_input_read_i64(v),
+            Self::Double(v) => record.soft_input_read_f64(v, dpvt),
+            Self::Long(v) => record.soft_input_read_i32(v, dpvt),
+            Self::UShort(v) => record.soft_input_read_u16(v, dpvt),
+            Self::ULong(v) => record.soft_input_read_u32(v, dpvt),
+            Self::Int64(v) => record.soft_input_read_i64(v, dpvt),
         }
     }
 }
@@ -1879,6 +1888,23 @@ pub enum LinkRead {
     Succeeded,
     /// Non-zero status. The LINK/INVALID alarm is already raised.
     Failed,
+}
+
+/// `prec->pact` as [`Record::set_process_continuation`] sees it: a view the
+/// record may read and never write — PACT has one owner. Passed as a view, not
+/// a loaded `bool`, so a record that never asks costs the cycle no load.
+#[derive(Clone, Copy)]
+pub struct Pact<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Pact<'a> {
+    pub fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self(flag)
+    }
+
+    /// PACT is held.
+    pub fn held(self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Which of the per-cycle hooks a type can answer with something other than
@@ -3248,7 +3274,11 @@ pub trait Record: Send + Sync + 'static {
     /// is the copy the RAW dset needs (`devAiSoftRaw::read_ai` returns 0, so
     /// `convert()` runs), while both soft dsets return 2 and `convert()` never
     /// runs for them at all.
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         match value {
             Some(value) => self.set_val(value),
             None => Ok(()),
@@ -3258,32 +3288,52 @@ pub trait Record: Send + Sync + 'static {
     /// [`Self::soft_input_read`] for a `DBR_DOUBLE` reading, handed over
     /// without the [`EpicsValue`] wrapper. A record whose soft read filters
     /// its input overrides this with the direct path.
-    fn soft_input_read_f64(&mut self, value: f64) -> CaResult<()> {
-        self.soft_input_read(Some(EpicsValue::Double(value)))
+    fn soft_input_read_f64(
+        &mut self,
+        value: f64,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Double(value)), dpvt)
     }
 
     /// [`Self::soft_input_read`] for a `DBR_LONG` reading. An override stores
     /// exactly what the wrapped read stores.
-    fn soft_input_read_i32(&mut self, value: i32) -> CaResult<()> {
-        self.soft_input_read(Some(EpicsValue::Long(value)))
+    fn soft_input_read_i32(
+        &mut self,
+        value: i32,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Long(value)), dpvt)
     }
 
     /// [`Self::soft_input_read`] for a `DBR_USHORT` reading. An override
     /// stores exactly what the wrapped read stores.
-    fn soft_input_read_u16(&mut self, value: u16) -> CaResult<()> {
-        self.soft_input_read(Some(EpicsValue::UShort(value)))
+    fn soft_input_read_u16(
+        &mut self,
+        value: u16,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::UShort(value)), dpvt)
     }
 
     /// [`Self::soft_input_read`] for a `DBR_ULONG` reading. An override
     /// stores exactly what the wrapped read stores.
-    fn soft_input_read_u32(&mut self, value: u32) -> CaResult<()> {
-        self.soft_input_read(Some(EpicsValue::ULong(value)))
+    fn soft_input_read_u32(
+        &mut self,
+        value: u32,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::ULong(value)), dpvt)
     }
 
     /// [`Self::soft_input_read`] for a `DBR_INT64` reading. An override
     /// stores exactly what the wrapped read stores.
-    fn soft_input_read_i64(&mut self, value: i64) -> CaResult<()> {
-        self.soft_input_read(Some(EpicsValue::Int64(value)))
+    fn soft_input_read_i64(
+        &mut self,
+        value: i64,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.soft_input_read(Some(EpicsValue::Int64(value)), dpvt)
     }
 
     /// The `dbrType` the record type's `soft` INPUT dset hands its INP
@@ -5985,7 +6035,11 @@ pub trait Record: Send + Sync + 'static {
     /// framework executes the returned actions (currently `WriteDbLink`
     /// and `ReadDbLink`) and then performs the input-link fetch.
     /// Default returns empty.
-    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        _dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> ProcessActions {
         ProcessActions::new()
     }
 
@@ -6022,11 +6076,13 @@ pub trait Record: Send + Sync + 'static {
     /// tells the record, so the record never has to infer it from a clock
     /// reading (which a mid-flight interval change silently falsifies).
     ///
-    /// Records that hold PACT across their delay (calcout / scalcout /
-    /// acalcout / swait / sseq ODLY) already disambiguate through PACT and do
-    /// not need this. Additive, framework-set-hook pattern (same shape as
+    /// `pact` is `prec->pact` at entry, which is what a record whose C
+    /// `process()` branches on PACT (calcout's ODLY arm, `calcoutRecord.c:231`)
+    /// must read instead: a device-link put clears it (`dbAccess.c:1194`) and
+    /// the scheduled re-entry then runs a fresh cycle. Additive,
+    /// framework-set-hook pattern (same shape as
     /// [`Record::set_process_context`]). Default: ignore.
-    fn set_process_continuation(&mut self, _continuation: bool) {}
+    fn set_process_continuation(&mut self, _continuation: bool, _pact: Pact<'_>) {}
 
     /// Called by the framework once for every [`ProcessAction::WriteDbLink`]
     /// this record emitted, reporting the value it carried and whether the
@@ -7309,7 +7365,11 @@ mod tests {
             let hooks = r.cycle_hooks();
             assert_eq!(hooks, expected(record_type), "{record_type} cycle_hooks");
             if !hooks.has(CycleHooks::PRE_INPUT) {
-                assert!(r.pre_input_link_actions(true).is_empty(), "{record_type}");
+                assert!(
+                    r.pre_input_link_actions(true, &mut Default::default())
+                        .is_empty(),
+                    "{record_type}"
+                );
             }
             if !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::WRITE_POSTED)) {
                 assert!(r.take_cycle_posted_fields().is_empty(), "{record_type}");

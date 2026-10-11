@@ -186,13 +186,14 @@ impl LinkKind {
     /// this question. `is_ca_link` is C's `dbInitLink` locality test, and
     /// `field_type` is `Some` only for a target the IOC can address right now
     /// — so an external link with no cached value is exactly C's
-    /// `dbCaIsLinkConnected() == 0`.
+    /// `dbCaIsLinkConnected() == 0`. Any other link is `Constant` only when
+    /// its type is, as `checkLinks` tests: a removed DB link is `PV_LINK`.
     fn from_target(target: &OutTarget) -> Self {
         match (target.is_ca_link, target.field_type.is_some()) {
             (true, true) => LinkKind::CaConnected,
             (true, false) => LinkKind::CaDisconnected,
-            (false, true) => LinkKind::Db,
-            (false, false) => LinkKind::Constant,
+            (false, _) if target.constant_type => LinkKind::Constant,
+            (false, _) => LinkKind::Db,
         }
     }
 }

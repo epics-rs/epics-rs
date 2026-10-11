@@ -260,12 +260,20 @@ impl CaServerBuilder {
         Ok(self)
     }
 
-    /// Register a device support factory by DTYP name.
-    pub fn register_device_support<F>(mut self, dtyp: &str, factory: F) -> Self
+    /// Register a device support: its factory under `devsup.choice`, and
+    /// `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        mut self,
+        record_type: &str,
+        devsup: &'static epics_base_rs::server::record::DevSup,
+        factory: F,
+    ) -> Self
     where
         F: Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync + 'static,
     {
-        self.ioc = self.ioc.register_device_support(dtyp, factory);
+        self.ioc = self
+            .ioc
+            .register_device_support(record_type, devsup, factory);
         self
     }
 

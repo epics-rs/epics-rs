@@ -57,12 +57,14 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
         .0
 }
 
-/// A record asking for I/O Intr with no device support at all: C's first
-/// branch, byte for byte, and the demotion it announces.
+/// A record asking for I/O Intr with no device support at all — a calc, whose
+/// type declares no `device()` line (a soft ai has a dset in C, and is
+/// refused as `(no get_ioint_info)` instead): C's first branch, byte for
+/// byte, and the demotion it announces.
 #[epics_macros_rs::epics_test]
 async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
     let sink = listen();
-    let db = ioc("record(ai, \"T:A\") { field(SCAN,\"I/O Intr\") }\n").await;
+    let db = ioc("record(calc, \"T:A\") { field(SCAN,\"I/O Intr\") }\n").await;
 
     let log = heard(&sink);
     assert!(

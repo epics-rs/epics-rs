@@ -16,7 +16,7 @@
 //! ```rust,ignore
 //! IocApplication::new()
 //!     .port(5064)
-//!     .register_device_support("myDevice", || Box::new(MyDeviceSupport::new()))
+//!     .register_device_support("ai", &MY_DEVICE, || Box::new(MyDeviceSupport::new()))
 //!     .register_startup_command(my_config_command())
 //!     .startup_script("st.cmd")
 //!     .run(my_protocol_runner)
@@ -1887,14 +1887,20 @@ impl IocApplication {
         self
     }
 
-    /// Register a device support factory by DTYP name.
-    /// Called during iocInit to wire device support to records.
-    pub fn register_device_support<F>(mut self, dtyp: &str, factory: F) -> Self
+    /// Register a device support: its factory under `devsup.choice`, and
+    /// `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        mut self,
+        record_type: &str,
+        devsup: &'static crate::server::record::DevSup,
+        factory: F,
+    ) -> Self
     where
         F: Fn() -> Box<dyn DeviceSupport> + Send + Sync + 'static,
     {
+        crate::server::record::register_device_object_row(record_type, devsup);
         self.device_factories
-            .insert(dtyp.to_string(), Box::new(factory));
+            .insert(devsup.choice.to_string(), Box::new(factory));
         self
     }
 
@@ -2639,7 +2645,12 @@ pub(crate) fn attach_device_support(
     resolve: Option<&DeviceSupportResolver>,
 ) -> bool {
     let dtyp = instance.common.dtyp.as_str().to_string();
-    if instance.common.dtyp.is_soft() {
+    if instance
+        .common
+        .dtyp
+        .bind(instance.record.record_type())
+        .is_some()
+    {
         // A soft channel needs no dset. Its `"Async Soft Channel"` variant
         // still owns an `add_record`, but that is C's `doResolveLinks` moment,
         // which sits BETWEEN the two init passes — so the init owner runs it,
@@ -2898,10 +2909,23 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             continue;
         }
         let Some(mut dev) = inst.device.take() else {
-            // C `dbScan.c:272-276` — `precord->dset == NULL`. The trailing
-            // space is C's literal (`dbScan.c:275`), not a typo.
+            // A soft device is served by the framework, so no device object
+            // says nothing about C's `precord->dset`; its devSup row does.
+            // No row is `dbScan.c:272-276` (the trailing space is C's
+            // literal), a row without `get_ioint_info` is `:278-281`, and a
+            // hook with no device here to answer it is `:290-293`'s NULL list.
             if on_io_intr {
-                demote.push((name, "scanAdd: I/O Intr not valid (no DSET) "));
+                let row = record::dev_sup_of(inst.record.record_type(), inst.common.dtyp.as_str());
+                demote.push((
+                    name,
+                    match row {
+                        None => "scanAdd: I/O Intr not valid (no DSET) ",
+                        Some(row) if !row.has_get_ioint_info() => {
+                            "scanAdd: I/O Intr not valid (no get_ioint_info)"
+                        }
+                        Some(_) => "scanAdd: I/O Intr not valid",
+                    },
+                ));
             }
             continue;
         };
@@ -3007,9 +3031,9 @@ mod io_intr_scan_add_tests {
     use crate::server::records::ai::AiRecord;
     use std::sync::Arc;
 
-    /// R6-8 — C `scanAdd` (`dbScan.c:272-276`): a `SCAN="I/O Intr"` record with
-    /// no device support (`precord->dset == NULL`) is reported with
-    /// `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
+    /// R6-8 — C `scanAdd` (`dbScan.c:272-282`): a `SCAN="I/O Intr"` record with
+    /// no device object (here a soft ai, whose C dset has no `get_ioint_info`)
+    /// is reported with `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
     /// left claiming I/O Intr, and must not stay in the I/O Intr scan bucket
     /// that `scanpiol` reports from.
     #[epics_macros_rs::epics_test]

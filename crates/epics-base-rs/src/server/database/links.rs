@@ -94,7 +94,7 @@ fn empty_read_fetch(
     link: &crate::server::record::ParsedLink,
 ) -> crate::server::recgbl::simm::LinkFetch {
     use crate::server::recgbl::simm::LinkFetch;
-    if crate::server::recgbl::simm::is_constant(link) {
+    if crate::server::recgbl::simm::has_const_lset(link) {
         LinkFetch::NoData
     } else {
         LinkFetch::Failed
@@ -779,6 +779,9 @@ impl PvDatabase {
         let Some((name, rec)) = self.lookup_record(&db.target().record) else {
             return DbLinkAnswer::Absent;
         };
+        if !self.names_field(&rec, db.field_as_written()) {
+            return DbLinkAnswer::Absent;
+        }
         let mut put =
             crate::server::record::record_instance::PutAddr::resolve_in(&rec, &db.target().field);
         if db.target().string_view {
@@ -1065,7 +1068,7 @@ impl PvDatabase {
         // here too so the illegal "no value, but here is the source's
         // severity" pair cannot leave it.
         let alarm = match value {
-            None if !crate::server::recgbl::simm::is_constant(link) => None,
+            None if !crate::server::recgbl::simm::has_const_lset(link) => None,
             _ => alarm,
         };
         (value, alarm, render)
@@ -1370,7 +1373,8 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
     ) -> Option<EpicsValue> {
         match link {
-            crate::server::record::ParsedLink::None => None,
+            crate::server::record::ParsedLink::None
+            | crate::server::record::ParsedLink::Removed(_) => None,
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_) => self.read_external_link_value(link),
@@ -1403,7 +1407,8 @@ impl PvDatabase {
             | ParsedLink::Constant(_)
             | ParsedLink::Hw(_)
             | ParsedLink::Calc(_)
-            | ParsedLink::State(_) => return None,
+            | ParsedLink::State(_)
+            | ParsedLink::Removed(_) => return None,
         };
         Some(
             name.rsplit_once('.')
@@ -1823,10 +1828,11 @@ impl PvDatabase {
             // reads as a value with no alarm to inherit.
             crate::server::record::ParsedLink::State(st) => (Some(self.read_state_link(st)), None),
             // Hardware links carry no generic readable value; `None` links
-            // deliver nothing.
-            crate::server::record::ParsedLink::Hw(_) | crate::server::record::ParsedLink::None => {
-                (None, None)
-            }
+            // deliver nothing. A removed link has no lset, so `empty_read_fetch`
+            // makes its empty read `dbTryGetLink`'s `S_db_noLSET`.
+            crate::server::record::ParsedLink::Hw(_)
+            | crate::server::record::ParsedLink::None
+            | crate::server::record::ParsedLink::Removed(_) => (None, None),
         }
     }
 
@@ -2929,20 +2935,27 @@ impl PvDatabase {
                             field_type,
                             Some(DbFieldType::String) | Some(DbFieldType::Enum)
                         ),
+                        constant_type: false,
                     }
                 }
                 None => OutTarget {
                     is_ca_link: true,
+                    constant_type: false,
                     ..OutTarget::UNRESOLVED
                 },
             }
         };
         match link {
             crate::server::record::ParsedLink::Db(db) => {
+                // A DB link is never `CONSTANT`, addressable or not.
+                const UNADDRESSED: OutTarget = OutTarget {
+                    constant_type: false,
+                    ..OutTarget::UNRESOLVED
+                };
                 let addressed = db.target();
                 let target = match self.db_link_target(db) {
                     LinkTarget::Local(rec) => rec,
-                    LinkTarget::LocalNotRecord => return OutTarget::UNRESOLVED,
+                    LinkTarget::LocalNotRecord => return UNADDRESSED,
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
                     LinkTarget::External => return external(db.pvname()),
                 };
@@ -2956,8 +2969,9 @@ impl PvDatabase {
                             element_count: (view.no_elements as i64).max(1),
                             is_ca_link: false,
                             puts_as_string: false,
+                            constant_type: false,
                         },
-                        None => OutTarget::UNRESOLVED,
+                        None => UNADDRESSED,
                     };
                 }
                 let field_type = crate::server::record::record_instance::declared_field_type_of(
@@ -2988,6 +3002,7 @@ impl PvDatabase {
                     // port's DBR-typed `field_type` cannot name. The target
                     // record classifies its own field.
                     puts_as_string: guard.field_puts_as_string(&addressed.field),
+                    constant_type: false,
                 }
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -3006,10 +3021,14 @@ impl PvDatabase {
                 element_count: 1,
                 is_ca_link: false,
                 puts_as_string: false,
+                constant_type: false,
             },
-            // Constant / Hw / Calc / None: not a writable target — the write
-            // path no-ops, so the metadata is never used.
-            _ => OutTarget::UNRESOLVED,
+            // Constant / Hw / Calc / None / Removed: no target. The type is
+            // the one the link holds — a removed DB link's is `PV_LINK`.
+            _ => OutTarget {
+                constant_type: link.db_link_type() == crate::server::record::DbLinkType::Constant,
+                ..OutTarget::UNRESOLVED
+            },
         }
     }
 
@@ -3088,31 +3107,25 @@ impl PvDatabase {
             let links = instance.record.multi_output_links();
             let mut pairs = Vec::new();
             for &(link_field, val_field) in links {
-                let link_str = match instance.record.get_field(link_field) {
-                    Some(EpicsValue::String(s)) => s,
-                    _ => continue,
+                let link = match instance.stored_link(link_field) {
+                    None | Some(crate::server::record::ParsedLink::None) => continue,
+                    Some(link) => link,
                 };
-                if link_str.is_empty() {
-                    continue;
-                }
                 if let Some(val) = instance.record.get_field(val_field) {
-                    pairs.push((link_field, link_str, val));
+                    pairs.push((link_field, link.clone(), val));
                 }
             }
             pairs
         };
-        for (link_field, link_str, val) in pairs {
+        for (link_field, parsed, val) in pairs {
             // `multi_output_links` carries record OUT links (scalcout /
             // acalcout `OUT` — `DBF_OUTLINK`) driven via `dbPutLink` →
             // `dbDbPutValue` (`dbDbLink.c:388`): a bare DB link is NPP, the
-            // value is written but the target is NOT processed.
-            // `parse_output_link_v2` applies that OUT-link-correct NPP default;
-            // `parse_link_v2` would wrongly default a bare link to
-            // ProcessPassive and re-process the target. An external
-            // `ca://`/`pva://` OUT link routes through the link set's
-            // `putValue` (C `dbLink.c::dbPutLink`, dbLink.c:434-448).
-            let parsed =
-                crate::server::record::parse_output_link_v2(link_str.as_str_lossy().as_ref());
+            // value is written but the target is NOT processed: the slot
+            // parsed the field under the OUT-link mask, whose NPP default
+            // that is. An external `ca://`/`pva://` OUT link routes through
+            // the link set's `putValue` (C `dbLink.c::dbPutLink`,
+            // dbLink.c:434-448).
             // Device-support write-buffer switch: the resolved target's DBF
             // type / element count decides which of the record's buffers C
             // would actually put (`devsCalcoutSoft.c:66-144`,
@@ -3200,25 +3213,23 @@ impl PvDatabase {
             }
             // C `lnkState_putValue` (`lnkState.c:153-203`) drives the named
             // bit; a DBR class it has no arm for is `S_db_badDbrtype`, which
-            // `dbPutLink` reports as a failed put.
+            // `dbPutLink` turns into the link alarm and nothing printed
+            // (`dbLink.c:443-446`).
             crate::server::record::ParsedLink::State(st) => {
-                match crate::server::record::StateLink::truth_of(&value) {
-                    Some(truth) => {
+                use crate::server::record::{StateLink, StatePut};
+                match StateLink::put_of(&value) {
+                    StatePut::Truth(truth) => {
                         self.db_state(&st.name).set(st.write(truth));
                         false
                     }
-                    None => {
-                        eprintln!(
-                            "OUT-link write to state '{}' failed: unsupported value type",
-                            st.name
-                        );
-                        true
-                    }
+                    StatePut::Nothing => false,
+                    StatePut::BadDbrType => true,
                 }
             }
             // Constant / Hw / Calc / None are not writable OUT-link
-            // targets — no-op (C `dbPutLink` → `S_db_noLSET`).
-            _ => false,
+            // targets — no-op. A removed link has no lset: `S_db_noLSET`,
+            // and no `setLinkAlarm` (`dbLink.c:440-441`).
+            _ => return matches!(link, crate::server::record::ParsedLink::Removed(_)),
         };
         if failed {
             let mut inst = src_rec.write();
@@ -4160,7 +4171,7 @@ impl PvDatabase {
         let crate::server::record::ParsedLink::Db(db) = &parsed else {
             return parsed;
         };
-        if self.has_name_no_resolve(&db.target().record) {
+        if self.has_db_link_target(&db.target().record, db.field_as_written()) {
             return parsed;
         }
         crate::server::record::ParsedLink::Ca(crate::server::record::CaLink {
@@ -4467,17 +4478,21 @@ impl PvDatabase {
 
     /// A put to `holder`'s link `field` after the connect pass: C
     /// `dbPutFieldLink` drops the old `caLink` and opens a new one, whose
-    /// connect processes the holder like the connect pass. Called once the
-    /// put's gate is down.
+    /// connect processes the holder like the connect pass. A link the put
+    /// removed and never added opens nothing. Called once the put's gate is
+    /// down.
     pub(crate) fn relink_cp_link(&self, holder: &str, field: &str) {
         if !self.inner.cp_links.load().connected() {
             return;
         }
         let holder = self.canonical_name(holder);
+        let removed = self
+            .get_record(&holder)
+            .is_some_and(|rec| rec.read().link_unadded(field));
         let edge = self
             .record_link_fields(&holder)
             .into_iter()
-            .find(|(f, _, _)| f.eq_ignore_ascii_case(field))
+            .find(|(f, _, _)| !removed && f.eq_ignore_ascii_case(field))
             .and_then(|(_, _, parsed)| Self::classify_cp_link(parsed));
         let field = field.to_ascii_uppercase();
         for external in [false, true] {
@@ -5923,7 +5938,6 @@ mod db_link_addr_tests {
             ("W MS", false, Some(6.0)),
             ("S MS", false, Some(3.25)),
             ("T MS", false, None),
-            ("C.NOPE MS", false, None),
         ] {
             let parsed = parse_link_v2(text);
             let ParsedLink::Db(link) = &parsed else {
@@ -5958,6 +5972,20 @@ mod db_link_addr_tests {
                 "{text}"
             );
         }
+        // `dbFindFieldPart` names neither, so the link has no address.
+        for text in ["C.NOPE MS", "C.val MS"] {
+            let ParsedLink::Db(link) = parse_link_v2(text) else {
+                panic!("{text} parses to a Db link");
+            };
+            assert!(db.db_link_addr(&link).is_none(), "{text}");
+        }
+        let ParsedLink::Db(link) = parse_link_v2("C.CALC$ MS") else {
+            panic!("C.CALC$ parses to a Db link");
+        };
+        assert!(
+            db.db_link_addr(&link).is_some(),
+            "the `$` is no part of the field"
+        );
     }
 
     /// `dbGetLink(DBR_CHAR)` of a non-char source converts it (softIoc
@@ -6034,7 +6062,7 @@ mod db_link_addr_tests {
             LinkReadAs::String,
             LinkReadAs::CharArrayAsString { max_elements: 40 },
         ];
-        for text in ["C MS", "C NMS", "SRC MS", "W MS", "T MS", "C.NOPE MS"] {
+        for text in ["C MS", "C NMS", "SRC MS", "W MS", "T MS"] {
             let parsed = parse_link_v2(text);
             let ParsedLink::Db(link) = &parsed else {
                 panic!("{text} parses to a Db link");

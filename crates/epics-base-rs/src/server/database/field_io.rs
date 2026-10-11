@@ -154,6 +154,22 @@ fn refuse_no_mod(field: &str, tail: &mut PutTail) -> CaError {
     CaError::ReadOnlyField(field.to_string())
 }
 
+/// [`check_no_mod_in_db_put`] for a `dbPutField` body, which hands a link
+/// field to `dbPutFieldLink`: there C refuses a device without `dsxt` first,
+/// and a NOMOD link is removed before it is refused, both under the hold
+/// ([`gate_link`]).
+fn check_no_mod_in_db_put_field(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+    at: &crate::server::record::record_instance::PutAddr,
+    tail: &mut PutTail,
+) -> CaResult<()> {
+    if instance.refuses_link_put_under_hold(field) {
+        return Ok(());
+    }
+    check_no_mod_in_db_put(instance, field, at, tail)
+}
+
 /// C `dbPut`'s link-field refusal (`field_type > DBF_DEVICE` →
 /// `S_db_badDbrtype`, `dbAccess.c:1340-1347`): only `dbPutField` may change a
 /// DBF_INLINK/OUTLINK/FWDLINK field — it routes them through `dbPutFieldLink`
@@ -563,6 +579,57 @@ impl PutTail {
     pub(crate) fn has_report(&self) -> bool {
         self.report.is_some()
     }
+}
+
+/// The write hold for a put carrying `link`. C reads DTYP under the record's
+/// lock (`dbAccess.c:1128`), where the port prepared the new dset before this
+/// hold; a DTYP that moved in between drops the hold and rebuilds once, and a
+/// second move is refused under the hold before anything moves.
+fn hold_for_link<'r>(
+    db: &PvDatabase,
+    rec: &'r crate::server::record::RecordCell,
+    link: &mut Option<PreparedCommonLink>,
+) -> crate::server::record::RecordMut<'r> {
+    let instance = rec.write();
+    match link {
+        Some(link) if link.device_dtyp_moved(&instance) => {
+            drop(instance);
+            link.ask_add_record(db, rec);
+            rec.write()
+        }
+        _ => instance,
+    }
+}
+
+/// C `dbPutFieldLink`'s gates on a link-field put, in its order, run once
+/// under the hold before `special(_, false)` and the store: for a device link
+/// the `dsxt` refusal ([`RecordInstance::gate_device_link_put`]), for another
+/// link `dbLinkIsDefined` ([`RecordInstance::link_put_slot`]), then
+/// `dbPutSpecial(paddr, 0)`'s SPC_NOMOD, which finds the link already
+/// removed (`dbAccess.c:1149`, `:1168-1176`).
+fn gate_link(
+    instance: &mut RecordInstance,
+    field: &str,
+    link: &mut Option<PreparedCommonLink>,
+    at: &crate::server::record::record_instance::PutAddr,
+    tail: &mut PutTail,
+) -> CaResult<()> {
+    if let Some(link) = link.as_mut().filter(|l| instance.is_device_link(l.field())) {
+        instance.gate_device_link_put(link)?;
+        let refused = check_no_mod_in_db_put(instance, link.field(), at, tail);
+        if refused.is_err() {
+            instance.detach_device_link(link);
+        }
+        return refused;
+    }
+    let Some(slot) = instance.link_put_slot(field)? else {
+        return Ok(());
+    };
+    let refused = check_no_mod_in_db_put(instance, field, at, tail);
+    if refused.is_err() {
+        instance.remove_link_slot(slot);
+    }
+    refused
 }
 
 /// Move the work a `special(_, true)` left for after the gate into the put's
@@ -2632,19 +2699,31 @@ impl PvDatabase {
     }
 
     /// [`Self::after_put_gate`] past the report: what a put that `ok`
-    /// landed owes, and its `special()`'s work either way.
+    /// landed owes, and its `special()`'s work either way. A refused link
+    /// put that had already removed the link (`dbRemoveLink`,
+    /// `dbAccess.c:1167-1168`) owes the relink too, which drops its CP edge.
     fn settle_put(&self, record_name: &str, field: &str, link_text: bool, ok: bool, tail: PutTail) {
         if let Some(report) = tail.report {
             self.emit_put_report(record_name, field, report);
         }
+        let rec = link_text
+            .then(|| self.get_record(record_name))
+            .flatten()
+            .filter(|rec| crate::types::dbf_link_class(rec.rdes().record_type, field).is_some());
+        let removed = !ok
+            && rec
+                .as_ref()
+                .is_some_and(|rec| rec.read().link_unadded(field));
+        if ok && rec.is_some() || removed {
+            self.relink_cp_link(record_name, field);
+        }
+        // `RecordInstance::refuse_device_link_put` left an I/O Intr record
+        // Passive; the index is re-filed from its live SCAN.
+        if removed && rec.is_some_and(|rec| rec.read().is_device_link(field)) {
+            use crate::server::record::ScanType;
+            self.update_scan_index(record_name, ScanType::IoIntr, ScanType::Passive, 0, 0);
+        }
         if ok {
-            if link_text
-                && self.get_record(record_name).is_some_and(|rec| {
-                    crate::types::dbf_link_class(rec.rdes().record_type, field).is_some()
-                })
-            {
-                self.relink_cp_link(record_name, field);
-            }
             if let Some(field) = super::put_posted_field(field) {
                 self.dispatch_put_cp_targets(record_name, field);
             }
@@ -2993,7 +3072,7 @@ impl PvDatabase {
         // The clients already hold their receivers; a failure here (record gone,
         // field refused) must still release them, which dropping the senders
         // does — the same completion a `dbNotifyCancel` gives the C client.
-        let held = {
+        let held = loop {
             let _record_gate = self.acquire_put_gate(record_name, "", None);
             let Some(rec) = self.get_record(record_name) else {
                 return;
@@ -3001,7 +3080,7 @@ impl PvDatabase {
             let Some(queued) = rec.write().take_next_notify_restart() else {
                 return;
             };
-            match queued {
+            break match queued {
                 crate::server::record::DeferredNotify::Put(
                     crate::server::record::DeferredNotifyPut {
                         field,
@@ -3032,7 +3111,29 @@ impl PvDatabase {
                     );
                     return;
                 }
-            }
+                // C `processNotifyCommon` with `first == 0`: a cancelled
+                // request was taken off the list (`dbNotify.c:400-410`), and
+                // one whose record is no longer Passive completes without a
+                // process (`:263-270`); either way the next entry is checked.
+                crate::server::record::DeferredNotify::ProcessGet {
+                    completion,
+                    requester,
+                } => {
+                    if !requester.is_current() {
+                        continue;
+                    }
+                    if rec.read().common.scan != crate::server::record::ScanType::Passive {
+                        let _ = completion.send(());
+                        continue;
+                    }
+                    let _ = self.install_notify_and_process_already_locked(
+                        record_name,
+                        completion,
+                        NotifyArrival::Replay,
+                    );
+                    return;
+                }
+            };
         };
         let (field, link_text, put, tail) = held;
         let _ = self.after_put_gate(record_name, &field, link_text, put, tail);
@@ -3245,13 +3346,13 @@ impl PvDatabase {
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route
             // ([`check_no_mod_in_db_put`]).
-            check_no_mod_in_db_put(&instance, &field, &at, tail)?;
+            check_no_mod_in_db_put_field(&instance, &field, &at, tail)?;
         }
         let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
         let mut common_link = PreparedCommonLink::for_put(record_name, &field, &value);
         create_put_link_channel(self, link.as_ref(), common_link.as_ref());
         if let Some(l) = common_link.as_mut() {
-            l.prepare_add_record(self, &rec);
+            l.ask_add_record(self, &rec);
         }
         // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
         // relinks the record's lock set, and its parse/`dbCanSetLink` refusals
@@ -3500,7 +3601,7 @@ impl PvDatabase {
         let link_backing = self.resolve_link_backed_metadata_for_posts(&rec);
         let link_backing = link_backing.as_link_backing();
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
-            let mut instance = rec.write();
+            let mut instance = hold_for_link(self, &rec, &mut common_link);
 
             // C `db_put_process` (db_access.c:1025-1043) returns 1 (didPut) even
             // when the internal `dbChannelPut` FAILS — a rejected conversion, an
@@ -3519,6 +3620,7 @@ impl PvDatabase {
             // tail run only when the put fully succeeded (C's `goto done` skips
             // them on failure).
             let block_result: CaResult<crate::server::record::CommonFieldPutResult> = (|| {
+                gate_link(&mut instance, &field, &mut common_link, &at, tail)?;
                 // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
                 // This matches C EPICS db_put_field() which converts from the CA client's type
                 // to the record field's native type.
@@ -3560,14 +3662,16 @@ impl PvDatabase {
                                 // and the field's monitor post, and `dbPutField`
                                 // skips the process. Propagating the error here
                                 // reproduces all three.
-                                let result = special_after_put(
+                                let special = special_after_put(
                                     self,
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
                                     link_backing,
                                     tail,
-                                )?;
+                                );
+                                let result = instance
+                                    .rebind_declared_device_link(&mut common_link, special)?;
                                 // The clear happens BEFORE `dbProcess` runs, so
                                 // any reader between the put and the process cycle
                                 // sees the new value with a consistent udf=false.
@@ -3997,13 +4101,13 @@ impl PvDatabase {
                 // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
                 // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
                 // IPTR) restorable, and dbCommon's with them.
-                check_no_mod_in_db_put(&instance, &field, &at, tail)?;
+                check_no_mod_in_db_put_field(&instance, &field, &at, tail)?;
             }
             let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
             let mut common_link = PreparedCommonLink::for_put(base, &field, &value);
             create_put_link_channel(self, link.as_ref(), common_link.as_ref());
             if let Some(l) = common_link.as_mut() {
-                l.prepare_add_record(self, &rec);
+                l.ask_add_record(self, &rec);
             }
             // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link
             // field relinks the record's lock set, inside the gate window
@@ -4030,7 +4134,8 @@ impl PvDatabase {
             let mut special_actions = Vec::new();
 
             let common_result = {
-                let mut instance = rec.write();
+                let mut instance = hold_for_link(self, &rec, &mut common_link);
+                gate_link(&mut instance, &field, &mut common_link, &at, tail)?;
 
                 // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
                 // `dbPut` runs on every entry path including the `dbPutField`
@@ -4138,14 +4243,22 @@ impl PvDatabase {
                 // (`dbPutFieldLink`, `dbAccess.c:1174,1178`) runs the same pair.
                 let result = match common {
                     Some(result) => result,
-                    None => special_after_put(
-                        self,
-                        &mut instance,
-                        &field,
-                        &mut special_actions,
-                        link_backing,
-                        tail,
-                    )?,
+                    None => {
+                        let special = special_after_put(
+                            self,
+                            &mut instance,
+                            &field,
+                            &mut special_actions,
+                            link_backing,
+                            tail,
+                        );
+                        match refused {
+                            None => {
+                                instance.rebind_declared_device_link(&mut common_link, special)?
+                            }
+                            Some(_) => special?,
+                        }
+                    }
                 };
 
                 // `if (status) goto done` (`dbAccess.c:1404`) — the refused

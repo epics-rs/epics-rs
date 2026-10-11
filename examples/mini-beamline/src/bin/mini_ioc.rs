@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_ca_rs::server::ioc_app::IocApplication;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
@@ -35,6 +36,22 @@ use mini_beamline::moving_dot::driver::{MovingDotRuntime, create_moving_dot_with
 use mini_beamline::physics::{BeamCurrentConfig, DetectorMode, MovingDotImageConfig};
 use mini_beamline::point_detector::{self, PointDetectorRuntime};
 use mini_beamline::random_waveform::ioc_support::RandomWaveformFactory;
+
+// The two DTYPs this binary serves, as the `device()` lines a C IOC's .dbd
+// would declare for them.
+static MINI_BEAM_CURRENT: DevSup = DevSup {
+    name: "devAiMiniBeamCurrent",
+    choice: "miniBeamCurrent",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 3, 4], false),
+};
+
+static MINI_RANDOM_WAVEFORM: DevSup = DevSup {
+    name: "devWfMiniRandom",
+    choice: "miniRandomWaveform",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
 // ============================================================================
 // Environment helpers
@@ -294,7 +311,7 @@ async fn main() -> CaResult<()> {
 
     {
         let h = holder.clone();
-        app = app.register_device_support("miniBeamCurrent", move || {
+        app = app.register_device_support("ai", &MINI_BEAM_CURRENT, move || {
             let rx = h
                 .beam_rx
                 .lock()
@@ -317,7 +334,8 @@ async fn main() -> CaResult<()> {
     {
         let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));
         factory.register_pva_bundle("mini:wf:bundle", "wf");
-        app = app.register_device_support("miniRandomWaveform", move || factory.make());
+        app =
+            app.register_device_support("waveform", &MINI_RANDOM_WAVEFORM, move || factory.make());
     }
     // PointDetector and MovingDot records now use standard asyn DTYPs
     // (asynFloat64, asynInt32) with @asyn(PORT,...) links. The universal

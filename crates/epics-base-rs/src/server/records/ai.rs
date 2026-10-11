@@ -6,25 +6,6 @@ use crate::server::record::{
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
-/// The soft `ai` dset's own "a read has completed" state — `prec->dpvt` in
-/// `devAiSoft.c` (set at :90, cleared at :94) and `pdevPvt->smooth` in
-/// `devAiSoftCallback.c` (:194, :182). It is the second term of the three-part
-/// `SMOO` guard, and it is what makes the FIRST soft read of a record — and
-/// the first after a failed one — land unblended.
-///
-/// Named rather than a bare `bool` because the state it carries is not "SMOO
-/// is armed" but "`VAL` currently holds a previous reading": `VAL` alone
-/// cannot say so (a caput, a `SIMM` landing and a constant-`INP` load all
-/// leave a perfectly finite `VAL` that C refuses to blend against).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SoftReadHistory {
-    /// C `dpvt == NULL` / `smooth == FALSE`.
-    #[default]
-    Absent,
-    /// C `dpvt != NULL` / `smooth == TRUE`.
-    Prior,
-}
-
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
 pub struct AiRecord {
@@ -68,10 +49,6 @@ pub struct AiRecord {
     /// `SPC_LINCONV` put, cleared at the end of every `process`.
     pub init: ConvertPhase,
     skip_convert: bool,
-    /// C's soft-dset history flag — see [`SoftReadHistory`]. Owned by
-    /// [`Record::soft_input_read`], which is the only place C touches
-    /// `dpvt`/`smooth` too.
-    soft_history: SoftReadHistory,
     /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the raw value fell past
     /// an end of the table. C `aiRecord.c::convert` raises
@@ -130,7 +107,6 @@ impl Default for AiRecord {
             mlst: 0.0,
             init: ConvertPhase::default(),
             skip_convert: false,
-            soft_history: SoftReadHistory::default(),
             bpt_error: false,
             bpt_registry: None,
             bpt_table: None,
@@ -731,7 +707,11 @@ impl Record for AiRecord {
     /// and at that point `prec->val` is still the PREVIOUS value — the reading
     /// is `vt.val`. So the finiteness test is on what is being blended INTO,
     /// and `dpvt` is the separate answer to "is there anything to blend into".
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         // A `DBR_DOUBLE` reading with SMOO off is the whole dset body; taking
         // it first keeps the blend's frame and `EpicsValue`'s out-of-line
         // drop off the per-cycle read.
@@ -740,34 +720,38 @@ impl Record for AiRecord {
             && self.smoo == 0.0
         {
             self.val = v;
-            self.soft_history = SoftReadHistory::Prior;
+            dpvt.read_done();
             return Ok(());
         }
         let Some(value) = std::mem::ManuallyDrop::into_inner(value) else {
-            self.soft_history = SoftReadHistory::Absent;
+            dpvt.read_failed();
             return Ok(());
         };
         let previous = self.val;
-        let history = self.soft_history;
+        let history = dpvt.smooth();
         // `set_val` stays the coercion owner (an array source delivers
         // `wf[0]`, C `dbGetLink` with `nRequest = NULL`), so the reading is
         // taken through it and blended afterwards.
         self.set_val(value)?;
-        if self.smoo != 0.0 && history == SoftReadHistory::Prior && previous.is_finite() {
+        if self.smoo != 0.0 && history && previous.is_finite() {
             self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
         }
-        self.soft_history = SoftReadHistory::Prior;
+        dpvt.read_done();
         Ok(())
     }
 
-    fn soft_input_read_f64(&mut self, value: f64) -> CaResult<()> {
+    fn soft_input_read_f64(
+        &mut self,
+        value: f64,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         let previous = self.val;
-        let history = self.soft_history;
+        let history = dpvt.smooth();
         self.val = value;
-        if self.smoo != 0.0 && history == SoftReadHistory::Prior && previous.is_finite() {
+        if self.smoo != 0.0 && history && previous.is_finite() {
             self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
         }
-        self.soft_history = SoftReadHistory::Prior;
+        dpvt.read_done();
         Ok(())
     }
 
@@ -828,6 +812,7 @@ impl Record for AiRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::device_support::Dpvt;
 
     /// `set_val`'s typed `DOUBLE` store must land what the generic internal
     /// delivery lands, and every other shape must still reach that owner.
@@ -838,18 +823,19 @@ mod tests {
         for smoo in [0.0, 0.5] {
             for reading in [2.5, f64::NAN, f64::INFINITY] {
                 let (mut bare, mut wrapped) = (AiRecord::new(1.0), AiRecord::new(1.0));
+                let (mut bare_pvt, mut wrapped_pvt) = (Dpvt::default(), Dpvt::default());
                 bare.smoo = smoo;
                 wrapped.smoo = smoo;
                 for _ in 0..3 {
-                    bare.soft_input_read_f64(reading).unwrap();
+                    bare.soft_input_read_f64(reading, &mut bare_pvt).unwrap();
                     wrapped
-                        .soft_input_read(Some(EpicsValue::Double(reading)))
+                        .soft_input_read(Some(EpicsValue::Double(reading)), &mut wrapped_pvt)
                         .unwrap();
                     assert_eq!(bare.val.to_bits(), wrapped.val.to_bits());
-                    assert!(bare.soft_history == wrapped.soft_history);
+                    assert_eq!(bare_pvt.smooth(), wrapped_pvt.smooth());
                 }
-                bare.soft_input_read(None).unwrap();
-                wrapped.soft_input_read(None).unwrap();
+                bare.soft_input_read(None, &mut bare_pvt).unwrap();
+                wrapped.soft_input_read(None, &mut wrapped_pvt).unwrap();
             }
         }
     }

@@ -280,7 +280,11 @@ impl Record for EventRecord {
     /// `devEventSoft.c::read_event` (76-80): the `DBR_STRING` read replaces
     /// VAL only when it differs (`strcmp` then `strcpy`). The read is already
     /// VAL's own type, so it skips the generic put's field-shape lookups.
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         match value {
             Some(EpicsValue::String(mut s)) => {
                 if s.as_bytes() != self.val.as_bytes() {
@@ -360,11 +364,17 @@ mod tests {
         rec.put_field("VAL", EpicsValue::String("shutter".into()))
             .unwrap();
         assert_eq!(name(&rec).as_deref(), Some("shutter"));
-        rec.soft_input_read(Some(EpicsValue::String("0".into())))
-            .unwrap();
+        rec.soft_input_read(
+            Some(EpicsValue::String("0".into())),
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(name(&rec), None);
-        rec.soft_input_read(Some(EpicsValue::String("7".into())))
-            .unwrap();
+        rec.soft_input_read(
+            Some(EpicsValue::String("7".into())),
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(name(&rec).as_deref(), Some("7"));
         rec.put_field("VAL", EpicsValue::String("".into())).unwrap();
         assert_eq!(name(&rec), None);

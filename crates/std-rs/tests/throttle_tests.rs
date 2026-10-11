@@ -559,7 +559,10 @@ fn test_no_forward_link_on_drain_with_nothing_queued() {
     assert!(rec.should_fire_forward_link());
 
     // Fire the cooldown timer with NOTHING queued.
-    rec.set_process_continuation(true);
+    rec.set_process_continuation(
+        true,
+        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
+    );
     rec.process().unwrap();
     assert!(
         !rec.should_fire_forward_link(),
@@ -798,7 +801,10 @@ fn put_dly(rec: &mut ThrottleRecord, dly: f64) -> Vec<ProcessAction> {
 /// The cooldown timer firing — C `delayFuncCallback` (:530-538). The
 /// framework marks its own `ReprocessAfter` re-entry; nothing else does.
 fn fire_timer(rec: &mut ThrottleRecord) -> Vec<ProcessAction> {
-    rec.set_process_continuation(true);
+    rec.set_process_continuation(
+        true,
+        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
+    );
     process_ok(rec)
 }
 

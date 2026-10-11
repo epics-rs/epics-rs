@@ -13,6 +13,7 @@
 //! read dropping the history, and the RAW dset still smoothing in `convert()`.
 
 use epics_base_rs::server::db_loader::create_record;
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -96,8 +97,11 @@ async fn a_raw_soft_channel_ai_still_smooths_through_convert() {
 #[test]
 fn smoo_zero_takes_every_reading_whole() {
     let mut ai = create_record("ai").unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(0.0))).unwrap();
+    let mut dpvt = Dpvt::default();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0)), &mut dpvt)
+        .unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(0.0)), &mut dpvt)
+        .unwrap();
 
     assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(0.0));
 }
@@ -107,9 +111,12 @@ fn smoo_zero_takes_every_reading_whole() {
 #[test]
 fn a_reading_at_smoo_zero_is_history_for_the_filter() {
     let mut ai = create_record("ai").unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
+    let mut dpvt = Dpvt::default();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0)), &mut dpvt)
+        .unwrap();
     ai.put_field("SMOO", EpicsValue::Double(0.5)).unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(0.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(0.0)), &mut dpvt)
+        .unwrap();
 
     assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(50.0));
 }
@@ -119,12 +126,15 @@ fn a_reading_at_smoo_zero_is_history_for_the_filter() {
 #[test]
 fn smoo_one_holds_the_first_reading() {
     let mut ai = create_record("ai").unwrap();
+    let mut dpvt = Dpvt::default();
     ai.put_field("SMOO", EpicsValue::Double(1.0)).unwrap();
 
-    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0)), &mut dpvt)
+        .unwrap();
     assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(100.0));
 
-    ai.soft_input_read(Some(EpicsValue::Double(0.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(0.0)), &mut dpvt)
+        .unwrap();
     assert_eq!(ai.get_field("VAL").unwrap().to_f64(), Some(100.0));
 }
 
@@ -134,11 +144,14 @@ fn smoo_one_holds_the_first_reading() {
 #[test]
 fn a_non_finite_previous_val_is_replaced_not_blended() {
     let mut ai = create_record("ai").unwrap();
+    let mut dpvt = Dpvt::default();
     ai.put_field("SMOO", EpicsValue::Double(0.9)).unwrap();
 
-    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0)), &mut dpvt)
+        .unwrap();
     ai.put_field("VAL", EpicsValue::Double(f64::NAN)).unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(10.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(10.0)), &mut dpvt)
+        .unwrap();
 
     assert_eq!(
         ai.get_field("VAL").unwrap().to_f64(),
@@ -152,11 +165,14 @@ fn a_non_finite_previous_val_is_replaced_not_blended() {
 #[test]
 fn a_failed_read_drops_the_history_so_the_next_one_is_unsmoothed() {
     let mut ai = create_record("ai").unwrap();
+    let mut dpvt = Dpvt::default();
     ai.put_field("SMOO", EpicsValue::Double(0.9)).unwrap();
 
-    ai.soft_input_read(Some(EpicsValue::Double(100.0))).unwrap();
-    ai.soft_input_read(None).unwrap();
-    ai.soft_input_read(Some(EpicsValue::Double(0.0))).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(100.0)), &mut dpvt)
+        .unwrap();
+    ai.soft_input_read(None, &mut dpvt).unwrap();
+    ai.soft_input_read(Some(EpicsValue::Double(0.0)), &mut dpvt)
+        .unwrap();
 
     assert_eq!(
         ai.get_field("VAL").unwrap().to_f64(),
@@ -193,18 +209,18 @@ record(ai, "BAD") {
     {
         let rec = db.get_record("BAD").unwrap();
         let mut guard = rec.write();
-        guard
-            .record
-            .soft_input_read(Some(EpicsValue::Double(100.0)))
+        let inst = &mut *guard;
+        inst.record
+            .soft_input_read(Some(EpicsValue::Double(100.0)), &mut inst.dpvt)
             .unwrap();
     }
     process(&db, "BAD").await;
     {
         let rec = db.get_record("BAD").unwrap();
         let mut guard = rec.write();
-        guard
-            .record
-            .soft_input_read(Some(EpicsValue::Double(0.0)))
+        let inst = &mut *guard;
+        inst.record
+            .soft_input_read(Some(EpicsValue::Double(0.0)), &mut inst.dpvt)
             .unwrap();
     }
 

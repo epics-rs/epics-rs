@@ -158,6 +158,10 @@ pub struct ScalcoutRecord {
     /// `cached_should_output` on the continuation so the deferred OUT write
     /// honours the original cycle's OOPT result. Mirrors calcout.rs.
     pending_output: bool,
+    /// `prec->pact` at `process()` entry: C takes the delayed-output arm only
+    /// with PACT held, so a re-entry after a device-link put cleared it
+    /// (`dbAccess.c:1194`) is a fresh cycle.
+    pact: bool,
     /// `OEVT` ("Event To Issue") — C `sCalcoutRecord.c` `prec->oevt`
     /// (DBF_USHORT). When output fires and `oevt > 0`, `execOutput` posts
     /// the numeric software event (`post_event((int)oevt)`); see
@@ -241,6 +245,7 @@ impl Default for ScalcoutRecord {
             odly: 0.0,
             dlya: 0,
             pending_output: false,
+            pact: false,
             oevt: 0,
             out_target: OutTarget::UNRESOLVED,
             awaiting_out: false,
@@ -809,6 +814,14 @@ impl Record for ScalcoutRecord {
         }
     }
 
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
@@ -826,6 +839,11 @@ impl Record for ScalcoutRecord {
         // No input fetch, no CALC pass and no second OUT write: clearing
         // `cached_should_output` is what keeps `multi_output_links()` empty so
         // the generic dispatch cannot re-issue the put that just completed.
+        // The put-callback wait is C's PACT; once PACT is gone the fresh
+        // cycle owes it nothing.
+        if !self.pact {
+            self.awaiting_out = false;
+        }
         if self.awaiting_out {
             self.awaiting_out = false;
             self.cached_should_output = false;
@@ -833,7 +851,7 @@ impl Record for ScalcoutRecord {
             return Ok(ProcessOutcome::complete());
         }
 
-        if self.dlya == 1 {
+        if self.pact && self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
@@ -1452,7 +1470,11 @@ impl Record for ScalcoutRecord {
     /// input-link fetch; `pre_process_actions` runs after it and would record
     /// this cycle's own values. The two re-entry flags are C's `pact == TRUE`
     /// arms (`:421-439`), which reach neither loop.
-    fn pre_input_link_actions(&mut self, _dol_is_constant: bool) -> ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        _dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> ProcessActions {
         if !self.awaiting_out && self.dlya != 1 {
             self.pa = self.num_vals;
             for (dst, src) in self.prev_str_vals.iter_mut().zip(self.str_vals.iter()) {
@@ -1980,6 +2002,9 @@ mod tests {
             "Don't_drive + ODLY>0 schedules the delayed re-process"
         );
         // Continuation: DLYA clears; OUT stays unwritten (the veto holds).
+        let pact = std::sync::atomic::AtomicBool::new(true);
+        let held = crate::server::record::Pact::new(&pact);
+        rec.set_process_continuation(true, held);
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("DLYA"),
@@ -2095,6 +2120,7 @@ mod tests {
                 field_type,
                 Some(DbFieldType::String) | Some(DbFieldType::Enum)
             ),
+            constant_type: false,
         }
     }
 
@@ -2108,6 +2134,7 @@ mod tests {
             element_count: 1,
             is_ca_link: false,
             puts_as_string: true,
+            constant_type: false,
         }
     }
 

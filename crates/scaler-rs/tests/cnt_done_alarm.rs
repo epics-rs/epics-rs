@@ -37,10 +37,19 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use scaler_rs::MAX_SCALER_CHANNELS;
 use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
+
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static ASYN_SCALER: DevSup = DevSup {
+    name: "devScalerAsyn",
+    choice: "Asyn Scaler",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(7, &[2, 4, 5, 6], false),
+};
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran on the exec
 // backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
@@ -74,7 +83,7 @@ async fn boot() -> (Arc<PvDatabase>, Counts) {
     let (name, factory) = scaler_rs::scaler_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
-        .register_device_support("Asyn Scaler", move || {
+        .register_device_support("scaler", &ASYN_SCALER, move || {
             let driver = SoftScalerDriver::new(8);
             *slot.lock().unwrap() = Some(driver.shared_counts());
             Box::new(ScalerAsynDeviceSupport::new(Box::new(driver)))

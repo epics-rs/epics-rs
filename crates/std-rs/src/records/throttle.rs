@@ -780,7 +780,11 @@ impl Record for ThrottleRecord {
     /// the timer dispatches to its own function — so the port takes the one
     /// the framework already computes rather than guessing from a clock,
     /// which a DLY change mid-cooldown silently falsifies.
-    fn set_process_continuation(&mut self, continuation: bool) {
+    fn set_process_continuation(
+        &mut self,
+        continuation: bool,
+        _pact: epics_base_rs::server::record::Pact<'_>,
+    ) {
         self.timer_fire = continuation;
     }
 

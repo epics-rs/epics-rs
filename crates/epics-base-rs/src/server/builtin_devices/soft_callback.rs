@@ -41,25 +41,37 @@
 use crate::server::database::PvDatabase;
 use crate::server::database::filters::ChannelCreateError;
 use crate::server::database::filters::channel::db_channel_create_unreported;
-use crate::server::device_support::{SoftDtyp, classify_soft};
+use crate::server::device_support::Dpvt;
+use crate::server::device_support::{SoftDtyp, served_soft};
 use crate::server::record::{ParsedLink, RecordInstance, parse_link_v2};
 
 /// The `dev<T>SoftCallback` dset whose name goes in the message, for the seven
-/// input record types C ships one for.
+/// input record types C ships one for, with the text its `add_record` gives a
+/// target `dbChannelCreate` cannot find.
 ///
-/// The name is not derivable from the record type — C abbreviates `int64in` to
-/// `I64in`, `longin` to `Li` and `stringin` to `Si` — so it is a table, and the
-/// table is also the gate: a record type absent from it has no `add_record` in
-/// C and must not be checked.
-fn callback_dset(record_type: &str) -> Option<&'static str> {
+/// Neither is derivable from the record type — C abbreviates `int64in` to
+/// `I64in`, `longin` to `Li` and `stringin` to `Si`, and the not-found text
+/// differs per file (`devLiSoftCallback.c:98` even says `init_record`) — so
+/// it is a table, and the table is also the gate: a record type absent from
+/// it has no `add_record` in C and must not be checked.
+fn callback_dset(record_type: &str) -> Option<(&'static str, &'static str)> {
     Some(match record_type {
-        "ai" => "devAiSoftCallback",
-        "bi" => "devBiSoftCallback",
-        "int64in" => "devI64inSoftCallback",
-        "longin" => "devLiSoftCallback",
-        "mbbi" => "devMbbiSoftCallback",
-        "mbbiDirect" => "devMbbiDirectSoftCallback",
-        "stringin" => "devSiSoftCallback",
+        "ai" => ("devAiSoftCallback", "(add_record) link target not found"),
+        "bi" => ("devBiSoftCallback", "(add_record) link target not found"),
+        "int64in" => (
+            "devI64inSoftCallback",
+            "(init_record) linked record not found",
+        ),
+        "longin" => ("devLiSoftCallback", "(init_record) linked record not found"),
+        "mbbi" => (
+            "devMbbiSoftCallback",
+            "(add_record) linked record not found",
+        ),
+        "mbbiDirect" => (
+            "devMbbiDirectSoftCallback",
+            "(add_record) linked record not found",
+        ),
+        "stringin" => ("devSiSoftCallback", "(add_record) linked record not found"),
         _ => return None,
     })
 }
@@ -98,10 +110,15 @@ pub(crate) fn add_record_input(
     inp: &str,
 ) -> Option<AddRecordInput> {
     callback_dset(record_type)?;
-    if classify_soft(dtyp) != Some(SoftDtyp::Async) {
+    if served_soft(record_type, dtyp) != Some(SoftDtyp::Async) {
         return None;
     }
     Some(match pv_link_name(inp) {
+        // An undotted name is all record name to `dbFindRecordPart`
+        // (`dbStaticLib.c:1557-1566`), so `REC$` names no record.
+        Some(name) if !name.contains('.') && name.contains('$') => {
+            AddRecordInput::Channel(Err(ChannelCreateError::NotFound))
+        }
         Some(name) => AddRecordInput::Channel(db_channel_create_unreported(db, &name).map(|_| ())),
         None => AddRecordInput::NotPvLink,
     })
@@ -130,26 +147,28 @@ pub(crate) fn add_record_input_of(
 /// An `add_record` refusal, printed by the caller once it holds no lock.
 pub(crate) struct AddRecordRefusal {
     dset: &'static str,
+    not_found: &'static str,
     channel: Option<ChannelCreateError>,
 }
 
 impl AddRecordRefusal {
+    /// The refusing dset, for the status a put returns with it.
+    pub(crate) fn dset(&self) -> &'static str {
+        self.dset
+    }
+
     pub(crate) fn report(&self, name: &str) {
         let (status, why) = match &self.channel {
             // `S_db_badField` is `(511 << 16) | 15`, and `dbAccessErrSymTbl`
             // IS linked, so `errSymLookup` finds it and prints the phrase
             // rather than the numeric fallback the `M_devSup` statuses take.
-            None => ("Illegal field value", "Illegal INP field"),
+            None => ("Illegal field value", "(add_record) Illegal INP field"),
             Some(e) => {
                 e.report();
-                ("Process Variable Not Found", "link target not found")
+                ("Process Variable Not Found", self.not_found)
             }
         };
-        crate::server::recgbl::rec_gbl_record_error(
-            status,
-            name,
-            &format!("{} (add_record) {why}", self.dset),
-        );
+        crate::server::recgbl::rec_gbl_record_error(status, name, &format!("{} {why}", self.dset));
     }
 }
 
@@ -170,20 +189,57 @@ pub(crate) fn add_record(
     // is the hook's own, not its caller's — the init owner calls the hook for
     // every record at C's `doResolveLinks` point and each hook answers for
     // itself, the way C's `pdsxt` is either present on the dset or not.
-    if instance.common.dtyp.soft() != Some(SoftDtyp::Async) {
+    let dtyp = instance.common.dtyp.as_str();
+    if served_soft(instance.record.record_type(), dtyp) != Some(SoftDtyp::Async) {
         return None;
     }
-    let dset = callback_dset(instance.record.record_type())?;
     let input = input.unwrap_or_else(|| match pv_link_name(&instance.common.inp) {
         Some(_) => AddRecordInput::Channel(Ok(())),
         None => AddRecordInput::NotPvLink,
     });
+    match answer(instance.record.record_type(), input) {
+        Ok(dpvt) => {
+            instance.dpvt = dpvt;
+            instance.invalidate_plan();
+            None
+        }
+        Err(refusal) => {
+            instance.common.dtyp.refuse_link();
+            instance.invalidate_plan();
+            Some(refusal)
+        }
+    }
+}
+
+/// `add_record`'s answer for a `record_type` record on `input`: the `dpvt`
+/// it leaves (a fresh devPvt for a PV link it accepts), or its refusal.
+fn answer(record_type: &str, input: AddRecordInput) -> Result<Dpvt, AddRecordRefusal> {
+    let Some((dset, not_found)) = callback_dset(record_type) else {
+        return Ok(Dpvt::Null);
+    };
     let channel = match input {
-        AddRecordInput::Channel(Ok(())) => return None,
+        AddRecordInput::Channel(Ok(())) => return Ok(Dpvt::Callback(Box::default())),
         AddRecordInput::Channel(Err(e)) => Some(e),
         AddRecordInput::NotPvLink => None,
     };
-    instance.common.dtyp.refuse_link();
-    instance.invalidate_plan();
-    Some(AddRecordRefusal { dset, channel })
+    Err(AddRecordRefusal {
+        dset,
+        not_found,
+        channel,
+    })
+}
+
+/// `dbPutFieldLink`'s `new_dsxt->add_record` (`dbAccess.c:1196`) for an INP
+/// put of `inp` to a `record_type` record whose DTYP is `dtyp`, decided
+/// before the hold since it looks the target up.
+pub(crate) fn put_add_record(
+    db: &PvDatabase,
+    record_type: &str,
+    dtyp: &str,
+    inp: &str,
+) -> Result<Dpvt, AddRecordRefusal> {
+    match add_record_input(db, record_type, dtyp, inp) {
+        Some(input) => answer(record_type, input),
+        None => Ok(Dpvt::Null),
+    }
 }

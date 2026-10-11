@@ -6,6 +6,7 @@ mod contributed_dbd;
 pub mod dbd_generated;
 mod declared_field_registry;
 mod device_menu_registry;
+mod dsets;
 mod link;
 mod menu_choices;
 pub mod menu_scan;
@@ -30,14 +31,17 @@ pub(crate) use contributed_dbd::{
 pub use declared_field_registry::{
     declared_field, declared_field_table, declared_fields, register_declared_fields,
 };
-pub use device_menu_registry::register_device_menu;
+pub use device_menu_registry::{
+    DevSup, Dset, register_device_menu, register_device_object_row, register_device_row,
+};
 pub(crate) use device_menu_registry::{
-    contributed_device_rows, has_contributed_device_menu, merged_device_menu,
+    contributed_device_rows, dev_sup_of, device_menu_choices, has_contributed_device_menu,
+    has_device_object, merged_device_menu,
 };
 pub use link::{
     CaLink, CalcArg, CalcLink, ConstLoadError, ConstantLink, DbLink, DbLinkType, HwLink,
     HwLinkKind, JlinkValue, JsonLinkParse, LinkFieldType, LinkProcessPolicy, LinkType, LsLoad,
-    MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, VxiAddr,
+    MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, StateLink, StatePut, VxiAddr,
     check_json_link_text, check_link_assignment, check_link_text, declared_link_type,
     link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp, parse_c_double,
     parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
@@ -70,9 +74,9 @@ pub use record_trait::{
     CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
     FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome,
-    ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, SimmCells,
-    Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
+    MonitorValueGate, OutTarget, Pact, ProcessAction, ProcessActions, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks,
+    SimmCells, Special, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
     calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
     input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
     put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,

@@ -1304,6 +1304,10 @@ async fn test_simm_raw_input_runs_conversion_chain() {
     ai.linr = 1;
     ai.eslo = 2.0;
     ai.eoff = 10.0;
+    // SIOL lives on the ai record-specific struct (not common); set before
+    // the instance exists, its link slot is parsed from it at construction.
+    ai.put_field("SIOL", EpicsValue::String("RAW:SRC".into()))
+        .unwrap();
     db.add_record("AI:SIMRAW", Box::new(ai)).await.unwrap();
     if let Some(rec) = db.get_record("AI:SIMRAW") {
         let mut inst = rec.write();
@@ -1311,12 +1315,6 @@ async fn test_simm_raw_input_runs_conversion_chain() {
         // Putting through put_field exercises the same code path
         // operators hit via caput .SIMM 2.
         inst.record.put_field("SIMM", EpicsValue::Short(2)).unwrap();
-        // SIOL lives on the ai record-specific struct (not common),
-        // so put through the record's own put_field — put_common_field
-        // would leave ai.siol empty and the simulation never enters.
-        inst.record
-            .put_field("SIOL", EpicsValue::String("RAW:SRC".into()))
-            .unwrap();
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6128,11 +6126,10 @@ impl Record for WriteThenFlnkProducer {
     }
 }
 
-static WRITE_FLNK_PRODUCER_FIELDS: &[FieldDesc] = &[FieldDesc::new(
-    "OUT",
-    epics_base_rs::types::DbFieldType::String,
-    false,
-)];
+static WRITE_FLNK_PRODUCER_FIELDS: &[FieldDesc] = &[FieldDesc {
+    declared_dbf: epics_base_rs::types::DbfCode::Outlink,
+    ..FieldDesc::new("OUT", epics_base_rs::types::DbFieldType::String, false)
+}];
 
 #[epics_macros_rs::epics_test]
 async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {

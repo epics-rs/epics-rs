@@ -1947,6 +1947,16 @@ fn dbpr_choice_text(
 /// rejects the `INST_IO` parse and the link keeps the devsup type with no
 /// text at all. The word is `INST_IO` on a field whose device support
 /// declares it.
+/// What `dbpr` prints a link field as: C's `plink->type` once `dbAddLink`
+/// ran, `PN_LINK` once a SoftCallback `add_record` re-typed it, or the
+/// parse's own type when a failed device-link put skipped `dbAddLink`.
+#[derive(Clone, Copy)]
+enum LinkShape {
+    Added,
+    Pn,
+    Unadded,
+}
+
 fn render_dbpr_link(
     ctx: &CommandContext,
     class: crate::types::DbfLinkClass,
@@ -2053,7 +2063,7 @@ fn dbpr_no_access(
     if usize::from(d.size) == std::mem::size_of::<*const ()>()
         && d.extra.is_some_and(|e| e.contains('*'))
     {
-        return Some(match dbpr_held_pointer(inst, d.name, held) {
+        return Some(match dbpr_private_pointers(inst, d.name, held) {
             Some(addr) => format!("PTR {addr:#x}"),
             None => "PTR (nil)".to_string(),
         });
@@ -2105,10 +2115,10 @@ impl DbprHeld {
     }
 }
 
-/// The address behind one `DBF_NOACCESS` pointer member, `None` for NULL.
-/// Rows are named for what C stores there; the C source that sets each is
-/// beside it.
-fn dbpr_held_pointer(
+/// The address behind one `DBF_NOACCESS` pointer member, `None` for NULL:
+/// C's `PTR %p` (`dbTest.c:1237-1241`). Rows are named for what C stores
+/// there; the C source that sets each is beside it.
+fn dbpr_private_pointers(
     inst: &crate::server::record::RecordInstance,
     name: &str,
     held: &DbprHeld,
@@ -2124,20 +2134,41 @@ fn dbpr_held_pointer(
         // `rset`, `rdes`: the record type's own tables, one per type.
         (_, "RSET") => Some(rtype.as_ptr() as usize),
         (_, "RDES") => Some(inst.record.field_list().as_ptr() as usize),
-        // `dset`: bound by `DTYP`, so a type with no device menu has none, and
-        // a DTYP that names no device support leaves it NULL.
-        (_, "DSET") => {
-            if let Some(dev) = inst.device.as_ref() {
-                return Some(
-                    std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
-                        .cast::<u8>() as usize,
-                );
+        // `dset`: the devSup row's, NULL for a record type with no
+        // `device()` line or after a refused device-link put; a DTYP only a
+        // runtime-registered support names has no row, and its device object
+        // stands in.
+        (_, "DSET") if inst.common.dtyp.is_detached() => None,
+        (_, "DSET") => match crate::server::record::dev_sup_of(rtype, inst.common.dtyp.as_str()) {
+            Some(row) => Some(std::ptr::from_ref(&row.dset) as usize),
+            None => inst.device.as_ref().map(|dev| {
+                std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
+                    .cast::<u8>() as usize
+            }),
+        },
+        // `dpvt` of a soft dset, which this port runs in the record:
+        // `devAiSoft` writes its own address (`devAiSoft.c:88`), so a set one
+        // is the devSup row's dset, and a SoftCallback dset's devPvt prints
+        // where it lives.
+        (_, "DPVT") if inst.device.is_none() && inst.common.dtyp.soft().is_some() => {
+            let row = crate::server::record::dev_sup_of(rtype, inst.common.dtyp.as_str())?;
+            match &inst.dpvt {
+                // `devEpidSoftCallback` keeps its trigger in `pact`, not `dpvt`.
+                crate::server::device_support::Dpvt::Null
+                | crate::server::device_support::Dpvt::Triggered => None,
+                crate::server::device_support::Dpvt::Read => {
+                    Some(std::ptr::from_ref(&row.dset) as usize)
+                }
+                crate::server::device_support::Dpvt::Callback(pvt) => {
+                    Some(std::ptr::from_ref(&**pvt).cast::<u8>() as usize)
+                }
             }
-            let dtyp = inst.common.dtyp.as_str();
-            let bound = inst.device_choices().is_some()
-                && (dtyp.is_empty()
-                    || crate::server::record::merged_device_menu(rtype).contains(&dtyp));
-            bound.then(|| std::ptr::from_ref(&inst.common.dtyp) as usize)
+        }
+        (_, "DPVT") if inst.device.as_ref().is_some_and(|dev| dev.holds_dpvt()) => {
+            inst.device.as_ref().map(|dev| {
+                std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
+                    .cast::<u8>() as usize
+            })
         }
         (_, "LSET") => held.lset,
         (_, "ASP") => held.asp,
@@ -2261,7 +2292,11 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         // rendered one here, while the record guard is held, and resolve the
         // type below: the locality half of `dbInitLink` reads the database's
         // record map, which nothing in this crate does under a record lock.
-        let rows: Vec<(String, String, Option<(crate::types::DbfLinkClass, String)>)> = descs
+        let rows: Vec<(
+            String,
+            String,
+            Option<(crate::types::DbfLinkClass, String, LinkShape)>,
+        )> = descs
             .iter()
             .filter(|d| i32::from(d.interest) <= level)
             .filter_map(|d| {
@@ -2279,7 +2314,14 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                         Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                         _ => String::new(),
                     };
-                    (class, raw)
+                    let shape = if inst.link_unadded(d.name) {
+                        LinkShape::Unadded
+                    } else if d.name == "INP" && inst.inp_is_pn_link() {
+                        LinkShape::Pn
+                    } else {
+                        LinkShape::Added
+                    };
+                    (class, raw, shape)
                 });
                 Some((d.name.to_string(), db_get_string(&inst, d, &value), link))
             })
@@ -2310,7 +2352,15 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
             .into_iter()
             .map(|(name, text, link)| match link {
                 None => (name, text),
-                Some((class, raw)) => {
+                // C's `PN_LINK` is set by `add_record`, so it is never seen
+                // before `iocInit`.
+                Some((_, _, LinkShape::Pn)) if running => (name, format!("PN_LINK {text}")),
+                Some((class, raw, LinkShape::Unadded)) => {
+                    let ftype = crate::server::record::LinkFieldType::for_class(class);
+                    let parsed = crate::server::record::parse_link_field(&raw, ftype);
+                    (name, format!("{} {text}", parsed.db_link_type().c_name()))
+                }
+                Some((class, raw, _)) => {
                     let text = render_dbpr_link(ctx, class, &raw, &text, running);
                     (name, text)
                 }
@@ -6148,7 +6198,9 @@ async fn install_record_defs(
                         &rec_arc,
                         None,
                     );
-                    rec_arc.write().run_init_passes(&def.name, input);
+                    let mut inst = rec_arc.write();
+                    inst.run_init_passes(&def.name, input);
+                    rec_arc.settle_string_typed(&inst);
                 }
             }
             // C's `init_record` checkLinks (`init_links`) and the constant-INP
@@ -11714,13 +11766,13 @@ record(bo, "$(P)_calc_ctrl") {{
         use crate::server::record::register_device_menu;
         // A record-type name + DTYP name no other test touches (the registry is
         // process-global and append-only).
-        register_device_menu(
-            "ai",
-            &[(
-                "Dbpf Contributed Probe",
-                crate::server::record::DbLinkType::Constant,
-            )],
-        );
+        static PROBE: &[crate::server::record::DevSup] = &[crate::server::record::DevSup {
+            name: "devDbpfProbe",
+            choice: "Dbpf Contributed Probe",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(5, &[], false),
+        }];
+        register_device_menu("ai", PROBE);
 
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
@@ -12062,6 +12114,802 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
             "<undefined>",
             "dbpr N:AI 4 TIME"
         );
+    }
+
+    /// A device-link put drops the device private, as C `dbPutFieldLink`
+    /// does (`dbAccess.c:1191`). `softIoc` R7.0.10-146 (8f5015b66) on the
+    /// same database: `AIDB` reads `DPVT: PTR 0x...` after its read and
+    /// `DPVT: PTR (nil)` after `dbpf AIDB.INP SRC.VAL`, and `SM` (SMOO 0.5)
+    /// reads 3, then 10 and 10 once its INP moves to `S2`, because
+    /// `devAiSoft.c:81` blends only into a set `dpvt`.
+    #[test]
+    fn a_device_link_put_drops_the_device_private() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "S1") { field(VAL, "3") }
+record(ai, "S2") { field(VAL, "10") }
+record(ai, "AIDB") { field(INP, "SRC") }
+record(ai, "SM") { field(INP, "S1") field(SMOO, "0.5") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let dpvt = |rec: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 4);
+            });
+            dbpr_field(&printed, "DPVT") != "PTR (nil)"
+        };
+        let val = |rec: &str| match db.get_pv(&format!("{rec}.VAL")).unwrap() {
+            EpicsValue::Double(v) => v,
+            other => panic!("{other:?}"),
+        };
+
+        run_cmd(&ctx, "dbpf", &["AIDB.PROC", "1"]);
+        assert!(dpvt("AIDB"));
+        run_cmd(&ctx, "dbpf", &["AIDB.INP", "SRC.VAL"]);
+        assert!(!dpvt("AIDB"));
+
+        let mut seen = Vec::new();
+        run_cmd(&ctx, "dbpf", &["SM.PROC", "1"]);
+        seen.push(val("SM"));
+        run_cmd(&ctx, "dbpf", &["SM.INP", "S2"]);
+        for _ in 0..2 {
+            run_cmd(&ctx, "dbpf", &["SM.PROC", "1"]);
+            seen.push(val("SM"));
+        }
+        assert_eq!(seen, [3.0, 10.0, 10.0]);
+    }
+
+    /// A device-link put clears PACT whoever set it (`dbAccess.c:1194`), and
+    /// the delayed `process()` already scheduled then runs a fresh cycle.
+    /// `softIoc` R7.0.10-146 (8f5015b66), ODLY/SDLY 2 s and the reads at
+    /// 0.5 s, 3 s and 5.5 s: `CO` PACT 1, then PACT 0 DLYA 1 after `dbpf
+    /// CO.OUT T2 PP`, then T1 0 T2 0 PACT 1 DLYA 1 VAL 1, then T1 0 T2 1
+    /// PACT 0; `SD` PACT 1, PACT 0 after `dbpf SD.INP S2`, then PACT 1 VAL 0
+    /// UDF 1, then PACT 0.
+    ///
+    /// The delays are an hour so no timer fires here; each elapsed delay is
+    /// the continuation the timer would run, fired by hand, and the put is
+    /// held to leaving the pending one current.
+    #[test]
+    fn a_device_link_put_mid_delay_releases_pact_and_the_delay_starts_over() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "T1") { field(VAL, "0") }
+record(ai, "T2") { field(VAL, "0") }
+record(calcout, "CO") { field(CALC, "A+1") field(ODLY, "3600") field(OUT, "T1 PP") }
+record(ai, "S1") { field(VAL, "5") }
+record(ai, "S2") { field(VAL, "7") }
+record(ai, "SD") { field(INP, "S1") field(SIMM, "YES") field(SIOL, "S1") field(SDLY, "3600") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let get = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+        let generation = |rec: &str| {
+            db.get_record(rec)
+                .unwrap()
+                .read()
+                .reprocess_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let elapse = |rec: &str| {
+            let token = db.mint_async_token(rec).unwrap();
+            ctx.block_on(token.fire(&db)).unwrap();
+        };
+
+        run_cmd(&ctx, "dbpf", &["CO.PROC", "1"]);
+        assert_eq!(get("CO.PACT"), 1.0);
+        let pending = generation("CO");
+        run_cmd(&ctx, "dbpf", &["CO.OUT", "T2 PP"]);
+        assert_eq!((get("CO.PACT"), get("CO.DLYA")), (0.0, 1.0));
+        assert_eq!(generation("CO"), pending, "the put cancelled the delay");
+        elapse("CO");
+        assert_eq!(
+            [
+                get("T1"),
+                get("T2"),
+                get("CO.PACT"),
+                get("CO.DLYA"),
+                get("CO")
+            ],
+            [0.0, 0.0, 1.0, 1.0, 1.0]
+        );
+        elapse("CO");
+        assert_eq!([get("T1"), get("T2"), get("CO.PACT")], [0.0, 1.0, 0.0]);
+
+        run_cmd(&ctx, "dbpf", &["SD.PROC", "1"]);
+        assert_eq!(get("SD.PACT"), 1.0);
+        let pending = generation("SD");
+        run_cmd(&ctx, "dbpf", &["SD.INP", "S2"]);
+        assert_eq!(get("SD.PACT"), 0.0);
+        assert_eq!(generation("SD"), pending, "the put cancelled the delay");
+        elapse("SD");
+        assert_eq!([get("SD.PACT"), get("SD"), get("SD.UDF")], [1.0, 0.0, 1.0]);
+        elapse("SD");
+        assert_eq!(get("SD.PACT"), 0.0);
+    }
+
+    /// A SoftCallback `add_record` allocates the devPvt `dbpr` prints as
+    /// `DPVT` and re-types INP to `PN_LINK` with only its severity bits, and a
+    /// device-link put replaces both. `softIoc` R7.0.10-146 (8f5015b66) on the
+    /// same database: `INP : PN_LINK S1 NMS` and a set DPVT on both records;
+    /// after `dbpf <rec>.INP S2`, `INP : PN_LINK S2 NMS`, `dbgf` reads
+    /// `"S2 NMS"`, and DPVT is a new address.
+    #[test]
+    fn a_soft_callback_dpvt_is_the_device_object_and_inp_is_a_pn_link() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "S1") { field(VAL, "3") }
+record(ai, "S2") { field(VAL, "10") }
+record(ai, "SMA") { field(DTYP, "Async Soft Channel") field(INP, "S1") }
+record(bi, "SMB") { field(DTYP, "Async Soft Channel") field(INP, "S1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 4);
+            });
+            dbpr_field(&printed, field)
+        };
+        let inp = |rec: &str| match db.get_pv(&format!("{rec}.INP")).unwrap() {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        for rec in ["SMA", "SMB"] {
+            let before = row(rec, "DPVT");
+            assert!(before.starts_with("PTR 0x"), "{rec}: {before}");
+            assert_eq!(row(rec, "INP"), "PN_LINK S1 NMS");
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.INP"), "S2"]);
+            let after = row(rec, "DPVT");
+            assert!(after.starts_with("PTR 0x"), "{rec}: {after}");
+            assert_ne!(before, after, "{rec}");
+            assert_eq!(row(rec, "INP"), "PN_LINK S2 NMS");
+            assert_eq!(inp(rec), "S2 NMS");
+        }
+    }
+
+    /// A refused `add_record` jumps past `dbAddLink`, so the link keeps its
+    /// parse type until a put binds again. `softIoc` R7.0.10-146 (8f5015b66):
+    /// after `dbpf ACB.INP NOPE`, `INP : PV_LINK NOPE NPP NMS` and `PACT: 1`;
+    /// after `dbpf ACB.INP SRC`, `INP : PN_LINK SRC NMS`.
+    #[test]
+    fn a_refused_device_link_put_leaves_a_pv_link() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let row = |field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, "ACB", 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "NOPE"]);
+        assert_eq!(row("INP"), "PV_LINK NOPE NPP NMS");
+        assert_eq!(row("PACT"), "1");
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "SRC"]);
+        assert_eq!(row("INP"), "PN_LINK SRC NMS");
+        assert_eq!(row("PACT"), "0");
+    }
+
+    /// C's add_record arm clears `dpvt` before `add_record` runs
+    /// (`dbAccess.c:1192`), so a refusal drops the one `devAiSoft` set: on
+    /// `softIoc` 8f5015b66 after `dbpf AP.PROC 1`, `dbpf AP.DTYP "Async Soft
+    /// Channel"` and `dbpf AP.INP NOPE`, `dbpr AP 4` prints `DPVT: PTR (nil)`,
+    /// `DSET: PTR (nil)` and `PACT: 1`.
+    #[test]
+    fn a_refused_add_record_clears_a_soft_read_dpvt() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "AP") { field(DTYP, "Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let rec = db.get_record("AP").unwrap();
+        run_cmd(&ctx, "dbpf", &["AP.PROC", "1"]);
+        assert!(matches!(
+            rec.read().dpvt,
+            crate::server::device_support::Dpvt::Read
+        ));
+        run_cmd(&ctx, "dbpf", &["AP.DTYP", "Async Soft Channel"]);
+        run_cmd(&ctx, "dbpf", &["AP.INP", "NOPE"]);
+        let printed = capture(&ctx, || {
+            dbpr_report(&ctx, "AP", 4);
+        });
+        assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)");
+        assert_eq!(dbpr_field(&printed, "DSET"), "PTR (nil)");
+        assert_eq!(dbpr_field(&printed, "PACT"), "1");
+        assert!(matches!(
+            rec.read().dpvt,
+            crate::server::device_support::Dpvt::Null
+        ));
+    }
+
+    /// `dbpr <rec> 4`'s pointer rows, nil or not, against `softIoc`
+    /// R7.0.10-146 (8f5015b66) on the same database after the same `dbpf`s,
+    /// as `set` or `nil`. Only `DPVT` and `WDPT` are compared: C's `SIMPVT`
+    /// on `AIS` and `WPTR` on `CMP` are allocated by the first process
+    /// (`aiRecord.c:501-504`, `compressRecord.c:334-339`) and this port
+    /// does not answer them yet.
+    #[test]
+    fn dbpr_pointer_rows_are_nil_where_c_s_are() {
+        const C: &str = "\
+AI ASP=nil DPVT=set DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AI0 ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIBAD ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIRAW ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIS ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=set SPVT=nil
+BO ASP=nil DPVT=nil DSET=set LSET=set PPN=nil PPNR=nil RDES=set RPVT=set RSET=set SIMPVT=nil SPVT=nil WDPT=nil
+CMP ASP=nil BPTR=set DPVT=nil DSET=nil LSET=set PPN=nil PPNR=nil RDES=set RSET=set SPTR=nil SPVT=nil VAL=nil WPTR=set";
+        const COMPARED: [&str; 2] = ["DPVT", "WDPT"];
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "AI") { field(INP, "SRC") }
+record(ai, "AI0") { field(INP, "SRC") }
+record(ai, "AIBAD") { field(INP, "NOSUCH") }
+record(ai, "AIRAW") { field(DTYP, "Raw Soft Channel") field(INP, "SRC") }
+record(ai, "AIS") { field(SIMM, "YES") field(SIOL, "SRC") field(SDLY, "5") }
+record(bo, "BO") { field(HIGH, "1") }
+record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(NSAM, "4") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        for rec in ["AI", "AIBAD", "AIRAW", "AIS", "BO", "CMP"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+        }
+        run_cmd(&ctx, "dbpf", &["BO", "1"]);
+
+        let mut wrong = Vec::new();
+        for line in C.lines() {
+            let mut words = line.split(' ');
+            let rec = words.next().unwrap();
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 4);
+            });
+            let mut port: Vec<String> = printed
+                .split("  ")
+                .filter_map(|cell| {
+                    let (name, value) = cell.trim().split_once(": ")?;
+                    if !COMPARED.contains(&name.trim()) {
+                        return None;
+                    }
+                    let value = value.trim().strip_prefix("PTR ")?;
+                    let nil = if value == "(nil)" { "nil" } else { "set" };
+                    Some(format!("{}={nil}", name.trim()))
+                })
+                .collect();
+            port.sort();
+            let c: Vec<String> = words
+                .filter(|w| COMPARED.iter().any(|f| w.split('=').next() == Some(*f)))
+                .map(str::to_string)
+                .collect();
+            if port != c {
+                wrong.push(format!(
+                    "{rec}\n  C    {}\n  port {}",
+                    c.join(" "),
+                    port.join(" ")
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // C's DPVT is `&devAiSoft`, so it prints the DSET row's address.
+        let printed = capture(&ctx, || {
+            dbpr_report(&ctx, "AI", 4);
+        });
+        let ai = crate::server::record::dev_sup_of("ai", "Soft Channel").unwrap();
+        assert_eq!(dbpr_field(&printed, "DPVT"), format!("PTR {:p}", &ai.dset));
+    }
+
+    /// C's `dbFindField` matches a field name case-sensitively, so
+    /// `SRC.desc` names no field. `softIoc` R7.0.10-146 (8f5015b66), with
+    /// `SRC` an ai whose DESC is `hello`: a stringin whose INP is `SRC.desc`,
+    /// loaded or put, reads `INP : CA_LINK SRC.desc NPP NMS`, VAL "" and STAT
+    /// LINK after `dbpf R.PROC 1`, with nothing printed at load; `SRC.DESC`
+    /// reads `hello`; `dbpf SRC.desc x` and `dbgf SRC.desc` print `PV
+    /// 'SRC.desc' not found`.
+    #[test]
+    fn a_lower_case_field_name_is_not_a_field() {
+        let (db, ctx) = make_ctx();
+        let load = capture(&ctx, || {
+            load_records(
+                &ctx,
+                r#"record(ai, "SRC") { field(VAL, "5") field(DESC, "hello") }
+record(stringin, "R") { field(INP, "SRC.desc") }
+record(stringin, "RU") { field(INP, "SRC.DESC") }
+record(stringin, "P") { field(INP, "SRC.DESC") }"#,
+            )
+            .expect("db must load");
+        });
+        assert_eq!(load.trim(), "");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        run_cmd(&ctx, "dbpf", &["P.INP", "SRC.desc"]);
+        for rec in ["R", "RU", "P"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+        }
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        for rec in ["R", "P"] {
+            assert_eq!(row(rec, "INP"), "CA_LINK SRC.desc NPP NMS", "{rec}");
+            assert_eq!(row(rec, "VAL"), "", "{rec}");
+            assert_eq!(row(rec, "STAT"), "LINK", "{rec}");
+        }
+        assert_eq!(row("RU", "VAL"), "hello");
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["SRC.desc", "x"]).trim(),
+            "PV 'SRC.desc' not found"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["SRC.desc"]).trim(),
+            "PV 'SRC.desc' not found"
+        );
+    }
+
+    /// `dbPutFieldLink` removes the old link before `dbPutSpecial(paddr, 0)`
+    /// refuses the `SPC_NOMOD` field, and does not restore it
+    /// (`dbAccess.c:1168-1176`); a second put finds no link and fails
+    /// `S_db_badHWaddr` without a line. Every row is `softIoc` R7.0.10-146
+    /// (8f5015b66) on this database and these commands.
+    #[test]
+    fn a_refused_subl_put_removes_the_link() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&heard);
+        crate::runtime::log::errlog_add_listener(move |m| {
+            sink.lock().expect("sink").push(m.to_string());
+        });
+        let no_mod_lines = || {
+            crate::runtime::log::errlog_flush();
+            heard
+                .lock()
+                .expect("sink")
+                .drain(..)
+                .filter(|m| m.contains("noMod"))
+                .map(|m| m.trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(stringin, "NM") { field(VAL, "nosub") }
+record(aSub, "AS") { field(SNAM, "") field(SUBL, "NM") }
+record(aSub, "AC") { field(SUBL, "") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        assert_eq!(row("AS", "SUBL"), "DB_LINK NM NPP NMS");
+
+        for (put, line) in [
+            (
+                "OTHER",
+                vec!["recGblDbaddrError: dbPut Attempt to modify noMod field PV: AS.SUBL"],
+            ),
+            ("THIRD", vec![]),
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["AS.SUBL", put]).trim_end(),
+                r#"DBF_STRING:         "NM NPP NMS""#
+            );
+            assert_eq!(no_mod_lines(), line);
+            assert_eq!(row("AS", "SUBL"), "PV_LINK NM NPP NMS");
+        }
+
+        run_cmd(&ctx, "dbpf", &["AS.LFLG", "READ"]);
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        assert_eq!(row("AS", "SNAM"), "");
+        assert_eq!(row("AS", "STAT"), "NO_ALARM");
+        assert_eq!(row("AS", "SEVR"), "NO_ALARM");
+
+        for line in [
+            vec!["recGblDbaddrError: dbPut Attempt to modify noMod field PV: AC.SUBL"],
+            vec![],
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["AC.SUBL", "NM"]).trim_end(),
+                r#"DBF_STRING:         """#
+            );
+            assert_eq!(no_mod_lines(), line);
+            assert_eq!(row("AC", "SUBL"), "CONSTANT");
+        }
+    }
+
+    /// A refused SUBL put removed the link, CP subscription included: `NM`
+    /// processes `AS` (and its FLNK counter) once at connect and once per
+    /// `NM.PROC` before the refusal, never after. `softIoc` R7.0.10-146
+    /// (8f5015b66) reads CNT 1, 2, then 2.
+    #[test]
+    fn a_refused_subl_put_drops_its_cp_subscription() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "NM") { field(VAL, "1") }
+record(calc, "CNT") { field(CALC, "VAL+1") }
+record(aSub, "AS") { field(SNAM, "") field(SUBL, "NM CP") field(FLNK, "CNT") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        ctx.block_on(db.setup_cp_links());
+        ctx.block_on(db.process_cp_links_on_connect());
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(300));
+        let cnt = || run_cmd(&ctx, "dbgf", &["CNT.VAL"]).trim_end().to_string();
+        settle();
+        assert_eq!(cnt(), "DBF_DOUBLE:         1");
+        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
+        settle();
+        assert_eq!(cnt(), "DBF_DOUBLE:         2");
+        run_cmd(&ctx, "dbpf", &["AS.SUBL", "NM2"]);
+        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["NM.PROC", "1"]);
+        settle();
+        assert_eq!(cnt(), "DBF_DOUBLE:         2");
+    }
+
+    /// An `Async Soft Channel` input completes through `dbProcessNotify` on its
+    /// INP target (`devAiSoftCallback.c` `read_ai`): PACT holds until the
+    /// target's chain finishes, and an INP put cancels the wait (`del_record`
+    /// -> `dbNotifyCancel`, `dbAccess.c:1161`) and clears PACT (`:1194`).
+    /// Every row is `softIoc` R7.0.10-146 (8f5015b66) on this database and
+    /// these commands.
+    #[test]
+    fn an_async_soft_input_waits_for_its_notify() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ao, "X") {}
+record(ai, "S2") { field(VAL, "5") }
+record(seq, "SQ") { field(DLY1, "2") field(DOL1, "3") field(LNK1, "X") }
+record(seq, "SQ2") { field(DLY1, "1") field(DOL1, "7") }
+record(ai, "AS") { field(DTYP, "Async Soft Channel") field(INP, "SQ.DO1") }
+record(ai, "AS2") { field(DTYP, "Async Soft Channel") field(INP, "SQ2.DO1") }
+record(ai, "AT") { field(DTYP, "Async Soft Channel") field(INP, "S2") }
+record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        const ONE: &str = "DBF_UCHAR:          1 = 0x1";
+        const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        run_cmd(&ctx, "dbpf", &["AS2.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AT.PROC", "1"]);
+        sleep(300);
+        assert_eq!(gf("AT.VAL"), "DBF_DOUBLE:         5");
+        assert_eq!(gf("AT.PACT"), ZERO);
+        assert_eq!(gf("AT.STAT"), r#"DBF_STRING:         "NO_ALARM""#);
+
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AS.INP", "S2"]).trim_end(),
+            r#"DBF_STRING:         "S2 NMS""#
+        );
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        sleep(2500);
+        assert_eq!(gf("X.VAL"), "DBF_DOUBLE:         3");
+        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.STAT"), r#"DBF_STRING:         "UDF""#);
+        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
+        assert_eq!(gf("AS2.PACT"), ZERO);
+
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AR.INP", "NOPE"]).trim_end(),
+            r#"DBF_STRING:         "NOPE NPP NMS""#
+        );
+        run_cmd(&ctx, "dbpf", &["AR.PROC", "1"]);
+        assert_eq!(gf("AR.STAT"), r#"DBF_STRING:         "UDF""#);
+        assert_eq!(gf("AR.SEVR"), r#"DBF_STRING:         "INVALID""#);
+        assert_eq!(gf("AR.PACT"), ONE);
+
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        sleep(300);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         5");
+        assert_eq!(gf("AS.PACT"), ZERO);
+    }
+
+    /// A PN_LINK keeps only its severity bits (`devAiSoftCallback.c:115`):
+    /// the notify processes a passive target once, `PP` or `CA` alike, and
+    /// the completion's read processes nothing. `softIoc` R7.0.10-146
+    /// (8f5015b66).
+    #[test]
+    fn an_async_soft_input_processes_its_target_once() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(calc, "CNT") { field(CALC, "VAL+1") }
+record(ai, "AP") { field(DTYP, "Async Soft Channel") field(INP, "CNT PP") }
+record(calc, "CNT2") { field(CALC, "VAL+1") }
+record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        for (rec, target) in [("AP", "CNT"), ("AC", "CNT2")] {
+            assert_eq!(
+                gf(&format!("{rec}.INP")),
+                format!(r#"DBF_STRING:         "{target} NMS""#)
+            );
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!(gf(&format!("{rec}.VAL")), "DBF_DOUBLE:         1", "{rec}");
+            assert_eq!(
+                gf(&format!("{target}.VAL")),
+                "DBF_DOUBLE:         1",
+                "{target}"
+            );
+            assert_eq!(gf(&format!("{target}.PUTF")), "DBF_UCHAR:          0 = 0x0");
+        }
+    }
+
+    /// A target already PACT takes the notify as its restart
+    /// (`dbNotify.c:225-231`) and is processed again once its cycle ends
+    /// (`notifyCallback`, `:299-301`), so the requester completes with the
+    /// second cycle's value. Not again when the target is no longer Passive
+    /// (`:247-249`) or the requester's INP put cancelled the request
+    /// (`dbNotifyCancel`, `:400-410`). `softIoc` R7.0.10-146 (8f5015b66).
+    #[test]
+    fn an_async_soft_input_restarts_a_busy_target() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(calc, "CN") { field(CALC, "VAL+1") }
+record(seq, "SQ") { field(DLY1, "2") field(DOL1, "CN NPP") field(LNK1, "CN.PROC") }
+record(ai, "AS") { field(DTYP, "Async Soft Channel") field(INP, "SQ.DO1") }
+record(calc, "BN") { field(CALC, "VAL+1") }
+record(seq, "BQ") { field(DLY1, "2") field(DOL1, "BN NPP") field(LNK1, "BN.PROC") }
+record(ai, "AB") { field(DTYP, "Async Soft Channel") field(INP, "BQ.DO1") }
+record(ai, "S2") { field(VAL, "5") }
+record(calc, "EN") { field(CALC, "VAL+1") }
+record(seq, "EQ") { field(SCAN, "Event") field(EVNT, "77") field(DLY1, "2") field(DOL1, "EN NPP") field(LNK1, "EN.PROC") }
+record(ai, "AE") { field(DTYP, "Async Soft Channel") field(INP, "EQ.DO1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        // The DLY1 windows end on the delay thread's clock, not this one's.
+        let settle = |pv: &str, want: &str| {
+            for _ in 0..2000 {
+                if gf(pv) == want {
+                    return;
+                }
+                sleep(5);
+            }
+        };
+        const ONE: &str = "DBF_UCHAR:          1 = 0x1";
+        const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+
+        for target in ["SQ.PROC", "BQ.PROC", "EQ.PROC"] {
+            run_cmd(&ctx, "dbpf", &[target, "1"]);
+        }
+        sleep(300);
+        for rec in ["AS.PROC", "AB.PROC", "AE.PROC"] {
+            run_cmd(&ctx, "dbpf", &[rec, "1"]);
+        }
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AE.PACT"), ONE);
+        sleep(300);
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AB.INP", "S2"]).trim_end(),
+            r#"DBF_STRING:         "S2 NMS""#
+        );
+        assert_eq!(gf("AB.PACT"), ZERO);
+        settle("CN.VAL", "DBF_DOUBLE:         1");
+        settle("SQ.PACT", ONE);
+        settle("AE.PACT", ZERO);
+        assert_eq!(gf("CN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("EN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("EQ.PACT"), ZERO);
+        assert_eq!(gf("AE.PACT"), ZERO);
+        assert_eq!(gf("AE.VAL"), "DBF_DOUBLE:         0");
+        settle("AS.PACT", ZERO);
+        assert_eq!(gf("CN.VAL"), "DBF_DOUBLE:         2");
+        assert_eq!(gf("SQ.DO1"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("BN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("BQ.PACT"), ZERO);
+        assert_eq!(gf("AB.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("AB.PACT"), ZERO);
+        assert_eq!(gf("EN.VAL"), "DBF_DOUBLE:         1");
+    }
+
+    /// Every record prints its DPVT row. `softIoc` R7.0.10-146 (8f5015b66):
+    /// `DPVT: PTR (nil)` for a processed `Soft Timestamp` stringin, a calc,
+    /// and an `Async Soft Channel` ai after `dbpf AR.INP NOSUCH`, whose
+    /// `add_record` refuses.
+    #[test]
+    fn dbpr_prints_a_nil_dpvt_for_every_record() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(stringin, "TS") { field(DTYP, "Soft Timestamp") }
+record(calc, "C") { field(CALC, "1") }
+record(ai, "S") { field(VAL, "1") }
+record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["TS.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AR.INP", "NOSUCH"]);
+        for rec in ["TS", "C", "AR"] {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec, 4);
+            });
+            assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)", "{rec}");
+        }
+    }
+
+    /// A device-link put whose `add_record` refuses leaves the record with no
+    /// dset and PACT set until a later device-link put binds again. `softIoc`
+    /// R7.0.10-146 (8f5015b66) on the same database: after `dbpf ACB.INP
+    /// NOPE`, `DSET: PTR (nil)` and `PACT: 1`, and `dbpf SRC 7` then `dbpf
+    /// ACB.PROC 1` leaves `ACB` at 3 with RPRO 1, LCNT 0 and PROC 1; `dbpf
+    /// ACB.INP SRC` gives `PACT: 0` and a set `DSET`.
+    #[test]
+    fn a_refused_device_link_put_detaches_the_dset_and_holds_pact() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let dset_nil = || {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, "ACB", 4);
+            });
+            dbpr_field(&printed, "DSET") == "PTR (nil)"
+        };
+        let get = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "NOPE"]);
+        assert!(dset_nil());
+        assert_eq!(get("ACB.PACT"), 1.0);
+
+        let before = get("ACB");
+        run_cmd(&ctx, "dbpf", &["SRC", "7"]);
+        run_cmd(&ctx, "dbpf", &["ACB.PROC", "1"]);
+        assert_eq!(get("ACB"), before);
+        assert_eq!(get("ACB.PACT"), 1.0);
+        // `dbPutField`'s PACT arm: PROC on an active record only sets RPRO.
+        assert_eq!(
+            (get("ACB.RPRO"), get("ACB.LCNT"), get("ACB.PROC")),
+            (1.0, 0.0, 1.0)
+        );
+
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "SRC"]);
+        assert!(!dset_nil());
+        assert_eq!(get("ACB.PACT"), 0.0);
+    }
+
+    /// C reads DTYP under the record's lock (`dbAccess.c:1128`); the port
+    /// prepares the new dset before the hold, so a DTYP that moves in between
+    /// is refused under the hold before the link moves.
+    #[test]
+    fn a_device_link_put_whose_dtyp_moved_is_refused_before_the_link_moves() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(bi, "DS") { field(DTYP, "Db State") field(INP, "@st1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let rec = db.get_record("DS").unwrap();
+        let text = || crate::types::EpicsValue::String("@st2".into());
+        let mut link = crate::server::record::PreparedCommonLink::for_put("DS", "INP", &text());
+        link.as_mut().unwrap().ask_add_record(&db, &rec);
+        rec.write().common.dtyp.set_name("Soft Channel");
+        let put = rec.write().gate_device_link_put(link.as_ref().unwrap());
+        assert!(
+            matches!(put, Err(crate::error::CaError::NoSupport)),
+            "{put:?}"
+        );
+        assert_eq!(rec.read().common.inp, "@st1");
+    }
+
+    /// `dbpr <rec> 4`'s `DSET` row on one record of every `softIoc.dbd`
+    /// record type, against `softIoc` R7.0.10-146 (8f5015b66): NULL exactly
+    /// on the ten types with no `device()` line.
+    #[test]
+    fn dbpr_dset_row_is_nil_where_c_s_is() {
+        const NIL: &[&str] = &[
+            "aSub",
+            "calc",
+            "compress",
+            "dfanout",
+            "fanout",
+            "permissive",
+            "sel",
+            "seq",
+            "state",
+            "sub",
+        ];
+        const SET: &[&str] = &[
+            "aai",
+            "aao",
+            "ai",
+            "ao",
+            "bi",
+            "bo",
+            "calcout",
+            "event",
+            "histogram",
+            "int64in",
+            "int64out",
+            "longin",
+            "longout",
+            "lsi",
+            "lso",
+            "mbbi",
+            "mbbiDirect",
+            "mbbo",
+            "mbboDirect",
+            "printf",
+            "stringin",
+            "stringout",
+            "subArray",
+            "waveform",
+        ];
+        let (db, ctx) = make_ctx();
+        let text: String = NIL
+            .iter()
+            .chain(SET)
+            .map(|t| format!("record({t}, \"R_{t}\") {{ }}\n"))
+            .collect();
+        load_records(&ctx, &text).expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let nil = |t: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, &format!("R_{t}"), 4);
+            });
+            dbpr_field(&printed, "DSET") == "PTR (nil)"
+        };
+        for t in NIL {
+            assert!(nil(t), "{t}");
+        }
+        for t in SET {
+            assert!(!nil(t), "{t}");
+        }
     }
 
     /// `base(HEX)` reaches `dbpr` and nothing else.

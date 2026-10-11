@@ -157,7 +157,11 @@ impl Record for MbbiDirectRecord {
     }
 
     /// The Plain and Async dsets' `DBR_ULONG` read lands in VAL bit for bit.
-    fn soft_input_read_u32(&mut self, value: u32) -> CaResult<()> {
+    fn soft_input_read_u32(
+        &mut self,
+        value: u32,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         self.val = value;
         Ok(())
     }

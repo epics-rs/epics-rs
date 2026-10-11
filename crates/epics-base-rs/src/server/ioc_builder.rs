@@ -191,13 +191,20 @@ impl IocBuilder {
         );
     }
 
-    /// Register a device support factory by DTYP name.
-    pub fn register_device_support<F>(mut self, dtyp: &str, factory: F) -> Self
+    /// Register a device support: its factory under `devsup.choice`, and
+    /// `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        mut self,
+        record_type: &str,
+        devsup: &'static crate::server::record::DevSup,
+        factory: F,
+    ) -> Self
     where
         F: Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync + 'static,
     {
+        crate::server::record::register_device_object_row(record_type, devsup);
         self.device_factories
-            .insert(dtyp.to_string(), Box::new(factory));
+            .insert(devsup.choice.to_string(), Box::new(factory));
         self
     }
 

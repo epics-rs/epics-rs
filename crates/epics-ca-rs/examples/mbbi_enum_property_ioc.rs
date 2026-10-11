@@ -37,11 +37,20 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport, PropertyPost};
 #[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 use std::collections::HashMap;
+
+/// `device(mbbi, CONSTANT, devMbbiEnumProp, "enumProp")`, with the
+/// `init_record` and `read_mbbi` a C dset for it would carry.
+static ENUM_PROP: DevSup = DevSup {
+    name: "devMbbiEnumProp",
+    choice: "enumProp",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
 /// Holds both ends until the framework claims the receiver: the device owns
 /// the source subscription, the framework owns the post.
@@ -116,7 +125,7 @@ record(mbbi, "RIG:MBBI") {
 "#;
     let ioc = IocBuilder::new()
         .db_string(db, &HashMap::new())?
-        .register_device_support("enumProp", || Box::new(EnumProp::new()))
+        .register_device_support("mbbi", &ENUM_PROP, || Box::new(EnumProp::new()))
         .build_ioc()
         .await?;
     let db = ioc.database().clone();

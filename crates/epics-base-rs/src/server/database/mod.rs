@@ -26,7 +26,10 @@ pub(crate) use links::{
     multi_out_rows, multi_output_dispatch_owned, posts_software_event, reads_sell,
     resolves_subroutine_from_link,
 };
-pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts, PostItem, PostRule, ProcStack};
+pub(crate) use processing::NotifiedRead;
+pub use processing::{
+    AsyncDbHandle, AsyncToken, InputLinkTexts, PostItem, PostRule, ProcStack, TokenWatch,
+};
 pub(crate) use record_lock::{FrameGate, InFrame, LockRecord, SetGuard};
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
 
@@ -939,12 +942,11 @@ struct PvDatabaseInner {
     /// `dbDumpRecordType`; sorting is the container's job here rather than an
     /// insertion dance.
     ///
-    /// A leaf lock: no other lock is taken while it is held, and it is taken
-    /// while a record read guard is live (`PvDatabase::get_pv`), never the
-    /// reverse.
-    record_attributes: crate::runtime::sync::PriorityInheritanceMutex<
-        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
-    >,
+    /// A published snapshot: a name lookup reads it under a record's hold and
+    /// on the search side, so a reader takes no lock. Writers serialise on
+    /// [`Self::record_attributes_write`].
+    record_attributes: ArcSwap<RecordAttributes>,
+    record_attributes_write: crate::runtime::sync::PriorityInheritanceMutex<()>,
     /// Subroutine functions by name, retained at runtime so the processing
     /// path can re-resolve an aSub's subroutine when its name changes
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
@@ -1425,8 +1427,10 @@ impl RecordAttributeError {
 /// `"none specified"`. The port's `.dbd` is the generated table, which is
 /// complete before the first `dbLoadRecords`, so the seed happens at
 /// construction instead of after a read.
-fn seeded_record_attributes()
--> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+type RecordAttributes =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+fn seeded_record_attributes() -> RecordAttributes {
     crate::server::record::dbd_generated::RECORD_TYPES
         .iter()
         .map(|t| {
@@ -1496,9 +1500,8 @@ impl PvDatabase {
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
-                record_attributes: crate::runtime::sync::PriorityInheritanceMutex::new(
-                    seeded_record_attributes(),
-                ),
+                record_attributes: ArcSwap::from_pointee(seeded_record_attributes()),
+                record_attributes_write: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
                 device_support_resolver: ArcSwapOption::empty(),
                 breaktable_registry: SnapshotCell::new(
@@ -1543,12 +1546,12 @@ impl PvDatabase {
         // keeps the same 39 for every name iocsh can pass and never produces
         // a value that is not a string.
         let truncated: String = value.chars().take(MAX_ATTRIBUTE_LEN).collect();
-        self.inner
-            .record_attributes
-            .lock()
-            .entry(record_type.to_string())
+        let _write = self.inner.record_attributes_write.lock();
+        let mut next = RecordAttributes::clone(&self.inner.record_attributes.load());
+        next.entry(record_type.to_string())
             .or_default()
             .insert(name.to_string(), truncated);
+        self.inner.record_attributes.store(Arc::new(next));
         Ok(())
     }
 
@@ -1562,10 +1565,19 @@ impl PvDatabase {
     pub fn record_type_attribute(&self, record_type: &str, name: &str) -> Option<String> {
         self.inner
             .record_attributes
-            .lock()
+            .load()
             .get(record_type)?
             .get(name)
             .cloned()
+    }
+
+    /// [`Self::record_type_attribute`]'s existence half, copying nothing.
+    pub(crate) fn has_record_type_attribute(&self, record_type: &str, name: &str) -> bool {
+        self.inner
+            .record_attributes
+            .load()
+            .get(record_type)
+            .is_some_and(|attrs| attrs.contains_key(name))
     }
 
     /// One record type's whole attribute list in C's `strcmp` order — the
@@ -1573,7 +1585,7 @@ impl PvDatabase {
     pub fn record_type_attributes(&self, record_type: &str) -> Vec<(String, String)> {
         self.inner
             .record_attributes
-            .lock()
+            .load()
             .get(record_type)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
@@ -1661,6 +1673,20 @@ impl PvDatabase {
         self.inner
             .device_support_resolver
             .store(Some(Arc::new(resolver)));
+    }
+
+    /// C `dbDTYPtoDevSup` for a device-link put: a fresh device object for
+    /// `ctx`, built from the table [`Self::install_device_support_resolver`]
+    /// installed, or `None` when none serves it.
+    pub(crate) fn resolve_device_support(
+        &self,
+        ctx: &crate::server::ioc_app::DeviceSupportContext,
+    ) -> Option<Box<dyn crate::server::device_support::DeviceSupport>> {
+        self.inner
+            .device_support_resolver
+            .load()
+            .as_deref()
+            .and_then(|resolve| resolve(ctx))
     }
 
     /// How many records hold device support. Derived from the records
@@ -3484,6 +3510,9 @@ impl PvDatabase {
                 crate::server::ioc_app::attach_device_support(instance, &name, resolver.as_deref());
                 instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
                 let reached = instance.run_init_pass0(&name);
+                // The load has moved the type selectors since the cell was
+                // built, and an `add_record` below may ask this record's `$`.
+                rec_arc.settle_string_typed(instance);
                 drop(guard);
                 (name, rec_arc, reached)
             })
@@ -3537,6 +3566,7 @@ impl PvDatabase {
                 instance.run_init_pass1(name);
             }
             super::database::processing::seed_constant_links(instance);
+            rec_arc.settle_string_typed(instance);
             (
                 instance.common.scan,
                 instance.common.phas,
@@ -3806,6 +3836,51 @@ impl PvDatabase {
         std::mem::take(&mut *self.inner.after_ioc_running.lock().unwrap())
     }
 
+    /// C `dbDbInitLink`'s `dbChannelCreate` succeeding (`dbDbLink.c:94`): a
+    /// local record that names `field`. Otherwise `dbInitLink` falls through
+    /// to CA (`dbLink.c:128`), `SRC.desc` and `SRC.NOSUCH` alike. Registry
+    /// facts only, as the holder may be held while this is asked.
+    pub(crate) fn has_db_link_target(&self, record: &str, field: &str) -> bool {
+        if self.inner.simple_pvs.lock().contains_key(record) {
+            return true;
+        }
+        let rec = self.inner.records.read().get(record).cloned().or_else(|| {
+            let target = self.alias_target(record);
+            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
+        });
+        rec.is_some_and(|rec| self.names_field(&rec, field))
+    }
+
+    /// `dbChannelCreate`'s field half for `rec`: `pvNameLookup` finds `field`
+    /// (`dbChannel.c:313-330`) and, with the `$` modifier, the field takes it
+    /// (`dbChannel.c:486-503`). A declared `DBF_NOACCESS` name is found, as
+    /// `dbNameToAddr` finds `MLOK`. Registry facts only: the search side and
+    /// a caller under a put gate ask it, so it takes no record lock.
+    pub(crate) fn channel_field_found(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        string_view: bool,
+    ) -> bool {
+        if !string_view {
+            return self.names_field(rec, field);
+        }
+        let addr = crate::server::record::record_instance::FieldAddr::resolve_in(rec, field);
+        filters::spells_a_field(field)
+            && match addr.desc {
+                Some(d) => rec.takes_string_view(d),
+                None if addr.declared => false,
+                // `dbGetAttributePart`'s descriptor is a `DBF_STRING`.
+                None => self.has_record_type_attribute(rec.rdes().record_type, field),
+            }
+    }
+
+    /// `dbNameToAddr`'s field half for `rec`: a declared name, else an
+    /// attribute (`dbGetAttributePart`), both compared as written.
+    pub(crate) fn names_field(&self, rec: &RecordCell, field: &str) -> bool {
+        rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
+    }
+
     /// Internal: synchronous existence check without resolver.
     fn has_name_no_resolve(&self, name: &str) -> bool {
         // strip the channel-filter suffix before lookup so a
@@ -3847,42 +3922,9 @@ impl PvDatabase {
         let Some(field) = explicit_field else {
             return true;
         };
-        let instance = rec.read();
-        // Trailing `$` is the long-string modifier, part of the channel
-        // syntax (`dbChannel.c:486-505`): eligible only on a `DBF_STRING`
-        // or link field, and `dbChannelTest` refuses it anywhere else.
         match field.strip_suffix('$') {
-            Some(core) => {
-                filters::spells_a_field(core) && instance.resolve_string_view_field(core).is_some()
-            }
-            None => {
-                // Existence is the DECLARED-name question, not the
-                // has-a-value question: `dbNameToAddr` resolves any field
-                // the `.dbd` declares — including `DBF_NOACCESS` ones like
-                // `MLOK` — so pvxs answers the SEARCH for them and refuses
-                // at CREATE instead (measured against `softIocPVX`:
-                // `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`).
-                // Three name sources, matching the port's field model:
-                // `resolve_field` (valued fields, incl. common/virtual ones
-                // like `RTYP`/`TIME` that C answers from dbStaticLib),
-                // `field_desc` (declared-but-valueless record fields), and
-                // the `DBF_NOACCESS` internals the generated tables drop —
-                // record-own (`BPTR`, from `record_noaccess_fields`) and
-                // `dbCommon` (`MLOK`) alike.
-                (filters::spells_a_field(field)
-                    && (instance.resolve_field(field).is_some()
-                        || instance.field_desc(field).is_some()
-                        || instance.resolves_noaccess_name(field)))
-                    // ... and the record type's attributes, which
-                    // `pvNameLookup` reaches through `dbGetAttributePart`
-                    // once the declared list has missed
-                    // (`dbChannel.c:326-327`), by `strcmp` as well. Shadowing
-                    // needs no test here: a declared name has already
-                    // answered above.
-                    || self
-                        .record_type_attribute(instance.record.record_type(), field)
-                        .is_some()
-            }
+            Some(core) => self.channel_field_found(&rec, core, true),
+            None => self.channel_field_found(&rec, field, false),
         }
     }
 
@@ -4662,6 +4704,58 @@ mod tests {
         // else is `S_dbLib_fieldNotFound` (`dbChannel.c:486-505`).
         assert!(db.has_name("TARGET.EGU$").await);
         assert!(!db.has_name("TARGET.VAL$").await);
+        // ... judged on the type `cvt_dbaddr` leaves: VAL by FTVL.
+        assert!(!db.has_name("WF.VAL$").await);
+        db.add_record(
+            "WS",
+            Box::new(crate::server::records::waveform::WaveformRecord::new(
+                2,
+                crate::types::DbFieldType::String,
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(db.has_name("WS.VAL$").await);
+        assert!(!db.has_name("TARGET.egu").await);
+    }
+
+    /// The search side answers from registry facts while another thread
+    /// holds the record, as C's `dbChannelTest` takes no record lock.
+    #[epics_macros_rs::epics_test]
+    async fn the_search_answers_while_the_record_is_held() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(42.0)),
+        )
+        .await
+        .unwrap();
+        let rec = db.get_record("TARGET").unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let asker = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let answers: Vec<bool> =
+                    ["TARGET.VAL", "TARGET.MLOK", "TARGET.EGU$", "TARGET.NOSUCH"]
+                        .iter()
+                        .map(|name| db.has_name_no_resolve(name))
+                        .collect();
+                answer_tx.send(answers).unwrap();
+            })
+        };
+        let answers = answer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        asker.join().unwrap();
+        assert_eq!(answers, Ok(vec![true, true, true, false]));
     }
 
     #[epics_macros_rs::epics_test]

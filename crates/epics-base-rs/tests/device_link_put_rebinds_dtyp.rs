@@ -100,3 +100,52 @@ record(ai, "DG") { field(INP, "DS NPP") }
     assert_eq!(get(&db, "DG.VAL"), 7.0, "DG.VAL");
     assert_eq!(get(&db, "DG.SEVR"), 0.0, "DG.SEVR");
 }
+
+/// The same refusal for a device a downstream crate registers: asyn's
+/// `device(ai,INST_IO,asynAiInt32,"asynInt32")` has no `devExtend`. Pinned to
+/// oracleScalerIoc (base + asyn + scaler): `dbpf DG.DTYP asynInt32` then
+/// `dbpf DG.INP "@asyn(scalerPort 0 0)"` prints nothing, DG.INP stays
+/// "DS NPP NMS", and a process reads DS with VAL 7, NO_ALARM.
+#[epics_macros_rs::epics_test]
+async fn a_device_link_put_to_a_registered_device_without_dsxt_is_refused() {
+    use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_menu};
+    static ASYN_AI: &[DevSup] = &[DevSup {
+        name: "asynAiInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(6, &[2, 3, 4, 5], false),
+    }];
+    register_device_menu("ai", ASYN_AI);
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(ai, "DS") { field(VAL, "7") }
+record(ai, "DG") { field(INP, "DS NPP") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    put(&db, "DG", "DTYP", "asynInt32").await;
+    let refused = db
+        .put_record_field_from_ca(
+            "DG",
+            "INP",
+            EpicsValue::String("@asyn(scalerPort 0 0)".into()),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(epics_base_rs::error::CaError::NoSupport)),
+        "{refused:?}"
+    );
+    let inp = db.get_pv("DG.INP").unwrap();
+    assert_eq!(inp, EpicsValue::String("DS NPP NMS".into()), "DG.INP");
+    process(&db, "DG").await;
+    assert_eq!(get(&db, "DG.VAL"), 7.0, "DG.VAL");
+    assert_eq!(get(&db, "DG.SEVR"), 0.0, "DG.SEVR");
+    assert_eq!(get(&db, "DG.PACT"), 0.0, "DG.PACT");
+}

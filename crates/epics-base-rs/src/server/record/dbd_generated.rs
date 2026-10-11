@@ -35,8 +35,9 @@
 
 #![allow(clippy::all)]
 
-use crate::server::record::DbLinkType;
+use super::dsets;
 use crate::server::record::{Asl, Base, FieldDesc, Special};
+use crate::server::record::{DbLinkType, DevSup};
 use crate::types::{DbFieldType, DbfCode};
 
 // ---------------------------------------------------------------------
@@ -50968,215 +50969,546 @@ pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------
-// Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the
-// half of the `device()` declaration `dbCanSetLink` enforces.
+// Per-record-type device rows (C `devSup`), in `.dbd` declaration order.
 // ---------------------------------------------------------------------
 
-/// `device(aai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AAI: &[(&str, DbLinkType)] = &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(aai, ...)` lines.
+pub static DEVICES_AAI: &[DevSup] = &[DevSup {
+    name: "devAaiSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVAAISOFT,
+}];
 
-/// `device(aao, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AAO: &[(&str, DbLinkType)] = &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(aao, ...)` lines.
+pub static DEVICES_AAO: &[DevSup] = &[DevSup {
+    name: "devAaoSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVAAOSOFT,
+}];
 
-/// `device(acalcout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_ACALCOUT: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(acalcout, ...)` lines.
+pub static DEVICES_ACALCOUT: &[DevSup] = &[DevSup {
+    name: "devaCalcoutSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVACALCOUTSOFT,
+}];
 
-/// `device(ai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AI: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("Soft Timestamp", DbLinkType::InstIo),
-    ("General Time", DbLinkType::InstIo),
+/// The `device(ai, ...)` lines.
+pub static DEVICES_AI: &[DevSup] = &[
+    DevSup {
+        name: "devAiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAISOFT,
+    },
+    DevSup {
+        name: "devAiSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAISOFTRAW,
+    },
+    DevSup {
+        name: "devAiSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAISOFTCALLBACK,
+    },
+    DevSup {
+        name: "devTimestampAI",
+        choice: "Soft Timestamp",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVTIMESTAMPAI,
+    },
+    DevSup {
+        name: "devAiGeneralTime",
+        choice: "General Time",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVAIGENERALTIME,
+    },
 ];
 
-/// `device(ao, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AO: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(ao, ...)` lines.
+pub static DEVICES_AO: &[DevSup] = &[
+    DevSup {
+        name: "devAoSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAOSOFT,
+    },
+    DevSup {
+        name: "devAoSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAOSOFTRAW,
+    },
+    DevSup {
+        name: "devAoSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVAOSOFTCALLBACK,
+    },
 ];
 
-/// `device(asyn, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_ASYN: &[(&str, DbLinkType)] =
-    &[("asynRecordDevice", DbLinkType::InstIo)];
+/// The `device(asyn, ...)` lines.
+pub static DEVICES_ASYN: &[DevSup] = &[DevSup {
+    name: "asynRecordDevice",
+    choice: "asynRecordDevice",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNRECORDDEVICE,
+}];
 
-/// `device(bi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_BI: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("Db State", DbLinkType::InstIo),
+/// The `device(bi, ...)` lines.
+pub static DEVICES_BI: &[DevSup] = &[
+    DevSup {
+        name: "devBiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBISOFT,
+    },
+    DevSup {
+        name: "devBiSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBISOFTRAW,
+    },
+    DevSup {
+        name: "devBiSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBISOFTCALLBACK,
+    },
+    DevSup {
+        name: "devBiDbState",
+        choice: "Db State",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVBIDBSTATE,
+    },
 ];
 
-/// `device(bo, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_BO: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("General Time", DbLinkType::InstIo),
-    ("Db State", DbLinkType::InstIo),
+/// The `device(bo, ...)` lines.
+pub static DEVICES_BO: &[DevSup] = &[
+    DevSup {
+        name: "devBoSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBOSOFT,
+    },
+    DevSup {
+        name: "devBoSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBOSOFTRAW,
+    },
+    DevSup {
+        name: "devBoSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBOSOFTCALLBACK,
+    },
+    DevSup {
+        name: "devBoGeneralTime",
+        choice: "General Time",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVBOGENERALTIME,
+    },
+    DevSup {
+        name: "devBoDbState",
+        choice: "Db State",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVBODBSTATE,
+    },
 ];
 
-/// `device(busy, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_BUSY: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
+/// The `device(busy, ...)` lines.
+pub static DEVICES_BUSY: &[DevSup] = &[
+    DevSup {
+        name: "devBusySoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBUSYSOFT,
+    },
+    DevSup {
+        name: "devBusySoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVBUSYSOFTRAW,
+    },
 ];
 
-/// `device(calcout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_CALCOUT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(calcout, ...)` lines.
+pub static DEVICES_CALCOUT: &[DevSup] = &[
+    DevSup {
+        name: "devCalcoutSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVCALCOUTSOFT,
+    },
+    DevSup {
+        name: "devCalcoutSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVCALCOUTSOFTCALLBACK,
+    },
 ];
 
-/// `device(event, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_EVENT: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(event, ...)` lines.
+pub static DEVICES_EVENT: &[DevSup] = &[DevSup {
+    name: "devEventSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVEVENTSOFT,
+}];
 
-/// `device(histogram, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_HISTOGRAM: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(histogram, ...)` lines.
+pub static DEVICES_HISTOGRAM: &[DevSup] = &[DevSup {
+    name: "devHistogramSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVHISTOGRAMSOFT,
+}];
 
-/// `device(int64in, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_INT64IN: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(int64in, ...)` lines.
+pub static DEVICES_INT64IN: &[DevSup] = &[
+    DevSup {
+        name: "devI64inSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVI64INSOFT,
+    },
+    DevSup {
+        name: "devI64inSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVI64INSOFTCALLBACK,
+    },
 ];
 
-/// `device(int64out, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_INT64OUT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(int64out, ...)` lines.
+pub static DEVICES_INT64OUT: &[DevSup] = &[
+    DevSup {
+        name: "devI64outSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVI64OUTSOFT,
+    },
+    DevSup {
+        name: "devI64outSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVI64OUTSOFTCALLBACK,
+    },
 ];
 
-/// `device(longin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LONGIN: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("General Time", DbLinkType::InstIo),
+/// The `device(longin, ...)` lines.
+pub static DEVICES_LONGIN: &[DevSup] = &[
+    DevSup {
+        name: "devLiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLISOFT,
+    },
+    DevSup {
+        name: "devLiSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLISOFTCALLBACK,
+    },
+    DevSup {
+        name: "devLiGeneralTime",
+        choice: "General Time",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVLIGENERALTIME,
+    },
 ];
 
-/// `device(longout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LONGOUT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(longout, ...)` lines.
+pub static DEVICES_LONGOUT: &[DevSup] = &[
+    DevSup {
+        name: "devLoSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLOSOFT,
+    },
+    DevSup {
+        name: "devLoSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLOSOFTCALLBACK,
+    },
 ];
 
-/// `device(lsi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LSI: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("getenv", DbLinkType::InstIo),
+/// The `device(lsi, ...)` lines.
+pub static DEVICES_LSI: &[DevSup] = &[
+    DevSup {
+        name: "devLsiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLSISOFT,
+    },
+    DevSup {
+        name: "devLsiEnviron",
+        choice: "getenv",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVLSIENVIRON,
+    },
 ];
 
-/// `device(lso, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LSO: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("stdio", DbLinkType::InstIo),
+/// The `device(lso, ...)` lines.
+pub static DEVICES_LSO: &[DevSup] = &[
+    DevSup {
+        name: "devLsoSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLSOSOFT,
+    },
+    DevSup {
+        name: "devLsoSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVLSOSOFTCALLBACK,
+    },
+    DevSup {
+        name: "devLsoStdio",
+        choice: "stdio",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVLSOSTDIO,
+    },
 ];
 
-/// `device(mbbi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBI: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(mbbi, ...)` lines.
+pub static DEVICES_MBBI: &[DevSup] = &[
+    DevSup {
+        name: "devMbbiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBISOFT,
+    },
+    DevSup {
+        name: "devMbbiSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBISOFTRAW,
+    },
+    DevSup {
+        name: "devMbbiSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBISOFTCALLBACK,
+    },
 ];
 
-/// `device(mbbiDirect, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBIDIRECT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(mbbiDirect, ...)` lines.
+pub static DEVICES_MBBIDIRECT: &[DevSup] = &[
+    DevSup {
+        name: "devMbbiDirectSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBIDIRECTSOFT,
+    },
+    DevSup {
+        name: "devMbbiDirectSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBIDIRECTSOFTRAW,
+    },
+    DevSup {
+        name: "devMbbiDirectSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBIDIRECTSOFTCALLBACK,
+    },
 ];
 
-/// `device(mbbo, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBO: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(mbbo, ...)` lines.
+pub static DEVICES_MBBO: &[DevSup] = &[
+    DevSup {
+        name: "devMbboSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBOSOFT,
+    },
+    DevSup {
+        name: "devMbboSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBOSOFTRAW,
+    },
+    DevSup {
+        name: "devMbboSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBOSOFTCALLBACK,
+    },
 ];
 
-/// `device(mbboDirect, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBODIRECT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Raw Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
+/// The `device(mbboDirect, ...)` lines.
+pub static DEVICES_MBBODIRECT: &[DevSup] = &[
+    DevSup {
+        name: "devMbboDirectSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBODIRECTSOFT,
+    },
+    DevSup {
+        name: "devMbboDirectSoftRaw",
+        choice: "Raw Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBODIRECTSOFTRAW,
+    },
+    DevSup {
+        name: "devMbboDirectSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVMBBODIRECTSOFTCALLBACK,
+    },
 ];
 
-/// `device(printf, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_PRINTF: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("stdio", DbLinkType::InstIo),
+/// The `device(printf, ...)` lines.
+pub static DEVICES_PRINTF: &[DevSup] = &[
+    DevSup {
+        name: "devPrintfSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVPRINTFSOFT,
+    },
+    DevSup {
+        name: "devPrintfSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVPRINTFSOFTCALLBACK,
+    },
+    DevSup {
+        name: "devPrintfStdio",
+        choice: "stdio",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVPRINTFSTDIO,
+    },
 ];
 
-/// `device(scalcout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_SCALCOUT: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(scalcout, ...)` lines.
+pub static DEVICES_SCALCOUT: &[DevSup] = &[DevSup {
+    name: "devsCalcoutSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVSCALCOUTSOFT,
+}];
 
-/// `device(stringin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_STRINGIN: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("Soft Timestamp", DbLinkType::InstIo),
-    ("General Time", DbLinkType::InstIo),
-    ("getenv", DbLinkType::InstIo),
+/// The `device(stringin, ...)` lines.
+pub static DEVICES_STRINGIN: &[DevSup] = &[
+    DevSup {
+        name: "devSiSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVSISOFT,
+    },
+    DevSup {
+        name: "devSiSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVSISOFTCALLBACK,
+    },
+    DevSup {
+        name: "devTimestampSI",
+        choice: "Soft Timestamp",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVTIMESTAMPSI,
+    },
+    DevSup {
+        name: "devSiGeneralTime",
+        choice: "General Time",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVSIGENERALTIME,
+    },
+    DevSup {
+        name: "devSiEnviron",
+        choice: "getenv",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVSIENVIRON,
+    },
 ];
 
-/// `device(stringout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_STRINGOUT: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("stdio", DbLinkType::InstIo),
+/// The `device(stringout, ...)` lines.
+pub static DEVICES_STRINGOUT: &[DevSup] = &[
+    DevSup {
+        name: "devSoSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVSOSOFT,
+    },
+    DevSup {
+        name: "devSoSoftCallback",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVSOSOFTCALLBACK,
+    },
+    DevSup {
+        name: "devSoStdio",
+        choice: "stdio",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVSOSTDIO,
+    },
 ];
 
-/// `device(subArray, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_SUBARRAY: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(subArray, ...)` lines.
+pub static DEVICES_SUBARRAY: &[DevSup] = &[DevSup {
+    name: "devSASoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVSASOFT,
+}];
 
-/// `device(swait, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_SWAIT: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(swait, ...)` lines.
+pub static DEVICES_SWAIT: &[DevSup] = &[DevSup {
+    name: "devSWaitIoEvent",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVSWAITIOEVENT,
+}];
 
-/// `device(waveform, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_WAVEFORM: &[(&str, DbLinkType)] =
-    &[("Soft Channel", DbLinkType::Constant)];
+/// The `device(waveform, ...)` lines.
+pub static DEVICES_WAVEFORM: &[DevSup] = &[DevSup {
+    name: "devWfSoft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVWFSOFT,
+}];
 
-/// Every `device()` line for a record type as `(choice, link type)`, in
-/// declaration order: [`device_menu`]'s choices, each with its link type.
-pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {
+/// Every `device()` line for a record type, in declaration order:
+/// [`device_menu`]'s choices, each as its `devSup`.
+pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {
     Some(match record_type {
-        "aai" => DEVICE_LINK_TYPES_AAI,
-        "aao" => DEVICE_LINK_TYPES_AAO,
-        "acalcout" => DEVICE_LINK_TYPES_ACALCOUT,
-        "ai" => DEVICE_LINK_TYPES_AI,
-        "ao" => DEVICE_LINK_TYPES_AO,
-        "asyn" => DEVICE_LINK_TYPES_ASYN,
-        "bi" => DEVICE_LINK_TYPES_BI,
-        "bo" => DEVICE_LINK_TYPES_BO,
-        "busy" => DEVICE_LINK_TYPES_BUSY,
-        "calcout" => DEVICE_LINK_TYPES_CALCOUT,
-        "event" => DEVICE_LINK_TYPES_EVENT,
-        "histogram" => DEVICE_LINK_TYPES_HISTOGRAM,
-        "int64in" => DEVICE_LINK_TYPES_INT64IN,
-        "int64out" => DEVICE_LINK_TYPES_INT64OUT,
-        "longin" => DEVICE_LINK_TYPES_LONGIN,
-        "longout" => DEVICE_LINK_TYPES_LONGOUT,
-        "lsi" => DEVICE_LINK_TYPES_LSI,
-        "lso" => DEVICE_LINK_TYPES_LSO,
-        "mbbi" => DEVICE_LINK_TYPES_MBBI,
-        "mbbiDirect" => DEVICE_LINK_TYPES_MBBIDIRECT,
-        "mbbo" => DEVICE_LINK_TYPES_MBBO,
-        "mbboDirect" => DEVICE_LINK_TYPES_MBBODIRECT,
-        "printf" => DEVICE_LINK_TYPES_PRINTF,
-        "scalcout" => DEVICE_LINK_TYPES_SCALCOUT,
-        "stringin" => DEVICE_LINK_TYPES_STRINGIN,
-        "stringout" => DEVICE_LINK_TYPES_STRINGOUT,
-        "subArray" => DEVICE_LINK_TYPES_SUBARRAY,
-        "swait" => DEVICE_LINK_TYPES_SWAIT,
-        "waveform" => DEVICE_LINK_TYPES_WAVEFORM,
+        "aai" => DEVICES_AAI,
+        "aao" => DEVICES_AAO,
+        "acalcout" => DEVICES_ACALCOUT,
+        "ai" => DEVICES_AI,
+        "ao" => DEVICES_AO,
+        "asyn" => DEVICES_ASYN,
+        "bi" => DEVICES_BI,
+        "bo" => DEVICES_BO,
+        "busy" => DEVICES_BUSY,
+        "calcout" => DEVICES_CALCOUT,
+        "event" => DEVICES_EVENT,
+        "histogram" => DEVICES_HISTOGRAM,
+        "int64in" => DEVICES_INT64IN,
+        "int64out" => DEVICES_INT64OUT,
+        "longin" => DEVICES_LONGIN,
+        "longout" => DEVICES_LONGOUT,
+        "lsi" => DEVICES_LSI,
+        "lso" => DEVICES_LSO,
+        "mbbi" => DEVICES_MBBI,
+        "mbbiDirect" => DEVICES_MBBIDIRECT,
+        "mbbo" => DEVICES_MBBO,
+        "mbboDirect" => DEVICES_MBBODIRECT,
+        "printf" => DEVICES_PRINTF,
+        "scalcout" => DEVICES_SCALCOUT,
+        "stringin" => DEVICES_STRINGIN,
+        "stringout" => DEVICES_STRINGOUT,
+        "subArray" => DEVICES_SUBARRAY,
+        "swait" => DEVICES_SWAIT,
+        "waveform" => DEVICES_WAVEFORM,
         _ => return None,
     })
 }
@@ -51187,10 +51519,10 @@ pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, D
 /// crate registering its device support at runtime (asyn, motor) brings no
 /// `.dbd`, so there is no declaration to enforce and none is invented.
 pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
-    device_link_types(record_type)?
+    devices(record_type)?
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))
-        .map(|(_, lt)| *lt)
+        .find(|row| row.choice.eq_ignore_ascii_case(dtyp))
+        .map(|row| row.link_type)
 }
 
 /// Every record type this port declares, in the order C's

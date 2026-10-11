@@ -922,7 +922,11 @@ impl Record for ScalerRecord {
     /// has one re-entry shape, so it reports whether this cycle IS that
     /// re-entry and `process()` pairs the answer with `pending_reentry` to
     /// recover which callback fired.
-    fn set_process_continuation(&mut self, continuation: bool) {
+    fn set_process_continuation(
+        &mut self,
+        continuation: bool,
+        _pact: epics_base_rs::server::record::Pact<'_>,
+    ) {
         self.continuation = continuation;
     }
 

@@ -1,12 +1,14 @@
 //! `dbStaticLib.c` dumps of std's contributions, against `oracleStdIoc`
 //! (`~/work/epics-modules/oracle-ioc`: base + std + calc, R7.0.10.1-DEV).
-//! C's `device name`, `pdset`, `func` and `pdsxt` lines are addresses and C
-//! symbol names, which the port does not carry, so they are cut from C's text.
+//! Addresses are masked on both sides; `(nil)` is compared.
 
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
+
+mod common;
+use common::masked;
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 8 ran and passed on
 // the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
@@ -14,8 +16,13 @@ use epics_base_rs::server::iocsh::IocShell;
 // feeds `BlockingBridge::capture` for the shell; no CA server is built.
 fn shell() -> IocShell {
     std_rs::register_std_dbd();
-    // devTimeOfDay.dbd's ai/stringin lines arrive with the supports it serves.
-    let _ = std_rs::std_device_supports();
+    // devTimeOfDay.dbd's ai/stringin lines arrive when its supports are
+    // registered.
+    let mut builder = epics_base_rs::server::ioc_builder::IocBuilder::new();
+    for (record_type, devsup, factory) in std_rs::std_device_supports() {
+        builder = builder.register_device_support(record_type, devsup, factory);
+    }
+    drop(builder);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bridge = {
         let _guard = rt.enter();
@@ -33,57 +40,46 @@ fn run(shell: &IocShell, line: &str) -> String {
     std::fs::read_to_string(out.path()).unwrap()
 }
 
-#[test]
-fn std_device_choices_carry_their_link_type_dbstaticlib_c_3456() {
-    let shell = shell();
-    assert_eq!(
-        run(&shell, "dbDumpDevice pdbbase ai"),
-        "recordtype(ai)
-\tchoice:    Soft Channel
-\tlink_type: 0
-\tchoice:    Raw Soft Channel
-\tlink_type: 0
-\tchoice:    Async Soft Channel
-\tlink_type: 0
-\tchoice:    Soft Timestamp
-\tlink_type: 12
-\tchoice:    General Time
-\tlink_type: 12
-\tchoice:    Sec Past Epoch
-\tlink_type: 0
-"
-    );
-    assert_eq!(
-        run(&shell, "dbDumpDevice pdbbase stringin"),
-        "recordtype(stringin)
-\tchoice:    Soft Channel
-\tlink_type: 0
-\tchoice:    Async Soft Channel
-\tlink_type: 0
-\tchoice:    Soft Timestamp
-\tlink_type: 12
-\tchoice:    General Time
-\tlink_type: 12
-\tchoice:    getenv
-\tlink_type: 12
-\tchoice:    Time of Day
-\tlink_type: 0
-"
-    );
+/// oracleStdIoc's `dbDumpDevice` block for `record_type`.
+fn c_device_block(record_type: &str) -> String {
+    let head = format!("recordtype({record_type})\n");
+    blocks(include_str!("oracle/dbDumpDevice.txt"), "recordtype(")
+        .into_iter()
+        .find(|b| b.starts_with(&head))
+        .unwrap()
+        .to_string()
 }
 
 #[test]
-fn a_std_record_type_is_in_the_device_dump_dbstaticlib_c_3444() {
+fn std_device_rows_print_c_s_devsup_blocks_dbstaticlib_c_3444() {
+    let shell = shell();
+    for record_type in ["ai", "stringin", "epid"] {
+        assert_eq!(
+            masked(&run(&shell, &format!("dbDumpDevice pdbbase {record_type}"))),
+            masked(&c_device_block(record_type)),
+            "{record_type}"
+        );
+    }
+}
+
+/// oracleIoc's block, since oracleStdIoc does not load the asyn record.
+#[test]
+fn the_asyn_record_device_prints_c_s_devsup_block_dbstaticlib_c_3444() {
     let shell = shell();
     assert_eq!(
-        run(&shell, "dbDumpDevice pdbbase epid"),
-        "recordtype(epid)
-\tchoice:    Soft Channel
-\tlink_type: 0
-\tchoice:    Async Soft Channel
-\tlink_type: 0
-\tchoice:    Fast Epid
+        masked(&run(&shell, "dbDumpDevice pdbbase asyn")),
+        "recordtype(asyn)
+    device name:   asynRecordDevice
+\tchoice:    asynRecordDevice
 \tlink_type: 12
+\tpdset:     %p
+\t    number: 5
+\t    func 0: (nil) - report()
+\t    func 1: (nil) - init()
+\t    func 2: (nil) - init_record()
+\t    func 3: %p - get_ioint_info()
+\t    func 4: (nil)
+\tpdsxt:     (nil)
 "
     );
 }
@@ -215,17 +211,9 @@ fn of_c_types(rs: &str, c: &str, head: &str) -> String {
 #[test]
 fn the_whole_device_dump_walks_types_in_c_order_dbstaticlib_c_3444() {
     let shell = shell();
-    let c: String = include_str!("oracle/dbDumpDevice.txt")
-        .lines()
-        .filter(|l| {
-            l.starts_with("recordtype(")
-                || l.starts_with("\tchoice:")
-                || l.starts_with("\tlink_type:")
-        })
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let c = include_str!("oracle/dbDumpDevice.txt");
     let rs = run(&shell, "dbDumpDevice pdbbase");
-    assert_eq!(of_c_types(&rs, &c, "recordtype("), c);
+    assert_eq!(masked(&of_c_types(&rs, c, "recordtype(")), masked(c));
 }
 
 #[test]

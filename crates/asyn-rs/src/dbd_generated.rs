@@ -35,8 +35,9 @@
 
 #![allow(clippy::all)]
 
-use epics_base_rs::server::record::DbLinkType;
+use super::dsets;
 use epics_base_rs::server::record::FieldDesc;
+use epics_base_rs::server::record::{DbLinkType, DevSup};
 
 // ---------------------------------------------------------------------
 // `menu(...)` choice tables. The index is the stored `epicsEnum16` and is
@@ -246,171 +247,501 @@ pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------
-// Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the
-// half of the `device()` declaration `dbCanSetLink` enforces.
+// Per-record-type device rows (C `devSup`), in `.dbd` declaration order.
 // ---------------------------------------------------------------------
 
-/// `device(aai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AAI: &[(&str, DbLinkType)] = &[
-    ("asynInt8ArrayIn", DbLinkType::InstIo),
-    ("asynInt16ArrayIn", DbLinkType::InstIo),
-    ("asynInt32ArrayIn", DbLinkType::InstIo),
-    ("asynFloat32ArrayIn", DbLinkType::InstIo),
-    ("asynFloat64ArrayIn", DbLinkType::InstIo),
-    ("asynInt64ArrayIn", DbLinkType::InstIo),
+/// The `device(aai, ...)` lines.
+pub static DEVICES_AAI: &[DevSup] = &[
+    DevSup {
+        name: "asynInt8ArrayAai",
+        choice: "asynInt8ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT8ARRAYAAI,
+    },
+    DevSup {
+        name: "asynInt16ArrayAai",
+        choice: "asynInt16ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT16ARRAYAAI,
+    },
+    DevSup {
+        name: "asynInt32ArrayAai",
+        choice: "asynInt32ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT32ARRAYAAI,
+    },
+    DevSup {
+        name: "asynFloat32ArrayAai",
+        choice: "asynFloat32ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT32ARRAYAAI,
+    },
+    DevSup {
+        name: "asynFloat64ArrayAai",
+        choice: "asynFloat64ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT64ARRAYAAI,
+    },
+    DevSup {
+        name: "asynInt64ArrayAai",
+        choice: "asynInt64ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT64ARRAYAAI,
+    },
 ];
 
-/// `device(aao, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AAO: &[(&str, DbLinkType)] = &[
-    ("asynInt8ArrayOut", DbLinkType::InstIo),
-    ("asynInt16ArrayOut", DbLinkType::InstIo),
-    ("asynInt32ArrayOut", DbLinkType::InstIo),
-    ("asynFloat32ArrayOut", DbLinkType::InstIo),
-    ("asynFloat64ArrayOut", DbLinkType::InstIo),
-    ("asynInt64ArrayOut", DbLinkType::InstIo),
+/// The `device(aao, ...)` lines.
+pub static DEVICES_AAO: &[DevSup] = &[
+    DevSup {
+        name: "asynInt8ArrayAao",
+        choice: "asynInt8ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT8ARRAYAAO,
+    },
+    DevSup {
+        name: "asynInt16ArrayAao",
+        choice: "asynInt16ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT16ARRAYAAO,
+    },
+    DevSup {
+        name: "asynInt32ArrayAao",
+        choice: "asynInt32ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT32ARRAYAAO,
+    },
+    DevSup {
+        name: "asynFloat32ArrayAao",
+        choice: "asynFloat32ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT32ARRAYAAO,
+    },
+    DevSup {
+        name: "asynFloat64ArrayAao",
+        choice: "asynFloat64ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT64ARRAYAAO,
+    },
+    DevSup {
+        name: "asynInt64ArrayAao",
+        choice: "asynInt64ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT64ARRAYAAO,
+    },
 ];
 
-/// `device(ai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AI: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynInt32Average", DbLinkType::InstIo),
-    ("asynFloat64", DbLinkType::InstIo),
-    ("asynFloat64Average", DbLinkType::InstIo),
-    ("asynInt64", DbLinkType::InstIo),
+/// The `device(ai, ...)` lines.
+pub static DEVICES_AI: &[DevSup] = &[
+    DevSup {
+        name: "asynAiInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAIINT32,
+    },
+    DevSup {
+        name: "asynAiInt32Average",
+        choice: "asynInt32Average",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAIINT32AVERAGE,
+    },
+    DevSup {
+        name: "asynAiFloat64",
+        choice: "asynFloat64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAIFLOAT64,
+    },
+    DevSup {
+        name: "asynAiFloat64Average",
+        choice: "asynFloat64Average",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAIFLOAT64AVERAGE,
+    },
+    DevSup {
+        name: "asynAiInt64",
+        choice: "asynInt64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAIINT64,
+    },
 ];
 
-/// `device(ao, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AO: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynFloat64", DbLinkType::InstIo),
-    ("asynInt64", DbLinkType::InstIo),
+/// The `device(ao, ...)` lines.
+pub static DEVICES_AO: &[DevSup] = &[
+    DevSup {
+        name: "asynAoInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAOINT32,
+    },
+    DevSup {
+        name: "asynAoFloat64",
+        choice: "asynFloat64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAOFLOAT64,
+    },
+    DevSup {
+        name: "asynAoInt64",
+        choice: "asynInt64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNAOINT64,
+    },
 ];
 
-/// `device(bi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_BI: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
+/// The `device(bi, ...)` lines.
+pub static DEVICES_BI: &[DevSup] = &[
+    DevSup {
+        name: "asynBiInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNBIINT32,
+    },
+    DevSup {
+        name: "asynBiUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNBIUINT32DIGITAL,
+    },
 ];
 
-/// `device(bo, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_BO: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
+/// The `device(bo, ...)` lines.
+pub static DEVICES_BO: &[DevSup] = &[
+    DevSup {
+        name: "asynBoInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNBOINT32,
+    },
+    DevSup {
+        name: "asynBoUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNBOUINT32DIGITAL,
+    },
 ];
 
-/// `device(int64in, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_INT64IN: &[(&str, DbLinkType)] = &[("asynInt64", DbLinkType::InstIo)];
+/// The `device(int64in, ...)` lines.
+pub static DEVICES_INT64IN: &[DevSup] = &[DevSup {
+    name: "asynInt64In",
+    choice: "asynInt64",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNINT64IN,
+}];
 
-/// `device(int64out, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_INT64OUT: &[(&str, DbLinkType)] = &[("asynInt64", DbLinkType::InstIo)];
+/// The `device(int64out, ...)` lines.
+pub static DEVICES_INT64OUT: &[DevSup] = &[DevSup {
+    name: "asynInt64Out",
+    choice: "asynInt64",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNINT64OUT,
+}];
 
-/// `device(longin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LONGIN: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
-    ("asynInt64", DbLinkType::InstIo),
+/// The `device(longin, ...)` lines.
+pub static DEVICES_LONGIN: &[DevSup] = &[
+    DevSup {
+        name: "asynLiInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLIINT32,
+    },
+    DevSup {
+        name: "asynLiUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLIUINT32DIGITAL,
+    },
+    DevSup {
+        name: "asynLiInt64",
+        choice: "asynInt64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLIINT64,
+    },
 ];
 
-/// `device(longout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LONGOUT: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
-    ("asynInt64", DbLinkType::InstIo),
+/// The `device(longout, ...)` lines.
+pub static DEVICES_LONGOUT: &[DevSup] = &[
+    DevSup {
+        name: "asynLoInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLOINT32,
+    },
+    DevSup {
+        name: "asynLoUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLOUINT32DIGITAL,
+    },
+    DevSup {
+        name: "asynLoInt64",
+        choice: "asynInt64",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLOINT64,
+    },
 ];
 
-/// `device(lsi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LSI: &[(&str, DbLinkType)] = &[
-    ("asynOctetCmdResponse", DbLinkType::InstIo),
-    ("asynOctetWriteRead", DbLinkType::InstIo),
-    ("asynOctetRead", DbLinkType::InstIo),
+/// The `device(lsi, ...)` lines.
+pub static DEVICES_LSI: &[DevSup] = &[
+    DevSup {
+        name: "asynLsiOctetCmdResponse",
+        choice: "asynOctetCmdResponse",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLSIOCTETCMDRESPONSE,
+    },
+    DevSup {
+        name: "asynLsiOctetWriteRead",
+        choice: "asynOctetWriteRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLSIOCTETWRITEREAD,
+    },
+    DevSup {
+        name: "asynLsiOctetRead",
+        choice: "asynOctetRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNLSIOCTETREAD,
+    },
 ];
 
-/// `device(lso, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_LSO: &[(&str, DbLinkType)] = &[("asynOctetWrite", DbLinkType::InstIo)];
+/// The `device(lso, ...)` lines.
+pub static DEVICES_LSO: &[DevSup] = &[DevSup {
+    name: "asynLsoOctetWrite",
+    choice: "asynOctetWrite",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNLSOOCTETWRITE,
+}];
 
-/// `device(mbbi, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBI: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
+/// The `device(mbbi, ...)` lines.
+pub static DEVICES_MBBI: &[DevSup] = &[
+    DevSup {
+        name: "asynMbbiInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNMBBIINT32,
+    },
+    DevSup {
+        name: "asynMbbiUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNMBBIUINT32DIGITAL,
+    },
 ];
 
-/// `device(mbbiDirect, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBIDIRECT: &[(&str, DbLinkType)] =
-    &[("asynUInt32Digital", DbLinkType::InstIo)];
+/// The `device(mbbiDirect, ...)` lines.
+pub static DEVICES_MBBIDIRECT: &[DevSup] = &[DevSup {
+    name: "asynMbbiDirectUInt32Digital",
+    choice: "asynUInt32Digital",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNMBBIDIRECTUINT32DIGITAL,
+}];
 
-/// `device(mbbo, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBO: &[(&str, DbLinkType)] = &[
-    ("asynInt32", DbLinkType::InstIo),
-    ("asynUInt32Digital", DbLinkType::InstIo),
+/// The `device(mbbo, ...)` lines.
+pub static DEVICES_MBBO: &[DevSup] = &[
+    DevSup {
+        name: "asynMbboInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNMBBOINT32,
+    },
+    DevSup {
+        name: "asynMbboUInt32Digital",
+        choice: "asynUInt32Digital",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNMBBOUINT32DIGITAL,
+    },
 ];
 
-/// `device(mbboDirect, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_MBBODIRECT: &[(&str, DbLinkType)] =
-    &[("asynUInt32Digital", DbLinkType::InstIo)];
+/// The `device(mbboDirect, ...)` lines.
+pub static DEVICES_MBBODIRECT: &[DevSup] = &[DevSup {
+    name: "asynMbboDirectUInt32Digital",
+    choice: "asynUInt32Digital",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNMBBODIRECTUINT32DIGITAL,
+}];
 
-/// `device(printf, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_PRINTF: &[(&str, DbLinkType)] =
-    &[("asynOctetWrite", DbLinkType::InstIo)];
+/// The `device(printf, ...)` lines.
+pub static DEVICES_PRINTF: &[DevSup] = &[DevSup {
+    name: "asynPfOctetWrite",
+    choice: "asynOctetWrite",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNPFOCTETWRITE,
+}];
 
-/// `device(stringin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_STRINGIN: &[(&str, DbLinkType)] = &[
-    ("asynOctetCmdResponse", DbLinkType::InstIo),
-    ("asynOctetWriteRead", DbLinkType::InstIo),
-    ("asynOctetRead", DbLinkType::InstIo),
+/// The `device(stringin, ...)` lines.
+pub static DEVICES_STRINGIN: &[DevSup] = &[
+    DevSup {
+        name: "asynSiOctetCmdResponse",
+        choice: "asynOctetCmdResponse",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNSIOCTETCMDRESPONSE,
+    },
+    DevSup {
+        name: "asynSiOctetWriteRead",
+        choice: "asynOctetWriteRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNSIOCTETWRITEREAD,
+    },
+    DevSup {
+        name: "asynSiOctetRead",
+        choice: "asynOctetRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNSIOCTETREAD,
+    },
 ];
 
-/// `device(stringout, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_STRINGOUT: &[(&str, DbLinkType)] =
-    &[("asynOctetWrite", DbLinkType::InstIo)];
+/// The `device(stringout, ...)` lines.
+pub static DEVICES_STRINGOUT: &[DevSup] = &[DevSup {
+    name: "asynSoOctetWrite",
+    choice: "asynOctetWrite",
+    link_type: DbLinkType::InstIo,
+    dset: dsets::ASYNSOOCTETWRITE,
+}];
 
-/// `device(waveform, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_WAVEFORM: &[(&str, DbLinkType)] = &[
-    ("asynOctetCmdResponse", DbLinkType::InstIo),
-    ("asynOctetWriteRead", DbLinkType::InstIo),
-    ("asynOctetRead", DbLinkType::InstIo),
-    ("asynOctetWrite", DbLinkType::InstIo),
-    ("asynOctetWriteBinary", DbLinkType::InstIo),
-    ("asynInt8ArrayIn", DbLinkType::InstIo),
-    ("asynInt8ArrayOut", DbLinkType::InstIo),
-    ("asynInt16ArrayIn", DbLinkType::InstIo),
-    ("asynInt16ArrayOut", DbLinkType::InstIo),
-    ("asynInt32ArrayIn", DbLinkType::InstIo),
-    ("asynInt32ArrayOut", DbLinkType::InstIo),
-    ("asynFloat32ArrayIn", DbLinkType::InstIo),
-    ("asynFloat32ArrayOut", DbLinkType::InstIo),
-    ("asynFloat64ArrayIn", DbLinkType::InstIo),
-    ("asynFloat64ArrayOut", DbLinkType::InstIo),
-    ("asynInt32TimeSeries", DbLinkType::InstIo),
-    ("asynFloat64TimeSeries", DbLinkType::InstIo),
-    ("asynInt64ArrayIn", DbLinkType::InstIo),
-    ("asynInt64ArrayOut", DbLinkType::InstIo),
-    ("asynInt64TimeSeries", DbLinkType::InstIo),
+/// The `device(waveform, ...)` lines.
+pub static DEVICES_WAVEFORM: &[DevSup] = &[
+    DevSup {
+        name: "asynWfOctetCmdResponse",
+        choice: "asynOctetCmdResponse",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNWFOCTETCMDRESPONSE,
+    },
+    DevSup {
+        name: "asynWfOctetWriteRead",
+        choice: "asynOctetWriteRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNWFOCTETWRITEREAD,
+    },
+    DevSup {
+        name: "asynWfOctetRead",
+        choice: "asynOctetRead",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNWFOCTETREAD,
+    },
+    DevSup {
+        name: "asynWfOctetWrite",
+        choice: "asynOctetWrite",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNWFOCTETWRITE,
+    },
+    DevSup {
+        name: "asynWfOctetWriteBinary",
+        choice: "asynOctetWriteBinary",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNWFOCTETWRITEBINARY,
+    },
+    DevSup {
+        name: "asynInt8ArrayWfIn",
+        choice: "asynInt8ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT8ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynInt8ArrayWfOut",
+        choice: "asynInt8ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT8ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynInt16ArrayWfIn",
+        choice: "asynInt16ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT16ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynInt16ArrayWfOut",
+        choice: "asynInt16ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT16ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynInt32ArrayWfIn",
+        choice: "asynInt32ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT32ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynInt32ArrayWfOut",
+        choice: "asynInt32ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT32ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynFloat32ArrayWfIn",
+        choice: "asynFloat32ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT32ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynFloat32ArrayWfOut",
+        choice: "asynFloat32ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT32ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynFloat64ArrayWfIn",
+        choice: "asynFloat64ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT64ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynFloat64ArrayWfOut",
+        choice: "asynFloat64ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT64ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynInt32TimeSeries",
+        choice: "asynInt32TimeSeries",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT32TIMESERIES,
+    },
+    DevSup {
+        name: "asynFloat64TimeSeries",
+        choice: "asynFloat64TimeSeries",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNFLOAT64TIMESERIES,
+    },
+    DevSup {
+        name: "asynInt64ArrayWfIn",
+        choice: "asynInt64ArrayIn",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT64ARRAYWFIN,
+    },
+    DevSup {
+        name: "asynInt64ArrayWfOut",
+        choice: "asynInt64ArrayOut",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT64ARRAYWFOUT,
+    },
+    DevSup {
+        name: "asynInt64TimeSeries",
+        choice: "asynInt64TimeSeries",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::ASYNINT64TIMESERIES,
+    },
 ];
 
-/// Every `device()` line for a record type as `(choice, link type)`, in
-/// declaration order: [`device_menu`]'s choices, each with its link type.
-pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {
+/// Every `device()` line for a record type, in declaration order:
+/// [`device_menu`]'s choices, each as its `devSup`.
+pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {
     Some(match record_type {
-        "aai" => DEVICE_LINK_TYPES_AAI,
-        "aao" => DEVICE_LINK_TYPES_AAO,
-        "ai" => DEVICE_LINK_TYPES_AI,
-        "ao" => DEVICE_LINK_TYPES_AO,
-        "bi" => DEVICE_LINK_TYPES_BI,
-        "bo" => DEVICE_LINK_TYPES_BO,
-        "int64in" => DEVICE_LINK_TYPES_INT64IN,
-        "int64out" => DEVICE_LINK_TYPES_INT64OUT,
-        "longin" => DEVICE_LINK_TYPES_LONGIN,
-        "longout" => DEVICE_LINK_TYPES_LONGOUT,
-        "lsi" => DEVICE_LINK_TYPES_LSI,
-        "lso" => DEVICE_LINK_TYPES_LSO,
-        "mbbi" => DEVICE_LINK_TYPES_MBBI,
-        "mbbiDirect" => DEVICE_LINK_TYPES_MBBIDIRECT,
-        "mbbo" => DEVICE_LINK_TYPES_MBBO,
-        "mbboDirect" => DEVICE_LINK_TYPES_MBBODIRECT,
-        "printf" => DEVICE_LINK_TYPES_PRINTF,
-        "stringin" => DEVICE_LINK_TYPES_STRINGIN,
-        "stringout" => DEVICE_LINK_TYPES_STRINGOUT,
-        "waveform" => DEVICE_LINK_TYPES_WAVEFORM,
+        "aai" => DEVICES_AAI,
+        "aao" => DEVICES_AAO,
+        "ai" => DEVICES_AI,
+        "ao" => DEVICES_AO,
+        "bi" => DEVICES_BI,
+        "bo" => DEVICES_BO,
+        "int64in" => DEVICES_INT64IN,
+        "int64out" => DEVICES_INT64OUT,
+        "longin" => DEVICES_LONGIN,
+        "longout" => DEVICES_LONGOUT,
+        "lsi" => DEVICES_LSI,
+        "lso" => DEVICES_LSO,
+        "mbbi" => DEVICES_MBBI,
+        "mbbiDirect" => DEVICES_MBBIDIRECT,
+        "mbbo" => DEVICES_MBBO,
+        "mbboDirect" => DEVICES_MBBODIRECT,
+        "printf" => DEVICES_PRINTF,
+        "stringin" => DEVICES_STRINGIN,
+        "stringout" => DEVICES_STRINGOUT,
+        "waveform" => DEVICES_WAVEFORM,
         _ => return None,
     })
 }
@@ -421,10 +752,10 @@ pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, D
 /// crate registering its device support at runtime (asyn, motor) brings no
 /// `.dbd`, so there is no declaration to enforce and none is invented.
 pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
-    device_link_types(record_type)?
+    devices(record_type)?
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))
-        .map(|(_, lt)| *lt)
+        .find(|row| row.choice.eq_ignore_ascii_case(dtyp))
+        .map(|row| row.link_type)
 }
 
 /// The record-own field table for a record type name, or `None` for a type

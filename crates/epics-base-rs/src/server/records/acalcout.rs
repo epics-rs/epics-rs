@@ -526,6 +526,10 @@ pub struct AcalcoutRecord {
     /// `cached_should_output` on the continuation so the deferred OUT write
     /// fires once after the delay. Mirrors `scalcout`/`calcout`.
     pending_output: bool,
+    /// `prec->pact` at `process()` entry: C takes the delayed-output arm only
+    /// with PACT held, so a re-entry after a device-link put cleared it
+    /// (`dbAccess.c:1194`) is a fresh cycle.
+    pact: bool,
 }
 
 impl Default for AcalcoutRecord {
@@ -605,6 +609,7 @@ impl Default for AcalcoutRecord {
             fetch_gate_failed: false,
             cached_should_output: false,
             pending_output: false,
+            pact: false,
         }
     }
 }
@@ -1280,6 +1285,14 @@ impl Record for AcalcoutRecord {
         self.refresh_link_status(LinkStatusPosts::All);
     }
 
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: the delayed re-process scheduled by a previous
         // cycle (C `aCalcoutRecord.c::process` `pact==TRUE` + `dlya` branch,
@@ -1287,7 +1300,7 @@ impl Record for AcalcoutRecord {
         // runs `execOutput` directly; the alarm state captured by the delaying
         // cycle persists. Restore the captured output decision, clear DLYA, and
         // let the framework write the OUT link + post OEVT. Mirrors `scalcout`.
-        if self.dlya == 1 {
+        if self.pact && self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
@@ -3100,6 +3113,9 @@ mod tests {
             "no monitor() ran to commit it"
         );
 
+        let pact = std::sync::atomic::AtomicBool::new(true);
+        let held = crate::server::record::Pact::new(&pact);
+        rec.set_process_continuation(true, held);
         rec.process().unwrap();
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
         assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));

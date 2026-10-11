@@ -173,15 +173,26 @@ impl LinkFetch {
     }
 }
 
-/// Whether a link is a C CONSTANT link — `dbLinkIsConstant` (`dbLink.c:220`).
+/// C `dbLinkIsConstant` (`dbLink.c:220-225`): `!plset || plset->isConstant`.
 /// An unset link is constant (its `lset` is `dbConst_lset` with a NULL string),
 /// which is why `recGblInitSimm`'s `if (dbLinkIsConstant(psiml))` covers the
-/// unset case too.
+/// unset case too, and so is a removed one, which has no `lset` at all.
 pub fn is_constant(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
     matches!(
         link,
-        crate::server::record::ParsedLink::None | crate::server::record::ParsedLink::Constant(_)
+        ParsedLink::None | ParsedLink::Constant(_) | ParsedLink::Removed(_)
     )
+}
+
+/// Whether the link's `lset` is `dbConst_lset`, so a read of it is
+/// `dbConstGetValue`: status 0, nothing stored (`dbConstLink.c:234-248`).
+/// [`is_constant`] less a removed link, whose read `dbTryGetLink` fails with
+/// `S_db_noLSET` (`dbLink.c:310-311`) — the gate for skipping a read rather
+/// than for C's `dbLinkIsConstant` tests.
+pub fn has_const_lset(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
+    matches!(link, ParsedLink::None | ParsedLink::Constant(_))
 }
 
 /// The record types whose C `.dbd` declares `field(SSCN)` + `field(OLDSIMM)`
@@ -231,6 +242,25 @@ pub fn record_type_has_sscn(record_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A removed link: `dbLinkIsConstant` true and `dbLinkIsDefined` false
+    /// (`dbLink.c:215-225`), no `dbConst_lset` to read, and `plink->type` what
+    /// the lset's remove left — `PV_LINK` for a DB link (`dbDbLink.c:132`).
+    #[test]
+    fn a_removed_link_is_constant_with_no_const_lset_and_keeps_its_type() {
+        use crate::server::record::{DbLinkType, ParsedLink};
+        let removed = ParsedLink::Removed(DbLinkType::PvLink);
+        assert!(is_constant(&removed));
+        assert!(!has_const_lset(&removed));
+        assert_eq!(removed.db_link_type(), DbLinkType::PvLink);
+        assert_eq!(
+            removed.link_type_after_init("MX NPP NMS"),
+            DbLinkType::PvLink
+        );
+        for live in [ParsedLink::None, crate::server::record::parse_link_v2("5")] {
+            assert!(is_constant(&live) && has_const_lset(&live), "{live:?}");
+        }
+    }
 
     #[test]
     fn only_the_21_c_records_with_field_sscn_swap_scan() {

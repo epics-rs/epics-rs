@@ -1475,7 +1475,11 @@ impl Record for WaveformRecord {
     /// Residual: the init-time constant-array load (`dbLoadLinkArray`, C's
     /// `init && isConst` arm) is not applied here — it belongs to
     /// `init_record`, not to the per-cycle hook.
-    fn pre_input_link_actions(&mut self, dol_is_constant: bool) -> ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> ProcessActions {
         if matches!(self.kind, ArrayKind::SubArray) {
             // C `readValue`: NELM/INDX are clamped before `read_sa`, on every
             // process and never at init.
@@ -2050,7 +2054,7 @@ mod array_kind_tests {
         aao.omsl = MENU_OMSL_CLOSED_LOOP;
         aao.set_dol("srcWaveform.VAL".to_string());
         assert_eq!(
-            &*aao.pre_input_link_actions(dol_is_constant(&aao.dol)),
+            &*aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default()),
             &[ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
@@ -2061,7 +2065,8 @@ mod array_kind_tests {
         // also arms the fetch.
         aao.set_dol("srcWaveform".to_string());
         assert_eq!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol)).len(),
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .len(),
             1
         );
     }
@@ -2080,25 +2085,25 @@ mod array_kind_tests {
         // (`dbStaticLib.c:2346-2357`).
         aao.set_dol("[1,2,3]".to_string());
         assert!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                 .is_empty()
         );
 
         aao.set_dol("42".to_string()); // constant scalar literal
         assert!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                 .is_empty()
         );
 
         aao.set_dol(String::new()); // unset
         assert!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                 .is_empty()
         );
 
         aao.set_dol("   ".to_string()); // whitespace-only
         assert!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                 .is_empty()
         );
     }
@@ -2117,7 +2122,7 @@ mod array_kind_tests {
             aao.put_field("DOL", EpicsValue::String(dol.into()))
                 .unwrap();
             assert_eq!(
-                !aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+                !aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                     .is_empty(),
                 fetches,
                 "DOL {dol}"
@@ -2135,7 +2140,7 @@ mod array_kind_tests {
         aao.omsl = 0; // supervisory
         aao.set_dol("srcWaveform.VAL".to_string());
         assert!(
-            aao.pre_input_link_actions(dol_is_constant(&aao.dol))
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
                 .is_empty()
         );
 
@@ -2145,7 +2150,8 @@ mod array_kind_tests {
             r.omsl = MENU_OMSL_CLOSED_LOOP;
             r.set_dol("srcWaveform.VAL".to_string());
             assert!(
-                r.pre_input_link_actions(dol_is_constant(&r.dol)).is_empty(),
+                r.pre_input_link_actions(dol_is_constant(&r.dol), &mut Default::default())
+                    .is_empty(),
                 "{kind:?} has no OMSL/DOL and must not fetch"
             );
         }

@@ -307,6 +307,15 @@ pub(crate) enum LinkWhy {
     Yajl(crate::server::db_convert_json::YajlError),
     /// A `#` link whose letters name no bus.
     NoBus,
+    /// This dset's `add_record` refused the new link; its line goes out
+    /// through the put's own report.
+    AddRecord(&'static str),
+    /// This dset's `del_record` refused to let the old link go.
+    DelRecord(&'static str),
+    /// `dbPutFieldLink`'s `S_db_badHWaddr` (`dbAccess.c:1171-1174`): this
+    /// field's link was removed by an earlier refused put, and C says
+    /// nothing.
+    NotDefined(&'static str),
 }
 
 impl LinkRefusal {
@@ -319,6 +328,18 @@ impl LinkRefusal {
                 | LinkWhy::Yajl(_)
         );
         Self { why, owed }
+    }
+
+    /// A dset's `add_record` refused the link, printing nothing of its own
+    /// or having printed it already.
+    pub fn add_record(dset: &'static str) -> Self {
+        Self::new(LinkWhy::AddRecord(dset))
+    }
+
+    /// A dset's `del_record` refused to release the old link, printing
+    /// nothing of its own or having printed it already.
+    pub fn del_record(dset: &'static str) -> Self {
+        Self::new(LinkWhy::DelRecord(dset))
     }
 
     /// The errlog line still owed for this refusal, if C prints one.
@@ -369,6 +390,9 @@ impl std::fmt::Display for LinkRefusal {
             LinkWhy::ConstStop(_) => f.write_str("dbJLinkInit: lnkConst refused its value"),
             LinkWhy::Yajl(_) => f.write_str("dbJLinkInit: not a JSON link"),
             LinkWhy::NoBus => f.write_str("dbParseLink: the text names no hardware bus"),
+            LinkWhy::AddRecord(dset) => write!(f, "{dset} (add_record) refused the link"),
+            LinkWhy::DelRecord(dset) => write!(f, "{dset} (del_record) kept the link"),
+            LinkWhy::NotDefined(field) => write!(f, "{field} has no link to remove"),
         }
     }
 }

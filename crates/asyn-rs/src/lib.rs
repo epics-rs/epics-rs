@@ -123,4 +123,6 @@ pub mod asyn_record;
 #[cfg(feature = "epics")]
 pub mod dbd_generated;
 #[cfg(feature = "epics")]
+mod dsets;
+#[cfg(feature = "epics")]
 pub mod iocsh;

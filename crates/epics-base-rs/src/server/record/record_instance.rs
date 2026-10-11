@@ -18,7 +18,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
-use super::link::{LinkFieldType, ParsedLink, parse_link_field, parse_link_v2};
+use super::link::{ParsedLink, parse_link_v2};
 use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, EnumSlots, FieldDeclaration, FieldDesc, InputLinkRequest,
@@ -115,6 +115,40 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &str) ->
         }
     };
     format!("{target}{pp} {}", monitor_switch_word(ms))
+}
+
+/// [`render_link_field`] for a link `dbRemoveLink` removed, of type `ty`:
+/// the remove clears `pvlMask` (`dbDbLink.c:138`, `dbCa.c:440`), so a
+/// `PV_LINK` prints its target with ` NPP NMS`, or bare in a forward link
+/// (`dbStaticLib.c:1935-1952`, `:2034-2044`); any other type keeps its text.
+fn render_removed_link(
+    class: crate::types::DbfLinkClass,
+    ty: super::DbLinkType,
+    raw: &str,
+) -> String {
+    let text = raw.trim();
+    if ty != super::DbLinkType::PvLink {
+        return text.to_string();
+    }
+    let target = text.split_once(' ').map_or(text, |(head, _)| head);
+    if matches!(class, crate::types::DbfLinkClass::FwdLink) {
+        target.to_string()
+    } else {
+        format!("{target} NPP NMS")
+    }
+}
+
+/// C `dbGetString`'s `PN_LINK` arm (`dbStaticLib.c:1930-1933`): the target
+/// and the severity switch, nothing else.
+fn render_pn_link(raw: &str) -> String {
+    let text = raw.trim();
+    let ms = match super::parse_link_field(text, super::LinkFieldType::In) {
+        ParsedLink::Db(link) => link.monitor_switch,
+        ParsedLink::Ca(link) => link.monitor_switch,
+        _ => return text.to_string(),
+    };
+    let target = text.split_once(' ').map_or(text, |(head, _)| head);
+    format!("{target} {}", monitor_switch_word(ms))
 }
 
 /// Every client-visible `special(SPC_NOMOD)` field of `dbCommon.dbd:13-190`.
@@ -308,7 +342,10 @@ impl NotifyWaitSet {
     /// C `dbProcessNotify` (`dbNotify.c:196-270`): the put named `record`, so
     /// `dbChannelRecord(ppn->chan)` is `record` and that is the one record
     /// `dbNotifyDump` prints a block for.
-    fn for_entry_record(record: &str, tx: crate::runtime::sync::oneshot::Sender<()>) -> Arc<Self> {
+    pub(crate) fn for_entry_record(
+        record: &str,
+        tx: crate::runtime::sync::oneshot::Sender<()>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pending: AtomicUsize::new(1),
             joined: StdMutex::new(Vec::new()),
@@ -515,6 +552,13 @@ pub enum DeferredNotify {
     Process {
         /// The client's completion channel, armed on the replayed process.
         completion: crate::runtime::sync::oneshot::Sender<()>,
+    },
+    /// C `processGetRequest` from a SoftCallback input dset, which restarts
+    /// the record only if it is Passive (`dbNotify.c:247-249`) and is gone
+    /// once the requester's `del_record` ran `dbNotifyCancel` (`:400-410`).
+    ProcessGet {
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+        requester: crate::server::database::TokenWatch,
     },
 }
 
@@ -926,9 +970,9 @@ impl ForwardTarget {
         }
     }
 }
-/// What C's `readValue`/`writeValue` reaches as struct members — `prec->siml`,
-/// `->siol`, `->sims`, `->sdly` — and which stage of the cycle C put the SIOL
-/// read in.
+/// What C's `readValue`/`writeValue` reaches as struct members — `prec->sims`,
+/// `->sdly` — and which stage of the cycle C put the SIOL read in. `siml` and
+/// `siol` are links, read through their slots ([`RecordInstance::sim_link`]).
 ///
 /// C names these fields at compile time; this port resolved all four BY NAME
 /// on every cycle of every record whose `.dbd` declares SIMM (`ai`, `bi`,
@@ -939,8 +983,6 @@ impl ForwardTarget {
 /// here once per record instance and the cycle reads through it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SimmBlock {
-    pub(crate) siml: Option<&'static FieldDesc>,
-    pub(crate) siol: Option<&'static FieldDesc>,
     pub(crate) sims: Option<&'static FieldDesc>,
     pub(crate) sdly: Option<&'static FieldDesc>,
     /// C put this type's SIOL read in the INPUT stage: `readValue` reads SIOL
@@ -956,8 +998,6 @@ impl SimmBlock {
     fn of(record: &dyn Record) -> Self {
         let rtype = record.record_type();
         SimmBlock {
-            siml: field_desc_of(record, "SIML"),
-            siol: field_desc_of(record, "SIOL"),
             sims: field_desc_of(record, "SIMS"),
             sdly: field_desc_of(record, "SDLY"),
             is_input: record.simulation_substitutes_input_stage()
@@ -1182,8 +1222,10 @@ pub(crate) struct UdfAlarm {
 }
 
 mod link_cache {
-    use crate::server::builtin_devices::soft_callback::{AddRecordInput, AddRecordRefusal};
-    use crate::server::record::{LinkFieldType, ParsedLink};
+    use crate::server::builtin_devices::soft_callback::AddRecordRefusal;
+    use crate::server::device_support::SoftDtyp;
+    use crate::server::recgbl::simm::has_const_lset;
+    use crate::server::record::{DbLinkType, LinkFieldType, ParsedLink};
     use std::sync::{Arc, LazyLock};
 
     /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
@@ -1214,10 +1256,43 @@ mod link_cache {
         pub(super) field: &'static str,
         pub(super) text: String,
         pub(super) parsed: ParsedLink,
-        /// An INP put's `add_record` input, taken before the hold.
-        pub(crate) add_record: Option<AddRecordInput>,
-        /// What that `add_record` refused, for the caller to report after it.
+        /// The new dset of a device-link put, prepared before the hold by
+        /// [`Self::ask_add_record`].
+        pub(super) device: Option<PreparedDevice>,
+        /// What a soft-channel `add_record` refused, for the caller to
+        /// report once the hold is down.
         pub(crate) add_record_refusal: Option<AddRecordRefusal>,
+    }
+
+    /// C `dbPutFieldLink`'s `new_dset` and the `add_record` answer for it
+    /// (`dbAccess.c:1128-1131`, `:1196`), for the DTYP read when it was
+    /// prepared.
+    pub(crate) struct PreparedDevice {
+        pub(super) dtyp: crate::server::device_support::DtypName,
+        pub(super) dset: NewDset,
+        /// The object the swap took off the record, dropped with the prepared
+        /// link once the hold is down.
+        pub(super) retired: Option<Box<dyn crate::server::device_support::DeviceSupport>>,
+        /// The `dpvt` the new dset's `add_record` made, and the one the swap
+        /// took off the record (`dbAccess.c:1192`).
+        pub(super) dpvt: crate::server::device_support::Dpvt,
+        pub(super) retired_dpvt: crate::server::device_support::Dpvt,
+    }
+
+    pub(crate) enum NewDset {
+        /// No device object: a soft channel, or a DTYP no factory serves.
+        Absent,
+        /// The bound object stays: its dset extends with `devSoft_DSXT`,
+        /// whose `add_record` binds nothing.
+        Keep,
+        /// A fresh object whose `add_record` bound the new link: C's new
+        /// `dpvt`.
+        Bound(Box<dyn crate::server::device_support::DeviceSupport>),
+        /// `add_record` refused.
+        Refused(crate::error::LinkRefusal),
+        /// `dev<T>SoftCallback`'s `add_record` refused; its line is printed
+        /// after the hold.
+        SoftRefused(AddRecordRefusal),
     }
 
     impl PreparedCommonLink {
@@ -1258,7 +1333,7 @@ mod link_cache {
                 field,
                 parsed: crate::server::record::parse_link_field(&text, ftype),
                 text,
-                add_record: None,
+                device: None,
                 add_record_refusal: None,
             })
         }
@@ -1267,20 +1342,101 @@ mod link_cache {
             &self.parsed
         }
 
-        /// An INP put's [`AddRecordInput`], resolved before the hold.
-        pub(crate) fn prepare_add_record(
+        pub(crate) fn field(&self) -> &'static str {
+            self.field
+        }
+
+        /// C `dbPutFieldLink`'s `new_dset` and `new_dsxt->add_record(precord)`
+        /// (`dbAccess.c:1128`, `:1196`) for an INP/OUT put to `rec`, decided
+        /// here because both look outside the record: the DTYP and record
+        /// type are read under a short read hold, the factory and the target
+        /// lookup run after it.
+        pub(crate) fn ask_add_record(
             &mut self,
             db: &crate::server::database::PvDatabase,
             rec: &super::RecordCell,
         ) {
-            if self.field == "INP" {
-                self.add_record =
-                    crate::server::builtin_devices::soft_callback::add_record_input_of(
-                        db,
-                        rec,
-                        Some(&self.text),
-                    );
+            if !matches!(self.field, "INP" | "OUT") {
+                return;
             }
+            let at = super::PutAddr::resolve_in(rec, self.field);
+            let (record_type, dtyp, bound_here, no_mod) = {
+                let inst = rec.read();
+                if !inst.has_device_list() {
+                    return;
+                }
+                let dtyp = inst.common.dtyp.shared_name();
+                let bound_here = inst.device.as_ref().is_some_and(|d| d.dtyp() == &*dtyp);
+                let no_mod = inst.is_no_mod_at(self.field, &at);
+                (inst.record.record_type(), dtyp, bound_here, no_mod)
+            };
+            let mut dpvt = crate::server::device_support::Dpvt::Null;
+            let row = super::super::dev_sup_of(record_type, &dtyp);
+            let dset = if no_mod {
+                // `dbPutSpecial(paddr, 0)` refuses it under the hold
+                // (`dbAccess.c:1176`), before `add_record` is reached.
+                NewDset::Keep
+            } else if row.is_some_and(|row| !row.has_dsxt()) {
+                // Refused under the hold before `add_record` is reached
+                // ([`super::RecordInstance::gate_device_link_put`]).
+                NewDset::Absent
+            } else if let Some(class) =
+                crate::server::device_support::served_soft(record_type, &dtyp)
+            {
+                let added = if self.field == "INP" && class == SoftDtyp::Async {
+                    crate::server::builtin_devices::soft_callback::put_add_record(
+                        db,
+                        record_type,
+                        &dtyp,
+                        &self.text,
+                    )
+                } else {
+                    Ok(crate::server::device_support::Dpvt::Null)
+                };
+                match added {
+                    Ok(added) => {
+                        dpvt = added;
+                        NewDset::Absent
+                    }
+                    Err(refusal) => NewDset::SoftRefused(refusal),
+                }
+            } else if bound_here && !row.is_some_and(|row| row.dset.extends) {
+                NewDset::Keep
+            } else {
+                let (inp, out) = if self.field == "INP" {
+                    (self.text.as_str(), "")
+                } else {
+                    ("", self.text.as_str())
+                };
+                let ctx = crate::server::ioc_app::DeviceSupportContext {
+                    record_type,
+                    dtyp: &dtyp,
+                    inp,
+                    out,
+                };
+                match db.resolve_device_support(&ctx) {
+                    Some(mut dev) => match dev.add_record(record_type) {
+                        Ok(()) => NewDset::Bound(dev),
+                        Err(refusal) => NewDset::Refused(refusal),
+                    },
+                    None => NewDset::Absent,
+                }
+            };
+            self.device = Some(PreparedDevice {
+                dtyp,
+                dset,
+                retired: None,
+                dpvt,
+                retired_dpvt: crate::server::device_support::Dpvt::Null,
+            });
+        }
+
+        /// The DTYP moved since [`Self::ask_add_record`] read it, so the
+        /// prepared dset is for another device.
+        pub(crate) fn device_dtyp_moved(&self, inst: &super::RecordInstance) -> bool {
+            self.device
+                .as_ref()
+                .is_some_and(|d| *d.dtyp != *inst.common.dtyp.as_str())
         }
     }
 
@@ -1299,7 +1455,26 @@ mod link_cache {
     /// `dbPutFieldLink` re-parses. Never filled by a read, so a reader needs
     /// only `&self` and the record's read lock.
     #[derive(Debug, Default)]
-    pub(crate) struct LinkSlots(Vec<LinkSlot>);
+    pub(crate) struct LinkSlots(Vec<LinkSlot>, SimlLset);
+
+    /// Whether SIML's slot holds a link with `dbConst_lset` — the steady
+    /// cycle's one SIML question ([`super::RecordInstance::siml_has_const_lset`]),
+    /// kept by [`LinkSlots::set`], the only writer of a slot after the build.
+    #[derive(Debug)]
+    struct SimlLset {
+        slot: u8,
+        const_lset: bool,
+    }
+
+    impl Default for SimlLset {
+        /// No SIML: it reads as no link, which is constant.
+        fn default() -> Self {
+            SimlLset {
+                slot: u8::MAX,
+                const_lset: true,
+            }
+        }
+    }
 
     /// Sixteen slotted links by slot index. The slots are in the type's
     /// declaration order, so a row is settled once, when the instance is built.
@@ -1311,6 +1486,8 @@ mod link_cache {
         /// [`field_key`] of `field`: the scan compares one word per entry.
         key: u64,
         field: &'static str,
+        /// [`ParsedLink::Removed`] once C `dbRemoveLink` left the field with
+        /// no `lset`; the record keeps the text.
         parsed: Arc<ParsedLink>,
         /// The text parsed, for the debug check that no writer went around
         /// the put funnel.
@@ -1329,24 +1506,51 @@ mod link_cache {
         u64::from_le_bytes(b)
     }
 
-    /// An unset link — most declared links — shares one allocation.
-    static NONE: LazyLock<Arc<ParsedLink>> = LazyLock::new(|| Arc::new(ParsedLink::None));
+    /// An unset link — most declared links — shares one allocation, and a
+    /// removed one of each type a remove can leave another, made at load
+    /// ([`LinkSlots::of`]) so a removal under a record's hold allocates
+    /// nothing.
+    static SHARED: LazyLock<[Arc<ParsedLink>; 4]> = LazyLock::new(|| {
+        [
+            Arc::new(ParsedLink::None),
+            Arc::new(ParsedLink::Removed(DbLinkType::Constant)),
+            Arc::new(ParsedLink::Removed(DbLinkType::PvLink)),
+            Arc::new(ParsedLink::Removed(DbLinkType::JsonLink)),
+        ]
+    });
+    const NONE: usize = 0;
+
+    /// The shared [`ParsedLink::Removed`] for `old`: the type `plink->type`
+    /// keeps after `dbRemoveLink`. Only a link with an lset is removed
+    /// (`dbAccess.c:1150`), and a hardware link has none, so a slot never
+    /// holds one here.
+    fn removed(old: &ParsedLink) -> Arc<ParsedLink> {
+        match old.db_link_type() {
+            DbLinkType::Constant => SHARED[1].clone(),
+            DbLinkType::JsonLink => SHARED[3].clone(),
+            ty => {
+                debug_assert_eq!(ty, DbLinkType::PvLink, "a removed hardware link");
+                SHARED[2].clone()
+            }
+        }
+    }
 
     fn parse(text: &str, ftype: LinkFieldType) -> Arc<ParsedLink> {
         match crate::server::record::parse_link_field(text, ftype) {
-            ParsedLink::None => NONE.clone(),
+            ParsedLink::None => SHARED[NONE].clone(),
             parsed => Arc::new(parsed),
         }
     }
 
-    /// The parser's link type for `d` when it is a link with a slot: every
-    /// link the type declares but the `dbCommon` five, which have their
-    /// [`LinkCache`]s.
+    /// The parser's link type for `d` when it is a link: every link the
+    /// record holds has a slot, but a `dbCommon` five the record leaves to
+    /// the framework, which has its [`LinkCache`] ([`is_common_link`]).
     fn slot_type(d: &crate::server::record::FieldDesc) -> Option<LinkFieldType> {
-        if matches!(d.name, "INP" | "OUT" | "TSEL" | "SDIS" | "FLNK") {
-            return None;
-        }
         crate::types::link_class_of(d).map(LinkFieldType::for_class)
+    }
+
+    fn is_common_link(field: &str) -> bool {
+        matches!(field, "INP" | "OUT" | "TSEL" | "SDIS" | "FLNK")
     }
 
     /// A slotted link's new parse, made before the record's hold is taken —
@@ -1371,6 +1575,8 @@ mod link_cache {
             let crate::types::EpicsValue::String(text) = value else {
                 return None;
             };
+            // `fields` is what the record stores, so a `dbCommon` five in it
+            // is one the record holds and has a slot ([`LinkSlots::of`]).
             let desc = super::field_desc_in(fields, field)?;
             let ftype = slot_type(desc)?;
             let text = text.as_str_lossy();
@@ -1419,11 +1625,16 @@ mod link_cache {
     }
 
     impl LinkSlots {
-        /// Every link field `record`'s type declares that has a slot.
+        /// Every link field `record`'s type declares that has a slot, from
+        /// the table [`PreparedLink::for_put`] reads, so a put's parse always
+        /// has its slot.
         pub(super) fn of(record: &dyn crate::server::record::Record) -> Self {
-            let fields = crate::server::record::declared_field_table(record.record_type())
-                .unwrap_or(&[])
+            use crate::server::record::FieldDeclaration as _;
+            LazyLock::force(&SHARED);
+            let fields = record
+                .field_list()
                 .iter()
+                .filter(|d| !is_common_link(d.name) || record.implements_field(d.name))
                 .filter_map(|d| Some((d.name, slot_type(d)?)));
             let mut slots = LinkSlots::default();
             for (field, ftype) in fields {
@@ -1436,7 +1647,45 @@ mod link_cache {
                     text,
                 });
             }
+            if let Some(i) = slots.position("SIML").and_then(|i| u8::try_from(i).ok()) {
+                slots.1 = SimlLset {
+                    slot: i,
+                    const_lset: has_const_lset(&slots.0[usize::from(i)].parsed),
+                };
+            }
             slots
+        }
+
+        /// Slot `i` takes `parsed`: every write after the build comes here.
+        fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) {
+            if usize::from(self.1.slot) == i {
+                self.1.const_lset = has_const_lset(&parsed);
+            }
+            self.0[i].parsed = parsed;
+        }
+
+        #[inline(always)]
+        pub(super) fn siml_has_const_lset(&self) -> bool {
+            self.1.const_lset
+        }
+
+        /// Parse `text` into slot `i`, for a link whose text lives in the
+        /// instance's override store (`mca`'s SIML/SIOL): only the load
+        /// writes one, since every such field is `SPC_NOMOD`.
+        pub(super) fn install_text(
+            &mut self,
+            i: usize,
+            desc: &crate::server::record::FieldDesc,
+            text: &str,
+        ) {
+            let Some(ftype) = slot_type(desc) else {
+                return;
+            };
+            self.set(i, parse(text, ftype));
+            #[cfg(debug_assertions)]
+            {
+                self.0[i].text = text.to_owned();
+            }
         }
 
         /// Move `link` into its slot; the parse was made outside the hold.
@@ -1445,11 +1694,10 @@ mod link_cache {
                 debug_assert!(false, "{}: PreparedLink without a slot", link.field);
                 return;
             };
-            let slot = &mut self.0[i];
-            slot.parsed = link.parsed;
+            self.set(i, link.parsed);
             #[cfg(debug_assertions)]
             {
-                slot.text = link.text;
+                self.0[i].text = link.text;
             }
         }
 
@@ -1465,6 +1713,19 @@ mod link_cache {
 
         pub(super) fn at(&self, i: usize) -> &Arc<ParsedLink> {
             &self.0[i].parsed
+        }
+
+        /// C `dbRemoveLink` on slot `i`.
+        pub(super) fn remove(&mut self, i: usize) {
+            self.set(i, removed(&self.0[i].parsed));
+        }
+
+        pub(super) fn is_removed(&self, i: usize) -> bool {
+            matches!(*self.0[i].parsed, ParsedLink::Removed(_))
+        }
+
+        pub(super) fn field(&self, i: usize) -> &'static str {
+            self.0[i].field
         }
 
         /// `fields`' slots, `None` unless every one has a slot.
@@ -1488,7 +1749,7 @@ mod link_cache {
 
         /// What a field with no slot reads as: no link.
         pub(super) fn none() -> &'static Arc<ParsedLink> {
-            &NONE
+            &SHARED[NONE]
         }
 
         #[cfg(debug_assertions)]
@@ -1515,21 +1776,24 @@ mod link_cache {
     }
 
     /// A single link field the process cycle reads by a name its type fixes:
-    /// the closed-loop and pre-input `DOL`, sel's `NVL`, aSub's `SUBL`.
+    /// the closed-loop and pre-input `DOL`, sel's `NVL`, aSub's `SUBL`, and
+    /// the SIM block's `SIML` and `SIOL`.
     #[derive(Debug, Clone, Copy)]
     pub(crate) enum CycleLink {
         Dol,
         Nvl,
         Subl,
+        Siml,
+        Siol,
     }
 
     impl CycleLink {
-        const FIELDS: [&'static str; 3] = ["DOL", "NVL", "SUBL"];
+        const FIELDS: [&'static str; 5] = ["DOL", "NVL", "SUBL", "SIML", "SIOL"];
     }
 
     /// [`LinkSlots`] index of each [`CycleLink`], `u8::MAX` for none.
     #[derive(Debug, Clone, Copy)]
-    pub(crate) struct CycleLinkSlots([u8; 3]);
+    pub(crate) struct CycleLinkSlots([u8; 5]);
 
     #[cfg(test)]
     mod tests {
@@ -1547,12 +1811,32 @@ mod link_cache {
                         text: String::new(),
                     })
                     .into(),
+                SimlLset::default(),
             );
             assert_eq!(slots.position("ABCDEFGH1"), Some(0));
             assert_eq!(slots.position("ABCDEFGH2"), Some(1));
             assert_eq!(slots.position("OUT"), Some(2));
             assert_eq!(slots.position("OUTA"), None);
             assert_eq!(slots.position("ABCDEFGH"), None);
+        }
+
+        /// The SIML gate follows every slot write: a DB link is read, a
+        /// removed one too (its read fails `S_db_noLSET`), an empty one not.
+        #[test]
+        fn the_siml_lset_flag_follows_every_slot_write() {
+            use crate::server::record::{FieldDeclaration as _, Record as _};
+            let mut ai = crate::server::records::ai::AiRecord::new(0.0);
+            ai.put_field("SIML", crate::types::EpicsValue::String("SRC".into()))
+                .unwrap();
+            let mut slots = LinkSlots::of(&ai);
+            assert!(!slots.siml_has_const_lset());
+            let i = slots.position("SIML").unwrap();
+            slots.remove(i);
+            assert!(!slots.siml_has_const_lset());
+            let desc = super::super::field_desc_in(ai.field_list(), "SIML").unwrap();
+            slots.install_text(i, desc, "");
+            assert!(slots.siml_has_const_lset());
+            assert!(LinkSlots::default().siml_has_const_lset(), "no SIML");
         }
 
         #[test]
@@ -1567,6 +1851,7 @@ mod link_cache {
                         text: String::new(),
                     })
                     .into(),
+                SimlLset::default(),
             );
             let cycle = slots.cycle_slots();
             assert_eq!(LinkSlots::cycle_slot(cycle, CycleLink::Dol), Some(1));
@@ -1578,7 +1863,8 @@ mod link_cache {
 
 pub use link_cache::LinkCache;
 pub(crate) use link_cache::{
-    CycleLink, CycleLinkSlots, LinkRow, LinkSlots, PreparedCommonLink, PreparedLink, PreparedLinks,
+    CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, PreparedCommonLink, PreparedLink,
+    PreparedLinks,
 };
 
 /// How one process cycle of one record instance runs, resolved from the
@@ -1885,9 +2171,28 @@ pub struct RecordCell {
     /// answer is the record's own, and the owed-ness cannot name a record
     /// that does not exist.
     init_owed: std::sync::atomic::AtomicBool,
+    /// Bit `i`: the `i`th [`FieldDesc::runtime_typed`] field of `rdes.fields`
+    /// is served as `DBF_STRING` (`cvt_dbaddr` from `FTVL`, `FTA`...). Those
+    /// selectors are `SPC_NOMOD`, so the fact is settled where they can still
+    /// move ([`Self::settle_string_typed`]) and read with no lock.
+    string_typed: std::sync::atomic::AtomicU64,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
+
+/// [`RecordCell::string_typed`] of `inst`.
+fn string_typed_mask(inst: &RecordInstance) -> u64 {
+    use crate::types::DbfCode;
+    let runtime_typed = inst.record.field_list().iter().filter(|f| f.runtime_typed);
+    runtime_typed.enumerate().fold(0, |mask, (i, f)| {
+        debug_assert!(i < 64, "{} has over 64 runtime-typed fields", f.name);
+        let value = inst.resolve_field(f.name);
+        match crate::server::database::char_view::field_addr_types(f, value.as_ref()).0 {
+            DbfCode::String => mask | 1 << i,
+            _ => mask,
+        }
+    })
+}
 
 /// A record type's declaration, C's `dbRecordType` behind `precord->rdes`:
 /// the two static tables a field name is resolved against.
@@ -1895,6 +2200,8 @@ const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
 pub(crate) struct RecordDesc {
     pub(crate) record_type: &'static str,
     pub(crate) fields: &'static [FieldDesc],
+    /// [`Record::noaccess_names`].
+    noaccess: &'static [&'static str],
     /// [`Record::primary_field`] and [`Record::process_passive_fields`].
     primary_field: &'static str,
     pp_fields: &'static [&'static str],
@@ -1905,6 +2212,7 @@ impl RecordDesc {
         RecordDesc {
             record_type: record.record_type(),
             fields: record.field_list(),
+            noaccess: record.noaccess_names(),
             primary_field: record.primary_field(),
             pp_fields: record.process_passive_fields(),
         }
@@ -2193,6 +2501,7 @@ impl RecordCell {
             ),
             load_order,
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
+            string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -2216,6 +2525,36 @@ impl RecordCell {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
+    /// Re-read [`Self::string_typed`] from `inst`, this cell's record, after a
+    /// load or an `init_record` that may have moved a type selector.
+    pub(crate) fn settle_string_typed(&self, inst: &RecordInstance) {
+        self.string_typed.store(
+            string_typed_mask(inst),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// C `dbChannelCreate`'s `$` test (`dbChannel.c:486-503`) on the type
+    /// `cvt_dbaddr` leaves (`dbEntryToAddr`, `dbAccess.c:642-648`): a
+    /// `DBF_STRING` or a link field.
+    pub(crate) fn takes_string_view(&self, desc: &FieldDesc) -> bool {
+        use crate::types::DbfCode;
+        if crate::types::link_class_of(desc).is_some() {
+            return true;
+        }
+        if !desc.runtime_typed {
+            return crate::server::database::char_view::field_addr_types(desc, None).0
+                == DbfCode::String;
+        }
+        let mask = self.string_typed.load(std::sync::atomic::Ordering::Relaxed);
+        self.rdes
+            .fields
+            .iter()
+            .filter(|f| f.runtime_typed)
+            .position(|f| f.name == desc.name)
+            .is_some_and(|i| mask >> i & 1 == 1)
+    }
+
     /// The type-static answers this cycle may test instead of re-asking the
     /// record under a lock.
     pub(crate) fn process_plan(&self) -> &ProcessPlan {
@@ -2225,6 +2564,27 @@ impl RecordCell {
     /// The record type's declaration — C `precord->rdes`.
     pub(crate) fn rdes(&self) -> &RecordDesc {
         &self.rdes
+    }
+
+    /// C `dbFindFieldPart`'s answer for `field`: a name the type's `.dbd`
+    /// declares, `DBF_NOACCESS` ones included, matched with `strncmp`
+    /// (`dbStaticLib.c:1822`). A fact of the type, so it takes no lock.
+    ///
+    /// A type with no field table (a programmatic record no `.dbd` declares)
+    /// has only the spelling to compare against.
+    pub(crate) fn declares_name(&self, field: &str) -> bool {
+        let rdes = &self.rdes;
+        if rdes.fields.is_empty() {
+            return crate::server::database::filters::parser::spells_a_field(field);
+        }
+        declares_field(rdes.record_type, field)
+            || rdes
+                .fields
+                .iter()
+                .chain(super::dbd_generated::DB_COMMON_FIELDS)
+                .any(|f| f.name == field)
+            || is_dbcommon_noaccess(field)
+            || rdes.noaccess.contains(&field)
     }
 
     /// [`FieldDesc::long_string`] of `field`, without taking the lock set.
@@ -2843,7 +3203,7 @@ impl ParsedInputLink {
     }
 }
 
-/// Which of the SIM block's two links [`RecordInstance::sim_link_parse`] serves.
+/// Which of the SIM block's two links [`RecordInstance::sim_link`] serves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SimLink {
     Siml,
@@ -2851,30 +3211,10 @@ pub(crate) enum SimLink {
 }
 
 impl SimLink {
-    fn field(self) -> &'static str {
+    fn cycle_link(self) -> CycleLink {
         match self {
-            SimLink::Siml => "SIML",
-            SimLink::Siol => "SIOL",
-        }
-    }
-}
-
-/// The parse of one SIM-block link (`SIML` / `SIOL`) — C's `DBLINK` as
-/// `dbInitLink` left it. `invalidate_plan_for` empties the slot on a put of
-/// the field and [`RecordInstance::sim_link_parse`] refills it, so the cycle
-/// pays a slot test; `text` is what the parse was made from, for the debug
-/// check that no put bypassed the funnel.
-pub(crate) struct SimLinkParse {
-    text: String,
-    parsed: Arc<ParsedLink>,
-}
-
-impl SimLinkParse {
-    /// The parse of `text` for `ftype`, shared.
-    fn fresh(text: &str, ftype: LinkFieldType) -> Self {
-        SimLinkParse {
-            text: text.to_owned(),
-            parsed: Arc::new(parse_link_field(text, ftype)),
+            SimLink::Siml => CycleLink::Siml,
+            SimLink::Siol => CycleLink::Siol,
         }
     }
 }
@@ -2939,16 +3279,10 @@ pub struct RecordInstance {
     /// holds for every entry by construction. C parses a link once at
     /// `dbInitLink`; the port parsed every set `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
-    /// The parse of SIML / SIOL for the text the record held at the last
-    /// simulated-mode check, validated against the current text on every
-    /// read by [`Self::sim_link_parse`], the one writer. `None` until a
-    /// SIMM-declaring record's first cycle; never set on any other type.
-    parsed_siml: Option<SimLinkParse>,
     /// SIMM as it stood before this cycle's SIML read (`rec_gbl_get_simm`), for
     /// an output's stamp, which C takes before `writeValue` reads SIML. `None`
     /// while no SIML read has run since the SIML was last put.
     pub(crate) simm_before_siml_read: Option<i16>,
-    parsed_siol: Option<SimLinkParse>,
     pub parsed_out: LinkCache,
     pub parsed_flnk: LinkCache,
     pub parsed_sdis: LinkCache,
@@ -2969,6 +3303,8 @@ pub struct RecordInstance {
     link_rows: (Option<LinkRow>, Option<LinkRow>),
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
+    /// C `prec->dpvt` for the soft dsets; see [`Dpvt`](crate::server::device_support::Dpvt).
+    pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
     /// The by-name function registry this record's PENDING `init_record` pass
@@ -3868,13 +4204,8 @@ impl RecordInstance {
             && self.common.dtyp.is_soft()
             && self.common.sscn.is_unset()
             && crate::server::recgbl::simm::is_constant(self.parsed_sdis.link())
-            && plan.simm.is_some_and(|simm| {
-                crate::server::recgbl::simm::is_constant(self.sim_link_parse(
-                    SimLink::Siml,
-                    simm.siml,
-                    LinkFieldType::In,
-                ))
-            });
+            && plan.simm.is_some()
+            && self.siml_has_const_lset();
         let reads_double = || match self.parsed_inp.link() {
             ParsedLink::Db(db)
                 if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive
@@ -3894,7 +4225,9 @@ impl RecordInstance {
             }
             _ => false,
         };
-        let arm = if !plain {
+        // An `Async Soft Channel` INP is notified, not read: the general
+        // input stage owns that (`PvDatabase::async_soft_inp_stage`).
+        let arm = if !plain || self.inp_is_pn_link() {
             CyclePlan::General
         } else if !self.dset_reads_inp() {
             CyclePlan::ConstSoftIn
@@ -3962,15 +4295,8 @@ impl RecordInstance {
         ) {
             self.invalidate_plan();
         }
-        // The SIM-block parse is keyed on put, not on a per-cycle text
-        // compare: every write of the text is a funnel call.
-        match field {
-            "SIML" => {
-                self.parsed_siml = None;
-                self.simm_before_siml_read = None;
-            }
-            "SIOL" => self.parsed_siol = None,
-            _ => {}
+        if field == "SIML" {
+            self.simm_before_siml_read = None;
         }
     }
 
@@ -4126,94 +4452,22 @@ impl RecordInstance {
         }
     }
 
-    /// The parse of SIM-block link `which` (`SIML` or `SIOL`): the cached
-    /// one while the slot is full, a fresh parse of the text the record holds
-    /// when a put (`invalidate_plan_for`) emptied it. C parses the link at
-    /// `dbInitLink` and again on each put of the field, same text or not.
-    ///
-    /// `desc` is the field's declaration from the type's `SimmBlock`, for
-    /// the owned fallback: a type that lends the text through
-    /// [`Record::link_text_ref`] is read without a copy, one that does not
-    /// (`mca`, whose SIML/SIOL live in the instance's override store) is read
-    /// through [`Self::resolve_field_stored_at`]. `ftype` is the link's
-    /// direction — SIOL is `DBF_INLINK` on an input type and `DBF_OUTLINK`
-    /// on an output one, and the modifier mask follows it.
+    /// `has_const_lset` of [`Self::sim_link`]`(Siml)` without the slot
+    /// lookup: the steady cycle's SIML gate.
     #[inline(always)]
-    pub(crate) fn sim_link_parse(
-        &mut self,
-        which: SimLink,
-        desc: Option<&'static FieldDesc>,
-        ftype: LinkFieldType,
-    ) -> &Arc<ParsedLink> {
-        // The steady cycle: the slot holds the parse of the text last put
-        // (`invalidate_plan_for` empties it on a SIML/SIOL put).
-        if self.sim_slot_ref(which).is_none() {
-            self.sim_link_refresh(which, desc, ftype);
-        }
-        #[cfg(debug_assertions)]
-        if let Some(entry) = self.sim_slot_ref(which) {
-            let stored;
-            let text: &str = match self.record.link_text_ref(which.field()) {
-                Some(text) => text,
-                // A type that lends no text (`mca`) keeps it in the override
-                // store; the same chain `sim_link_refresh` reads.
-                None => {
-                    stored = match self.resolve_field_stored_at(which.field(), desc) {
-                        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                        _ => String::new(),
-                    };
-                    &stored
-                }
-            };
-            debug_assert_eq!(
-                entry.text,
-                text,
-                "{}.{}: link text changed without a funnel put",
-                self.name,
-                which.field()
-            );
-        }
-        match self.sim_slot_ref(which) {
-            Some(entry) => &entry.parsed,
-            None => unreachable!("sim_link_refresh fills the slot"),
-        }
+    pub(crate) fn siml_has_const_lset(&self) -> bool {
+        self.link_slots.siml_has_const_lset()
     }
 
+    /// SIM-block link `which` (`SIML` or `SIOL`) as its slot holds it: the
+    /// parse made at load and on each put, which C makes at `dbInitLink` and
+    /// on each put of the field, and [`ParsedLink::Removed`] once a refused
+    /// put removed it. The slot's type is the field's, so SIOL carries the
+    /// `DBF_INLINK` mask on an input type and the `DBF_OUTLINK` one on an
+    /// output type.
     #[inline(always)]
-    fn sim_slot_ref(&self, which: SimLink) -> &Option<SimLinkParse> {
-        match which {
-            SimLink::Siml => &self.parsed_siml,
-            SimLink::Siol => &self.parsed_siol,
-        }
-    }
-
-    /// The miss path of [`Self::sim_link_parse`]: read the text and parse it.
-    #[inline(never)]
-    fn sim_link_refresh(
-        &mut self,
-        which: SimLink,
-        desc: Option<&'static FieldDesc>,
-        ftype: LinkFieldType,
-    ) {
-        let field = which.field();
-        let owned;
-        let text: &str = match self.record.link_text_ref(field) {
-            Some(text) => text,
-            None => {
-                owned = match self.resolve_field_stored_at(field, desc) {
-                    Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                    _ => String::new(),
-                };
-                &owned
-            }
-        };
-        let slot = match which {
-            SimLink::Siml => &mut self.parsed_siml,
-            SimLink::Siol => &mut self.parsed_siol,
-        };
-        if !slot.as_ref().is_some_and(|entry| entry.text == text) {
-            *slot = Some(SimLinkParse::fresh(text, ftype));
-        }
+    pub(crate) fn sim_link(&self, which: SimLink) -> &Arc<ParsedLink> {
+        self.cycle_link(which.cycle_link())
     }
 
     /// Whether `field` is a link with a slot — the load's check that a
@@ -4226,8 +4480,8 @@ impl RecordInstance {
     /// [`LinkSlots`], made at load and on each put, so a cycle borrows it
     /// under the read lock and does no parse. A DB link's target address is
     /// the parse's own ([`PvDatabase::db_link_addr`]), so a cycle reading
-    /// through this does no name work. Not for the `dbCommon` links, which
-    /// have their [`LinkCache`]s.
+    /// through this does no name work. Not for a `dbCommon` link the record
+    /// leaves to the framework, which has its [`LinkCache`].
     ///
     /// [`PvDatabase::db_link_addr`]: crate::server::database::PvDatabase
     #[inline]
@@ -4264,6 +4518,26 @@ impl RecordInstance {
             self.name
         );
         self.link_slots.at(i)
+    }
+
+    /// The link the record holds in its own link field `field`: the slot, or
+    /// the `dbCommon` link's [`LinkCache`]; `None` for a field that is not
+    /// one of the record's links. A cycle or put path that acts on the
+    /// record's own link reads it here and never re-parses the text, which
+    /// a removed link keeps ([`ParsedLink::Removed`]).
+    pub(crate) fn stored_link(&self, field: &str) -> Option<&ParsedLink> {
+        if let Some(link) = self.declared_record_link(field) {
+            return Some(link);
+        }
+        let cache = match field {
+            "INP" => &self.parsed_inp,
+            "OUT" => &self.parsed_out,
+            "TSEL" => &self.parsed_tsel,
+            "SDIS" => &self.parsed_sdis,
+            "FLNK" => &self.parsed_flnk,
+            _ => return None,
+        };
+        Some(cache.link())
     }
 
     /// [`Self::record_link`] for a field the type may not declare: `None`
@@ -4307,9 +4581,23 @@ impl RecordInstance {
     /// a parse, a `Vec` entry — can be built before the answer is known. Each
     /// of the six link reads this replaced did build something first and throw
     /// it away.
+    ///
+    /// A link the record leaves to the framework (`mca`'s SIML/SIOL) keeps
+    /// its text in the override store, read here after the record.
     #[inline]
     pub(crate) fn link_text(&self, field: &str) -> Option<String> {
-        link_text_of(&*self.record, field)
+        link_text_of(&*self.record, field).or_else(|| self.override_link_text(field))
+    }
+
+    #[cold]
+    fn override_link_text(&self, field: &str) -> Option<String> {
+        if self.declared_overrides.is_empty() {
+            return None;
+        }
+        match self.declared_overrides.get(field)? {
+            EpicsValue::String(text) if !text.is_empty() => Some(text.as_str_lossy().into_owned()),
+            _ => None,
+        }
     }
 
     /// Whether link field `field` holds a text — [`Self::link_text`] without
@@ -4411,15 +4699,14 @@ impl RecordInstance {
             parsed_sdis: LinkCache::none(),
             parsed_tsel: LinkCache::none(),
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
-            parsed_siml: None,
             simm_before_siml_read: None,
-            parsed_siol: None,
             link_slots,
             cycle_links,
             dol_mode,
             selm,
             link_rows,
             device: None,
+            dpvt: Default::default(),
             subroutine: None,
             init_subroutines: None,
             dset_init: crate::server::device_support::DsetInit::Succeeded,
@@ -4563,7 +4850,7 @@ impl RecordInstance {
         // C `iocInit.c::doInitRecord0` binds `prec->dset` for every record
         // (`:529`), including one whose `init_record` returns S_dev_noDSET
         // below; an unbound class would still follow a later DTYP put.
-        self.common.dtyp.bind();
+        self.common.dtyp.bind(self.record.record_type());
         // C `<rec>Record.c::init_record`'s FIRST statement, for the 26 record
         // types that make it: `if (!pdset) { recGblRecordError(S_dev_noDSET,
         // …); return S_dev_noDSET; }` (`aiRecord.c:105-110`,
@@ -5085,6 +5372,13 @@ impl RecordInstance {
         self.pact.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// [`Record::set_process_continuation`], handed this instance's PACT.
+    #[inline(always)]
+    pub(crate) fn set_process_continuation(&mut self, continuation: bool) {
+        self.record
+            .set_process_continuation(continuation, crate::server::record::Pact::new(&self.pact));
+    }
+
     /// C `prec->pact = TRUE` — the record goes busy for an async device
     /// round-trip, an SDLY simulation defer, or an ODLY reprocess window.
     pub fn enter_pact(&self) {
@@ -5411,7 +5705,7 @@ impl RecordInstance {
         desc: Option<&'static FieldDesc>,
     ) -> Option<EpicsValue> {
         let value = self.resolve_field_stored_at(name, desc)?;
-        Some(Self::as_a_reader_sees(desc, value))
+        Some(self.as_a_reader_sees(desc, value))
     }
 
     /// [`Self::resolve_field`] without the reader's view — what the field
@@ -5488,18 +5782,55 @@ impl RecordInstance {
     /// The class is read off `desc`, the declaration the caller resolved the
     /// field with, so a string read pays no second scan for it.
     #[inline]
-    fn as_a_reader_sees(desc: Option<&'static FieldDesc>, value: EpicsValue) -> EpicsValue {
+    fn as_a_reader_sees(&self, desc: Option<&'static FieldDesc>, value: EpicsValue) -> EpicsValue {
         let EpicsValue::String(ref text) = value else {
             return value;
         };
-        let Some(class) = desc.and_then(crate::types::link_class_of) else {
+        let Some((class, desc)) = desc.and_then(|d| Some((crate::types::link_class_of(d)?, d)))
+        else {
             return value;
         };
-        EpicsValue::String(
-            render_link_field(class, text.as_str_lossy().as_ref())
-                .as_str()
-                .into(),
-        )
+        let text = text.as_str_lossy();
+        let rendered = match self.declared_record_link(desc.name).map(|l| &**l) {
+            Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, &text),
+            _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(&text),
+            _ => render_link_field(class, &text),
+        };
+        EpicsValue::String(rendered.as_str().into())
+    }
+
+    /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed: a
+    /// device link's failed put leaves the record with no dset
+    /// ([`Dtyp::is_detached`](crate::server::device_support::Dtyp::is_detached)),
+    /// and any other link is [`ParsedLink::Removed`] in its slot.
+    pub(crate) fn link_unadded(&self, field: &str) -> bool {
+        if self.is_device_link(field) {
+            return self.common.dtyp.is_detached();
+        }
+        self.link_slots
+            .position(field)
+            .is_some_and(|i| self.link_slots.is_removed(i))
+    }
+
+    /// The old dsxt's `del_record` on a device-link put (`dbAccess.c:1163`):
+    /// a SoftCallback devPvt is cancelled and freed
+    /// (`devAiSoftCallback.c:138-140`), so a pending completion re-entry of
+    /// this record goes with it. Any other `dpvt` stays until `:1192`'s
+    /// `dpvt = NULL`, which only a put that reaches `add_record` passes.
+    fn del_record(&mut self) -> crate::server::device_support::Dpvt {
+        if !self.inp_is_pn_link() {
+            return crate::server::device_support::Dpvt::Null;
+        }
+        self.reprocess_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::mem::take(&mut self.dpvt)
+    }
+
+    /// C's `PN_LINK`: a SoftCallback `add_record` that allocated its devPvt
+    /// re-typed INP and kept only the severity bits
+    /// (`devAiSoftCallback.c:114-115` and the input twins).
+    pub(crate) fn inp_is_pn_link(&self) -> bool {
+        self.dpvt.callback().is_some()
     }
 
     /// The value a field that is DECLARED by the `.dbd` but has no live store
@@ -5581,6 +5912,13 @@ impl RecordInstance {
 
     /// C `ellCount(&precord->rdes->devList) > 0`: the loaded `.dbd` set
     /// declares a `device()` for this type, statically or contributed.
+    /// C `pfldDes->isDevLink` on a record type with a device menu
+    /// (`dbAccess.c:1115`): a put to it goes through the device-link gates.
+    pub(crate) fn is_device_link(&self, field: &str) -> bool {
+        (field.eq_ignore_ascii_case("INP") || field.eq_ignore_ascii_case("OUT"))
+            && self.has_device_list()
+    }
+
     fn has_device_list(&self) -> bool {
         let record_type = self.record.record_type();
         super::dbd_generated::device_menu(record_type).is_some()
@@ -6885,8 +7223,12 @@ impl RecordInstance {
         bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
         let mut link = PreparedCommonLink::for_put(&self.name, name, &value);
-        if let Some(link) = &link {
+        if let Some(link) = &mut link {
             self.check_link_assignment(link.field, &link.text, bound)?;
+            // The database's put bodies run the gate under their own hold.
+            if matches!(bound, MenuBound::DbPut) {
+                self.gate_device_link_put(link)?;
+            }
         }
         self.put_common_field_with(name, value, bound, &mut link)
     }
@@ -6913,33 +7255,191 @@ impl RecordInstance {
         self.put_common_field_with(name, value, MenuBound::DbLoad, link)
     }
 
-    /// C `dbPutFieldLink`'s `isDevLink` arm (`dbAccess.c:1127,1191-1193`): a
-    /// runtime INP/OUT put re-takes `dset` from the CURRENT DTYP, so a DTYP put
-    /// made after init takes effect only once the device link is written. The
-    /// loader's puts are bound at init instead (`dbInitRecord`).
-    fn rebind_device_link(&mut self, bound: MenuBound) {
-        if matches!(bound, MenuBound::DbPut) && self.has_device_list() {
-            self.common.dtyp.rebind();
+    /// C `dbPutFieldLink`'s `isDevLink` arm (`dbAccess.c:1127-1131`,
+    /// `:1183-1201`): a runtime INP/OUT put re-takes `dset` from the CURRENT
+    /// DTYP once `dbPutSpecial(paddr, 1)` has passed, so a DTYP put made after
+    /// init takes effect only once the device link is written, and the device
+    /// private starts over. The loader's puts are bound at init instead
+    /// (`dbInitRecord`).
+    ///
+    /// The new object was built and asked `add_record` before the hold; here
+    /// it only moves onto the record, and the one it replaces leaves with
+    /// `link` to be dropped after the hold. A failed `special` or a refused
+    /// `add_record` leaves the record with no dset and PACT set
+    /// (`:1185-1186`, `:1198-1199`), so every process entry takes the
+    /// active-record refusal (`count_refused_active_entry`) until a
+    /// device-link put binds again. Otherwise `dpvt = NULL` (`:1192`) and
+    /// `pact = FALSE` (`:1194`) whoever set PACT: the put owns it here, and a
+    /// pending continuation finds it released and runs a fresh cycle, as C's
+    /// delayed `process()` does.
+    ///
+    /// `special` is the after-store pass's answer, carried through on success.
+    fn rebind_device_link<R>(
+        &mut self,
+        bound: MenuBound,
+        link: &mut PreparedCommonLink,
+        special: CaResult<R>,
+    ) -> CaResult<R> {
+        if !matches!(bound, MenuBound::DbPut) || !self.has_device_list() {
+            return special;
+        }
+        let Some(prepared) = link.device.as_mut() else {
+            return special;
+        };
+        self.common.dtyp.rebind(self.record.record_type());
+        let reaches_add_record = special.is_ok();
+        // What is not installed stays in `prepared` and is freed with it,
+        // after the hold.
+        let rebound = match special {
+            Err(e) => Err(e),
+            Ok(passed) => match std::mem::replace(&mut prepared.dset, NewDset::Keep) {
+                NewDset::Refused(refusal) => Err(CaError::BadLink(refusal)),
+                NewDset::Keep => Ok(passed),
+                NewDset::SoftRefused(refusal) => {
+                    let e = CaError::BadLink(crate::error::LinkRefusal::add_record(refusal.dset()));
+                    link.add_record_refusal = Some(refusal);
+                    Err(e)
+                }
+                NewDset::Absent => {
+                    prepared.retired = self.device.take();
+                    Ok(passed)
+                }
+                NewDset::Bound(dev) => {
+                    prepared.retired = self.device.replace(dev);
+                    Ok(passed)
+                }
+            },
+        };
+        prepared.retired_dpvt = self.del_record();
+        // C `dpvt = NULL` (`:1192`) precedes `add_record`, so a refused one
+        // leaves it NULL too; `del_record` took any devPvt that owns memory.
+        if reaches_add_record {
+            self.dpvt = std::mem::take(&mut prepared.dpvt);
+        }
+        let passed = match rebound {
+            Ok(passed) => passed,
+            Err(e) => {
+                self.refuse_device_link_put(prepared, reaches_add_record);
+                return Err(e);
+            }
+        };
+        // C restarts a queued put-notify at a cycle's completion, not at this
+        // store, so the token has no tail to reach.
+        let _ = self.leave_pact();
+        Ok(passed)
+    }
+
+    /// [`Self::rebind_device_link`] for a `dbPutField` of a device link the
+    /// record stores itself (epid INP, scaler OUT), after its
+    /// `special(_, true)`; a `dbCommon` INP/OUT rebinds in
+    /// [`Self::put_common_field_prepared`].
+    pub(crate) fn rebind_declared_device_link<R>(
+        &mut self,
+        link: &mut Option<PreparedCommonLink>,
+        special: CaResult<R>,
+    ) -> CaResult<R> {
+        match link {
+            Some(link) => self.rebind_device_link(MenuBound::DbPut, link, special),
+            None => special,
         }
     }
 
     /// C `dbPutFieldLink`'s refusal (`dbAccess.c:1149-1153`) of a runtime
-    /// INP/OUT put whose DTYP names a device with no extension table
-    /// (`dsxt`): `S_db_noSupport` before the link moves, so INP and the bound
-    /// dset stay. A `CONSTANT` device has `devSoft_DSXT` (`dbInitDevSup`);
-    /// the other base devices that have one are the `devExtend` callers. A
-    /// device no vendored `.dbd` declares is not judged
-    /// ([`declared_link_type`](super::declared_link_type)).
-    fn refuse_unextended_device_link(&self, field: &str, bound: MenuBound) -> CaResult<()> {
-        if !matches!(bound, MenuBound::DbPut) || !self.has_device_list() {
-            return Ok(());
+    /// device-link put whose DTYP names a device with no extension table
+    /// (`dsxt`): `S_db_noSupport`, silent, before the link moves, so the link
+    /// and the bound dset stay. Run ahead of the store whichever writer owns
+    /// the field: scaler keeps OUT itself. The devSup row answers it
+    /// ([`DevSup::has_dsxt`]), whichever crate registered it. A DTYP with no
+    /// row, which only a dynamic device support can bind and C cannot
+    /// express, is not judged.
+    ///
+    /// It is also where a put whose DTYP moved after its dset was prepared
+    /// is refused, before anything moves: the put entry has already rebuilt
+    /// once ([`PreparedCommonLink::device_dtyp_moved`]). Past both, the bound
+    /// object's `del_record` may still keep the link
+    /// ([`crate::server::device_support::DeviceSupport::del_record`]); C's `restoreScan` then leaves the
+    /// record as it found it.
+    pub(crate) fn gate_device_link_put(&mut self, link: &PreparedCommonLink) -> CaResult<()> {
+        if link.device_dtyp_moved(self) {
+            return Err(CaError::NoSupport);
         }
-        let dtyp = self.common.dtyp.as_str();
-        match super::declared_link_type(self.record.record_type(), Some(dtyp), field) {
-            Some(super::DbLinkType::Constant) | None => Ok(()),
-            Some(_) if matches!(dtyp, "Soft Timestamp" | "stdio" | "Db State" | "getenv") => Ok(()),
-            Some(_) => Err(CaError::NoSupport),
+        if super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str())
+            .is_some_and(|row| !row.has_dsxt())
+        {
+            return Err(CaError::NoSupport);
         }
+        match self.device.as_mut() {
+            Some(dev) => dev.del_record().map_err(CaError::BadLink),
+            None => Ok(()),
+        }
+    }
+
+    /// A device-link put refused by `dbPutSpecial`'s SPC_NOMOD, which C
+    /// reaches only after `dbRemoveLink` (`dbAccess.c:1167-1168`): the text
+    /// stays but the link is gone, and the record leaves with no dset and
+    /// PACT set (`:1183-1188`), as [`Self::rebind_device_link`]'s failure arm
+    /// does.
+    pub(crate) fn detach_device_link(&mut self, link: &mut PreparedCommonLink) {
+        if let Some(prepared) = link.device.as_mut() {
+            prepared.retired_dpvt = self.del_record();
+            self.refuse_device_link_put(prepared, false);
+        }
+    }
+
+    /// Every failure arm of C `dbPutFieldLink` past `dbRemoveLink`
+    /// (`dbAccess.c:1183-1186`, `:1196-1199`): the record keeps no dset, which
+    /// is also what says the link stays unadded, sets PACT, and `dpvt` is the
+    /// caller's. A
+    /// device object stands for its dpvt too, so it goes only once
+    /// `add_record` was reached (`:1192`); before that it stays as
+    /// `del_record` left it. An I/O Intr record stays where the put's `scanDelete` left it,
+    /// Passive (`:1155-1158`, posted at `:1231-1232`); only the success arm
+    /// restores it. The put's settle re-files its scan index.
+    fn refuse_device_link_put(
+        &mut self,
+        prepared: &mut link_cache::PreparedDevice,
+        add_record_ran: bool,
+    ) {
+        if add_record_ran {
+            prepared.retired = self.device.take();
+        }
+        self.common.dtyp.detach();
+        self.enter_pact();
+        if self.common.scan == ScanType::IoIntr {
+            let _ = self.set_scan(ScanType::Passive);
+            use crate::server::recgbl::EventMask;
+            self.notify_field("SCAN", EventMask::VALUE | EventMask::LOG);
+        }
+    }
+
+    /// C `dbPutFieldLink` on a link field that is not a device link
+    /// (`dbAccess.c:1168-1174`): `Some(slot)` for a field with a link slot,
+    /// and a link an earlier refused put removed fails `dbLinkIsDefined`
+    /// with `S_db_badHWaddr`, silently.
+    pub(crate) fn link_put_slot(&self, field: &str) -> CaResult<Option<usize>> {
+        let Some(i) = self.link_slots.position(field) else {
+            return Ok(None);
+        };
+        if self.link_slots.is_removed(i) {
+            return Err(CaError::BadLink(crate::error::LinkRefusal::new(
+                crate::error::LinkWhy::NotDefined(self.link_slots.field(i)),
+            )));
+        }
+        Ok(Some(i))
+    }
+
+    /// C `dbRemoveLink` on [`Self::link_put_slot`]'s slot: run before
+    /// `dbPutSpecial(paddr, 0)` refuses an `SPC_NOMOD` field, and the error
+    /// path does not restore it, so aSub's SUBL reads nothing afterwards.
+    pub(crate) fn remove_link_slot(&mut self, i: usize) {
+        self.invalidate_plan_for(self.link_slots.field(i));
+        self.link_slots.remove(i);
+    }
+
+    /// The link puts whose `SPC_NOMOD` refusal waits for the hold: a device
+    /// link's and [`Self::link_put_slot`]'s.
+    pub(crate) fn refuses_link_put_under_hold(&self, field: &str) -> bool {
+        self.is_device_link(field) || self.link_slots.position(field).is_some()
     }
 
     fn put_common_field_with(
@@ -7127,28 +7627,14 @@ impl RecordInstance {
                     return Err(CaError::FieldNotFound("INP".to_string()));
                 }
                 if let Some(link) = link {
-                    self.refuse_unextended_device_link("INP", bound)?;
                     std::mem::swap(&mut self.common.inp, &mut link.text);
                     if !self.record_declares_field("INP") {
                         self.swap_link_cache("INP", &mut link.parsed);
-                    }
-                    self.rebind_device_link(bound);
-                    // `new_dsxt->add_record(precord)` (`dbAccess.c:1196`), on
-                    // the input the caller prepared before the hold.
-                    if matches!(bound, MenuBound::DbPut)
-                        && let Some(input) = link.add_record.take()
-                    {
-                        link.add_record_refusal =
-                            crate::server::builtin_devices::soft_callback::add_record(
-                                self,
-                                Some(input),
-                            );
                     }
                 }
             }
             "OUT" => {
                 if let Some(link) = link {
-                    self.refuse_unextended_device_link("OUT", bound)?;
                     std::mem::swap(&mut self.common.out, &mut link.text);
                     // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
                     // link processes its target only on an explicit
@@ -7158,7 +7644,6 @@ impl RecordInstance {
                     if !self.record_declares_field("OUT") {
                         self.swap_link_cache("OUT", &mut link.parsed);
                     }
-                    self.rebind_device_link(bound);
                     // `special(OUT, true)` (longout's OOCH hook among them)
                     // is the tail's, once the link has moved.
                 }
@@ -7181,11 +7666,18 @@ impl RecordInstance {
             // name (asyn's "asynInt32", scaler-rs's "Asyn Scaler") back to
             // NoChange, leaving DTYP unset after a valid put.
             "DTYP" => match value {
-                EpicsValue::String(s) => self.common.dtyp.set_name(s.as_str_lossy()),
+                EpicsValue::String(s) => {
+                    let text = s.as_str_lossy();
+                    match super::device_menu_choices(self.record.record_type())
+                        .find(|choice| *choice == text)
+                    {
+                        Some(choice) => self.common.dtyp.set_menu_name(choice),
+                        None => self.common.dtyp.set_name(text),
+                    }
+                }
                 EpicsValue::Enum(i) => {
-                    let merged = super::merged_device_menu(self.record.record_type());
-                    match merged.get(i as usize) {
-                        Some(name) => self.common.dtyp.set_name(*name),
+                    match super::device_menu_choices(self.record.record_type()).nth(i as usize) {
+                        Some(choice) => self.common.dtyp.set_menu_name(choice),
                         None => return Ok(CommonFieldPutResult::NoChange),
                     }
                 }
@@ -7453,7 +7945,13 @@ impl RecordInstance {
         // `dbPutSpecial(paddr, 1)` status to the caller — the stored value
         // stays, but the monitor post and the process are skipped and the
         // client sees the failure. Never drop it.
-        self.record.special(&name, true)?;
+        let special = self.record.special(&name, true);
+        match link {
+            Some(link) if matches!(&*name, "INP" | "OUT") => {
+                self.rebind_device_link(bound, link, special)?
+            }
+            _ => special?,
+        }
         Ok(CommonFieldPutResult::NoChange)
     }
 
@@ -7565,6 +8063,14 @@ impl RecordInstance {
         let target = desc.dbf_type;
         match crate::server::record::coerce_put_value(self.record.as_ref(), name, target, value)? {
             Converted::Stored(coerced) => {
+                // A link the record leaves to the framework keeps its text
+                // here and its parse in its slot, like any other.
+                if let (Some(i), EpicsValue::String(text)) =
+                    (self.link_slots.position(desc.name), &coerced)
+                {
+                    self.link_slots
+                        .install_text(i, desc, text.as_str_lossy().as_ref());
+                }
                 self.declared_overrides
                     .insert(name.to_ascii_uppercase(), coerced);
             }
@@ -9984,6 +10490,15 @@ mod device_menu_marking_tests {
     use crate::server::records::calc::CalcRecord;
     use crate::server::records::mbbo::MbboRecord;
 
+    const fn test_row(choice: &'static str) -> crate::server::record::DevSup {
+        crate::server::record::DevSup {
+            name: choice,
+            choice,
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(5, &[], false),
+        }
+    }
+
     /// C `dbAccess.c:176-179`: a `DBF_DEVICE` field whose record type declares
     /// no device support has `pfldDes->ftPvt == NULL` and takes `goto nostrs`,
     /// which clears `DBR_ENUM_STRS` — the client is sent NO choice list.
@@ -10033,6 +10548,29 @@ mod device_menu_marking_tests {
         assert_eq!(inst.dtyp_index(), 0);
     }
 
+    /// A DTYP put runs under the record's hold, so a menu choice must land as
+    /// the menu's own pointer, whether it arrives as the index or the label.
+    #[test]
+    fn a_dtyp_put_stores_the_device_menu_choice() {
+        use crate::server::device_support::DtypName;
+        let mut inst = RecordInstance::new("X".into(), AiRecord::default());
+        let raw = super::super::device_menu_choices("ai")
+            .position(|c| c == "Raw Soft Channel")
+            .unwrap();
+        for value in [
+            EpicsValue::Enum(raw as u16),
+            EpicsValue::String("Raw Soft Channel".into()),
+        ] {
+            inst.common.dtyp.set_name("Soft Channel");
+            inst.put_common_field_prepared("DTYP", value, &mut None)
+                .unwrap();
+            assert!(matches!(
+                inst.common.dtyp.shared_name(),
+                DtypName::Menu("Raw Soft Channel")
+            ));
+        }
+    }
+
     #[test]
     fn a_record_without_its_dset_is_still_bound_iocinit_529() {
         let mut inst = RecordInstance::new("X".into(), AiRecord::default());
@@ -10053,13 +10591,8 @@ mod device_menu_marking_tests {
     #[test]
     fn a_registered_device_menu_merges_after_the_base_declared_choices() {
         // The list asyn's generated `dbd_generated::DEVICE_MENU_MBBO` carries.
-        static ASYN_MBBO: &[(&str, crate::server::record::DbLinkType)] = &[
-            ("asynInt32", crate::server::record::DbLinkType::Constant),
-            (
-                "asynUInt32Digital",
-                crate::server::record::DbLinkType::Constant,
-            ),
-        ];
+        static ASYN_MBBO: &[crate::server::record::DevSup] =
+            &[test_row("asynInt32"), test_row("asynUInt32Digital")];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
         let mut inst = RecordInstance::new("X".into(), MbboRecord::default());
@@ -10095,13 +10628,8 @@ mod device_menu_marking_tests {
     /// process.
     #[test]
     fn calc_stays_none_after_asyn_menus_are_registered() {
-        static ASYN_MBBO: &[(&str, crate::server::record::DbLinkType)] = &[
-            ("asynInt32", crate::server::record::DbLinkType::Constant),
-            (
-                "asynUInt32Digital",
-                crate::server::record::DbLinkType::Constant,
-            ),
-        ];
+        static ASYN_MBBO: &[crate::server::record::DevSup] =
+            &[test_row("asynInt32"), test_row("asynUInt32Digital")];
         super::super::register_device_menu("mbbo", ASYN_MBBO);
 
         let inst = RecordInstance::new("X".into(), CalcRecord::default());
@@ -11805,13 +12333,9 @@ mod metadata_cache_tests {
         );
     }
 
-    fn siol_desc(inst: &RecordInstance) -> Option<&'static FieldDesc> {
-        field_desc_of(&*inst.record, "SIOL")
-    }
-
     fn put_siol(inst: &mut RecordInstance, text: &str) {
         inst.put_merged_field("SIOL", EpicsValue::String(text.into()))
-            .expect("ai.SIOL put");
+            .expect("SIOL put");
     }
 
     fn db_link(parsed: &ParsedLink) -> &crate::server::record::DbLink {
@@ -11821,109 +12345,38 @@ mod metadata_cache_tests {
         }
     }
 
-    /// An unchanged SIOL text is served from the cache, not reparsed.
+    /// SIOL is read from its slot: the parse each put installs, the same
+    /// `Arc` between puts.
     #[test]
-    fn sim_link_parse_reuses_the_parse_for_unchanged_text() {
+    fn sim_link_reads_the_parse_each_put_installs() {
         let mut inst = ai_instance();
         put_siol(&mut inst, "SRC.VAL");
-        let desc = siol_desc(&inst);
-        let first = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        let second = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert!(Arc::ptr_eq(&first, &second));
+        let first = inst.sim_link(SimLink::Siol).clone();
+        assert!(Arc::ptr_eq(&first, inst.sim_link(SimLink::Siol)));
         assert_eq!(db_link(&first).pvname(), "SRC");
+        put_siol(&mut inst, "OTHER.VAL");
+        assert_eq!(db_link(inst.sim_link(SimLink::Siol)).pvname(), "OTHER");
     }
 
-    /// Each put of SIOL, same text or new, is parsed at the next read, as C
-    /// re-parses on every put; a read with no put between reuses the parse.
+    /// SIOL's CP survives as `DBF_INLINK` (ai) and is discarded as
+    /// `DBF_OUTLINK` (ao).
     #[test]
-    fn sim_link_parse_reparses_on_each_put_only() {
-        let mut inst = ai_instance();
-        put_siol(&mut inst, "SRC.VAL");
-        let desc = siol_desc(&inst);
-        let before = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        put_siol(&mut inst, "OTHER.VAL");
-        let changed = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert!(!Arc::ptr_eq(&before, &changed));
-        assert_eq!(db_link(&changed).pvname(), "OTHER");
-        put_siol(&mut inst, "OTHER.VAL");
-        let reput = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert!(!Arc::ptr_eq(&changed, &reput));
-        assert_eq!(db_link(&reput).pvname(), "OTHER");
-        let again = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert!(Arc::ptr_eq(&reput, &again));
-    }
-
-    /// SIOL's CP survives as `DBF_INLINK` and is discarded as `DBF_OUTLINK`.
-    #[test]
-    fn sim_link_parse_modifier_mask_follows_direction() {
+    fn sim_link_modifier_mask_follows_the_field_type() {
         let mut input = ai_instance();
         put_siol(&mut input, "OTHER.VAL CP");
-        let desc = siol_desc(&input);
-        let parsed = input
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
         assert_eq!(
-            db_link(&parsed).policy,
+            db_link(input.sim_link(SimLink::Siol)).policy,
             crate::server::record::LinkProcessPolicy::ChannelProcess
         );
-        let mut output = ai_instance();
+        let mut output = RecordInstance::new(
+            "AO".to_string(),
+            crate::server::records::ao::AoRecord::default(),
+        );
         put_siol(&mut output, "OTHER.VAL CP");
-        let parsed = output
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::Out)
-            .clone();
         assert_eq!(
-            db_link(&parsed).policy,
+            db_link(output.sim_link(SimLink::Siol)).policy,
             crate::server::record::LinkProcessPolicy::NoProcess
         );
-    }
-
-    /// A type that stores no SIOL (as `mca`) is read through the override
-    /// store, and its parse is cached like any other.
-    #[test]
-    fn sim_link_parse_reads_unmodeled_text_from_the_override_store() {
-        use crate::server::records::dfanout::DfanoutRecord;
-        let desc = siol_desc(&ai_instance());
-        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
-        assert!(inst.record.get_field("SIOL").is_none());
-        inst.declared_overrides
-            .insert("SIOL".into(), EpicsValue::String("OVR.VAL".into()));
-        let first = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert_eq!(db_link(&first).pvname(), "OVR");
-        let second = inst
-            .sim_link_parse(SimLink::Siol, desc, LinkFieldType::In)
-            .clone();
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    /// The debug check reads an override-store SIOL too: a text changed
-    /// behind the funnel is caught on a type that lends none.
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "link text changed without a funnel put")]
-    fn sim_link_parse_debug_check_covers_the_override_store() {
-        use crate::server::records::dfanout::DfanoutRecord;
-        let desc = siol_desc(&ai_instance());
-        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
-        inst.declared_overrides
-            .insert("SIOL".into(), EpicsValue::String("OVR.VAL".into()));
-        inst.sim_link_parse(SimLink::Siol, desc, LinkFieldType::In);
-        inst.declared_overrides
-            .insert("SIOL".into(), EpicsValue::String("OTHER.VAL".into()));
-        inst.sim_link_parse(SimLink::Siol, desc, LinkFieldType::In);
     }
 }
 

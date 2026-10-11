@@ -424,7 +424,8 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     .unwrap();
     out.push_str("#![allow(clippy::all)]\n\n");
     if !input.devices.is_empty() {
-        writeln!(out, "use {base}::server::record::DbLinkType;").unwrap();
+        writeln!(out, "use super::dsets;").unwrap();
+        writeln!(out, "use {base}::server::record::{{DbLinkType, DevSup}};").unwrap();
     }
     // `Asl`, `Special`, `DbFieldType` and `DbfCode` appear ONLY in an emitted `FieldDesc`
     // literal, so a target with no record fields (asyn declares only `device()`
@@ -1005,51 +1006,50 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
     }
     out.push_str("];\n\n");
 
-    // --- device link types ----------------------------------------------
+    // --- device rows ------------------------------------------------------
     //
-    // The `link_type` argument of each `device()` line — C `devSup::link_type`.
-    // `dbCanSetLink` (`dbStaticLib.c:2400-2419`) refuses to install a link whose
-    // parsed type is incompatible with the device's, which is how C rejects a
-    // `.db` that hands an `INST_IO` device a constant `INP`. The port dropped
-    // this argument at the parser and so accepted that `.db`.
+    // Each `device()` line as C's `devSup`. Its `link_type` is what
+    // `dbCanSetLink` (`dbStaticLib.c:2400-2419`) holds a link to, which is how
+    // C rejects a `.db` that hands an `INST_IO` device a constant `INP`. The
+    // dset shape comes from the target's hand-written `dsets` module, one
+    // const per dset symbol, so a `device()` line without one does not build.
     out.push_str(
         "// ---------------------------------------------------------------------\n\
-         // Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the\n\
-         // half of the `device()` declaration `dbCanSetLink` enforces.\n\
+         // Per-record-type device rows (C `devSup`), in `.dbd` declaration order.\n\
          // ---------------------------------------------------------------------\n\n",
     );
-    let mut link_consts: Vec<(&str, String)> = Vec::new();
+    let mut row_consts: Vec<(&str, String)> = Vec::new();
     let mut by_record: BTreeMap<&str, Vec<&Device>> = BTreeMap::new();
     for d in input.devices {
         by_record.entry(d.record.as_str()).or_default().push(d);
     }
     for (record, devs) in &by_record {
-        let konst = format!(
-            "DEVICE_LINK_TYPES_{}",
-            record.to_uppercase().replace('-', "_")
-        );
-        writeln!(
-            out,
-            "/// `device({record}, LINK_TYPE, ...)` — the link type each DTYP choice demands."
-        )
-        .unwrap();
-        writeln!(out, "pub static {konst}: &[(&str, DbLinkType)] = &[").unwrap();
+        let konst = format!("DEVICES_{}", record.to_uppercase().replace('-', "_"));
+        writeln!(out, "/// The `device({record}, ...)` lines.").unwrap();
+        writeln!(out, "pub static {konst}: &[DevSup] = &[").unwrap();
         for d in devs {
             let variant = link_type_variant(&d.link_type)?;
-            writeln!(out, "    ({}, DbLinkType::{variant}),", rust_str(&d.name)).unwrap();
+            writeln!(
+                out,
+                "    DevSup {{\n        name: {},\n        choice: {},\n        link_type: DbLinkType::{variant},\n        dset: dsets::{},\n    }},",
+                rust_str(&d.dset),
+                rust_str(&d.name),
+                d.dset.to_uppercase()
+            )
+            .unwrap();
         }
         out.push_str("];\n\n");
-        link_consts.push((record, konst));
+        row_consts.push((record, konst));
     }
     out.push_str(
-        "/// Every `device()` line for a record type as `(choice, link type)`, in\n\
-         /// declaration order: [`device_menu`]'s choices, each with its link type.\n\
-         pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {\n",
+        "/// Every `device()` line for a record type, in declaration order:\n\
+         /// [`device_menu`]'s choices, each as its `devSup`.\n\
+         pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {\n",
     );
     emit_str_lookup(
         out,
         "record_type",
-        link_consts
+        row_consts
             .iter()
             .map(|(record, konst)| (*record, konst.as_str())),
     );
@@ -1061,10 +1061,10 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
          /// crate registering its device support at runtime (asyn, motor) brings no\n\
          /// `.dbd`, so there is no declaration to enforce and none is invented.\n\
          pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {\n\
-         \x20   device_link_types(record_type)?\n\
+         \x20   devices(record_type)?\n\
          \x20       .iter()\n\
-         \x20       .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))\n\
-         \x20       .map(|(_, lt)| *lt)\n\
+         \x20       .find(|row| row.choice.eq_ignore_ascii_case(dtyp))\n\
+         \x20       .map(|row| row.link_type)\n\
          }\n\n",
     );
 

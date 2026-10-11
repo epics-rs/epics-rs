@@ -750,17 +750,13 @@ record(epid, "PID") {
     field(FLNK, "CTR")
 }
 "#;
+    std_rs::register_std_dbd();
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("calc", || {
             Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
-        })
-        .register_device_support("Async Soft Channel", || {
-            Box::new(
-                std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
-            )
         })
         .db_string(db_str, &macros)
         .unwrap()
@@ -1308,4 +1304,80 @@ async fn test_throttle_sync_runs_at_once_after_a_failed_put_leaves_nothing_queue
         server.get("TEST:THRSYNCF.SYNC").await.unwrap(),
         EpicsValue::Short(0)
     );
+}
+
+/// The epid `E` (DTYP "Async Soft Channel", INP `CV`, CA TRIG) and the two
+/// records its INP names.
+async fn epid_ioc() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
+    let db_str = r#"
+record(ai, "CV") { field(VAL, "1") }
+record(ai, "CV2") { field(VAL, "2") }
+record(epid, "E") {
+    field(DTYP, "Async Soft Channel")
+    field(INP, "CV")
+    field(TRIG, "ca://REMOTE:READBACK")
+}
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db
+}
+
+/// epid stores INP itself, and a put to it is still `dbPutFieldLink`'s
+/// device-link put: oracleStdIoc reads `E.PACT 0` right after
+/// `dbpf E.INP CV2` lands mid-cycle (`dbAccess.c:1194`).
+#[tokio::test]
+async fn a_device_link_put_to_epid_inp_releases_pact() {
+    let db = epid_ioc().await;
+    let rec = db.get_record("E").unwrap();
+    rec.write().enter_pact();
+    db.put_record_field_from_ca("E", "INP", EpicsValue::String("CV2".into()))
+        .await
+        .unwrap();
+    assert!(!rec.read().is_processing(), "E.PACT");
+}
+
+/// The trigger in flight is device-private, and the put above drops it with
+/// the `dpvt` (`dbAccess.c:1192`), so the callback's process fires the
+/// trigger again, as oracleStdIoc does after `dbpf E.INP CV2` (see
+/// `epid_tests.rs`'s `a_device_link_put_mid_trigger_fires_the_trigger_again`).
+#[tokio::test]
+async fn a_device_link_put_drops_the_trigger_in_flight() {
+    use epics_base_rs::server::device_support::Dpvt;
+    let db = epid_ioc().await;
+    let rec = db.get_record("E").unwrap();
+    {
+        // The trigger pass, without the 1 ms callback timer behind it.
+        let mut guard = rec.write();
+        let inst = &mut *guard;
+        inst.record
+            .set_process_context(&epics_base_rs::server::record::ProcessContext {
+                udf: false,
+                udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
+                nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
+                phas: 0,
+                tse: 0,
+                time: std::time::SystemTime::UNIX_EPOCH,
+                soft: inst.common.dtyp.soft(),
+                callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            });
+        assert!(
+            !inst
+                .record
+                .pre_input_link_actions(false, &mut inst.dpvt)
+                .is_empty()
+        );
+        assert!(matches!(inst.dpvt, Dpvt::Triggered));
+        inst.enter_pact();
+    }
+    db.put_record_field_from_ca("E", "INP", EpicsValue::String("CV2".into()))
+        .await
+        .unwrap();
+    assert!(matches!(rec.read().dpvt, Dpvt::Null));
 }

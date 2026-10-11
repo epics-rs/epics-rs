@@ -1172,6 +1172,7 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
 // ============================================================
 
 use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::record::{LinkType, ProcessAction, link_field_type};
 use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
 
@@ -1240,6 +1241,7 @@ fn test_db_inp_does_not_raise_soft_alarm() {
 #[test]
 fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
     rec.trig = "READBACK:REC.VAL".to_string();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
     rec.kp = 1.0;
@@ -1249,7 +1251,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     // The TRIG write is a pre-input-link action emitted by the record,
     // gated on the callback DSET (DTYP "Async Soft Channel").
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
-    let pre = rec.pre_input_link_actions(true);
+    let pre = rec.pre_input_link_actions(true, &mut dpvt);
     assert!(
         pre.iter().any(|a| matches!(
             a,
@@ -1287,12 +1289,13 @@ fn test_db_trig_link_synchronous_fallthrough() {
 #[test]
 fn test_non_callback_dtyp_emits_no_trig_write() {
     let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
     rec.trig = "READBACK:REC.VAL".to_string();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
     assert!(
-        rec.pre_input_link_actions(true).is_empty(),
+        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
         "non-callback DSET must not drive the TRIG link"
     );
 }
@@ -1303,6 +1306,7 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 #[test]
 fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".to_string();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
@@ -1313,7 +1317,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 
     // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
     // PID compute is deferred to the re-process pass.
-    let actions = rec.pre_input_link_actions(true);
+    let actions = rec.pre_input_link_actions(true, &mut dpvt);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -1335,9 +1339,45 @@ fn test_ca_trig_link_deferred_second_pass() {
     // `if (!pepid->pact)` skips the whole trigger block, so nothing is
     // re-fired and the PID runs.
     assert!(
-        rec.pre_input_link_actions(true).is_empty(),
+        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
         "second pass must not re-trigger"
     );
+}
+
+/// A device-link put lands between the trigger and its callback: C
+/// clears `pact` (`dbAccess.c:1194`) and the callback's process fires
+/// the trigger again (`devEpidSoftCallback.c:116`). The put replaces the
+/// `dpvt` the trigger lives in. oracleStdIoc, TRIG `TG.PROC CA` on a
+/// calcout with ODLY 2: after `dbpf E.INP CV2` E.PACT is 0, at the
+/// callback TG.VAL is 2 with E.PACT 1 and CVAL 0, at the next one CVAL is
+/// 2 and E.PACT 0.
+#[test]
+fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
+    let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "ca://REMOTE:READBACK".to_string();
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
+    let fires = |actions: &epics_base_rs::server::record::ProcessActions| {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "TRIG",
+                    ..
+                }
+            )
+        })
+    };
+
+    assert!(fires(&rec.pre_input_link_actions(true, &mut dpvt)));
+    // `rebind_device_link` takes the record's dpvt and installs the new
+    // dset's, which `devEpidSoftCB` leaves NULL.
+    dpvt = Dpvt::Null;
+    assert!(
+        fires(&rec.pre_input_link_actions(true, &mut dpvt)),
+        "the callback after a device-link put fires the trigger again"
+    );
+    assert!(!fires(&rec.pre_input_link_actions(true, &mut dpvt)));
 }
 
 /// TASK 2 — bumpless transfer: on the feedback OFF->ON edge in PID
@@ -1611,6 +1651,7 @@ use epics_base_rs::server::record::RecordProcessResult;
 #[test]
 fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".to_string();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
@@ -1626,7 +1667,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
     // --- Trigger pass: pre_input_link_actions fires the CA trigger ---
-    let actions1 = rec.pre_input_link_actions(true);
+    let actions1 = rec.pre_input_link_actions(true, &mut dpvt);
     assert!(
         actions1.iter().any(|a| matches!(
             a,
@@ -1658,7 +1699,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 
     // --- Reprocess (callback) pass: the trigger block is skipped ---
     assert!(
-        rec.pre_input_link_actions(true).is_empty(),
+        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
         "reprocess pass must not re-trigger"
     );
     rec.set_device_did_compute(false);

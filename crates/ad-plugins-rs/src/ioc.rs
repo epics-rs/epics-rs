@@ -1049,16 +1049,21 @@ impl AdIoc {
         self.app = Some(app.register_startup_command(cmd));
     }
 
-    /// Register a static device support factory for a fixed DTYP name.
-    pub fn register_device_support<F>(&mut self, dtyp: &str, factory: F)
-    where
+    /// Register a static device support: its factory under `devsup.choice`,
+    /// and `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        &mut self,
+        record_type: &str,
+        devsup: &'static epics_base_rs::server::record::DevSup,
+        factory: F,
+    ) where
         F: Fn() -> Box<dyn epics_base_rs::server::device_support::DeviceSupport>
             + Send
             + Sync
             + 'static,
     {
         let app = self.app.take().unwrap();
-        self.app = Some(app.register_device_support(dtyp, factory));
+        self.app = Some(app.register_device_support(record_type, devsup, factory));
     }
 
     /// Register a dynamic device support factory (dispatches by context).

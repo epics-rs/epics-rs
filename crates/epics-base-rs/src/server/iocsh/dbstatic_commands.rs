@@ -657,18 +657,11 @@ fn cmd_db_dump_field() -> CommandDef {
 /// each record type. C `dbDumpDevice` (`dbStaticLib.c:3429-3486`), registered
 /// at `dbStaticIocRegister.c:270`.
 ///
-/// C prints five values per device. Two are `.dbd` declarations the port
-/// carries — `choice` (the `DTYP` string) and `link_type` — and are printed on
-/// C's lines. The other three are C addresses: `pdset` and `pdsxt` are the
-/// device support function tables, and `device name` is the C symbol naming
-/// `pdset`, which the generator never sees because a port device support is a
-/// Rust type rather than a linker symbol.
-///
-/// A device menu contributed at runtime
-/// ([`register_device_menu`](crate::server::record::register_device_menu),
-/// how `asyn-rs` and `std-rs` add their `DTYP`s) carries the link type of each
-/// `device()` line its crate's `.dbd` declares; a menu registered as bare names
-/// prints the `choice` line alone rather than a guessed `link_type`.
+/// Every row is a [`DevSup`](crate::server::record::DevSup), base's from the
+/// generated tables and the rest as registered, so each prints C's full
+/// block. The addresses are the row's own: `pdset` its dset, `func N` that
+/// slot's entry in the dset's table, `pdsxt` one shared extension table; a
+/// slot or `pdsxt` C leaves NULL prints `(nil)`.
 fn cmd_db_dump_device() -> CommandDef {
     CommandDef::new(
         "dbDumpDevice",
@@ -697,15 +690,13 @@ fn cmd_db_dump_device() -> CommandDef {
                 {
                     continue;
                 }
-                let declared = crate::server::record::dbd_generated::device_link_types(record_type)
+                let declared = crate::server::record::dbd_generated::devices(record_type)
                     .unwrap_or_default()
-                    .iter()
-                    .copied();
+                    .iter();
                 let contributed = crate::server::record::contributed_device_rows(record_type);
                 ctx.println(&format!("recordtype({record_type})"));
-                for (choice, link_type) in declared.chain(contributed) {
-                    ctx.println(&format!("\tchoice:    {choice}"));
-                    ctx.println(&format!("\tlink_type: {}", c_link_type_number(link_type)));
+                for row in declared.chain(contributed) {
+                    print_dev_sup(ctx, row);
                 }
                 if wanted.is_some() {
                     break;
@@ -714,6 +705,43 @@ fn cmd_db_dump_device() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// One `devSup` as `dbDumpDevice` prints it (`dbStaticLib.c:3458-3483`).
+fn print_dev_sup(ctx: &CommandContext, row: &'static crate::server::record::DevSup) {
+    /// C's `devSoft_DSXT` and the `do_nothing` both its hooks point at.
+    static DSXT: u8 = 0;
+    static DO_NOTHING: u8 = 0;
+    const NAMES: [&str; 4] = [
+        " - report()",
+        " - init()",
+        " - init_record()",
+        " - get_ioint_info()",
+    ];
+    let dset = &row.dset;
+    ctx.println(&format!("    device name:   {}", row.name));
+    ctx.println(&format!("\tchoice:    {}", row.choice));
+    ctx.println(&format!(
+        "\tlink_type: {}",
+        c_link_type_number(row.link_type)
+    ));
+    ctx.println(&format!("\tpdset:     {:p}", dset));
+    ctx.println(&format!("\t    number: {}", dset.number));
+    for i in 0..dset.number {
+        let func = match dset.funcs.iter().find(|&&slot| slot == i) {
+            Some(slot) => format!("{:p}", slot),
+            None => "(nil)".to_string(),
+        };
+        let name = NAMES.get(usize::from(i)).copied().unwrap_or("");
+        ctx.println(&format!("\t    func {i}: {func}{name}"));
+    }
+    if row.has_dsxt() {
+        ctx.println(&format!("\tpdsxt:     {:p}", &DSXT));
+        ctx.println(&format!("\t    add_record: {:p}", &DO_NOTHING));
+        ctx.println(&format!("\t    del_record: {:p}", &DO_NOTHING));
+    } else {
+        ctx.println("\tpdsxt:     (nil)");
+    }
 }
 
 /// `dbDumpDriver pdbbase` — C `dbDumpDriver` (`dbStaticLib.c:3488-3495`) over
@@ -2074,15 +2102,23 @@ variable(seqDLYprecision,int)
         assert!(out.contains("\tinfo(\"Q:group\",\"grp\")\n"), "got:\n{out}");
     }
 
-    /// `dbDumpDevice`'s two `.dbd` lines, byte for byte
-    /// (`dbStaticLib.c:3447-3448`).
+    /// `dbDumpDevice`'s devSup block (`dbStaticLib.c:3458-3483`): a dset
+    /// slot C leaves NULL prints `(nil)`, as does a non-CONSTANT row's
+    /// `pdsxt`.
     #[test]
-    fn dump_device_prints_the_choice_and_link_type() {
+    fn dump_device_prints_the_devsup_block() {
         let (_db, ctx) = make_ctx();
         let out = run(&ctx, "dbDumpDevice", &["pdbbase", "ai"]).unwrap();
         assert!(out.starts_with("recordtype(ai)\n"), "got:\n{out}");
-        assert!(out.contains("\tchoice:    Soft Channel\n"), "got:\n{out}");
-        assert!(out.contains("\tlink_type: 0\n"), "got:\n{out}");
+        assert!(out.contains("    device name:   devAiSoft\n\tchoice:    Soft Channel\n\tlink_type: 0\n\tpdset:     0x"), "got:\n{out}");
+        assert!(out.contains("\t    number: 6\n\t    func 0: (nil) - report()\n\t    func 1: (nil) - init()\n\t    func 2: 0x"), "got:\n{out}");
+        assert!(
+            out.contains(
+                "    device name:   devAiGeneralTime\n\tchoice:    General Time\n\tlink_type: 12\n"
+            ),
+            "got:\n{out}"
+        );
+        assert!(out.ends_with("\tpdsxt:     (nil)\n"), "got:\n{out}");
         // C breaks out of the record-type walk once the named type is done
         // (`dbStaticLib.c:3484`).
         assert!(!out.contains("recordtype(bi)"), "got:\n{out}");

@@ -12,7 +12,7 @@
 //! `stderr` → `vfprintf(stderr)`, `errlog` → `errlogVprintf`. An OUT naming
 //! no known stream leaves `dpvt = NULL`, so the record writes nothing.
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, LinkRefusal};
 use crate::runtime::log::errlog_printf;
 use crate::server::device_support::{DeviceInitOutcome, DeviceSupport};
 use crate::server::record::Record;
@@ -80,6 +80,11 @@ impl DeviceSupport for StdioDeviceSupport {
         "stdio"
     }
 
+    /// `add_xxx`'s `prec->dpvt = pstream` (`devStdio.c:73`).
+    fn holds_dpvt(&self) -> bool {
+        self.stream.is_some()
+    }
+
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C registers a SEPARATE dset per record type (devLsoStdio /
         // devPrintfStdio / devSoStdio), and "stdio" is not a valid DTYP menu
@@ -97,11 +102,19 @@ impl DeviceSupport for StdioDeviceSupport {
                 "DTYP='stdio': unsupported record type '{rt}' (use lso, printf, or stringout)"
             )));
         }
-        // An OUT naming no known stream leaves `stream = None`. C `add_xxx`
-        // returns -1 in that case, but iocInit's `doResolveLinks` discards the
-        // return value (no `recGblRecordError`, no alarm) — so C is silent and
-        // the record simply writes nothing. Match that: no diagnostic, no alarm.
+        // iocInit's `doResolveLinks` discards `add_xxx`'s -1 for an unknown
+        // stream: no diagnostic, no alarm, and the record writes nothing.
+        let _ = self.add_record(rt);
         Ok(DeviceInitOutcome::Live)
+    }
+
+    fn add_record(&mut self, _record_type: &str) -> Result<(), LinkRefusal> {
+        // `add_xxx` returns -1, printing nothing, for an OUT naming no
+        // stream in `outStreams`.
+        match self.stream {
+            Some(_) => Ok(()),
+            None => Err(LinkRefusal::add_record("devStdio")),
+        }
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {

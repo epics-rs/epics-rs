@@ -25,7 +25,8 @@
 //! `dbPutLinkAsync(out, DBR_DOUBLE, &oval, 1)` with a synchronous `dbPutLink`
 //! fallback (`devAoSoftCallback.c:41-54`), and `read_ai` returns 2 —
 //! do-not-convert — on every terminal path (`devAiSoftCallback.c:167-216`).
-//! This port applies the link synchronously, so it owes the same values.
+//! The input reads its link once its `dbProcessNotify` completes, the output
+//! still writes synchronously; both owe the same values.
 //!
 //! Real breakage this closes: `pva2pva/testApp/testpvalink.db:30-35`, a
 //! `longout "async:trig"` with this DTYP driving a pva OUT link, shipped in
@@ -102,6 +103,15 @@ async fn an_async_soft_input_reads_its_inp_link() {
 
     process(&db, "A:AI").await;
     process(&db, "A:LI").await;
+    // The reading lands in the completion's pass, which clears PACT.
+    for name in ["A:AI", "A:LI"] {
+        let rec = db.get_record(name).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while rec.read().is_processing() {
+            assert!(std::time::Instant::now() < until, "{name} never completed");
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 
     assert_eq!(value(&db, "A:AI", "VAL"), 5.0, "C reads 5, not RVAL 0");
     assert_eq!(value(&db, "A:LI", "VAL"), 5.0);

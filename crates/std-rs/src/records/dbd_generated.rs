@@ -35,8 +35,9 @@
 
 #![allow(clippy::all)]
 
-use epics_base_rs::server::record::DbLinkType;
+use super::dsets;
 use epics_base_rs::server::record::{Asl, Base, FieldDesc, Special};
+use epics_base_rs::server::record::{DbLinkType, DevSup};
 use epics_base_rs::types::{DbFieldType, DbfCode};
 
 // ---------------------------------------------------------------------
@@ -1913,32 +1914,54 @@ pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {
 pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &["ai", "epid", "stringin"];
 
 // ---------------------------------------------------------------------
-// Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the
-// half of the `device()` declaration `dbCanSetLink` enforces.
+// Per-record-type device rows (C `devSup`), in `.dbd` declaration order.
 // ---------------------------------------------------------------------
 
-/// `device(ai, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_AI: &[(&str, DbLinkType)] =
-    &[("Sec Past Epoch", DbLinkType::Constant)];
+/// The `device(ai, ...)` lines.
+pub static DEVICES_AI: &[DevSup] = &[DevSup {
+    name: "devAiTodSeconds",
+    choice: "Sec Past Epoch",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVAITODSECONDS,
+}];
 
-/// `device(epid, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_EPID: &[(&str, DbLinkType)] = &[
-    ("Soft Channel", DbLinkType::Constant),
-    ("Async Soft Channel", DbLinkType::Constant),
-    ("Fast Epid", DbLinkType::InstIo),
+/// The `device(epid, ...)` lines.
+pub static DEVICES_EPID: &[DevSup] = &[
+    DevSup {
+        name: "devEpidSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVEPIDSOFT,
+    },
+    DevSup {
+        name: "devEpidSoftCB",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVEPIDSOFTCB,
+    },
+    DevSup {
+        name: "devEpidFast",
+        choice: "Fast Epid",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVEPIDFAST,
+    },
 ];
 
-/// `device(stringin, LINK_TYPE, ...)` — the link type each DTYP choice demands.
-pub static DEVICE_LINK_TYPES_STRINGIN: &[(&str, DbLinkType)] =
-    &[("Time of Day", DbLinkType::Constant)];
+/// The `device(stringin, ...)` lines.
+pub static DEVICES_STRINGIN: &[DevSup] = &[DevSup {
+    name: "devSiTodString",
+    choice: "Time of Day",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVSITODSTRING,
+}];
 
-/// Every `device()` line for a record type as `(choice, link type)`, in
-/// declaration order: [`device_menu`]'s choices, each with its link type.
-pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, DbLinkType)]> {
+/// Every `device()` line for a record type, in declaration order:
+/// [`device_menu`]'s choices, each as its `devSup`.
+pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {
     Some(match record_type {
-        "ai" => DEVICE_LINK_TYPES_AI,
-        "epid" => DEVICE_LINK_TYPES_EPID,
-        "stringin" => DEVICE_LINK_TYPES_STRINGIN,
+        "ai" => DEVICES_AI,
+        "epid" => DEVICES_EPID,
+        "stringin" => DEVICES_STRINGIN,
         _ => return None,
     })
 }
@@ -1949,10 +1972,10 @@ pub fn device_link_types(record_type: &str) -> Option<&'static [(&'static str, D
 /// crate registering its device support at runtime (asyn, motor) brings no
 /// `.dbd`, so there is no declaration to enforce and none is invented.
 pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
-    device_link_types(record_type)?
+    devices(record_type)?
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))
-        .map(|(_, lt)| *lt)
+        .find(|row| row.choice.eq_ignore_ascii_case(dtyp))
+        .map(|row| row.link_type)
 }
 
 /// The record-own field table for a record type name, or `None` for a type

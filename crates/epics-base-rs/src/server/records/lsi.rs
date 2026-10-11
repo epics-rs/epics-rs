@@ -480,17 +480,21 @@ impl Record for LsiRecord {
     /// SIZV) lands in VAL through [`link_ls_read`], and LEN is `strlen + 1`. The read is
     /// already VAL's text, so it skips the generic put's shape lookups and
     /// its 40-byte DBR_STRING put cap, which C's char-source read does not have.
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
         let Some(value) = value else { return Ok(()) };
-        match link_ls_read(value, self.sizv, &mut self.val) {
-            Ok(()) => Ok(()),
-            Err(other) => self.set_val(other),
-        }
+        self.land_simulated_value(value)
     }
 
     /// The simulated SIOL read is the same `dbGetLinkLS` (`lsiRecord.c:244`).
     fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
-        self.soft_input_read(Some(value))
+        match link_ls_read(value, self.sizv, &mut self.val) {
+            Ok(()) => Ok(()),
+            Err(other) => self.set_val(other),
+        }
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

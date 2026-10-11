@@ -1,0 +1,143 @@
+recordtype(ai)
+    device name:   devAiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x773c82fcbaa0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c82fb00e0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb0160
+	    func 5: (nil)
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350
+    device name:   devAiSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x773c82fcbae0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c82fb0350 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb0380
+	    func 5: (nil)
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350
+    device name:   devAiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x773c82fcc2e0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: 0x773c82fb1f60 - init()
+	    func 2: 0x773c82fb1f30 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb1d70
+	    func 5: (nil)
+	pdsxt:     0x773c82fcc320
+	    add_record: 0x773c82fb2030
+	    del_record: 0x773c82fb1f90
+    device name:   devTimestampAI
+	choice:    Soft Timestamp
+	link_type: 12
+	pdset:     0x773c82fcc9c0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: 0x773c82fb4640 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb45f0
+	    func 5: (nil)
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350
+    device name:   devAiGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x773c82fcc920
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c82fb4210 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb41b0
+	    func 5: (nil)
+	pdsxt:     (nil)
+    device name:   asynAiInt32
+	choice:    asynInt32
+	link_type: 12
+	pdset:     0x773c83082320
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c83028d30 - init_record()
+	    func 3: 0x773c830294b0 - get_ioint_info()
+	    func 4: 0x773c830262e0
+	    func 5: 0x773c830255b0
+	pdsxt:     (nil)
+    device name:   asynAiInt32Average
+	choice:    asynInt32Average
+	link_type: 12
+	pdset:     0x773c830822e0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c83028e20 - init_record()
+	    func 3: 0x773c830294b0 - get_ioint_info()
+	    func 4: 0x773c830257c0
+	    func 5: 0x773c830255b0
+	pdsxt:     (nil)
+    device name:   asynAiFloat64
+	choice:    asynFloat64
+	link_type: 12
+	pdset:     0x773c83082680
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c8302e000 - init_record()
+	    func 3: 0x773c8302e940 - get_ioint_info()
+	    func 4: 0x773c8302e1c0
+	    func 5: (nil)
+	pdsxt:     (nil)
+    device name:   asynAiFloat64Average
+	choice:    asynFloat64Average
+	link_type: 12
+	pdset:     0x773c83082600
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c8302e770 - init_record()
+	    func 3: 0x773c8302e940 - get_ioint_info()
+	    func 4: 0x773c8302d590
+	    func 5: (nil)
+	pdsxt:     (nil)
+    device name:   asynAiInt64
+	choice:    asynInt64
+	link_type: 12
+	pdset:     0x773c83082ea0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c8304bbf0 - init_record()
+	    func 3: 0x773c8304c1a0 - get_ioint_info()
+	    func 4: 0x773c8304b280
+	    func 5: 0x773c8304a330
+	pdsxt:     (nil)
+    device name:   devAiTodSeconds
+	choice:    Sec Past Epoch
+	link_type: 0
+	pdset:     0x5e25d52777c0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5e25d5272c70 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5e25d5272c80
+	    func 5: 0x5e25d5272d60
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350

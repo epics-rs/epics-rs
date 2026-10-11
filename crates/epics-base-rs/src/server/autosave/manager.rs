@@ -253,11 +253,7 @@ impl AutosaveManager {
                                     update_status_pvs(&db, prefix, &set, &result).await;
                                 }
                             }
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    break;
-                                }
-                            }
+                            _ = stopped(&mut shutdown_rx) => break,
                         }
                     }
                 })
@@ -285,11 +281,7 @@ impl AutosaveManager {
                             _ = ticker.tick() => {
                                 triggered_poll(&mut watermark, &trigger_pv, mode).await;
                             }
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    break;
-                                }
-                            }
+                            _ = stopped(&mut shutdown_rx) => break,
                         }
                     }
                 })
@@ -307,11 +299,7 @@ impl AutosaveManager {
                         _ = ticker.tick() => {
                             onchange_poll(&mut watermark, float_epsilon).await;
                         }
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
+                        _ = stopped(&mut shutdown_rx) => break,
                     }
                 }
             }),
@@ -365,7 +353,7 @@ impl AutosaveManager {
 
     /// Send shutdown signal to all tasks.
     pub fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Get the list of save set names.
@@ -392,6 +380,14 @@ impl AutosaveManager {
     pub fn sets(&self) -> Vec<SetEntry> {
         self.sets.lock().unwrap().clone()
     }
+}
+
+/// Resolve once `shutdown` has been called, or the manager is gone. A task
+/// subscribes when it starts, which can be after `shutdown`; a late receiver
+/// has already seen `true`, so this cannot be `changed()`, and `shutdown`
+/// must `send_replace`, since `send` stores nothing while no task listens.
+async fn stopped(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
 }
 
 /// Compare two stringified values with float epsilon tolerance.

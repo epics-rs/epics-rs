@@ -152,15 +152,16 @@ use crate::protocol::{
     CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_EVENTS_OFF,
     CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ, CA_PROTO_READ_NOTIFY,
     CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
-    CaHeader, ECA_UNAVAILINSERV,
+    CaHeader,
 };
 use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
     RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
-    cancel_subscription_reply, dispatch_message, is_peer_disconnect, print_forcing_disconnect,
-    print_log_header, register_subscription, run_event_task, send_ca_error, serve_write_head,
+    cancel_subscription_reply, dispatch_message, is_peer_disconnect, log_circuit,
+    print_forcing_disconnect, refuse_bad_tcp_command, register_subscription, report_gate_error,
+    run_event_task, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1123,10 +1124,6 @@ fn drain_outbox_locked(
 /// subscriber can be removed from its record/PV.
 pub(crate) struct BlockingSub {
     channel_sid: u32,
-    /// The subscription's slot, which its producer row and its event-thread
-    /// delivery are found by; the client's sub_id, this map's key, may be
-    /// reused.
-    id: epics_base_rs::server::event_queue::AttachId,
     data_type: u16,
     data_count: u32,
     target: ChannelTarget,
@@ -1144,15 +1141,14 @@ pub(crate) struct BlockingSub {
 /// thread is gone is dropped, the client being on its way out.
 pub(crate) fn hand_off_subscription(
     state: &mut ClientState,
-    blk_subs: &mut HashMap<u32, BlockingSub>,
+    blk_subs: &mut HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
     ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
     r: RegisteredSubscription,
 ) {
     blk_subs.insert(
-        r.sub_id,
+        r.reader.id(),
         BlockingSub {
             channel_sid: r.channel_sid,
-            id: r.reader.id(),
             data_type: r.data_type,
             data_count: r.data_count,
             target: r.target.clone(),
@@ -1161,8 +1157,8 @@ pub(crate) fn hand_off_subscription(
     );
     state.link_subscription(
         r.channel_sid,
-        r.sub_id,
         crate::server::tcp::ChannelMonitor {
+            sub_id: r.sub_id,
             gate: r.gate,
             denied: r.denied,
             id: r.reader.id(),
@@ -1346,7 +1342,9 @@ fn handle_client_blocking(
     });
 
     // The blocking driver's own subscription registry (see [`BlockingSub`]).
-    let mut blk_subs: HashMap<u32, BlockingSub> = HashMap::new();
+    // Keyed by slot, never sub_id, which a client may install twice.
+    let mut blk_subs: HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub> =
+        HashMap::new();
 
     // Run the read/dispatch loop in a closure so the producer teardown + event-
     // thread join below runs on EVERY exit path (EOF, peer-disconnect, idle,
@@ -1400,11 +1398,7 @@ fn handle_client_blocking(
                 Admit::Parse => {}
                 Admit::Draining => continue,
                 Admit::Overflow(cap) => {
-                    tracing::warn!(
-                        target: "epics_ca_rs::server::blocking",
-                        %peer, cap,
-                        "CA server: client accumulated buffer exceeded the ceiling, closing"
-                    );
+                    log_circuit(peer, format_args!("receive buffer past {cap} bytes"));
                     break;
                 }
             }
@@ -1426,43 +1420,13 @@ fn handle_client_blocking(
                     Gate::Refuse(err) => {
                         // C `RSRV_OK`: the peer keeps every channel and
                         // subscription it holds; only this message is lost.
-                        tracing::warn!(
-                            target: "epics_ca_rs::server::blocking",
-                            %peer,
-                            cmmd = err.hdr.cmmd,
-                            status = err.status,
-                            diagnostic = %err.diagnostic,
-                            "CAS: message refused, circuit kept"
-                        );
-                        let _ = send_ca_error(
-                            &outbox,
-                            &err.hdr,
-                            err.status,
-                            0xFFFF_FFFF,
-                            &err.diagnostic,
-                            state.client_minor_version(),
-                        );
-                        print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
+                        report_gate_error(&outbox, &state, peer, &err);
                         continue;
                     }
                     Gate::TearDown { error, reason } => {
                         // C `RSRV_ERROR`: send what C sends, flush it, close.
-                        tracing::warn!(
-                            target: "epics_ca_rs::server::blocking",
-                            %peer,
-                            reason = %reason,
-                            "CAS: circuit torn down by the receive gate"
-                        );
                         if let Some(err) = error {
-                            let _ = send_ca_error(
-                                &outbox,
-                                &err.hdr,
-                                err.status,
-                                0xFFFF_FFFF,
-                                &err.diagnostic,
-                                state.client_minor_version(),
-                            );
-                            print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
+                            report_gate_error(&outbox, &state, peer, &err);
                         }
                         let _ = drain_outbox_locked(&send_lock, &mut drain);
                         print_forcing_disconnect(peer);
@@ -1474,11 +1438,9 @@ fn handle_client_blocking(
                         continue;
                     }
                     Gate::RateLimited { strikes } => {
-                        tracing::warn!(
-                            target: "epics_ca_rs::server::blocking",
-                            %peer,
-                            strikes,
-                            "rate limit exceeded; closing connection"
+                        log_circuit(
+                            peer,
+                            format_args!("rate limit: {strikes} messages discarded in a row"),
                         );
                         return Ok(());
                     }
@@ -1489,11 +1451,9 @@ fn handle_client_blocking(
                     // `HandOff` mode: it validates caps/dedup/type/mask/count/ACF,
                     // queues the initial value on the circuit's ring, and hands back
                     // the live reader WITHOUT spawning (this thread has no runtime). The
-                    // per-channel cap and duplicate-sub-id check consult the blocking
-                    // driver's own map (`blk_subs`), not the async `subscriptions`.
+                    // per-channel cap consults the blocking driver's own map
+                    // (`blk_subs`), not the async `subscriptions`.
                     let sid = hdr.cid;
-                    let sub_id = hdr.available;
-                    let sub_id_in_use = blk_subs.contains_key(&sub_id);
                     let outcome = block_on_sync(register_subscription(
                         &hdr,
                         &payload,
@@ -1501,14 +1461,11 @@ fn handle_client_blocking(
                         &outbox,
                         SubscriptionDelivery::HandOff,
                         || blk_subs.values().filter(|s| s.channel_sid == sid).count(),
-                        sub_id_in_use,
                     ));
                     match outcome {
                         Ok(Ok(SubscriptionOutcome::HandedOff(r))) => {
                             hand_off_subscription(&mut state, &mut blk_subs, &ev_tx, r);
                         }
-                        // A refusal frame is already queued; keep serving.
-                        Ok(Ok(SubscriptionOutcome::Refused)) => {}
                         Ok(Ok(SubscriptionOutcome::Circuit(_))) => {
                             unreachable!("HandOff mode never spawns a task")
                         }
@@ -1528,32 +1485,33 @@ fn handle_client_blocking(
                 } else if hdr.cmmd == CA_PROTO_EVENT_CANCEL {
                     // Shared cancel wire logic (bad-SID / bad-mon-id / ACK), reading
                     // the addressed subscription from the blocking driver's own map.
-                    let sub_id = hdr.available;
-                    let sub_info = blk_subs.get(&sub_id).map(|s| CancelInfo {
-                        channel_sid: s.channel_sid,
-                        data_type: s.data_type,
-                        data_count: s.data_count,
-                        gate: s.gate.clone(),
-                    });
+                    let sub_info = state
+                        .find_subscription(hdr.cid, hdr.available)
+                        .and_then(|id| blk_subs.get(&id).map(|s| (id, s)))
+                        .map(|(id, s)| CancelInfo {
+                            id,
+                            channel_sid: s.channel_sid,
+                            data_type: s.data_type,
+                            data_count: s.data_count,
+                            gate: s.gate.clone(),
+                        });
                     match cancel_subscription_reply(&hdr, &state, &outbox, sub_info) {
-                        Ok(true) => {
-                            state.unlink_subscription(hdr.cid, sub_id);
-                            if let Some(sub) = blk_subs.remove(&sub_id) {
+                        Ok(id) => {
+                            state.unlink_subscription(hdr.cid, id);
+                            if let Some(sub) = blk_subs.remove(&id) {
                                 // Stop the producer: drop the reader on the event
                                 // thread, then remove the subscriber from record/PV.
-                                let _ = ev_tx.send(EventTaskControl::Cancel(sub.id));
+                                let _ = ev_tx.send(EventTaskControl::Cancel(id));
                                 match &sub.target {
                                     ChannelTarget::SimplePv(pv) => {
-                                        pv.remove_subscriber(sub.id);
+                                        pv.remove_subscriber(id);
                                     }
                                     ChannelTarget::RecordField { record, .. } => {
-                                        record.write().remove_subscriber(sub.id);
+                                        record.write().remove_subscriber(id);
                                     }
                                 }
                             }
                         }
-                        // `cancel_subscription_reply` returns only `Ok(true)` or `Err`.
-                        Ok(false) => {}
                         Err(e) => {
                             // The CA_PROTO_ERROR is queued; ship it, then end the
                             // circuit (C `event_cancel_reply` RSRV_ERROR).
@@ -1631,15 +1589,15 @@ fn handle_client_blocking(
                             // whole `db_cancel_event`-then-confirm order of C
                             // `clear_channel_reply` (`camessage.c:1890-1912`)
                             // holds on this driver too.
-                            for sub_id in state.take_retired_subscriptions() {
-                                if let Some(sub) = blk_subs.remove(&sub_id) {
-                                    let _ = ev_tx.send(EventTaskControl::Cancel(sub.id));
+                            for id in state.take_retired_subscriptions() {
+                                if let Some(sub) = blk_subs.remove(&id) {
+                                    let _ = ev_tx.send(EventTaskControl::Cancel(id));
                                     match &sub.target {
                                         ChannelTarget::SimplePv(pv) => {
-                                            pv.remove_subscriber(sub.id);
+                                            pv.remove_subscriber(id);
                                         }
                                         ChannelTarget::RecordField { record, .. } => {
-                                            record.write().remove_subscriber(sub.id);
+                                            record.write().remove_subscriber(id);
                                         }
                                     }
                                 }
@@ -1662,24 +1620,20 @@ fn handle_client_blocking(
                         }
                     }
                 } else {
-                    // A LEGAL CA opcode this driver does not route. It cannot be
-                    // an illegal one: `RecvAccumulator::next_message` answers
-                    // those with C's `bad_tcp_cmd_action` — `ECA_INTERNAL` and a
-                    // tear-down — before a message reaches here, which is the
-                    // fact `command_drives_without_spawn` used to conflate with
-                    // this one. The set is empty today
-                    // (`every_legal_tcp_command_is_routed_by_this_driver` pins
-                    // that), so this is what a routing table that fell behind the
-                    // protocol would produce: fail closed with a keep-serving
-                    // warning rather than punishing the peer for a server gap.
-                    let _ = send_ca_error(
+                    // A legal opcode this driver does not route; the set is
+                    // empty (`every_legal_tcp_command_is_routed_by_this_driver`).
+                    // C has no such opcode and answers any unhandled one with
+                    // `bad_tcp_cmd_action`.
+                    let e = refuse_bad_tcp_command(
                         &outbox,
                         &hdr,
-                        ECA_UNAVAILINSERV,
-                        0xFFFF_FFFF,
-                        "CAS: command not yet supported by blocking CA driver",
+                        peer,
+                        state.channel_addr(hdr.cid),
                         state.client_minor_version(),
                     );
+                    let _ = drain_outbox_locked(&send_lock, &mut drain);
+                    print_forcing_disconnect(peer);
+                    return Err(e);
                 }
             }
             // The reply drain lives at the loop top (FIONREAD-gated), not here —
@@ -1694,13 +1648,13 @@ fn handle_client_blocking(
     // Producer teardown (runs on every exit path): drop each subscriber from
     // its record/PV so no dangling `EvQue` post target survives this client —
     // the blocking analogue of `dispatch_message`'s disconnect drain.
-    for (_, sub) in blk_subs.drain() {
+    for (id, sub) in blk_subs.drain() {
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
-                pv.remove_subscriber(sub.id);
+                pv.remove_subscriber(id);
             }
             ChannelTarget::RecordField { record, .. } => {
-                record.write().remove_subscriber(sub.id);
+                record.write().remove_subscriber(id);
             }
         }
     }
@@ -3195,11 +3149,9 @@ mod tests {
     ///
     /// This is what keeps the two facts apart now that
     /// [`crate::protocol::is_legal_tcp_command`] owns legality. The `else`
-    /// arm answers `ECA_UNAVAILINSERV` and keeps serving, which is right for
-    /// "this driver has not caught up with the protocol" and wrong for
-    /// "damaged opcode" — and it was reachable by the second, because the
-    /// allowlist was doing both jobs. Reaching it at all is now a routing gap
-    /// in this file, and this test is the thing that reports one.
+    /// arm answers C's `bad_tcp_cmd_action`, so a legal opcode reaching it
+    /// would cost the peer its circuit for a routing gap in this file; this
+    /// test is the thing that reports one.
     #[test]
     fn every_legal_tcp_command_is_routed_by_this_driver() {
         // The commands with a dedicated branch ahead of the allowlist.
@@ -3215,7 +3167,8 @@ mod tests {
             }
             assert!(
                 DEDICATED.contains(&cmmd) || command_drives_without_spawn(cmmd),
-                "legal TCP command {cmmd} reaches the fail-closed else arm —                  it would be answered ECA_UNAVAILINSERV and the peer would                  never learn the driver simply does not route it"
+                "legal TCP command {cmmd} reaches the else arm, which tears the \
+                 circuit down as C does only for an illegal opcode"
             );
         }
     }
@@ -3948,7 +3901,6 @@ mod tests {
             &outbox,
             SubscriptionDelivery::HandOff,
             || 0usize,
-            false,
         ))
         .expect("blockable");
         assert!(
@@ -4337,7 +4289,6 @@ mod tests {
             &outbox,
             SubscriptionDelivery::HandOff,
             || 0usize,
-            false,
         ))
         .expect("blockable")
         .expect("register ok");
@@ -4352,6 +4303,7 @@ mod tests {
                 .expect("blockable")
                 .expect("a queued entry");
             crate::server::monitor::send_event(
+                crate::server::tcp::RefusalChannel { cid: 0, pv: "" },
                 r.data_type,
                 r.data_count,
                 r.sub_id,

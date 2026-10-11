@@ -746,7 +746,7 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
         let mut sid = 0u32;
         for field in own.iter().copied().chain(COMMON_POSTED.iter().copied()) {
             sid += 1;
-            if let Some(rx) = inst.add_subscriber(field, sid, DbFieldType::String, MASK) {
+            if let Ok(rx) = inst.add_subscriber(field, sid, DbFieldType::String, MASK) {
                 readers.push((name, field, rx));
             }
         }

@@ -44,7 +44,7 @@ fn subscribe(db: &PvDatabase, field: &str, id: u32) -> EventReader {
     let mut g = inst.write();
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     g.add_subscriber(field, id, DbFieldType::Double, full)
-        .unwrap_or_else(|| panic!("a {field} subscription must be accepted"))
+        .unwrap_or_else(|_| panic!("a {field} subscription must be accepted"))
 }
 
 async fn process(db: &PvDatabase) {

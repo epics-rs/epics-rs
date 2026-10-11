@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
+use epics_base_rs::server::pv::SubscribeRefused;
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::server::snapshot::PropertySupport;
 use epics_base_rs::types::DbFieldType;
@@ -2650,7 +2651,13 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // gates this member's events exactly as it gates a
             // single-record monitor's. Re-parsing the suffix here would
             // hand every resubscribe a fresh baseline and never filter.
-            if let Some(sub) = DbSubscription::subscribe_with_mask_and_filters(
+            // pvxs throws out of `onSubscribe` when a member's
+            // `db_add_event` fails (subscriptionctx.h:48): the whole group
+            // monitor fails, it does not open without that member.
+            let refused = |why| {
+                (why == SubscribeRefused::CapReached).then_some(BridgeError::SubscriptionFailed)
+            };
+            match DbSubscription::subscribe_with_mask_and_filters(
                 &self.db,
                 &member.pv_name,
                 0,
@@ -2659,19 +2666,27 @@ impl super::provider::PvaMonitor for GroupMonitor {
             )
             .await
             {
-                // Capture the enable/disable handle BEFORE the subscription
-                // moves into the pump's registration, so the per-op gate
-                // can toggle this member's event flow without owning the sub.
-                // The pump drains with `poll_recv_event` (not a snapshot
-                // read) so the per-event DBE mask reaches the mark
-                // resolution — pvxs reads `pDbFieldLog->mask` for the
-                // self-trigger narrowing.
-                self.activation_handles.push(sub.activation_handle());
-                member_subs.push(super::group_pump::MemberSub {
-                    member_index: idx,
-                    kind: MemberEventKind::Value,
-                    sub,
-                });
+                Err(why) => {
+                    if let Some(e) = refused(why) {
+                        self.activation_handles.clear();
+                        return Err(e);
+                    }
+                }
+                Ok(sub) => {
+                    // Capture the enable/disable handle BEFORE the subscription
+                    // moves into the pump's registration, so the per-op gate
+                    // can toggle this member's event flow without owning the sub.
+                    // The pump drains with `poll_recv_event` (not a snapshot
+                    // read) so the per-event DBE mask reaches the mark
+                    // resolution — pvxs reads `pDbFieldLog->mask` for the
+                    // self-trigger narrowing.
+                    self.activation_handles.push(sub.activation_handle());
+                    member_subs.push(super::group_pump::MemberSub {
+                        member_index: idx,
+                        kind: MemberEventKind::Value,
+                        sub,
+                    });
+                }
             }
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
@@ -2687,7 +2702,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 let prop_mask = epics_base_rs::server::recgbl::EventMask::PROPERTY.bits();
                 // The property channel's INDEPENDENT chain — see
                 // `MemberChannel::property_filters`.
-                if let Some(sub) = DbSubscription::subscribe_with_mask_and_filters(
+                match DbSubscription::subscribe_with_mask_and_filters(
                     &self.db,
                     &member.pv_name,
                     0,
@@ -2696,12 +2711,20 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 )
                 .await
                 {
-                    self.activation_handles.push(sub.activation_handle());
-                    member_subs.push(super::group_pump::MemberSub {
-                        member_index: idx,
-                        kind: MemberEventKind::Property,
-                        sub,
-                    });
+                    Err(why) => {
+                        if let Some(e) = refused(why) {
+                            self.activation_handles.clear();
+                            return Err(e);
+                        }
+                    }
+                    Ok(sub) => {
+                        self.activation_handles.push(sub.activation_handle());
+                        member_subs.push(super::group_pump::MemberSub {
+                            member_index: idx,
+                            kind: MemberEventKind::Property,
+                            sub,
+                        });
+                    }
                 }
             }
         }

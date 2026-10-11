@@ -45,6 +45,7 @@ pub(crate) async fn deliver_monitor_event(
     // delivery was between its ring and the outbox.
     let delivered = m.gate.deliver(|| {
         send_event(
+            m.refusal_channel(),
             m.data_type,
             m.data_count,
             m.sub_id,
@@ -69,6 +70,7 @@ pub(crate) async fn deliver_monitor_event(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_event(
+    chan: super::tcp::RefusalChannel<'_>,
     data_type: u16,
     data_count: u32,
     sub_id: u32,
@@ -80,6 +82,9 @@ pub(crate) fn send_event(
     stage: &super::DeliveryStage,
     reply: super::tcp::ReplyContext,
 ) {
+    if super::tcp::refuse_unframeable_update(outbox, chan, data_type, data_count, stage, reply) {
+        return;
+    }
     let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // The channel's post chain and long-string boundary conversion
     // (`$` → CHAR[40]+NUL, or a long-string record field → scalar
@@ -102,7 +107,7 @@ pub(crate) fn send_event(
     // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
     if encode_dbr_into(frame.dst(), data_type, snapshot).is_err() {
-        super::tcp::send_get_fail_event(outbox, data_type, data_count, sub_id, reply);
+        super::tcp::send_get_fail_event(outbox, chan, data_type, data_count, sub_id, reply);
         return;
     }
     // Size the payload and pick the header count — `size_dbr_reply` owns the
@@ -127,7 +132,14 @@ pub(crate) fn send_event(
         .set_payload_size(frame.payload_len(), element_count, client_minor)
         .is_err()
     {
-        let _ = super::tcp::send_16k_array_client_err(outbox, req_hdr, req_hdr.cid, client_minor);
+        let _ = super::tcp::send_16k_array_client_err(
+            outbox,
+            req_hdr,
+            chan,
+            super::tcp::UnloadedReply::ReadReply,
+            element_count,
+            client_minor,
+        );
         return;
     }
     hdr.data_type = data_type;
@@ -195,6 +207,7 @@ mod tests {
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
         send_event(
+            crate::server::tcp::RefusalChannel { cid: 0, pv: "" },
             DBR_LONG,
             0,
             7,
@@ -290,6 +303,7 @@ mod tests {
             let context: epics_base_rs::server::event_queue::DeliveryContext =
                 Arc::new(crate::server::tcp::CircuitMonitor {
                     target: crate::server::tcp::ChannelTarget::SimplePv(pv.clone()),
+                    cid: 0,
                     sub_id: 1,
                     data_type: DBR_DOUBLE,
                     data_count: 0,

@@ -20,6 +20,7 @@ fn subscribe(db: &PvDatabase, field: &str, sid: u32) -> Option<EventReader> {
         DbFieldType::Double,
         (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
     )
+    .ok()
 }
 
 fn read(db: &PvDatabase, field: &str) -> Option<EpicsValue> {

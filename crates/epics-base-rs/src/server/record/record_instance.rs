@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::server::database::LinkBacking;
 use crate::server::event_queue::{EventReader, EventUser, PostBurst};
-use crate::server::pv::{MonitorEvent, Subscriber};
+use crate::server::pv::{MonitorEvent, SubscribeRefused, Subscriber};
 use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{
     ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
@@ -9705,8 +9705,8 @@ impl RecordInstance {
         }
     }
 
-    /// Add a subscriber for a specific field. Returns `None` when the
-    /// per-field subscriber cap (`EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`)
+    /// Add a subscriber for a specific field. Refuses with
+    /// [`SubscribeRefused::CapReached`] when the per-field subscriber cap (`EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`)
     /// is reached. the parallel cap on `ProcessVariable`
     /// defends against a misbehaving client opening many
     /// MONITOR ops against one shared PV; the same defence is needed
@@ -9718,7 +9718,7 @@ impl RecordInstance {
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
-    ) -> Option<EventReader> {
+    ) -> Result<EventReader, SubscribeRefused> {
         self.add_subscriber_on(
             &EventUser::new(),
             field,
@@ -9743,13 +9743,13 @@ impl RecordInstance {
         data_type: DbFieldType,
         mask: u16,
         context: &crate::server::event_queue::DeliveryContext,
-    ) -> Option<EventReader> {
+    ) -> Result<EventReader, SubscribeRefused> {
         let cap = crate::server::pv::max_subscribers_per_pv();
         // A destroyed record takes no new monitor, so `destroyed => no
         // subscribers` survives a CREATE_CHAN + EVENT_ADD that races the
         // removal. Both are `&mut self`, so there is no window between them.
         if self.destroyed {
-            return None;
+            return Err(SubscribeRefused::NoRecord);
         }
         // Looked up by `&str`: the key is copied only for a field's first
         // monitor, since a bucket outlives its last subscriber.
@@ -9768,14 +9768,7 @@ impl RecordInstance {
             None => 0,
         };
         if live >= cap {
-            tracing::warn!(
-                record = %self.name,
-                field = %field,
-                live,
-                cap,
-                "record field subscriber cap reached, refusing add_subscriber"
-            );
-            return None;
+            return Err(SubscribeRefused::CapReached);
         }
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
         let subscriber = Subscriber {
@@ -9803,7 +9796,7 @@ impl RecordInstance {
                 self.record_value_post(field, val);
             }
         }
-        Some(reader)
+        Ok(reader)
     }
 
     /// Attach a filter to the most recently added subscriber for

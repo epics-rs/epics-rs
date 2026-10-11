@@ -317,3 +317,4 @@ source-guard = { path = "../source-guard" }
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 serial_test = "3"
 tempfile = "3"
+tracing-subscriber = "0.3"

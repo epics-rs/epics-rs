@@ -552,6 +552,164 @@ mod exec_model {
         );
     }
 
+    /// `realtime-ca-ioc` serving one record, booted for a raw client.
+    fn boot_one_record(dir: &std::path::Path) -> Booted {
+        let db = dir.join("one.db");
+        std::fs::write(&db, "record(ai, \"MIS:A\") {}\n").expect("write the db");
+        boot_on_a_named_port(
+            dir,
+            |cmd, port| {
+                cmd.arg(format!("EPICS_CA_NAME_SERVERS=127.0.0.1:{}", closed_port()))
+                    .arg(format!("EPICS_CA_SERVER_PORT={port}"))
+                    .arg(format!("EPICS_CAS_SERVER_PORT={port}"))
+                    .arg("EPICS_CAS_INTF_ADDR_LIST=127.0.0.1")
+                    .arg("EPICS_CAS_BEACON_ADDR_LIST=127.0.0.1")
+                    .arg("EPICS_CA_AUTO_ADDR_LIST=NO")
+                    .arg(&db);
+            },
+            |console| boot_report(console).is_some(),
+        )
+    }
+
+    fn ca_hdr(cmmd: u16, size: u16, dt: u16, count: u16, p1: u32, p2: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(16);
+        for v in [cmmd, size, dt, count] {
+            h.extend_from_slice(&v.to_be_bytes());
+        }
+        h.extend_from_slice(&p1.to_be_bytes());
+        h.extend_from_slice(&p2.to_be_bytes());
+        h
+    }
+
+    /// Send `handshake` on a fresh circuit and read `answered` bytes of reply,
+    /// then send `frames` and read to the server's close; return the client's
+    /// address and every console line naming it, once the disconnect line has
+    /// been written.
+    fn console_for_a_closed_circuit(
+        booted: &Booted,
+        handshake: &[u8],
+        answered: usize,
+        frames: &[u8],
+    ) -> (String, String) {
+        use std::io::Write as _;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
+        c.set_read_timeout(Some(crate::budget::FACT_BUDGET))
+            .unwrap();
+        let peer = c.local_addr().unwrap().to_string();
+        c.write_all(handshake).unwrap();
+        let mut answer = vec![0u8; answered];
+        c.read_exact(&mut answer).expect("the handshake's replies");
+        c.write_all(frames).unwrap();
+        let mut rest = Vec::new();
+        c.read_to_end(&mut rest)
+            .expect("the server closes the circuit");
+
+        let disconnect = format!("CAS: forcing disconnect from {peer}\n");
+        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        let console = loop {
+            let console = booted.console();
+            if console.contains(&disconnect) {
+                break console;
+            }
+            assert!(Instant::now() < deadline, "no disconnect line:\n{console}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let about_the_client = console
+            .split_inclusive('\n')
+            .filter(|l| l.contains(&peer))
+            .collect();
+        (peer, about_the_client)
+    }
+
+    /// The blocking driver's console for a misaligned request is softIoc's:
+    /// `log_header`'s three lines and the disconnect (`camessage.c:2452-2463`,
+    /// `camsgtask.c`), which softIoc 8f5015b66 printed on stderr for this
+    /// frame after an ECHO round trip, and nothing else naming the client.
+    #[test]
+    fn a_misaligned_request_prints_softiocs_lines_and_no_others() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        // VERSION, then an ECHO whose reply proves both were read: softIoc's
+        // greeting VERSION and the ECHO reply are the 32 bytes before it.
+        let handshake = [ca_hdr(0, 0, 0, 13, 0, 0), ca_hdr(23, 0, 0, 0, 0, 0)].concat();
+        let mut frame = ca_hdr(23, 4, 7, 3, 0x1234, 0x55);
+        frame.extend_from_slice(b"abcd");
+        let (peer, console) = console_for_a_closed_circuit(&booted, &handshake, 32, &frame);
+        assert_eq!(
+            console,
+            format!(
+                "CAS: request from {peer} => CAS: Missaligned protocol rejected\n\
+                 CAS: Request from {peer} => cmmd=23 cid=0x1234 type=7 count=3 postsize=4\n\
+                 CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n\
+                 CAS: forcing disconnect from {peer}\n"
+            )
+        );
+    }
+
+    /// The receive gate's other arm, a refusal that keeps the circuit: a
+    /// message before any VERSION is from a client too old to serve
+    /// (`camessage.c:2491-2501`), and softIoc 8f5015b66 printed `log_header`'s
+    /// three lines on stderr for this ECHO, then nothing once the client
+    /// closed.
+    #[test]
+    fn a_too_old_client_prints_softiocs_lines_and_no_others() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
+        c.set_read_timeout(Some(crate::budget::FACT_BUDGET))
+            .unwrap();
+        let peer = c.local_addr().unwrap().to_string();
+        c.write_all(&ca_hdr(23, 0, 0, 0, 0x1234, 0x55)).unwrap();
+        // The greeting VERSION, then the ECA_DEFUNCT frame: its header, the
+        // echoed request and "CAS: Client version 0 too old" padded to 32.
+        let mut answer = [0u8; 80];
+        c.read_exact(&mut answer).expect("VERSION and the refusal");
+        drop(c);
+
+        let last = format!("CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n");
+        let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+        let console = loop {
+            let console = booted.console();
+            if console.contains(&last) {
+                break console;
+            }
+            assert!(Instant::now() < deadline, "no log_header:\n{console}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let about_the_client: String = console
+            .split_inclusive('\n')
+            .filter(|l| l.contains(&peer))
+            .collect();
+        assert_eq!(
+            about_the_client,
+            format!(
+                "CAS: request from {peer} => CAS: Client version too old\n\
+                 CAS: Request from {peer} => cmmd=23 cid=0x1234 type=0 count=0 postsize=0\n\
+                 {last}"
+            )
+        );
+    }
+
+    /// `tcp_version_action` refuses a minor version below 4 and a priority
+    /// above 99 with `RSRV_ERROR` and no line (`camessage.c:368-375`, the
+    /// first under `DLOG(2)` only): softIoc 8f5015b66 printed the disconnect
+    /// alone for each.
+    #[test]
+    fn a_refused_version_prints_only_the_disconnect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        for (minor, priority) in [(3, 0), (13, 100)] {
+            let (peer, console) =
+                console_for_a_closed_circuit(&booted, &[], 0, &ca_hdr(0, 0, priority, minor, 0, 0));
+            assert_eq!(
+                console,
+                format!("CAS: forcing disconnect from {peer}\n"),
+                "minor {minor}, priority {priority}"
+            );
+        }
+    }
+
     /// `build_ioc`'s link passes open the external links at init, before
     /// anything processes: `setup_cp_links` warms the CP link of a Passive
     /// holder, whose monitor is then the only thing that processes it, and

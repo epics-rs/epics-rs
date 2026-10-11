@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{CaError, CaResult};
+use crate::server::pv::SubscribeRefused;
 
 /// Access level for a channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,8 +415,9 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                 Stop,
             }
             let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
-            // Targets not yet attached because their record is not loaded.
-            let mut pending: Vec<(String, String)> = Vec::new();
+            // Targets not yet attached, each with whether its full cap has
+            // been reported: C's exception arrives once per `ca_add_event`.
+            let mut pending: Vec<(String, String, bool)> = Vec::new();
             // Identity of the policy `readers` was built from. A notification this
             // task raises itself does not move it, so the watcher cannot re-enter
             // its own rebuild.
@@ -444,9 +446,25 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                 if id != built_from {
                     built_from = id;
                     readers.clear();
-                    pending = config.map(|c| c.inp_link_targets()).unwrap_or_default();
+                    pending = config
+                        .as_ref()
+                        .map(|c| c.inp_link_targets())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(record, field)| (record, field, false))
+                        .collect();
                 }
-                pending.retain(|(record, field)| !attach_asg_inp(&db, record, field, &mut readers));
+                pending.retain_mut(|(record, field, reported)| {
+                    match attach_asg_inp(&db, record, field, &mut readers) {
+                        Ok(()) => false,
+                        Err(SubscribeRefused::CapReached) if !*reported => {
+                            *reported = true;
+                            report_asg_inp_refused(&db, config.as_deref(), record, field);
+                            true
+                        }
+                        Err(_) => true,
+                    }
+                });
                 drop(db);
 
                 let wake = tokio::select! {
@@ -469,31 +487,69 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
 
 /// Subscribe one `INP*` target to its record's value and alarm events, the
 /// default mask of C's `ca_add_event(DBR_STS_DOUBLE, ...)` (`asCa.c:193`).
-/// `false` = not attached, retry later; the record is not in the database yet,
-/// or its subscriber cap is full (which frees again as clients disconnect, and
-/// losing a security monitor is worth the retry's log noise).
+/// Refused = not attached, retry later; the record is not in the database yet,
+/// or its subscriber cap is full (which frees again as clients disconnect).
 fn attach_asg_inp(
     db: &crate::server::database::PvDatabase,
     record: &str,
     field: &str,
     readers: &mut Vec<crate::server::event_queue::EventReader>,
-) -> bool {
-    let Some(rec) = db.get_record(record) else {
-        return false;
-    };
+) -> Result<(), SubscribeRefused> {
+    let rec = db.get_record(record).ok_or(SubscribeRefused::NoRecord)?;
     let reader = rec.write().add_subscriber(
         field,
         0,
         crate::types::DbFieldType::Double,
         (crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM).bits(),
-    );
-    match reader {
-        Some(reader) => {
-            readers.push(reader);
-            true
-        }
-        None => false,
-    }
+    )?;
+    readers.push(reader);
+    Ok(())
+}
+
+/// asCa.c:79's `exceptionCallback` line for an `ECA_ALLOCMEM` on
+/// `ca_add_event`, with rsrv's `send_err` context (camessage.c:1872) and the
+/// rights rsrv would grant asCa's own circuit.
+fn report_asg_inp_refused(
+    db: &crate::server::database::PvDatabase,
+    config: Option<&AccessSecurityConfig>,
+    record: &str,
+    field: &str,
+) {
+    let Some(rec) = db.get_record(record) else {
+        return;
+    };
+    let (native, (asg, asl)) = {
+        let rec = rec.read();
+        (
+            rec.resolve_field(field),
+            (rec.common.asg.clone(), rec.common.asl),
+        )
+    };
+    let level = config.map_or(AccessLevel::ReadWrite, |c| {
+        let user = std::env::var("USER").unwrap_or_default();
+        c.check_access_asl(&asg, &crate::runtime::env::hostname(), &user, asl)
+    });
+    crate::runtime::log::errlog_printf(&format!(
+        "dbCa:exceptionCallback stat \"Unable to allocate additional dynamic memory\" \
+         channel \"{record}.{field}\" context \"subscription install into record {record} failed\"\n \
+         nativeType {} requestType DBR_STS_DOUBLE nativeCount {} requestCount 0 {} {}\n",
+        native
+            .as_ref()
+            .map_or("DBR_invalid", |v| crate::types::dbr_type_to_text(
+                v.dbr_type() as u16
+            )),
+        native.as_ref().map_or(0, |v| v.count()),
+        if level == AccessLevel::NoAccess {
+            "noReadAccess"
+        } else {
+            "readAccess"
+        },
+        if level == AccessLevel::ReadWrite {
+            "writeAccess"
+        } else {
+            "noWriteAccess"
+        },
+    ));
 }
 
 /// Resolve once any watched link has posted, having drained every queued post

@@ -15,6 +15,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
+use epics_base_rs::server::pv::SubscribeRefused;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -334,16 +335,24 @@ impl SoftScalerPorts {
             let mut inputs = Vec::with_capacity(pv_inputs.names.len());
             let mut values = [0; MAX_SCALER_CHANNELS];
             for (i, pv) in pv_inputs.names.iter().enumerate() {
-                let reader = db.get_record(&pv.record).and_then(|cell| {
-                    cell.write().add_subscriber(
-                        &pv.field,
-                        i as u32,
-                        DbFieldType::Long,
-                        EventMask::VALUE.bits(),
-                    )
-                });
+                let reader = db
+                    .get_record(&pv.record)
+                    .ok_or(SubscribeRefused::NoRecord)
+                    .and_then(|cell| {
+                        cell.write().add_subscriber(
+                            &pv.field,
+                            i as u32,
+                            DbFieldType::Long,
+                            EventMask::VALUE.bits(),
+                        )
+                    });
+                // C `connectPVs` never subscribes (`dbNameToAddr` only), so a
+                // full cap has no C line: the port just fails.
+                if matches!(reader, Err(SubscribeRefused::CapReached)) {
+                    break;
+                }
                 let current = db.get_pv(&format!("{}.{}", pv.record, pv.field)).ok();
-                let (Some(reader), Some(current)) = (reader, current) else {
+                let (Ok(reader), Some(current)) = (reader, current) else {
                     // C asynPrint ASYN_TRACE_ERROR, then `stateFailed`.
                     eprintln!(
                         "drvScalerSoft::connectPVs port {port} can't find PV {}.",

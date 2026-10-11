@@ -181,6 +181,15 @@ impl DeliveryStage {
         }
     }
 
+    /// `read_reply`'s `item_count` for a `requested_count` request
+    /// (`camessage.c:510-514`).
+    pub(crate) fn item_count(&self, requested_count: u32) -> u32 {
+        match requested_count {
+            0 => self.autosize,
+            n => n,
+        }
+    }
+
     /// Whether every event goes out exactly as posted.
     pub(crate) fn is_identity(&self) -> bool {
         self.post.is_none() && self.long_string_mode == LongStringMode::Plain
@@ -193,12 +202,9 @@ impl DeliveryStage {
         event: epics_base_rs::server::pv::MonitorEvent,
         requested_count: u32,
     ) -> Option<epics_base_rs::server::pv::MonitorEvent> {
-        // `read_reply`'s `item_count`: an autosize request reads the field's
-        // own count, which a log the filters grew (`ts`) is cut to.
-        let n_request = match requested_count {
-            0 => self.autosize,
-            n => n,
-        } as usize;
+        // An autosize request reads the field's own count, which a log the
+        // filters grew (`ts`) is cut to.
+        let n_request = self.item_count(requested_count) as usize;
         let mut event = match &self.post {
             // A `$` view's read is already `dbGet`'s chars for this count.
             Some(post) if post.reads_chars() => return post.read_request(event, n_request),

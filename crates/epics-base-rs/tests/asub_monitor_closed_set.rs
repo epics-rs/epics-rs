@@ -109,7 +109,7 @@ fn subscribe(db: &PvDatabase, rec: &str, field: &str, id: u32) -> EventReader {
     let mut g = inst.write();
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     g.add_subscriber(field, id, DbFieldType::Double, full)
-        .unwrap_or_else(|| panic!("a {field} subscription must be accepted"))
+        .unwrap_or_else(|why| panic!("a {field} subscription must be accepted: {why:?}"))
 }
 
 /// The finding's own trigger: `INPA`'s source moves, and `.A` / `.NEA` stay

@@ -11,6 +11,16 @@ use crate::server::event_queue::{
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
 
+/// Why a monitor was not installed. C `db_add_event` returns NULL for both and
+/// each caller prints its own line, so the reason is handed back, not logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeRefused {
+    /// No such record or PV, or it was destroyed.
+    NoRecord,
+    /// The per-PV subscriber cap (`EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`).
+    CapReached,
+}
+
 /// Per-PV subscriber cap. Default 1024 — comfortably above
 /// any realistic dashboard fan-out, small enough to bound the
 /// per-PV `Vec<Subscriber>` under abuse. Override via
@@ -893,7 +903,7 @@ impl ProcessVariable {
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
-    ) -> Option<EventReader> {
+    ) -> Result<EventReader, SubscribeRefused> {
         self.add_subscriber_on(&EventUser::new(), sid, data_type, mask, no_context())
     }
 
@@ -903,7 +913,8 @@ impl ProcessVariable {
     /// `nDuplicates`: a duplicate queued for one of them releases the
     /// EVENTS_OFF drain for all of them (`dbEvent.c:947`).
     ///
-    /// Returns `None` when the per-PV subscriber cap is reached (defends
+    /// Refuses with [`SubscribeRefused::CapReached`] when the per-PV subscriber
+    /// cap is reached (defends
     /// against a misbehaving client opening many MONITOR ops against one shared
     /// PV; the per-channel cap limits channels but not subscriber rows on a
     /// single PV). Operators override it via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
@@ -914,7 +925,7 @@ impl ProcessVariable {
         data_type: DbFieldType,
         mask: u16,
         context: &DeliveryContext,
-    ) -> Option<EventReader> {
+    ) -> Result<EventReader, SubscribeRefused> {
         let cap = max_subscribers_per_pv();
         let mut subs = self.subscribers.lock();
         // A destroyed PV takes no new monitor. The flag is set under this
@@ -922,7 +933,7 @@ impl ProcessVariable {
         // construction and a CREATE_CHAN + EVENT_ADD racing the destruction
         // cannot re-attach to a corpse.
         if self.is_destroyed() {
-            return None;
+            return Err(SubscribeRefused::NoRecord);
         }
         // Reap rows whose consumer is gone BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
@@ -932,17 +943,11 @@ impl ProcessVariable {
         // reaper — a long-lived subscribe / disconnect storm could
         // pin the Vec at `cap` worth of dead rows and lock
         // out genuine new subscribers with a false-positive cap-
-        // reached warning. Same defect class as the
+        // reached refusal. Same defect class as the
         // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:129).
         subs.retain(|s| !s.is_closed());
         if subs.len() >= cap {
-            tracing::warn!(
-                pv = %self.name,
-                live = subs.len(),
-                cap,
-                "PV subscriber cap reached, refusing add_subscriber"
-            );
-            return None;
+            return Err(SubscribeRefused::CapReached);
         }
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
         subs.push(Subscriber {
@@ -953,7 +958,7 @@ impl ProcessVariable {
             filters: crate::server::database::filters::FilterChain::new(),
             active: true,
         });
-        Some(reader)
+        Ok(reader)
     }
 
     /// attach a channel-filter chain to an already-added
@@ -1103,13 +1108,13 @@ pub struct PvSubscription {
 }
 
 impl PvSubscription {
-    /// Register a value-change monitor on `pv`. Returns `None` when the
-    /// per-PV subscriber cap is reached. The caller emits the initial
+    /// Register a value-change monitor on `pv`, refused when the per-PV
+    /// subscriber cap is reached. The caller emits the initial
     /// snapshot itself (pvxs `SharedPV::attach` posts the current value
     /// before storing the subscriber); registering the subscriber *before*
     /// reading that snapshot is the miss-free ordering — a PUT racing the
     /// two is then delivered through the stream rather than lost.
-    pub async fn subscribe(pv: Arc<ProcessVariable>) -> Option<Self> {
+    pub async fn subscribe(pv: Arc<ProcessVariable>) -> Result<Self, SubscribeRefused> {
         use crate::server::recgbl::EventMask;
         // VALUE|LOG matches the record-side `DbSubscription` default so
         // simple-PV and record-backed monitors gate identically; a
@@ -1120,7 +1125,7 @@ impl PvSubscription {
         // the full `Snapshot` and gates only on mask/filters, never on the
         // stored type — `DbSubscription` likewise registers as `Double`.
         let reader = pv.add_subscriber(sid, DbFieldType::Double, mask)?;
-        Some(Self { reader, pv })
+        Ok(Self { reader, pv })
     }
 
     /// Await the next value change as a full `Snapshot`. A consumer that falls
@@ -2017,7 +2022,7 @@ mod destruction_tests {
         assert!(
             removed
                 .add_subscriber(1, DbFieldType::Double, u16::MAX)
-                .is_none(),
+                .is_err(),
             "a CREATE_CHAN + EVENT_ADD racing the removal must not re-attach"
         );
     }

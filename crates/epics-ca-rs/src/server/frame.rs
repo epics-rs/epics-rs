@@ -296,6 +296,18 @@ pub(crate) fn size_dbr_reply(
     requested_count
 }
 
+/// C `cas_copy_in_header`'s refusal (`caserverio.c:262-270`) of a reply
+/// header for `count` elements of `data_type`: whether a client of
+/// `client_minor` cannot be sent it.
+pub(crate) fn header_refused(data_type: u16, count: u32, client_minor: u16) -> bool {
+    let payload = epics_base_rs::types::native_type_for_dbr(data_type).map_or(0, |native| {
+        epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize)
+    });
+    CaHeader::new(0)
+        .set_payload_size(align8(payload), count, client_minor)
+        .is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

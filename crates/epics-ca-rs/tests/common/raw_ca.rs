@@ -65,7 +65,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use epics_ca_rs::protocol::{
     CA_MINOR_VERSION, CA_PROTO_ACCESS_RIGHTS, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CLIENT_NAME,
-    CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
+    CA_PROTO_CREATE_CHAN, CA_PROTO_ECHO, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
     CA_PROTO_HOST_NAME, CA_PROTO_READ_NOTIFY, CA_PROTO_VERSION, CaHeader, pad_string,
 };
 use epics_ca_rs::server::blocking::BlockingCaServer;
@@ -409,14 +409,10 @@ pub fn clear_channel_frame(sid: u32, cid: u32) -> Vec<u8> {
 }
 
 /// Open a circuit and complete the CA handshake: our VERSION + CLIENT_NAME +
-/// HOST_NAME out, and **both** of the server's VERSION frames in.
-///
-/// Two are due, and claiming only one is what a discarding reader let pass: C
-/// `create_tcp_client` (`caservertask.c:1526`, mirrored at `blocking.rs:637`)
-/// sends an unsolicited greeting as the server's very first frame, and the
-/// dispatch handler then answers our own VERSION request. Leaving the second
-/// queued would surface much later as an unexplained frame under some
-/// unrelated expectation.
+/// HOST_NAME out, and the server's one VERSION in: C `create_tcp_client`
+/// (`caservertask.c:1525`) greets with it, and `tcp_version_action` answers
+/// our own VERSION with nothing, so an ECHO round trip is what proves the
+/// three are consumed and the caller's next frame is read on its own.
 pub fn connect_and_handshake(addr: SocketAddr) -> Circuit {
     let mut c = Circuit::new(TcpStream::connect(addr).expect("connect to blocking server"));
     c.send(&version_frame());
@@ -428,15 +424,16 @@ pub fn connect_and_handshake(addr: SocketAddr) -> Circuit {
         CA_MINOR_VERSION,
         "server advertises its CA minor version in the greeting"
     );
-    let _echo = c.expect(CA_PROTO_VERSION, "VERSION answering our own");
+    c.send(&CaHeader::new(CA_PROTO_ECHO).to_bytes());
+    c.expect(CA_PROTO_ECHO, "ECHO behind the handshake");
     c
 }
 
 /// CREATE_CHAN for `pv`; returns the server-assigned sid.
 ///
-/// Claims the ACCESS_RIGHTS frame the server sends alongside the reply. Like
-/// the second VERSION above, it is not optional — it was simply invisible
-/// while the reader discarded whatever it was not looking for.
+/// Claims the ACCESS_RIGHTS frame the server sends alongside the reply. It is
+/// not optional — it was simply invisible while the reader discarded whatever
+/// it was not looking for.
 pub fn create_channel(c: &mut Circuit, cid: u32, pv: &str) -> u32 {
     c.send(&create_chan_frame(cid, pv));
     let replies = c.expect_all(

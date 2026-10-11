@@ -167,6 +167,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/put_native_type_conversion.rs"),
     ("epics-ca-rs", "tests/rate_limit_parity.rs"),
     ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
+    ("epics-ca-rs", "tests/rsrv_error_frame_matches_softioc.rs"),
     ("epics-ca-rs", "tests/scalar_string_write_needs_a_nul.rs"),
     ("epics-ca-rs", "tests/softioc_db_channel_create_line.rs"),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),

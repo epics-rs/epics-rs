@@ -68,7 +68,7 @@ async fn nord_sub(db: &PvDatabase, rec: &str) -> EventReader {
     let r = db.get_record(rec).unwrap();
     let mut inst = r.write();
     inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
-        .unwrap_or_else(|| panic!("{rec}.NORD subscription accepted"))
+        .unwrap_or_else(|_| panic!("{rec}.NORD subscription accepted"))
 }
 
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {

@@ -510,6 +510,10 @@ impl SearchReplyBatch {
     }
 }
 
+/// `log_header`'s context at each of C's three empty-name refusals,
+/// `claim_ciu_action`, `search_reply_udp` and `search_reply_tcp`.
+pub(crate) const EMPTY_PV_NAME: &str = "empty PV name in UDP search request?";
+
 /// Parse one inbound UDP datagram's CA messages (VERSION + SEARCH),
 /// appending SEARCH-reply bytes to `batch`. This is the shared
 /// decode/respond core of the CA UDP name-search responder: the async
@@ -650,9 +654,9 @@ pub(crate) async fn parse_search_datagram(
             if !crate::protocol::declares_supported_version(&hdr) {
                 break;
             }
-            // C `search_reply_udp` (rsrv/camessage.c:2159-2163) rejects
-            // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
-            // search request") and silently returns RSRV_OK. The
+            // C `search_reply_udp` (rsrv/camessage.c:2210-2214) rejects
+            // SEARCH whose `m_postsize <= 1` with `log_header` ("empty PV
+            // name in UDP search request?") and returns RSRV_OK. The
             // null-terminator alone is 1 byte; a usable PV name
             // needs at least one non-null byte plus the terminator
             // (postsize >= 2). Without this guard the Rust path
@@ -663,6 +667,7 @@ pub(crate) async fn parse_search_datagram(
             // named "" (impossible in practice, but the C side
             // documents the reject and we match it).
             if hdr.postsize <= 1 {
+                crate::server::tcp::print_log_header(lookup_src, &hdr, EMPTY_PV_NAME, 0, None);
                 offset += msg_len;
                 continue;
             }

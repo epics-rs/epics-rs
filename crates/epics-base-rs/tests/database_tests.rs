@@ -7231,6 +7231,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         let mut nord_rx = if let Some(rec) = db.get_record(name) {
             let mut inst = rec.write();
             inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
+                .ok()
         } else {
             None
         }
@@ -7351,6 +7352,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     let mut aux_rx = if let Some(rec) = db.get_record("ASYNC_GATE") {
         let mut inst = rec.write();
         inst.add_subscriber("AUX", 7, DbFieldType::Double, EventMask::VALUE.bits())
+            .ok()
     } else {
         None
     }
@@ -7442,8 +7444,12 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
     // the next change is treated as new.
     let (mut nord_rx, mut val_rx) = if let Some(rec) = db.get_record("WF_GW") {
         let mut inst = rec.write();
-        let n = inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits());
-        let v = inst.add_subscriber("VAL", 2, DbFieldType::Double, EventMask::VALUE.bits());
+        let n = inst
+            .add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            .ok();
+        let v = inst
+            .add_subscriber("VAL", 2, DbFieldType::Double, EventMask::VALUE.bits())
+            .ok();
         (n, v)
     } else {
         (None, None)
@@ -7619,6 +7625,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
     let mut val_rx = if let Some(rec) = db.get_record("ASYNC_TS") {
         let mut inst = rec.write();
         inst.add_subscriber("VAL", 9, DbFieldType::Double, EventMask::VALUE.bits())
+            .ok()
     } else {
         None
     }
@@ -7875,6 +7882,7 @@ async fn test_compress_res_write_posts_val_monitor() {
     let mut val_rx = if let Some(rec) = db.get_record("CMP_RES") {
         let mut inst = rec.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .ok()
     } else {
         None
     }

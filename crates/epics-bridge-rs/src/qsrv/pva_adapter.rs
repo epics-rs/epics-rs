@@ -468,7 +468,16 @@ async fn open_monitor(
             .ok()?
             .with_queue_size(opts.queue_size),
     };
-    monitor.start().await.ok()?;
+    if let Err(e) = monitor.start().await {
+        // servermon.cpp:598, logging what `onSubscribe` threw.
+        if matches!(e, crate::error::BridgeError::SubscriptionFailed) {
+            tracing::error!(
+                "Client {} Monitor \"{name}\" onSubscribe() error: {e}",
+                ctx.peer
+            );
+        }
+        return None;
+    }
     Some(OpenedMonitor::Db(monitor))
 }
 
@@ -2726,6 +2735,112 @@ mod tests {
             matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
             "post-put VAL must be 2.5, got {val1:?}"
         );
+    }
+
+    /// A full subscriber cap on a record refuses its single-record monitor
+    /// and every group monitor that has it as a member, with pvxs's line:
+    /// subscriptionctx.h:48 throws out of `onSubscribe` and servermon.cpp:598
+    /// logs it at ERR. The group fails whole, as groupsource.cpp's throw does,
+    /// so its other member keeps no subscription.
+    #[epics_base_rs::epics_test]
+    async fn a_full_subscriber_cap_refuses_single_and_group_monitors_with_pvxss_line() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        let db = Arc::new(PvDatabase::new());
+        for name in ["CAP:a", "CAP:b"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        let full = db.get_record("CAP:b").unwrap();
+        let held: Vec<_> = (1..)
+            .map_while(|sid| {
+                full.write()
+                    .add_subscriber("VAL", sid, epics_base_rs::types::DbFieldType::Double, 1)
+                    .ok()
+            })
+            .collect();
+        assert!(!held.is_empty());
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider
+            .load_group_config(
+                r#"{"CAP:GRP": {
+                    "a": {"+channel": "CAP:a.VAL", "+type": "plain"},
+                    "b": {"+channel": "CAP:b.VAL", "+type": "plain"}
+                }}"#,
+            )
+            .expect("load group");
+        provider.process_groups().await;
+        let store = QsrvPvStore::new(crate::test_reactor(), provider);
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = buf.clone();
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || LogBuf(writer.clone()))
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .with_target(false)
+                .with_ansi(false)
+                .finish(),
+        );
+        let peer: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        for name in ["CAP:b", "CAP:GRP"] {
+            let checked = AccessGate::open()
+                .check(name, "127.0.0.1", "anonymous", "anonymous", "")
+                .await;
+            let ctx = ChannelContext {
+                peer,
+                creds: std::sync::Arc::new(
+                    epics_pva_rs::server_native::config::ClientCredentials {
+                        account: "anonymous".into(),
+                        method: "anonymous".into(),
+                        host: "127.0.0.1".into(),
+                        authority: String::new(),
+                        roles: Vec::new(),
+                    },
+                ),
+                pv_request: None,
+                log: Default::default(),
+            };
+            let opened = store
+                .subscribe_checked_opts_marked(checked, ctx, Default::default())
+                .await;
+            assert!(opened.is_none(), "{name}: the cap refuses the monitor");
+        }
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            format!(
+                "ERROR Client {peer} Monitor \"CAP:b\" onSubscribe() error: Failed to create db subscription\n\
+                 ERROR Client {peer} Monitor \"CAP:GRP\" onSubscribe() error: Failed to create db subscription\n"
+            )
+        );
+        // A new subscriber reaps closed rows first, so only it remains when
+        // the group left nothing live behind.
+        let other = db.get_record("CAP:a").unwrap();
+        let _probe = other
+            .write()
+            .add_subscriber("VAL", 1, epics_base_rs::types::DbFieldType::Double, 1)
+            .expect("under the cap");
+        assert_eq!(
+            other.read().subscribers["VAL"].len(),
+            1,
+            "the failed group keeps no subscription on its other member"
+        );
+    }
+
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// Regression: `get_value_checked` must forward the INIT

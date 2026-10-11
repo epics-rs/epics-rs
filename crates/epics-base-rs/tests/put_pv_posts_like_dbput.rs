@@ -57,7 +57,7 @@ fn subscribe(db: &PvDatabase, rec: &str, field: &str, dbf: DbFieldType) -> Event
     let r = db.get_record(rec).unwrap();
     let mut inst = r.write();
     inst.add_subscriber(field, 1, dbf, EventMask::VALUE.bits())
-        .unwrap_or_else(|| panic!("{rec}.{field} subscription accepted"))
+        .unwrap_or_else(|_| panic!("{rec}.{field} subscription accepted"))
 }
 
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {

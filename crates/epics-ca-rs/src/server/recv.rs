@@ -155,6 +155,21 @@ pub(crate) struct GateError {
     pub(crate) mnum: u32,
 }
 
+impl GateError {
+    /// C `bad_tcp_cmd_action` (`camessage.c:342-357`): `ECA_INTERNAL` with
+    /// the same text as diagnostic and `log_header` context, and `RSRV_ERROR`.
+    pub(crate) fn bad_tcp_command(hdr: CaHeader) -> Self {
+        GateError {
+            hdr,
+            status: ECA_INTERNAL,
+            diagnostic: BAD_TCP_COMMAND_DIAGNOSTIC.to_string(),
+            // `bad_tcp_cmd_action` passes 0 (`camessage.c:346`).
+            context: BAD_TCP_COMMAND_DIAGNOSTIC,
+            mnum: 0,
+        }
+    }
+}
+
 /// What [`RecvAccumulator::next_message`] decided about the bytes at the parse
 /// cursor — **the one place C's `RSRV_OK`/`RSRV_ERROR` distinction is
 /// represented in this crate.**
@@ -542,14 +557,7 @@ impl RecvAccumulator {
         self.nmsg += 1;
         if !is_legal_tcp_command(hdr.cmmd) {
             return Gate::TearDown {
-                error: Some(GateError {
-                    hdr,
-                    status: ECA_INTERNAL,
-                    diagnostic: BAD_TCP_COMMAND_DIAGNOSTIC.to_string(),
-                    // `bad_tcp_cmd_action` passes 0 (`camessage.c:346`).
-                    context: BAD_TCP_COMMAND_DIAGNOSTIC,
-                    mnum: 0,
-                }),
+                error: Some(GateError::bad_tcp_command(hdr)),
                 reason: CaError::Protocol(format!(
                     "illegal TCP command {} (C bad_tcp_cmd_action)",
                     hdr.cmmd

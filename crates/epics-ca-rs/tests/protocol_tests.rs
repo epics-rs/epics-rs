@@ -883,14 +883,14 @@ async fn server_echo_round_trips_request_header_and_payload() {
         .await
         .expect("connect");
 
-    // Handshake: send VERSION, drain BOTH server VERSION frames
-    // (unsolicited VERSION on accept + VERSION reply = 32 bytes).
+    // Handshake: send VERSION, drain the server's one VERSION, its greeting
+    // on accept; softIoc answers the client's VERSION with nothing.
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut buf = [0u8; 64];
     let mut drained = 0;
-    while drained < 32 {
+    while drained < 16 {
         let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION drain timed out")
@@ -901,8 +901,8 @@ async fn server_echo_round_trips_request_header_and_payload() {
         drained += n;
     }
     assert!(
-        drained >= 32,
-        "expected 2 VERSION frames; got {drained} bytes"
+        drained >= 16,
+        "expected 1 VERSION frame; got {drained} bytes"
     );
 
     // Send CA_PROTO_ECHO with a non-trivial header AND an 8-byte
@@ -1009,14 +1009,11 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
 
-    // server emits an unsolicited VERSION when the circuit
-    // becomes ready in addition to the handshake VERSION echo, so the
-    // post-handshake drain must consume up to 2 VERSION frames
-    // (32 bytes total) before the bad-SID cancel is written. Drain
-    // until we've seen 32 bytes.
+    // The server's one VERSION is its greeting on accept; drain it before
+    // the bad-SID cancel is written.
     let mut buf = [0u8; 64];
     let mut drained = 0usize;
-    while drained < 32 {
+    while drained < 16 {
         let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION reply timed out")
@@ -1027,8 +1024,8 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
         drained += n;
     }
     assert!(
-        drained >= 32,
-        "expected 2 VERSION frames (32 bytes); got {drained} bytes"
+        drained >= 16,
+        "expected 1 VERSION frame (16 bytes); got {drained} bytes"
     );
 
     // Send EVENT_CANCEL with an SID that was never opened. The server
@@ -1129,18 +1126,15 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
         .await
         .expect("connect");
 
-    // server now emits an unsolicited VERSION immediately
-    // after accept (libca `rsrv_version_reply` parity). The client
-    // therefore receives two CA_PROTO_VERSION frames before any
-    // command-specific reply: one unsolicited, one in response to
-    // our VERSION below. Drain both so the subsequent reads see
+    // The server's one VERSION is its greeting on accept
+    // (`rsrv_version_reply`); drain it so the subsequent reads see
     // the unknown-cmd CA_PROTO_ERROR cleanly.
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut buf = [0u8; 64];
     let mut got = 0;
-    while got < 32 {
+    while got < 16 {
         let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[got..]))
             .await
             .expect("server VERSION drain timed out")
@@ -1151,8 +1145,8 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
         got += n;
     }
     assert!(
-        got >= 32,
-        "expected two CA_PROTO_VERSION frames; got {got} bytes"
+        got >= 16,
+        "expected one CA_PROTO_VERSION frame; got {got} bytes"
     );
 
     // Send a TCP frame with an unknown command code. CA_PROTO_LAST_CMMD
@@ -2075,10 +2069,10 @@ async fn server_read_notify_bad_type_closes_silently() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
-    // drain BOTH server VERSION frames (unsolicited + reply).
+    // drain the server's VERSION greeting.
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
-    while got_hello < 32 {
+    while got_hello < 16 {
         let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
@@ -2208,10 +2202,10 @@ async fn server_read_sync_echoes_request_header() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
-    // drain both VERSION frames (unsolicited + reply).
+    // drain the server's VERSION greeting.
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
-    while got_hello < 32 {
+    while got_hello < 16 {
         let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
@@ -2221,10 +2215,7 @@ async fn server_read_sync_echoes_request_header() {
         }
         got_hello += n;
     }
-    assert!(
-        got_hello >= 32,
-        "expected 2 VERSION frames; got {got_hello}"
-    );
+    assert!(got_hello >= 16, "expected 1 VERSION frame; got {got_hello}");
 
     // Send READ_SYNC with distinctive field values to verify echo.
     let mut sync = CaHeader::new(CA_PROTO_READ_SYNC);

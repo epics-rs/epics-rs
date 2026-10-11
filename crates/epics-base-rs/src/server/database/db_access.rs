@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::error::CaResult;
 use crate::server::event_queue::{EventReader, TryRecvError};
-use crate::server::pv::MonitorEvent;
+use crate::server::pv::{MonitorEvent, SubscribeRefused};
 use crate::server::recgbl::EventMask;
 use crate::types::{DbFieldType, EpicsValue};
 
@@ -338,8 +338,9 @@ impl SubscriptionActivation {
 }
 
 impl DbSubscription {
-    /// Subscribe to a record field. Returns `None` if the record doesn't exist.
-    pub async fn subscribe(db: &PvDatabase, pv_name: &str) -> Option<Self> {
+    /// Subscribe to a record field, refused with the reason the monitor was
+    /// not installed.
+    pub async fn subscribe(db: &PvDatabase, pv_name: &str) -> Result<Self, SubscribeRefused> {
         Self::subscribe_filtered(db, pv_name, 0).await
     }
 
@@ -349,7 +350,7 @@ impl DbSubscription {
         db: &PvDatabase,
         pv_name: &str,
         ignore_origin: u64,
-    ) -> Option<Self> {
+    ) -> Result<Self, SubscribeRefused> {
         let mask = (EventMask::VALUE | EventMask::LOG).bits();
         Self::subscribe_with_mask(db, pv_name, ignore_origin, mask).await
     }
@@ -363,7 +364,7 @@ impl DbSubscription {
         pv_name: &str,
         ignore_origin: u64,
         mask: u16,
-    ) -> Option<Self> {
+    ) -> Result<Self, SubscribeRefused> {
         Self::subscribe_with_mask_and_filters(db, pv_name, ignore_origin, mask, None).await
     }
 
@@ -378,10 +379,12 @@ impl DbSubscription {
         ignore_origin: u64,
         mask: u16,
         filters: Option<&crate::server::database::filters::FilterChain>,
-    ) -> Option<Self> {
+    ) -> Result<Self, SubscribeRefused> {
         let (record_name, field) = parse_pv_name(pv_name);
         let field = field.to_ascii_uppercase();
-        let rec = db.get_record(record_name)?;
+        let rec = db
+            .get_record(record_name)
+            .ok_or(SubscribeRefused::NoRecord)?;
         let sid = next_sid();
         let (pre, post) = filters.map(|chain| chain.split()).unwrap_or_default();
         let reader = {
@@ -392,7 +395,7 @@ impl DbSubscription {
             }
             reader
         };
-        Some(Self {
+        Ok(Self {
             pv_name: pv_name.to_string(),
             ignore_origin,
             id: reader.id(),
@@ -617,11 +620,13 @@ impl DbMultiMonitor {
     }
 
     /// Create subscriptions with origin filtering. Events from `ignore_origin`
-    /// are silently skipped in `wait_change`.
+    /// are silently skipped in `wait_change`. A refused PV is skipped without a
+    /// line: C's sequencer monitors through a CA circuit, where a refusal is
+    /// OOM-only and reaches CA's default exception handler.
     pub async fn new_filtered(db: &PvDatabase, pv_names: &[String], ignore_origin: u64) -> Self {
         let mut subs = Vec::new();
         for name in pv_names {
-            if let Some(sub) = DbSubscription::subscribe_filtered(db, name, ignore_origin).await {
+            if let Ok(sub) = DbSubscription::subscribe_filtered(db, name, ignore_origin).await {
                 subs.push(sub);
             }
         }

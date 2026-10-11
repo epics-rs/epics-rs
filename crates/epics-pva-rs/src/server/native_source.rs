@@ -1390,6 +1390,8 @@ impl ChannelSource for PvDatabaseSource {
                 Some(value_filters),
             )
             .await
+            .map_err(|why| report_subscribe_refused(why, peer, &name))
+            .ok()
             .map(|sub| render.subscribed(sub))?;
             let property_sub = DbSubscription::subscribe_with_mask_and_filters(
                 &db,
@@ -1399,6 +1401,8 @@ impl ChannelSource for PvDatabaseSource {
                 Some(property_filters),
             )
             .await
+            .map_err(|why| report_subscribe_refused(why, peer, &name))
+            .ok()
             .map(|sub| render.subscribed(sub))?;
             // The subscriptions ARE the stream: `marked_update` runs as the
             // server pulls, so no task stands between them.
@@ -1437,7 +1441,7 @@ impl ChannelSource for PvDatabaseSource {
                     // `ProcessVariable::set` -> `notify_subscribers`.
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
-                        Some(sub) => {
+                        Ok(sub) => {
                             let initial = snapshot_to_pv_field(&pv.snapshot());
                             // The seed rides on the stream and is handed out
                             // ahead of the subscription's own events, exactly
@@ -1449,7 +1453,7 @@ impl ChannelSource for PvDatabaseSource {
                                 UpstreamMonitor::from_pv(sub, event_field).with_seed(initial),
                             ))
                         }
-                        None => {
+                        Err(_) => {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
                             // the current value, then end the stream.
@@ -1477,6 +1481,7 @@ impl ChannelSource for PvDatabaseSource {
                         Some(&filters),
                     )
                     .await
+                    .ok()
                     .map(|sub| render.subscribed(sub))?;
                     Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
                         sub,
@@ -1492,6 +1497,21 @@ impl ChannelSource for PvDatabaseSource {
                 }
             }
         }
+    }
+}
+
+/// pvxs's line for a `db_add_event` that returned NULL: subscriptionctx.h:48
+/// throws "Failed to create db subscription" out of `onSubscribe`, and
+/// servermon.cpp:598 logs it at ERR. A missing record is not that refusal.
+fn report_subscribe_refused(
+    why: epics_base_rs::server::pv::SubscribeRefused,
+    peer: std::net::SocketAddr,
+    name: &str,
+) {
+    if why == epics_base_rs::server::pv::SubscribeRefused::CapReached {
+        tracing::error!(
+            "Client {peer} Monitor \"{name}\" onSubscribe() error: Failed to create db subscription"
+        );
     }
 }
 
@@ -5153,6 +5173,67 @@ ASG(PLAIN) {
             .subscribe_checked_opts_marked(checked, ctx, opts)
             .await
             .expect("record subscribe")
+    }
+
+    /// A record field whose subscriber cap is full refuses the monitor with
+    /// pvxs's line: subscriptionctx.h:48 throws "Failed to create db
+    /// subscription" out of `onSubscribe`, servermon.cpp:598 logs it at ERR.
+    #[epics_macros_rs::epics_test]
+    async fn a_full_subscriber_cap_refuses_the_monitor_with_pvxss_line() {
+        use crate::server_native::source::MonitorOptions;
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:CAP", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:CAP").unwrap();
+        let held: Vec<_> = (1..)
+            .map_while(|sid| {
+                rec.write()
+                    .add_subscriber("VAL", sid, epics_base_rs::types::DbFieldType::Double, 1)
+                    .ok()
+            })
+            .collect();
+        assert!(!held.is_empty());
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("h", "alice", "anonymous");
+        let peer = ctx.peer;
+        let checked = source
+            .access()
+            .check("AI:CAP", "h", "alice", "anonymous", "")
+            .await;
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = buf.clone();
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || LogBuf(writer.clone()))
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .with_target(false)
+                .with_ansi(false)
+                .finish(),
+        );
+        let opened = source
+            .subscribe_checked_opts_marked(checked, ctx, MonitorOptions::default())
+            .await;
+        assert!(opened.is_none(), "the cap refuses the monitor");
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            format!(
+                "ERROR Client {peer} Monitor \"AI:CAP\" onSubscribe() error: Failed to create db subscription\n"
+            )
+        );
+    }
+
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// pvxs opens the value subscription with the client's

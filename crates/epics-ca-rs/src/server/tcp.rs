@@ -592,7 +592,11 @@ impl PutNotifySlot {
     /// `epicsEventWaitWithTimeout` does to the client's receive thread — so a
     /// `CA_PROTO_ECHO` queued behind a second put-callback is answered late on
     /// both. The database below is reached only after this returns.
-    async fn serialize(&self, writer: &Outbox) -> CaResult<()> {
+    ///
+    /// `peer` and `paddr` are what C's `log_header` prints for a timed-out
+    /// predecessor: the client and the address of the channel the saved `msg`
+    /// addresses, as an integer so the future stays `Send`.
+    async fn serialize(&self, writer: &Outbox, peer: &str, paddr: usize) -> CaResult<()> {
         // Taken out for the duration of the wait, not consulted in place: this
         // channel's one receive loop is both the only reader of the slot and
         // the thread that waits, so holding the registration here removes the
@@ -622,11 +626,27 @@ impl PutNotifySlot {
         let Some(reply_token) = reg.completion.claim() else {
             return Ok(());
         };
+        // C logs the saved `msg`, copied after the count clamp
+        // (`camessage.c:1775`), before the frame (`:1742-1745`).
+        let mut msg = reg.reply.req_hdr;
+        if msg.extended_count.is_some() {
+            msg.extended_count = Some(reg.reply.write_count);
+        } else {
+            msg.count = reg.reply.write_count as u16;
+        }
+        print_log_header(
+            peer,
+            &msg,
+            "put call back time out",
+            0,
+            Some(std::ptr::without_provenance(paddr)),
+        );
         // Dropping the token un-completed closes the put-log bracket with the
         // guard's cancel AfterWrite — C `asTrapWriteAfter(asWritePvtTmp)`.
         drop(reply_token);
         send_put_notify_response(
             writer,
+            NotifyReplyKind::Error,
             reg.reply.write_type,
             reg.reply.write_count,
             ECA_PUTCBINPROG,
@@ -702,12 +722,15 @@ struct ChannelEntry {
     /// is stored with the id because revoking it is the one teardown step
     /// that must happen before the delete-confirmed echo is queued, and it is
     /// driver-neutral.
-    subscriptions: HashMap<u32, ChannelMonitor>,
+    /// In install order, as C `pciu->eventq`: a sub_id may be installed twice
+    /// and EVENT_CANCEL takes the first.
+    subscriptions: Vec<ChannelMonitor>,
 }
 
 /// One monitor as its channel knows it: what CLEAR_CHANNEL and an access
 /// re-evaluation need, whichever driver holds the producer.
 pub(crate) struct ChannelMonitor {
+    pub sub_id: u32,
     pub gate: crate::server::outbox::MonitorGate,
     /// C `asCheckGet` as `read_reply` sees it; flipped by
     /// [`reeval_access_rights`].
@@ -716,6 +739,13 @@ pub(crate) struct ChannelMonitor {
 }
 
 impl ChannelEntry {
+    fn refusal_channel(&self) -> RefusalChannel<'_> {
+        RefusalChannel {
+            cid: self.cid,
+            pv: self.target.rsrv_record_name(),
+        }
+    }
+
     /// parse a FRESH channel-filter chain from this channel's
     /// stored `.{...}` suffix. A fresh chain per call is REQUIRED:
     /// stateful filters (`dbnd` last-value, `dec` counter, `sync` state)
@@ -746,6 +776,7 @@ impl ChannelEntry {
 }
 
 struct SubscriptionEntry {
+    sub_id: u32,
     target: ChannelTarget,
     channel_sid: u32,
     data_type: u16,
@@ -771,7 +802,8 @@ struct SubscriptionEntry {
 /// front-ends share this state and the dispatch handlers verbatim.
 pub(crate) struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
-    subscriptions: HashMap<u32, SubscriptionEntry>,
+    /// Keyed by slot, never sub_id, which a client may install twice.
+    subscriptions: HashMap<epics_base_rs::server::event_queue::AttachId, SubscriptionEntry>,
     channel_access: HashMap<u32, AccessLevel>,
     /// per-SID write-trap mask of the ACF rule that resolved
     /// the channel's access level. Kept parallel to `channel_access`
@@ -795,7 +827,7 @@ pub(crate) struct ClientState {
     /// registry. Drained by the driver after each dispatch — see
     /// [`ClientState::take_retired_subscriptions`]. Empty for the async
     /// server, which owns `subscriptions` and finishes in place.
-    retired_subscriptions: Vec<u32>,
+    retired_subscriptions: Vec<epics_base_rs::server::event_queue::AttachId>,
     /// This circuit's access-security host identity. See [`HostIdentity`]
     /// — the variant, not a runtime check at the write site, decides
     /// whether `CA_PROTO_HOST_NAME` may replace it.
@@ -931,18 +963,39 @@ impl ClientState {
     /// The single owner of the channel→monitor association, so both drivers
     /// register through it and [`destroy_channel`] can cancel a cleared
     /// channel's monitors without knowing which registry holds them.
-    pub(crate) fn link_subscription(&mut self, sid: u32, sub_id: u32, monitor: ChannelMonitor) {
+    pub(crate) fn link_subscription(&mut self, sid: u32, monitor: ChannelMonitor) {
         if let Some(chan) = self.channels.get_mut(&sid) {
-            chan.subscriptions.insert(sub_id, monitor);
+            chan.subscriptions.push(monitor);
         }
+    }
+
+    /// The monitor EVENT_CANCEL addresses: the first on the channel's eventq
+    /// with this sub_id (C `event_cancel_reply`, `camessage.c:2057-2063`).
+    pub(crate) fn find_subscription(
+        &self,
+        sid: u32,
+        sub_id: u32,
+    ) -> Option<epics_base_rs::server::event_queue::AttachId> {
+        self.channels
+            .get(&sid)?
+            .subscriptions
+            .iter()
+            .find(|m| m.sub_id == sub_id)
+            .map(|m| m.id)
     }
 
     /// Unlink a cancelled subscription from its channel — C
     /// `event_cancel_reply`'s `ellDelete` on `pciu->eventq`
     /// (`camessage.c:2019`).
-    pub(crate) fn unlink_subscription(&mut self, sid: u32, sub_id: u32) {
-        if let Some(chan) = self.channels.get_mut(&sid) {
-            chan.subscriptions.remove(&sub_id);
+    pub(crate) fn unlink_subscription(
+        &mut self,
+        sid: u32,
+        id: epics_base_rs::server::event_queue::AttachId,
+    ) {
+        if let Some(chan) = self.channels.get_mut(&sid)
+            && let Some(at) = chan.subscriptions.iter().position(|m| m.id == id)
+        {
+            chan.subscriptions.remove(at);
         }
     }
 
@@ -954,7 +1007,9 @@ impl ClientState {
     /// A driver that keeps its producers elsewhere — the blocking one hands
     /// readers to its event thread — drains this after every dispatch and
     /// finishes its own half. Empty for the async server.
-    pub(crate) fn take_retired_subscriptions(&mut self) -> Vec<u32> {
+    pub(crate) fn take_retired_subscriptions(
+        &mut self,
+    ) -> Vec<epics_base_rs::server::event_queue::AttachId> {
         std::mem::take(&mut self.retired_subscriptions)
     }
 
@@ -1074,6 +1129,25 @@ impl ClientState {
     /// (`send_ca_error`) from outside this module.
     pub(crate) fn client_minor_version(&self) -> u16 {
         self.client_minor_version
+    }
+
+    /// C `vsend_err`'s `m_cid` (`camessage.c:162-191`): the client's cid of
+    /// the live channel a channel request names, the request's own cid for a
+    /// SEARCH, and `0xffffffff` for anything else.
+    pub(crate) fn send_err_cid(&self, hdr: &CaHeader) -> u32 {
+        match hdr.cmmd {
+            CA_PROTO_EVENT_ADD
+            | CA_PROTO_EVENT_CANCEL
+            | CA_PROTO_READ
+            | CA_PROTO_READ_NOTIFY
+            | CA_PROTO_WRITE
+            | CA_PROTO_WRITE_NOTIFY => self
+                .channels
+                .get(&hdr.cid)
+                .map_or(0xFFFF_FFFF, |entry| entry.refusal_channel().cid),
+            CA_PROTO_SEARCH => hdr.cid,
+            _ => 0xFFFF_FFFF,
+        }
     }
 
     /// C `MPTOPCIU` for [`print_log_header`]: the channel `sid` names on
@@ -2256,11 +2330,7 @@ where
                 Admit::Parse => {}
                 Admit::Draining => continue,
                 Admit::Overflow(cap) => {
-                    tracing::warn!(
-                        peer = %state.peer,
-                        cap,
-                        "CA server: client accumulated buffer exceeded the ceiling, closing"
-                    );
+                    log_circuit(&state.peer, format_args!("receive buffer past {cap} bytes"));
                     break 'client_loop Ok(());
                 }
             }
@@ -2280,42 +2350,14 @@ where
                         // C `RSRV_OK`: the peer keeps every channel and
                         // subscription it holds; only this message is lost.
                         parsed_any = true;
-                        tracing::warn!(
-                            peer = %state.peer,
-                            cmmd = err.hdr.cmmd,
-                            status = err.status,
-                            diagnostic = %err.diagnostic,
-                            "CAS: message refused, circuit kept"
-                        );
-                        let _ = send_ca_error(
-                            &outbox,
-                            &err.hdr,
-                            err.status,
-                            0xFFFF_FFFF,
-                            &err.diagnostic,
-                            state.client_minor_version,
-                        );
-                        print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
+                        report_gate_error(&outbox, &state, peer, &err);
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         continue;
                     }
                     Gate::TearDown { error, reason } => {
                         // C `RSRV_ERROR`: send what C sends, then close.
-                        tracing::warn!(
-                            peer = %state.peer,
-                            reason = %reason,
-                            "CAS: circuit torn down by the receive gate"
-                        );
                         if let Some(err) = error {
-                            let _ = send_ca_error(
-                                &outbox,
-                                &err.hdr,
-                                err.status,
-                                0xFFFF_FFFF,
-                                &err.diagnostic,
-                                state.client_minor_version,
-                            );
-                            print_log_header(peer, &err, state.channel_addr(err.hdr.cid));
+                            report_gate_error(&outbox, &state, peer, &err);
                         }
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         print_forcing_disconnect(peer);
@@ -2328,10 +2370,9 @@ where
                         continue;
                     }
                     Gate::RateLimited { strikes } => {
-                        tracing::warn!(
-                            peer = %state.peer,
-                            strikes,
-                            "rate limit exceeded; closing connection"
+                        log_circuit(
+                            &state.peer,
+                            format_args!("rate limit: {strikes} messages discarded in a row"),
                         );
                         disconnect_reason = "rate_limited";
                         break 'client_loop Ok(());
@@ -2339,35 +2380,22 @@ where
                 };
                 parsed_any = true;
 
-                // Bound how long one message may spend in dispatch. On
-                // timeout we drop the connection; any in-flight reply is
-                // discarded.
-                //
-                // This does NOT bound a stuck reader, though it was written
-                // to and still carried that claim until 2026-08-03.
-                // `dispatch_message` takes `&Outbox` — an unbounded channel —
-                // and never writes the socket, so a peer that stops reading
-                // cannot make it late. The batch-flush refactor moved every
-                // write to the unwrapped `drain_and_flush` below. What is
-                // left bounded here is dispatch's own work: a handler that
-                // blocks on the database or a link.
-                match tokio::time::timeout(
-                    send_timeout(),
-                    dispatch_message(
-                        &hdr,
-                        &payload,
-                        &mut state,
-                        &db,
-                        &outbox,
-                        peer,
-                        conn_events.as_ref(),
-                        SubscriptionDelivery::AsyncSpawn(conn_reactor.clone()),
-                    ),
+                // Unbounded, as in C and the blocking driver: a WRITE_NOTIFY
+                // may wait out C's 60 s `blockSem` in here.
+                match dispatch_message(
+                    &hdr,
+                    &payload,
+                    &mut state,
+                    &db,
+                    &outbox,
+                    peer,
+                    conn_events.as_ref(),
+                    SubscriptionDelivery::AsyncSpawn(conn_reactor.clone()),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
+                    Ok(()) => {}
+                    Err(e) => {
                         // Regression defence: dispatch_message no longer
                         // flushes per response (batched at the bottom of
                         // this outer loop). On a propagated dispatch
@@ -2383,24 +2411,6 @@ where
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
-                    }
-                    Err(_) => {
-                        // send_timeout fires — dispatch_message future is
-                        // cancelled mid-flight. BufWriter may hold a
-                        // partial frame (e.g., header without payload if
-                        // cancellation landed between the two write_alls
-                        // of a READ_NOTIFY response). Flushing here would
-                        // ship the orphan header to the client and leave
-                        // it parsing an incomplete frame, so we skip the
-                        // flush and let BufWriter drop discard the
-                        // partial bytes — same behaviour as before the
-                        // batch-flush refactor.
-                        tracing::warn!(
-                            peer = %peer,
-                            "CA server: dispatch send-timeout (stuck client?), closing"
-                        );
-                        disconnect_reason = "send_timeout";
-                        break 'client_loop Ok(());
                     }
                 }
             }
@@ -2447,8 +2457,10 @@ where
     // explicit EVENT_CANCEL (TCP RST, network drop, panic). Without
     // this, `active_subscriptions` reports a permanent leak after
     // every ungraceful disconnect.
-    let pending_subs: Vec<(u32, SubscriptionEntry)> = state.subscriptions.drain().collect();
-    for (sub_id, sub) in pending_subs {
+    let pending_subs: Vec<SubscriptionEntry> =
+        state.subscriptions.drain().map(|(_, s)| s).collect();
+    for sub in pending_subs {
+        let sub_id = sub.sub_id;
         sub.gate.revoke();
         let id = sub.reader.id();
         drop(sub.reader);
@@ -2557,7 +2569,7 @@ fn destroy_channel(
     // whichever driver installed them; the async server finds each one in
     // `state.subscriptions` and finishes here, and what it does not find is
     // left for the driver that owns it via `retired_subscriptions`.
-    for monitor in entry.subscriptions.values() {
+    for monitor in &entry.subscriptions {
         // Before the caller queues CLEAR_CHANNEL's delete-confirmed echo
         // (or SERVER_DISCONN): `task.abort()` only lands at the task's next
         // await point, so without this a delivery already past `recv()`
@@ -2566,16 +2578,16 @@ fn destroy_channel(
         // SEND_LOCK (`camessage.c:1890-1903`).
         monitor.gate.revoke();
     }
-    let sub_ids: Vec<u32> = entry.subscriptions.keys().copied().collect();
-    for sub_id in sub_ids {
-        let Some(sub) = state.subscriptions.remove(&sub_id) else {
+    for monitor in &entry.subscriptions {
+        let Some(sub) = state.subscriptions.remove(&monitor.id) else {
             // Not this registry's: the blocking driver holds the producer.
             // It drains this after the dispatch that retired the channel and
             // before the echo reaches the socket.
-            state.retired_subscriptions.push(sub_id);
+            state.retired_subscriptions.push(monitor.id);
             continue;
         };
         {
+            let sub_id = sub.sub_id;
             let id = sub.reader.id();
             drop(sub.reader);
             match &sub.target {
@@ -2684,11 +2696,6 @@ pub(crate) async fn dispatch_message(
             // wire format we no longer fully support — silently
             // diverging from C IOC behaviour.
             if !declares_supported_version(hdr) {
-                tracing::warn!(
-                    peer = ?peer,
-                    minor = hdr.count,
-                    "CAS: Ignore version from unsupported client (minor < 4); dropping"
-                );
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "unsupported CA minor version {} (matches C tcp_version_action drop)",
                     hdr.count
@@ -2701,33 +2708,17 @@ pub(crate) async fn dispatch_message(
             // priority drives the IOC's per-client epicsThread
             // scheduling-priority assignment downstream, so a value
             // outside the legal 0..=99 range is rejected hard rather
-            // than silently clamped. Pre-fix Rust accepted any
-            // priority and emitted the VERSION reply normally —
-            // benign on the wire but diverges from libca's expected
-            // close-on-bad-priority behaviour, which a strict CAC
-            // peer would notice.
+            // than silently clamped.
             const CA_PROTO_PRIORITY_MAX: u16 = 99;
             if hdr.data_type > CA_PROTO_PRIORITY_MAX {
-                tracing::warn!(
-                    peer = ?peer,
-                    priority = hdr.data_type,
-                    "CAS: VERSION with priority > CA_PROTO_PRIORITY_MAX; dropping"
-                );
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "VERSION priority {} > {} (matches C tcp_version_action drop)",
                     hdr.data_type, CA_PROTO_PRIORITY_MAX
                 )));
             }
+            // No reply: C's one VERSION is `rsrv_version_reply` at connect
+            // (`caservertask.c:1525`), which each driver sends before its loop.
             state.client_minor_version = hdr.count;
-            // C `rsrv_version_reply` (camessage.c:2124-2126) emits VERSION
-            // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.
-            // The previous Rust defaults (`data_type=1, cid=1`) drifted
-            // from byte-exact parity — C clients only consult `m_count`
-            // (`tcpiiu.cpp::versionRespNotify`) so it was harmless in
-            // practice, but a strict peer or wire trace would diverge.
-            let mut resp = CaHeader::new(CA_PROTO_VERSION);
-            resp.count = CA_MINOR_VERSION;
-            writer.push(resp.to_bytes().to_vec());
         }
 
         CA_PROTO_HOST_NAME => {
@@ -2768,6 +2759,7 @@ pub(crate) async fn dispatch_message(
                 // post-claim freeze branch above returns RSRV_OK
                 // (recoverable misuse), but the size cap is a
                 // wire-malformation reject.
+                log_request(state, hdr, "bad (very long) host name");
                 send_ca_error(
                     writer,
                     hdr,
@@ -2841,6 +2833,7 @@ pub(crate) async fn dispatch_message(
                 // 511-byte cap as host_name; send_err + RSRV_ERROR
                 // (disconnect). Post-claim freeze branch returns
                 // RSRV_OK; size cap returns RSRV_ERROR.
+                log_request(state, hdr, "a very long user name was specified");
                 send_ca_error(
                     writer,
                     hdr,
@@ -2913,10 +2906,9 @@ pub(crate) async fn dispatch_message(
         }
 
         CA_PROTO_CREATE_CHAN => {
-            // Pre-CA-4.4 clients send claims with no PV name (postsize=0).
-            // Silently ignore these, matching C server behavior (camessage.c:1204-1208).
-            // The client will retry with v4.4+ format after receiving our VERSION.
+            // C `claim_ciu_action` (camessage.c:1235-1239): logged, circuit kept.
             if hdr.actual_postsize() <= 1 {
+                log_request(state, hdr, crate::server::udp::EMPTY_PV_NAME);
                 return Ok(());
             }
             // C `rsrv/camessage.c:1196` `claim_ciu_action` writes
@@ -2942,75 +2934,6 @@ pub(crate) async fn dispatch_message(
             // so a peer using the upgrade pattern saw truncated large arrays.
             if (hdr.available as u16) > state.client_minor_version {
                 state.client_minor_version = hdr.available as u16;
-            }
-
-            // DoS guard: refuse new channels once an opt-in per-client
-            // cap is hit. Default-unbounded (`None`) — C `claim_ciu_action`
-            // imposes no per-client channel count limit (see
-            // `max_channels_per_client`). When no cap is configured the
-            // whole block is inert, so a legitimate large-fan-out client
-            // (e.g. `caget` over thousands of PVs on one circuit) is never
-            // refused at a fixed boundary.
-            if let Some(cap) = max_channels_per_client() {
-                // Pre-warning at 90% — fired once per crossing, not once per
-                // CREATE_CHAN, to avoid log spam.
-                let warn_threshold = (cap * 9) / 10;
-                if !state.channel_limit_warned && state.channels.len() >= warn_threshold {
-                    tracing::warn!(
-                        channels = state.channels.len(),
-                        cap,
-                        "approaching per-client channel limit (90%)"
-                    );
-                    metrics::counter!("ca_server_channel_limit_warnings_total").increment(1);
-                    state.channel_limit_warned = true;
-                }
-                if state.channels.len() >= cap {
-                    tracing::warn!(
-                        channels = state.channels.len(),
-                        cap,
-                        "rejecting CREATE_CHAN: per-client channel limit reached"
-                    );
-                    metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
-                    // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
-                    // routes channel-allocation failure through
-                    // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
-                    // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
-                    // `dbChannel_create` (PV/field not found) branch
-                    // (camessage.c:1211-1220). libca
-                    // `exceptionRespAction` surfaces the ECA_ALLOCMEM
-                    // status to the user-level callback so the client
-                    // knows "server out of resources" vs CREATE_CH_FAIL's
-                    // "PV does not exist on this server" — the existing
-                    // Rust path conflated the two, leading clients to
-                    // remove our address from their resolution cache on
-                    // a transient server saturation. Per `vsend_err`'s
-                    // switch, CA_PROTO_CREATE_CHAN falls to `default`
-                    // and uses `0xffffffff` for `m_cid`.
-                    send_ca_error(
-                        writer,
-                        hdr,
-                        ECA_ALLOCMEM,
-                        u32::MAX,
-                        "channel limit reached",
-                        state.client_minor_version,
-                    )?;
-                    // C `claim_ciu_action` (camessage.c:1229-1239): when
-                    // the server's channel-allocation pool is exhausted,
-                    // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
-                    // which tears the connection down. The Rust per-
-                    // client cap is the closest analogue: same root
-                    // cause (this client requested more channels than
-                    // the server is willing to hold) and the same
-                    // ECA_ALLOCMEM wire byte. Match C by dropping the
-                    // connection so a misbehaving client doesn't sit
-                    // and spam CREATE_CHAN frames against a saturated
-                    // cap; the next reconnect re-baselines.
-                    return Err(epics_base_rs::error::CaError::Protocol(
-                        "CREATE_CHAN per-client cap reached \
-                         (matches C claim_ciu_action ECA_ALLOCMEM + RSRV_ERROR)"
-                            .into(),
-                    ));
-                }
             }
 
             // C `claim_ciu_action` (`rsrv/camessage.c`) forces
@@ -3246,6 +3169,76 @@ pub(crate) async fn dispatch_message(
                 // probe ends at (`camessage.c:1202`).
                 let dbr_type = channel.final_field_type(dbr_type);
 
+                // DoS guard: refuse new channels once an opt-in per-client
+                // cap is hit, where C's `casCreateChannel` fails: after
+                // `dbChannel_create`, with `RECORD_NAME(dbch)`
+                // (`camessage.c:1264`). Default-unbounded (`None`) — C
+                // `claim_ciu_action` imposes no per-client channel count
+                // limit (see `max_channels_per_client`). When no cap is configured the
+                // whole block is inert, so a legitimate large-fan-out client
+                // (e.g. `caget` over thousands of PVs on one circuit) is never
+                // refused at a fixed boundary.
+                if let Some(cap) = max_channels_per_client() {
+                    // Pre-warning at 90% — fired once per crossing, not once per
+                    // CREATE_CHAN, to avoid log spam.
+                    let warn_threshold = (cap * 9) / 10;
+                    if !state.channel_limit_warned && state.channels.len() >= warn_threshold {
+                        log_request(
+                            state,
+                            hdr,
+                            &format!(
+                                "approaching the channel limit: {} of {cap}",
+                                state.channels.len()
+                            ),
+                        );
+                        metrics::counter!("ca_server_channel_limit_warnings_total").increment(1);
+                        state.channel_limit_warned = true;
+                    }
+                    if state.channels.len() >= cap {
+                        metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
+                        log_request(state, hdr, "no memory to create new channel");
+                        // C parity: `claim_ciu_action` (rsrv/camessage.c:1256-1271)
+                        // routes channel-allocation failure through
+                        // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
+                        // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
+                        // `dbChannel_create` (PV/field not found) branch
+                        // (camessage.c:1242-1251). libca
+                        // `exceptionRespAction` surfaces the ECA_ALLOCMEM
+                        // status to the user-level callback so the client
+                        // knows "server out of resources" vs CREATE_CH_FAIL's
+                        // "PV does not exist on this server" — the existing
+                        // Rust path conflated the two, leading clients to
+                        // remove our address from their resolution cache on
+                        // a transient server saturation. Per `vsend_err`'s
+                        // switch, CA_PROTO_CREATE_CHAN falls to `default`
+                        // and uses `0xffffffff` for `m_cid`.
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_ALLOCMEM,
+                            u32::MAX,
+                            target.rsrv_record_name(),
+                            state.client_minor_version,
+                        )?;
+                        // C `claim_ciu_action` (camessage.c:1256-1271): when
+                        // the server's channel-allocation pool is exhausted,
+                        // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
+                        // which tears the connection down. The Rust per-
+                        // client cap is the closest analogue: same root
+                        // cause (this client requested more channels than
+                        // the server is willing to hold) and the same
+                        // ECA_ALLOCMEM wire byte. Match C by dropping the
+                        // connection so a misbehaving client doesn't sit
+                        // and spam CREATE_CHAN frames against a saturated
+                        // cap; the next reconnect re-baselines.
+                        return Err(epics_base_rs::error::CaError::Protocol(
+                            "CREATE_CHAN per-client cap reached \
+                                 (matches C claim_ciu_action ECA_ALLOCMEM + RSRV_ERROR)"
+                                .into(),
+                        ));
+                    }
+                }
+
                 let (access, rule_was_trap) = state.compute_access(&target).await;
                 let access_level = match access {
                     3 => AccessLevel::ReadWrite,
@@ -3268,7 +3261,7 @@ pub(crate) async fn dispatch_message(
                         // a later request's element count is clamped to.
                         final_element_count: element_count,
                         field_element_count,
-                        subscriptions: HashMap::new(),
+                        subscriptions: Vec::new(),
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -3384,13 +3377,15 @@ pub(crate) async fn dispatch_message(
                     // `MPTOPCIU` returned NULL, `vsend_err` stamps
                     // cid=0xFFFFFFFF (camessage.c:162-168). So C emits one
                     // ECA_INTERNAL frame, then drops the connection.
-                    send_ca_error(
+                    send_bad_resource_id(
                         writer,
                         hdr,
-                        ECA_INTERNAL,
-                        0xFFFF_FFFF,
-                        "Bad Resource ID",
-                        state.client_minor_version,
+                        if hdr.cmmd == CA_PROTO_READ_NOTIFY {
+                            LogBadId::ReadNotify
+                        } else {
+                            LogBadId::Read
+                        },
+                        state,
                     )?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ on unknown SID {} (matches C read_action logBadId + RSRV_ERROR)",
@@ -3436,6 +3431,33 @@ pub(crate) async fn dispatch_message(
                 )));
             }
 
+            // C `read_action` and `read_reply` frame the header from the
+            // request before the access check and the get
+            // (`camessage.c:629-638`, `:510-528`); a READ_NOTIFY autosize
+            // stands for every element of the field.
+            let item_count = match requested_count {
+                0 if is_notify => entry.field_element_count,
+                n => n,
+            };
+            if crate::server::frame::header_refused(
+                requested_type,
+                item_count,
+                state.client_minor_version,
+            ) {
+                return send_16k_array_client_err(
+                    writer,
+                    hdr,
+                    entry.refusal_channel(),
+                    if is_notify {
+                        UnloadedReply::ReadReply
+                    } else {
+                        UnloadedReply::Read
+                    },
+                    item_count,
+                    state.client_minor_version,
+                );
+            }
+
             // Type-state:
             // `state.lookup_access(sid)` is the only path to the
             // access cache. `require_read()` returns a witness on
@@ -3461,11 +3483,14 @@ pub(crate) async fn dispatch_message(
                         // mirrors the C wire format.
                         send_no_read_access_event(
                             writer,
-                            CA_PROTO_READ_NOTIFY,
-                            requested_type,
-                            requested_count,
-                            ioid,
-                            denied.eca_code(),
+                            entry.refusal_channel(),
+                            StatusEvent {
+                                cmd: CA_PROTO_READ_NOTIFY,
+                                data_type: requested_type,
+                                count: requested_count,
+                                available: ioid,
+                                eca_status: denied.eca_code(),
+                            },
                             ReplyContext {
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
@@ -3531,11 +3556,14 @@ pub(crate) async fn dispatch_message(
                         // body, which diverged from the C wire form.
                         send_no_read_access_event(
                             writer,
-                            CA_PROTO_READ_NOTIFY,
-                            requested_type,
-                            requested_count,
-                            ioid,
-                            ECA_GETFAIL,
+                            entry.refusal_channel(),
+                            StatusEvent {
+                                cmd: CA_PROTO_READ_NOTIFY,
+                                data_type: requested_type,
+                                count: requested_count,
+                                available: ioid,
+                                eca_status: ECA_GETFAIL,
+                            },
                             ReplyContext {
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
@@ -3564,11 +3592,14 @@ pub(crate) async fn dispatch_message(
                     // body — not the prior `count=0`/empty `send_cmd_error`.
                     send_no_read_access_event(
                         writer,
-                        CA_PROTO_READ_NOTIFY,
-                        requested_type,
-                        requested_count,
-                        ioid,
-                        ECA_BADCHID,
+                        entry.refusal_channel(),
+                        StatusEvent {
+                            cmd: CA_PROTO_READ_NOTIFY,
+                            data_type: requested_type,
+                            count: requested_count,
+                            available: ioid,
+                            eca_status: ECA_BADCHID,
+                        },
                         ReplyContext {
                             req_hdr: *hdr,
                             client_minor: state.client_minor_version,
@@ -3714,11 +3745,14 @@ pub(crate) async fn dispatch_message(
                     if is_notify {
                         return send_no_read_access_event(
                             writer,
-                            CA_PROTO_READ_NOTIFY,
-                            requested_type,
-                            requested_count,
-                            ioid,
-                            ECA_GETFAIL,
+                            entry.refusal_channel(),
+                            StatusEvent {
+                                cmd: CA_PROTO_READ_NOTIFY,
+                                data_type: requested_type,
+                                count: requested_count,
+                                available: ioid,
+                                eca_status: ECA_GETFAIL,
+                            },
                             ReplyContext {
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
@@ -3734,7 +3768,7 @@ pub(crate) async fn dispatch_message(
                         state.client_minor_version,
                     );
                 }
-                Err(ReadReplyError::Oversize) => {
+                Err(ReadReplyError::Oversize { count }) => {
                     // C client TCP parser requires 8-byte aligned postsize.
                     // C `read_action` (`camessage.c:622-631`): a reply needing
                     // the extended header for a pre-V49 client is not framed —
@@ -3743,7 +3777,13 @@ pub(crate) async fn dispatch_message(
                     return send_16k_array_client_err(
                         writer,
                         hdr,
-                        entry.cid,
+                        entry.refusal_channel(),
+                        if is_notify {
+                            UnloadedReply::ReadReply
+                        } else {
+                            UnloadedReply::Read
+                        },
+                        count,
                         state.client_minor_version,
                     );
                 }
@@ -3796,11 +3836,9 @@ pub(crate) async fn dispatch_message(
             // monitor on the circuit's event task and this arm records it in
             // `state.subscriptions`.
             let sid = hdr.cid;
-            let sub_id = hdr.available;
             if let Some(reactor) = delivery.spawn_on() {
                 state.start_circuit_monitors(writer, reactor);
             }
-            let sub_id_in_use = state.subscriptions.contains_key(&sub_id);
             let channel_sub_count = || {
                 state
                     .subscriptions
@@ -3815,11 +3853,9 @@ pub(crate) async fn dispatch_message(
                 writer,
                 delivery.clone(),
                 channel_sub_count,
-                sub_id_in_use,
             )
             .await?
             {
-                SubscriptionOutcome::Refused => {}
                 SubscriptionOutcome::HandedOff(_) => {
                     unreachable!(
                         "a driver that passes HandOff must not route EVENT_ADD through \
@@ -3832,16 +3868,17 @@ pub(crate) async fn dispatch_message(
                     // knows its monitors, so CLEAR_CHANNEL can cancel them.
                     state.link_subscription(
                         s.channel_sid,
-                        s.sub_id,
                         ChannelMonitor {
+                            sub_id: s.sub_id,
                             gate: s.gate.clone(),
                             denied: s.denied,
                             id: s.reader.id(),
                         },
                     );
                     state.subscriptions.insert(
-                        s.sub_id,
+                        s.reader.id(),
                         SubscriptionEntry {
+                            sub_id: s.sub_id,
                             target: s.target,
                             channel_sid: s.channel_sid,
                             data_type: s.data_type,
@@ -3873,39 +3910,42 @@ pub(crate) async fn dispatch_message(
             // On success this arm performs the async teardown (abort the producer
             // task, drop the subscriber, emit the close event).
             let sub_id = hdr.available;
-            let sub_info = state.subscriptions.get(&sub_id).map(|s| CancelInfo {
-                channel_sid: s.channel_sid,
-                data_type: s.data_type,
-                data_count: s.data_count,
-                gate: s.gate.clone(),
-            });
-            if cancel_subscription_reply(hdr, state, writer, sub_info)? {
-                // C `event_cancel_reply` unlinks the `event_ext` from
-                // `pciu->eventq` before `db_cancel_event` (`camessage.c:2019`).
-                state.unlink_subscription(hdr.cid, sub_id);
-                if let Some(sub) = state.subscriptions.remove(&sub_id) {
-                    let id = sub.reader.id();
-                    drop(sub.reader);
-                    match &sub.target {
-                        ChannelTarget::SimplePv(pv) => {
-                            pv.remove_subscriber(id);
-                        }
-                        ChannelTarget::RecordField { record, .. } => {
-                            record.write().remove_subscriber(id);
-                        }
+            let sub_info = state
+                .find_subscription(hdr.cid, sub_id)
+                .and_then(|id| state.subscriptions.get(&id).map(|s| (id, s)))
+                .map(|(id, s)| CancelInfo {
+                    id,
+                    channel_sid: s.channel_sid,
+                    data_type: s.data_type,
+                    data_count: s.data_count,
+                    gate: s.gate.clone(),
+                });
+            let id = cancel_subscription_reply(hdr, state, writer, sub_info)?;
+            // C `event_cancel_reply` unlinks the `event_ext` from
+            // `pciu->eventq` before `db_cancel_event` (`camessage.c:2061`).
+            state.unlink_subscription(hdr.cid, id);
+            if let Some(sub) = state.subscriptions.remove(&id) {
+                let id = sub.reader.id();
+                drop(sub.reader);
+                match &sub.target {
+                    ChannelTarget::SimplePv(pv) => {
+                        pv.remove_subscriber(id);
                     }
-                    if let Some(tx) = conn_events {
-                        let pv_name = state
-                            .channels
-                            .get(&sub.channel_sid)
-                            .map(|e| e.pv_name.clone())
-                            .unwrap_or_default();
-                        let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
-                            peer,
-                            pv_name,
-                            sub_id,
-                        });
+                    ChannelTarget::RecordField { record, .. } => {
+                        record.write().remove_subscriber(id);
                     }
+                }
+                if let Some(tx) = conn_events {
+                    let pv_name = state
+                        .channels
+                        .get(&sub.channel_sid)
+                        .map(|e| e.pv_name.clone())
+                        .unwrap_or_default();
+                    let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
+                        peer,
+                        pv_name,
+                        sub_id,
+                    });
                 }
             }
         }
@@ -4004,13 +4044,12 @@ pub(crate) async fn dispatch_message(
                     hdr.count
                 )));
             }
-            // C `search_reply_tcp` (rsrv/camessage.c:2238-2241) rejects
-            // SEARCH whose `m_postsize <= 1` and silently returns
-            // RSRV_OK. Mirror that here so an attacker's empty-name
-            // SEARCH burst on an open TCP connection cannot drive
-            // `db.has_name("")` per frame nor trigger a NOT_FOUND
-            // amplification when CA_DO_REPLY is set.
+            // C `search_reply_tcp` (rsrv/camessage.c:2297-2301) rejects
+            // SEARCH whose `m_postsize <= 1` with `log_header` and returns
+            // RSRV_OK, so an empty-name SEARCH burst cannot drive
+            // `db.has_name("")` per frame nor a NOT_FOUND reply.
             if hdr.postsize <= 1 {
+                log_request(state, hdr, crate::server::udp::EMPTY_PV_NAME);
                 return Ok(());
             }
             // C `search_reply_tcp` forces NUL at postsize-1.
@@ -4097,14 +4136,7 @@ pub(crate) async fn dispatch_message(
             // so a probing peer could send CLEAR_CHANNEL on random
             // SIDs indefinitely.
             if !state.channels.contains_key(&sid) {
-                send_ca_error(
-                    writer,
-                    hdr,
-                    ECA_INTERNAL,
-                    0xFFFF_FFFF,
-                    "Bad Resource ID",
-                    state.client_minor_version,
-                )?;
+                send_bad_resource_id(writer, hdr, LogBadId::ClearChannel, state)?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
                     sid
@@ -4121,27 +4153,17 @@ pub(crate) async fn dispatch_message(
         }
 
         _ => {
-            // A LEGAL CA opcode with no arm above. An ILLEGAL one never
-            // reaches here: `RecvAccumulator::next_message` answers those
-            // with C `bad_tcp_cmd_action` (`camessage.c:337-352`) —
-            // ECA_INTERNAL and a tear-down — for both drivers, so this arm
-            // no longer carries a second copy of that rule. The set is
-            // empty today (`every_legal_tcp_command_is_routed_by_this_driver`
-            // pins it), and C's answer is the right fail-closed default for
-            // a routing table that fell behind the protocol.
-            let error_msg = format!("Unrouted command {}", hdr.cmmd);
-            send_ca_error(
+            // The arms above are every `is_legal_tcp_command` opcode and the
+            // receive gate tears down the rest, so only a routing table that
+            // fell behind the protocol lands here; C has no such opcode, and
+            // its answer to any unhandled one is `bad_tcp_cmd_action`.
+            return Err(refuse_bad_tcp_command(
                 writer,
                 hdr,
-                ECA_INTERNAL,
-                0xFFFF_FFFF,
-                &error_msg,
+                peer,
+                state.channel_addr(hdr.cid),
                 state.client_minor_version,
-            )?;
-            return Err(epics_base_rs::error::CaError::Protocol(format!(
-                "legal but unrouted TCP command {}",
-                hdr.cmmd
-            )));
+            ));
         }
     }
 
@@ -4329,13 +4351,15 @@ pub(crate) async fn serve_write_head(
                 // ID" frame (cid=0xFFFFFFFF), flushed before the
                 // disconnect — same family as the EVENT_ADD bad-SID
                 // and the matching READ branch below.
-                send_ca_error(
+                send_bad_resource_id(
                     writer,
                     hdr,
-                    ECA_INTERNAL,
-                    0xFFFF_FFFF,
-                    "Bad Resource ID",
-                    state.client_minor_version,
+                    if is_notify {
+                        LogBadId::WriteNotify
+                    } else {
+                        LogBadId::Write
+                    },
+                    state,
                 )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "WRITE (ACKT/ACKS) on unknown SID {} \
@@ -4397,6 +4421,7 @@ pub(crate) async fn serve_write_head(
                 if is_notify {
                     send_put_notify_response(
                         writer,
+                        NotifyReplyKind::Error,
                         hdr.data_type,
                         ack_count,
                         denied.eca_code(),
@@ -4466,7 +4491,10 @@ pub(crate) async fn serve_write_head(
         // The deprecated fire-and-forget CA_PROTO_WRITE path is not
         // serialised in C.
         if is_notify {
-            entry.put_notify_slot.serialize(writer).await?;
+            entry
+                .put_notify_slot
+                .serialize(writer, &state.peer, std::ptr::from_ref(entry).addr())
+                .await?;
         }
         let result = match &entry.target {
             ChannelTarget::RecordField { record, field } => {
@@ -4489,6 +4517,7 @@ pub(crate) async fn serve_write_head(
             };
             send_put_notify_response(
                 writer,
+                NotifyReplyKind::Completion,
                 hdr.data_type,
                 ack_count,
                 eca.eca(),
@@ -4536,13 +4565,15 @@ pub(crate) async fn serve_write_head(
             // ACKT/ACKS branch above and the READ branch: an
             // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
             // is buffered then flushed ahead of the disconnect.
-            send_ca_error(
+            send_bad_resource_id(
                 writer,
                 hdr,
-                ECA_INTERNAL,
-                0xFFFF_FFFF,
-                "Bad Resource ID",
-                state.client_minor_version,
+                if is_notify {
+                    LogBadId::WriteNotify
+                } else {
+                    LogBadId::Write
+                },
+                state,
             )?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
@@ -4565,6 +4596,7 @@ pub(crate) async fn serve_write_head(
     // supersede gate and the async-completion install below use it
     // without holding the `entry` borrow across them.
     let put_notify_slot = entry.put_notify_slot.clone();
+    let entry_addr = std::ptr::from_ref(entry).addr();
 
     // The text a refused request carries in its `CA_PROTO_ERROR`: C sends
     // `RECORD_NAME(pciu->dbch)`, the record without its field.
@@ -4604,12 +4636,22 @@ pub(crate) async fn serve_write_head(
             // A peer sending a DBR above `LAST_BUFFER_TYPE` has a
             // corrupted dispatcher or is probing, so C drops. A compound
             // type is BELOW that bound and therefore never reaches here.
+            log_request(
+                state,
+                hdr,
+                if is_notify {
+                    "bad put notify data type"
+                } else {
+                    "bad put data type"
+                },
+            );
             if is_notify {
                 // C `putNotifyErrorReply` (camessage.c:1482-1502)
                 // preserves `m_dataType`/`m_count` from the request —
                 // the count is pre-clamp here, as in C.
                 send_put_notify_response(
                     writer,
+                    NotifyReplyKind::Error,
                     hdr.data_type,
                     hdr.actual_count(),
                     ECA_BADTYPE,
@@ -4620,8 +4662,7 @@ pub(crate) async fn serve_write_head(
                     },
                 )?;
             }
-            // `write_action` sends nothing: C logs "bad put data type"
-            // and returns RSRV_ERROR without a frame.
+            // `write_action` sends nothing after its `log_header`.
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "{} with unsupported DBR type {} (matches C INVALID_DB_REQ RSRV_ERROR)",
                 if is_notify { "WRITE_NOTIFY" } else { "WRITE" },
@@ -4690,6 +4731,7 @@ pub(crate) async fn serve_write_head(
                 // one — C reads the mutated `mp->m_count`.
                 send_put_notify_response(
                     writer,
+                    NotifyReplyKind::Error,
                     hdr.data_type,
                     write_count,
                     denied.eca_code(),
@@ -4751,7 +4793,9 @@ pub(crate) async fn serve_write_head(
     // ECA_PUTCBINPROG, for its own ioid. The deprecated fire-and-forget
     // CA_PROTO_WRITE path is not serialised in C, so it is left untouched.
     if is_notify {
-        put_notify_slot.serialize(writer).await?;
+        put_notify_slot
+            .serialize(writer, &state.peer, entry_addr)
+            .await?;
     }
 
     // The CLAMPED full 32-bit count flows to the decode, the put and the
@@ -4785,15 +4829,22 @@ pub(crate) async fn serve_write_head(
     // only `caNetConvert` failure (`camessage.c:753-766`) drops the circuit.
     // This port carries both, so they are named by commit. One closure so
     // that drop rule cannot fork between the native and compound decoders.
+    //
+    // A decode failure is C's `caNetConvert` failure (`camessage.c:788`,
+    // `:1788`), which logs where the size checks above stay silent. Neither
+    // can run: `size_check` guarantees every length the decoders test, and
+    // caNetConvert refuses only the types the type gate already dropped.
     let value_or_drop = |decoded: CaResult<EpicsValue>| -> CaResult<EpicsValue> {
         if decoded.is_ok() {
             return decoded;
         }
+        log_request(state, hdr, "invalid data type");
         if is_notify {
             // Same `putNotifyErrorReply` shape; count post-clamp, as C's
             // mutated `mp->m_count` is at this point.
             send_put_notify_response(
                 writer,
+                NotifyReplyKind::Error,
                 hdr.data_type,
                 write_count,
                 ECA_BADTYPE,
@@ -5076,6 +5127,7 @@ pub(crate) async fn serve_write_head(
         // the deferred reply above: C frames both from the request header.
         send_put_notify_response(
             writer,
+            NotifyReplyKind::Completion,
             hdr.data_type,
             write_count,
             eca_status,
@@ -5131,6 +5183,7 @@ pub(crate) fn finish_write_notify(
     }
     send_put_notify_response(
         writer,
+        NotifyReplyKind::Completion,
         reply.write_type,
         reply.write_count,
         final_status,
@@ -5361,9 +5414,6 @@ impl SubscriptionDelivery {
 
 /// The result of [`register_subscription`].
 pub(crate) enum SubscriptionOutcome {
-    /// A refusal frame (CA_PROTO_ERROR) was already queued; the caller returns
-    /// without registering anything. C's admission-failure branches.
-    Refused,
     /// `SubscriptionDelivery::AsyncSpawn`: the monitor is attached to the
     /// circuit's event queue; the caller records it in its subscription map.
     Circuit(CircuitSubscription),
@@ -5408,6 +5458,8 @@ pub(crate) struct RegisteredSubscription {
 /// the caller in its own registry (`state.subscriptions` for async,
 /// the blocking-side map for the RTEMS driver).
 pub(crate) struct CancelInfo {
+    /// The install the cancel found, handed back on confirmation.
+    pub id: epics_base_rs::server::event_queue::AttachId,
     pub channel_sid: u32,
     pub data_type: u16,
     pub data_count: u32,
@@ -5428,9 +5480,9 @@ pub(crate) struct CancelInfo {
 /// mode it returns the live
 /// [`EventReader`](epics_base_rs::server::event_queue::EventReader) as [`SubscriptionOutcome::HandedOff`], so
 /// the blocking driver's single event thread can multiplex it (the driver
-/// has no async runtime to spawn onto). `channel_sub_count` and
-/// `sub_id_in_use` are read from the caller's own subscription registry so
-/// the per-channel cap and duplicate-sub-id refusal consult the right map.
+/// has no async runtime to spawn onto). `channel_sub_count` is read from the
+/// caller's own subscription registry so the per-channel cap consults the
+/// right map.
 pub(crate) async fn register_subscription(
     hdr: &CaHeader,
     payload: &[u8],
@@ -5438,7 +5490,6 @@ pub(crate) async fn register_subscription(
     writer: &Outbox,
     mode: SubscriptionDelivery,
     channel_sub_count: impl Fn() -> usize,
-    sub_id_in_use: bool,
 ) -> CaResult<SubscriptionOutcome> {
     let sid = hdr.cid;
     let sub_id = hdr.available;
@@ -5448,37 +5499,6 @@ pub(crate) async fn register_subscription(
     // C `event_add_action` capturing `pevext->msg` for later
     // `read_reply` / `event_cancel_reply` use).
     let mut requested_count = hdr.actual_count();
-
-    // DoS guard: cap subscriptions per channel. Default-unbounded
-    // (`None`) — C `event_add_action` imposes no per-channel
-    // subscription count limit (see `max_subs_per_channel`). The
-    // O(n) count is only paid when an opt-in cap is configured.
-    if let Some(cap) = max_subs_per_channel() {
-        let subs_for_channel = channel_sub_count();
-        if subs_for_channel >= cap {
-            // C `event_add_action` sends admission
-            // failures through `send_err(ECA_ALLOCMEM, ...)`
-            // i.e. CA_PROTO_ERROR — libca's
-            // `cac::eventRespAction` returns immediately for
-            // zero-payload EVENT_ADD because that shape is the
-            // historical cancel-confirmation no-op. Pre-fix
-            // Rust used `send_cmd_error` which emits zero-
-            // payload EVENT_ADD, so a libca client treated the
-            // refusal as a cancel ack and waited forever for
-            // monitor updates that never arrived. Use
-            // CA_PROTO_ERROR so the exception path fires.
-            let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
-            send_ca_error(
-                writer,
-                hdr,
-                ECA_ALLOCMEM,
-                entry_cid,
-                "EVENT_ADD refused: per-channel subscription cap",
-                state.client_minor_version,
-            )?;
-            return Ok(SubscriptionOutcome::Refused);
-        }
-    }
 
     let native_type = match native_type_for_dbr(requested_type) {
         Ok(t) => t,
@@ -5526,20 +5546,32 @@ pub(crate) async fn register_subscription(
             // missing-channel branch precedes the `db_add_event`
             // NULL (select==0) path, so an unknown SID draws the
             // ECA_INTERNAL frame regardless of mask.
-            send_ca_error(
-                writer,
-                hdr,
-                ECA_INTERNAL,
-                0xFFFF_FFFF,
-                "Bad Resource ID",
-                state.client_minor_version,
-            )?;
+            send_bad_resource_id(writer, hdr, LogBadId::EventAdd, state)?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
                 sid
             )));
         }
     };
+
+    // DoS guard: cap subscriptions per channel, where C's `event_ext`
+    // allocation fails: after `MPTOPCIU`, with `RECORD_NAME(dbch)`
+    // (`camessage.c:1840-1851`). Default-unbounded
+    // (`None`) — C `event_add_action` imposes no per-channel
+    // subscription count limit (see `max_subs_per_channel`). The
+    // O(n) count is only paid when an opt-in cap is configured.
+    if let Some(cap) = max_subs_per_channel() {
+        let subs_for_channel = channel_sub_count();
+        if subs_for_channel >= cap {
+            return Err(refuse_install(
+                writer,
+                hdr,
+                state,
+                entry,
+                InstallFailure::EventExt,
+            ));
+        }
+    }
 
     // PR #934 (epics-base) parity: clamp the wire element count to
     // the channel's final element count BEFORE it is stored on the
@@ -5565,21 +5597,13 @@ pub(crate) async fn register_subscription(
     // a *valid* channel (after the missing-channel check above), so
     // `entry.cid` is always known here — no `u32::MAX` fallback.
     if mask == 0 || mask > u16::from(u8::MAX) {
-        let entry_cid = entry.cid;
-        send_ca_error(
+        return Err(refuse_install(
             writer,
             hdr,
-            ECA_ALLOCMEM,
-            entry_cid,
-            &format!(
-                "subscription install into record {} failed",
-                entry.target.rsrv_record_name()
-            ),
-            state.client_minor_version,
-        )?;
-        return Err(epics_base_rs::error::CaError::Protocol(
-                    "EVENT_ADD invalid mask (matches C db_add_event select==0 || select>UCHAR_MAX + RSRV_ERROR)".into(),
-                ));
+            state,
+            entry,
+            InstallFailure::DbAddEvent,
+        ));
     }
     let long_string_mode = entry.long_string_mode;
     // C's `dbChannel` order whatever the JSON order: the pre chain runs on
@@ -5616,33 +5640,6 @@ pub(crate) async fn register_subscription(
     // `reeval_access_rights` can flip it later (Bug 4 parity).
     let access_denied = state.lookup_access(sid).require_read().is_err();
 
-    // Refuse a duplicate sub_id on the same connection. Without
-    // this, two EVENT_ADDs with identical sub_id leave both
-    // subscribers attached to the producer (push without
-    // dedup); EVENT_CANCEL strips both at once via retain, but
-    // until then every event delivery emits two wire frames —
-    // archived data + dashboard counts duplicated.
-    if sub_id_in_use {
-        tracing::warn!(
-            sub_id,
-            "EVENT_ADD refused: sub_id already in use on this connection"
-        );
-        // use CA_PROTO_ERROR (libca exception path)
-        // instead of zero-payload EVENT_ADD which
-        // `cac::eventRespAction` treats as a cancel-ack
-        // no-op. The libca peer
-        // otherwise silently swallows the refusal and
-        // waits forever for monitor updates.
-        send_ca_error(
-            writer,
-            hdr,
-            ECA_BADMONID,
-            entry.cid,
-            "duplicate sub_id",
-            state.client_minor_version,
-        )?;
-        return Ok(SubscriptionOutcome::Refused);
-    }
     let target = entry.target.clone();
     let denied = Arc::new(AtomicBool::new(access_denied));
     // One gate per subscription, revoked by whichever teardown confirms its
@@ -5654,6 +5651,7 @@ pub(crate) async fn register_subscription(
     // this client's negotiated version and echoes this header if unbuildable.
     let monitor = Arc::new(CircuitMonitor {
         target: target.clone(),
+        cid: entry_cid,
         sub_id,
         data_type: requested_type,
         data_count: requested_count,
@@ -5675,25 +5673,16 @@ pub(crate) async fn register_subscription(
     // read access is denied.
     let rx = match &target {
         ChannelTarget::SimplePv(pv) => {
-            let Some(rx) =
+            let Ok(rx) =
                 pv.add_subscriber_on(&state.event_user, sub_id, native_type, mask, &context)
             else {
-                tracing::warn!(
-                    pv = %pv.name,
-                    sub_id,
-                    "EVENT_ADD refused: PV subscriber cap reached"
-                );
-                // ECA_ALLOCMEM so the client surfaces the refusal at once
-                // instead of timing out.
-                send_ca_error(
+                return Err(refuse_install(
                     writer,
                     hdr,
-                    ECA_ALLOCMEM,
-                    entry.cid,
-                    "EVENT_ADD refused: per-PV subscriber cap",
-                    state.client_minor_version,
-                )?;
-                return Ok(SubscriptionOutcome::Refused);
+                    state,
+                    entry,
+                    InstallFailure::DbAddEvent,
+                ));
             };
             // The same chain a record-field monitor runs, sourced from the
             // single `ChannelEntry::filter_chain` owner.
@@ -5729,27 +5718,14 @@ pub(crate) async fn register_subscription(
                         }
                     })
             };
-            let Some(rx) = registered else {
-                tracing::warn!(
-                    record = %record.read().name,
-                    field = %field,
-                    sub_id,
-                    "EVENT_ADD refused: record-field subscriber cap reached"
-                );
-                // CA_PROTO_ERROR: libca's eventRespAction treats a
-                // zero-payload EVENT_ADD as a cancel ack.
-                send_ca_error(
+            let Ok(rx) = registered else {
+                return Err(refuse_install(
                     writer,
                     hdr,
-                    ECA_ALLOCMEM,
-                    entry.cid,
-                    &format!(
-                        "subscription install into record {} failed",
-                        entry.target.rsrv_record_name()
-                    ),
-                    state.client_minor_version,
-                )?;
-                return Ok(SubscriptionOutcome::Refused);
+                    state,
+                    entry,
+                    InstallFailure::DbAddEvent,
+                ));
             };
             rx
         }
@@ -5782,10 +5758,10 @@ pub(crate) async fn register_subscription(
 }
 
 /// Shared EVENT_CANCEL wire logic (C `event_cancel_reply`,
-/// `rsrv/camessage.c:1981-2048`): validates the addressed channel and monitor
-/// id and queues the cancel acknowledgement. Returns `Ok(true)` when the
-/// subscription is valid and the ACK is queued — the caller then performs its
-/// (driver-specific) teardown. Bad SID / bad mon-id already pushed the
+/// `rsrv/camessage.c:2035-2102`): validates the addressed channel and monitor
+/// id and queues the cancel acknowledgement. Returns the install's id once
+/// the ACK is queued — the caller then performs its (driver-specific)
+/// teardown. Bad SID / bad mon-id already pushed the
 /// CA_PROTO_ERROR frame and return `Err` (C `RSRV_ERROR` → the circuit ends).
 /// `sub_info` is the addressed subscription as seen in the caller's registry.
 pub(crate) fn cancel_subscription_reply(
@@ -5793,7 +5769,7 @@ pub(crate) fn cancel_subscription_reply(
     state: &ClientState,
     writer: &Outbox,
     sub_info: Option<CancelInfo>,
-) -> CaResult<bool> {
+) -> CaResult<epics_base_rs::server::event_queue::AttachId> {
     let sub_id = hdr.available;
     let req_channel_sid = hdr.cid;
     // C `event_cancel_reply` resolves the channel first (`MPTOPCIU`); an unknown
@@ -5801,14 +5777,7 @@ pub(crate) fn cancel_subscription_reply(
     let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
         Some(entry) => (entry.cid, entry.target.rsrv_record_name()),
         None => {
-            send_ca_error(
-                writer,
-                hdr,
-                ECA_INTERNAL,
-                0xFFFF_FFFF,
-                "Bad Resource ID",
-                state.client_minor_version,
-            )?;
+            send_bad_resource_id(writer, hdr, LogBadId::EventCancel, state)?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "EVENT_CANCEL on unknown SID {} (matches C event_cancel_reply \
                  logBadId + RSRV_ERROR)",
@@ -5816,17 +5785,14 @@ pub(crate) fn cancel_subscription_reply(
             )));
         }
     };
-    // C walks the channel's eventq for a matching sub-id; a sub-id that is
-    // unknown OR bound to a different channel is "not on this channel's eventq"
-    // and draws ECA_BADMONID + RSRV_ERROR.
-    let channel_matches = sub_info
-        .as_ref()
-        .is_some_and(|i| i.channel_sid == req_channel_sid);
-    if !channel_matches {
+    // C walks the channel's eventq for a matching sub-id, which is where the
+    // caller found `sub_info` ([`ClientState::find_subscription`]); one not on
+    // it draws ECA_BADMONID + RSRV_ERROR.
+    let Some(info) = sub_info else {
         tracing::debug!(
             sub_id,
             sid = req_channel_sid,
-            "EVENT_CANCEL channel-mismatch (sub belongs to different channel); ECA_BADMONID"
+            "EVENT_CANCEL sub-id not on this channel; ECA_BADMONID"
         );
         send_ca_error(
             writer,
@@ -5837,14 +5803,13 @@ pub(crate) fn cancel_subscription_reply(
             state.client_minor_version,
         )?;
         return Err(epics_base_rs::error::CaError::Protocol(format!(
-            "EVENT_CANCEL sub-id {} channel-mismatch (requested sid {}; \
-             matches C event_cancel_reply 'not on this channel's eventq' RSRV_ERROR)",
+            "EVENT_CANCEL sub-id {} not on sid {} (matches C event_cancel_reply \
+             'not on this channel's eventq' RSRV_ERROR)",
             sub_id, req_channel_sid
         )));
-    }
-    let info = sub_info.expect("channel_matches ⟹ sub_info is Some");
+    };
     // Stop the producer BEFORE the confirmation is queued. C
-    // `event_cancel_reply` calls `db_cancel_event` (`camessage.c:2032`), which
+    // `event_cancel_reply` calls `db_cancel_event` (`camessage.c:2081`), which
     // nulls `user_sub` under LOCKEVQUE and waits out any in-flight callback,
     // and only then takes SEND_LOCK for the echo — so no monitor frame for
     // this subscription can follow it. Revoking here is that ordering, and it
@@ -5852,7 +5817,7 @@ pub(crate) fn cancel_subscription_reply(
     // caller's own teardown (abort the task, drop the subscriber) may then run
     // at its leisure, because nothing it races with can still emit.
     info.gate.revoke();
-    // C `event_cancel_reply` (`camessage.c:2035-2037`): echo the stored
+    // C `event_cancel_reply` (`camessage.c:2089-2091`): echo the stored
     // EVENT_ADD request — m_dataType / m_count / m_cid (the SID) / m_available —
     // with a zero payload, in the extended form when the count needs it.
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -5862,7 +5827,7 @@ pub(crate) fn cancel_subscription_reply(
     resp.cid = info.channel_sid;
     resp.available = sub_id;
     writer.push(resp.to_bytes_extended());
-    Ok(true)
+    Ok(info.id)
 }
 
 /// One subscription's delivery context for the blocking driver's event thread —
@@ -6149,6 +6114,7 @@ pub(crate) async fn run_event_task<W>(
                             }
                         }
                         super::monitor::send_event(
+                            m.refusal_channel(),
                             m.data_type,
                             m.data_count,
                             m.sub_id,
@@ -6268,6 +6234,7 @@ fn send_monitor_snapshot(
         mask: epics_base_rs::server::recgbl::EventMask::VALUE,
     };
     super::monitor::send_event(
+        RefusalChannel { cid: 0, pv: "" },
         data_type,
         requested_count,
         sub_id,
@@ -6375,7 +6342,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // `no_read_access_event`, and is then disabled; one regaining it is
         // enabled and then posts the current value. Both posts take the
         // monitor's pre-chain and ring like any update.
-        for monitor in entry.subscriptions.values() {
+        for monitor in &entry.subscriptions {
             monitor.denied.store(!new_read, Ordering::Release);
             let id = monitor.id;
             match &entry.target {
@@ -6408,6 +6375,30 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     Ok(())
 }
 
+/// Which C function frames a WRITE_NOTIFY reply. A count a pre-V49 client
+/// cannot take is sent as nothing in both, under different reports.
+#[derive(Clone, Copy)]
+enum NotifyReplyKind {
+    /// `putNotifyErrorReply`.
+    Error,
+    /// `write_notify_reply`, the put's completion.
+    Completion,
+}
+
+impl NotifyReplyKind {
+    fn unframed_report(self) -> &'static str {
+        match self {
+            // `camessage.c:1527`, `__FILE__`/`__LINE__` as softIoc prints them.
+            NotifyReplyKind::Error => {
+                "../rsrv/camessage.c at 1528: should always get sufficient space for put \
+                 notify error reply\n"
+            }
+            // `camessage.c:1444`.
+            NotifyReplyKind::Completion => "CA server corrupted - put call back(s) discarded\n",
+        }
+    }
+}
+
 /// CA_PROTO_WRITE_NOTIFY reply with extended-form
 /// count support. C `putNotifyErrorReply` / `write_notify_reply`
 /// (`rsrv/camessage.c:1482-1502` / `1407-1410`) call
@@ -6421,19 +6412,20 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
 /// the count with an extended header.
 fn send_put_notify_response(
     writer: &Outbox,
+    kind: NotifyReplyKind,
     data_type: u16,
     count: u32,
     eca_status: u32,
     ioid: u32,
     reply: ReplyContext,
 ) -> CaResult<()> {
-    let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
     resp.data_type = data_type;
     // postsize = 0 (WRITE_NOTIFY replies have no payload);
     // set_payload_size promotes to extended form when count >= 0xFFFF.
-    if resp.set_payload_size(0, count, client_minor).is_err() {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
+    if resp.set_payload_size(0, count, reply.client_minor).is_err() {
+        epics_base_rs::runtime::log::errlog_printf(kind.unframed_report());
+        return Ok(());
     }
     resp.cid = eca_status;
     resp.available = ioid;
@@ -6468,18 +6460,43 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
     }
 }
 
+/// C `send_err` then `log_header` for a message the receive gate refused.
+pub(crate) fn report_gate_error(
+    outbox: &Outbox,
+    state: &ClientState,
+    peer: impl std::fmt::Display,
+    err: &crate::server::recv::GateError,
+) {
+    let _ = send_ca_error(
+        outbox,
+        &err.hdr,
+        err.status,
+        state.send_err_cid(&err.hdr),
+        &err.diagnostic,
+        state.client_minor_version,
+    );
+    print_log_header(
+        peer,
+        &err.hdr,
+        err.context,
+        err.mnum,
+        state.channel_addr(err.hdr.cid),
+    );
+}
+
 /// C `log_header` (`camessage.c:282-307`), which every receive-gate refusal
 /// prints after its `send_err`. `paddr` is the channel `m_cid` names on this
 /// circuit, as `MPTOPCIU` finds it; glibc prints a NULL one as `(nil)`.
 pub(crate) fn print_log_header(
-    peer: SocketAddr,
-    err: &crate::server::recv::GateError,
+    peer: impl std::fmt::Display,
+    hdr: &CaHeader,
+    context: &str,
+    mnum: u32,
     paddr: Option<*const ()>,
 ) {
     use epics_base_rs::runtime::log::errlog_printf;
-    let hdr = &err.hdr;
     let paddr = paddr.map_or_else(|| "(nil)".to_string(), |p| format!("{p:p}"));
-    errlog_printf(&format!("CAS: request from {peer} => {}\n", err.context));
+    errlog_printf(&format!("CAS: request from {peer} => {context}\n"));
     errlog_printf(&format!(
         "CAS: Request from {peer} => cmmd={} cid={:#x} type={} count={} postsize={}\n",
         hdr.cmmd,
@@ -6489,9 +6506,43 @@ pub(crate) fn print_log_header(
         hdr.actual_postsize()
     ));
     errlog_printf(&format!(
-        "CAS: Request from {peer} =>   available={:#x} \tN={} paddr={paddr}\n",
-        hdr.available, err.mnum
+        "CAS: Request from {peer} =>   available={:#x} \tN={mnum} paddr={paddr}\n",
+        hdr.available
     ));
+}
+
+/// `log_header`'s first line for a refusal of this port's own that has no
+/// request header to print, on the errlog beside C's so `eltc 0` silences it.
+pub(crate) fn log_circuit(peer: impl std::fmt::Display, context: impl std::fmt::Display) {
+    epics_base_rs::runtime::log::errlog_printf(&format!("CAS: request from {peer} => {context}\n"));
+}
+
+/// C `log_header` from a message handler, which passes `mnum` 0 and finds
+/// the channel by `MPTOPCIU`.
+fn log_request(state: &ClientState, hdr: &CaHeader, context: &str) {
+    print_log_header(&state.peer, hdr, context, 0, state.channel_addr(hdr.cid));
+}
+
+/// C `bad_tcp_cmd_action` for an opcode a driver does not route: the
+/// gate's frame and `log_header` lines; the caller ends the circuit.
+pub(crate) fn refuse_bad_tcp_command(
+    writer: &Outbox,
+    hdr: &CaHeader,
+    peer: SocketAddr,
+    paddr: Option<*const ()>,
+    client_minor: u16,
+) -> epics_base_rs::error::CaError {
+    let err = crate::server::recv::GateError::bad_tcp_command(*hdr);
+    let _ = send_ca_error(
+        writer,
+        hdr,
+        err.status,
+        0xFFFF_FFFF,
+        &err.diagnostic,
+        client_minor,
+    );
+    print_log_header(peer, &err.hdr, err.context, err.mnum, paddr);
+    epics_base_rs::error::CaError::Protocol(format!("unrouted TCP command {}", hdr.cmmd))
 }
 
 /// C `camsgtask.c:151`: the line every RSRV_ERROR from message handling
@@ -6509,14 +6560,27 @@ pub(crate) fn send_denied_event(
     event: &epics_base_rs::server::pv::MonitorEvent,
     outbox: &Outbox,
 ) {
+    if refuse_unframeable_update(
+        outbox,
+        m.refusal_channel(),
+        m.data_type,
+        m.data_count,
+        &m.stage,
+        m.reply,
+    ) {
+        return;
+    }
     let count = no_read_access_count(m.data_count, event.snapshot.value.count());
     let _ = send_no_read_access_event(
         outbox,
-        CA_PROTO_EVENT_ADD,
-        m.data_type,
-        count,
-        m.sub_id,
-        ECA_NORDACCESS,
+        m.refusal_channel(),
+        StatusEvent {
+            cmd: CA_PROTO_EVENT_ADD,
+            data_type: m.data_type,
+            count,
+            available: m.sub_id,
+            eca_status: ECA_NORDACCESS,
+        },
         m.reply,
     );
 }
@@ -6538,6 +6602,7 @@ pub(crate) fn send_denied_event(
 /// `m_cid = ECA_GETFAIL`. The subscription stays.
 pub(crate) fn send_get_fail_event(
     writer: &Outbox,
+    chan: RefusalChannel<'_>,
     data_type: u16,
     data_count: u32,
     sub_id: u32,
@@ -6545,44 +6610,62 @@ pub(crate) fn send_get_fail_event(
 ) {
     let _ = send_no_read_access_event(
         writer,
-        CA_PROTO_EVENT_ADD,
-        data_type,
-        data_count,
-        sub_id,
-        ECA_GETFAIL,
+        chan,
+        StatusEvent {
+            cmd: CA_PROTO_EVENT_ADD,
+            data_type,
+            count: data_count,
+            available: sub_id,
+            eca_status: ECA_GETFAIL,
+        },
         reply,
     );
 }
 
+/// The header fields of a zero-filled status update; `eca_status` rides in
+/// `m_cid`, as C `read_reply` frames a refused read.
+#[derive(Clone, Copy)]
+pub(crate) struct StatusEvent {
+    pub cmd: u16,
+    pub data_type: u16,
+    pub count: u32,
+    pub available: u32,
+    pub eca_status: u32,
+}
+
 fn send_no_read_access_event(
     writer: &Outbox,
-    cmd: u16,
-    data_type: u16,
-    count: u32,
-    available: u32,
-    eca_status: u32,
+    chan: RefusalChannel<'_>,
+    ev: StatusEvent,
     reply: ReplyContext,
 ) -> CaResult<()> {
     let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
-    match status_event_frame(cmd, data_type, count, available, eca_status, client_minor) {
+    match status_event_frame(ev, client_minor) {
         Some(frame) => {
             writer.push(frame);
             Ok(())
         }
-        None => send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor),
+        None => send_16k_array_client_err(
+            writer,
+            request_hdr,
+            chan,
+            UnloadedReply::ReadReply,
+            ev.count,
+            client_minor,
+        ),
     }
 }
 
 /// The [`send_no_read_access_event`] frame, or `None` when `count` does not
 /// fit the peer's header.
-pub(crate) fn status_event_frame(
-    cmd: u16,
-    data_type: u16,
-    count: u32,
-    available: u32,
-    eca_status: u32,
-    client_minor: u16,
-) -> Option<Vec<u8>> {
+pub(crate) fn status_event_frame(ev: StatusEvent, client_minor: u16) -> Option<Vec<u8>> {
+    let StatusEvent {
+        cmd,
+        data_type,
+        count,
+        available,
+        eca_status,
+    } = ev;
     let native = epics_base_rs::types::native_type_for_dbr(data_type)
         .unwrap_or(epics_base_rs::types::DbFieldType::Char);
     let payload_size = epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize);
@@ -6614,8 +6697,8 @@ enum ReadReplyError {
     BadType,
     /// The framed payload needs the extended (24-byte) header but the client
     /// is pre-V49 and cannot parse it — C answers `ECA_16KARRAYCLIENT` and
-    /// keeps the circuit (`camessage.c:622-631`).
-    Oversize,
+    /// keeps the circuit (`camessage.c:622-631`). `count` is the header's.
+    Oversize { count: u32 },
     /// `dbChannel_get`'s conversion returned a non-zero status — C
     /// `read_reply` answers with a zeroed payload and `m_cid = ECA_GETFAIL`
     /// (`camessage.c:540-557`), keeping the circuit. Distinct from
@@ -6790,7 +6873,9 @@ fn build_read_reply(
         .set_payload_size(frame.payload_len(), element_count, client_minor)
         .is_err()
     {
-        return Err(ReadReplyError::Oversize);
+        return Err(ReadReplyError::Oversize {
+            count: element_count,
+        });
     }
     resp.data_type = requested_type;
     resp.available = ioid;
@@ -6849,6 +6934,8 @@ pub(crate) struct ReplyContext {
 /// ([`EventReader::enable`](epics_base_rs::server::event_queue::EventReader::enable)).
 pub(crate) struct CircuitMonitor {
     pub(crate) target: ChannelTarget,
+    /// The client's id for the channel, which a refusal carries.
+    pub(crate) cid: u32,
     pub(crate) sub_id: u32,
     pub(crate) data_type: u16,
     pub(crate) data_count: u32,
@@ -6860,6 +6947,15 @@ pub(crate) struct CircuitMonitor {
     /// The monitor's frame could not be built; its later entries are dropped.
     /// Only the event task touches it.
     pub(crate) ended: AtomicBool,
+}
+
+impl CircuitMonitor {
+    pub(crate) fn refusal_channel(&self) -> RefusalChannel<'_> {
+        RefusalChannel {
+            cid: self.cid,
+            pv: self.target.rsrv_record_name(),
+        }
+    }
 }
 
 /// C `event_task` for the async server: the one consumer of this circuit's
@@ -6916,6 +7012,16 @@ async fn deliver_record_field_event(
         m.gate.deliver(|| send_denied_event(m, &event, outbox));
         return;
     }
+    if refuse_unframeable_update(
+        outbox,
+        m.refusal_channel(),
+        m.data_type,
+        m.data_count,
+        &m.stage,
+        m.reply,
+    ) {
+        return;
+    }
     // CA-268 monitor parity: populate class_name on every emitted
     // event so a `ca_create_subscription` against DBR_CLASS_NAME
     // sees the record_type string instead of an empty 40-byte pad.
@@ -6936,7 +7042,14 @@ async fn deliver_record_field_event(
     // this ports.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
     if encode_dbr_into(frame.dst(), m.data_type, &event.snapshot).is_err() {
-        send_get_fail_event(outbox, m.data_type, m.data_count, m.sub_id, m.reply);
+        send_get_fail_event(
+            outbox,
+            m.refusal_channel(),
+            m.data_type,
+            m.data_count,
+            m.sub_id,
+            m.reply,
+        );
         return;
     }
     // CA-268: an EVENT_ADD with explicit `count=1` on a waveform
@@ -6962,7 +7075,9 @@ async fn deliver_record_field_event(
         let _ = send_16k_array_client_err(
             outbox,
             &m.reply.req_hdr,
-            m.reply.req_hdr.cid,
+            m.refusal_channel(),
+            UnloadedReply::ReadReply,
+            element_count,
             m.reply.client_minor,
         );
         return;
@@ -7162,28 +7277,166 @@ fn truncate_diag(message: &str) -> &str {
     &message[..end]
 }
 
-/// C `read_reply` (`camessage.c:515-524`) and `read_action`
-/// (`camessage.c:625-631`): when `cas_copy_in_header` refuses to frame a reply
-/// because the client is pre-CA_V49 and the payload/count needs the 24-byte
-/// extended header (`caserverio.c:266-270` returns `ECA_16KARRAYCLIENT`), the
-/// server does NOT put the frame on the wire. It answers CA_PROTO_ERROR with
-/// that status, echoing the request header, and keeps the circuit.
+/// C `read_reply` frames an update's header from the request before it checks
+/// access or reads (`camessage.c:510-528`), so an autosize request stands for
+/// every element of the field whatever the value holds. `true` when that
+/// header is refused and the refusal has been queued in the update's place.
+pub(crate) fn refuse_unframeable_update(
+    outbox: &Outbox,
+    chan: RefusalChannel<'_>,
+    data_type: u16,
+    data_count: u32,
+    stage: &super::DeliveryStage,
+    reply: ReplyContext,
+) -> bool {
+    let count = stage.item_count(data_count);
+    if !crate::server::frame::header_refused(data_type, count, reply.client_minor) {
+        return false;
+    }
+    let _ = send_16k_array_client_err(
+        outbox,
+        &reply.req_hdr,
+        chan,
+        UnloadedReply::ReadReply,
+        count,
+        reply.client_minor,
+    );
+    true
+}
+
+/// The channel a refusal names, as C `send_err` does: `pciu->cid` in `m_cid`
+/// and `RECORD_NAME` in the context.
+#[derive(Clone, Copy)]
+pub(crate) struct RefusalChannel<'a> {
+    pub(crate) cid: u32,
+    pub(crate) pv: &'a str,
+}
+
+/// Which C reply a refused frame was: the two `send_err` texts differ.
+#[derive(Clone, Copy)]
+pub(crate) enum UnloadedReply {
+    /// `read_action` (`camessage.c:632-638`).
+    Read,
+    /// `read_reply` (`camessage.c:516-528`), for an update and a READ_NOTIFY.
+    /// Its check precedes the access check, so a denied reply draws this text
+    /// and `no_read_access_event`'s own is never reached.
+    ReadReply,
+}
+
+/// C `read_reply` and `read_action`: when `cas_copy_in_header` refuses to
+/// frame a reply because the client is pre-CA_V49 and the payload/count needs
+/// the 24-byte extended header (`caserverio.c:266-270` returns
+/// `ECA_16KARRAYCLIENT`), the server does NOT put the frame on the wire. It
+/// answers CA_PROTO_ERROR with that status, echoing the request header, and
+/// keeps the circuit. `count` is the element count the refused header carried.
 pub(crate) fn send_16k_array_client_err(
     writer: &Outbox,
     request_hdr: &CaHeader,
-    chan_cid: u32,
+    chan: RefusalChannel<'_>,
+    reply: UnloadedReply,
+    count: u32,
     client_minor: u16,
 ) -> CaResult<()> {
+    let what = match reply {
+        UnloadedReply::Read => "read",
+        UnloadedReply::ReadReply => "read (or subscription update)",
+    };
     send_ca_error(
         writer,
         request_hdr,
         ECA_16KARRAYCLIENT,
-        chan_cid,
-        "server unable to load read (or subscription update) response into \
-         protocol buffer: client protocol revision does not support transfers \
-         exceeding 16k bytes",
+        chan.cid,
+        format_args!(
+            "server unable to load {what} response into protocol buffer PV=\"{}\" \
+             dbf={} count={count} avail={} max bytes={}",
+            chan.pv,
+            request_hdr.data_type,
+            request_hdr.available,
+            crate::protocol::max_array_bytes_buffer(),
+        ),
         client_minor,
     )
+}
+
+/// The rsrv handler whose `logBadId` (`camessage.c:60-61`) refused a request
+/// naming no channel of this client.
+#[derive(Clone, Copy)]
+pub(crate) enum LogBadId {
+    Read,
+    ReadNotify,
+    Write,
+    WriteNotify,
+    EventAdd,
+    ClearChannel,
+    EventCancel,
+}
+
+/// C `logBadIdWithFileAndLineno` (`camessage.c:312-325`): `log_header`,
+/// then ECA_INTERNAL, cid 0xffffffff, and the `__FILE__.__LINE__` of the
+/// handler's `logBadId` as softIoc 8f5015b66 sends them.
+pub(crate) fn send_bad_resource_id(
+    writer: &Outbox,
+    hdr: &CaHeader,
+    site: LogBadId,
+    state: &ClientState,
+) -> CaResult<()> {
+    log_request(state, hdr, "bad resource ID");
+    let ctx = match site {
+        LogBadId::Read => "Bad Resource ID at ../rsrv/camessage.c.614",
+        LogBadId::ReadNotify => "Bad Resource ID at ../rsrv/camessage.c.709",
+        LogBadId::Write => "Bad Resource ID at ../rsrv/camessage.c.749",
+        LogBadId::WriteNotify => "Bad Resource ID at ../rsrv/camessage.c.1674",
+        LogBadId::EventAdd => "Bad Resource ID at ../rsrv/camessage.c.1825",
+        LogBadId::ClearChannel => "Bad Resource ID at ../rsrv/camessage.c.1939",
+        LogBadId::EventCancel => "Bad Resource ID at ../rsrv/camessage.c.2048",
+    };
+    send_ca_error(
+        writer,
+        hdr,
+        ECA_INTERNAL,
+        0xFFFF_FFFF,
+        ctx,
+        state.client_minor_version,
+    )
+}
+
+/// The two `event_add_action` install failures, each `log_header`, an
+/// `ECA_ALLOCMEM` frame and `RSRV_ERROR`; this port's subscription caps
+/// fail at the same stages.
+#[derive(Clone, Copy)]
+enum InstallFailure {
+    /// The `event_ext` allocation (`camessage.c:1840-1851`).
+    EventExt,
+    /// `db_add_event` returning NULL (`camessage.c:1868-1877`).
+    DbAddEvent,
+}
+
+/// C's answer to an [`InstallFailure`]; the caller ends the circuit.
+fn refuse_install(
+    writer: &Outbox,
+    hdr: &CaHeader,
+    state: &ClientState,
+    entry: &ChannelEntry,
+    failure: InstallFailure,
+) -> epics_base_rs::error::CaError {
+    let pv = entry.target.rsrv_record_name();
+    let (context, diagnostic) = match failure {
+        InstallFailure::EventExt => ("no memory to add subscription", pv.to_string()),
+        InstallFailure::DbAddEvent => (
+            "no memory to add subscription to db",
+            format!("subscription install into record {pv} failed"),
+        ),
+    };
+    log_request(state, hdr, context);
+    let _ = send_ca_error(
+        writer,
+        hdr,
+        ECA_ALLOCMEM,
+        entry.cid,
+        &diagnostic,
+        state.client_minor_version,
+    );
+    epics_base_rs::error::CaError::Protocol(format!("EVENT_ADD on {pv}: {context}"))
 }
 
 /// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
@@ -7196,7 +7449,7 @@ pub(crate) fn send_ca_error(
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
-    message: &str,
+    message: impl std::fmt::Display,
     client_minor: u16,
 ) -> CaResult<()> {
     writer.push(build_ca_error_frame(
@@ -7216,10 +7469,19 @@ pub(crate) fn build_ca_error_frame(
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
-    message: &str,
+    message: impl std::fmt::Display,
     client_minor: u16,
 ) -> Vec<u8> {
-    let error_msg_bytes = pad_string(truncate_diag(message));
+    // Formatted straight into the one buffer `pad_string` used to allocate, so
+    // a `format_args!` context costs nothing beyond it.
+    let mut error_msg_bytes = Vec::new();
+    std::io::Write::write_fmt(&mut error_msg_bytes, format_args!("{message}"))
+        .expect("writing to a Vec cannot fail");
+    let kept =
+        truncate_diag(std::str::from_utf8(&error_msg_bytes).expect("Display writes UTF-8")).len();
+    error_msg_bytes.truncate(kept);
+    error_msg_bytes.push(0);
+    error_msg_bytes.resize(align8(error_msg_bytes.len()), 0);
     // C `vsend_err` (`rsrv/camessage.c:201-223`) picks the echo's form from
     // the request's ACTUAL size and count — `(m_postsize >= 0xffff ||
     // m_count >= 0xffff) && CA_V49(minor)` — never from the form the request
@@ -7512,7 +7774,7 @@ mod put_notify_serialize_tests {
     /// Drive the gate to completion on this test thread. `park_on`, since no
     /// runtime is entered here — the same way the blocking driver runs it.
     fn serialize(slot: &PutNotifySlot, outbox: &Outbox) {
-        block_on_sync(slot.serialize(outbox))
+        block_on_sync(slot.serialize(outbox, "", 0))
             .expect("no async runtime on this thread")
             .expect("serialize");
     }
@@ -7580,8 +7842,11 @@ mod put_notify_serialize_tests {
     fn a_predecessor_inside_the_wait_holds_the_arrival() {
         let (outbox, mut drain) = live_outbox();
         let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
-        let proceeded = block_on_sync(timeout(Duration::from_millis(200), slot.serialize(&outbox)))
-            .expect("no async runtime on this thread");
+        let proceeded = block_on_sync(timeout(
+            Duration::from_millis(200),
+            slot.serialize(&outbox, "", 0),
+        ))
+        .expect("no async runtime on this thread");
         assert!(
             proceeded.is_err(),
             "the arrival must not proceed while the channel's put-callback is busy"
@@ -7619,6 +7884,7 @@ mod put_notify_serialize_tests {
                 let _owned = completion.claim().expect("the completion path replies");
                 send_put_notify_response(
                     &outbox,
+                    super::NotifyReplyKind::Completion,
                     epics_base_rs::types::DBR_LONG,
                     1,
                     ECA_NORMAL,
@@ -7638,6 +7904,7 @@ mod put_notify_serialize_tests {
         // What the released request does next, standing in for its own put.
         send_put_notify_response(
             &outbox,
+            super::NotifyReplyKind::Completion,
             epics_base_rs::types::DBR_LONG,
             1,
             ECA_NORMAL,
@@ -8075,8 +8342,8 @@ mod pre_v49_peer_tests {
 
     /// Read from `client` until a `CA_PROTO_ERROR` frame appears, and
     /// return its ECA status. The server emits an unsolicited VERSION
-    /// greeting on connect plus a VERSION reply to ours, so the error
-    /// frame is never at a fixed offset — walk the header chain.
+    /// greeting on connect, so the error frame is never at offset zero —
+    /// walk the header chain.
     async fn read_until_error(
         client: &mut tokio::io::DuplexStream,
         peer_minor: u16,
@@ -8522,7 +8789,7 @@ mod extended_header_split_tests {
         // returned stops reading, the write stalls, and its return arrives
         // first. A window only ever proved the return was slower than it.
         // The pipe is bidirectional and both directions share the 1-byte
-        // buffer, so the server's own VERSION echo would wedge it the moment
+        // buffer, so the server's VERSION greeting would wedge it the moment
         // nobody reads: keep the reverse direction moving in its own task.
         let (mut client_rd, mut client_wr) = tokio::io::split(client_io);
         let reply_drain = tokio::spawn(async move {
@@ -10254,11 +10521,14 @@ mod single_write_all_framing_tests {
         // exactly where `count=0`/empty diverged from C.
         send_no_read_access_event(
             &outbox,
-            CA_PROTO_READ_NOTIFY,
-            epics_base_rs::types::DBR_TIME_DOUBLE,
-            requested_count,
-            0x4242_4242, // ioid echoed into m_available
-            ECA_GETFAIL,
+            RefusalChannel { cid: 0, pv: "" },
+            StatusEvent {
+                cmd: CA_PROTO_READ_NOTIFY,
+                data_type: epics_base_rs::types::DBR_TIME_DOUBLE,
+                count: requested_count,
+                available: 0x4242_4242, // ioid echoed into m_available
+                eca_status: ECA_GETFAIL,
+            },
             ReplyContext {
                 req_hdr: CaHeader::new(CA_PROTO_READ_NOTIFY),
                 client_minor: crate::protocol::CA_MINOR_VERSION,
@@ -11785,7 +12055,7 @@ mod read_reply_sans_io_tests {
         );
         let err = build_read_reply(&pool(), DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
             .expect_err("pre-V49 client cannot frame an extended reply");
-        assert!(matches!(err, ReadReplyError::Oversize));
+        assert!(matches!(err, ReadReplyError::Oversize { .. }));
     }
 
     /// An unencodable DBR type is `BadType` (C `INVALID_DB_REQ`), which the
@@ -13150,7 +13420,7 @@ mod access_change_walk_tests {
     /// reaches `reeval_access_rights` on that driver once a channel exists
     /// (HOST_NAME and CLIENT_NAME are refused after the first channel, and it
     /// has no ACF-reload listener), so this pins its link, not the wire.
-    // RTEMS-EXEC-MODEL-ALLOW(1): runs and passes under
+    // RTEMS-EXEC-MODEL-ALLOW(2): both run and pass under
     // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
     #[tokio::test]
     async fn an_access_change_reaches_a_monitor_held_outside_the_async_registry() {
@@ -13203,7 +13473,6 @@ mod access_change_walk_tests {
             &outbox,
             SubscriptionDelivery::HandOff,
             || 0,
-            false,
         )
         .await
         else {
@@ -13239,5 +13508,53 @@ mod access_change_walk_tests {
         assert_eq!(access_rights(&out[0]), (0x1234, 3));
         assert_eq!(next_event(&state), Some((false, 1.5)), "the restore frame");
         assert_eq!(next_event(&state), None);
+    }
+}
+
+#[cfg(test)]
+mod unrouted_command_tests {
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+
+    /// The `_` arm answers with the frame the receive gate sends for an
+    /// illegal opcode, which `an_illegal_command_names_the_damaged_request`
+    /// pins against softIoc, and ends the circuit.
+    #[tokio::test]
+    async fn an_unrouted_command_is_answered_as_bad_tcp_cmd_action() {
+        let db = Arc::new(PvDatabase::new());
+        let mut state = ClientState::new(
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            5064,
+            db.clone(),
+        );
+        state.client_minor_version = 13;
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let mut hdr = CaHeader::new(5);
+        hdr.cid = 7;
+        hdr.available = 9;
+        let res = dispatch_message(
+            &hdr,
+            &[],
+            &mut state,
+            &db,
+            &outbox,
+            "127.0.0.1:55991".parse().unwrap(),
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await;
+        assert!(res.is_err());
+        let frames: Vec<Vec<u8>> =
+            std::iter::from_fn(|| drain.try_next().map(|f| f.to_vec())).collect();
+        assert_eq!(
+            frames,
+            [build_ca_error_frame(
+                &hdr,
+                ECA_INTERNAL,
+                0xFFFF_FFFF,
+                "invalid (damaged?) request code from TCP",
+                13
+            )]
+        );
     }
 }

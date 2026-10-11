@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
+use epics_base_rs::server::pv::SubscribeRefused;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_pva_rs::pvdata::PvStructure;
 
@@ -269,7 +270,10 @@ impl PvaMonitor for BridgeMonitor {
         )
         .await
         .map(|sub| self.view.subscribed(sub))
-        .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        .map_err(|why| match why {
+            SubscribeRefused::CapReached => BridgeError::SubscriptionFailed,
+            SubscribeRefused::NoRecord => BridgeError::RecordNotFound(self.record_name.clone()),
+        })?;
 
         // pvxs QSRV opens a second subscription with the
         // PROPERTY mask (singlesource.cpp:162-167) so a PVA monitor
@@ -301,7 +305,10 @@ impl PvaMonitor for BridgeMonitor {
         )
         .await
         .map(|sub| self.view.subscribed(sub))
-        .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        .map_err(|why| match why {
+            SubscribeRefused::CapReached => BridgeError::SubscriptionFailed,
+            SubscribeRefused::NoRecord => BridgeError::RecordNotFound(self.record_name.clone()),
+        })?;
 
         // The native PVA server emits the initial snapshot via
         // ChannelSource::read_checked() at MONITOR INIT time (server_native/

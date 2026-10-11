@@ -1713,7 +1713,7 @@ fn shift_chars(bytes: &[u8], count: f64, right: bool) -> Vec<u8> {
 /// `epicsStrSnPrintEscaped` resolves to. Raw bytes in, printable string out:
 /// the C escapes, `\0` for NUL, `\xNN` (lower-case) for anything else
 /// unprintable, and the byte itself when `isprint`.
-fn escaped_from_raw(src: &[u8]) -> String {
+pub(crate) fn escaped_from_raw(src: &[u8]) -> String {
     let mut out = String::new();
     for &c in src {
         match c {

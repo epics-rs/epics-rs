@@ -1327,16 +1327,7 @@ impl PvDatabase {
                 value.get_convert(DbFieldType::String).ok()?
             }
         };
-        Some(match rendered {
-            EpicsValue::StringArray(a) => EpicsValue::StringArray(
-                a.iter()
-                    .cloned()
-                    .map(crate::types::codec::cap_dbr_string)
-                    .collect(),
-            ),
-            EpicsValue::String(s) => EpicsValue::String(crate::types::codec::cap_dbr_string(s)),
-            other => other,
-        })
+        Some(crate::types::codec::cap_dbr_strings(rendered))
     }
 
     fn dbr_string_rendered(

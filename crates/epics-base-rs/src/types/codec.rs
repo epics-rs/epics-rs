@@ -211,6 +211,17 @@ pub(crate) fn cap_dbr_string(s: PvString) -> PvString {
     }
 }
 
+/// [`cap_dbr_string`] for each element of a `DBR_STRING` result.
+pub(crate) fn cap_dbr_strings(value: EpicsValue) -> EpicsValue {
+    match value {
+        EpicsValue::StringArray(a) => {
+            EpicsValue::StringArray(a.into_iter().map(cap_dbr_string).collect())
+        }
+        EpicsValue::String(s) => EpicsValue::String(cap_dbr_string(s)),
+        other => other,
+    }
+}
+
 /// The float/double rows of C's `DBR_STRING` column, **in both directions**.
 ///
 /// `getFloatString`/`getDoubleString` (`dbConvert.c:735`/`:772`),

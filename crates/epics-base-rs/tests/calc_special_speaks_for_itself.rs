@@ -211,10 +211,29 @@ async fn a_calc_that_compiles_says_nothing() {
 
 /// The `init_record` half: a different `pmessage`, and the record is NOT
 /// refused (`calcRecord.c:105-110` falls through to `return 0`).
+///
+/// A `.db` CALC that does not compile is refused by the LOAD first
+/// (`dbPutString` runs `postfix()`, `dbStaticLib.c:2593`), which fails
+/// `dbLoadRecords` but leaves the record and its stored text, so a startup
+/// script goes on to `iocInit` and hears this line as well. softIoc
+/// R7.0.10-146-g8f5015b66 prints both, in that order, for `CALC="A+"`.
 #[epics_macros_rs::epics_test]
 async fn a_bad_calc_from_the_db_file_reports_at_init_without_refusing_the_record() {
+    use epics_base_rs::server::iocsh::IocShell;
+
     let sink = listen();
-    let db = ioc("record(calc, \"P:F\") { field(CALC,\"(A\") }\n").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("f.db");
+    std::fs::write(&path, "record(calc, \"P:F\") { field(CALC,\"(A\") }\n").unwrap();
+    let db = Arc::new(PvDatabase::new());
+    let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    let line = format!("dbLoadRecords(\"{}\")", path.display());
+    let shell_db = Arc::clone(&db);
+    // The load itself fails, which is the point: the status is not asserted.
+    let _ = std::thread::spawn(move || IocShell::new(shell_db, bridge).execute_line(&line))
+        .join()
+        .expect("the shell thread");
+    db.ioc_init().await;
 
     let log = heard(&sink);
     assert!(
@@ -268,24 +287,37 @@ async fn an_emptied_calc_is_reported_like_any_other_failure() {
 
 /// calcout `init_record` writes the same pair for CALC and, only under DOPT
 /// "Use OCAL", for OCAL (`calcoutRecord.c:191-205`). softIoc 8f5015b66, this
-/// db through a `dbLoadRecords` whose failure the script ignores: exactly
-/// these four lines at iocInit, then `dbgf` of CLCV/OCLV. OB0's bad OCAL is
-/// silent yet still OCLV -1.
+/// db through a `dbLoadRecords` whose failure the script ignores: the load's
+/// three `dbPutString` lines (`dbStaticLib.c:2599`), these four at iocInit,
+/// then `dbgf` of CLCV/OCLV. OB0's bad OCAL is silent at init yet still
+/// OCLV -1.
 #[epics_macros_rs::epics_test]
 async fn calcout_init_reports_a_bad_calc_and_a_used_bad_ocal() {
     let sink = listen();
-    let db = ioc(r#"
+    let db = IocBuilder::new()
+        .boot_past_failed_loads()
+        .db_string(
+            r#"
 record(calcout, "COB") { field(CALC, "A+") }
 record(calcout, "OB0") { field(CALC, "A") field(OCAL, "B+") }
 record(calcout, "OB1") { field(CALC, "A") field(OCAL, "B+") field(DOPT, "Use OCAL") }
 record(calcout, "GOOD") { field(CALC, "A") field(OCAL, "B") field(DOPT, "Use OCAL") }
 record(calcout, "DEF") {}
-"#)
-    .await;
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
 
     assert_eq!(
         heard(&sink),
         [
+            "Incomplete expression, operand missing in CALC expression 'A+'\n",
+            "Incomplete expression, operand missing in CALC expression 'B+'\n",
+            "Incomplete expression, operand missing in CALC expression 'B+'\n",
             "recGblRecordError: calcout: init_record: Illegal CALC field Illegal field value PV: COB\n",
             "COB.CALC: Incomplete expression, operand missing in expression \"A+\"\n",
             "recGblRecordError: calcout: init_record: Illegal OCAL field Illegal field value PV: OB1\n",

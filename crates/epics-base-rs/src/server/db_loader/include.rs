@@ -23,19 +23,60 @@ impl Default for DbLoadConfig {
     }
 }
 
+/// Build the DB include config the way `dbReadCOM` does
+/// (`dbLexRoutines.c:245-253`): a non-empty `explicit_path` wins outright,
+/// otherwise `EPICS_DB_INCLUDE_PATH`, otherwise `"."`. Only
+/// `dbLoadDatabase` can supply the first arm — C hands `dbLoadRecords` a
+/// hard `0` — which is why `explicit_path` had no caller and the arm was
+/// missing until the command existed.
+///
+/// Resolving the list is also what INSTALLS it: C `dbPath` runs inside
+/// `dbReadCOM`, so the path a load resolved is the path `dbDumpPath`
+/// reports afterwards. This is the only routine that resolves one, so it
+/// is the only writer of [`set_loaded_path`].
+pub(crate) fn db_load_config(explicit_path: &str) -> DbLoadConfig {
+    let include_paths = if explicit_path.is_empty() {
+        std::env::var("EPICS_DB_INCLUDE_PATH")
+            .map_or_else(|_| vec![std::path::PathBuf::from(".")], |val| db_path(&val))
+    } else {
+        db_path(explicit_path)
+    };
+    set_loaded_path(&include_paths);
+    DbLoadConfig {
+        include_paths,
+        max_include_depth: 32,
+    }
+}
+
+/// Resolve a load's file name through C `dbOpenFile`: the path list is
+/// searched FIRST and the process CWD is never consulted for a bare name.
+/// `None` is C's NULL return, which `dbReadCOM` turns into `Can't open
+/// file` without ever reaching the parser.
+///
+/// `include_path` is `dbLoadDatabase`'s second argument, empty for every
+/// other caller — see [`db_load_config`].
+pub(crate) fn resolve_db_file(
+    path: &str,
+    include_path: &str,
+) -> (DbLoadConfig, Option<DbOpenedFile>) {
+    let config = db_load_config(include_path);
+    // The located form, not the bare `PathBuf`: every diagnostic the load
+    // raises names the file as the operator wrote it and the path entry it
+    // was found under, which is what C's `inputFile` keeps — see
+    // [`DbOpenedFile`].
+    let opened = db_open_file_located(path, &config.include_paths);
+    (config, opened)
+}
+
 /// File-based entry point: expand includes, substitute macros, parse
-/// records. Records-only, so an unresolved file-scope alias is reported
-/// and dropped — see [`super::parse_db`].
+/// records. Records-only, so a file-scope alias with no target above it is
+/// reported and dropped — see [`super::parse_db`].
 pub fn parse_db_file(
     path: &Path,
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
-    let parsed = parse_db_file_with_breaktables(path, macros, config)?;
-    for (target, alias, _) in &parsed.unresolved_aliases {
-        eprintln!("{}", super::unknown_alias_message(alias, target));
-    }
-    Ok(parsed.records)
+    Ok(parse_db_file_with_breaktables(path, macros, config)?.records_with_file_aliases())
 }
 
 /// Like [`parse_db_file`] but returns the whole [`super::ParsedDb`], for
@@ -60,6 +101,16 @@ pub fn parse_db_opened_with_breaktables(
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<super::ParsedDb> {
+    parse_db_opened_held(opened, macros, config)?.raise_abort()
+}
+
+/// [`parse_db_opened_with_breaktables`] for an installer: a parse abort is
+/// carried on the result, to be raised once the records above it are in.
+pub(crate) fn parse_db_opened_held(
+    opened: &DbOpenedFile,
+    macros: impl Into<MacroDefs>,
+    config: &DbLoadConfig,
+) -> CaResult<super::ParsedDb> {
     // The include layer and the record parser both report through the
     // same owner, so a recoverable failure in either reaches the caller
     // as one set — see [`DbFaults`].
@@ -79,19 +130,13 @@ pub fn parse_db_opened_with_breaktables(
         }
     };
     // Already through `db_read_lines` once, inside the expansion — see
-    // [`super::parse_db_expanded`].
-    //
-    // This is also why a load's read-time diagnostics (macLib's notices,
-    // the per-line `WARNING: … has undefined macros`) all come out
-    // before its first parse-time refusal, where C interleaves them per
-    // line: C's lexer reads one line and the parser consumes it, while
-    // the whole include tree is expanded here before the parser sees a
-    // character. Same lines, same bytes, different grouping — an
-    // intended consequence of flattening, not a defect to time away.
-    let mut parsed = super::parse_db_expanded(&expanded.text, expanded.source)?;
-    faults.absorb(parsed.faults);
-    parsed.faults = faults;
-    Ok(parsed)
+    // [`super::parse_db_expanded`]. The faults carry the read-time notices
+    // of every line, which the load releases as it reaches each one.
+    Ok(super::parse_db_expanded(
+        &expanded.text,
+        expanded.source,
+        faults,
+    ))
 }
 
 /// The flattened include tree: the text the parser reads, and the map
@@ -297,7 +342,10 @@ fn expand_includes_inner(
         // to match them on the raw line and expand only the argument,
         // which left an `include "$(NOPE)b.db"` line without the
         // `WARNING: … has undefined macros` C prints for it.
-        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num);
+        // The flattened line this one's output starts at, which is where
+        // C's lexer stands when it reads it.
+        let at = out.lines.len() as u32 + 1;
+        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num, at, faults);
         let line = expanded.strip_suffix('\n').unwrap_or(&expanded);
         if let Some(dirs) = parse_path_directive(line, "path") {
             // `path "a:b:c"` — replace the search path. C separates
@@ -321,10 +369,19 @@ fn expand_includes_inner(
             if let Some(frame) = out.open.last_mut() {
                 frame.line = line_num;
             }
+            // C opens the file while reading this line, and the open's own
+            // `macEnvExpand` prints at once.
+            faults.read_through(at);
             let Some(included) = db_open_file_located(&expanded_filename, &local_paths) else {
+                // `yyerror(NULL)` with the lexer on this line and `yytext`
+                // the quoted name. The line stays in the text, for the echo;
+                // the parser skips an `include` it meets.
+                faults.seek(at, &format!("\"{expanded_filename}\""));
                 faults.recoverable(format!(
                     "{ERL_ERROR}: Can't open include file '{expanded_filename}'"
                 ));
+                faults.seek_end();
+                emit(out, line_num, expanded);
                 continue;
             };
             expand_includes_inner(&included, table, config, stack, faults, out)?;

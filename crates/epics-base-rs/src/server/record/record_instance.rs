@@ -7503,9 +7503,9 @@ impl RecordInstance {
         if let EpicsValue::String(ref s) = value {
             let text = s.as_str_lossy();
             if text.trim_start().starts_with('{')
-                && crate::types::dbf_link_class(self.record.record_type(), &name).is_some()
+                && let Some(class) = crate::types::dbf_link_class(self.record.record_type(), &name)
             {
-                super::check_json_link_text(&text)?;
+                super::check_json_link_text(&text, super::LinkFieldType::for_class(class))?;
             }
         }
         // The common fields a `CyclePlan` is resolved from. This is the funnel

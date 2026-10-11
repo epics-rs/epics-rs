@@ -48,7 +48,8 @@ fn stderr_of<T>(f: impl FnOnce() -> T) -> (T, String) {
 }
 
 /// (file, text, diagnostics). A diagnostic is (message, line, source line);
-/// the first quotes ` at or before ')'`, and an abort adds `syntax error`.
+/// the first quotes ` at or before ')'`, and an abort inside a record body
+/// still open at the end of its line adds `syntax error`.
 type Diagnostic = (&'static str, u32, &'static str);
 type Case = (&'static str, &'static str, &'static [Diagnostic], bool);
 
@@ -62,6 +63,26 @@ const CASES: &[Case] = &[
             "record(nosuch, \"R1\") {",
         )],
         true,
+    ),
+    (
+        "unknown_type_closed.db",
+        "record(nosuch, \"R1\") { }\n",
+        &[(
+            "Record type 'nosuch' for record 'R1' not found",
+            1,
+            "record(nosuch, \"R1\") { }",
+        )],
+        false,
+    ),
+    (
+        "unknown_type_bare.db",
+        "record(nosuch, \"R1\")\nrecord(ai, \"R2\")\n",
+        &[(
+            "Record type 'nosuch' for record 'R1' not found",
+            1,
+            "record(nosuch, \"R1\")",
+        )],
+        false,
     ),
     (
         "other_type.db",
@@ -174,7 +195,7 @@ fn iocbuilder_locates_install_stage_refusals() {
             &format!(" in file \"{}\"", path.display()),
             diagnostics,
             *abort,
-            "",
+            &format!("ERROR: Failed to load '{}'\n", path.display()),
         );
         assert_eq!(
             got, want,

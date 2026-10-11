@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CaError, CaResult, JsonLexFault};
-use crate::runtime::log::ERL_ERROR;
+use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
 use crate::server::record::{FieldDesc, Record, check_link_text};
 use crate::types::{DbfCode, EpicsValue, PvString};
 
 mod include;
+mod install;
 mod json_lex;
 mod source;
 mod substitution;
@@ -17,6 +18,8 @@ pub use include::{
     db_open_file_located, db_path, expand_includes, loaded_path, parse_db_file,
     parse_db_file_with_breaktables, parse_db_opened_with_breaktables, set_loaded_path,
 };
+pub(crate) use include::{db_load_config, parse_db_opened_held, resolve_db_file};
+pub(crate) use install::{InstallHost, LoadRejected, install_records};
 pub use source::{DbIncludeFrame, DbSource};
 pub use substitution::{
     RowMacro, SubstitutionEvent, SubstitutionFault, Substitutions, TemplateLoad,
@@ -449,20 +452,47 @@ fn menu_name_of(choices: &'static [&'static str]) -> Option<&'static str> {
         .map(|(name, _, _)| *name)
 }
 
-/// C's refusal for a `.db` field value `dbPutString` would not take
-/// (`dbLexRoutines.c:1406-1413` @`R7.0.10`), without its newline.
-///
-/// `detail` is `pdbentry->message`, which C prints unconditionally between the
-/// value and the status text — an arm that set no message still leaves the two
-/// spaces that produces.
-pub(crate) fn cant_set_line(
+/// C's `pdbentry->message` for one `record()` block: allocated with the entry
+/// at the head (`dbLexRoutines.c:1131`) and freed at the close (`:1533`).
+/// Three `dbPutString` arms write it (`dbStaticRun.c:497`, `:500`,
+/// `dbStaticLib.c:2647`) and nothing in the block clears it, so a refusal
+/// prints the last text any earlier refusal of the block left there.
+#[derive(Default)]
+pub(crate) struct EntryMessage(Option<String>);
+
+impl EntryMessage {
+    /// C's refusal for a `.db` field value `dbPutString` would not take
+    /// (`dbLexRoutines.c:1406-1413` @`R7.0.10`), without its newline, after
+    /// `writes` — the refusing arm's own `dbMsgPrint`, if it made one.
+    pub(crate) fn cant_set_line(
+        &mut self,
+        record: &str,
+        field: &str,
+        value: &str,
+        writes: Option<&str>,
+        status: &str,
+    ) -> String {
+        if let Some(text) = writes {
+            self.0 = Some(text.to_string());
+        }
+        cant_set_sentence(
+            record,
+            field,
+            value,
+            self.0.as_deref().unwrap_or(""),
+            status,
+        )
+    }
+}
+
+fn cant_set_sentence(
     record: &str,
     field: &str,
     value: &str,
-    detail: &str,
+    message: &str,
     status: &str,
 ) -> String {
-    format!("{ERL_ERROR}: Can't set '{record}.{field}' to '{value}' {detail} : {status}")
+    format!("{ERL_ERROR}: Can't set '{record}.{field}' to '{value}' {message} : {status}")
 }
 
 /// The refusal C's `.db` loader would print for `value` on `field`, or `None`
@@ -476,6 +506,38 @@ pub(crate) fn cant_set_line(
 /// three call sites, which is the point of deciding it here rather than at
 /// whichever site happens to apply the field.
 ///
+/// C `dbRecordField`'s two name-side refusals (`dbLexRoutines.c:1241-1396`),
+/// both `yyerror(NULL)`: the field is dropped, the record and its other fields
+/// stay. `record_type` is the type of the record the body is APPLIED to — C
+/// asks `pdbentry`, which for `record("*",…)` and for a duplicate of another
+/// type is the record already in the database, not the type the head names.
+///
+/// C follows the first refusal with a spelling suggestion when it finds one
+/// and prints nothing when it does not. C reads the value before
+/// `dbTranslateEscape`; nothing a suggestion depends on can be spelled with an
+/// escape, so the translated value gives the same answer.
+pub(crate) fn field_name_refusal(
+    record_type: &str,
+    record_name: &str,
+    field: &str,
+    value: &str,
+) -> Option<DbDiagnostic> {
+    match record_type_field_exists(record_type, field)? {
+        false => Some(DbDiagnostic::suggesting(
+            format!(
+                "{ERL_ERROR}: {record_type} record '{record_name}' doesn't have a field '{field}'"
+            ),
+            suggest_field(record_type, field, value).map(suggestion_line),
+        )),
+        // `indfield == 0` is `NAME`, dbCommon's first field
+        // (`dbLexRoutines.c:1390-1396`): found, then refused in its own words.
+        true if field == "NAME" => Some(DbDiagnostic::new(format!(
+            "{ERL_ERROR}: Can't set 'NAME' field of record '{record_name}'"
+        ))),
+        true => None,
+    }
+}
+
 /// The menu arm of `dbPutStringNum` (`dbStaticRun.c:484-512`) has TWO refusals,
 /// and they read differently. A value that is neither an exact choice nor a
 /// number is `S_db_badChoice`, and the arm names the menu first
@@ -513,7 +575,9 @@ pub(crate) fn menu_value_refusal(
 ) -> Option<MenuRefusal> {
     use crate::server::record::declared_field;
 
-    let desc = declared_field(record_type, field)?;
+    // `None` for a field the generated table leaves out, which is how most
+    // `DBF_NOACCESS` declarations (`ai.PBRK`) are carried.
+    let desc = declared_field(record_type, field);
     // C `dbPutString` refuses ANY field value that still carries a macro,
     // before the field-type switch it would otherwise reach
     // (`dbStaticLib.c:2579-2585` @`R7.0.10`). The `macroIsOk` half of that test
@@ -524,34 +588,113 @@ pub(crate) fn menu_value_refusal(
     // hook.
     if value.contains("$(") || value.contains("${") {
         return Some(MenuRefusal {
-            notice: Some(format!("{record_name}.{field} Has unexpanded macro")),
-            // `S_dbLib_badField` with no `pdbentry->message`, which is what
-            // leaves two spaces before the colon.
-            line: cant_set_line(record_name, field, value, "", "Bad Field value"),
+            notice: Some(DbNotice::Stderr(format!(
+                "{record_name}.{field} Has unexpanded macro"
+            ))),
+            target: (
+                record_name.to_string(),
+                field.to_string(),
+                value.to_string(),
+            ),
+            writes: None,
+            status: "Bad Field value",
             // `dbRecordField` runs `dbPutStringSuggest` after every refusal
             // (`dbLexRoutines.c:1414`) and only its menu and device arms
             // propose anything, so a menu field still gets a proposal off the
             // unexpanded text -- measured on `compressTest.db`,
             // `field(ALG,"$(ALG,undefined)")` gets `Did you mean "Average"?`
             // while `field(NSAM,"$(NSAM,undefined)")` gets nothing.
-            suggestion: load_menu_of(desc).and_then(|(_, choices)| suggest_choice(choices, value)),
+            suggestion: desc
+                .and_then(load_menu_of)
+                .and_then(|(_, choices)| suggest_choice(choices, value)),
+            stored: false,
         });
     }
+    let target = (
+        record_name.to_string(),
+        field.to_string(),
+        value.to_string(),
+    );
+    if is_declared_no_access(record_type, field, desc) {
+        return Some(MenuRefusal {
+            notice: None,
+            target,
+            writes: Some("Can't set array field before iocInit()".to_string()),
+            status: "Bad Field value",
+            suggestion: None,
+            stored: false,
+        });
+    }
+    let desc = desc?;
+    // `S_dbLib_strLen`, tested on the declared size before the copy and before
+    // `postfix()` (`dbStaticLib.c:2589`): the field keeps what it held.
+    if desc.declared_dbf == DbfCode::String
+        && desc.size > 0
+        && value.len() >= usize::from(desc.size)
+    {
+        return Some(MenuRefusal {
+            notice: None,
+            target,
+            writes: None,
+            status: "String is too long",
+            suggestion: None,
+            stored: false,
+        });
+    }
+    if let Some(refusal) = calc_expression_refusal(&target, desc, value) {
+        return Some(refusal);
+    }
     let probe = db_put_string_probe(value);
-    let (detail, status, suggestion) = match load_menu_of(desc) {
+    let (writes, status, suggestion) = match load_menu_of(desc) {
         Some((menu_name, choices)) => menu_arm(desc, field, menu_name, choices, probe, value)?,
         // Not a menu — or one that resolves no choice table. Either way the
         // numeric arms of the same C function decide it.
         None => (
-            String::new(),
+            None,
             numeric_value_refusal(desc.declared_dbf, field, probe)?,
             None,
         ),
     };
     Some(MenuRefusal {
         notice: None,
-        line: cant_set_line(record_name, field, value, &detail, status),
+        target,
+        writes,
+        status,
         suggestion,
+        stored: false,
+    })
+}
+
+/// The `DBF_STRING` arm of `dbPutString` for a `special(SPC_CALC)` field
+/// (`dbStaticLib.c:2593-2601` @`R7.0.10`): the text is compiled with base
+/// `postfix()` whatever record type owns the field, and a failure is
+/// `S_dbLib_badField` after `errlogPrintf("%s in CALC expression '%s'")`.
+///
+/// Keyed on the declared special, not on a record type, so calc `CALC`,
+/// calcout `CALC`/`OCAL` and swait `CALC` — and any later `.dbd` that declares
+/// the special — take one rule. A value that still carries a macro, or one
+/// that does not fit the field (`S_dbLib_strLen`), never gets here.
+fn calc_expression_refusal(
+    target: &(String, String, String),
+    desc: &FieldDesc,
+    value: &str,
+) -> Option<MenuRefusal> {
+    use crate::server::record::Special;
+
+    if desc.declared_dbf != DbfCode::String || desc.declared_special != Special::Calc {
+        return None;
+    }
+    let err = crate::calc::compile(value).err()?;
+    let text = crate::calc::calc_error_str(err.code()).unwrap_or("Unknown error");
+    Some(MenuRefusal {
+        notice: Some(DbNotice::Errlog(format!(
+            "{text} in CALC expression '{value}'"
+        ))),
+        target: target.clone(),
+        writes: None,
+        status: "Bad Field value",
+        suggestion: None,
+        stored: true,
     })
 }
 
@@ -564,21 +707,21 @@ fn menu_arm(
     choices: &[&'static str],
     probe: &str,
     value: &str,
-) -> Option<(String, &'static str, Option<String>)> {
+) -> Option<(Option<String>, &'static str, Option<String>)> {
     use crate::server::record::resolve_menu_field_string_db_load;
     use crate::types::c_parse::{self, NumericField};
 
     if resolve_menu_field_string_db_load(field, choices, desc.dbf_type, probe).is_ok() {
         return None;
     }
-    let (detail, status) = match c_parse::parse_auto_base_units_null(NumericField::UShort, probe) {
+    let (writes, status) = match c_parse::parse_auto_base_units_null(NumericField::UShort, probe) {
         // `epicsParseUInt16` succeeded, so the bound is what refused it.
-        Some(_) => (String::new(), "Bad Field value"),
+        Some(_) => (None, "Bad Field value"),
         // C words this with `pdbMenu->name`; an externally-registered menu
         // has no `.dbd` name, and the field's own name is the nearest thing
         // the wording can carry.
         None => (
-            format!("using menu {}", menu_name.unwrap_or(field)),
+            Some(format!("using menu {}", menu_name.unwrap_or(field))),
             "Illegal choice",
         ),
     };
@@ -588,7 +731,7 @@ fn menu_arm(
     // menu and device arms of that function propose anything at all
     // (`dbStaticLib.c:2669-2708`), which is why the numeric refusals below
     // carry no suggestion.
-    Some((detail, status, suggest_choice(choices, value)))
+    Some((writes, status, suggest_choice(choices, value)))
 }
 
 /// The `errSymLookup` text of the `S_stdlib_*` statuses (`epicsStdlib.h:43-51`)
@@ -770,16 +913,54 @@ fn integer_refusal(
     }
 }
 
+/// A line `dbPutString` itself prints before returning its status, on the
+/// stream C writes it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbNotice {
+    /// `fprintf(stderr, …)`, as for an unexpanded macro (`dbStaticLib.c:2582`).
+    Stderr(String),
+    /// `errlogPrintf`, as for an SPC_CALC text `postfix()` refuses (`:2599`).
+    Errlog(String),
+}
+
+impl DbNotice {
+    pub fn print(&self) {
+        match self {
+            DbNotice::Stderr(text) => eprintln!("{text}"),
+            DbNotice::Errlog(text) => crate::runtime::log::errlog_printf(&format!("{text}\n")),
+        }
+    }
+}
+
 /// A refused `.db` menu value, with every line C prints for it.
 pub(crate) struct MenuRefusal {
     /// What `dbPutString` itself printed before returning the status
     /// (`dbStaticLib.c:2582-2584`), which therefore precedes the `ERROR:` line
     /// its caller prints. `None` for the arms that return a status silently.
-    pub notice: Option<String>,
-    /// The `ERROR:` line.
-    pub line: String,
+    pub notice: Option<DbNotice>,
+    /// The record, field and value the `ERROR:` line names.
+    target: (String, String, String),
+    /// What the refusing arm wrote into `pdbentry->message`.
+    writes: Option<String>,
+    /// `errSymLookup` of the status the arm returned.
+    status: &'static str,
     /// C `dbPutStringSuggest`'s proposal, or `None` when it proposes nothing.
     pub suggestion: Option<String>,
+    /// Whether the refused text is nevertheless the field's value afterwards.
+    /// `dbPutString` copies a `DBF_STRING` into the field and only then runs
+    /// `postfix()` on a `SPC_CALC` one (`dbStaticLib.c:2589-2599`), so the
+    /// load fails and the record keeps the uncompilable text — which is what
+    /// `init_record` then complains about. Every other refusal stores nothing.
+    pub stored: bool,
+}
+
+impl MenuRefusal {
+    /// The `ERROR:` line, read against the block's `entry` after this arm
+    /// wrote to it.
+    pub(crate) fn line(&self, entry: &mut EntryMessage) -> String {
+        let (record, field, value) = &self.target;
+        entry.cant_set_line(record, field, value, self.writes.as_deref(), self.status)
+    }
 }
 
 /// The choice C would propose after refusing `value` (`dbPutStringSuggest`,
@@ -824,6 +1005,24 @@ pub(crate) fn registered_record_type_entries() -> Vec<(String, usize)> {
         .collect()
 }
 
+/// One `alias(...)` naming a record, with the flattened line its `)` closed
+/// on — where C's `dbRecordAlias` / `dbAlias` call `yyerror(NULL)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbAlias {
+    pub name: String,
+    pub line: u32,
+}
+
+/// A file-scope `alias("record","new")`. C `dbAlias` runs it where it stands
+/// (`dbLexRoutines.c:1501-1520`), against the database as it is after the
+/// `after` records parsed above it in this text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbFileAlias {
+    pub target: String,
+    pub alias: DbAlias,
+    pub after: usize,
+}
+
 /// A record definition parsed from a .db file.
 #[derive(Debug, Clone)]
 pub struct DbRecordDef {
@@ -834,15 +1033,11 @@ pub struct DbRecordDef {
     /// (`epicsString.c:106`), and a DBF_STRING's budget is 40 BYTES. Modelling
     /// the value as a Rust `String` made `\xff` two bytes (R19-68).
     pub fields: Vec<DbFieldDef>,
-    /// Aliases declared inside the record body (`alias("name")`).
+    /// Aliases declared inside the record body (`alias("name")`), and
+    /// file-scope `alias("record","name")` directives naming this record.
     /// Mirrors epics-base PR #336 — alias names are validated with
     /// the same rules as record names.
-    pub aliases: Vec<String>,
-    /// The line each of [`Self::aliases`] was read on (C's
-    /// `pinputFileNow->line_num` when `dbRecordAlias` reduces), index for
-    /// index. Pushed only beside `aliases`, at the two places the parser
-    /// adds one, so the vectors cannot drift.
-    pub alias_lines: Vec<u32>,
+    pub aliases: Vec<DbAlias>,
     /// `info(tag, value)` pairs declared inside the record body.
     /// Mirrors `info` directives in EPICS db files; common tags include
     /// `asyn:READBACK` (asyn upstream PRs #60 / #208), `Q:form`, etc.
@@ -897,54 +1092,90 @@ impl DbFieldDef {
     }
 }
 
-/// Validate a record (or alias) name against epics-base PR #78 rules.
-///
-/// Returns `Err(CaError::DbParseError)` for the hard-error cases (empty
-/// name, embedded space/tab/quote/dot/dollar). Logs `tracing::warn!`
-/// for the soft-warning cases (leading `-`/`+`/`[`/`{`, embedded
-/// non-printable characters); the parse continues so legacy databases
-/// still load.
-///
-/// The check runs **after** macro substitution, mirroring base where
-/// `dbRecordHead` is invoked from the lexer with the substituted name.
-///
-/// The third argument is no longer read. C locates both refusals at the `)`
-/// the `record_head`/`alias` production had just reduced — measured on
-/// `softIoc` @`R7.0.10`, `record(ai, "")` and `record(ai, "a b")` both print
-/// ` at or before ')'` — so the locator is a constant, not something a caller
-/// can know better. Dropping the parameter needs the iocsh caller that still
-/// passes one, which is another panel's file.
-pub(crate) fn validate_record_name(name: &str, line: usize, _col: usize) -> CaResult<()> {
+/// What C `dbRecordNameValidate` (`dbLexRoutines.c:1085-1119`) refuses.
+pub(crate) enum NameRefusal {
+    /// `yyerrorAbort(ERL_ERROR ": Record/Alias name can't be empty")`.
+    Empty,
+    /// The `fprintf` of the character, then `yyerrorAbort(NULL)`.
+    BadChar(char),
+}
+
+impl NameRefusal {
+    /// The text C hands `yyerror` for [`Self::Empty`], or prints before its
+    /// `yyerror(NULL)` for [`Self::BadChar`].
+    fn message(&self, name: &str) -> String {
+        match self {
+            Self::Empty => format!("{ERL_ERROR}: Record/Alias name can't be empty"),
+            Self::BadChar(c) => {
+                format!("{ERL_ERROR}: Bad character '{c}' in Record/Alias name \"{name}\"")
+            }
+        }
+    }
+}
+
+/// C `dbRecordNameValidate` over a substituted name: the `WARNING:` lines it
+/// prints as it scans, and the refusal that stops it.
+fn record_name_verdict(name: &str) -> (Vec<String>, Option<NameRefusal>) {
+    let mut warnings = Vec::new();
     if name.is_empty() {
-        return Err(CaError::DbParseError {
+        return (warnings, Some(NameRefusal::Empty));
+    }
+    for (i, c) in name.bytes().enumerate() {
+        if i == 0 && matches!(c, b'-' | b'+' | b'[' | b'{') {
+            warnings.push(format!(
+                "{ERL_WARNING}: Record/Alias name '{name}' should not begin with '{}'",
+                c as char
+            ));
+        }
+        if c < b' ' {
+            warnings.push(format!(
+                "{ERL_WARNING}: Record/Alias name '{name}' contains non-printable 0x{c:02x}"
+            ));
+        } else if matches!(c, b' ' | b'\t' | b'"' | b'\'' | b'.' | b'$') {
+            return (warnings, Some(NameRefusal::BadChar(c as char)));
+        }
+    }
+    (warnings, None)
+}
+
+/// [`record_name_verdict`]'s refusal alone, for a caller outside the `.db`
+/// grammar. The third argument is not read; the iocsh caller still passes it.
+pub(crate) fn validate_record_name(name: &str, line: usize, _col: usize) -> CaResult<()> {
+    match record_name_verdict(name).1 {
+        None => Ok(()),
+        Some(refusal) => Err(CaError::DbParseError {
             line,
             token: String::from(")"),
-            message: "record/alias name can't be empty".into(),
-        });
+            message: refusal.message(name),
+        }),
     }
-    for (i, c) in name.chars().enumerate() {
-        if i == 0 && matches!(c, '-' | '+' | '[' | '{') {
-            tracing::warn!(name, "record/alias name should not begin with '{}'", c);
-        }
-        // Non-printable ASCII (< space) is a warning, not an error —
-        // matches base PR #78's `errlogPrintf("Warning: ...")` branch.
-        if (c as u32) < 0x20 {
-            tracing::warn!(
-                name,
-                "record/alias name should not contain non-printable 0x{:02X}",
-                c as u32
-            );
-            continue;
-        }
-        if matches!(c, ' ' | '\t' | '"' | '\'' | '.' | '$') {
-            return Err(CaError::DbParseError {
-                line,
-                token: String::from(")"),
-                message: format!("bad character '{c}' in record/alias name \"{name}\""),
-            });
-        }
+}
+
+/// C `dbRecordNameValidate` as `dbRecordHead`/`dbAlias`/`dbRecordAlias` run
+/// it: the warnings print at `line`, and a refusal is a `yyerrorAbort`
+/// located at the `)` just reduced (measured on softIoc R7.0.10, `record(ai,
+/// "")` and `record(ai, "a b")` both print ` at or before ')'`).
+fn db_record_name_validate(
+    name: &str,
+    line: usize,
+    faults: &mut DbFaults,
+    yy_abort: &mut bool,
+    yyerror_null: &mut bool,
+) -> CaResult<()> {
+    let (warnings, refusal) = record_name_verdict(name);
+    for warning in warnings {
+        faults.defer(line as u32, ReadNotice::Stderr(format!("{warning}\n")));
     }
-    Ok(())
+    let Some(refusal) = refusal else {
+        return Ok(());
+    };
+    *yy_abort = true;
+    *yyerror_null = matches!(refusal, NameRefusal::BadChar(_));
+    Err(CaError::DbParseError {
+        line,
+        token: String::from(")"),
+        message: refusal.message(name),
+    })
 }
 
 /// The single owner of C's `yyerror` / `yyerrorAbort` distinction.
@@ -995,7 +1226,7 @@ pub(crate) fn validate_record_name(name: &str, line: usize, _col: usize) -> CaRe
 pub struct DbDiagnostic {
     /// C `dbPutString`'s own `fprintf` before it returns the status
     /// (`dbStaticLib.c:2582-2584`) — printed ABOVE the `ERROR:` line.
-    pub notice: Option<String>,
+    pub notice: Option<DbNotice>,
     /// The `ERROR:` line itself, and the only part recorded as a fault.
     pub message: String,
     /// C `dbPutStringSuggest`'s proposal — printed BELOW the `ERROR:`
@@ -1023,9 +1254,42 @@ impl DbDiagnostic {
     }
 }
 
+/// A line of output held by [`DbFaults`] until the load reaches the line of
+/// the file it is about, kept on the stream it would have gone to.
+#[derive(Debug)]
+pub(crate) enum ReadNotice {
+    /// macLib's notice, which `refer` writes through `errlogPrintf`; also
+    /// `dbParseLink`'s refusal report, which C prints the same way.
+    Errlog(String),
+    /// `db_yyinput`'s `WARNING: … has undefined macros`, a direct
+    /// `fprintf(stderr, …)`.
+    Stderr(String),
+    /// A diagnostic with the token its `yyerror` quotes, rendered — and
+    /// so given ` at or before` or not — only when it is released.
+    Report(String, DbDiagnostic),
+    /// A `yyerrorAbort(str)` with the token it quotes.
+    Yyerror(String, String),
+}
+
 #[derive(Debug, Default)]
 pub struct DbFaults {
     messages: Vec<String>,
+    /// Everything with a line that the load has not printed yet, each
+    /// keyed by its flattened line, in line order.
+    ///
+    /// C reads, parses and installs one record at a time, so its output is
+    /// in file order. This port expands the whole include tree, then
+    /// parses all of it, then installs record by record, screening every
+    /// field's menu value before applying any. So read-time notices,
+    /// parse-time refusals and both install passes' refusals all wait here,
+    /// and [`Self::read_through`] releases them in line order when the
+    /// install loop reaches a record head. Nothing prints early, and
+    /// nothing is lost: [`Drop`] releases what is left, and only an abort,
+    /// past which C reads nothing, discards them.
+    unread: std::collections::VecDeque<(u32, ReadNotice)>,
+    /// The last line [`Self::read_through`] released: a diagnostic about a
+    /// line at or before it has nothing left to wait for.
+    read: u32,
     /// C's lexer state that `yyerror` reads — `pinputFileNow` and
     /// `my_buffer` (`dbYacc.y:374-381`) — for the whole flattened text.
     source: Option<source::DbSource>,
@@ -1062,6 +1326,76 @@ impl DbFaults {
     /// as it reads.
     pub fn bind_source(&mut self, source: source::DbSource) {
         self.source = Some(source);
+        self.read_through(self.read);
+    }
+
+    /// Hold `notice` until the load reaches flattened `line`, after
+    /// everything already held for that line.
+    pub(crate) fn defer(&mut self, line: u32, notice: ReadNotice) {
+        let at = self.unread.partition_point(|(held, _)| *held <= line);
+        self.unread.insert(at, (line, notice));
+        // A line the lexer has already passed has nothing left to wait for.
+        if line <= self.read {
+            self.read_through(self.read);
+        }
+    }
+
+    /// Hold the errlog line `dbParseLink` prints while `dbPutString` runs
+    /// until the load reaches `line`.
+    pub(crate) fn defer_put_report(&mut self, line: u32, e: &CaError) {
+        if let CaError::BadLink(refusal) = e
+            && let Some(report) = refusal.report()
+        {
+            self.defer(line, ReadNotice::Errlog(report));
+        }
+    }
+
+    /// C's lexer having read through `line`: release every notice of the
+    /// lines up to it, in the order they were raised.
+    pub fn read_through(&mut self, line: u32) {
+        self.read = self.read.max(line);
+        while let Some((at, _)) = self.unread.front()
+            && *at <= line
+        {
+            // A position names a line of the bound text: none is bound
+            // while the include layer is still reading it.
+            if self.source.is_none()
+                && matches!(
+                    self.unread.front(),
+                    Some((_, ReadNotice::Report(..) | ReadNotice::Yyerror(..)))
+                )
+            {
+                break;
+            }
+            let Some((at, notice)) = self.unread.pop_front() else {
+                break;
+            };
+            match notice {
+                ReadNotice::Errlog(text) => crate::runtime::log::errlog_printf(&text),
+                ReadNotice::Stderr(text) => eprint!("{text}"),
+                ReadNotice::Report(token, diagnostic) => {
+                    let parked = self.park.replace((at, token));
+                    self.render(diagnostic);
+                    self.park = parked;
+                }
+                ReadNotice::Yyerror(token, message) => {
+                    let parked = self.park.replace((at, token));
+                    self.yyerror(Some(&message));
+                    self.park = parked;
+                }
+            }
+        }
+    }
+
+    /// C's lexer at end of file.
+    pub fn read_to_end(&mut self) {
+        self.read_through(u32::MAX);
+    }
+
+    /// C's `yyAbort`: the lexer reads no further, so the lines after this
+    /// point never raise their notices.
+    pub fn stop_reading(&mut self) {
+        self.unread.clear();
     }
 
     /// C's lexer seat: say where the parser now is, so a diagnostic
@@ -1101,6 +1435,12 @@ impl DbFaults {
     /// forgotten, and no caller outside this module is left printing a
     /// `.db` rejection as a bare error string.
     pub fn abort(&mut self, err: &CaError) {
+        self.abort_as(err, false);
+    }
+
+    /// [`Self::abort`], or with `yyerror_null` the `yyerrorAbort(NULL)` that
+    /// follows an `fprintf` of the error's message.
+    fn abort_as(&mut self, err: &CaError, yyerror_null: bool) {
         let message = match err {
             CaError::DbParseError {
                 line,
@@ -1119,44 +1459,55 @@ impl DbFaults {
                 // is what the two lines below say properly.
                 message.clone()
             }
-            CaError::DbJsonValue {
-                line,
-                faults,
-                syntax_token,
-            } => {
-                // One `yyerrorAbort` per refusal, all parked on the line the
-                // lexer still holds; ` at or before` quotes the first one's
-                // `yytext` and `yy_failed` keeps the later ones to the echo.
-                // The grammar's own `syntax error` is last, and is the
-                // message that is recorded.
-                self.park = Some((*line as u32, syntax_token.clone()));
-                for fault in faults {
-                    let (token, messages) = match fault {
-                        JsonLexFault::Invalid(c) => (c.to_string(), invalid_character_messages(*c)),
-                        JsonLexFault::BadString(text) => (
-                            text.clone(),
-                            vec!["Bad character in JSON string".to_string()],
-                        ),
-                        JsonLexFault::NewlineInString(text) => (
-                            text.clone(),
-                            vec!["Newline in string, closing quote missing".to_string()],
-                        ),
-                    };
-                    for message in messages {
-                        self.park = Some((*line as u32, token.clone()));
-                        self.yyerror(Some(&message));
-                        self.messages.push(message);
-                    }
-                }
-                SYNTAX_ERROR.to_string()
-            }
             _ => {
                 self.park = None;
                 err.to_string()
             }
         };
-        self.yyerror(Some(&message));
+        // A position-less abort comes from the include layer, which has
+        // read every line it queued.
+        match &self.park {
+            Some((line, _)) => self.read_through(*line),
+            None => self.read_to_end(),
+        }
+        self.stop_reading();
+        if yyerror_null {
+            eprintln!("{message}");
+            self.yyerror(None);
+        } else {
+            self.yyerror(Some(&message));
+        }
         self.messages.push(message);
+    }
+
+    /// [`Self::abort`] for a parse that ended in `abort`, followed by the
+    /// warning `dbReadCOM` prints once `yyparse` has returned
+    /// (`dbLexRoutines.c:303-306`).
+    pub(crate) fn abort_parse(&mut self, abort: &ParseAbort) {
+        self.abort_as(&abort.error, abort.yyerror_null);
+        if abort.stack_dirty {
+            eprintln!("{ERL_WARNING}: dbReadCOM: Parser stack dirty w/o error. 1");
+        }
+    }
+
+    /// C `yyerrorAbort(str)` from the JSON lexer, raised with it on `line`:
+    /// one `yyerror` per message, held until the load reaches the line.
+    pub(crate) fn lex_abort(&mut self, line: u32, fault: &JsonLexFault) {
+        let (token, messages) = match fault {
+            JsonLexFault::Invalid(c) => (c.to_string(), invalid_character_messages(*c)),
+            JsonLexFault::BadString(text) => (
+                text.clone(),
+                vec!["Bad character in JSON string".to_string()],
+            ),
+            JsonLexFault::NewlineInString(text) => (
+                text.clone(),
+                vec!["Newline in string, closing quote missing".to_string()],
+            ),
+        };
+        for message in messages {
+            self.messages.push(message.clone());
+            self.defer(line, ReadNotice::Yyerror(token.clone(), message));
+        }
     }
 
     /// C `yyerror(NULL)`: print the diagnostic, remember that the load
@@ -1176,21 +1527,34 @@ impl DbFaults {
 
     /// [`Self::recoverable`] with the lines C prints AROUND the `ERROR:`
     /// one, in C's own order — see [`DbDiagnostic`].
+    ///
+    /// One positioned past what the load has read is held until it gets
+    /// there (see [`Self::unread`]); any other prints now.
     pub fn report(&mut self, diagnostic: DbDiagnostic) {
+        self.messages.push(diagnostic.message.clone());
+        match self.park.clone() {
+            Some((line, token)) if line > self.read || self.source.is_none() => {
+                self.defer(line, ReadNotice::Report(token, diagnostic))
+            }
+            _ => self.render(diagnostic),
+        }
+    }
+
+    /// Print `diagnostic` at the current [`Self::park`].
+    fn render(&mut self, diagnostic: DbDiagnostic) {
         let DbDiagnostic {
             notice,
             message,
             suggestion,
         } = diagnostic;
         if let Some(notice) = notice {
-            eprintln!("{notice}");
+            notice.print();
         }
         eprintln!("{message}");
         if let Some(suggestion) = suggestion {
             eprintln!("{suggestion}");
         }
         self.yyerror(None);
-        self.messages.push(message);
     }
 
     /// [`Self::report`] for a diagnostic raised after the parse, at a
@@ -1204,13 +1568,30 @@ impl DbFaults {
     }
 
     /// C `yyerrorAbort(NULL)`: [`Self::report_at`], then the `syntax error`
-    /// the grammar draws at the EOF the abort makes of the next line read.
+    /// the grammar draws at the EOF the abort makes of the next line read
+    /// (`dbLexRoutines.c:374`). The rest of the line is still parsed, so
+    /// that EOF is an error only inside a record body still open there.
     pub fn abort_at(&mut self, line: u32, diagnostic: DbDiagnostic) {
         self.seek(line, ")");
         self.report(diagnostic);
-        self.yyerror(Some(SYNTAX_ERROR));
-        self.messages.push(SYNTAX_ERROR.to_string());
+        self.read_through(line);
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|s| s.body_open_after(line))
+        {
+            self.yyerror(Some(SYNTAX_ERROR));
+            self.messages.push(SYNTAX_ERROR.to_string());
+        }
         self.seek_end();
+    }
+
+    /// A record read from the `record` keyword on line `start` to its
+    /// closing `}` on line `end`.
+    fn body_spans(&mut self, start: u32, end: u32) {
+        if let Some(source) = self.source.as_mut() {
+            source.body_spans(start, end);
+        }
     }
 
     /// C `yyerror` itself (`dbYacc.y:371-383`), both of its arms.
@@ -1255,8 +1636,10 @@ impl DbFaults {
         // C's `my_buffer` still carries the newline `fgets` left on it, so
         // this format's own trailing `\n` is what puts a blank line under
         // the echo. A last line with no newline of its own loses it, in C
-        // too.
-        out.push_str(&format!("\n {line} | {text}\n"));
+        // too. The number is `pinputFileNow->line_num`, the innermost
+        // file's own line, not the flattened one.
+        let file_line = frames.first().map_or(line, |frame| frame.line);
+        out.push_str(&format!("\n {file_line} | {text}\n"));
         Some(out)
     }
 
@@ -1269,11 +1652,14 @@ impl DbFaults {
     /// printed ` at or before` must not print it again from an outer
     /// frame, and an outer frame with no text of its own must be able to
     /// locate a diagnostic in the inner one.
-    pub fn absorb(&mut self, other: DbFaults) {
-        self.messages.extend(other.messages);
+    pub fn absorb(&mut self, mut other: DbFaults) {
+        self.messages.append(&mut other.messages);
+        for (line, held) in std::mem::take(&mut other.unread) {
+            self.defer(line, held);
+        }
         self.yy_failed |= other.yy_failed;
         if self.source.is_none() {
-            self.source = other.source;
+            self.source = other.source.take();
         }
     }
 
@@ -1305,6 +1691,12 @@ impl DbFaults {
             Some((first, [])) => Some(first.clone()),
             Some((first, rest)) => Some(format!("{first} (+{} more)", rest.len())),
         }
+    }
+}
+
+impl Drop for DbFaults {
+    fn drop(&mut self) {
+        self.read_to_end();
     }
 }
 
@@ -1417,12 +1809,10 @@ pub struct ParsedDb {
     /// breakpoint-table registry so `ai`/`ao` records with `LINR >= 3`
     /// can resolve their linearisation table.
     pub breaktables: Vec<crate::server::cvt_bpt::BrkTable>,
-    /// File-scope `alias("record","new")` directives whose target is not
-    /// declared in this text. C `dbAlias` (`dbLexRoutines.c:1508`) looks
-    /// the target up in `savedPdbbase` — the whole accumulated database
-    /// — so only a caller that owns that database can resolve them, and
-    /// the parser must not decide their fate on its own.
-    pub unresolved_aliases: Vec<(String, String, u32)>,
+    /// File-scope `alias("record","new")` directives, in text order. C
+    /// `dbAlias` looks the target up in `savedPdbbase` at that point of the
+    /// parse, so only a caller installing the records can run them.
+    pub file_aliases: Vec<DbFileAlias>,
     /// Recoverable failures this text produced (C `yyerror(NULL)`). The
     /// records above are everything that parsed in spite of them; the
     /// caller turns a non-empty set into the load's non-zero status.
@@ -1430,6 +1820,21 @@ pub struct ParsedDb {
     /// The `.dbd` declarations the text carried. Empty for an ordinary
     /// `.db`; C accepts both through the same grammar.
     pub dbd: DbdDefs,
+    /// The abort that ended the parse, not yet reported: the records
+    /// above are everything C had reduced before it.
+    pub(crate) aborted: Option<ParseAbort>,
+}
+
+/// A parse C ended with `yyerror(str)` or `yyerrorAbort`.
+#[derive(Debug)]
+pub(crate) struct ParseAbort {
+    pub(crate) error: CaError,
+    /// C's `Parser stack dirty w/o error` condition
+    /// (`dbLexRoutines.c:303-306`): a record body was open and the abort
+    /// was the grammar's, not `yyerrorAbort`'s.
+    pub(crate) stack_dirty: bool,
+    /// The abort was `yyerrorAbort(NULL)`, its message already `fprintf`ed.
+    pub(crate) yyerror_null: bool,
 }
 
 impl ParsedDb {
@@ -1448,6 +1853,18 @@ impl ParsedDb {
             Ok(self)
         } else {
             Err(CaError::DbLoadFailed(source.to_string()))
+        }
+    }
+
+    /// Report the abort, if the parse ended in one, for a caller that does
+    /// not install the records before it.
+    pub(crate) fn raise_abort(mut self) -> CaResult<Self> {
+        match self.aborted.take() {
+            None => Ok(self),
+            Some(abort) => {
+                self.faults.abort_parse(&abort);
+                Err(abort.error)
+            }
         }
     }
 }
@@ -1495,8 +1912,10 @@ pub(crate) async fn create_alias(
         None if db.get_record_no_resolve(alias).is_some() => Some(format!(
             "Alias '{alias}' for record '{record}' is already a record name."
         )),
+        // The new alias names the de-aliased record, as `dbCreateAlias`
+        // does (`dbStaticLib.c:1675-1677`).
         None => db
-            .add_alias(alias, record)
+            .add_alias(alias, &canonical)
             .await
             .err()
             .map(|e| format!("Alias '{alias}' for record '{record}' rejected: {e}")),
@@ -1508,53 +1927,36 @@ pub(crate) async fn create_alias(
     true
 }
 
-/// What C writes when a record type cannot be instantiated for
-/// `record(type, name)`, and which of its two texts it is.
-pub struct RecordTypeMiss {
-    /// C's `printf` (stdout), tab included.
-    pub stdout: Option<&'static str>,
-    /// C's `epicsPrintf`: errlog, terminator included.
-    pub errlog: Option<String>,
-    /// The `yyerrorAbort` sentence.
-    pub message: String,
-}
-
-/// `dbFindRecordType` failing is `Record type '%s' for record '%s' not
-/// found`; a type the `.dbd` declares but no `recordType` registrar
-/// installed reaches `dbAllocRecord` with `rec_size = 0` and ends in
-/// `Can't create %s record '%s'` (`dbLexRoutines.c:1162-1194`). This port
-/// resolves types from a compile-time table, so "declared" means the
-/// crate vendors the `.dbd`.
-pub fn record_type_miss(record_type: &str, name: &str) -> RecordTypeMiss {
-    if crate::server::record::dbd_generated::record_fields(record_type).is_some() {
-        return RecordTypeMiss {
-            stdout: Some("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***"),
-            errlog: Some(format!(
-                "dbAllocRecord({name}) with {record_type} rec_size = 0\n"
-            )),
-            message: format!("{ERL_ERROR}: Can't create {record_type} record '{name}'"),
-        };
-    }
-    RecordTypeMiss {
-        stdout: None,
-        errlog: None,
-        message: format!("{ERL_ERROR}: Record type '{record_type}' for record '{name}' not found"),
-    }
-}
-
 /// Parse an EPICS .db file with macro substitution.
 ///
 /// The records-only entry point: it has no database to resolve a
 /// file-scope alias against, so an unmatched one is reported to stderr
 /// and dropped. C keeps the records it already read too — callers that
 /// own a database ([`crate::server::ioc_builder`], `dbLoadRecords`)
-/// take [`ParsedDb::unresolved_aliases`] instead and resolve them.
+/// take [`ParsedDb::file_aliases`] instead and run them.
 pub fn parse_db(input: &str, macros: impl Into<MacroDefs>) -> CaResult<Vec<DbRecordDef>> {
     let parsed = parse_db_with_breaktables(input, macros)?.load_status(DB_STRING_SOURCE)?;
-    for (target, alias, _) in &parsed.unresolved_aliases {
-        eprintln!("{}", unknown_alias_message(alias, target));
+    Ok(parsed.records_with_file_aliases())
+}
+
+impl ParsedDb {
+    /// The records, each file-scope alias attached to its target, for a
+    /// caller with no database. Only a record parsed above the alias is one
+    /// C could find; any other target is reported and the alias dropped.
+    pub fn records_with_file_aliases(self) -> Vec<DbRecordDef> {
+        let mut records = self.records;
+        for file_alias in self.file_aliases {
+            let target = &file_alias.target;
+            match records[..file_alias.after]
+                .iter_mut()
+                .rfind(|r| r.name == *target)
+            {
+                Some(rec) => rec.aliases.push(file_alias.alias),
+                None => eprintln!("{}", unknown_alias_message(&file_alias.alias.name, target)),
+            }
+        }
+        records
     }
-    Ok(parsed.records)
 }
 
 /// C `dbQuietMacroWarnings` (`dbLexRoutines.c:58`), the `int` the `.db`
@@ -1616,6 +2018,7 @@ pub(crate) fn db_read_lines(
     text: &str,
     macros: impl Into<MacroDefs>,
     filename: Option<&str>,
+    faults: &mut DbFaults,
 ) -> (String, DbSource) {
     // One table for the file, because C holds one `MAC_HANDLE` for the
     // whole `.db` (`dbReadCOM`, `dbLexRoutines.c:256-300`) and reads
@@ -1634,7 +2037,7 @@ pub(crate) fn db_read_lines(
     let mut frames = Vec::new();
     for (i, raw) in text.split_inclusive('\n').enumerate() {
         let line_num = i as u32 + 1;
-        let expanded = db_expand_line_in(&mut table, raw, filename, line_num);
+        let expanded = db_expand_line_in(&mut table, raw, filename, line_num, line_num, faults);
         out.push_str(&expanded);
         lines.push(expanded);
         frames.push(std::sync::Arc::from(vec![DbIncludeFrame {
@@ -1648,7 +2051,8 @@ pub(crate) fn db_read_lines(
 
 /// One line through C's `macExpandString` call and the warning that
 /// follows it (`dbLexRoutines.c:378-387`) — the single seat for both
-/// macro diagnostics a `.db` load produces.
+/// macro diagnostics a `.db` load produces. Both are deferred to `faults`
+/// at flattened line `at`, where C's lexer reads this line.
 ///
 /// `raw` must carry its own trailing newline exactly as `fgets` leaves
 /// it, because macLib quotes the string it was given: C's console shows
@@ -1665,8 +2069,13 @@ pub(crate) fn db_expand_line_in(
     raw: &str,
     filename: Option<&str>,
     line_num: u32,
+    at: u32,
+    faults: &mut DbFaults,
 ) -> String {
-    let expansion = table.expand(raw);
+    let (expansion, notices) = table.expand_deferred(raw);
+    for notice in notices {
+        faults.defer(at, ReadNotice::Errlog(notice));
+    }
     // C `entry->error`, not "an undefined name": `macExpandString`
     // returns the same negative length for a recursive reference, and
     // this warning is what tells the operator the line went out wrong.
@@ -1685,9 +2094,12 @@ pub(crate) fn db_expand_line_in(
         // negative length and this line still prints. Measured on
         // `compressTest.db` with `var dbQuietMacroWarnings 1`: C drops
         // the four `macLib:` notices and keeps all four of these.
-        eprintln!(
-            "{}: '{name}' line {line_num} has undefined macros",
-            crate::runtime::log::ERL_WARNING
+        faults.defer(
+            at,
+            ReadNotice::Stderr(format!(
+                "{}: '{name}' line {line_num} has undefined macros\n",
+                crate::runtime::log::ERL_WARNING
+            )),
         );
     }
     expansion.text
@@ -1695,11 +2107,20 @@ pub(crate) fn db_expand_line_in(
 
 /// Like [`parse_db`] but returns the whole [`ParsedDb`].
 pub fn parse_db_with_breaktables(input: &str, macros: impl Into<MacroDefs>) -> CaResult<ParsedDb> {
+    let mut parsed = parse_db_held(input, macros).raise_abort()?;
+    parsed.faults.read_to_end();
+    Ok(parsed)
+}
+
+/// [`parse_db_with_breaktables`] for an installer: every positioned
+/// diagnostic, and an abort, stays held until the install reaches its line.
+pub(crate) fn parse_db_held(input: &str, macros: impl Into<MacroDefs>) -> ParsedDb {
     // Per LINE, not per file: C's loader expands each `fgets` line
     // separately (`dbLexRoutines.c:375-391`), so quote state cannot leak
     // across lines — see [`db_read_lines`].
-    let (expanded, source) = db_read_lines(input, macros, None);
-    parse_db_expanded(&expanded, source)
+    let mut faults = DbFaults::default();
+    let (expanded, source) = db_read_lines(input, macros, None, &mut faults);
+    parse_db_expanded(&expanded, source, faults)
 }
 
 /// The parser proper: text that has ALREADY been through
@@ -1710,47 +2131,66 @@ pub fn parse_db_with_breaktables(input: &str, macros: impl Into<MacroDefs>) -> C
 /// because it has to resolve an `include` filename before it can open it,
 /// and again here — which was invisible while the expander said nothing
 /// and would have printed every `macLib:` line twice the moment it did.
-pub(crate) fn parse_db_expanded(expanded: &str, source: DbSource) -> CaResult<ParsedDb> {
-    // The ONE place a `.db` abort meets the text it came from. C reaches
-    // the same point through `yyerror(str)` from inside the lexer; this
-    // parser returns instead, so the return is where the report has to
-    // happen — and it is a single return, so every abort site the
-    // grammar has gets the position at once. See [`DbFaults::abort`].
-    let mut faults = DbFaults::default();
+pub(crate) fn parse_db_expanded(
+    expanded: &str,
+    source: DbSource,
+    mut faults: DbFaults,
+) -> ParsedDb {
+    // C installs each record as the grammar reduces it, so an abort keeps
+    // every record above it, the one it interrupted included, and is
+    // reported only once they are in: the abort travels on the result for
+    // the installer to raise at its line. See [`ParsedDb::raise_abort`].
     faults.bind_source(source);
-    match parse_db_items(expanded, &mut faults) {
-        Ok(items) => Ok(ParsedDb {
-            records: items.records,
-            breaktables: items.breaktables,
-            unresolved_aliases: items.unresolved_aliases,
-            faults,
-            dbd: items.dbd,
-        }),
-        Err(e) => {
-            faults.abort(&e);
-            // C follows the abort with `WARNING: dbReadCOM: Parser stack
-            // dirty w/o error. <n>` when its `tempList` still holds the
-            // half-built objects `yyparse` abandoned
-            // (`dbLexRoutines.c:303-305`). Deliberately absent: it counts
-            // C's own allocations, this parser builds its records on the
-            // stack and has no such list, and printing it would state a
-            // fact about a structure that does not exist here.
-            Err(e)
-        }
+    let mut items = DbItems::default();
+    let mut parsed = parse_db_items(expanded, &mut faults, &mut items);
+    let lexed = std::mem::take(&mut items.lexed);
+    // Past a lexer abort, a rejection with no token is the EOF the abort
+    // made: bison's `syntax error`, with the lexer still on the abort's line.
+    if lexed.eof.is_some()
+        && let Err(CaError::DbParseError { token, .. }) = &parsed
+        && token.is_empty()
+    {
+        parsed = Err(CaError::DbParseError {
+            line: lexed.line,
+            token: String::new(),
+            message: SYNTAX_ERROR.to_string(),
+        });
+    }
+    for fault in &lexed.faults {
+        faults.lex_abort(lexed.line as u32, fault);
+    }
+    let aborted = parsed.err().map(|error| ParseAbort {
+        error,
+        stack_dirty: items.temp_list > 0 && !items.yy_abort && lexed.eof.is_none(),
+        yyerror_null: items.yyerror_null,
+    });
+    ParsedDb {
+        records: items.records,
+        breaktables: items.breaktables,
+        file_aliases: items.file_aliases,
+        faults,
+        dbd: items.dbd,
+        aborted,
     }
 }
 
-/// What one text yields before its faults are attached.
-///
-/// Separate from [`ParsedDb`] because the reporter cannot be a field of
-/// the result while the parse is still running: it is the parse's own
-/// output channel, and an abort has to report through it AFTER the body
-/// has given up on producing a result at all.
+/// What one text yields before its faults are attached — filled as the
+/// grammar reduces, so an abort keeps everything reduced before it, as
+/// C's `pdbbase` does.
+#[derive(Default)]
 struct DbItems {
     records: Vec<DbRecordDef>,
     breaktables: Vec<crate::server::cvt_bpt::BrkTable>,
-    unresolved_aliases: Vec<(String, String, u32)>,
+    file_aliases: Vec<DbFileAlias>,
     dbd: DbdDefs,
+    /// C's `tempList` depth: 1 while a record body is open.
+    temp_list: usize,
+    /// C's `yyAbort`: the abort came from `yyerrorAbort`, not the grammar.
+    yy_abort: bool,
+    /// That `yyerrorAbort` was given NULL; see [`ParseAbort::yyerror_null`].
+    yyerror_null: bool,
+    /// The JSON lexer's `yyerrorAbort`s, which end the text but not the parse.
+    lexed: json_lex::LexAborts,
 }
 
 /// The grammar itself.
@@ -1761,17 +2201,22 @@ struct DbItems {
 /// [`parse_db_expanded`], which reports them. Only the semantic actions
 /// C guards with `yyerror(NULL)` are recoverable, and those live in the
 /// layers that own a database — see [`DbFaults`].
-fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
-    let mut records = Vec::new();
-    let mut breaktables: Vec<crate::server::cvt_bpt::BrkTable> = Vec::new();
+fn parse_db_items(expanded: &str, faults: &mut DbFaults, items: &mut DbItems) -> CaResult<()> {
     // `.dbd` declarations: C parses these through the same `yyparse` as
-    // `record`, so they are accepted here rather than rejected.
-    let mut dbd = DbdDefs::default();
-    // Standalone `alias("record","newname")` directives (dbYacc.y:275).
-    // Resolved against the record list after the full file is parsed
-    // so the alias target may appear before or after the directive.
-    let mut global_aliases: Vec<(String, String, u32)> = Vec::new();
-    let chars: Vec<char> = expanded.chars().collect();
+    // `record`, so they are accepted here rather than rejected. Standalone
+    // `alias("record","newname")` directives (dbYacc.y:275) are run by the
+    // installer at their place among the records.
+    let DbItems {
+        records,
+        breaktables,
+        file_aliases: global_aliases,
+        dbd,
+        temp_list,
+        yy_abort,
+        yyerror_null,
+        lexed,
+    } = items;
+    let mut chars: Vec<char> = expanded.chars().collect();
     let mut pos = 0;
     let mut line = 1;
     let mut col = 1;
@@ -1830,8 +2275,18 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
-            validate_record_name(&alias_name, line, col)?;
-            global_aliases.push((target, alias_name, line as u32));
+            // `dbAlias` checks the new name, then the target, and stops at
+            // the first refusal (`dbLexRoutines.c:1505`).
+            db_record_name_validate(&alias_name, line, faults, yy_abort, yyerror_null)?;
+            db_record_name_validate(&target, line, faults, yy_abort, yyerror_null)?;
+            global_aliases.push(DbFileAlias {
+                target,
+                alias: DbAlias {
+                    name: alias_name,
+                    line: line as u32,
+                },
+                after: records.len(),
+            });
             continue;
         }
 
@@ -1988,6 +2443,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             });
         }
 
+        let keyword_line = line as u32;
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, '(', line)?;
 
@@ -2012,13 +2468,22 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
         // `softIoc` @`R7.0.10`, while `record(ai, "")` prints the empty-name
         // refusal located at `)`. Validating before the paren gave both of
         // them the name refusal.
-        validate_record_name(&name, line, col)?;
+        db_record_name_validate(&name, line, faults, yy_abort, yyerror_null)?;
+
+        // C's `dbRecordHead` has created the record: from here every field
+        // reduced lands on it, and an abort leaves it in place.
+        records.push(DbRecordDef {
+            record_type: rec_type,
+            name,
+            fields: Vec::new(),
+            aliases: Vec::new(),
+            info_tags: Vec::new(),
+            line: head_line,
+        });
+        let def = records.last_mut().expect("pushed above");
+        *temp_list = 1;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let mut fields = Vec::new();
-        let mut aliases: Vec<String> = Vec::new();
-        let mut alias_lines: Vec<u32> = Vec::new();
-        let mut info_tags: Vec<(String, String)> = Vec::new();
         // C `dbYacc.y:237-241`: `record_body: /* empty */` is the FIRST
         // alternative, ahead of `'{' '}'` and `'{' record_field_list '}'`,
         // and `tokenRECORD` and `tokenGRECORD` share it — so
@@ -2040,6 +2505,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 if chars[pos] == '}' {
                     pos += 1;
                     col += 1;
+                    faults.body_spans(keyword_line, line as u32);
                     break;
                 }
 
@@ -2068,9 +2534,11 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                     expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                    validate_record_name(&alias_name, line, col)?;
-                    aliases.push(alias_name);
-                    alias_lines.push(line as u32);
+                    db_record_name_validate(&alias_name, line, faults, yy_abort, yyerror_null)?;
+                    def.aliases.push(DbAlias {
+                        name: alias_name,
+                        line: line as u32,
+                    });
                     continue;
                 }
                 if kw == "info" {
@@ -2095,10 +2563,14 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                     expect_char(&chars, &mut pos, &mut col, ',', line)?;
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                    let value = read_field_value(&chars, &mut pos, &mut line, &mut col, lexed)?;
+                    if let Some(eof) = lexed.eof {
+                        *yy_abort = true;
+                        chars.truncate(eof);
+                    }
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                     expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                    info_tags.push((tag, value.as_str_lossy().into_owned()));
+                    def.info_tags.push((tag, value.as_str_lossy().into_owned()));
                     continue;
                 }
 
@@ -2112,64 +2584,18 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 expect_char(&chars, &mut pos, &mut col, ',', line)?;
 
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let field_value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                let field_value = read_field_value(&chars, &mut pos, &mut line, &mut col, lexed)?;
+                if let Some(eof) = lexed.eof {
+                    *yy_abort = true;
+                    chars.truncate(eof);
+                }
 
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                // C reduces `dbRecordField` with the closing paren as the
-                // last token the lexer matched, which is why every field
-                // diagnostic in C's console quotes ` at or before ')'`.
+                // Field names are judged where the body is applied, against
+                // the record it lands on — see [`field_name_refusal`].
                 let field_line = line as u32;
-                faults.seek(field_line, ")");
-
-                // C `dbRecordField` (`dbLexRoutines.c:1231-1416` @`R7.0.10`)
-                // asks the record type what it declares BEFORE it stores
-                // anything, and both of its name-side refusals end in
-                // `yyerror(NULL)`: the field is dropped, the record and its
-                // other fields survive, and the load's status goes non-zero.
-                // The port had neither refusal, so `field(OUT,...)` on a calc
-                // record loaded and `dbgf C:TWO.OUT` answered the raw text —
-                // an invalid database that reads back plausibly, which is
-                // worse than the parse error it replaced. This is the one
-                // place the check can live: `apply_fields` resolves every
-                // record type but never learns the record's NAME, and the
-                // message is built from it.
-                match record_type_field_exists(&rec_type, &field_name) {
-                    Some(false) => {
-                        // C follows the refusal with a spelling suggestion when
-                        // it finds one, and prints NOTHING when it does not
-                        // (`dbLexRoutines.c:1241-1385`). The silence is the half
-                        // that has to be reproduced exactly: a suggestion the
-                        // operator did not mean is worse than none.
-                        //
-                        // C reads the value BEFORE `dbTranslateEscape`, so its
-                        // type test sees `\t` as two characters where this sees
-                        // the tab. Nothing in the map or in the numeric and
-                        // choice tests can be spelled with an escape, so the
-                        // two agree on every value that changes a suggestion.
-                        faults.report(DbDiagnostic::suggesting(
-                            format!(
-                                "{ERL_ERROR}: {rec_type} record '{name}' doesn't have a field \
-                                 '{field_name}'"
-                            ),
-                            suggest_field(&rec_type, &field_name, &field_value.as_str_lossy())
-                                .map(suggestion_line),
-                        ));
-                        continue;
-                    }
-                    // `indfield == 0` is `NAME`, dbCommon's first field
-                    // (`dbLexRoutines.c:1390-1396`). `dbFindField` finds it,
-                    // so this is a second, separately-worded refusal rather
-                    // than a missing declaration.
-                    Some(true) if field_name == "NAME" => {
-                        faults.recoverable(format!(
-                            "{ERL_ERROR}: Can't set 'NAME' field of record '{name}'"
-                        ));
-                        continue;
-                    }
-                    _ => {}
-                }
-                fields.push(DbFieldDef {
+                def.fields.push(DbFieldDef {
                     name: field_name,
                     value: field_value,
                     line: field_line,
@@ -2177,31 +2603,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             }
         }
 
-        records.push(DbRecordDef {
-            record_type: rec_type,
-            name,
-            fields,
-            aliases,
-            alias_lines,
-            info_tags,
-            line: head_line,
-        });
-    }
-
-    // Attach standalone `alias("record","newname")` directives to the
-    // matching record (C `dbAlias`). A target this text does not
-    // declare is NOT an error here: C resolves it against
-    // `savedPdbbase`, so an earlier `dbLoadRecords` may own it. Hand it
-    // to the caller, which is the only party that can see the database.
-    let mut unresolved_aliases = Vec::new();
-    for (target, alias_name, alias_line) in global_aliases {
-        match records.iter_mut().find(|r| r.name == target) {
-            Some(rec) => {
-                rec.aliases.push(alias_name);
-                rec.alias_lines.push(alias_line);
-            }
-            None => unresolved_aliases.push((target, alias_name, alias_line)),
-        }
+        *temp_list = 0;
     }
 
     // C's lexer is done with this text; a diagnostic raised after this
@@ -2209,13 +2611,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
     // must seek for itself rather than inherit wherever the parse
     // stopped. See [`DbFaults::seek_end`].
     faults.seek_end();
-
-    Ok(DbItems {
-        records,
-        breaktables,
-        unresolved_aliases,
-        dbd,
-    })
+    Ok(())
 }
 
 // libCom macLib lives in `epics-libcom-rs`; these are its names at the paths
@@ -2788,80 +3184,45 @@ fn read_field_value(
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
+    aborts: &mut json_lex::LexAborts,
 ) -> CaResult<PvString> {
     if matches!(chars.get(*pos), Some('"' | '\'')) {
         let at = (*pos, *line, *col);
         return match read_json_string(chars, pos, line, col) {
-            Ok(v) => json_lex::after_value(chars, pos, line, col).map(|()| v),
+            Ok(v) => {
+                json_lex::after_value(chars, pos, line, col, aborts);
+                Ok(v)
+            }
             Err(refused) => {
                 // The string reader names what is wrong with the string; C's
                 // lexer, in `JSON` state, names what it refuses, one fault per
                 // character, and goes on.
                 (*pos, *line, *col) = at;
-                json_lex::read_json_value(chars, pos, line, col)?;
+                let before = aborts.faults.len();
+                let relexed = json_lex::read_json_value(chars, pos, line, col, aborts);
+                if aborts.faults.len() > before {
+                    return relexed.map(PvString::from);
+                }
                 (*pos, *line, *col) = at;
                 Err(refused)
             }
         };
     }
 
-    // JSON value: C's dbLex tokenizes a brace- or bracket-delimited field
-    // value as JSON (`field(DOL, {const:"hello"})`, `field(INP, {pva:"PV"})`,
-    // `field(INP, [1, 2, 3])`) and hands the raw text to `dbParseLink`, which
-    // calls `dbJLinkParse` for an object (dbStaticLib.c:2280-2285) and takes
-    // a bracketed value as an array CONSTANT (`:2352-2356`). `json_array` is
-    // a `json_value` alternative just like `json_object` (dbYacc.y:328-337,
-    // `:356-363`), so both open the same way; the port had no `[` branch, so
-    // `[1, 2, 3]` fell through to the bareword reader, stopped at the first
-    // comma and failed the whole file. Keep the text verbatim — the link
-    // parser is the one that interprets it.
-    if matches!(chars.get(*pos), Some('{' | '[')) {
-        // The brace text is JSON source — ASCII/UTF-8 by construction, and the
-        // escapes inside it belong to yajl, not to the `.db` lexer (R19-67).
-        return json_lex::read_json_value(chars, pos, line, col).map(PvString::from);
-    }
-
-    // Unquoted value: a C `bareword` (dbLex.l:21) —
-    // `[a-zA-Z0-9_\-+:.\[\]<>;]+`. Leading/trailing whitespace is
-    // skipped; an embedded space or any character outside the
-    // bareword set is a lexer error in C (the text would tokenize as
-    // two tokens). L-5: the Rust parser previously accepted arbitrary
-    // bytes up to the next `,`/`)`, which is strictly more permissive
-    // than C.
-    let is_bareword = |c: char| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
-    };
-
-    let mut s = String::new();
-    while *pos < chars.len() && is_bareword(chars[*pos]) {
-        s.push(chars[*pos]);
-        *pos += 1;
-        *col += 1;
-    }
-    if !s.is_empty() {
-        json_lex::after_value(chars, pos, line, col)?;
-    }
-    // Skip trailing whitespace before the delimiter.
-    while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t' | '\r' | '\n') {
-        if chars[*pos] == '\n' {
-            *line += 1;
-            *col = 0;
-        }
-        *pos += 1;
-        *col += 1;
-    }
-    // The only thing allowed after an unquoted value is the field
-    // delimiter (`,` or `)`); anything else means the value contained
-    // an illegal bareword character.
-    if *pos < chars.len() && chars[*pos] != ')' && chars[*pos] != ',' {
-        return Err(CaError::DbParseError {
-            line: *line,
-            token: yytext_at(chars, *pos),
-            message: SYNTAX_ERROR.into(),
-        });
-    }
-    Ok(PvString::from(s))
+    // Everything else is the rest of `json_value` (dbYacc.y:356-362): an
+    // object or array, kept as the grammar rebuilds it for `dbParseLink` to
+    // read (dbStaticLib.c:2280-2285, `:2352-2356`), or a `jsonNUMBER`,
+    // keyword or `jsonBARE`. A bare value is a `json_string`, quoted by its
+    // action and unquoted again by `dbRecordField` (dbLexRoutines.c:1397-1402),
+    // so what lands is the `barechar` run (dbLex.l:24): `X:Y` is `X`, and
+    // the `:Y` after it is the grammar's syntax error.
+    let value = json_lex::read_json_value(chars, pos, line, col, aborts)?;
+    // The brace text is JSON source, and its escapes belong to yajl, not to
+    // the `.db` lexer (R19-67).
+    Ok(PvString::from(match value.strip_prefix('"') {
+        Some(bare) => bare.strip_suffix('"').unwrap_or(bare).to_string(),
+        None => value,
+    }))
 }
 
 /// The sentence bison itself writes for EVERY grammar rejection
@@ -3281,15 +3642,15 @@ impl LoadTarget for crate::server::record::RecordInstance {
 }
 
 /// The `dbRecordField` sentence for a field `apply_fields` refused
-/// (`dbLexRoutines.c:1406-1413` @`R7.0.10`), from the one formatter every
-/// refusal class prints through — [`cant_set_line`], as the menu screen does.
+/// (`dbLexRoutines.c:1406-1413` @`R7.0.10`).
 ///
 /// C's `pdbentry->message` and `errSymLookup(status)` slots, per class:
-/// a `DBF_NOACCESS` field is `Can't set array field before iocInit()` with
-/// `Bad Field value` (`dbStaticLib.c:2646-2650`), a link `dbParseLink` refused
-/// is `S_dbLib_badField` with no message, and the port's own text stands in
-/// for anything else the applier raises.
+/// a `DBF_NOACCESS` field writes `Can't set array field before iocInit()`
+/// with `Bad Field value` (`dbStaticLib.c:2646-2650`), a link `dbParseLink`
+/// refused is `S_dbLib_badField` and writes nothing, and the port's own text
+/// stands in for anything else the applier raises without entering the slot.
 fn field_refusal_line(
+    entry: &mut EntryMessage,
     target: &(impl LoadTarget + ?Sized),
     record_name: &str,
     field: &DbFieldDef,
@@ -3298,50 +3659,82 @@ fn field_refusal_line(
     let upper = field.name.to_uppercase();
     let record = target.record();
     let spec = crate::server::record::record_instance::field_desc_of(record, upper.as_str());
-    let detail = if is_declared_no_access(record.record_type(), &upper, spec) {
-        "Can't set array field before iocInit()".to_string()
-    } else if matches!(err, CaError::BadLink(_)) {
-        String::new()
-    } else {
-        err.to_string()
-    };
-    cant_set_line(
+    let value = field.value.as_str_lossy();
+    if is_declared_no_access(record.record_type(), &upper, spec) {
+        let writes = Some("Can't set array field before iocInit()");
+        return entry.cant_set_line(record_name, &field.name, &value, writes, "Bad Field value");
+    }
+    if matches!(err, CaError::BadLink(_)) {
+        return entry.cant_set_line(record_name, &field.name, &value, None, "Bad Field value");
+    }
+    cant_set_sentence(
         record_name,
         &field.name,
-        &field.value.as_str_lossy(),
-        &detail,
+        &value,
+        &err.to_string(),
         "Bad Field value",
     )
 }
 
 /// Put each field the way C's parser does — one element at a time, so a value
-/// the applier refuses costs that FIELD and nothing else.
+/// C refuses costs that FIELD and nothing else.
 ///
 /// C reduces one `field(NAME,"value")` at a time, and every failure arm of
 /// `dbRecordField` ends in `yyerror(NULL)` and `return`
 /// (`dbLexRoutines.c:1405-1416`): the record stays, its remaining fields still
-/// load, and only the file's status goes non-zero. `apply_fields` over the
-/// whole slice made the FIRST refusal cost the record and every field behind
-/// it. Splitting the call is sound because `apply_fields` carries nothing
-/// between fields — `check_link_syntax` is per field and `common_fields` is
-/// append-only.
+/// load, and only the file's status goes non-zero. Each field is first
+/// judged by `dbRecordField`'s name checks ([`field_name_refusal`]), against
+/// the record the body lands on, then by `dbPutString` read as a predicate
+/// ([`menu_value_refusal`]), so the applier never sees a field C refuses. Screen and apply run in one pass,
+/// in the block's field order, because a refusal prints whatever an earlier
+/// one left in `pdbentry->message` ([`EntryMessage`]).
 ///
-/// `refused` gets the field, the error and C's sentence for it. Returns
-/// whether any field was refused.
+/// `refused` gets the field, the applier's error if it was the applier that
+/// refused, and C's lines for it. Returns whether any field was refused.
 pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
     target: &mut T,
     record_name: &str,
     fields: &[DbFieldDef],
     common_fields: &mut Vec<(String, EpicsValue)>,
-    mut refused: impl FnMut(&DbFieldDef, &CaError, String),
+    mut refused: impl FnMut(&DbFieldDef, Option<&CaError>, DbDiagnostic),
 ) -> bool {
+    let record_type = target.record().record_type().to_string();
+    let mut entry = EntryMessage::default();
     let mut any = false;
     for f in fields {
+        if let Some(refusal) =
+            field_name_refusal(&record_type, record_name, &f.name, &f.value.as_str_lossy())
+        {
+            refused(f, None, refusal);
+            any = true;
+            continue;
+        }
+        if let Some(refusal) = menu_value_refusal(
+            &record_type,
+            record_name,
+            &f.name.to_uppercase(),
+            &f.value.as_str_lossy(),
+        ) {
+            refused(
+                f,
+                None,
+                DbDiagnostic {
+                    message: refusal.line(&mut entry),
+                    notice: refusal.notice,
+                    suggestion: refusal.suggestion,
+                },
+            );
+            any = true;
+            // A `SPC_CALC` string is copied before `postfix()` refuses it.
+            if !refusal.stored {
+                continue;
+            }
+        }
         let Err(e) = apply_fields(target, std::slice::from_ref(f), common_fields) else {
             continue;
         };
-        let line = field_refusal_line(target, record_name, f, &e);
-        refused(f, &e, line);
+        let line = field_refusal_line(&mut entry, target, record_name, f, &e);
+        refused(f, Some(&e), DbDiagnostic::new(line));
         any = true;
     }
     any
@@ -3523,6 +3916,10 @@ pub(crate) fn macro_safe_path(path: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    fn alias_names(rec: &DbRecordDef) -> Vec<&str> {
+        rec.aliases.iter().map(|a| a.name.as_str()).collect()
+    }
+
     #[test]
     fn test_parse_simple_db() {
         let input = r#"
@@ -3627,9 +4024,11 @@ mod tests {
     /// @`R7.0.10`) ends in `yyerror(NULL)`, not `yyerrorAbort`: the FIELD is
     /// dropped and nothing else is. Measured on softIoc @`R7.0.10` with this
     /// exact text — `dbl` lists C:ONE, C:TWO and C:THREE, `dbgf C:TWO.CALC`
-    /// is "2", and `dbgf C:TWO.OUT` is `PV 'C:TWO.OUT' not found`.
+    /// is "2", and `dbgf C:TWO.OUT` is `PV 'C:TWO.OUT' not found`. The parse
+    /// keeps the field: C judges it against the record the body lands on,
+    /// which only the install knows.
     #[test]
-    fn an_undeclared_field_is_dropped_and_the_rest_of_the_load_survives() {
+    fn an_undeclared_field_is_judged_at_install_not_at_parse() {
         let parsed = parse_db_with_breaktables(
             r#"
 record(calc, "C:ONE") { field(CALC, "1") }
@@ -3644,53 +4043,32 @@ record(calc, "C:THREE") { field(CALC, "3") }
         .expect("an undeclared field must not abort the parse");
 
         let names: Vec<&str> = parsed.records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["C:ONE", "C:TWO", "C:THREE"]);
+        assert_eq!(parsed.records[1].fields.len(), 2);
+        assert!(parsed.faults.is_empty());
         assert_eq!(
-            names,
-            ["C:ONE", "C:TWO", "C:THREE"],
-            "every record survives"
-        );
-        let two = &parsed.records[1];
-        assert_eq!(
-            two.fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            ["CALC"],
-            "OUT is dropped, CALC is kept"
-        );
-        assert_eq!(
-            parsed.faults.first_diagnostic().unwrap(),
+            field_name_refusal("calc", "C:TWO", "OUT", "C:ONE.VAL PP")
+                .unwrap()
+                .message,
             format!("{ERL_ERROR}: calc record 'C:TWO' doesn't have a field 'OUT'"),
             "C's message, verbatim"
         );
+        assert!(field_name_refusal("calc", "C:TWO", "CALC", "2").is_none());
     }
 
     /// The second name-side refusal in the same C function
     /// (`dbLexRoutines.c:1390-1396`): `dbFindField` FINDS `NAME` — it is
     /// dbCommon's field 0 — so `indfield == 0` refuses it separately, with its
     /// own wording. softIoc @`R7.0.10` on `field(NAME,"C:OTHER")` prints
-    /// `ERROR: Can't set 'NAME' field of record 'C:N'` and still loads C:N
-    /// with CALC applied.
+    /// `ERROR: Can't set 'NAME' field of record 'C:N'`.
     #[test]
     fn the_name_field_is_refused_with_its_own_message() {
-        let parsed = parse_db_with_breaktables(
-            r#"record(calc, "C:N") { field(NAME, "C:OTHER") field(CALC, "5") }"#,
-            &HashMap::new(),
-        )
-        .expect("NAME must not abort the parse");
-        assert_eq!(parsed.records[0].name, "C:N");
+        let refusal = field_name_refusal("calc", "C:N", "NAME", "C:OTHER").unwrap();
         assert_eq!(
-            parsed.records[0]
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            ["CALC"]
-        );
-        assert_eq!(
-            parsed.faults.first_diagnostic().unwrap(),
+            refusal.message,
             format!("{ERL_ERROR}: Can't set 'NAME' field of record 'C:N'")
         );
+        assert_eq!(refusal.suggestion, None);
     }
 
     /// `dbFindFieldPart` compares with `strncmp` (`dbStaticLib.c:1822-1824`),
@@ -3698,14 +4076,10 @@ record(calc, "C:THREE") { field(CALC, "3") }
     /// @`R7.0.10`: `ERROR: calc record 'C:CASE' doesn't have a field 'calc'`.
     #[test]
     fn a_field_name_in_the_wrong_case_is_not_the_field() {
-        let parsed = parse_db_with_breaktables(
-            r#"record(calc, "C:CASE") { field(calc, "9") }"#,
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert!(parsed.records[0].fields.is_empty());
         assert_eq!(
-            parsed.faults.first_diagnostic().unwrap(),
+            field_name_refusal("calc", "C:CASE", "calc", "9")
+                .unwrap()
+                .message,
             format!("{ERL_ERROR}: calc record 'C:CASE' doesn't have a field 'calc'")
         );
     }
@@ -3718,13 +4092,8 @@ record(calc, "C:THREE") { field(CALC, "3") }
     /// diagnostic at all.
     #[test]
     fn the_rtyp_and_vers_record_attributes_load() {
-        let parsed = parse_db_with_breaktables(
-            r#"record(calc, "C:A") { field(RTYP, "zz") field(VERS, "9") field(CALC, "1") }"#,
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert_eq!(parsed.records[0].fields.len(), 3);
-        assert!(parsed.faults.is_empty(), "C reports nothing here");
+        assert!(field_name_refusal("calc", "C:A", "RTYP", "zz").is_none());
+        assert!(field_name_refusal("calc", "C:A", "VERS", "9").is_none());
     }
 
     /// A `DBF_NOACCESS` field is IN `papFldDes`, so `dbFindField` finds it and
@@ -3733,13 +4102,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
     /// [`is_declared_no_access`] rather than claim the field does not exist.
     #[test]
     fn a_noaccess_field_passes_the_name_gate() {
-        let parsed = parse_db_with_breaktables(
-            r#"record(waveform, "W:ONE") { field(VAL, "1") }"#,
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert_eq!(parsed.records[0].fields.len(), 1);
-        assert!(parsed.faults.is_empty());
+        assert!(field_name_refusal("waveform", "W:ONE", "VAL", "1").is_none());
         assert_eq!(
             record_type_field_exists("waveform", "VAL"),
             Some(true),
@@ -3801,13 +4164,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
     #[test]
     fn a_record_type_with_no_visible_declarations_is_not_judged() {
         assert_eq!(record_type_field_exists("noSuchRecordType", "ANY"), None);
-        let parsed = parse_db_with_breaktables(
-            r#"record(noSuchRecordType, "X:ONE") { field(WHATEVER, "1") }"#,
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert_eq!(parsed.records[0].fields.len(), 1);
-        assert!(parsed.faults.is_empty());
+        assert!(field_name_refusal("noSuchRecordType", "X:ONE", "WHATEVER", "1").is_none());
     }
 
     #[test]
@@ -3884,7 +4241,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
     "#;
         assert!(matches!(
             parse_db(input, &HashMap::new()),
-            Err(CaError::DbJsonValue { .. })
+            Err(CaError::DbParseError { .. })
         ));
     }
 
@@ -3910,9 +4267,9 @@ record(calc, "C:THREE") { field(CALC, "3") }
         let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\nline2\")\n}\n";
         let res = parse_db(input, &HashMap::new());
         assert!(
-            matches!(res, Err(CaError::DbJsonValue { ref faults, .. })
-                if faults == &[JsonLexFault::Invalid('"')]),
-            "expected one Invalid character '\"', got {res:?}"
+            matches!(res, Err(CaError::DbParseError { ref message, .. })
+                if message == SYNTAX_ERROR),
+            "expected the grammar's syntax error, got {res:?}"
         );
     }
 
@@ -4912,7 +5269,8 @@ record(lsi, "longstr4") {
                 .map(|f| f.value.as_str_lossy().into_owned())
                 .unwrap()
         };
-        assert_eq!(inp(&recs[0]), "[1, 2, 3]");
+        // `json_elements` concatenates with no whitespace (dbYacc.y:340-354).
+        assert_eq!(inp(&recs[0]), "[1,2,3]");
         assert_eq!(inp(&recs[1]), r#"["One","Two","Three","Four"]"#);
     }
 
@@ -4935,7 +5293,7 @@ record(lsi, "longstr4") {
         let recs = parse_db(src, &HashMap::new()).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name, "TARGET");
-        assert_eq!(recs[0].aliases, vec!["ALIAS1", "ALIAS2"]);
+        assert_eq!(alias_names(&recs[0]), ["ALIAS1", "ALIAS2"]);
         assert_eq!(recs[0].fields.len(), 1);
     }
 
@@ -4986,18 +5344,20 @@ record(lsi, "longstr4") {
         "#;
         let recs = parse_db(src, &HashMap::new()).unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].aliases, vec!["TARGET_ALIAS"]);
+        assert_eq!(alias_names(&recs[0]), ["TARGET_ALIAS"]);
     }
 
+    /// C `dbAlias` runs at its own line, so a target declared below it is
+    /// unknown there: softIoc prints `Alias 'EARLY_ALIAS' names an unknown
+    /// record 'TARGET'` and loads TARGET without the alias.
     #[test]
-    fn parse_db_global_alias_forward_reference() {
-        // The alias directive may precede its target record.
+    fn parse_db_global_alias_forward_reference_names_no_record() {
         let src = r#"
             alias("TARGET", "EARLY_ALIAS")
             record(ai, "TARGET") { field(VAL, "1") }
         "#;
         let recs = parse_db(src, &HashMap::new()).unwrap();
-        assert_eq!(recs[0].aliases, vec!["EARLY_ALIAS"]);
+        assert!(alias_names(&recs[0]).is_empty());
     }
 
     /// I-R3-5: C `dbYacc.y:237-241` puts `record_body: /* empty */`
@@ -5043,8 +5403,15 @@ record(ai, "EMPTY") { }
         "#;
         let parsed = parse_db_with_breaktables(src, &HashMap::new()).unwrap();
         assert_eq!(
-            parsed.unresolved_aliases,
-            vec![("NOSUCH".to_string(), "X".to_string(), 2)]
+            parsed.file_aliases,
+            vec![DbFileAlias {
+                target: "NOSUCH".to_string(),
+                alias: DbAlias {
+                    name: "X".to_string(),
+                    line: 2,
+                },
+                after: 0,
+            }]
         );
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].name, "KEPT");
@@ -5080,7 +5447,7 @@ record(ai, "EMPTY") { }
         // '*'` then `syntax error`.
         let src = r#"record(ai, "REC") { field(DESC, a*b) }"#;
         let res = parse_db(src, &HashMap::new());
-        assert!(matches!(res, Err(CaError::DbJsonValue { .. })), "{res:?}");
+        assert!(matches!(res, Err(CaError::DbParseError { .. })), "{res:?}");
     }
 
     #[test]
@@ -5864,10 +6231,10 @@ mod suggestion_tests {
 /// @`R7.0.10`.
 #[cfg(test)]
 mod menu_refusal_tests {
-    use super::{ERL_ERROR, menu_value_refusal};
+    use super::{DbNotice, ERL_ERROR, menu_value_refusal};
 
     fn line(rt: &str, rec: &str, field: &str, value: &str) -> Option<String> {
-        menu_value_refusal(rt, rec, field, value).map(|r| r.line)
+        menu_value_refusal(rt, rec, field, value).map(|r| r.line(&mut Default::default()))
     }
 
     fn hint(rt: &str, field: &str, value: &str) -> Option<String> {
@@ -5911,13 +6278,109 @@ mod menu_refusal_tests {
                 .unwrap_or_else(|| panic!("compress.{field} = {value:?} must be refused"));
             assert_eq!(
                 refusal.notice,
-                Some(format!("comp.{field} Has unexpanded macro"))
+                Some(DbNotice::Stderr(format!(
+                    "comp.{field} Has unexpanded macro"
+                )))
             );
             assert_eq!(
-                refusal.line,
+                refusal.line(&mut Default::default()),
                 format!("{ERL_ERROR}: Can't set 'comp.{field}' to '{value}'  : Bad Field value")
             );
             assert_eq!(refusal.suggestion.as_deref(), suggestion);
+        }
+    }
+
+    /// `dbPutString`'s `DBF_STRING` arm for a `special(SPC_CALC)` field runs
+    /// base `postfix()` on the text. Rows are softIoc R7.0.10-146-g8f5015b66
+    /// (calc, calcout) and oracleSwaitIoc (swait), each loaded from a one-record
+    /// `.db`: `postfix`'s `<calcErrorStr> in CALC expression '<text>'` line, then
+    /// `Can't set` with two spaces (no `pdbentry->message`), exit 2.
+    #[test]
+    fn a_spc_calc_string_that_does_not_compile_is_refused_and_still_stored() {
+        for (rt, field, value, text) in [
+            (
+                "calc",
+                "CALC",
+                "A+",
+                "Incomplete expression, operand missing",
+            ),
+            ("calc", "CALC", "1)", "Close parenthesis found without open"),
+            (
+                "calc",
+                "CALC",
+                "",
+                "NULL or empty input argument to postfix()",
+            ),
+            (
+                "calcout",
+                "OCAL",
+                "(",
+                "Parenthesis still open at end of expression",
+            ),
+            (
+                "calcout",
+                "CALC",
+                "A+",
+                "Incomplete expression, operand missing",
+            ),
+            (
+                "swait",
+                "CALC",
+                "(A",
+                "Parenthesis still open at end of expression",
+            ),
+            (
+                "swait",
+                "CALC",
+                "A+",
+                "Incomplete expression, operand missing",
+            ),
+            (
+                "swait",
+                "CALC",
+                "",
+                "NULL or empty input argument to postfix()",
+            ),
+        ] {
+            let refusal = menu_value_refusal(rt, "R", field, value)
+                .unwrap_or_else(|| panic!("{rt}.{field} = {value:?} must be refused"));
+            assert_eq!(
+                refusal.notice,
+                Some(DbNotice::Errlog(format!(
+                    "{text} in CALC expression '{value}'"
+                ))),
+                "{rt}.{field} {value:?}"
+            );
+            assert_eq!(
+                refusal.line(&mut Default::default()),
+                format!("{ERL_ERROR}: Can't set 'R.{field}' to '{value}'  : Bad Field value")
+            );
+            assert_eq!(refusal.suggestion, None);
+            // C copies the string before it compiles it.
+            assert!(refusal.stored, "{rt}.{field} {value:?}");
+        }
+        // The same text on a good expression, and on a field that is not
+        // SPC_CALC, is taken.
+        for (rt, field, value) in [
+            ("calc", "CALC", "A+1"),
+            ("calcout", "CALC", "A+1"),
+            ("calcout", "OCAL", "A*2"),
+            ("swait", "CALC", "A+1"),
+            ("calc", "DESC", "A+"),
+            // `stringHasMacro` is tested first, so postfix() never sees it.
+            ("calc", "CALC", "A+$(X)"),
+        ] {
+            let refused = menu_value_refusal(rt, "R", field, value);
+            if value.contains("$(") {
+                let refusal = refused.expect("a macro is refused");
+                assert_eq!(
+                    refusal.notice,
+                    Some(DbNotice::Stderr(format!("R.{field} Has unexpanded macro")))
+                );
+                assert!(!refusal.stored);
+            } else {
+                assert!(refused.is_none(), "{rt}.{field} {value:?}");
+            }
         }
     }
 
@@ -6142,7 +6605,7 @@ mod menu_refusal_tests {
         );
         let (detail, status, _) =
             super::menu_arm(&desc, "MODE", None, EXT_CHOICES, "Bogus", "Bogus").unwrap();
-        assert_eq!(detail, "using menu MODE");
+        assert_eq!(detail.as_deref(), Some("using menu MODE"));
         assert_eq!(status, "Illegal choice");
 
         // `DBF_DEVICE` keeps its own channel even when it carries a table.
@@ -6173,9 +6636,14 @@ mod numeric_refusal_tests {
         assert_eq!(r.suggestion, None, "{rt}.{field} = {value:?}");
         let head = format!("{ERL_ERROR}: Can't set 'R.{field}' to '{value}'  : ");
         Some(
-            r.line
+            r.line(&mut Default::default())
                 .strip_prefix(&head)
-                .unwrap_or_else(|| panic!("{:?} does not open with {head:?}", r.line))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?} does not open with {head:?}",
+                        r.line(&mut Default::default())
+                    )
+                })
                 .to_string(),
         )
     }
@@ -6267,7 +6735,7 @@ mod numeric_refusal_tests {
             ("ao", "HOPR", ""),
         ] {
             assert_eq!(
-                menu_value_refusal(rt, "R", field, value).map(|r| r.line),
+                menu_value_refusal(rt, "R", field, value).map(|r| r.line(&mut Default::default())),
                 None,
                 "{rt}.{field} = {value:?}"
             );

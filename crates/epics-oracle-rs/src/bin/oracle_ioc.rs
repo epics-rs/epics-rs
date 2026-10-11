@@ -135,10 +135,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
     }
 
-    let ioc = port_ioc_builder()
+    let ioc = match port_ioc_builder()
         .db_file(&db_path, &macros)?
         .build_ioc()
-        .await?;
+        .await
+    {
+        Ok(ioc) => ioc,
+        // `softIoc -d`: `dbLoadRecords` has printed its own lines, and
+        // `errIf` exits 2 with an empty message (`softMain.cpp:198`).
+        Err(epics_base_rs::error::CaError::DbLoadFailed(_)) => std::process::exit(2),
+        Err(e) => return Err(e.into()),
+    };
 
     // C `connectPVs`, which waits for `interruptAccept`: the inputs are
     // records of the database just loaded. A port missing an input fails on

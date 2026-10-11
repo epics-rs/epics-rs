@@ -203,46 +203,24 @@ ERROR: Failed to load 'bad4.db'
     );
 }
 
-/// A record type the port DECLARES but cannot construct — C's rec_size == 0,
-/// not C's "not found".
-///
-/// Measured on `softIoc` with a `.dbd` that declares `recordtype(zzz)` and no
-/// `registerRecordDeviceDriver` to fill in its size:
-///
-/// ```text
-/// stdout: \t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***
-/// stderr: ERROR: Can't create zzz record 'Z1'
-///         ERROR:  at or before ')' … line 1, then `syntax error`
-///         dbAllocRecord(Z1) with zzz rec_size = 0
-/// ```
-///
-/// `swait` is this port's version of that state: `stdRecords.dbd` does not
-/// carry it, the crate vendors its `.dbd` anyway, and an application opts
-/// into the factory with `register_record_type`. Until it does, the type has
-/// a shape and no support — which is what C's `rec_size == 0` means, and why
-/// this is not the `Record type … not found` line the case below gets.
-///
-/// The hint goes to STDOUT and the size line to stderr because that is where
-/// C puts them: `printf` and `epicsPrintf` respectively
-/// (`dbStaticRun.c:92-94`). An operator redirecting only one of the two
-/// streams sees half of C's answer, and would have seen none of ours.
+/// A record type the crate vendors a `.dbd` for but no factory is registered
+/// for is still C's "not found": a registered factory is the `.dbd` load and
+/// `registerRecordDeviceDriver` together, so `rec_size = 0` has no state to
+/// come from. softIoc R7.0.10.1 (8f5015b66) `-d unreg.db` prints these lines,
+/// plus the bison unwind the case above leaves out.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
-async fn a_declared_but_unregistered_record_type_is_cs_rec_size_zero() {
+async fn an_unregistered_vendored_record_type_is_not_found() {
     let (out, err, dir) = load(
         "unreg.db",
         "record(swait, \"Z1\") {\n    field(SCAN, \"Passive\")\n}\n",
     );
-    assert_eq!(
-        out, "\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***\n",
-        "C's printf half, on stdout"
-    );
+    assert_eq!(out, "", "C prints nothing on stdout");
     assert_eq!(
         err,
         format!(
             "\
-dbAllocRecord(Z1) with swait rec_size = 0
-ERROR: Can't create swait record 'Z1'
+ERROR: Record type 'swait' for record 'Z1' not found
 ERROR:  at or before ')' in path \"{dir}\"  file \"unreg.db\" line 1
 
  1 | record(swait, \"Z1\") {{

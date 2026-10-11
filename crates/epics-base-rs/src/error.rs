@@ -106,19 +106,6 @@ pub enum CaError {
         message: String,
     },
 
-    /// A field value the `.db` lexer's `JSON` start condition or the
-    /// `json_value` grammar refused. `faults` are the `yyerrorAbort`s in the
-    /// order the lexer met them, all on `line`; `syntax_token` is `yytext` of
-    /// the token the grammar rejected, and is only quoted when no fault
-    /// came first. C then prints `syntax error`. Rendered by
-    /// [`crate::server::db_loader::DbFaults::abort`].
-    #[error("DB parse error at line {line}: invalid JSON value")]
-    DbJsonValue {
-        line: usize,
-        faults: Vec<JsonLexFault>,
-        syntax_token: String,
-    },
-
     /// C `dbLoadRecords` returning non-zero after `yyerror(NULL)`
     /// recovered from a bad item (`dbAccess.c:795-813`). The records
     /// that parsed are still there; the load's *status* is the failure,
@@ -304,6 +291,14 @@ pub(crate) enum LinkWhy {
     ValueRejected(ReportString),
     /// `lnkConst` stopped the parse, printing what it said if anything.
     ConstStop(Option<&'static str>),
+    /// `alloc_jlink` refused the field's link type: what the link type said,
+    /// then `dbJLinkInit: Link type '%s' allocation failed. `.
+    AllocFailed {
+        key: &'static str,
+        said: &'static str,
+    },
+    /// `lnkCalc`'s callbacks stopped the parse, saying why.
+    CalcStop(CalcSaid),
     /// yajl's verbose error block.
     Yajl(crate::server::db_convert_json::YajlError),
     /// A `#` link whose letters name no bus.
@@ -319,6 +314,51 @@ pub(crate) enum LinkWhy {
     NotDefined(&'static str),
 }
 
+/// What `lnkCalc`'s parse callbacks print before they stop
+/// (`lnkCalc.c:122-370`), each after `lnkCalc: `.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CalcSaid {
+    TooManyArgs,
+    UnexpectedInteger(i64),
+    /// `%g` of the value.
+    UnexpectedDouble(ReportString),
+    BadTime(ReportString),
+    /// `sCalcErrorStr`'s text.
+    BadExpr(&'static str),
+    UnexpectedString(ReportString),
+    UnexpectedMap,
+    UnknownKey(ReportString),
+    NoExpr,
+    NoOut,
+    UnexpectedArray,
+    UnexpectedChild(i32),
+}
+
+impl std::fmt::Display for CalcSaid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyArgs => write!(
+                f,
+                "Too many input args, limit is {}",
+                crate::calc::CALC_NARGS
+            ),
+            Self::UnexpectedInteger(value) => write!(f, "Unexpected integer {value}"),
+            Self::UnexpectedDouble(g) => write!(f, "Unexpected double {}", g.as_str()),
+            Self::BadTime(text) => write!(f, "Bad 'time' parameter \"{}\"", text.as_str()),
+            Self::BadExpr(why) => write!(f, "Error in calc expression, {why}"),
+            Self::UnexpectedString(text) => write!(f, "Unexpected string \"{}\"", text.as_str()),
+            Self::UnexpectedMap => f.write_str("Unexpected map"),
+            Self::UnknownKey(key) => write!(f, "Unknown key \"{}\"", key.as_str()),
+            Self::NoExpr => f.write_str("No expression ('expr' key)"),
+            Self::NoOut => f.write_str("No output link ('out' key)"),
+            Self::UnexpectedArray => f.write_str("Unexpected array"),
+            Self::UnexpectedChild(state) => {
+                write!(f, "Unexpected child link, parser state = {state}")
+            }
+        }
+    }
+}
+
 impl LinkRefusal {
     pub(crate) fn new(why: LinkWhy) -> Self {
         let owed = matches!(
@@ -326,6 +366,8 @@ impl LinkRefusal {
             LinkWhy::NotFound(_)
                 | LinkWhy::SecondKey(_)
                 | LinkWhy::ConstStop(Some(_))
+                | LinkWhy::AllocFailed { .. }
+                | LinkWhy::CalcStop(_)
                 | LinkWhy::Yajl(_)
         );
         Self { why, owed }
@@ -350,6 +392,9 @@ impl LinkRefusal {
         }
         Some(match self.why {
             LinkWhy::ConstStop(Some(said)) => said.to_string(),
+            LinkWhy::AllocFailed { key, said } => {
+                format!("{said}\ndbJLinkInit: Link type '{key}' allocation failed. \n")
+            }
             LinkWhy::Yajl(e) => format!("dbJLinkInit: {e}\n"),
             _ => format!("{self}\n"),
         })
@@ -389,6 +434,10 @@ impl std::fmt::Display for LinkRefusal {
                 key.as_str()
             ),
             LinkWhy::ConstStop(_) => f.write_str("dbJLinkInit: lnkConst refused its value"),
+            LinkWhy::AllocFailed { key, .. } => {
+                write!(f, "dbJLinkInit: Link type '{key}' allocation failed.")
+            }
+            LinkWhy::CalcStop(said) => write!(f, "lnkCalc: {said}"),
             LinkWhy::Yajl(_) => f.write_str("dbJLinkInit: not a JSON link"),
             LinkWhy::NoBus => f.write_str("dbParseLink: the text names no hardware bus"),
             LinkWhy::AddRecord(dset) => write!(f, "{dset} (add_record) refused the link"),

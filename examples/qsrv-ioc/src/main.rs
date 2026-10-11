@@ -132,7 +132,8 @@ async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     let mut macros: HashMap<String, String> = HashMap::new();
     // Seed QSRV_IOC so $(QSRV_IOC) expands in st.cmd
     macros.insert("QSRV_IOC".into(), env!("CARGO_MANIFEST_DIR").into());
-    let mut ioc = IocBuilder::new();
+    // A st.cmd goes on past a failed `dbLoadRecords`, unlike `softIoc -d`.
+    let mut ioc = IocBuilder::new().boot_past_failed_loads();
     let mut group_file: Option<String> = None;
 
     for raw_line in script.lines() {

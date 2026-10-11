@@ -3298,6 +3298,7 @@ impl PvDatabase {
         // field list because that is the only place the distinction between
         // `field(INP,"")` and no `INP` line survives.
         let mut empty_links: Vec<String> = Vec::new();
+        let mut entry = crate::server::db_loader::EntryMessage::default();
         for (field, value) in load.common_fields {
             if let crate::types::EpicsValue::String(text) = &value {
                 if text.as_str_lossy().is_empty()
@@ -3313,10 +3314,10 @@ impl PvDatabase {
                     &field,
                     &text.as_str_lossy(),
                 ) {
-                    if let Some(notice) = refusal.notice {
-                        eprintln!("{notice}");
+                    if let Some(notice) = &refusal.notice {
+                        notice.print();
                     }
-                    eprintln!("{}", refusal.line);
+                    eprintln!("{}", refusal.line(&mut entry));
                     // C follows the refusal with `dbPutStringSuggest`, which
                     // proposes the closest choice or prints nothing
                     // (`dbLexRoutines.c:1414`). It reaches the operator through
@@ -3327,7 +3328,9 @@ impl PvDatabase {
                         eprintln!("{suggestion}");
                     }
                     refused.get_or_insert(format!("{name}.{field}"));
-                    continue;
+                    if !refusal.stored {
+                        continue;
+                    }
                 }
             }
             if let Err(e) = instance.put_common_field_db_load(&field, value) {

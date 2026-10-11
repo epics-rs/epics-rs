@@ -132,7 +132,15 @@ fn standalone_alias_takes_both_forms_in_both_args() {
         r#"record(ai,"R"){} alias(R, "N")"#,
     ] {
         let defs = parse_db(text, &HashMap::new()).unwrap_or_else(|e| panic!("{text}\n{e}"));
-        assert_eq!(defs[0].aliases, vec!["N".to_string()], "{text}");
+        assert_eq!(
+            defs[0]
+                .aliases
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["N"],
+            "{text}"
+        );
     }
 }
 

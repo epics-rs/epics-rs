@@ -268,6 +268,11 @@ async fn json_state_refusals_print_what_the_lexer_and_grammar_print() {
             }
             want += &format!("\n 2 | {source}\n\n");
         }
+        // No lexer refusal means no `yyAbort`, so `dbReadCOM` finds the
+        // record's temporary still pushed (`dbLexRoutines.c:303-306`).
+        if diagnostics.iter().all(|(message, _)| *message == SYNTAX) {
+            want += "WARNING: dbReadCOM: Parser stack dirty w/o error. 1\n";
+        }
         want += &format!("ERROR: Failed to load '{name}'\n");
         assert_eq!(
             got, want,

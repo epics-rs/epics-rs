@@ -427,6 +427,19 @@ impl MacroTable {
     /// only place the caller's own text is ever looked at.
     #[must_use]
     pub fn expand(&mut self, src: &str) -> MacroExpansion {
+        let (expansion, notices) = self.expand_deferred(src);
+        for notice in &notices {
+            crate::runtime::log::errlog_printf(notice);
+        }
+        expansion
+    }
+
+    /// [`Self::expand`] with its `macLib:` notices handed back instead of
+    /// printed, for a caller that expands ahead of where C would: the
+    /// `.db` reader flattens a whole file before parsing it, while C's
+    /// lexer expands and reports one line as it reads it.
+    #[must_use]
+    pub fn expand_deferred(&mut self, src: &str) -> (MacroExpansion, Vec<String>) {
         let suppressed = self.opts.suppress_warnings;
         let mut ctx = ExpandCtx {
             table: self,
@@ -436,15 +449,19 @@ impl MacroTable {
                 faults: MacroFaults::default(),
             },
             suppressed,
+            notices: Vec::new(),
         };
         expand_table(&mut ctx);
         let chars: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
         trans(&chars, 0, &mut ctx, &mut out);
-        MacroExpansion {
-            text: out,
-            faults: ctx.seat.faults,
-        }
+        (
+            MacroExpansion {
+                text: out,
+                faults: ctx.seat.faults,
+            },
+            ctx.notices,
+        )
     }
 
     /// C `macPutValue( handle, name, value )` (`macCore.c:262-289`) with
@@ -615,6 +632,10 @@ struct ExpandCtx<'a> {
     /// `macLib:` notice is about to be written, so a caller's knob and a
     /// region's own quiet are the same bit.
     suppressed: bool,
+    /// The `macLib:` notices this expansion raised, in raise order, for
+    /// the caller to put through `errlogPrintf` — see
+    /// [`MacroTable::expand_deferred`].
+    notices: Vec<String>,
 }
 
 impl ExpandCtx<'_> {
@@ -953,7 +974,7 @@ fn refer(
             } else {
                 "unterminated"
             };
-            crate::runtime::log::errlog_printf(&format!(
+            ctx.notices.push(format!(
                 "macLib: {unterminated} macro reference in {} {}\n",
                 ctx.seat.kind, ctx.seat.name
             ));
@@ -1043,7 +1064,7 @@ fn refer(
                     } else {
                         "recursive"
                     };
-                    crate::runtime::log::errlog_printf(&format!(
+                    ctx.notices.push(format!(
                         "macLib: {} {} is {recursive} (expanding {refkind} {name})\n",
                         ctx.seat.kind, ctx.seat.name
                     ));
@@ -1105,7 +1126,7 @@ fn refer(
                     } else {
                         "undefined"
                     };
-                    crate::runtime::log::errlog_printf(&format!(
+                    ctx.notices.push(format!(
                         "macLib: macro {name} is {undefined} (expanding {} {})\n",
                         ctx.seat.kind, ctx.seat.name
                     ));

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use super::registry::*;
+use crate::calc::engine::string::escaped_from_raw;
 use crate::error::{CaError, CaResult};
-use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
+use crate::runtime::log::ERL_ERROR;
 use crate::runtime::mac_lib::macro_defn_pairs;
 use crate::server::database::char_view::{
     CharView, CharWrite, char_view, field_addr_types, long_string_len,
 };
 use crate::server::database::filters::sync::DbState;
-use crate::server::database::{DbNode, RecordLoad, parse_pv_name};
+use crate::server::database::{DbNode, parse_pv_name};
 use crate::server::db_loader;
 use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special, served_element_size};
 use crate::types::{DbFieldType, DbfCode, EpicsValue};
@@ -687,11 +688,19 @@ fn dbr_request(dbr: DbfCode) -> Option<(&'static str, crate::types::DbFieldType)
 /// is what makes the pairs below exhaustive over what can actually arrive —
 /// the fallback is C's own `default:` arm (`dbTest.c:1144-1147`) and not a
 /// guard against a shape this port can construct.
+/// `printBuffer`'s `DBR_STRING` element (`dbTest.c:1001-1011`): escaped into a
+/// `MAXLINE - 3` destination, so the text stops at 76 characters.
+fn dbr_string_element(text: &[u8]) -> String {
+    let mut escaped = escaped_from_raw(text);
+    escaped.truncate(TabBuffer::MAXLINE - 4);
+    format!("\"{escaped}\"")
+}
+
 fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     use crate::calc::engine::cvt::fmt_g;
 
     fn quoted(bytes: &[u8]) -> String {
-        format!("\"{}\"", escape_char_array_for_dbgf(bytes))
+        format!("\"{}\"", escaped_from_raw(bytes))
     }
     fn i32_hex(v: i32) -> String {
         format!("{v} = 0x{:x}", v as u32)
@@ -725,9 +734,9 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     }
 
     match (dbr, val) {
-        (DbfCode::String, EpicsValue::String(v)) => vec![quoted(v.as_bytes())],
+        (DbfCode::String, EpicsValue::String(v)) => vec![dbr_string_element(v.as_bytes())],
         (DbfCode::String, EpicsValue::StringArray(v)) => {
-            v.iter().map(|s| quoted(s.as_bytes())).collect()
+            v.iter().map(|s| dbr_string_element(s.as_bytes())).collect()
         }
         // `%d = 0x%x`, plus the printable character (`dbTest.c:1013-1021`).
         (DbfCode::Char, EpicsValue::Char(v)) => vec![char_scalar(*v)],
@@ -741,12 +750,26 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
         // the NUL `dbpf` appends is a terminator, not a `\x00` in the text.
         // A buffer that STARTS with one gives `len == 0`, and C's
         // `while (len > 0)` then prints nothing under the header.
+        //
+        // Each message is a chunk whose escaped form fits `MAXLINE - 5`, and
+        // all but the last end in ` +` (`:1027-1038`).
         (DbfCode::Char, EpicsValue::CharArray(v)) => {
             let len = v.iter().position(|&b| b == 0).unwrap_or(v.len());
-            match len {
-                0 => vec![],
-                len => vec![quoted(&v[..len])],
+            let mut rest = &v[..len];
+            let mut chunks = Vec::new();
+            while !rest.is_empty() {
+                let mut chunk = rest.len().min(TabBuffer::MAXLINE - 5);
+                while escaped_from_raw(&rest[..chunk]).len() >= TabBuffer::MAXLINE - 5 {
+                    chunk -= 1;
+                }
+                let mut text = quoted(&rest[..chunk]);
+                rest = &rest[chunk..];
+                if !rest.is_empty() {
+                    text.push_str(" +");
+                }
+                chunks.push(text);
             }
+            chunks
         }
         (DbfCode::UChar, EpicsValue::UChar(v)) => vec![format!("{v} = 0x{v:x}")],
         (DbfCode::UChar, EpicsValue::UCharArray(v)) => {
@@ -813,8 +836,10 @@ fn native_readback_lines(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     let Some((label, target)) = dbr_request(dbr) else {
         return printbuffer_lines(dbr.name(), 1, Some(&printbuffer_elements(dbr, val)));
     };
+    // A `DBR_STRING` element is `getStringString`'s 39-byte copy
+    // (`dbConvert.c:141-143`) whatever the field's size.
     match val.get_convert(target) {
-        Ok(v) => printbuffer_block(label, dbr, &v),
+        Ok(v) => printbuffer_block(label, dbr, &crate::types::codec::cap_dbr_strings(v)),
         Err(_) => printbuffer_lines(label, 1, None),
     }
 }
@@ -1971,7 +1996,10 @@ fn render_dbpr_link(
     let parsed = ctx
         .db()
         .db_init_link_locality(crate::server::record::parse_link_field(raw, ftype));
-    format!("{} {rendered}", parsed.link_type_after_init(raw).c_name())
+    format!(
+        "{} {rendered}",
+        parsed.link_type_after_init(raw, ftype).c_name()
+    )
 }
 
 fn cmd_dbpr() -> CommandDef {
@@ -2461,7 +2489,7 @@ fn dbtgf_string_elements(
     Some(
         dbr_string_row(snap, precision)?
             .into_iter()
-            .map(|t| format!("\"{}\"", escape_char_array_for_dbgf(t.as_bytes())))
+            .map(|t| dbr_string_element(t.as_bytes()))
             .collect(),
     )
 }
@@ -5514,7 +5542,7 @@ fn db_read_database_macros(
     // C installs the search path inside the read
     // (`dbLexRoutines.c:245-253`), before the open, so a load that cannot
     // find its file has still replaced the list `dbDumpPath` reports.
-    let (config, file_path) = resolve_db_file(file, path);
+    let (config, file_path) = db_loader::resolve_db_file(file, path);
     let Some(file_path) = file_path else {
         // The name the caller wrote, deliberately, where C prints
         // `macEnvExpand`'s result (`dbLexRoutines.c:274-286`) and so prints
@@ -5539,7 +5567,7 @@ fn db_read_database_macros(
     // column 6: expected 'field', got 'qqq'`, and that positionless line
     // was the whole of what an operator with a syntax error in a real
     // `.db` got: no file, no line, no source.
-    let parsed = db_loader::parse_db_opened_with_breaktables(&file_path, &macros, &config)
+    let parsed = db_loader::parse_db_opened_held(&file_path, &macros, &config)
         .map_err(|_| DbReadFailure::Rejected)?;
 
     // Merge any `breaktable(...)` definitions into the database's shared
@@ -5567,7 +5595,8 @@ fn db_read_database_macros(
     ctx.block_on(install_record_defs(
         ctx,
         parsed.records,
-        parsed.unresolved_aliases,
+        parsed.file_aliases,
+        parsed.aborted,
         &breaktable_registry,
         faults,
     ))?;
@@ -5621,53 +5650,6 @@ fn db_load_records(
     read
 }
 
-/// Build the DB include config the way `dbReadCOM` does
-/// (`dbLexRoutines.c:245-253`): a non-empty `explicit_path` wins outright,
-/// otherwise `EPICS_DB_INCLUDE_PATH`, otherwise `"."`. Only
-/// `dbLoadDatabase` can supply the first arm — C hands `dbLoadRecords` a
-/// hard `0` — which is why `explicit_path` had no caller and the arm was
-/// missing until the command existed.
-///
-/// Resolving the list is also what INSTALLS it: C `dbPath` runs inside
-/// `dbReadCOM`, so the path a load resolved is the path `dbDumpPath`
-/// reports afterwards. This is the only routine that resolves one, so it
-/// is the only writer of [`db_loader::set_loaded_path`].
-fn db_load_config(explicit_path: &str) -> db_loader::DbLoadConfig {
-    let include_paths = if explicit_path.is_empty() {
-        std::env::var("EPICS_DB_INCLUDE_PATH").map_or_else(
-            |_| vec![std::path::PathBuf::from(".")],
-            |val| db_loader::db_path(&val),
-        )
-    } else {
-        db_loader::db_path(explicit_path)
-    };
-    db_loader::set_loaded_path(&include_paths);
-    db_loader::DbLoadConfig {
-        include_paths,
-        max_include_depth: 32,
-    }
-}
-
-/// Resolve a load's file name through C `dbOpenFile`: the path list is
-/// searched FIRST and the process CWD is never consulted for a bare name.
-/// `None` is C's NULL return, which `dbReadCOM` turns into `Can't open
-/// file` without ever reaching the parser.
-///
-/// `include_path` is `dbLoadDatabase`'s second argument, empty for every
-/// other caller — see [`db_load_config`].
-fn resolve_db_file(
-    path: &str,
-    include_path: &str,
-) -> (db_loader::DbLoadConfig, Option<db_loader::DbOpenedFile>) {
-    let config = db_load_config(include_path);
-    // The located form, not the bare `PathBuf`: every diagnostic the load
-    // raises names the file as the operator wrote it and the path entry it
-    // was found under, which is what C's `inputFile` keeps — see
-    // [`db_loader::DbOpenedFile`].
-    let opened = db_loader::db_open_file_located(path, &config.include_paths);
-    (config, opened)
-}
-
 /// Resolve a `dbLoadTemplate` `.substitutions` file. C keeps the
 /// opposite gate here from the one it uses for the templates the file
 /// names: `dbLoadTemplate.y:362-370` tries a bare `fopen(sub_file)`
@@ -5681,7 +5663,7 @@ fn resolve_db_file(
 /// the environment for every template, so the argument never affects
 /// the templates the file names.
 fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathBuf {
-    let config = db_load_config("");
+    let config = db_loader::db_load_config("");
     let direct = std::path::PathBuf::from(path);
     if direct.exists() || direct.is_absolute() {
         return direct;
@@ -5739,553 +5721,48 @@ fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
     parts.join(",")
 }
 
-/// The two ways C can fail to give a record its type, told apart by the
-/// same question C asks: is the type DECLARED?
-///
-/// C `dbRecordHead` reaches `dbFindRecordType` first
-/// (`dbLexRoutines.c:1161-1167`), and a type no loaded `.dbd` declares stops
-/// there with `Record type '%s' for record '%s' not found`. A type that IS
-/// declared gets past it and dies one call later inside `dbAllocRecord`
-/// (`dbStaticRun.c:91-96`), because nothing filled in its `rec_size` — the
-/// `.dbd` was read but `x_RegisterRecordDeviceDriver` never ran, so the
-/// recordtype has a shape and no support:
-///
-/// ```c
-///     if (pdbRecordType->rec_size == 0) {
-///         printf("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***\n");
-///         epicsPrintf("dbAllocRecord(%s) with %s rec_size = 0\n",
-///                     precordName, pdbRecordType->name);
-///         return(S_dbLib_noRecSup);
-///     }
-/// ```
-///
-/// Both then fall out of `dbCreateRecord` into the same `yyerrorAbort`
-/// (`dbLexRoutines.c:1189-1194`), so only the lines ABOVE it differ.
-///
-/// The port's two populations are the same two. `record_fields` is the
-/// vendored `.dbd`s read as a table, so a type it knows is a type this port
-/// declares; `create_record` failing on one of those means no factory is
-/// registered for it — `aCalcout`, `swait`, `busy` and the rest of the
-/// module-owned types an application opts into with `register_record_type`.
-/// That is C's rec_size == 0 exactly: declared, unsupported. Reporting it as
-/// "not found" sent an operator looking for a missing `.dbd` when the `.dbd`
-/// is the one thing that IS there.
-///
-/// One deviation, stated because it is the port's structure and not a
-/// choice: `record_fields` answers for every type this crate vendors, not
-/// for the ones a given IOC has actually loaded `.dbd`s for, because the
-/// port resolves record types from a compile-time table rather than from
-/// `pdbbase`. So a type C would call "not found" (no `.dbd` loaded) is
-/// "declared, unsupported" here whenever the crate vendors its `.dbd`.
-fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) -> RecordFault {
-    let miss = db_loader::record_type_miss(record_type, name);
-    if let Some(line) = miss.stdout {
-        ctx.println(line);
+/// The iocsh load routes' side of [`db_loader::install_records`].
+struct IocshInstall<'a>(&'a CommandContext);
+
+impl db_loader::InstallHost for IocshInstall<'_> {
+    fn db(&self) -> &crate::server::database::PvDatabase {
+        self.0.db()
     }
-    if let Some(line) = &miss.errlog {
-        crate::runtime::log::errlog_printf(line);
+
+    fn records_once_only(&self) -> bool {
+        db_records_once_only()
     }
-    RecordFault::Fatal(miss.message)
+
+    fn create_record(&self, record_type: &str) -> Option<Box<dyn crate::server::record::Record>> {
+        db_loader::create_record(record_type).ok()
+    }
+
+    fn warn(&self, line: &str) {
+        self.0.eprintln(line);
+    }
 }
 
-/// Put each field the way C's parser does — one element at a time, so a value
-/// the applier refuses costs that FIELD and nothing else.
-///
-/// C reduces one `field(NAME,"value")` at a time, and every failure arm of
-/// `dbRecordField` ends in `yyerror(NULL)` and `return`
-/// (`dbLexRoutines.c:1405-1416` @`R7.0.10-146-g8f5015b663d764ad75df`):
-///
-/// ```c
-///     status = dbPutString(pdbentry,value);
-///     if (status) {
-///         ...
-///         yyerror(NULL);
-///         return;
-///     }
-/// ```
-///
-/// so the record stays, its remaining fields still load, and only the file's
-/// status goes non-zero. Handing the whole slice to [`db_loader::apply_fields`]
-/// made the FIRST refusal cost the record and every field behind it as well:
-/// measured against `softIoc` R7.0.10 on a `record(ai,"N1"){field(RSET,"1")}`,
-/// C's `dbl` listed `N1` and the port's listed nothing.
-///
-/// Splitting the call is sound because `apply_fields` is itself a loop over
-/// `fields` that carries nothing between iterations — `check_link_syntax` is
-/// per field and `common_fields` is append-only — so N one-field calls are the
-/// same load as one N-field call, minus the abort.
-///
-/// That makes the rule uniform: the menu screen above drops a refused field and
-/// keeps the record, and now the applier's own refusals — `DBF_NOACCESS`, an
-/// unparsable value, a link the syntax check rejects — do the same, rather than
-/// each apply site deciding for itself how much of the file a bad field costs.
-///
-/// The loop and the sentence are `db_loader::apply_fields_one_at_a_time`'s,
-/// shared with `IocBuilder`; this site only decides where the report goes.
-fn apply_fields_one_at_a_time<T: db_loader::LoadTarget + ?Sized>(
-    record: &mut T,
-    record_name: &str,
-    fields: &[db_loader::DbFieldDef],
-    common_fields: &mut Vec<(String, EpicsValue)>,
-    faults: &mut db_loader::DbFaults,
-) {
-    db_loader::apply_fields_one_at_a_time(
-        record,
-        record_name,
-        fields,
-        common_fields,
-        |f, e, line| {
-            // C's lexer names the line; the parse is over by the time this
-            // runs, so the element's own recorded line takes that seat — as
-            // in the screen.
-            faults.seek(f.line, ")");
-            // `dbParseLink` prints while `dbPutString` runs, before
-            // `dbRecordField` reports the status it returned.
-            e.emit_put_report();
-            faults.report(db_loader::DbDiagnostic::new(line));
-        },
-    );
-}
-
-/// How C classifies a per-record `.db` failure. `dbRecordHead` and
-/// `dbRecordField` (`dbLexRoutines.c:1123-1197`, `:1199-1380`) reach for
-/// `yyerror(NULL)` when the record can be skipped and the rest of the file
-/// still read, and for `yyerrorAbort` only when the parse cannot continue
-/// — an unknown record type or a `dbCreateRecord` that failed for any
-/// other reason. The port had one class, so the first skippable record
-/// discarded every record after it.
-enum RecordFault {
-    /// C `yyerror(NULL)`: report, skip this record, keep loading.
-    Recoverable(String),
-    /// C `yyerrorAbort`: stop the load here.
-    Fatal(String),
-}
-
-/// Install each parsed record definition into the database through the
-/// one routine both `dbLoadRecords` and `dbLoadTemplate` share.
-///
-/// This is the extracted body of the old `dbLoadRecords` install loop:
-/// duplicate-name merge, field application, the creation sink's
-/// load-then-init ordering, alias registration, and the post-load link /
-/// SIMM / watchdog init passes — all identical for both commands so a
-/// template-loaded record is byte-for-byte the same as a directly loaded
-/// one. On the first rejected record it prints the C-visible diagnostic
-/// and propagates the error to the iocsh script chain (epics-base
-/// 144f975), exactly as the inline loop did.
+/// Install each parsed record definition through the routine every load
+/// route shares, so a template-loaded record is byte-for-byte the same as a
+/// directly loaded one.
 async fn install_record_defs(
     ctx: &CommandContext,
     defs: Vec<db_loader::DbRecordDef>,
-    unresolved_aliases: Vec<(String, String, u32)>,
+    file_aliases: Vec<db_loader::DbFileAlias>,
+    aborted: Option<db_loader::ParseAbort>,
     breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
-    // Non-fatal per-record failures (alias reject, merge-field put) join
-    // whatever the parse itself recovered from, in the one owner that
-    // decides what recoverable means: the load continues past them, but
-    // the command must still end in Err so `on error` fires — C's
-    // dbLoadRecords returns non-zero after its parser recovered and kept
-    // going (epics-base#498 / UI-105).
-    for mut def in defs {
-        // C `dbRecordHead` (`dbLexRoutines.c:1136-1157`) reads two record
-        // types as instructions rather than types: `*` modifies the record
-        // already in the database and `#` deletes it. Both skip the body
-        // when the name is unknown (`duplicate = TRUE`), and they report
-        // it differently — `*` with `yyerror(NULL)`, `#` with a bare
-        // WARNING that leaves the load's status clean. The port passed
-        // both to the record factory, so every such block failed as an
-        // unknown record type and took the load with it.
-        let modify_block = def.record_type == "*";
-        if modify_block {
-            let existing = ctx
-                .db()
-                .get_record(&def.name)
-                .map(|rec| rec.read().record.record_type().to_string());
-            match existing {
-                // Continue as the type already there: from here on this is
-                // the same field merge a same-type reload performs, which
-                // is what C's pdbentry does after `dbFindRecord`.
-                Some(t) => def.record_type = t,
-                None => {
-                    faults.recoverable(format!("{ERL_ERROR}: Record '{}' not found", def.name));
-                    continue;
-                }
-            }
-        }
-        if def.record_type == "#" {
-            if !ctx.db().remove_record(&def.name).await {
-                // C also names the file and line here; the port does not
-                // carry either as far as the install loop.
-                ctx.eprintln(&format!(
-                    "{ERL_WARNING}: Record '{}' not found, can't delete",
-                    def.name
-                ));
-            }
-            continue;
-        }
-
-        // Resolve a `LINR` field naming a loaded breakpoint table to its
-        // menuConvert index (shared with the IocBuilder load path).
-        db_loader::resolve_linr_breaktable_names(
-            &def.record_type,
-            &mut def.fields,
-            breaktable_registry,
-        );
-
-        // C creates the record and only THEN puts each field
-        // (`dbCreateRecord` at `dbLexRoutines.c:1172`, `dbPutString` at
-        // `:1405`), so a value `dbPutString` refuses costs that FIELD its
-        // value and nothing else: the record stays and keeps the default,
-        // its other fields load, the rest of the file is read, and the
-        // load's status goes non-zero only at the end (`yyerror`, `:1415`).
-        //
-        // Screening here, once, before the record exists, is what makes that
-        // uniform. The refusal used to be decided at whichever site happened
-        // to apply the field — `add_loaded_record` for a dbCommon field,
-        // `apply_fields` for a record-own one — which gave one rule two
-        // spellings: `SCAN` reported C's wording and aborted the file while
-        // `SELM` reported the port's own wording and continued, and both
-        // discarded a record C keeps. After the screen neither apply site can
-        // see a value its menu would refuse, so neither can decide anything.
-        let (screen_type, screen_name) = (def.record_type.clone(), def.name.clone());
-        def.fields.retain(|f| {
-            let Some(refusal) = db_loader::menu_value_refusal(
-                &screen_type,
-                &screen_name,
-                &f.name.to_uppercase(),
-                &f.value.as_str_lossy(),
-            ) else {
-                return true;
-            };
-            // C refuses this value inside the parse, so `yyerror` names the
-            // line from the lexer. Here the parse is over, so the element's
-            // own recorded line takes the lexer's seat — see
-            // [`db_loader::DbFieldDef`]. Without it every refusal below
-            // would print the file with no line at all, which is what an
-            // operator debugging a real `.db` is left with.
-            faults.seek(f.line, ")");
-            // C's three lines around a refusal go out in one call, because
-            // their ORDER is C's — see [`db_loader::DbDiagnostic`].
-            faults.report(db_loader::DbDiagnostic {
-                notice: refusal.notice,
-                message: refusal.line,
-                suggestion: refusal.suggestion,
-            });
-            false
-        });
-
-        let added: Result<(), RecordFault> = async {
-            // C-parity (dbLexRoutines.c:1170-1188): the SAME
-            // record name re-loaded with the SAME record_type
-            // merges fields into the existing instance (the
-            // standard ADCore convention — simDetector.template
-            // overrides ColorMode menu choices declared by its
-            // included NDArrayBase.template). A different
-            // record_type is skipped with `yyerror(NULL)`, and the
-            // diagnostic names the type being LOADED first and the
-            // type already there last — `recordType` is the new one
-            // and `dbGetRecordTypeName(pdbentry)` the existing one
-            // (`dbLexRoutines.c:1173-1180`).
-            let existing = if let Some(rec) = ctx.db().get_record(&def.name) {
-                let r = rec.read();
-                let existing_type = r.record.record_type();
-                if existing_type != def.record_type {
-                    return Err(RecordFault::Recoverable(format!(
-                        "{ERL_ERROR}: {} record '{}' already exists, can't load {} record",
-                        def.record_type, def.name, existing_type
-                    )));
-                }
-                drop(r);
-                // `dbRecordsOnceOnly` (`dbLexRoutines.c:1181-1187`) refuses
-                // the SECOND declaration once the type matched, and sets
-                // `duplicate` so the body is dropped whole — fields, info
-                // tags and aliases alike. Returning here is that drop.
-                //
-                // A `record("*", …)` block is exempt because C's `*` arm
-                // returns from `dbRecordHead` before `dbCreateRecord`
-                // (`:1136-1144`), so it never reaches the flag: modifying
-                // an existing record is what `*` is FOR, and refusing it
-                // would make the knob mean two different things.
-                if db_records_once_only() && !modify_block {
-                    return Err(RecordFault::Recoverable(format!(
-                        "{ERL_ERROR}: Record '{}' already defined; dbRecordsOnceOnly is set,\n  \
-                         so can't modify record.",
-                        def.name
-                    )));
-                }
-                Some(rec)
-            } else {
-                None
-            };
-
-            let mut common_fields = Vec::new();
-            let is_merge = existing.is_some();
-            let rec_arc = if let Some(rec_arc) = existing {
-                // Merge: apply field overrides directly to the
-                // existing record instance.
-                {
-                    let mut inst = rec_arc.write();
-                    apply_fields_one_at_a_time(
-                        &mut *inst,
-                        &def.name,
-                        &def.fields,
-                        &mut common_fields,
-                        faults,
-                    );
-                }
-                rec_arc
-            } else {
-                // C `dbFindRecordType` failing is `yyerrorAbort`
-                // (`dbLexRoutines.c:1162-1167`) — an unknown record type
-                // stops the load on both sides.
-                //
-                // The sentence is built HERE because C builds it here, out
-                // of the two things only this site holds: the type and the
-                // RECORD NAME. The factory sees neither, so forwarding its
-                // error put `DB parse error at line 0, column 0: unknown
-                // record type: 'nosuchtype'` on the stream — this port's own
-                // words, and a position it did not have. The factory's
-                // `register_record_type` hint is dropped with it: it is
-                // addressed to whoever builds the IOC, and `IocBuilder`
-                // (`ioc_builder.rs:305`) still shows it to them.
-                let mut record = db_loader::create_record(&def.record_type).map_err(|_| {
-                    record_type_unavailable(ctx, &def.record_type, &def.name)
-                })?;
-                // The breakpoint-table registry is installed by the
-                // creation sink; apply_fields only needs the LINR
-                // index, already resolved above.
-                apply_fields_one_at_a_time(
-                    &mut record,
-                    &def.name,
-                    &def.fields,
-                    &mut common_fields,
-                    faults,
-                );
-                // Record + its whole loaded field set in one call: the
-                // sink applies the common fields and info tags, THEN
-                // runs C's `iocInit` passes, so the initial UDF
-                // severity sees the `.db`'s final UDF (a
-                // `field(VAL,…)` clears it — `dbStaticLib.c:2653`).
-                let load = RecordLoad {
-                    common_fields: std::mem::take(&mut common_fields),
-                    info_tags: def.info_tags.clone(),
-                };
-                if ctx
-                    .db()
-                    .add_loaded_record(&def.name, record, load)
-                    .await
-                    .is_err()
-                {
-                    // C `dbCreateRecord` failing for anything other than
-                    // `S_dbLib_recExists` is `yyerrorAbort`
-                    // (`dbLexRoutines.c:1189-1194`), with the same
-                    // site-built shape as the type miss above.
-                    return Err(RecordFault::Fatal(format!(
-                        "{ERL_ERROR}: Can't create {} record '{}'",
-                        def.record_type, def.name
-                    )));
-                }
-                ctx.db().get_record(&def.name).ok_or_else(|| {
-                    // No C counterpart: this is the port's own invariant
-                    // (the creation sink installed it) failing. It wears
-                    // the `ERROR:` prefix because it now leaves by the same
-                    // exit as the two above.
-                    RecordFault::Fatal(format!(
-                        "{ERL_ERROR}: dbLoadRecords: '{}' vanished between add_record and get_record",
-                        def.name
-                    ))
-                })?
-            };
-
-            // Register any aliases declared in the record body
-            // (epics-base PR #336). Failures are reported but
-            // don't abort the load — the record is already in.
-            // For a merge, aliases declared in the new block
-            // are also registered (C parser appends).
-            for (alias, &alias_line) in def.aliases.iter().zip(&def.alias_lines) {
-                db_loader::create_alias(
-                    ctx.db(),
-                    alias,
-                    &def.name,
-                    alias_line,
-                    db_records_once_only(),
-                    faults,
-                )
-                .await;
-            }
-
-            // A record created during THIS load — fresh, or a merge whose
-            // original was created during the load — has its whole init deferred
-            // to C's `initDatabase` pass (`drain_deferred_record_inits` at
-            // `iocInit`), so none of the init tail below runs here for it: doing
-            // so would bind the dset against ports not yet configured and out of
-            // C's order. Only a merge into a record created BEFORE the load
-            // (programmatically, already eager-inited) re-inits in place.
-            let init_deferred = ctx.db().record_init_deferred(&def.name);
-
-            // A MERGE re-applies the new block's fields to a record that
-            // is already in the database and already initialised, so
-            // the load-then-init ordering the creation sink guarantees
-            // has to be re-created by hand here: fields first, passes
-            // after. A fresh record took that ordering from the sink
-            // and must not run the passes twice.
-            if is_merge {
-                {
-                    let mut instance = rec_arc.write();
-                    // info(key, value) directives — last write
-                    // wins. Populated before common-field application
-                    // so device support seeing `init_record` can
-                    // observe info tags.
-                    for (k, v) in &def.info_tags {
-                        instance.set_info(k, v);
-                    }
-                }
-                for (name, value) in common_fields {
-                    use crate::server::record::CommonFieldPutResult;
-                    // `.db` load: C's loader converter, whose menu
-                    // bound differs from a runtime dbPut's
-                    // (`dbStaticRun.c::dbPutStringNum`).
-                    // The record data lock is scoped per field so it is
-                    // down before `update_scan_index` re-enters the
-                    // database — the same rule as `field_io`'s put path;
-                    // the data lock is not the processing-exclusion
-                    // mechanism, so the per-field release is a bounded,
-                    // `.await`-free window.
-                    let mut link =
-                        crate::server::record::PreparedCommonLink::for_put(&def.name, &name, &value);
-                    let put = rec_arc
-                        .write()
-                        .put_common_field_db_load_prepared(&name, value, &mut link);
-                    drop(link);
-                    match put {
-                        Ok(CommonFieldPutResult::ScanChanged {
-                            old_scan,
-                            new_scan,
-                            phas,
-                        }) => {
-                            ctx.db()
-                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas);
-                        }
-                        Ok(CommonFieldPutResult::PhasChanged {
-                            scan,
-                            old_phas,
-                            new_phas,
-                        }) => {
-                            ctx.db()
-                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas);
-                        }
-                        Ok(CommonFieldPutResult::NoChange) => {}
-                        Err(e) => {
-                            faults.recoverable(format!(
-                                "put_common_field({name}) failed for {}: {e}",
-                                def.name
-                            ));
-                        }
-                    }
-                }
-                // C `iocInit` calls init_record once per record AFTER all
-                // dbLoadRecords blocks, so init_record always sees the final
-                // merged field set. A merge into a record created during this
-                // load is left for that barrier pass (`init_deferred`); a merge
-                // into a record created BEFORE the load re-runs init in place so
-                // the new field values (LINR / ESLO / ZRST / ...) take effect in
-                // convert routines and post-init derived state. The cost of the
-                // in-place re-run: stateful records (compress accum,
-                // first_output_done) get re-initialised — still better than
-                // silently ignoring field overrides that affect init.
-                if !init_deferred {
-                    let input = crate::server::builtin_devices::soft_callback::add_record_input_of(
-                        ctx.db(),
-                        &rec_arc,
-                        None,
-                    );
-                    let mut inst = rec_arc.write();
-                    inst.run_init_passes(&def.name, input);
-                    rec_arc.settle_string_typed(&inst);
-                }
-            }
-            // C's `init_record` checkLinks (`init_links`) and the constant-INP
-            // seed / `dbLoadLinkArray` (`rec_gbl_init_constant_links`). For a
-            // record whose init is deferred to `iocInit`, the barrier pass owns
-            // both; only an in-place re-init (pre-load record merged into) runs
-            // them here.
-            if !init_deferred {
-                {
-                    let mut instance = rec_arc.write();
-                    let inst = &mut *instance;
-                    inst.record.init_links(&inst.common);
-                }
-                ctx.db().rec_gbl_init_constant_links(&rec_arc);
-                if is_merge {
-                    // A merge re-ran `run_init_passes` above against the new
-                    // field set, so the rest of pass 1 owes a re-run too: a
-                    // second block may have introduced SIML/SIOL or moved SDEL.
-                    // A FRESH record takes both from the creation sink
-                    // (`PvDatabase::add_loaded_record`) and must not repeat them
-                    // here — `arm_watchdog` would spawn a second task and
-                    // supersede the first for nothing.
-                    ctx.db().rec_gbl_init_simm(&rec_arc);
-                    ctx.db().arm_watchdog(&def.name);
-                }
-            }
-            Ok(())
-        }
-        .await;
-        match added {
-            Ok(()) => {}
-            // The load's status still goes non-zero (epics-base 144f975:
-            // the `iocshSetError` equivalent, so a startup script fails),
-            // but the records already installed stay and the ones after
-            // this record are still read.
-            Err(RecordFault::Recoverable(msg)) => {
-                faults.report_at(def.line, db_loader::DbDiagnostic::new(msg))
-            }
-            Err(RecordFault::Fatal(msg)) => {
-                // C `yyerrorAbort(NULL)` (`dbYacc.y:385-389`) is
-                // `yyerror(NULL)` plus `yyAbort = TRUE`: the sentence is
-                // the site's own `fprintf`, and the abort adds exactly the
-                // bare `ERROR: ` and the position that a RECOVERED fault
-                // gets. So the two arms print through the SAME owner and
-                // differ only in whether the loop goes on — which is what
-                // makes it impossible for an abort to reach the operator
-                // without the file, line and source echo the rest carry.
-                // This arm used to `ctx.println` the message instead:
-                // stdout, unframed, and invisible to a `2>` startup log.
-                faults.abort_at(def.line, db_loader::DbDiagnostic::new(msg));
-                return Err(DbReadFailure::Rejected);
-            }
-        }
-    }
-    // File-scope `alias("record","new")` whose target this file does not
-    // declare. C `dbAlias` (`dbLexRoutines.c:1508`) resolves against
-    // `savedPdbbase`, so a record installed by an earlier
-    // `dbLoadRecords` is a legal target; running after the loop above
-    // means this file's own records are equally visible. A target
-    // nothing owns gets C's diagnostic and fails the call's status
-    // through the fault owner, leaving every record that parsed installed.
-    for (target, alias, alias_line) in unresolved_aliases {
-        if ctx.db().get_record(&target).is_none() {
-            faults.report_at(
-                alias_line,
-                db_loader::DbDiagnostic::new(db_loader::unknown_alias_message(&alias, &target)),
-            );
-            continue;
-        }
-        db_loader::create_alias(
-            ctx.db(),
-            &alias,
-            &target,
-            alias_line,
-            db_records_once_only(),
-            faults,
-        )
-        .await;
-    }
-
-    if faults.is_empty() {
-        Ok(())
-    } else {
-        Err(DbReadFailure::Rejected)
-    }
+    db_loader::install_records(
+        &IocshInstall(ctx),
+        defs,
+        file_aliases,
+        aborted,
+        breaktable_registry,
+        faults,
+    )
+    .await
+    .map_err(|db_loader::LoadRejected| DbReadFailure::Rejected)
 }
 
 /// `dbLoadTemplate(subFile [, globalMacros])` — load records described by
@@ -6560,32 +6037,6 @@ fn cmd_exit() -> CommandDef {
         "exit - Exit the IOC shell",
         |_args: &[ArgValue], _ctx: &CommandContext| Ok(CommandOutcome::Exit),
     )
-}
-
-/// C-style escape a CHAR-array buffer for `dbgf` output (epics-base
-/// dc70dfd6). Printable ASCII passes through; well-known C escapes
-/// (`\n`, `\t`, `\r`, `\\`, `\"`, `\a`, `\b`, `\f`, `\v`) get their
-/// short form; everything else is rendered as `\xNN`. Mirrors
-/// `epicsStrnEscapedFromRaw` exactly enough for the dbgf use case —
-/// the surrounding quote pair is added by the caller.
-fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
-    let mut out = String::with_capacity(buf.len());
-    for &b in buf {
-        match b {
-            b'\n' => out.push_str("\\n"),
-            b'\t' => out.push_str("\\t"),
-            b'\r' => out.push_str("\\r"),
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x0c => out.push_str("\\f"),
-            0x0b => out.push_str("\\v"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    out
 }
 
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
@@ -7699,37 +7150,37 @@ fn cmd_db_dump_breaktable() -> CommandDef {
 
 #[cfg(test)]
 mod dbgf_escape_tests {
-    use super::escape_char_array_for_dbgf;
+    use crate::calc::engine::string::escaped_from_raw;
 
     /// epics-base dc70dfd6 — printable ASCII passes through unchanged.
     #[test]
     fn printable_ascii_passes_through() {
-        assert_eq!(escape_char_array_for_dbgf(b"hello"), "hello");
-        assert_eq!(escape_char_array_for_dbgf(b"a b c"), "a b c");
+        assert_eq!(escaped_from_raw(b"hello"), "hello");
+        assert_eq!(escaped_from_raw(b"a b c"), "a b c");
     }
 
     /// Common C escapes get their short form.
     #[test]
     fn common_c_escapes() {
-        assert_eq!(escape_char_array_for_dbgf(b"a\nb"), "a\\nb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\tb"), "a\\tb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\rb"), "a\\rb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\\b"), "a\\\\b");
-        assert_eq!(escape_char_array_for_dbgf(b"a\"b"), "a\\\"b");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x07b"), "a\\ab");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x08b"), "a\\bb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x0cb"), "a\\fb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x0bb"), "a\\vb");
+        assert_eq!(escaped_from_raw(b"a\nb"), "a\\nb");
+        assert_eq!(escaped_from_raw(b"a\tb"), "a\\tb");
+        assert_eq!(escaped_from_raw(b"a\rb"), "a\\rb");
+        assert_eq!(escaped_from_raw(b"a\\b"), "a\\\\b");
+        assert_eq!(escaped_from_raw(b"a\"b"), "a\\\"b");
+        assert_eq!(escaped_from_raw(b"a\x07b"), "a\\ab");
+        assert_eq!(escaped_from_raw(b"a\x08b"), "a\\bb");
+        assert_eq!(escaped_from_raw(b"a\x0cb"), "a\\fb");
+        assert_eq!(escaped_from_raw(b"a\x0bb"), "a\\vb");
     }
 
     /// Other non-printable bytes (and any high-bit byte) become `\xNN`.
     #[test]
     fn other_bytes_use_hex_escape() {
-        assert_eq!(escape_char_array_for_dbgf(&[0x01, 0xff]), "\\x01\\xff");
+        assert_eq!(escaped_from_raw(&[0x01, 0xff]), "\\x01\\xff");
         // DEL (0x7f) is non-printable per the C convention.
-        assert_eq!(escape_char_array_for_dbgf(&[0x7f]), "\\x7f");
+        assert_eq!(escaped_from_raw(&[0x7f]), "\\x7f");
         // Empty buffer stays empty.
-        assert_eq!(escape_char_array_for_dbgf(&[]), "");
+        assert_eq!(escaped_from_raw(&[]), "");
     }
 }
 
@@ -9561,6 +9012,123 @@ mod tests {
                 run_cmd(&ctx, "dbpf", &[pv, text]),
                 want,
                 "dbpf {pv} {text:?}"
+            );
+        }
+    }
+
+    /// `dbgf` reads `DBR_STRING`, which `getStringString` caps at 39 bytes
+    /// whatever the field's size (`dbConvert.c:141-143`). Oracle — softIoc
+    /// R7.0.10.1 (8f5015b66), a 40-character `DESC`, an `lsi` of 50:
+    ///
+    /// ```text
+    /// dbgf L1.VAL  -> DBF_STRING:         "F...F" (39)
+    /// dbgf D1.DESC -> DBF_STRING:         "F...F" (39)
+    /// ```
+    #[test]
+    fn dbgf_prints_a_string_as_getstringstring_copies_it() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.db");
+        let f50 = "F".repeat(50);
+        std::fs::write(
+            &path,
+            format!(
+                "record(lsi, \"L1\") {{ field(SIZV, 80) field(INP, {{const:\"{f50}\"}}) }}\n\
+                 record(ai, \"D1\") {{ field(DESC, \"{}\") }}\n",
+                &f50[..40]
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let want = format!("DBF_STRING:         \"{}\"         \n", &f50[..39]);
+        for pv in ["L1.VAL", "D1.DESC"] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// `printBuffer` escapes a `DBR_STRING` with `epicsStrnEscapedFromRaw`
+    /// into `MAXLINE - 3` bytes (`dbTest.c:1001-1011`). softIoc R7.0.10.1
+    /// (8f5015b66) prints `Q1` with `\'` and `Q3`, 39 quotes, as 38 escaped
+    /// pairs on a line of its own.
+    #[test]
+    fn dbgf_escapes_a_string_as_epicsstrnescapedfromraw_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("esc.db");
+        std::fs::write(
+            &path,
+            format!(
+                "record(stringin, \"Q1\") {{ field(VAL, \"it's \\\\ a\\\"b\") }}\n\
+                 record(stringin, \"Q3\") {{ field(VAL, \"{}\") }}\n",
+                "\\\"".repeat(39)
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["Q1"]),
+            "DBF_STRING:         \"it\\'s \\\\ a\\\"b\"     \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["Q3"]),
+            format!("DBF_STRING:         \n\"{}\"  \n", "\\\"".repeat(38))
+        );
+    }
+
+    /// A `DBR_CHAR` array prints in chunks whose escaped text fits
+    /// `MAXLINE - 5` (`dbTest.c:1024-1039`). softIoc R7.0.10.1 (8f5015b66)
+    /// on a 100-digit `dbpf` into a CHAR waveform prints 74 digits, ` +`,
+    /// then the other 26.
+    #[test]
+    fn dbgf_prints_a_long_char_array_in_chunks() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        std::fs::write(
+            &path,
+            "record(waveform, \"W1\") { field(FTVL, \"CHAR\") field(NELM, \"120\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let digits = "0123456789".repeat(10);
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["W1", &digits]),
+            format!(
+                "DBF_CHAR[101]:      \n\"{}\" +  \n\"{}\"  \n",
+                &digits[..74],
+                &digits[74..]
+            )
+        );
+    }
+
+    /// C stores a `SPC_CALC` string before `postfix()` refuses it
+    /// (`dbStaticLib.c:2589-2599`), so the load fails but the record exists with
+    /// the text — softIoc R7.0.10-146-g8f5015b66 `dbgf CB.CALC` after
+    /// `dbLoadRecords` of `record(calc,"CB") {field(CALC,"A+")}` prints
+    /// `DBF_STRING: "A+"`, and `iocInit` then reports the record's own
+    /// `init_record` error. The record that compiles is untouched.
+    #[test]
+    fn a_calc_that_postfix_refuses_keeps_its_record_and_text() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"CB\") { field(CALC, \"A+\") }\n\
+             record(calc, \"CG\") { field(CALC, \"A+1\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, want) in [("CB.CALC", "\"A+\""), ("CG.CALC", "\"A+1\"")] {
+            let out = run_cmd(&ctx, "dbgf", &[pv]);
+            assert_eq!(
+                out.split_whitespace().collect::<Vec<_>>()[1..],
+                [want],
+                "{pv}"
             );
         }
     }
@@ -12116,6 +11684,33 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
         );
     }
 
+    /// A load that merges FTVL into a record created before it moves the
+    /// type `dbChannelCreate` judges `$` on. `softIoc` R7.0.10 on
+    /// `waveform` NELM 2: `cainfo WS.VAL$` connects with FTVL STRING, and
+    /// `WD.VAL$` is "not found" with FTVL DOUBLE (`dbChannel.c:486-503`).
+    #[test]
+    fn a_merged_ftvl_moves_the_string_view_of_val() {
+        let (db, ctx) = make_ctx();
+        for name in ["WS", "WD"] {
+            ctx.block_on(db.add_record(
+                name,
+                Box::new(crate::server::records::waveform::WaveformRecord::new(
+                    2,
+                    crate::types::DbFieldType::Double,
+                )),
+            ))
+            .unwrap();
+        }
+        load_records(
+            &ctx,
+            r#"record(waveform, "WS") { field(FTVL, "STRING") }
+record(waveform, "WD") { field(FTVL, "DOUBLE") }"#,
+        )
+        .expect("db must load");
+        assert!(ctx.block_on(db.has_name("WS.VAL$")));
+        assert!(!ctx.block_on(db.has_name("WD.VAL$")));
+    }
+
     /// A device-link put drops the device private, as C `dbPutFieldLink`
     /// does (`dbAccess.c:1191`). `softIoc` R7.0.10-146 (8f5015b66) on the
     /// same database: `AIDB` reads `DPVT: PTR 0x...` after its read and
@@ -13395,13 +12990,13 @@ record(ai, "AFTER:HASH") { }
     }
 
     /// R5-4: the same name at a different record type is `yyerror(NULL)`
-    /// (`dbLexRoutines.c:1173-1180`), so the record is skipped and the
-    /// rest of the file still loads. The message names the type being
-    /// LOADED first and the type already in the database last —
-    /// `recordType` then `dbGetRecordTypeName(pdbentry)` — which the port
-    /// had the other way round, without C's `ERROR: ` prefix.
+    /// (`dbLexRoutines.c:1173-1180`) without `duplicate = TRUE`, so the
+    /// body goes to the existing record and the rest of the file still
+    /// loads. The message names the type being LOADED first and the type
+    /// already in the database last — `recordType` then
+    /// `dbGetRecordTypeName(pdbentry)`.
     #[test]
-    fn test_db_load_records_different_type_duplicate_is_skipped() {
+    fn test_db_load_records_different_type_duplicate_merges_into_the_existing_record() {
         let (db, ctx) = make_ctx();
         // Pre-register DUP:CM as an `ai`.
         ctx.block_on(async {
@@ -13412,14 +13007,17 @@ record(ai, "AFTER:HASH") { }
         let err = load_records(
             &ctx,
             r#"
-record(mbbo, "DUP:CM") { field(ZRST, "Mono") }
+record(mbbo, "DUP:CM") { field(ZRST, "Mono") field(DESC, "from mbbo") }
 record(ai, "SIM:C") { field(VAL, "1") }
 "#,
         )
         .expect_err("the load's status must still be non-zero");
+        // The second is `ZRST`, judged against the ai the body landed on.
         assert_eq!(
             err,
-            format!("{ERL_ERROR}: mbbo record 'DUP:CM' already exists, can't load ai record")
+            format!(
+                "{ERL_ERROR}: mbbo record 'DUP:CM' already exists, can't load ai record (+1 more)"
+            )
         );
         assert!(
             exists(&db, &ctx, "SIM:C"),
@@ -13432,6 +13030,11 @@ record(ai, "SIM:C") { field(VAL, "1") }
                 inst.record.record_type(),
                 "ai",
                 "the existing record keeps its own type"
+            );
+            assert_eq!(
+                inst.resolve_field("DESC").unwrap().to_string(),
+                "from mbbo",
+                "a field the existing type declares is applied to it"
             );
         });
     }

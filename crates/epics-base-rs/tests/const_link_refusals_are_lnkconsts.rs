@@ -3,10 +3,10 @@
 //! Each report below is what softIoc R7.0.10 printed for the same text.
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::record::check_json_link_text;
+use epics_base_rs::server::record::{LinkFieldType, check_json_link_text};
 
 fn report(text: &str) -> Option<String> {
-    match check_json_link_text(text) {
+    match check_json_link_text(text, LinkFieldType::In) {
         Err(CaError::BadLink(refusal)) => refusal.report(),
         other => panic!("{text} was not refused as a link: {other:?}"),
     }
@@ -70,7 +70,10 @@ fn lnkconst_takes_what_c_takes() {
         "{const:-5}",
         r#"{const:["a","b"]}"#,
     ] {
-        assert!(check_json_link_text(text).is_ok(), "{text} refused");
+        assert!(
+            check_json_link_text(text, LinkFieldType::In).is_ok(),
+            "{text} refused"
+        );
     }
 }
 

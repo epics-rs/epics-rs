@@ -11,6 +11,18 @@
 
 use crate::error::{CaError, CaResult, JsonLexFault};
 
+/// The lexer's `yyerrorAbort`s over one text (`dbLex.l:129-153`).
+#[derive(Default)]
+pub(super) struct LexAborts {
+    /// The line the lexer held at the first refusal; every later one is on
+    /// it too, since the next line read is EOF.
+    pub(super) line: usize,
+    pub(super) faults: Vec<JsonLexFault>,
+    /// Where the text now ends: past the newline of [`Self::line`]
+    /// (`db_yyinput` hands the lexer nothing more, `dbLexRoutines.c:374`).
+    pub(super) eof: Option<usize>,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
     /// `jsonNULL` / `jsonTRUE` / `jsonFALSE` / `jsonNUMBER` / `jsonBARE` /
@@ -35,8 +47,7 @@ struct Lexer<'a> {
     pos: &'a mut usize,
     line: &'a mut usize,
     col: &'a mut usize,
-    faults: Vec<JsonLexFault>,
-    fault_line: usize,
+    aborts: &'a mut LexAborts,
 }
 
 fn is_barechar(c: char) -> bool {
@@ -133,11 +144,28 @@ impl Lexer<'_> {
         *self.pos += 1;
     }
 
-    fn refuse(&mut self, fault: JsonLexFault) {
-        if self.faults.is_empty() {
-            self.fault_line = *self.line;
+    /// Record a refusal raised with the lexer on `line`, whose `yytext`
+    /// began at `start`.
+    fn refuse_at(&mut self, start: usize, line: usize, fault: JsonLexFault) {
+        if self.aborts.eof.is_none() {
+            self.aborts.line = line;
+            self.aborts.eof = Some(
+                self.chars[start..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(self.chars.len(), |at| start + at + 1),
+            );
         }
-        self.faults.push(fault);
+        self.aborts.faults.push(fault);
+    }
+
+    /// [`Self::refuse_at`] for the one character just consumed.
+    fn refuse(&mut self, fault: JsonLexFault) {
+        self.refuse_at(*self.pos - 1, *self.line, fault);
+    }
+
+    fn aborted(&self) -> bool {
+        self.aborts.eof.is_some()
     }
 
     /// C `yylex` in the `JSON` start condition.
@@ -145,7 +173,7 @@ impl Lexer<'_> {
         loop {
             // Whitespace and `#` comments.
             while let Some(&c) = self.chars.get(*self.pos) {
-                if c == '\n' && !self.faults.is_empty() {
+                if c == '\n' && self.aborted() {
                     // `yyAbort`: the next line read is EOF.
                     return self.eof();
                 }
@@ -186,7 +214,7 @@ impl Lexer<'_> {
                                 line,
                             };
                         }
-                        self.refuse(JsonLexFault::BadString(text));
+                        self.refuse_at(start, line, JsonLexFault::BadString(text));
                     }
                     None => {
                         self.advance();
@@ -241,7 +269,7 @@ impl Lexer<'_> {
     fn lookahead(&mut self) {
         loop {
             while let Some(&c) = self.chars.get(*self.pos) {
-                if c == '\n' && !self.faults.is_empty() {
+                if c == '\n' && self.aborted() {
                     return;
                 }
                 if c == '#' {
@@ -272,10 +300,7 @@ impl Lexer<'_> {
                             }
                         }
                         let text: String = self.chars[start..*self.pos].iter().collect();
-                        if self.faults.is_empty() {
-                            self.fault_line = line;
-                        }
-                        self.faults.push(JsonLexFault::NewlineInString(text));
+                        self.refuse_at(start, line, JsonLexFault::NewlineInString(text));
                         continue;
                     }
                 }
@@ -299,85 +324,103 @@ impl Lexer<'_> {
         }
     }
 
-    /// `json_value`, its first token already read. The error is the token
-    /// the grammar rejected.
-    fn value(&mut self, first: Token) -> Result<(), Token> {
+    /// `json_value`, its first token already read, rebuilt as `dbYacc.y`'s
+    /// actions rebuild it (`:300-362`): no whitespace, a bare value quoted, a
+    /// bare key quoted when it holds `+`, `-` or `.`, a member's trailing
+    /// comma dropped and an element's kept. The error is the token the
+    /// grammar rejected.
+    fn value(&mut self, first: Token) -> Result<String, Token> {
         match first.kind {
-            Kind::Scalar { .. } => Ok(()),
+            Kind::Scalar { key: false } => Ok(first.text),
+            Kind::Scalar { key: true } if first.text.starts_with(['"', '\'']) => Ok(first.text),
+            Kind::Scalar { key: true } => Ok(format!("\"{}\"", first.text)),
             Kind::Punct('[') => {
+                let mut out = String::from("[");
                 let mut t = self.token();
-                if t.kind == Kind::Punct(']') {
-                    return Ok(());
-                }
-                loop {
-                    self.value(t)?;
-                    match self.token() {
-                        Token {
-                            kind: Kind::Punct(']'),
-                            ..
-                        } => return Ok(()),
-                        Token {
-                            kind: Kind::Punct(','),
-                            ..
-                        } => {
-                            t = self.token();
-                            if t.kind == Kind::Punct(']') {
-                                return Ok(());
+                if t.kind != Kind::Punct(']') {
+                    loop {
+                        out.push_str(&self.value(t)?);
+                        match self.token() {
+                            Token {
+                                kind: Kind::Punct(']'),
+                                ..
+                            } => break,
+                            Token {
+                                kind: Kind::Punct(','),
+                                ..
+                            } => {
+                                out.push(',');
+                                t = self.token();
+                                if t.kind == Kind::Punct(']') {
+                                    break;
+                                }
                             }
+                            other => return Err(other),
                         }
-                        other => return Err(other),
                     }
                 }
+                out.push(']');
+                Ok(out)
             }
             Kind::Punct('{') => {
+                let mut members = Vec::new();
                 let mut t = self.token();
-                if t.kind == Kind::Punct('}') {
-                    return Ok(());
-                }
-                loop {
-                    if !matches!(t.kind, Kind::Scalar { key: true }) {
-                        return Err(t);
-                    }
-                    let colon = self.token();
-                    if colon.kind != Kind::Punct(':') {
-                        return Err(colon);
-                    }
-                    let v = self.token();
-                    self.value(v)?;
-                    match self.token() {
-                        Token {
-                            kind: Kind::Punct('}'),
-                            ..
-                        } => return Ok(()),
-                        Token {
-                            kind: Kind::Punct(','),
-                            ..
-                        } => {
-                            t = self.token();
-                            if t.kind == Kind::Punct('}') {
-                                return Ok(());
-                            }
+                if t.kind != Kind::Punct('}') {
+                    loop {
+                        if !matches!(t.kind, Kind::Scalar { key: true }) {
+                            return Err(t);
                         }
-                        other => return Err(other),
+                        let key = if !t.text.starts_with(['"', '\''])
+                            && t.text.contains(['+', '-', '.'])
+                        {
+                            format!("\"{}\"", t.text)
+                        } else {
+                            t.text
+                        };
+                        let colon = self.token();
+                        if colon.kind != Kind::Punct(':') {
+                            return Err(colon);
+                        }
+                        let v = self.token();
+                        members.push(format!("{key}:{}", self.value(v)?));
+                        match self.token() {
+                            Token {
+                                kind: Kind::Punct('}'),
+                                ..
+                            } => break,
+                            Token {
+                                kind: Kind::Punct(','),
+                                ..
+                            } => {
+                                t = self.token();
+                                if t.kind == Kind::Punct('}') {
+                                    break;
+                                }
+                            }
+                            other => return Err(other),
+                        }
                     }
                 }
+                Ok(format!("{{{}}}", members.join(",")))
             }
             _ => Err(first),
         }
     }
 }
 
-/// Read one brace- or bracket-delimited field value, verbatim, as C's
-/// `json_value` would accept it. See the module comment for what a refusal
-/// costs; every refusal comes back as [`CaError::DbJsonValue`].
+/// Read one field value as C's `json_value` would, rebuilt (see
+/// [`Lexer::value`]). A lexer refusal lands in `aborts` and the value still
+/// completes if the grammar lets it; only the grammar's own rejection is an
+/// error, its `syntax error`.
 pub(super) fn read_json_value(
     chars: &[char],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
+    aborts: &mut LexAborts,
 ) -> CaResult<String> {
-    let (start, start_line) = (*pos, *line);
-    let close = if chars.get(start) == Some(&'[') {
+    let start_line = *line;
+    let close = if chars.get(*pos) == Some(&'[') {
         ']'
     } else {
         '}'
@@ -387,70 +430,55 @@ pub(super) fn read_json_value(
         pos,
         line,
         col,
-        faults: Vec::new(),
-        fault_line: 0,
+        aborts,
     };
     let first = lx.token();
-    let value = lx.value(first);
-    let at = (*lx.pos, *lx.line, *lx.col);
-    if value.is_ok() {
-        lx.lookahead();
-    }
-    match value {
-        Ok(()) if lx.faults.is_empty() => {
-            // Nothing refused: the lookahead only looked.
-            (*lx.pos, *lx.line, *lx.col) = at;
-            Ok(chars[start..at.0].iter().collect())
+    match lx.value(first) {
+        Ok(text) => {
+            lx.look_past();
+            Ok(text)
         }
-        Ok(()) => Err(CaError::DbJsonValue {
-            line: lx.fault_line,
-            faults: lx.faults,
-            syntax_token: String::new(),
-        }),
         // The file ended inside the value, with nothing refused on the way.
-        Err(t) if t.kind == Kind::Eof && lx.faults.is_empty() => Err(CaError::DbParseError {
+        Err(t) if t.kind == Kind::Eof && !lx.aborted() => Err(CaError::DbParseError {
             line: start_line,
             token: String::new(),
             message: format!("unterminated JSON value (missing '{close}')"),
         }),
-        Err(t) => Err(CaError::DbJsonValue {
-            line: if lx.faults.is_empty() {
-                t.line
-            } else {
-                lx.fault_line
-            },
-            faults: lx.faults,
-            syntax_token: t.text,
+        Err(t) => Err(CaError::DbParseError {
+            line: t.line,
+            token: t.text,
+            message: super::SYNTAX_ERROR.to_string(),
         }),
     }
 }
 
 /// What the lexer refuses between a value that parsed and the token that
-/// follows it, without consuming that token. `Ok` leaves `pos`, `line` and
-/// `col` where they were.
+/// follows it, which it does not consume.
 pub(super) fn after_value(
     chars: &[char],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
-) -> CaResult<()> {
-    let at = (*pos, *line, *col);
-    let mut lx = Lexer {
+    aborts: &mut LexAborts,
+) {
+    Lexer {
         chars,
         pos,
         line,
         col,
-        faults: Vec::new(),
-        fault_line: 0,
-    };
-    lx.lookahead();
-    if lx.faults.is_empty() {
-        (*lx.pos, *lx.line, *lx.col) = at;
-        return Ok(());
+        aborts,
     }
-    Err(CaError::DbJsonValue {
-        line: lx.fault_line,
-        faults: lx.faults,
-        syntax_token: String::new(),
-    })
+    .look_past();
+}
+
+impl Lexer<'_> {
+    /// [`Self::lookahead`], moving past only what it refused.
+    fn look_past(&mut self) {
+        let at = (*self.pos, *self.line, *self.col);
+        let refused = self.aborts.faults.len();
+        self.lookahead();
+        if self.aborts.faults.len() == refused {
+            (*self.pos, *self.line, *self.col) = at;
+        }
+    }
 }

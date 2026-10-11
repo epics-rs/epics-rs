@@ -126,13 +126,13 @@ async fn a_refused_noaccess_field_loses_the_field_and_keeps_the_record() {
     );
     drop(held);
 
-    // C's own sentence, minus the two slots this port cannot fill from a
-    // single error value — `pdbentry->message` and `errSymLookup(status)`,
-    // which C prints as `Can't set array field before iocInit() : Bad Field
-    // value`. The frame, the position and the source echo are C's.
+    // `pdbentry->message` is the arm's own `dbMsgPrint`.
     assert!(
-        err.starts_with("ERROR: Can't set 'N1.RSET' to '1' "),
-        "C names the record, the field and the value; got:\n{err}"
+        err.starts_with(
+            "ERROR: Can't set 'N1.RSET' to '1' Can't set array field before iocInit() : \
+             Bad Field value\n"
+        ),
+        "C's sentence; got:\n{err}"
     );
     assert!(
         err.contains(&format!(

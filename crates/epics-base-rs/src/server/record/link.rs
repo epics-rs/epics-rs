@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
-use crate::error::{CaError, CaResult, LinkRefusal, LinkWhy};
+use crate::error::{CaError, CaResult, CalcSaid, LinkRefusal, LinkWhy};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
+use crate::server::recgbl::ReportString;
 use crate::types::{DbFieldType, DbfLinkClass, EpicsValue, PvString};
 
 /// Link processing policy for input/output links.
@@ -1492,10 +1493,10 @@ pub fn declared_link_type(
 /// Two failure arms, both C's: a brace-delimited link naming no registered
 /// jlink type, and a `#` form whose identifier letters name no bus.
 pub fn check_link_text(record_type: &str, upper_field: &str, text: &str) -> CaResult<()> {
-    if crate::types::dbf_link_class(record_type, upper_field).is_none() {
+    let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
         return Ok(());
-    }
-    check_json_link_text(text)?;
+    };
+    check_json_link_text(text, LinkFieldType::for_class(class))?;
     check_hw_link_text(text)
 }
 
@@ -1636,8 +1637,8 @@ impl ParsedLink {
     /// same two variants a bare `1` and this port's `pva://X` scheme
     /// extension produce. Nothing in the parse tree distinguishes them
     /// afterwards; the text does.
-    pub fn link_type_after_init(&self, raw: &str) -> DbLinkType {
-        if matches!(parse_json_link(raw.trim()), JsonLinkParse::Parsed(_)) {
+    pub fn link_type_after_init(&self, raw: &str, ftype: LinkFieldType) -> DbLinkType {
+        if matches!(parse_json_link(raw.trim(), ftype), JsonLinkParse::Parsed(_)) {
             return DbLinkType::JsonLink;
         }
         match self {
@@ -2196,10 +2197,13 @@ fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
 /// type whose own callbacks refuse the value stops the parse the same way.
 /// Both come back here as [`JsonLinkParse::Rejected`], so brace-delimited
 /// text never reaches PV-name parsing on any path.
-pub fn parse_json_link(s: &str) -> JsonLinkParse {
+pub fn parse_json_link(s: &str, ftype: LinkFieldType) -> JsonLinkParse {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') || s.len() < 2 {
         return JsonLinkParse::NotJson;
+    }
+    if let Some(refusal) = jlink_syntax_refusal(s, ftype) {
+        return JsonLinkParse::Rejected(refusal);
     }
     // Read the link type from the NORMALIZED text. A comment is whitespace in
     // this dialect, so `{/*which*/calc:{…}}` names the type `calc`, but
@@ -2227,11 +2231,6 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
     if let Some(refusal) = unknown_link_type(key) {
         return JsonLinkParse::Rejected(refusal);
     }
-    if key == "const"
-        && let Some(refusal) = const_link_refusal(s)
-    {
-        return JsonLinkParse::Rejected(refusal);
-    }
     // The body reader splits on `:` and matches barewords too, so it needs the
     // same normalized text.
     match try_parse_json_link_body(&normalized) {
@@ -2246,6 +2245,307 @@ pub fn parse_json_link(s: &str) -> JsonLinkParse {
         None => JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::ValueRejected(
             crate::server::recgbl::ReportString::new(key),
         ))),
+    }
+}
+
+/// The link field type `dbjl_start_map` hands the next key's `alloc_jlink`
+/// (`parser->dbfType`, `dbJLink.c:197-209`).
+type ChildSlot = Option<LinkFieldType>;
+
+/// What a `parse_start_map` answers (`jlif_key_result`, `dbJLink.h`).
+enum MapStart {
+    Stop,
+    Continue,
+    Child(LinkFieldType),
+}
+
+/// The one refusal a callback records before it stops the parse.
+type Said = Option<LinkRefusal>;
+
+/// One open jlink on `dbjl`'s stack: its type's key, its parse callbacks and
+/// its `parseDepth`.
+struct Jlink {
+    key: crate::server::recgbl::ReportString,
+    jlif: Jlif,
+    depth: u32,
+}
+
+/// The parse halves of the registered `jlif`s. A callback slot C leaves NULL
+/// is `CALL_OR_STOP`, a stop with no word (`dbJLink.c:58`).
+enum Jlif {
+    Const(LnkConstParse),
+    Calc(LnkCalcParse),
+    /// `lnkStateIf` fills only `parse_string` (`lnkState.c:226-232`).
+    State,
+    /// A type whose callbacks the port does not model (pvxs `pva`, `ca`):
+    /// its value is only checked as JSON.
+    Opaque,
+}
+
+impl Jlif {
+    /// `pjlif->alloc_jlink(parser->dbfType)`: the refusals that depend on the
+    /// link field's type (`lnkConst.c:50-53`, `lnkCalc.c:81-84`,
+    /// `lnkState.c:54-57`) say their own line.
+    fn alloc(key: &str, ftype: LinkFieldType) -> Result<Self, LinkRefusal> {
+        let failed = |key, said| Err(LinkRefusal::new(LinkWhy::AllocFailed { key, said }));
+        match (key, ftype) {
+            ("const", LinkFieldType::Out | LinkFieldType::Fwd) => {
+                failed("const", "lnkConst: Only works with input links")
+            }
+            ("calc", LinkFieldType::Fwd) => failed("calc", "lnkCalc: No support for forward links"),
+            ("state", LinkFieldType::Fwd) => failed("state", "lnkState: DBF_FWDLINK not supported"),
+            ("const", _) => Ok(Self::Const(LnkConstParse {
+                shape: ConstShape::S0,
+            })),
+            ("calc", _) => Ok(Self::Calc(LnkCalcParse::new(ftype))),
+            ("state", _) => Ok(Self::State),
+            _ => Ok(Self::Opaque),
+        }
+    }
+
+    fn null(&mut self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
+    fn boolean(&mut self, said: &mut Said) -> bool {
+        match self {
+            Self::Const(c) => c.number(said),
+            Self::Opaque => true,
+            Self::Calc(_) | Self::State => false,
+        }
+    }
+
+    fn integer(&mut self, value: i64, said: &mut Said) -> bool {
+        match self {
+            Self::Const(c) => c.number(said),
+            Self::Calc(c) => c.integer(value, said),
+            Self::Opaque => true,
+            Self::State => false,
+        }
+    }
+
+    fn double(&mut self, value: f64, said: &mut Said) -> bool {
+        match self {
+            Self::Const(c) => c.number(said),
+            Self::Calc(c) => c.double(value, said),
+            Self::Opaque => true,
+            Self::State => false,
+        }
+    }
+
+    fn string(&mut self, bytes: &[u8], said: &mut Said) -> bool {
+        match self {
+            Self::Const(c) => c.string(said),
+            Self::Calc(c) => c.string(bytes, said),
+            Self::State | Self::Opaque => true,
+        }
+    }
+
+    fn start_map(&mut self, said: &mut Said) -> MapStart {
+        match self {
+            Self::Calc(c) => c.start_map(said),
+            Self::Opaque => MapStart::Continue,
+            Self::Const(_) | Self::State => MapStart::Stop,
+        }
+    }
+
+    fn map_key(&mut self, key: &[u8], said: &mut Said) -> bool {
+        match self {
+            Self::Calc(c) => c.map_key(key, said),
+            Self::Opaque => true,
+            Self::Const(_) | Self::State => false,
+        }
+    }
+
+    fn end_map(&mut self, said: &mut Said) -> bool {
+        match self {
+            Self::Calc(c) => c.end_map(said),
+            Self::Opaque => true,
+            Self::Const(_) | Self::State => false,
+        }
+    }
+
+    fn start_array(&mut self, said: &mut Said) -> bool {
+        match self {
+            Self::Const(c) => c.start_array(said),
+            Self::Calc(c) => c.start_array(said),
+            Self::Opaque => true,
+            Self::State => false,
+        }
+    }
+
+    fn end_array(&mut self) -> bool {
+        match self {
+            Self::Calc(c) => c.end_array(),
+            Self::Const(_) | Self::Opaque => true,
+            Self::State => false,
+        }
+    }
+
+    /// `parent->pif->end_child`, which only lnkCalc fills.
+    fn end_child(&mut self, said: &mut Said) {
+        if let Self::Calc(c) = self {
+            c.end_child(said);
+        }
+    }
+}
+
+/// C `dbjl_callbacks` (`dbJLink.c:56-376`): the stack of open jlinks, each
+/// fed by its own type's callbacks, a child allocated with the link field
+/// type its parent's `parse_start_map` asked for.
+struct Dbjl {
+    stack: Vec<Jlink>,
+    slot: ChildSlot,
+    /// What stopped the parse, if a callback or `dbjl` itself said why.
+    said: Said,
+}
+
+impl Dbjl {
+    /// `dbjl_value`: a value that leaves its link at depth 0 completes it,
+    /// and the parent's `end_child` takes it.
+    fn value(&mut self, ok: bool) -> bool {
+        if !ok {
+            return false;
+        }
+        if self.stack.last().is_some_and(|top| top.depth == 0) {
+            self.stack.pop();
+            if let Some(parent) = self.stack.last_mut() {
+                parent.jlif.end_child(&mut self.said);
+            }
+        }
+        true
+    }
+
+    fn top(&mut self) -> Option<(&mut Jlink, &mut Said)> {
+        self.stack.last_mut().map(|top| (top, &mut self.said))
+    }
+}
+
+impl crate::server::db_convert_json::Callbacks for Dbjl {
+    fn null(&mut self) -> bool {
+        let ok = self.top().is_some_and(|(top, _)| top.jlif.null());
+        self.value(ok)
+    }
+    fn boolean(&mut self, _value: bool) -> bool {
+        let ok = self.top().is_some_and(|(top, said)| top.jlif.boolean(said));
+        self.value(ok)
+    }
+    fn integer(&mut self, value: i64) -> bool {
+        let ok = self
+            .top()
+            .is_some_and(|(top, said)| top.jlif.integer(value, said));
+        self.value(ok)
+    }
+    fn double(&mut self, value: f64) -> bool {
+        let ok = self
+            .top()
+            .is_some_and(|(top, said)| top.jlif.double(value, said));
+        self.value(ok)
+    }
+    fn string(&mut self, bytes: &[u8]) -> bool {
+        let ok = self
+            .top()
+            .is_some_and(|(top, said)| top.jlif.string(bytes, said));
+        self.value(ok)
+    }
+    fn start_map(&mut self) -> bool {
+        let Some((top, said)) = self.top() else {
+            return true;
+        };
+        top.depth += 1;
+        match top.jlif.start_map(said) {
+            MapStart::Stop => false,
+            MapStart::Continue => true,
+            MapStart::Child(ftype) => {
+                self.slot = Some(ftype);
+                true
+            }
+        }
+    }
+    fn map_key(&mut self, key: &[u8]) -> bool {
+        let Some(ftype) = self.slot.take() else {
+            return match self.top() {
+                Some((top, said)) => top.jlif.map_key(key, said),
+                None => {
+                    let key = String::from_utf8_lossy(key);
+                    self.said = Some(LinkRefusal::new(LinkWhy::SecondKey(
+                        crate::server::recgbl::ReportString::new(&key),
+                    )));
+                    false
+                }
+            };
+        };
+        let key = String::from_utf8_lossy(key);
+        if let Some(refusal) = unknown_link_type(&*key) {
+            self.said = Some(refusal);
+            return false;
+        }
+        match Jlif::alloc(&key, ftype) {
+            Ok(jlif) => {
+                let key = crate::server::recgbl::ReportString::new(&key);
+                self.stack.push(Jlink {
+                    key,
+                    jlif,
+                    depth: 0,
+                });
+                true
+            }
+            Err(refusal) => {
+                self.said = Some(refusal);
+                false
+            }
+        }
+    }
+    fn end_map(&mut self) -> bool {
+        let Some((top, said)) = self.top() else {
+            return true;
+        };
+        top.depth -= 1;
+        let ok = top.jlif.end_map(said);
+        self.value(ok)
+    }
+    fn start_array(&mut self) -> bool {
+        self.top().is_some_and(|(top, said)| {
+            top.depth += 1;
+            top.jlif.start_array(said)
+        })
+    }
+    fn end_array(&mut self) -> bool {
+        let ok = self.top().is_some_and(|(top, _)| {
+            top.depth -= 1;
+            top.jlif.end_array()
+        });
+        self.value(ok)
+    }
+}
+
+/// C `dbJLinkParse` (`dbJLink.c:379-445`) as a gate: text yajl rejects is
+/// reported with yajl's rendered error; a callback's stop prints only what
+/// the callbacks said.
+fn jlink_syntax_refusal(s: &str, ftype: LinkFieldType) -> Option<LinkRefusal> {
+    use crate::server::db_convert_json::{Parser, Status};
+
+    let txt = s.as_bytes();
+    let mut parser = Parser::new(Dbjl {
+        stack: Vec::new(),
+        slot: Some(ftype),
+        said: None,
+    });
+    let mut status = parser.parse(txt);
+    if status == Status::Ok {
+        status = parser.finish();
+    }
+    match status {
+        Status::Ok => None,
+        // A stop with no word is still a refusal: the top link's type
+        // refused its value, or there was no link to take it.
+        Status::ClientCanceled => Some(parser.ctx.said.take().unwrap_or_else(|| {
+            LinkRefusal::new(match parser.ctx.stack.last() {
+                Some(top) => LinkWhy::ValueRejected(top.key),
+                None => LinkWhy::NoTypeKey,
+            })
+        })),
+        Status::Error => Some(LinkRefusal::new(LinkWhy::Yajl(parser.error(txt)))),
     }
 }
 
@@ -2265,54 +2565,41 @@ enum ConstShape {
 /// and `parse_start_map` are NULL, so they stop without a word.
 struct LnkConstParse {
     shape: ConstShape,
-    said: Option<&'static str>,
 }
 
 impl LnkConstParse {
-    fn mixed(&mut self) -> bool {
-        self.said = Some("lnkConst: Mixed data types in array\n");
+    fn mixed(said: &mut Said) -> bool {
+        *said = Some(LinkRefusal::new(LinkWhy::ConstStop(Some(
+            "lnkConst: Mixed data types in array\n",
+        ))));
         false
     }
 
-    fn number(&mut self) -> bool {
+    fn number(&mut self, said: &mut Said) -> bool {
         match self.shape {
             ConstShape::S0 => self.shape = ConstShape::Scalar,
             ConstShape::A0 | ConstShape::Numbers => self.shape = ConstShape::Numbers,
-            ConstShape::Strings => return self.mixed(),
+            ConstShape::Strings => return Self::mixed(said),
             ConstShape::Scalar => return false,
         }
         true
     }
-}
 
-impl crate::server::db_convert_json::Callbacks for LnkConstParse {
-    fn null(&mut self) -> bool {
-        false
-    }
-    fn boolean(&mut self, _value: bool) -> bool {
-        self.number()
-    }
-    fn integer(&mut self, _value: i64) -> bool {
-        self.number()
-    }
-    fn double(&mut self, _value: f64) -> bool {
-        self.number()
-    }
-    fn string(&mut self, _bytes: &[u8]) -> bool {
+    fn string(&mut self, said: &mut Said) -> bool {
         match self.shape {
             ConstShape::S0 => self.shape = ConstShape::Scalar,
             ConstShape::A0 | ConstShape::Strings => self.shape = ConstShape::Strings,
-            ConstShape::Numbers => return self.mixed(),
+            ConstShape::Numbers => return Self::mixed(said),
             ConstShape::Scalar => return false,
         }
         true
     }
-    fn start_map(&mut self) -> bool {
-        false
-    }
-    fn start_array(&mut self) -> bool {
+
+    fn start_array(&mut self, said: &mut Said) -> bool {
         if self.shape != ConstShape::S0 {
-            self.said = Some("lnkConst: Embedded array value\n");
+            *said = Some(LinkRefusal::new(LinkWhy::ConstStop(Some(
+                "lnkConst: Embedded array value\n",
+            ))));
             return false;
         }
         self.shape = ConstShape::A0;
@@ -2320,85 +2607,215 @@ impl crate::server::db_convert_json::Callbacks for LnkConstParse {
     }
 }
 
-/// The byte after the `:` that ends a link's first key in `s` — where
-/// yajl starts the link type's value.
-fn first_value_offset(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut i = 1;
-    while i < b.len() {
-        match b[i] {
-            b':' => return Some(i + 1),
-            q @ (b'"' | b'\'') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += s[i + 2..].find("*/").map_or(b.len(), |e| e + 3);
-            }
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                i += s[i..].find('\n').unwrap_or(b.len());
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// `calc_link.pstate` (`lnkCalc.c:43-51`), numbered as C prints it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CalcPs {
+    Init = 0,
+    Expr,
+    Major,
+    Minor,
+    Args,
+    Out,
+    Prec,
+    Units,
+    Time,
+    Error,
 }
 
-/// C's parse of a `{const:…}` link, as far as it can refuse: yajl over the
-/// whole text with the value handed to `lnkConst`'s callbacks, then
-/// `dbjl_end_map` — or a second key, which `dbjl_map_key` refuses
-/// (`dbJLink.c:234-238`). A callback's stop prints only what the callback
-/// said; a yajl error prints `dbJLinkInit: ` and yajl's verbose block
-/// (`dbJLink.c:424-428`).
-fn const_link_refusal(s: &str) -> Option<LinkRefusal> {
-    use crate::server::db_convert_json::{Parser, Status};
+/// `lnkCalcIf`'s parse half (`lnkCalc.c:122-370`): the state it keeps that
+/// decides a refusal.
+struct LnkCalcParse {
+    ftype: LinkFieldType,
+    pstate: CalcPs,
+    nargs: usize,
+    expr: bool,
+    major: bool,
+    minor: bool,
+    units: bool,
+    out: bool,
+}
 
-    let txt = s.as_bytes();
-    let start = first_value_offset(s)?;
-    let mut parser = Parser::new(LnkConstParse {
-        shape: ConstShape::S0,
-        said: None,
-    });
-    let mut status = parser.parse_value_at(txt, start);
-    if status == Status::Ok && !parser.complete() {
-        status = parser.finish();
-    }
-    match status {
-        Status::ClientCanceled => {
-            return Some(LinkRefusal::new(LinkWhy::ConstStop(parser.ctx.said)));
+impl LnkCalcParse {
+    fn new(ftype: LinkFieldType) -> Self {
+        Self {
+            ftype,
+            pstate: CalcPs::Init,
+            nargs: 0,
+            expr: false,
+            major: false,
+            minor: false,
+            units: false,
+            out: false,
         }
-        Status::Error => {}
-        Status::Ok => {
-            let end = parser.consumed();
-            let rest = &s[end..];
-            let after = rest.trim_start();
-            let at = end + (rest.len() - after.len());
-            match after.strip_prefix(',').map(str::trim_start) {
-                None if after == "}" => return None,
-                // JSON5 lets a map end in a comma.
-                Some("}") => return None,
-                Some(key) => {
-                    let key = key.split(':').next().unwrap_or("").trim();
-                    let key = key.trim_matches(|c| c == '"' || c == '\'');
-                    return Some(LinkRefusal::new(LinkWhy::SecondKey(
-                        crate::server::recgbl::ReportString::new(key),
-                    )));
-                }
-                None => parser.fail_at(at, "after key and value, inside map, I expect ',' or '}'"),
+    }
+
+    /// One more `arg[nArgs++]` / `inp[nArgs++]`, refused at the limit.
+    fn take_arg(&mut self, said: &mut Said) -> bool {
+        if self.nargs == crate::calc::CALC_NARGS {
+            calc_stop(said, CalcSaid::TooManyArgs);
+            return false;
+        }
+        self.nargs += 1;
+        true
+    }
+
+    fn integer(&mut self, value: i64, said: &mut Said) -> bool {
+        match self.pstate {
+            CalcPs::Prec => true,
+            CalcPs::Args => self.take_arg(said),
+            _ => {
+                calc_stop(said, CalcSaid::UnexpectedInteger(value));
+                false
             }
         }
     }
-    Some(LinkRefusal::new(LinkWhy::Yajl(parser.error(txt))))
+
+    fn double(&mut self, value: f64, said: &mut Said) -> bool {
+        if self.pstate != CalcPs::Args {
+            let g = crate::calc::engine::cvt::fmt_g(value, 6, false, false);
+            calc_stop(said, CalcSaid::UnexpectedDouble(ReportString::new(&g)));
+            return false;
+        }
+        self.take_arg(said)
+    }
+
+    fn string(&mut self, bytes: &[u8], said: &mut Said) -> bool {
+        let text = String::from_utf8_lossy(bytes);
+        match self.pstate {
+            CalcPs::Units => {
+                self.units = true;
+                true
+            }
+            CalcPs::Time => {
+                let letter = text.bytes().next().map(|b| b.to_ascii_uppercase());
+                match letter {
+                    Some(l)
+                        if text.len() == 1
+                            && l.is_ascii_uppercase()
+                            && usize::from(l - b'A') < crate::calc::CALC_NARGS =>
+                    {
+                        true
+                    }
+                    _ => {
+                        calc_stop(said, CalcSaid::BadTime(ReportString::new(&text)));
+                        false
+                    }
+                }
+            }
+            // DEVIATION, kept from `json_calc_arg`: C stops on a string here,
+            // the port takes it as an embedded link's PV name.
+            CalcPs::Args => self.take_arg(said),
+            CalcPs::Expr | CalcPs::Major | CalcPs::Minor => {
+                match self.pstate {
+                    CalcPs::Expr => self.expr = true,
+                    CalcPs::Major => self.major = true,
+                    _ => self.minor = true,
+                }
+                match crate::calc::compile(&text) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let why = crate::calc::calc_error_str(e.code()).unwrap_or("Unknown error");
+                        calc_stop(said, CalcSaid::BadExpr(why));
+                        false
+                    }
+                }
+            }
+            _ => {
+                calc_stop(said, CalcSaid::UnexpectedString(ReportString::new(&text)));
+                false
+            }
+        }
+    }
+
+    fn start_map(&mut self, said: &mut Said) -> MapStart {
+        match self.pstate {
+            CalcPs::Args => MapStart::Child(LinkFieldType::In),
+            CalcPs::Out => MapStart::Child(LinkFieldType::Out),
+            CalcPs::Init => MapStart::Continue,
+            _ => {
+                calc_stop(said, CalcSaid::UnexpectedMap);
+                MapStart::Stop
+            }
+        }
+    }
+
+    fn map_key(&mut self, key: &[u8], said: &mut Said) -> bool {
+        let next = match key {
+            b"out" if self.ftype == LinkFieldType::Out && !self.out => Some(CalcPs::Out),
+            b"expr" if !self.expr => Some(CalcPs::Expr),
+            b"args" if self.nargs == 0 => Some(CalcPs::Args),
+            b"prec" => Some(CalcPs::Prec),
+            b"time" => Some(CalcPs::Time),
+            b"major" if !self.major => Some(CalcPs::Major),
+            b"minor" if !self.minor => Some(CalcPs::Minor),
+            b"units" if !self.units => Some(CalcPs::Units),
+            _ => None,
+        };
+        match next {
+            Some(pstate) => {
+                self.pstate = pstate;
+                true
+            }
+            None => {
+                let key = String::from_utf8_lossy(key);
+                calc_stop(said, CalcSaid::UnknownKey(ReportString::new(&key)));
+                false
+            }
+        }
+    }
+
+    fn end_map(&mut self, said: &mut Said) -> bool {
+        if self.pstate == CalcPs::Error {
+            return false;
+        }
+        if self.ftype == LinkFieldType::In && !self.expr {
+            calc_stop(said, CalcSaid::NoExpr);
+            return false;
+        }
+        if self.ftype == LinkFieldType::Out && !self.out {
+            calc_stop(said, CalcSaid::NoOut);
+            return false;
+        }
+        true
+    }
+
+    fn start_array(&mut self, said: &mut Said) -> bool {
+        if self.pstate != CalcPs::Args {
+            calc_stop(said, CalcSaid::UnexpectedArray);
+            return false;
+        }
+        true
+    }
+
+    fn end_array(&mut self) -> bool {
+        self.pstate != CalcPs::Error
+    }
+
+    fn end_child(&mut self, said: &mut Said) {
+        match self.pstate {
+            CalcPs::Args => {
+                if !self.take_arg(said) {
+                    self.pstate = CalcPs::Error;
+                }
+            }
+            CalcPs::Out => self.out = true,
+            ps => {
+                calc_stop(said, CalcSaid::UnexpectedChild(ps as i32));
+                self.pstate = CalcPs::Error;
+            }
+        }
+    }
+}
+
+fn calc_stop(said: &mut Said, why: CalcSaid) {
+    *said = Some(LinkRefusal::new(LinkWhy::CalcStop(why)));
 }
 
 /// C `dbParseLink`'s JSON arm as a validation gate: `Err` exactly when the
 /// text is a brace-delimited link C would refuse to load
 /// (`dbStaticLib.c:2281-2283` → `S_dbLib_badField`).
-pub fn check_json_link_text(text: &str) -> CaResult<()> {
-    match parse_json_link(text) {
+pub fn check_json_link_text(text: &str, ftype: LinkFieldType) -> CaResult<()> {
+    match parse_json_link(text, ftype) {
         JsonLinkParse::Rejected(refusal) => Err(CaError::BadLink(refusal)),
         JsonLinkParse::NotJson | JsonLinkParse::Parsed(_) => Ok(()),
     }
@@ -2595,10 +3012,13 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
 fn json_calc_arg(v: &serde_json::Value) -> Option<CalcArg> {
     match v {
         serde_json::Value::Number(n) => Some(CalcArg::Literal(n.as_f64()?)),
-        serde_json::Value::Object(_) => match parse_json_link(&serde_json::to_string(v).ok()?) {
-            JsonLinkParse::Parsed(parsed) => Some(CalcArg::Link(Box::new(parsed))),
-            JsonLinkParse::NotJson | JsonLinkParse::Rejected(_) => None,
-        },
+        // `lnkCalc_start_map` asks for `jlif_key_child_inlink` (`lnkCalc.c:234-235`).
+        serde_json::Value::Object(_) => {
+            match parse_json_link(&serde_json::to_string(v).ok()?, LinkFieldType::In) {
+                JsonLinkParse::Parsed(parsed) => Some(CalcArg::Link(Box::new(parsed))),
+                JsonLinkParse::NotJson | JsonLinkParse::Rejected(_) => None,
+            }
+        }
         // DEVIATION, deliberate and pre-existing. C refuses a bare string
         // here: `lnkCalc_string` reaches its `pstate < ps_expr || pstate >
         // ps_minor` guard with `pstate == ps_args` and returns `jlif_stop`
@@ -3129,15 +3549,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     let s = s.trim();
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
-    match parse_json_link(s) {
-        // C `lnkState_alloc` (`lnkState.c:51-55`) refuses `DBF_FWDLINK`
-        // outright, and `dbjl_map_key` turns a NULL from `alloc_jlink` into
-        // `jlif_stop` (`dbJLink.c:277-283`) — so `field(FLNK,'{state:"X"}')`
-        // leaves the field with the unset link it was born with. This is the
-        // only step that knows which link field it is parsing.
-        JsonLinkParse::Parsed(ParsedLink::State(_)) if ftype == LinkFieldType::Fwd => {
-            return ParsedLink::None;
-        }
+    match parse_json_link(s, ftype) {
         JsonLinkParse::Parsed(parsed) => return parsed,
         // C never builds a link out of JSON it could not resolve: the put
         // fails and the field keeps its unset value. The load-time gate
@@ -3753,9 +4165,10 @@ mod json_link_tests {
     /// parses.
     #[test]
     fn a_comment_inside_a_link_body_parses() {
-        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
-            parse_json_link(r#"{calc: {expr:"A*B" /* the product */, args:[2, 3]}}"#)
-        else {
+        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) = parse_json_link(
+            r#"{calc: {expr:"A*B" /* the product */, args:[2, 3]}}"#,
+            LinkFieldType::In,
+        ) else {
             panic!("a comment in a link body must not stop the parse");
         };
         assert_eq!(link.expr, "A*B");
@@ -3772,6 +4185,7 @@ mod json_link_tests {
     fn base_s_own_shipped_calc_link_parses_verbatim() {
         let JsonLinkParse::Parsed(ParsedLink::Calc(link)) = parse_json_link(
             "{calc:{\n                expr:'A+5',\n                args:5\n             }}",
+            LinkFieldType::In,
         ) else {
             panic!("base's own linkRetargetLink.db calc link must parse");
         };
@@ -3790,7 +4204,9 @@ mod json_link_tests {
             "{calc:{expr:\"A+5\", args:5}}",
             "{calc:{expr:\"A+5\", args:[5]}}",
         ] {
-            let JsonLinkParse::Parsed(ParsedLink::Calc(link)) = parse_json_link(body) else {
+            let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
+                parse_json_link(body, LinkFieldType::In)
+            else {
                 panic!("{body} must parse");
             };
             assert!(
@@ -3801,9 +4217,10 @@ mod json_link_tests {
         }
         // The same rule reaches an embedded link, C `lnkCalc_end_child`
         // (`lnkCalc.c:340-368`), which also appends on `ps_args` alone.
-        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
-            parse_json_link(r#"{calc:{expr:"A", args:{pva:"REC:AI"}}}"#)
-        else {
+        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) = parse_json_link(
+            r#"{calc:{expr:"A", args:{pva:"REC:AI"}}}"#,
+            LinkFieldType::In,
+        ) else {
             panic!("a bare embedded link in `args` must parse");
         };
         assert!(matches!(link.args.as_slice(), [CalcArg::Link(_)]));
@@ -3814,13 +4231,14 @@ mod json_link_tests {
     #[test]
     fn a_single_quoted_pv_name_is_dequoted() {
         let JsonLinkParse::Parsed(ParsedLink::Pva(pv)) =
-            parse_json_link(r#"{pva: {pv: 'REC:AI.VAL'}}"#)
+            parse_json_link(r#"{pva: {pv: 'REC:AI.VAL'}}"#, LinkFieldType::In)
         else {
             panic!("a single-quoted pv name must parse");
         };
         assert_eq!(pv, "REC:AI.VAL");
         // The shorthand spelling too, where the whole value is the name.
-        let JsonLinkParse::Parsed(ParsedLink::Pva(pv)) = parse_json_link(r"{pva: 'REC:AI.VAL'}")
+        let JsonLinkParse::Parsed(ParsedLink::Pva(pv)) =
+            parse_json_link(r"{pva: 'REC:AI.VAL'}", LinkFieldType::In)
         else {
             panic!("the single-quoted shorthand must parse");
         };
@@ -3833,7 +4251,7 @@ mod json_link_tests {
     #[test]
     fn a_comment_before_the_link_type_key_parses() {
         let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
-            parse_json_link(r#"{/* which */ calc: {expr:"A+1"}}"#)
+            parse_json_link(r#"{/* which */ calc: {expr:"A+1"}}"#, LinkFieldType::In)
         else {
             panic!("a comment before the link type must not stop the parse");
         };
@@ -3845,7 +4263,10 @@ mod json_link_tests {
     #[test]
     fn an_unterminated_comment_in_a_link_body_is_rejected() {
         assert!(matches!(
-            parse_json_link(r#"{calc: {expr:"A*B" /* never closed }}"#),
+            parse_json_link(
+                r#"{calc: {expr:"A*B" /* never closed }}"#,
+                LinkFieldType::In
+            ),
             JsonLinkParse::Rejected(_)
         ));
     }
@@ -4435,7 +4856,10 @@ mod json_link_tests {
             r#"{state:["X"]}"#,
         ] {
             assert!(
-                matches!(parse_json_link(body), JsonLinkParse::Rejected(_)),
+                matches!(
+                    parse_json_link(body, LinkFieldType::In),
+                    JsonLinkParse::Rejected(_)
+                ),
                 "C stops the parse for {body}"
             );
         }

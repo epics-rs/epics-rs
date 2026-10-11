@@ -1728,7 +1728,7 @@ variable(seqDLYprecision,int)
             "{state:\"x\"}",
         ] {
             assert!(
-                check_json_link_text(text).is_ok(),
+                check_json_link_text(text, crate::server::record::LinkFieldType::In).is_ok(),
                 "{text} is reported by dbDumpLink and must load"
             );
         }
@@ -1737,7 +1737,7 @@ variable(seqDLYprecision,int)
             ("trace", "{trace:{const:1}}"),
         ] {
             assert!(
-                check_json_link_text(text).is_err(),
+                check_json_link_text(text, crate::server::record::LinkFieldType::In).is_err(),
                 "{text} is refused, so it must stay out of the report"
             );
             assert!(!printed.contains(&format!("link({key},")));
@@ -2818,7 +2818,7 @@ variable(seqDLYprecision,int)
     fn a_hardware_links_type_word_is_its_bus() {
         let word = |text: &str| {
             crate::server::record::parse_link_field(text, crate::server::record::LinkFieldType::In)
-                .link_type_after_init(text)
+                .link_type_after_init(text, crate::server::record::LinkFieldType::In)
                 .c_name()
         };
 

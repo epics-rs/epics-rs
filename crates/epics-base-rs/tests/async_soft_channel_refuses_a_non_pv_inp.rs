@@ -71,12 +71,13 @@ async fn only_a_pv_link_passes_add_record() {
 
 /// An OUTPUT `"Async Soft Channel"` record has no `add_record` in C, and a
 /// non-Async soft channel has no callback dset at all. Neither may be
-/// reported.
+/// reported. The ao's link is a CONSTANT: `{const:…}` on an output link is
+/// refused at load (`lnkConst.c:50-53`).
 #[epics_macros_rs::epics_test]
 async fn nothing_else_is_checked() {
     let sink = listen();
     let _db = ioc(
-        "record(ao, \"T:AO\") { field(DTYP,\"Async Soft Channel\") field(OUT,{const:1}) }\n\
+        "record(ao, \"T:AO\") { field(DTYP,\"Async Soft Channel\") field(OUT,\"1\") }\n\
          record(ai, \"T:PLAIN\") { field(DTYP,\"Soft Channel\") field(INP,{const:9}) }\n",
     )
     .await;

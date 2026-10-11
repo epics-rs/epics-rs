@@ -57,13 +57,33 @@ pub struct DbSource {
     lines: Vec<String>,
     /// The stack open at each line, innermost first.
     frames: Vec<Arc<[DbIncludeFrame]>>,
+    /// Each record body left open across a line end, as the lines of its
+    /// `record` keyword and its closing `}`.
+    open_bodies: Vec<(u32, u32)>,
 }
 
 impl DbSource {
     /// Build from the per-line pairs the include expander emits.
     pub fn new(lines: Vec<String>, frames: Vec<Arc<[DbIncludeFrame]>>) -> Self {
         debug_assert_eq!(lines.len(), frames.len());
-        Self { lines, frames }
+        Self {
+            lines,
+            frames,
+            open_bodies: Vec::new(),
+        }
+    }
+
+    pub(super) fn body_spans(&mut self, start: u32, end: u32) {
+        if start < end {
+            self.open_bodies.push((start, end));
+        }
+    }
+
+    /// Whether the grammar is inside a record body at the end of `line`.
+    pub(super) fn body_open_after(&self, line: u32) -> bool {
+        self.open_bodies
+            .iter()
+            .any(|&(start, end)| start <= line && line < end)
     }
 
     /// A single un-included file: every line carries the same one frame,
@@ -79,7 +99,7 @@ impl DbSource {
                 }])
             })
             .collect();
-        Self { lines, frames }
+        Self::new(lines, frames)
     }
 
     /// The stack and the source text at a 1-based flattened line, or

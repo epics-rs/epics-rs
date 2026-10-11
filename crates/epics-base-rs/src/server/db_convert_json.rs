@@ -80,9 +80,8 @@ impl std::error::Error for ConvertJsonError {}
 /// There is no `comment` token here: `yajl_lex_lex` consumes a comment and
 /// loops (`yajl_lex.c:730-737`), so `Comment` never escapes the lexer and
 /// [`Lexer::lex_comment`] reports its outcome on its own enum instead. There
-/// is no identifier token because identifiers are lexed only in key position
-/// (`yajl_lex_key`, `:791`), and key position is unreachable — `dbcj_start_map`
-/// cancels the parse at the `{` itself.
+/// is no identifier token because `yajl_lex_key` hands one back as
+/// `yajl_tok_string` (`yajl_lex.c:892-894`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tok {
     Eof,
@@ -267,14 +266,73 @@ impl Lexer {
             }
         };
 
-        // C's `lexed:` epilogue (`yajl_lex.c:749-776`).
+        self.lexed(tok, txt, start_offset, *off)
+    }
+
+    /// C `yajl_lex_key` (`yajl_lex.c:793-895`) — the KEY lexer, which takes a
+    /// JSON5 identifier where the value lexer takes `true` or a number.
+    fn lex_key(&mut self, txt: &[u8], off: &mut usize) -> (Tok, Vec<u8>) {
+        let mut start_offset = *off;
+        let tok = loop {
+            if *off >= txt.len() {
+                break Tok::Eof;
+            }
+            let c = self.read_char(txt, off);
+            match c {
+                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ' => start_offset += 1,
+                b'}' => break Tok::RightBrace,
+                b'\'' | b'"' => break self.lex_string(txt, off, c),
+                b'/' => match self.lex_comment(txt, off) {
+                    CommentEnd::Done => {
+                        self.buf.clear();
+                        self.buf_in_use = false;
+                        start_offset = *off;
+                    }
+                    CommentEnd::Eof => break Tok::Eof,
+                    CommentEnd::Error => break Tok::Error,
+                },
+                b'$' | b'_' | b'A'..=b'Z' | b'a'..=b'z' => {
+                    // `yajl_lex_identifier` (`:406-420`) reads one past the end.
+                    loop {
+                        if *off >= txt.len() {
+                            break;
+                        }
+                        let c = self.read_char(txt, off);
+                        if !matches!(c, b'$' | b'_' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z') {
+                            self.unread_char(off);
+                            break;
+                        }
+                    }
+                    // `RETURN_IF_EOF` inside the loop is `yajl_tok_eof`.
+                    if *off >= txt.len() {
+                        break Tok::Eof;
+                    }
+                    break Tok::Str;
+                }
+                _ => {
+                    self.error = LexError::InvalidChar;
+                    break Tok::Error;
+                }
+            }
+        };
+        let identifier = tok == Tok::Str && !matches!(txt.get(start_offset), Some(b'"' | b'\''));
+        let (tok, out) = self.lexed(tok, txt, start_offset, *off);
+        // An identifier has no quotes for the string arm to strip.
+        if identifier {
+            return (tok, txt.get(start_offset..*off).unwrap_or(&[]).to_vec());
+        }
+        (tok, out)
+    }
+
+    /// C's `lexed:` epilogue (`yajl_lex.c:749-776`).
+    fn lexed(&mut self, tok: Tok, txt: &[u8], start_offset: usize, off: usize) -> (Tok, Vec<u8>) {
         let mut out = Vec::new();
         if tok == Tok::Eof || self.buf_in_use {
             if !self.buf_in_use {
                 self.buf.clear();
             }
             self.buf_in_use = true;
-            let span = txt.get(start_offset..*off).unwrap_or(&[]);
+            let span = txt.get(start_offset..off).unwrap_or(&[]);
             self.buf.extend_from_slice(span);
             self.buf_off = 0;
             if tok != Tok::Eof {
@@ -282,7 +340,7 @@ impl Lexer {
                 self.buf_in_use = false;
             }
         } else if tok != Tok::Error {
-            out = txt.get(start_offset..*off).unwrap_or(&[]).to_vec();
+            out = txt.get(start_offset..off).unwrap_or(&[]).to_vec();
         }
         // "special case for strings. skip the quotes." (`:772-776`)
         if matches!(tok, Tok::Str | Tok::StrWithEscapes) && out.len() >= 2 {
@@ -750,9 +808,7 @@ fn string_decode(src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `yajl_state`, less the map states (`dbcj_start_map` cancels at the `{`, so
-/// no key is ever lexed) and `got_value` (which needs
-/// `yajl_allow_multiple_values`).
+/// `yajl_state`, less `got_value` (which needs `yajl_allow_multiple_values`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Start,
@@ -760,6 +816,11 @@ enum State {
     ArrayStart,
     ArrayNeedVal,
     ArrayGotVal,
+    MapStart,
+    MapNeedKey,
+    MapSep,
+    MapNeedVal,
+    MapGotVal,
     ParseError,
     LexicalError,
 }
@@ -808,6 +869,18 @@ pub(crate) trait Callbacks {
     fn string(&mut self, bytes: &[u8]) -> bool;
     fn start_map(&mut self) -> bool;
     fn start_array(&mut self) -> bool;
+    /// `yajl_map_key`. Only a table whose `start_map` lets the parse in sees a
+    /// key, and C skips a NULL slot, so the default goes on.
+    fn map_key(&mut self, _key: &[u8]) -> bool {
+        true
+    }
+    /// `yajl_end_map` / `yajl_end_array`; a NULL slot goes on.
+    fn end_map(&mut self) -> bool {
+        true
+    }
+    fn end_array(&mut self) -> bool {
+        true
+    }
     /// `Some` when the table fills `yajl_number`, which takes a number raw
     /// before yajl would parse (and overflow-check) it.
     fn number(&mut self, _text: &[u8]) -> Option<bool> {
@@ -942,29 +1015,9 @@ impl<C: Callbacks> Parser<C> {
         Status::ClientCanceled
     }
 
-    /// C `yajl_do_parse` (`yajl_parser.c:207-524`), minus the map arms.
-    fn do_parse(&mut self, txt: &[u8]) -> Status {
-        self.do_parse_from(txt, 0, false)
-    }
-
-    /// One value of `txt` starting at byte `start`, as a jlink's callbacks see
-    /// it inside the link's map: the parse stops where the value completes,
-    /// at [`Self::consumed`], and the `}` or `,` after it is the caller's.
-    /// Offsets stay `txt`'s, so a rendered caret points into the whole text.
-    /// `Ok` with the value incomplete is text that ran out first, which
-    /// [`Self::finish`] turns into yajl's `premature EOF`.
-    pub(crate) fn parse_value_at(&mut self, txt: &[u8], start: usize) -> Status {
-        self.do_parse_from(txt, start, true)
-    }
-
-    /// Whether the value [`Self::parse_value_at`] read is whole.
-    pub(crate) fn complete(&self) -> bool {
-        self.state() == State::ParseComplete
-    }
-
-    /// `hand->bytesConsumed`.
-    pub(crate) fn consumed(&self) -> usize {
-        self.bytes_consumed
+    /// `yajl_parse` over the whole of `txt`.
+    pub(crate) fn parse(&mut self, txt: &[u8]) -> Status {
+        self.do_parse(txt)
     }
 
     /// `yajl_complete_parse`.
@@ -972,19 +1025,11 @@ impl<C: Callbacks> Parser<C> {
         self.do_finish()
     }
 
-    /// A parse error the caller's own state machine raises at `offset`, for
-    /// [`Self::render_error`] to print as yajl would.
-    pub(crate) fn fail_at(&mut self, offset: usize, error: &'static str) {
-        self.set(State::ParseError);
-        self.parse_error = Some(error);
-        self.bytes_consumed = offset;
-    }
-
-    fn do_parse_from(&mut self, txt: &[u8], start: usize, one_value: bool) -> Status {
-        self.bytes_consumed = start;
+    /// C `yajl_do_parse` (`yajl_parser.c:207-524`).
+    fn do_parse(&mut self, txt: &[u8]) -> Status {
+        self.bytes_consumed = 0;
         loop {
             match self.state() {
-                State::ParseComplete if one_value => return Status::Ok,
                 State::ParseComplete => {
                     // Neither `yajl_allow_multiple_values` nor
                     // `yajl_allow_trailing_garbage` is set on an EPICS handle.
@@ -1000,11 +1045,11 @@ impl<C: Callbacks> Parser<C> {
                     }
                 }
                 State::LexicalError | State::ParseError => return Status::Error,
-                State::Start | State::ArrayStart | State::ArrayNeedVal => {
+                State::Start | State::ArrayStart | State::ArrayNeedVal | State::MapNeedVal => {
                     let mut off = self.bytes_consumed;
                     let (tok, buf) = self.lexer.lex(txt, &mut off);
                     self.bytes_consumed = off;
-                    let mut push_array = false;
+                    let mut push = None;
                     let accepted = match tok {
                         Tok::Eof => return Status::Ok,
                         Tok::Error => {
@@ -1018,9 +1063,12 @@ impl<C: Callbacks> Parser<C> {
                         }
                         Tok::Bool => self.ctx.boolean(buf.first() == Some(&b't')),
                         Tok::Null => self.ctx.null(),
-                        Tok::LeftBrace => self.ctx.start_map(),
+                        Tok::LeftBrace => {
+                            push = Some(State::MapStart);
+                            self.ctx.start_map()
+                        }
                         Tok::LeftBracket => {
-                            push_array = true;
+                            push = Some(State::ArrayStart);
                             self.ctx.start_array()
                         }
                         Tok::Integer | Tok::Double if let Some(ok) = self.ctx.number(&buf) => ok,
@@ -1047,7 +1095,9 @@ impl<C: Callbacks> Parser<C> {
                         {
                             // A trailing comma before `]` is JSON5's
                             // (`yajl_parser.c:357-360` admits `array_need_val`);
-                            // `dbcj_callbacks` has no `end_array`.
+                            if !self.ctx.end_array() {
+                                return self.cancel();
+                            }
                             self.stack.pop();
                             continue;
                         }
@@ -1061,13 +1111,84 @@ impl<C: Callbacks> Parser<C> {
                         return self.cancel();
                     }
                     // "got a value. transition depends on the state we're in."
-                    if self.state() == State::Start {
-                        self.set(State::ParseComplete);
-                    } else {
-                        self.set(State::ArrayGotVal);
+                    match self.state() {
+                        State::Start => self.set(State::ParseComplete),
+                        State::MapNeedVal => self.set(State::MapGotVal),
+                        _ => self.set(State::ArrayGotVal),
                     }
-                    if push_array {
-                        self.stack.push(State::ArrayStart);
+                    if let Some(state) = push {
+                        self.stack.push(state);
+                    }
+                }
+                // "only difference between these two states is that in start
+                // '}' is valid, whereas in need_key, we've parsed a comma" —
+                // and JSON5 admits that trailing comma too.
+                State::MapStart | State::MapNeedKey => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, key) = self.lexer.lex_key(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        Tok::Str | Tok::StrWithEscapes => {
+                            let key = if tok == Tok::StrWithEscapes {
+                                string_decode(&key)
+                            } else {
+                                key
+                            };
+                            if !self.ctx.map_key(&key) {
+                                return self.cancel();
+                            }
+                            self.set(State::MapSep);
+                        }
+                        Tok::RightBrace => {
+                            if !self.ctx.end_map() {
+                                return self.cancel();
+                            }
+                            self.stack.pop();
+                        }
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("invalid object key (must be a string or identifier)");
+                        }
+                    }
+                }
+                State::MapSep => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, _) = self.lexer.lex(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::Colon => self.set(State::MapNeedVal),
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("object key and value must be separated by a colon (':')");
+                        }
+                    }
+                }
+                State::MapGotVal => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, buf) = self.lexer.lex(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::RightBrace => {
+                            if !self.ctx.end_map() {
+                                return self.cancel();
+                            }
+                            self.stack.pop();
+                        }
+                        Tok::Comma => self.set(State::MapNeedKey),
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("after key and value, inside map, I expect ',' or '}'");
+                            self.restore_error_offset(buf.len());
+                        }
                     }
                 }
                 State::ArrayGotVal => {
@@ -1076,6 +1197,9 @@ impl<C: Callbacks> Parser<C> {
                     self.bytes_consumed = off;
                     match tok {
                         Tok::RightBracket => {
+                            if !self.ctx.end_array() {
+                                return self.cancel();
+                            }
                             self.stack.pop();
                         }
                         Tok::Comma => self.set(State::ArrayNeedVal),

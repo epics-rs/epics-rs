@@ -13,7 +13,7 @@ use crate::server::record::{Record, SubroutineFn};
 use crate::types::EpicsValue;
 
 use super::cvt_bpt::BrkTable;
-use super::database::{PvDatabase, RecordLoad};
+use super::database::PvDatabase;
 use super::device_support;
 use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
 use super::{DeviceSupportFactory, RecordFactory};
@@ -26,37 +26,12 @@ use super::{autosave, db_loader};
 pub struct IocBuilder {
     pvs: Vec<(String, EpicsValue)>,
     records: Vec<(String, Box<dyn Record>)>,
-    /// One entry per `.db` text taken in, in the order it was loaded,
-    /// holding the source C would quote in `ERROR: Failed to load '%s'`.
-    /// The file name is known only here, never to the record itself.
-    sources: Vec<String>,
-    /// The lexer state of each text, parallel to [`IocBuilder::sources`]:
-    /// its bound source lines and `yyFailed`. The per-record refusals are
-    /// raised in `build`, after the parse, and can only name their line
-    /// through the same `DbFaults` that parsed the text.
-    load_faults: Vec<db_loader::DbFaults>,
-    /// Each `.db` definition, tagged with its [`IocBuilder::sources`]
-    /// index.
-    db_defs: Vec<(usize, db_loader::DbRecordDef)>,
-    /// Which loads produced at least one recoverable diagnostic, as
-    /// [`IocBuilder::sources`] indices. C recovers from every
-    /// `yyerror(NULL)` and settles a load's status only when its file is
-    /// finished (`dbLoadRecords`), so this is the whole status of every
-    /// load: `build` fails naming the EARLIEST-LOADED entry, which is the
-    /// file C's `softMain` would have stopped on. Indices, not names,
-    /// because the two halves report at different times — a later file's
-    /// parse fault is recorded before an earlier file's records are even
-    /// built — and only the load position orders them the way C does.
-    failed_loads: Vec<usize>,
+    /// One entry per `.db` text taken in, in the order it was loaded.
+    loads: Vec<DbLoad>,
     /// What a failed load does to the build: `false` is `softIoc -d`, which
     /// exits before `iocInit`; `true` is a `dbLoadRecords` line in a startup
     /// script, which reports and lets the script go on to `iocInit`.
     boot_past_failed_loads: bool,
-    /// File-scope aliases whose target no `.db` added so far declares,
-    /// each tagged with the [`IocBuilder::sources`] index that carried it.
-    /// Resolved at `build` against the accumulated definitions, which is
-    /// this builder's stand-in for C's `savedPdbbase`.
-    db_aliases: Vec<(usize, String, String, u32)>,
     /// `breaktable(...)` definitions parsed from the loaded `.db`/`.dbd` text,
     /// used to populate the breakpoint-table registry for `ai`/`ao` records
     /// with `LINR >= 3`.
@@ -82,6 +57,50 @@ enum LinkInit {
     Build,
 }
 
+/// One `.db` text, parsed and waiting for `build` to install it as C's
+/// `dbLoadRecords` would.
+struct DbLoad {
+    /// What C quotes in `ERROR: Failed to load '%s'`.
+    source: String,
+    /// `None` for a file `dbReadCOM` could not open: a failed load with
+    /// nothing to install, reported in its turn.
+    text: Option<DbText>,
+}
+
+/// What one opened `.db` text parsed to.
+struct DbText {
+    records: Vec<db_loader::DbRecordDef>,
+    file_aliases: Vec<db_loader::DbFileAlias>,
+    aborted: Option<db_loader::ParseAbort>,
+    /// Every positioned diagnostic of the parse, released as `build`
+    /// installs this load, so the console reads in C's file order.
+    faults: db_loader::DbFaults,
+}
+
+/// The builder's side of [`db_loader::install_records`].
+struct BuilderInstall<'a> {
+    db: &'a PvDatabase,
+    record_factories: &'a HashMap<String, RecordFactory>,
+}
+
+impl db_loader::InstallHost for BuilderInstall<'_> {
+    fn db(&self) -> &PvDatabase {
+        self.db
+    }
+
+    fn records_once_only(&self) -> bool {
+        crate::server::iocsh::db_records_once_only()
+    }
+
+    fn create_record(&self, record_type: &str) -> Option<Box<dyn Record>> {
+        db_loader::create_record_with_factories(record_type, self.record_factories).ok()
+    }
+
+    fn warn(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
 impl IocBuilder {
     /// Create an empty builder. Built-in device support that historically
     /// ships with epics-base (currently: `getenv` for stringin/lsi)
@@ -98,12 +117,8 @@ impl IocBuilder {
         Self {
             pvs: Vec::new(),
             records: Vec::new(),
-            sources: Vec::new(),
-            load_faults: Vec::new(),
-            db_defs: Vec::new(),
-            failed_loads: Vec::new(),
+            loads: Vec::new(),
             boot_past_failed_loads: false,
-            db_aliases: Vec::new(),
             breaktables: Vec::new(),
             device_factories,
             // The base built-in device support — all needing the runtime
@@ -139,19 +154,24 @@ impl IocBuilder {
 
     /// Load records from a .db file.
     ///
-    /// A recoverable diagnostic in the text fails the eventual
-    /// [`IocBuilder::build`] with [`CaError::DbLoadFailed`], which is C
-    /// `dbLoadRecords` returning non-zero (`dbAccess.c:795-813`);
-    /// `softIoc -d` on such a file exits 2 without reaching `iocInit`.
-    /// Only a syntax error the parser cannot recover from — C's
-    /// `yyerrorAbort` — fails here.
+    /// A recoverable diagnostic in the text, a syntax error (once the records
+    /// above it are installed) or a file that cannot be opened is a failed
+    /// load, C `dbLoadRecords` returning non-zero (`dbAccess.c:795-813`);
+    /// [`IocBuilder::boot_past_failed_loads`] decides what
+    /// [`IocBuilder::build`] does next.
+    ///
+    /// The read is `dbLoadRecords`' own: the file is found on the include
+    /// path list and its `include`s resolve there, as `softIoc -d` does.
     pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
-        // The file's name goes in with its text: `yyerror` quotes it in
-        // ` in file "<f>" line N`, and a text read without one is C's
-        // "standard input".
-        let (expanded, source) = db_loader::db_read_lines(&content, macros, Some(path));
-        let parsed = db_loader::parse_db_expanded(&expanded, source)?;
+        let (config, opened) = db_loader::resolve_db_file(path, "");
+        let Some(opened) = opened else {
+            self.loads.push(DbLoad {
+                source: path.to_string(),
+                text: None,
+            });
+            return Ok(self);
+        };
+        let parsed = db_loader::parse_db_opened_held(&opened, macros, &config)?;
         self.absorb_parsed(path, parsed);
         Ok(self)
     }
@@ -159,7 +179,7 @@ impl IocBuilder {
     /// Load records from a .db string. Settles its status exactly as
     /// [`IocBuilder::db_file`] does.
     pub fn db_string(mut self, content: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
-        let parsed = db_loader::parse_db_with_breaktables(content, macros)?;
+        let parsed = db_loader::parse_db_held(content, macros);
         self.absorb_parsed(db_loader::DB_STRING_SOURCE, parsed);
         Ok(self)
     }
@@ -173,22 +193,17 @@ impl IocBuilder {
     /// per-record refusals as well and then fail once, with the name C
     /// quotes. Returning here instead would end the load at the first
     /// diagnostic and let the caller's own error stand in for C's tail.
-    fn absorb_parsed(&mut self, source: &str, mut parsed: db_loader::ParsedDb) {
-        let load = self.sources.len();
-        self.sources.push(source.to_string());
-        if !parsed.faults.is_empty() {
-            self.failed_loads.push(load);
-        }
-        self.load_faults.push(std::mem::take(&mut parsed.faults));
-        self.db_defs
-            .extend(parsed.records.into_iter().map(|def| (load, def)));
+    fn absorb_parsed(&mut self, source: &str, parsed: db_loader::ParsedDb) {
         self.breaktables.extend(parsed.breaktables);
-        self.db_aliases.extend(
-            parsed
-                .unresolved_aliases
-                .into_iter()
-                .map(|(target, alias, line)| (load, target, alias, line)),
-        );
+        self.loads.push(DbLoad {
+            source: source.to_string(),
+            text: Some(DbText {
+                records: parsed.records,
+                file_aliases: parsed.file_aliases,
+                aborted: parsed.aborted,
+                faults: parsed.faults,
+            }),
+        });
     }
 
     /// Register a device support: its factory under `devsup.choice`, and
@@ -259,10 +274,10 @@ impl IocBuilder {
     }
 
     /// Load as a startup script's `dbLoadRecords` does rather than as
-    /// `softIoc -d`: a failed load prints C's `Failed to load` tail
-    /// (`dbAccess.c:808`) and the build still boots every record that
-    /// parsed, a refused field keeping whatever its `dbPutString` left
-    /// (`dbLexRoutines.c:1405-1415` is `yyerror(NULL)`, not an abort).
+    /// `softIoc -d`: the loads after a failed one still run and the build
+    /// still boots every record that parsed, a refused field keeping whatever
+    /// its `dbPutString` left (`dbLexRoutines.c:1405-1415` is `yyerror(NULL)`,
+    /// not an abort).
     pub fn boot_past_failed_loads(mut self) -> Self {
         self.boot_past_failed_loads = true;
         self
@@ -390,244 +405,42 @@ impl IocBuilder {
             db.add_record(&name, record).await?;
         }
 
-        // 3. .db definitions — create records, apply fields, init, wire device support & subs
-        //
-        // C reports every record in the file and settles the load's status
-        // only when the file is finished, so a refused FIELD must not end the
-        // loop. C is not uniform here and neither is this loop: a field that
-        // `dbPutString` refuses ends in `yyerror(NULL)`
-        // (`dbLexRoutines.c:1409-1417`), which sets `yyFailed` and resumes at
-        // the next record, while a record whose TYPE cannot be resolved or
-        // whose creation fails ends in `yyerrorAbort(NULL)` (`:1163-1167` and
-        // `:1189-1193`), which stops the parse of that file outright. So the
-        // create step below abandons the rest of its own load and the two
-        // field steps carry on.
-        //
-        // The diagnostic is printed by whichever site refuses, and C prints
-        // at the refusal.
-        let mut failed_loads = self.failed_loads;
-        let mut load_faults = self.load_faults;
-        let mut aborted_loads: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (load, mut def) in self.db_defs {
-            if aborted_loads.contains(&load) {
-                continue;
-            }
-            let mut record = match db_loader::create_record_with_factories(
-                &def.record_type,
-                &self.record_factories,
-            ) {
-                Ok(record) => record,
-                Err(_) => {
-                    // C's two texts for a type it cannot instantiate, and
-                    // `yyerrorAbort`: the rest of this load is not read.
-                    // (The factory's `register_record_type` hint is not C
-                    // output and no longer shares the diagnostic's stream.)
-                    let miss = db_loader::record_type_miss(&def.record_type, &def.name);
-                    if let Some(line) = miss.stdout {
-                        println!("{line}");
-                    }
-                    if let Some(line) = &miss.errlog {
-                        crate::runtime::log::errlog_printf(line);
-                    }
-                    load_faults[load]
-                        .abort_at(def.line, db_loader::DbDiagnostic::new(miss.message));
-                    failed_loads.push(load);
-                    aborted_loads.insert(load);
-                    continue;
+        // 3. .db definitions — each load installed as C's `dbLoadRecords`
+        // reads it, through the same per-record install as iocsh, and a failed
+        // one prints its tail as `dbLoadRecords` does (`dbAccess.c`).
+        let host = BuilderInstall {
+            db: &db,
+            record_factories: &self.record_factories,
+        };
+        let mut loads = self.loads.into_iter();
+        while let Some(load) = loads.next() {
+            let installed = match load.text {
+                Some(mut text) => db_loader::install_records(
+                    &host,
+                    text.records,
+                    text.file_aliases,
+                    text.aborted,
+                    &breaktable_registry,
+                    &mut text.faults,
+                )
+                .await
+                .is_ok(),
+                None => {
+                    eprintln!("{ERL_ERROR}: Can't open file '{}'", load.source);
+                    false
                 }
             };
-
-            // C `dbCreateRecord` (`dbLexRoutines.c:1173-1180`): a name that
-            // is already a record of ANOTHER type is refused before any
-            // field is read, and the body is dropped. The sentence names the
-            // type being loaded first and the type already there last.
-            if let Some(existing) = db.get_record(&def.name) {
-                let existing_type = existing.read().record.record_type().to_string();
-                if existing_type != def.record_type {
-                    load_faults[load].report_at(
-                        def.line,
-                        db_loader::DbDiagnostic::new(format!(
-                            "{ERL_ERROR}: {} record '{}' already exists, can't load {} record",
-                            def.record_type, def.name, existing_type
-                        )),
-                    );
-                    failed_loads.push(load);
-                    continue;
+            if !installed {
+                eprintln!("{ERL_ERROR}: Failed to load '{}'", load.source);
+                if !self.boot_past_failed_loads {
+                    for unread in loads {
+                        if let Some(mut text) = unread.text {
+                            text.faults.stop_reading();
+                        }
+                    }
+                    return Err(CaError::DbLoadFailed(load.source));
                 }
             }
-
-            // Resolve a `LINR` field that names a loaded breakpoint table to the
-            // numeric `menuConvert` index that selects it (before apply_fields,
-            // which only knows the fixed menuConvert labels). The registry
-            // itself is installed by `add_record` (the single creation sink).
-            db_loader::resolve_linr_breaktable_names(
-                &def.record_type,
-                &mut def.fields,
-                &breaktable_registry,
-            );
-
-            // Screen the menu values before the record is built, which is the
-            // same screen the iocsh `dbLoadRecords` path runs and for the same
-            // reason. C creates the record and only THEN puts each field
-            // (`dbCreateRecord` at `dbLexRoutines.c:1172`, `dbPutString` at
-            // `:1405`), so a value `dbPutString` refuses costs that FIELD its
-            // value and nothing else: the record stays with the dbd default,
-            // its other fields load, and only the load's status goes non-zero.
-            //
-            // Deciding it at whichever site happened to apply the field gave
-            // one C rule two spellings here too — `SCAN` reached
-            // `add_loaded_record` and reported C's wording, `SELM` reached
-            // `apply_fields` and reported the port's — and both discarded a
-            // record C keeps. After the screen neither apply site can see a
-            // value its menu would refuse, so neither can decide anything, and
-            // the two load paths cannot drift apart again.
-            let (screen_type, screen_name) = (def.record_type.clone(), def.name.clone());
-            let mut screen_refused = false;
-            def.fields.retain(|f| {
-                let Some(refusal) = db_loader::menu_value_refusal(
-                    &screen_type,
-                    &screen_name,
-                    &f.name.to_uppercase(),
-                    &f.value.as_str_lossy(),
-                ) else {
-                    return true;
-                };
-                // Same seat and same call as the iocsh `dbLoadRecords`
-                // path, so both print `yyerror`'s location and echo.
-                load_faults[load].seek(f.line, ")");
-                load_faults[load].report(db_loader::DbDiagnostic {
-                    notice: refusal.notice,
-                    message: refusal.line,
-                    suggestion: refusal.suggestion,
-                });
-                screen_refused = true;
-                false
-            });
-            if screen_refused {
-                failed_loads.push(load);
-            }
-
-            // As C dbLoadRecords: a refused field keeps the record loaded; only build()'s Err carries the status.
-            let mut common_fields = Vec::new();
-            // One field at a time, as C's parser does: a refused field costs
-            // that field and the load's status, never the record.
-            if db_loader::apply_fields_one_at_a_time(
-                &mut record,
-                &def.name,
-                &def.fields,
-                &mut common_fields,
-                |f, e, line| {
-                    load_faults[load].seek(f.line, ")");
-                    e.emit_put_report();
-                    load_faults[load].report(db_loader::DbDiagnostic::new(line));
-                },
-            ) {
-                failed_loads.push(load);
-            }
-
-            // The record and its whole loaded field set enter the database
-            // together: the sink applies the common fields and the info tags,
-            // and only then runs C's `iocInit` passes — so the initial UDF
-            // severity is evaluated against the `.db`'s final UDF/STAT/UDFS
-            // (C `dbLoadRecords` → `iocInit`, not the reverse).
-            if db
-                .add_loaded_record(
-                    &def.name,
-                    record,
-                    RecordLoad {
-                        common_fields,
-                        info_tags: std::mem::take(&mut def.info_tags),
-                    },
-                )
-                .await
-                .is_err()
-            {
-                // `dbCreateRecord` failing for any other reason is
-                // `yyerrorAbort` (`dbLexRoutines.c:1189-1194`), as in the
-                // `dbLoadRecords` path.
-                load_faults[load].abort_at(
-                    def.line,
-                    db_loader::DbDiagnostic::new(format!(
-                        "{ERL_ERROR}: Can't create {} record '{}'",
-                        def.record_type, def.name
-                    )),
-                );
-                failed_loads.push(load);
-                aborted_loads.insert(load);
-                continue;
-            }
-
-            // alias(...) directives. C `dbRecordAlias` reports the rejection
-            // and calls `yyerror(NULL)` (`dbLexRoutines.c:1496`), so the
-            // record keeps its place and the load's status goes non-zero.
-            for (alias, &alias_line) in def.aliases.iter().zip(&def.alias_lines) {
-                if db_loader::create_alias(
-                    &db,
-                    alias,
-                    &def.name,
-                    alias_line,
-                    crate::server::iocsh::db_records_once_only(),
-                    &mut load_faults[load],
-                )
-                .await
-                {
-                    failed_loads.push(load);
-                }
-            }
-
-            // The per-record init tail — `init_links` (checkLinks) and
-            // `rec_gbl_init_constant_links` (the constant-INP seed) — is not run
-            // here any more: `add_loaded_record` deferred this record's whole
-            // init to C's `initDatabase` pass, which `drain_deferred_record_inits`
-            // below runs once every record has loaded and every device-support
-            // port has been configured.
-        }
-
-        // File-scope `alias("record","new")` that no single `.db` could
-        // resolve on its own. C `dbAlias` looks the target up in
-        // `savedPdbbase` (`dbLexRoutines.c:1508`), the whole accumulated
-        // database — here that is every definition added to the builder,
-        // now installed. An unknown target keeps C's diagnostic and
-        // leaves the records that did load in place.
-        // Both arms are `yyerror(NULL)` in C `dbAlias`
-        // (`dbLexRoutines.c:1509-1517`), so both fail the load.
-        for (load, target, alias, line) in self.db_aliases {
-            let refused = if db.get_record(&target).is_none() {
-                load_faults[load].report_at(
-                    line,
-                    db_loader::DbDiagnostic::new(db_loader::unknown_alias_message(&alias, &target)),
-                );
-                true
-            } else {
-                db_loader::create_alias(
-                    &db,
-                    &alias,
-                    &target,
-                    line,
-                    crate::server::iocsh::db_records_once_only(),
-                    &mut load_faults[load],
-                )
-                .await
-            };
-            if refused {
-                failed_loads.push(load);
-            }
-        }
-
-        // The status of every load, settled once for the whole build. C's
-        // `softMain` exits on the first `dbLoadRecords` that returns
-        // non-zero (`softMain.cpp:198`), so the file named is the
-        // earliest-loaded one that failed, and `iocInit` below never runs.
-        // A script instead prints each failed load's tail and goes on.
-        failed_loads.sort_unstable();
-        failed_loads.dedup();
-        if let Some(&load) = failed_loads.first()
-            && !self.boot_past_failed_loads
-        {
-            return Err(CaError::DbLoadFailed(self.sources[load].clone()));
-        }
-        for load in failed_loads {
-            eprintln!("{ERL_ERROR}: Failed to load '{}'", self.sources[load]);
         }
         let Some(begun) = iocinit_begins() else {
             return Err(CaError::InvalidValue(
@@ -939,6 +752,41 @@ record(ai, "A:ONE") {
         );
     }
 
+    /// A `SPC_CALC` string `postfix()` refuses fails the load's status, as
+    /// C's `softIoc -d` does (exit 2, `Failed to load`), whichever record type
+    /// owns the field; the same text compiling loads.
+    #[epics_macros_rs::epics_test]
+    async fn a_calc_expression_that_does_not_compile_fails_the_load() {
+        for db in [
+            "record(calc, \"R\") { field(CALC, \"A+\") }\n",
+            "record(calcout, \"R\") { field(OCAL, \"(\") }\n",
+            "record(swait, \"R\") { field(CALC, \"1)\") }\n",
+        ] {
+            let result = IocBuilder::new()
+                .db_string(db, &HashMap::new())
+                .unwrap()
+                .build()
+                .await;
+            let Err(err) = result else {
+                panic!("{db:?} must fail the load");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!("Failed to load '{}'", db_loader::DB_STRING_SOURCE),
+                "{db:?}"
+            );
+        }
+        IocBuilder::new()
+            .db_string(
+                "record(calc, \"R\") { field(CALC, \"A+1\") }\n",
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .expect("a CALC that compiles loads");
+    }
+
     /// The other half of C's rule, and the boundary between the two: a
     /// record whose type cannot be resolved ends in `yyerrorAbort(NULL)`
     /// (`dbLexRoutines.c:1163-1167`), which stops the parse of that FILE, so
@@ -1020,6 +868,52 @@ record(ai, "A:ONE") {
             err.to_string(),
             format!("Failed to load '{}'", first.display()),
         );
+    }
+
+    /// A st.cmd's policy: the failed file keeps its other records, the next
+    /// file loads, and the build reaches `iocInit`.
+    #[epics_macros_rs::epics_test]
+    async fn continue_loads_past_a_failed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.db");
+        let second = dir.path().join("second.db");
+        let missing = dir.path().join("missing.db");
+        std::fs::write(
+            &first,
+            "record(ai, \"F1\") { }\nrecord(ai, \"F2\") { field(SCAN, \"Bogus\") }\n",
+        )
+        .unwrap();
+        std::fs::write(&second, "record(ai, \"S1\") { }\n").unwrap();
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .boot_past_failed_loads()
+            .db_file(first.to_str().unwrap(), &HashMap::new())
+            .unwrap()
+            .db_file(missing.to_str().unwrap(), &HashMap::new())
+            .unwrap()
+            .db_file(second.to_str().unwrap(), &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .expect("a st.cmd goes on");
+        for rec in ["F1", "F2", "S1"] {
+            assert!(db.get_record(rec).is_some(), "{rec}");
+        }
+    }
+
+    /// `softIoc -d nope.db` is `Can't open file` then `Failed to load` and
+    /// exit 2: an unopened file is a failed load like any other.
+    #[epics_macros_rs::epics_test]
+    async fn stop_fails_the_build_at_a_missing_file() {
+        let Err(err) = IocBuilder::new()
+            .db_file("/nonexistent/missing.db", &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+        else {
+            panic!("a missing file fails the load");
+        };
+        assert_eq!(err.to_string(), "Failed to load '/nonexistent/missing.db'");
     }
 
     /// A clean .db still loads, so the gate above cannot be passing by

@@ -112,16 +112,8 @@ fn strip_ansi(s: &str) -> String {
 /// The whole of C's answer to "where", on the file that produced the
 /// measurement.
 ///
-/// One deviation, and it is the flattening this port does before it parses:
-/// C's lexer reads a line and the parser consumes it, so C interleaves each
-/// line's read-time diagnostics with that line's parse-time ones, while
-/// `expand_includes` here expands the whole include tree first — so all four
-/// macro notices come out before the first refusal. Every line C writes is
-/// written, with the same bytes; only the grouping differs. Making them
-/// interleave would mean buffering the expander's output and flushing it as
-/// the install loop walks records, which is ordering by convention — the
-/// install loop is under no obligation to visit lines in file order — and this
-/// port would rather have the honest grouping than a fragile imitation.
+/// Each line's read-time notices sit between the previous line's refusals and
+/// its own, where C's lexer reads it; captured from `softIoc` R7.0.10.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn every_db_diagnostic_names_its_file_and_line() {
@@ -145,33 +137,33 @@ async fn every_db_diagnostic_names_its_file_and_line() {
 macLib: macro INP is undefined (expanding string   field(INP, \"$(INP) NPP\")
 )
 WARNING: 'compressTest.db' line 7 has undefined macros
-macLib: macro ALG is undefined (expanding string   field(ALG, \"$(ALG)\")
-)
-WARNING: 'compressTest.db' line 8 has undefined macros
-macLib: macro BALG is undefined (expanding string   field(BALG,\"$(BALG)\")
-)
-WARNING: 'compressTest.db' line 10 has undefined macros
-macLib: macro NSAM is undefined (expanding string   field(NSAM,\"$(NSAM)\")
-)
-WARNING: 'compressTest.db' line 11 has undefined macros
 comp.INP Has unexpanded macro
 ERROR: Can't set 'comp.INP' to '$(INP,undefined) NPP'  : Bad Field value
 ERROR:  at or before ')' in path \"{found_under}\"  file \"compressTest.db\" line 7
 
  7 |   field(INP, \"$(INP,undefined) NPP\")
 
+macLib: macro ALG is undefined (expanding string   field(ALG, \"$(ALG)\")
+)
+WARNING: 'compressTest.db' line 8 has undefined macros
 comp.ALG Has unexpanded macro
 ERROR: Can't set 'comp.ALG' to '$(ALG,undefined)'  : Bad Field value
     Did you mean \"Average\"?
 ERROR: 
  8 |   field(ALG, \"$(ALG,undefined)\")
 
+macLib: macro BALG is undefined (expanding string   field(BALG,\"$(BALG)\")
+)
+WARNING: 'compressTest.db' line 10 has undefined macros
 comp.BALG Has unexpanded macro
 ERROR: Can't set 'comp.BALG' to '$(BALG,undefined)'  : Bad Field value
     Did you mean \"FIFO Buffer\"?
 ERROR: 
  10 |   field(BALG,\"$(BALG,undefined)\")
 
+macLib: macro NSAM is undefined (expanding string   field(NSAM,\"$(NSAM)\")
+)
+WARNING: 'compressTest.db' line 11 has undefined macros
 comp.NSAM Has unexpanded macro
 ERROR: Can't set 'comp.NSAM' to '$(NSAM,undefined)'  : Bad Field value
 ERROR: 
@@ -218,27 +210,27 @@ async fn quiet_macro_warnings_drops_maclibs_notice_and_keeps_the_loaders() {
     let want = format!(
         "\
 WARNING: 'compressTest.db' line 7 has undefined macros
-WARNING: 'compressTest.db' line 8 has undefined macros
-WARNING: 'compressTest.db' line 10 has undefined macros
-WARNING: 'compressTest.db' line 11 has undefined macros
 comp.INP Has unexpanded macro
 ERROR: Can't set 'comp.INP' to '$(INP) NPP'  : Bad Field value
 ERROR:  at or before ')' in path \"{found_under}\"  file \"compressTest.db\" line 7
 
  7 |   field(INP, \"$(INP) NPP\")
 
+WARNING: 'compressTest.db' line 8 has undefined macros
 comp.ALG Has unexpanded macro
 ERROR: Can't set 'comp.ALG' to '$(ALG)'  : Bad Field value
     Did you mean \"N to 1 Average\"?
 ERROR: 
  8 |   field(ALG, \"$(ALG)\")
 
+WARNING: 'compressTest.db' line 10 has undefined macros
 comp.BALG Has unexpanded macro
 ERROR: Can't set 'comp.BALG' to '$(BALG)'  : Bad Field value
     Did you mean \"FIFO Buffer\"?
 ERROR: 
  10 |   field(BALG,\"$(BALG)\")
 
+WARNING: 'compressTest.db' line 11 has undefined macros
 comp.NSAM Has unexpanded macro
 ERROR: Can't set 'comp.NSAM' to '$(NSAM)'  : Bad Field value
 ERROR: 
@@ -304,11 +296,8 @@ async fn var_reaches_the_quiet_knob_the_loader_reads() {
 /// them apart — and the ` at or before` clause quotes that token rather than
 /// a column of this port's invention.
 ///
-/// One deviation is left:
-///
-/// * `WARNING: dbReadCOM: Parser stack dirty w/o error. 1` is absent. It
-///   counts the half-built objects left on C's `tempList`
-///   (`dbLexRoutines.c:303-305`); this parser has no such list.
+/// The abort falls inside `S1`'s body, so C's `tempList` still holds it and
+/// `dbReadCOM` follows with `Parser stack dirty` (`dbLexRoutines.c:303-306`).
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn a_syntax_error_names_its_file_line_and_source() {
@@ -332,6 +321,7 @@ ERROR: syntax error
 
  3 |   qqq
 
+WARNING: dbReadCOM: Parser stack dirty w/o error. 1
 ERROR: Failed to load 'syn.db'
 "
     );

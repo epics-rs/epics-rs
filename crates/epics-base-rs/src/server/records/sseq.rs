@@ -1251,7 +1251,10 @@ impl Record for SseqRecord {
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
     /// (`mark_value_write`), with that C call site's mask and comparison.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
-        CycleMarks::of(&VALUE_WRITE_POSTS, std::mem::take(&mut self.pending_posts))
+        CycleMarks::of(
+            &VALUE_WRITE_POSTS,
+            u128::from(std::mem::take(&mut self.pending_posts)),
+        )
     }
 
     /// C change-detects neither view of a step's value pair; see

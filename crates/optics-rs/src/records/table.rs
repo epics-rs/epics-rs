@@ -3225,7 +3225,7 @@ impl Record for TableRecord {
     /// Neither is `pp(TRUE)`, so no process cycle posts it.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         static SET_POST: [(&str, CyclePostMask); 1] = [("SET", CyclePostMask::Value)];
-        CycleMarks::of(&SET_POST, u64::from(std::mem::take(&mut self.set_marked)))
+        CycleMarks::of(&SET_POST, u128::from(std::mem::take(&mut self.set_marked)))
     }
 
     /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:

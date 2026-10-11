@@ -73,7 +73,7 @@ impl Record for MarkRecord {
     fn take_process_posted_fields(&mut self) -> CycleMarks {
         static X_POST: [(&str, CyclePostMask); 1] = [("X", CyclePostMask::Value)];
         self.drains += 1;
-        CycleMarks::of(&X_POST, u64::from(std::mem::take(&mut self.marked)))
+        CycleMarks::of(&X_POST, u128::from(std::mem::take(&mut self.marked)))
     }
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &["X"]

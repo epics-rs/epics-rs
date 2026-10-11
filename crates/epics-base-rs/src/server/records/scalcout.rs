@@ -773,7 +773,10 @@ impl Record for ScalcoutRecord {
             ("CLCV", CyclePostMask::Value),
             ("OCLV", CyclePostMask::Value),
         ];
-        CycleMarks::of(&CALC_POSTS, std::mem::take(&mut self.calc_posts))
+        CycleMarks::of(
+            &CALC_POSTS,
+            u128::from(std::mem::take(&mut self.calc_posts)),
+        )
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.

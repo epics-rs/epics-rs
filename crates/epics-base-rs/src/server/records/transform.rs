@@ -1169,7 +1169,7 @@ impl Record for TransformRecord {
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         static POSTS: [(&str, CyclePostMask); POSTED_FIELDS.len()] =
             crate::server::record::uniform_post_table(POSTED_FIELDS, CyclePostMask::ValueLog);
-        crate::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut self.posts) as u64)
+        crate::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut self.posts) as u128)
     }
 
     /// C keeps LA..LP and never compares against the published value.

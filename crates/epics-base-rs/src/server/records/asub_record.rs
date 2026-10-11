@@ -509,7 +509,7 @@ impl ASubRecord {
             bits |= u64::from(val_marks >> i & 1) << (2 * i);
             bits |= u64::from(nev_marks >> i & 1) << (2 * i + 1);
         }
-        CycleMarks::of(&OUTPUT_EVENT_POSTS, bits)
+        CycleMarks::of(&OUTPUT_EVENT_POSTS, u128::from(bits))
     }
 }
 

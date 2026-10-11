@@ -124,7 +124,7 @@ impl Record for PermissiveRecord {
     /// `permissiveRecord.c:111-114`: `monitor_mask|DBE_VALUE|DBE_LOG`.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         static WFLG_POST: [(&str, CyclePostMask); 1] = [("WFLG", CyclePostMask::MonitorValueLog)];
-        CycleMarks::of(&WFLG_POST, std::mem::take(&mut self.wflg_marked) as u64)
+        CycleMarks::of(&WFLG_POST, std::mem::take(&mut self.wflg_marked) as u128)
     }
 
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {

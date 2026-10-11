@@ -8374,6 +8374,7 @@ impl RecordInstance {
         } else {
             CycleMarks::NONE
         };
+        let any_marks = !cycle_marks.is_empty();
         let value_masked = self.monitor_plan.value_masked;
         // C `if (prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG)` — the guard
         // `OnChangeForced` fields sit behind, which the record may open on a
@@ -8553,7 +8554,7 @@ impl RecordInstance {
                 // C `monitor()` posts a statically re-marked field with
                 // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                 snapshot.push((name(), val.clone(), aux_mask));
-            } else if { cycle_marks }.any(|(name, _)| name == field) {
+            } else if any_marks && cycle_marks.names(field) {
                 // One event per MARK, each with the mask of the C call site that
                 // made it (`CyclePostMask`) — a field marked twice (aCalcout's
                 // AMASK `afterCalc` post AND its NEWM `monitor()` post) is posted

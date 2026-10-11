@@ -934,7 +934,7 @@ pub enum CyclePostMask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleMarks {
     table: &'static [(&'static str, CyclePostMask)],
-    bits: u64,
+    bits: u128,
 }
 
 impl CycleMarks {
@@ -944,9 +944,9 @@ impl CycleMarks {
     };
 
     /// Bit `i` of `bits` marks `table[i]`.
-    pub fn of(table: &'static [(&'static str, CyclePostMask)], bits: u64) -> Self {
+    pub fn of(table: &'static [(&'static str, CyclePostMask)], bits: u128) -> Self {
         debug_assert!(
-            table.len() >= u64::BITS as usize || bits >> table.len() == 0,
+            table.len() >= u128::BITS as usize || bits >> table.len() == 0,
             "a mark past the end of its post table"
         );
         Self { table, bits }
@@ -954,6 +954,13 @@ impl CycleMarks {
 
     pub fn is_empty(self) -> bool {
         self.bits == 0
+    }
+
+    /// Whether a mark names `field`. Out of line, so a per-field walk keeps
+    /// the take in memory rather than holding its 128 bits in registers.
+    #[inline(never)]
+    pub fn names(&self, field: &str) -> bool {
+        { *self }.any(|(name, _)| name == field)
     }
 
     /// The marks ahead of the first marked `Reset*` entry, and the rest.
@@ -1000,7 +1007,7 @@ pub const fn uniform_post_table<const N: usize>(
     names: &[&'static str],
     mask: CyclePostMask,
 ) -> [(&'static str, CyclePostMask); N] {
-    assert!(names.len() == N && N <= u64::BITS as usize);
+    assert!(names.len() == N && N <= u128::BITS as usize);
     let mut table = [("", mask); N];
     let mut i = 0;
     while i < N {

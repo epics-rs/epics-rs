@@ -1697,7 +1697,7 @@ impl Record for CalcoutRecord {
             table[CLCV_POST + 1].0 = "OCLV";
             table
         };
-        CycleMarks::of(&PUT_POSTS, std::mem::take(&mut self.put_posts))
+        CycleMarks::of(&PUT_POSTS, u128::from(std::mem::take(&mut self.put_posts)))
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.

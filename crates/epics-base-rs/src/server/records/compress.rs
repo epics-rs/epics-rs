@@ -637,7 +637,10 @@ impl Record for CompressRecord {
     }
 
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
-        crate::server::record::CycleMarks::of(&RESET_POSTS, std::mem::take(&mut self.reset_posts))
+        crate::server::record::CycleMarks::of(
+            &RESET_POSTS,
+            u128::from(std::mem::take(&mut self.reset_posts)),
+        )
     }
 
     /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`

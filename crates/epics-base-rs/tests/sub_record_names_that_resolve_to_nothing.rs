@@ -56,8 +56,11 @@ impl Captured {
     }
 
     /// Restore BEFORE anything can panic on an assertion, or the failure
-    /// report has nowhere to go.
+    /// report has nowhere to go. `SNAM is empty` is an `epicsPrintf` that
+    /// `build` (no `iocBuild`, so not ok-to-block) leaves to the errlog
+    /// worker; drain it while fd 2 still points here.
     fn finish(self) -> String {
+        epics_base_rs::runtime::log::errlog_flush();
         assert!(
             unsafe { libc::dup2(self.saved, 2) } >= 0,
             "restore fd 2 failed"

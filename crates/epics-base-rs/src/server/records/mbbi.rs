@@ -390,7 +390,7 @@ impl Record for MbbiRecord {
             [("VAL", crate::server::record::CyclePostMask::ValueLog)];
         crate::server::record::CycleMarks::of(
             &VAL_POST,
-            u64::from(std::mem::take(&mut self.label_post)),
+            u128::from(std::mem::take(&mut self.label_post)),
         )
     }
 

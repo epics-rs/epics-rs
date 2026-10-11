@@ -436,7 +436,7 @@ impl Record for LsiRecord {
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         use crate::server::record::{CycleMarks, CyclePostMask};
         static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
-        CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u64)
+        CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u128)
     }
 
     /// LEN posts from `special()` and from `monitor()`'s `olen` compare, never

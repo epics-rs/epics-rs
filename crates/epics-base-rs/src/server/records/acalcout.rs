@@ -2607,7 +2607,7 @@ impl Record for AcalcoutRecord {
         bits |= u64::from(std::mem::take(&mut self.aval_oav_posts)) << (6 + ARR_NAMES.len());
         // C `special()` (`aCalcoutRecord.c:478`, `:490`), a literal DBE_VALUE.
         bits |= std::mem::take(&mut self.calc_posts) << (12 + ARR_NAMES.len());
-        CycleMarks::of(&POSTS, bits)
+        CycleMarks::of(&POSTS, u128::from(bits))
     }
 
     /// C `afterCalc` (`:294-298`): the arrays the expression stored into, with
@@ -2619,7 +2619,7 @@ impl Record for AcalcoutRecord {
             crate::server::record::uniform_post_table(&ARR_NAMES, CyclePostMask::ValueLog);
         CycleMarks::of(
             &AMASK_POSTS,
-            u64::from(std::mem::take(&mut self.amask_posts)),
+            u128::from(std::mem::take(&mut self.amask_posts)),
         )
     }
 

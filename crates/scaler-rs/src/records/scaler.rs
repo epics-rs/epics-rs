@@ -1405,7 +1405,7 @@ impl Record for ScalerRecord {
 
     fn take_process_posted_fields(&mut self) -> CycleMarks {
         static CNT_POST: [(&str, CyclePostMask); 1] = [("CNT", CyclePostMask::Value)];
-        CycleMarks::of(&CNT_POST, std::mem::take(&mut self.cnt_posted) as u64)
+        CycleMarks::of(&CNT_POST, std::mem::take(&mut self.cnt_posted) as u128)
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that
@@ -1421,7 +1421,7 @@ impl Record for ScalerRecord {
     /// `TP` there, which is CBUG-B18 (see the deviation note at that case).
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         let posts = std::mem::take(&mut self.side_effect_posts);
-        CycleMarks::of(posts, (1u64 << posts.len()) - 1)
+        CycleMarks::of(posts, (1u128 << posts.len()) - 1)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {

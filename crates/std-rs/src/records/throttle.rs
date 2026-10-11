@@ -796,7 +796,7 @@ impl Record for ThrottleRecord {
     }
 
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
-        CycleMarks::of(&POSTS, std::mem::take(&mut self.posts))
+        CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.posts)))
     }
 
     fn take_value_put_tail(&mut self) -> CycleMarks {
@@ -805,12 +805,15 @@ impl Record for ThrottleRecord {
         }
         let moved = self.osent != self.sent;
         self.osent = self.sent;
-        let sts = std::mem::take(&mut self.tail_sts) as u64;
+        let sts = std::mem::take(&mut self.tail_sts) as u128;
         CycleMarks::of(&TAIL, sts | if moved { 1 << 1 } else { 1 << 2 })
     }
 
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        CycleMarks::of(&PROCESS_POSTS, std::mem::take(&mut self.process_posts))
+        CycleMarks::of(
+            &PROCESS_POSTS,
+            u128::from(std::mem::take(&mut self.process_posts)),
+        )
     }
 
     /// C posts VAL, WAIT, SENT, STS and DRVLS from a process cycle, the last

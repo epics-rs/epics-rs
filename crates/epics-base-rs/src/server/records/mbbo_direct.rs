@@ -337,7 +337,7 @@ impl Record for MbboDirectRecord {
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
         static BIT_POSTS: [(&str, CyclePostMask); 32] =
             uniform_post_table(&BIT_NAMES, CyclePostMask::MonitorValueLog);
-        CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u64)
+        CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u128)
     }
 
     /// C `:323` posts a bit on `bitsChanged` or an alarm event, never on a

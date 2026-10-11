@@ -53,7 +53,7 @@ async fn same_phas_records_scan_in_record_type_list_order() {
         saved
     };
     let owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(1500)).await;
     drop(owner);
     // SAFETY: restoring the descriptor this test replaced, before anything
     // can panic.

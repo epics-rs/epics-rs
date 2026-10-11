@@ -126,7 +126,7 @@ record(seq, "SQ") {
             if said.len() >= 2 {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
             said.extend(heard());
         }
         assert_eq!(said, [NOMOD.to_string(), line("A.SUBL")], "{rec}");

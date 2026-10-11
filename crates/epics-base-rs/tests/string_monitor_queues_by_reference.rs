@@ -92,12 +92,12 @@ async fn three_posts_to_a_string_monitor_deliver_one_latest_event() {
          newest value, because C's reference reads the live field at delivery"
     );
     assert!(
-        rx.queue().latest_only(1),
+        rx.queue().latest_only(rx.id()),
         "the subscription must be latched by-reference, not merely coalesced \
          by chance"
     );
     assert_eq!(
-        rx.queue().ncollapse(1),
+        rx.queue().ncollapse(rx.id()),
         2,
         "two of the three posts were absorbed by the early-drop"
     );
@@ -155,7 +155,7 @@ async fn a_numeric_scalar_monitor_still_queues_every_post() {
         "a DBF_DOUBLE field fits union native_value, so C queues each post"
     );
     assert!(
-        !rx.queue().latest_only(1),
+        !rx.queue().latest_only(rx.id()),
         "and the subscription is never latched into keep-only-the-latest"
     );
 }

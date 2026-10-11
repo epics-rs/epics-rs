@@ -115,7 +115,7 @@ async fn mdel_rate_limits_the_val_monitor() {
         process(&db, "HG").await;
     }
 
-    let collapsed = val_rx.queue().ncollapse(1);
+    let collapsed = val_rx.queue().ncollapse(val_rx.id());
     let mut events = Vec::new();
     while let Ok(ev) = val_rx.try_recv() {
         events.push(ev);
@@ -160,7 +160,7 @@ async fn the_default_mdel_of_zero_posts_every_process() {
         process(&db, "HG0").await;
     }
 
-    let collapsed = val_rx.queue().ncollapse(1);
+    let collapsed = val_rx.queue().ncollapse(val_rx.id());
     let mut n = 0u64;
     while val_rx.try_recv().is_ok() {
         n += 1;

@@ -1,123 +1,70 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use super::frame::{FrameBuf, size_dbr_reply};
-use super::outbox::{Credit, MonitorGate, Outbox};
-use super::stats::ServerStats;
+use super::outbox::{Credit, Outbox};
 use crate::protocol::*;
-use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::types::encode_dbr_into;
 
-/// Spawn a task that forwards monitor events from a PV subscription to the client TCP stream.
-/// Returns a handle that can be used to cancel the subscription.
-///
-/// Generic over the writer type so the same task body works for plain
-/// `tokio::net::tcp::OwnedWriteHalf` and the TLS-wrapped
-/// `WriteHalf<TlsStream<TcpStream>>` produced by the server's TLS
-/// dispatch path.
-/// `data_count` is the original EVENT_ADD request count. When
-/// non-zero, every monitor delivery echoes this in the header and
-/// zero-pads short payloads up to `dbr_buffer_size(type, native,
-/// count)` — matches C `read_reply` which keeps the request count
-/// and pads (or uses `snapshot.value.count()` when the request was
-/// autosize=0).
-// `long_string_mode` propagated from `ChannelEntry`; monitor events are
-// converted inside `send_event` per the channel's mode — `$`-suffix
-// channels `EpicsValue::String` → `EpicsValue::CharArray[40]` (C
-// dbChannel.c:486-505), long-string record fields `EpicsValue::CharArray`
-// → scalar `EpicsValue::String` (C cvt_dbaddr).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_monitor_sender(
-    // The producer opens no socket of its own, but every delivery it frames is
-    // written through the connection's outbox, whose writer lives on the
-    // reactor — so the producer belongs there too, and says so here rather
-    // than inheriting whatever executor its caller happened to run on.
-    reactor: &epics_base_rs::runtime::task::Reactor,
-    sub_id: u32,
-    data_type: u16,
-    data_count: u32,
-    // The single per-connection wire outbox. This monitor producer pushes
-    // framed EVENT_ADD deliveries into it instead of reaching into a shared
-    // socket writer out-of-band — the connection loop is the sole writer
-    // owner. See `super::outbox`.
-    outbox: Outbox,
-    mut reader: EventReader,
-    denied: Arc<AtomicBool>,
-    // Revoked by the teardown that queues this subscription's cancel
-    // confirmation, so a delivery still in flight is dropped rather than
-    // written after it — see `MonitorGate`.
-    gate: MonitorGate,
-    stage: super::DeliveryStage,
-    stats: Option<Arc<ServerStats>>,
-    // The EVENT_ADD request header (C `pevext->msg`) plus the client's
-    // negotiated minor version. Every delivery on this subscription is framed
-    // for THIS client: a pre-CA_V49 peer gets `ECA_16KARRAYCLIENT` rather than
-    // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
-    reply: super::tcp::ReplyContext,
-) -> epics_base_rs::runtime::task::TaskHandle<()> {
-    reactor.spawn(async move {
-        loop {
-            // C `event_read`: take this monitor's next queued entry, suspending
-            // under EVENTS_OFF exactly where C does (`flowCtrlMode &&
-            // nDuplicates == 0`). The queue is the single owner of both that
-            // gate and the coalescing rule — a post arriving while the ring is
-            // short of room replaced this monitor's LAST entry in place, so the
-            // earlier distinct entries are still here and go out as their own
-            // frames, and no side slot can reorder delivery.
-            let Some(event) = reader.recv().await else {
-                break;
-            };
-            // One subscription update committed for delivery this cycle
-            // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
-            // see `ServerStats::subscription_events_posted`. Counted
-            // before the read-access gate so a suppressed delivery shows
-            // as posted-but-not-processed, exactly as the gateway's
-            // `serverPostRate` > `serverEventRate` divergence expects.
-            if let Some(ref s) = stats {
-                s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
-            }
-            // C `casAccessRightsCB` (`rsrv/camessage.c:1085-1093`)
-            // suppresses event deliveries with `db_event_disable`
-            // while read access is denied (without tearing the
-            // subscription down). Producer keeps running so a
-            // later re-enable resumes the same camonitor; we just
-            // drop the event silently.
-            if denied.load(Ordering::Acquire) {
-                continue;
-            }
-            // Back-pressure, taken once this event is known to become a frame:
-            // after `recv`, so a producer waiting for work holds nothing, and
-            // after the access gate, so a suppressed delivery spends none
-            // (`super::outbox` invariant). With the outbox full this parks the
-            // producer, and every later post then coalesces in the ring above
-            // instead of queueing — which is what stops a client that has
-            // stopped reading from growing the server without limit.
-            let credit = outbox.reserve().await;
-            // C `db_cancel_event` nulls `user_sub` under LOCKEVQUE before
-            // `event_cancel_reply` writes the delete-confirmed echo, so this
-            // frame either precedes the echo or never exists. `deliver` is
-            // that decision: the enqueue happens inside it, and the teardown
-            // revokes before it queues the echo. `None` = cancelled while this
-            // delivery was between its ring and the outbox.
-            match gate.deliver(|| {
-                send_event(
-                    data_type, data_count, sub_id, &event, &outbox, credit, &stage, reply,
-                )
-            }) {
-                Some(Ok(())) => {}
-                Some(Err(_)) => break,
-                None => break,
-            }
-            // Successfully written to the client — PCAS
-            // `subscriptionEventsProcessed` parity (gateway
-            // `serverEventRate`).
-            if let Some(ref s) = stats {
-                s.subscription_events_processed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    })
+/// Deliver one queued entry of a `SimplePv` monitor — the `user_sub` C's
+/// `event_read` calls for it.
+pub(crate) async fn deliver_monitor_event(
+    m: &super::tcp::CircuitMonitor,
+    event: MonitorEvent,
+    // The single per-connection wire outbox — the connection loop is the sole
+    // writer owner. See `super::outbox`.
+    outbox: &Outbox,
+) {
+    // One subscription update committed for delivery this cycle
+    // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
+    // see `ServerStats::subscription_events_posted`. Counted
+    // before the read-access gate so a suppressed delivery shows
+    // as posted-but-not-processed, exactly as the gateway's
+    // `serverPostRate` > `serverEventRate` divergence expects.
+    if let Some(ref s) = m.stats {
+        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+    }
+    if m.denied.load(Ordering::Acquire) {
+        m.gate
+            .deliver(|| super::tcp::send_denied_event(m, &event, outbox));
+        return;
+    }
+    // Back-pressure, taken once this event is known to become a frame:
+    // after the access gate, so a suppressed delivery spends none
+    // (`super::outbox` invariant). With the outbox full this parks the
+    // circuit's event task, and every later post then coalesces in the ring
+    // instead of queueing — which is what stops a client that has stopped
+    // reading from growing the server without limit. C's `event_task`
+    // blocks in the socket send the same way.
+    let credit = outbox.reserve().await;
+    // C `db_cancel_event` nulls `user_sub` under LOCKEVQUE before
+    // `event_cancel_reply` writes the delete-confirmed echo, so this
+    // frame either precedes the echo or never exists. `deliver` is
+    // that decision: the enqueue happens inside it, and the teardown
+    // revokes before it queues the echo. `None` = cancelled while this
+    // delivery was between its ring and the outbox.
+    let delivered = m.gate.deliver(|| {
+        send_event(
+            m.data_type,
+            m.data_count,
+            m.sub_id,
+            &event,
+            outbox,
+            credit,
+            &m.stage,
+            m.reply,
+        )
+    });
+    if delivered.is_none() {
+        return;
+    }
+    // Successfully written to the client — PCAS
+    // `subscriptionEventsProcessed` parity (gateway
+    // `serverEventRate`).
+    if let Some(ref s) = m.stats {
+        s.subscription_events_processed
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -132,7 +79,7 @@ pub(crate) fn send_event(
     credit: Credit,
     stage: &super::DeliveryStage,
     reply: super::tcp::ReplyContext,
-) -> std::io::Result<()> {
+) {
     let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // The channel's post chain and long-string boundary conversion
     // (`$` → CHAR[40]+NUL, or a long-string record field → scalar
@@ -146,7 +93,7 @@ pub(crate) fn send_event(
                 prepared = event;
                 &prepared.snapshot
             }
-            None => return Ok(()),
+            None => return,
         }
     };
     // One buffer with the header space reserved at the front, and the payload
@@ -154,31 +101,9 @@ pub(crate) fn send_event(
     // client's send buffer and `dbGet` converting into that space
     // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
-    if let Err(e) = encode_dbr_into(frame.dst(), data_type, snapshot) {
-        // C `read_reply` (`camessage.c:540-557`): a refused conversion is a
-        // zeroed ECA_GETFAIL update, and the subscription stays.
-        let getfail = matches!(e, epics_base_rs::error::CaError::GetConvertFailed(_))
-            .then(|| {
-                super::tcp::status_event_frame(
-                    CA_PROTO_EVENT_ADD,
-                    data_type,
-                    data_count,
-                    sub_id,
-                    ECA_GETFAIL,
-                    reply.client_minor,
-                )
-            })
-            .flatten();
-        return match getfail {
-            Some(getfail) => {
-                outbox.push_with(getfail, credit);
-                Ok(())
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "encode",
-            )),
-        };
+    if encode_dbr_into(frame.dst(), data_type, snapshot).is_err() {
+        super::tcp::send_get_fail_event(outbox, data_type, data_count, sub_id, reply);
+        return;
     }
     // Size the payload and pick the header count — `size_dbr_reply` owns the
     // rule (autosize, request-count pad/truncate, and the DBR_CLASS_NAME
@@ -203,15 +128,14 @@ pub(crate) fn send_event(
         .is_err()
     {
         let _ = super::tcp::send_16k_array_client_err(outbox, req_hdr, req_hdr.cid, client_minor);
-        return Ok(());
+        return;
     }
     hdr.data_type = data_type;
     hdr.cid = 1; // ECA_NORMAL status
     hdr.available = sub_id;
 
-    // Abort-safety: this runs inside a monitor task that `handle_client`
-    // may `task.abort()` (EVENT_CANCEL / CLEAR_CHANNEL / disconnect
-    // cleanup). `seal` yields the whole CA_PROTO_EVENT_ADD frame as ONE
+    // Abort-safety: this runs inside the circuit's event task, which
+    // `handle_client` aborts at disconnect cleanup. `seal` yields the whole CA_PROTO_EVENT_ADD frame as ONE
     // contiguous buffer, handed to the outbox with a single synchronous
     // `push_with`. Because that is a synchronous channel send with no await
     // between building the frame and enqueuing it, an abort can only land
@@ -222,7 +146,6 @@ pub(crate) fn send_event(
     // structurally.) The caller's `reserve().await` is likewise outside
     // this function, so an abort there strands neither a frame nor credit.
     outbox.push_with(frame.seal(&hdr), credit);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -283,8 +206,7 @@ mod tests {
                 req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
-        )
-        .expect("send_event must succeed");
+        );
 
         let batches = drain_frames(&mut drain);
 
@@ -327,7 +249,7 @@ mod tests {
     /// Server-wide subscription-event counters (PCAS
     /// `subscriptionEventsPosted` / `subscriptionEventsProcessed`,
     /// feeding the CA gateway's `serverPostRate` / `serverEventRate`).
-    /// The monitor task is the single owner that advances them, so the
+    /// The circuit's event task is the single owner that advances them, so the
     /// invariant boundaries are tested here against the real delivery
     /// loop rather than through a full TCP round-trip.
     mod subscription_event_counters {
@@ -335,6 +257,8 @@ mod tests {
         use crate::server::stats::ServerStats;
         use epics_base_rs::server::pv::ProcessVariable;
         use epics_base_rs::types::{DBR_DOUBLE, DbFieldType, EpicsValue};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
         use crate::server::outbox::{Outbox, OutboxDrain};
@@ -342,7 +266,7 @@ mod tests {
         const DBE_VALUE: u16 = 1;
 
         /// A live outbox whose drain the caller keeps bound for the test's
-        /// duration, so the spawned monitor task's `push`es are accepted
+        /// duration, so the circuit event task's `push`es are accepted
         /// (an already-dropped drain would silently discard them — still
         /// correct for the counter assertions, but keeping the drain alive
         /// models a live connection).
@@ -350,8 +274,48 @@ mod tests {
             crate::server::outbox::channel()
         }
 
+        /// One `SimplePv` monitor on its own circuit, delivered by the
+        /// circuit's event task. The reader is the dispatch side's handle:
+        /// dropping it cancels the monitor.
+        fn start_circuit(
+            pv: &Arc<ProcessVariable>,
+            denied: bool,
+            stats: &Arc<ServerStats>,
+            outbox: Outbox,
+        ) -> (
+            epics_base_rs::runtime::task::TaskHandle<()>,
+            epics_base_rs::server::event_queue::EventReader,
+        ) {
+            let user = Arc::new(epics_base_rs::server::event_queue::EventUser::new());
+            let context: epics_base_rs::server::event_queue::DeliveryContext =
+                Arc::new(crate::server::tcp::CircuitMonitor {
+                    target: crate::server::tcp::ChannelTarget::SimplePv(pv.clone()),
+                    sub_id: 1,
+                    data_type: DBR_DOUBLE,
+                    data_count: 0,
+                    denied: Arc::new(AtomicBool::new(denied)),
+                    gate: crate::server::outbox::MonitorGate::open(),
+                    stage: crate::server::DeliveryStage::plain(),
+                    reply: crate::server::tcp::ReplyContext {
+                        req_hdr: crate::protocol::CaHeader::new(
+                            crate::protocol::CA_PROTO_EVENT_ADD,
+                        ),
+                        client_minor: crate::protocol::CA_MINOR_VERSION,
+                    },
+                    stats: Some(stats.clone()),
+                    ended: AtomicBool::new(false),
+                });
+            let reader = pv
+                .add_subscriber_on(&user, 1, DbFieldType::Double, DBE_VALUE, &context)
+                .expect("subscriber added");
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor");
+            let task = reactor.spawn(crate::server::tcp::run_circuit_monitors(user, outbox));
+            (task, reader)
+        }
+
         /// Poll `counter` until it reaches `want`, driving the
-        /// single-threaded test runtime so the spawned monitor task can
+        /// single-threaded test runtime so the circuit event task can
         /// run. Fails the test if it does not arrive within the timeout.
         async fn wait_for(counter: &std::sync::atomic::AtomicU64, want: u64) {
             epics_base_rs::runtime::task::timeout(Duration::from_secs(5), async {
@@ -376,29 +340,9 @@ mod tests {
         #[epics_macros_rs::epics_test]
         async fn successful_delivery_advances_posted_and_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
-            let reader = pv
-                .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
-            let reactor = epics_base_rs::runtime::task::Reactor::current()
-                .expect("the test driver enters an executor");
-            let task = spawn_monitor_sender(
-                &reactor,
-                1,
-                DBR_DOUBLE,
-                0,
-                outbox,
-                reader,
-                Arc::new(AtomicBool::new(false)),
-                crate::server::outbox::MonitorGate::open(),
-                crate::server::DeliveryStage::plain(),
-                Some(stats.clone()),
-                crate::server::tcp::ReplyContext {
-                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
-                    client_minor: crate::protocol::CA_MINOR_VERSION,
-                },
-            );
+            let (task, _reader) = start_circuit(&pv, false, &stats, outbox);
 
             for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
                 pv.set(EpicsValue::Double(v));
@@ -426,29 +370,9 @@ mod tests {
         #[epics_macros_rs::epics_test]
         async fn denied_delivery_counts_posted_not_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
-            let reader = pv
-                .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
-            let reactor = epics_base_rs::runtime::task::Reactor::current()
-                .expect("the test driver enters an executor");
-            let task = spawn_monitor_sender(
-                &reactor,
-                1,
-                DBR_DOUBLE,
-                0,
-                outbox,
-                reader,
-                Arc::new(AtomicBool::new(true)), // read access denied
-                crate::server::outbox::MonitorGate::open(),
-                crate::server::DeliveryStage::plain(),
-                Some(stats.clone()),
-                crate::server::tcp::ReplyContext {
-                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
-                    client_minor: crate::protocol::CA_MINOR_VERSION,
-                },
-            );
+            let (task, _reader) = start_circuit(&pv, true, &stats, outbox); // read access denied
 
             pv.set(EpicsValue::Double(1.0));
             wait_for(&stats.subscription_events_posted, 1).await;

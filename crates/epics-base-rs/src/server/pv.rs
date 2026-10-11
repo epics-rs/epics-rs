@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::runtime::sync::PriorityInheritanceMutex;
 
 use crate::error::CaError;
-use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome, TryRecvError};
+use crate::server::event_queue::{
+    AttachId, DeliveryContext, EventReader, EventSink, EventUser, PostBurst, PostOutcome,
+    TryRecvError, no_context,
+};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
 
@@ -303,10 +306,10 @@ impl Subscriber {
     /// that lives outside the queue — the counter for a value that a later post
     /// displaced before the consumer ever saw it (C `nreplace`, plus the
     /// latest-only collapse that C leaves uncounted; both mean one value the
-    /// consumer will never see).
-    pub(crate) fn post(&self, event: MonitorEvent) {
+    /// consumer will never see). The readers wake when `burst` drops.
+    pub(crate) fn post(&self, burst: &mut PostBurst, event: MonitorEvent) {
         if matches!(
-            self.sink.post(event),
+            self.sink.post_in(burst, event),
             PostOutcome::Replaced | PostOutcome::Collapsed
         ) {
             DROPPED_MONITOR_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -316,6 +319,35 @@ impl Subscriber {
     /// The consumer for this monitor is gone; the producer row can be reaped.
     pub(crate) fn is_closed(&self) -> bool {
         self.sink.is_closed()
+    }
+
+    /// This subscriber's slot, the key it is found by. Never `sid`: a client
+    /// chooses that, and two circuits monitoring one PV can both choose it.
+    pub fn id(&self) -> AttachId {
+        self.sink.id()
+    }
+
+    /// C `db_post_single_event`: queue `snapshot` for this monitor alone,
+    /// under its `select` (`db_create_event_log`) and through its pre-chain.
+    /// `active` does not gate it; C posts before `db_event_enable` and
+    /// before `db_event_disable`.
+    pub(crate) fn post_single(&self, snapshot: Arc<Snapshot>) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        let event = MonitorEvent {
+            snapshot,
+            origin: 0,
+            mask: crate::server::recgbl::EventMask::from_bits(self.mask),
+        };
+        let filtered = if self.filters.is_empty() {
+            Some(event)
+        } else {
+            self.filters
+                .apply(FilteredMonitorEvent::new(event))
+                .map(|fe| fe.event)
+        };
+        if let Some(event) = filtered {
+            self.post(&mut PostBurst::new(), event);
+        }
     }
 }
 
@@ -740,6 +772,7 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock();
         // Remove subscribers whose consumer has been dropped.
         subs.retain(|sub| !sub.is_closed());
+        let mut burst = PostBurst::new();
         for sub in subs.iter() {
             // Paused subscribers (`db_event_disable`) receive nothing —
             // skip before any work so a disabled monitor stops the event
@@ -773,7 +806,7 @@ impl ProcessVariable {
             // C `db_queue_event_log`: the queue appends, or replaces this
             // monitor's last entry in place when it is in flow control or
             // nearly full. Earlier distinct entries are never discarded.
-            sub.post(event);
+            sub.post(&mut burst, event);
         }
     }
 
@@ -861,7 +894,7 @@ impl ProcessVariable {
         data_type: DbFieldType,
         mask: u16,
     ) -> Option<EventReader> {
-        self.add_subscriber_on(&EventUser::new(), sid, data_type, mask)
+        self.add_subscriber_on(&EventUser::new(), sid, data_type, mask, no_context())
     }
 
     /// Add a subscriber whose events are queued on `user`'s event queue —
@@ -880,6 +913,7 @@ impl ProcessVariable {
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
+        context: &DeliveryContext,
     ) -> Option<EventReader> {
         let cap = max_subscribers_per_pv();
         let mut subs = self.subscribers.lock();
@@ -910,7 +944,7 @@ impl ProcessVariable {
             );
             return None;
         }
-        let (sink, reader) = crate::server::event_queue::attach(user, sid);
+        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
         subs.push(Subscriber {
             sid,
             data_type,
@@ -923,7 +957,7 @@ impl ProcessVariable {
     }
 
     /// attach a channel-filter chain to an already-added
-    /// subscriber (looked up by `sid`). The CA server first
+    /// subscriber (looked up by its reader's slot `id`). The CA server first
     /// `add_subscriber`s, then attaches the chain parsed from the
     /// channel's `.{...}` suffix — symmetric with the record-field
     /// `RecordInstance::attach_filter_to_last_subscriber` path, so a
@@ -937,26 +971,45 @@ impl ProcessVariable {
     /// The caller passes a FRESH chain per subscriber so stateful
     /// filters (`dbnd` last-value, `dec` counter, `sync` state) stay
     /// isolated across subscribers. An empty chain is a no-op (keeps the
-    /// default). No-op when no subscriber matches `sid` (e.g. it was
+    /// default). No-op when no subscriber holds `id` (e.g. it was
     /// reaped between add and attach).
     pub fn attach_filters_to_subscriber(
         &self,
-        sid: u32,
+        id: AttachId,
         filters: crate::server::database::filters::FilterChain,
     ) {
         if filters.is_empty() {
             return;
         }
         let mut subs = self.subscribers.lock();
-        if let Some(sub) = subs.iter_mut().find(|s| s.sid == sid) {
+        if let Some(sub) = subs.iter_mut().find(|s| s.id() == id) {
             sub.filters = filters;
         }
     }
 
-    /// Remove a subscriber by subscription ID.
-    pub fn remove_subscriber(&self, sid: u32) {
+    /// C `db_post_single_event` for the subscriber holding slot `id`.
+    pub fn post_single_event(&self, id: AttachId, snapshot: Arc<Snapshot>) {
+        let subs = self.subscribers.lock();
+        if let Some(sub) = subs.iter().find(|s| s.id() == id) {
+            sub.post_single(snapshot);
+        }
+    }
+
+    /// C `db_event_enable` (`true`) / `db_event_disable` (`false`) for the
+    /// subscriber holding slot `id`; see
+    /// [`RecordInstance::set_subscriber_active`](crate::server::record::record_instance::RecordInstance::set_subscriber_active).
+    pub fn set_subscriber_active(&self, id: AttachId, active: bool) {
         let mut subs = self.subscribers.lock();
-        subs.retain(|s| s.sid != sid);
+        if let Some(sub) = subs.iter_mut().find(|s| s.id() == id) {
+            sub.active = active;
+        }
+    }
+
+    /// Remove the subscriber holding slot `id` (its reader's
+    /// [`EventReader::id`]).
+    pub fn remove_subscriber(&self, id: AttachId) {
+        let mut subs = self.subscribers.lock();
+        subs.retain(|s| s.id() != id);
     }
 
     /// Destroy this PV: drop every monitor and refuse every future one.
@@ -1047,7 +1100,6 @@ fn next_pv_sub_sid() -> u32 {
 pub struct PvSubscription {
     reader: EventReader,
     pv: Arc<ProcessVariable>,
-    sid: u32,
 }
 
 impl PvSubscription {
@@ -1068,7 +1120,7 @@ impl PvSubscription {
         // the full `Snapshot` and gates only on mask/filters, never on the
         // stored type — `DbSubscription` likewise registers as `Double`.
         let reader = pv.add_subscriber(sid, DbFieldType::Double, mask)?;
-        Some(Self { reader, pv, sid })
+        Some(Self { reader, pv })
     }
 
     /// Await the next value change as a full `Snapshot`. A consumer that falls
@@ -1129,7 +1181,7 @@ impl Drop for PvSubscription {
     /// row for the life of the IOC and every later `notify_subscribers`
     /// paid to build an event for a reader that was gone.
     fn drop(&mut self) {
-        self.pv.remove_subscriber(self.sid);
+        self.pv.remove_subscriber(self.reader.id());
     }
 }
 
@@ -1266,7 +1318,7 @@ mod mask_gate_tests {
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
             .expect("subscriber added");
-        pv.attach_filters_to_subscriber(1, parse_filter_chain(r#"{"dbnd":{"d":10}}"#));
+        pv.attach_filters_to_subscriber(rx.id(), parse_filter_chain(r#"{"dbnd":{"d":10}}"#));
 
         // First event: `dbnd`'s baseline is NaN, so C's `delta > deadband`
         // is INF > 10 and it always passes.

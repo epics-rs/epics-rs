@@ -158,9 +158,9 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
-    SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
-    dispatch_message, is_peer_disconnect, print_forcing_disconnect, print_log_header,
-    register_subscription, run_event_task, send_ca_error, serve_write_head,
+    RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
+    cancel_subscription_reply, dispatch_message, is_peer_disconnect, print_forcing_disconnect,
+    print_log_header, register_subscription, run_event_task, send_ca_error, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1121,9 +1121,12 @@ fn drain_outbox_locked(
 /// id (echoed in the cancel ACK, and the key the event thread drops on cancel),
 /// the framed type/count for the cancel ACK, and the target so the producer
 /// subscriber can be removed from its record/PV.
-struct BlockingSub {
+pub(crate) struct BlockingSub {
     channel_sid: u32,
-    sub_id: u32,
+    /// The subscription's slot, which its producer row and its event-thread
+    /// delivery are found by; the client's sub_id, this map's key, may be
+    /// reused.
+    id: epics_base_rs::server::event_queue::AttachId,
     data_type: u16,
     data_count: u32,
     target: ChannelTarget,
@@ -1132,6 +1135,44 @@ struct BlockingSub {
     /// dispatch thread queues a cancel confirmation. See
     /// [`MonitorGate`](crate::server::outbox::MonitorGate).
     gate: crate::server::outbox::MonitorGate,
+}
+
+/// C `event_add_action` past its checks (`camessage.c:1863-1866`): the one
+/// path from a handed-off EVENT_ADD to delivery. The link onto the channel is
+/// what CLEAR_CHANNEL and `casAccessRightsCB` find the monitor by; the event
+/// thread then owns the reader and its teardown, and a reader sent after that
+/// thread is gone is dropped, the client being on its way out.
+pub(crate) fn hand_off_subscription(
+    state: &mut ClientState,
+    blk_subs: &mut HashMap<u32, BlockingSub>,
+    ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
+    r: RegisteredSubscription,
+) {
+    blk_subs.insert(
+        r.sub_id,
+        BlockingSub {
+            channel_sid: r.channel_sid,
+            id: r.reader.id(),
+            data_type: r.data_type,
+            data_count: r.data_count,
+            target: r.target.clone(),
+            gate: r.gate.clone(),
+        },
+    );
+    state.link_subscription(
+        r.channel_sid,
+        r.sub_id,
+        crate::server::tcp::ChannelMonitor {
+            gate: r.gate,
+            denied: r.denied,
+            id: r.reader.id(),
+        },
+    );
+    let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
+        reader: r.reader,
+        target: r.target,
+        cid: r.cid,
+    })));
 }
 
 /// Serve one CA client over a blocking `TcpStream`. C `camsgtask`
@@ -1284,6 +1325,7 @@ fn handle_client_blocking(
     // accept loop's one `acquire`, which refuses *before* any of this runs.
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EventTaskControl>();
     let event_send_lock = send_lock.clone();
+    let event_user = state.event_user();
     let event_job = event_worker.run(move || {
         // C `event_task` registers itself (`dbEvent.c:1027`) and removes on the
         // way out (`:1093`). Unbounded: it parks on this client's monitor
@@ -1294,7 +1336,7 @@ fn handle_client_blocking(
             None,
         );
         let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
-        if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
+        if block_on_sync(run_event_task(event_user, ev_rx, &mut write)).is_err() {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -1445,8 +1487,8 @@ fn handle_client_blocking(
                 if hdr.cmmd == CA_PROTO_EVENT_ADD {
                     // Register the subscription with the SHARED parity logic in
                     // `HandOff` mode: it validates caps/dedup/type/mask/count/ACF,
-                    // delivers the initial value into `outbox`, and hands back the
-                    // live reader WITHOUT spawning (this thread has no runtime). The
+                    // queues the initial value on the circuit's ring, and hands back
+                    // the live reader WITHOUT spawning (this thread has no runtime). The
                     // per-channel cap and duplicate-sub-id check consult the blocking
                     // driver's own map (`blk_subs`), not the async `subscriptions`.
                     let sid = hdr.cid;
@@ -1463,54 +1505,11 @@ fn handle_client_blocking(
                     ));
                     match outcome {
                         Ok(Ok(SubscriptionOutcome::HandedOff(r))) => {
-                            // Flush the initial snapshot (already queued in `outbox`)
-                            // to the socket NOW, before the event thread can deliver
-                            // any later `db_post_events` update — preserving the
-                            // initial-before-update order (C funnels both through the
-                            // one `event_task` queue; here two threads share the
-                            // socket, so we serialize by writing the initial first).
-                            match drain_outbox_locked(&send_lock, &mut drain) {
-                                Ok(()) => {}
-                                Err(ref e) if is_peer_disconnect(e.kind()) => break,
-                                Err(e) => return Err(CaError::Io(e)),
-                            }
-                            blk_subs.insert(
-                                r.sub_id,
-                                BlockingSub {
-                                    channel_sid: r.channel_sid,
-                                    sub_id: r.sub_id,
-                                    data_type: r.data_type,
-                                    data_count: r.data_count,
-                                    target: r.target.clone(),
-                                    gate: r.gate.clone(),
-                                },
-                            );
-                            // C `event_add_action` links the new `event_ext` onto
-                            // `pciu->eventq`; that link is what lets CLEAR_CHANNEL
-                            // cancel this monitor.
-                            state.link_subscription(r.channel_sid, r.sub_id, r.gate.clone());
-                            // Hand the live reader to the event thread; it frames
-                            // every later update with the same `send_event` builder
-                            // the async producer uses (byte-identical). If the event
-                            // thread is already gone, the client is ending — drop it.
-                            let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
-                                reader: r.reader,
-                                target: r.target,
-                                cid: r.cid,
-                                sub_id: r.sub_id,
-                                data_type: r.data_type,
-                                data_count: r.data_count,
-                                denied: r.denied,
-                                gate: r.gate,
-                                stage: r.stage,
-                                req_hdr: hdr,
-                                client_minor: r.client_minor,
-                                stats: r.stats,
-                            })));
+                            hand_off_subscription(&mut state, &mut blk_subs, &ev_tx, r);
                         }
                         // A refusal frame is already queued; keep serving.
                         Ok(Ok(SubscriptionOutcome::Refused)) => {}
-                        Ok(Ok(SubscriptionOutcome::Spawned(_))) => {
+                        Ok(Ok(SubscriptionOutcome::Circuit(_))) => {
                             unreachable!("HandOff mode never spawns a task")
                         }
                         Ok(Err(e)) => {
@@ -1542,13 +1541,13 @@ fn handle_client_blocking(
                             if let Some(sub) = blk_subs.remove(&sub_id) {
                                 // Stop the producer: drop the reader on the event
                                 // thread, then remove the subscriber from record/PV.
-                                let _ = ev_tx.send(EventTaskControl::Cancel(sub.sub_id));
+                                let _ = ev_tx.send(EventTaskControl::Cancel(sub.id));
                                 match &sub.target {
                                     ChannelTarget::SimplePv(pv) => {
-                                        pv.remove_subscriber(sub.sub_id);
+                                        pv.remove_subscriber(sub.id);
                                     }
                                     ChannelTarget::RecordField { record, .. } => {
-                                        record.write().remove_subscriber(sub.sub_id);
+                                        record.write().remove_subscriber(sub.id);
                                     }
                                 }
                             }
@@ -1634,13 +1633,13 @@ fn handle_client_blocking(
                             // holds on this driver too.
                             for sub_id in state.take_retired_subscriptions() {
                                 if let Some(sub) = blk_subs.remove(&sub_id) {
-                                    let _ = ev_tx.send(EventTaskControl::Cancel(sub.sub_id));
+                                    let _ = ev_tx.send(EventTaskControl::Cancel(sub.id));
                                     match &sub.target {
                                         ChannelTarget::SimplePv(pv) => {
-                                            pv.remove_subscriber(sub.sub_id);
+                                            pv.remove_subscriber(sub.id);
                                         }
                                         ChannelTarget::RecordField { record, .. } => {
-                                            record.write().remove_subscriber(sub.sub_id);
+                                            record.write().remove_subscriber(sub.id);
                                         }
                                     }
                                 }
@@ -1698,10 +1697,10 @@ fn handle_client_blocking(
     for (_, sub) in blk_subs.drain() {
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
-                pv.remove_subscriber(sub.sub_id);
+                pv.remove_subscriber(sub.id);
             }
             ChannelTarget::RecordField { record, .. } => {
-                record.write().remove_subscriber(sub.sub_id);
+                record.write().remove_subscriber(sub.id);
             }
         }
     }
@@ -4291,8 +4290,8 @@ mod tests {
     }
 
     /// The initial + first-update monitor frames the SHARED path produces for a
-    /// DBR_DOUBLE subscription: `register_subscription` (the initial snapshot)
-    /// and `send_event` (the update), driven entirely in-process. Both the
+    /// DBR_DOUBLE subscription: `register_subscription` queues both, and
+    /// `send_event` frames each, driven entirely in-process. Both the
     /// async server and this blocking driver run these exact functions, so
     /// these are the async server's monitor bytes — the byte-parity reference.
     /// Uses its OWN db so the update posted here does not perturb the server
@@ -4326,7 +4325,7 @@ mod tests {
         run(&mut state, create_chan_frame(0x1234, "REF:MON")); // -> sid 1
 
         // EVENT_ADD via the shared register in HandOff mode: the initial value
-        // lands in `outbox`, and we hold the live reader for the update.
+        // is queued on the monitor's ring like the update after it.
         let add = event_add_double_frame(1, sub_id);
         let (hdr, hdr_size) =
             CaHeader::from_bytes_for_peer(&add, state.client_minor_version()).unwrap();
@@ -4346,35 +4345,35 @@ mod tests {
             SubscriptionOutcome::HandedOff(r) => r,
             _ => panic!("HandOff must hand off the reader"),
         };
-        let initial = drain_one_event_add(&mut drain);
-
-        // Post the update, then frame it with the SAME `send_event` the event
-        // thread uses.
+        let mut reader = r.reader;
+        // Frame each entry with the SAME `send_event` the event thread uses.
+        let mut next_frame = |reader: &mut epics_base_rs::server::event_queue::EventReader| {
+            let event = block_on_sync(reader.recv())
+                .expect("blockable")
+                .expect("a queued entry");
+            crate::server::monitor::send_event(
+                r.data_type,
+                r.data_count,
+                r.sub_id,
+                &event,
+                &outbox,
+                crate::server::outbox::Credit::none(),
+                &crate::server::DeliveryStage::plain(),
+                crate::server::tcp::ReplyContext {
+                    req_hdr: hdr,
+                    client_minor: state.client_minor_version(),
+                },
+            );
+            drain_one_event_add(&mut drain)
+        };
+        let initial = next_frame(&mut reader);
         match &r.target {
             ChannelTarget::SimplePv(pv) => {
                 pv.set(EpicsValue::Double(update));
             }
             _ => panic!("REF:MON must be a simple PV"),
         }
-        let mut reader = r.reader;
-        let event = block_on_sync(reader.recv())
-            .expect("blockable")
-            .expect("an update event");
-        crate::server::monitor::send_event(
-            r.data_type,
-            r.data_count,
-            r.sub_id,
-            &event,
-            &outbox,
-            crate::server::outbox::Credit::none(),
-            &r.stage,
-            crate::server::tcp::ReplyContext {
-                req_hdr: hdr,
-                client_minor: r.client_minor,
-            },
-        )
-        .expect("encode update");
-        let update_frame = drain_one_event_add(&mut drain);
+        let update_frame = next_frame(&mut reader);
         (initial, update_frame)
     }
 
@@ -4421,6 +4420,51 @@ mod tests {
             update, ref_update,
             "update monitor frame must match the shared path bytes"
         );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A monitor whose get fails keeps its subscription. softIoc on
+    /// `stringin GF "abc"`, a raw DBR_DOUBLE count-0 EVENT_ADD, then
+    /// `dbpf GF.VAL def` and `dbpf GF.VAL 1.5`, sends exactly:
+    ///
+    /// ```text
+    /// cmd=1 size=0 type=6 count=0 cid/status=152
+    /// cmd=1 size=0 type=6 count=0 cid/status=152
+    /// cmd=1 size=8 type=6 count=1 cid/status=1 payload=3ff8000000000000
+    /// ```
+    #[test]
+    fn a_failed_get_keeps_the_monitor_camessage_c_545() {
+        let db = seed_db(&[("BLK:GF", EpicsValue::String("abc".into()))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:GF")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        let mut add = event_add_double_frame(sid, 7);
+        add[6..8].copy_from_slice(&0u16.to_be_bytes());
+        c.write_all(&add).unwrap();
+
+        let get_fail = |f: &[u8]| (f.len(), f[6..12].to_vec());
+        let initial = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(get_fail(&initial), (16, vec![0, 0, 0, 0, 0, 152]));
+        let pv = simple_pv(&db, "BLK:GF");
+        pv.set(EpicsValue::String("def".into()));
+        let update = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(get_fail(&update), (16, vec![0, 0, 0, 0, 0, 152]));
+        pv.set(EpicsValue::String("1.5".into()));
+        let value = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(&value[6..12], &[0, 1, 0, 0, 0, 1]);
+        assert_eq!(monitor_reply_value(&value), 1.5);
 
         server.shutdown();
         accept.join().unwrap();

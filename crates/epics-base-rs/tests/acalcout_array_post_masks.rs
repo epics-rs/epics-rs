@@ -114,7 +114,7 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
     process(&db, "A").await;
 
     assert_eq!(
-        both_rx.queue().ncollapse(1),
+        both_rx.queue().ncollapse(both_rx.id()),
         1,
         "two db_post_events calls reached this subscription — the second \
          collapsed onto the first, which is what C's early-drop does to a \
@@ -136,7 +136,7 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
     assert!(both_rx.try_recv().is_err());
 
     assert_eq!(
-        alarm_rx.queue().ncollapse(2),
+        alarm_rx.queue().ncollapse(alarm_rx.id()),
         0,
         "afterCalc's post is a LITERAL DBE_VALUE|DBE_LOG — monitor_mask is not \
          in scope there — so it never reaches an ALARM-only subscription and \

@@ -33,7 +33,10 @@
 //!   the append branch of [`EventSink::post`] raises it and only
 //!   `QueInner::remove_front` lowers it — C `db_queue_event_log`
 //!   (`dbEvent.c:837-839`) and `event_remove` (`dbEvent.c:542-558`).
-//! * MUST: `total_pending == Σ npend`, and `total_pending < size` — the `quota`
+//! * MUST: `order` holds one [`AttachId`] per pending entry, in post order,
+//!   so `order.len() == Σ npend` and the ids of one monitor appear in `order` in
+//!   the order of its `SubQ::events` (C's ring: `evque[getix..putix]`).
+//! * MUST: `order.len() < size` — the `quota`
 //!   reservation is what guarantees the ring can never fill: past the replace
 //!   threshold each attached subscription can add at most one more entry, and
 //!   attachment is capped so that always fits (C asserts the free slot at
@@ -122,15 +125,18 @@
 //! mutating method of its own, so no caller can enqueue past the replace rule
 //! or dequeue past the EVENTS_OFF gate.
 //!
+//! # Two consumers
+//!
+//! * [`EventUser::poll_next`] is C's `event_task`: one consumer per circuit
+//!   taking entries in ring order, `firstque` before `nextque` — the order the
+//!   posts were queued in, across every monitor on the circuit. The CA server
+//!   delivers through it.
+//! * [`EventReader::recv`] takes one monitor's entries only. It is for an
+//!   in-process consumer that owns its `EventUser`, where the queue holds one
+//!   monitor and the two orders coincide.
+//!
 //! # Documented deviations from C
 //!
-//! * C's ring is drained in strict ring order by one event task per
-//!   `event_user`; here each subscription has its own reader task (the CA
-//!   server frames every subscription separately), so entries are taken in
-//!   per-subscription FIFO order and the *interleaving* of two subscriptions on
-//!   one circuit is not fixed. Every quantity C's queue behaviour depends on —
-//!   ring occupancy, `nDuplicates`, `quota`, per-monitor `npend`/`pLastLog` —
-//!   is shared and accounted exactly as in C.
 //! * C's early-drop (`dbEvent.c:794-800`) keeps the entry already queued and
 //!   discards the incoming one, because the queued one is a live reference.
 //!   The port's entries are owned copies, so keeping the older one would
@@ -151,7 +157,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::runtime::sync::{Arc, Notify};
+use crate::runtime::sync::Arc;
 use crate::server::pv::MonitorEvent;
 
 /// C `EVENTENTRIES` (`dbEvent.c:62`) — ring entries reserved per attached
@@ -176,16 +182,81 @@ pub fn event_que_size() -> usize {
 }
 
 /// C `event_user::flowCtrlMode` (`dbEvent.c:101`) — the circuit-wide EVENTS_OFF
-/// flag. Held behind its own `Arc` so an [`EvQue`] can read it without a
-/// back-pointer to the [`EventUser`] that owns the chain.
+/// flag — and `ppendsem`, the one wakeup of the circuit consumer. Held behind
+/// its own `Arc` so an [`EvQue`] can reach both without a back-pointer to the
+/// [`EventUser`] that owns the chain.
 #[derive(Default, Debug)]
 struct FlowCtrl {
     on: AtomicBool,
+    /// The parked waker of this `event_user`'s one consumer — the circuit's
+    /// [`EventUser::poll_next`], or the sole reader of an in-process
+    /// subscription's private user. One slot for the whole chain, so a burst
+    /// touching several queues wakes the consumer once, and a wake moves the
+    /// waker out rather than freeing a list.
+    ppendsem: Mutex<Option<std::task::Waker>>,
 }
 
 impl FlowCtrl {
     fn is_on(&self) -> bool {
         self.on.load(Ordering::Acquire)
+    }
+
+    fn ppendsem(&self) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
+        self.ppendsem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Park `cx` as the consumer. Taken under the polled queue's lock, so a
+    /// post landing after the consumer's check finds it parked.
+    fn park(&self, cx: &std::task::Context<'_>) {
+        let mut parked = self.ppendsem();
+        if !parked.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            *parked = Some(cx.waker().clone());
+        }
+    }
+}
+
+/// One producer's run of posts — C's `db_post_events` calls made under one
+/// `dbScanLock` — whose readers are woken once, when it drops, after its last
+/// post. [`EventSink::post_in`] is the only way to post into one, so a post is
+/// always followed by its wake.
+///
+/// The queues it touched are chained through themselves
+/// ([`QueInner::burst_next`]), so a burst allocates nothing. A queue already
+/// in another producer's burst stays there: that burst's drop wakes it, after
+/// this post.
+#[derive(Default)]
+pub struct PostBurst {
+    head: Option<Arc<EvQue>>,
+}
+
+impl PostBurst {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(never)]
+    fn wake_chain(&mut self) {
+        while let Some(que) = self.head.take() {
+            self.head = {
+                let mut q = que.lock();
+                q.in_burst = false;
+                q.burst_next.take()
+            };
+            que.wake_readers();
+        }
+    }
+}
+
+/// Most bursts post nothing — a put to a field no one monitors — and their
+/// drop is inlined down to this test.
+impl Drop for PostBurst {
+    #[inline]
+    fn drop(&mut self) {
+        if self.head.is_some() {
+            self.wake_chain();
+        }
     }
 }
 
@@ -213,8 +284,24 @@ pub enum PostOutcome {
     Closed,
 }
 
+/// One subscription's slot, unique for the life of the process. A slot is
+/// keyed by this and never by the client's subscription id, which a client
+/// may reuse — and a record's subscriber list holds every circuit's — while
+/// the earlier slot still drains (C keys by the `evSubscrip` pointer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttachId(u64);
+
+impl AttachId {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// C `evSubscrip` — one subscription's state inside a queue.
 struct SubQ {
+    /// The client's id for this monitor, which its frames carry.
+    sid: u32,
     /// C `npend` is `events.len()`; C `*pLastLog` is `events.back_mut()`. Every
     /// pending event of this monitor lives here and nowhere else.
     events: VecDeque<MonitorEvent>,
@@ -235,17 +322,25 @@ struct SubQ {
     producer_gone: bool,
     /// The reader (`EventReader`) is gone: posts are refused from here on.
     reader_gone: bool,
+    /// [`EventUser::poll_next`] has reported this monitor's end of stream.
+    end_reported: bool,
+    /// C `user_sub`/`user_arg`, fixed at attach as `db_add_event` fixes them:
+    /// handed to the circuit consumer with each entry.
+    context: DeliveryContext,
 }
 
 impl SubQ {
-    fn new() -> Self {
+    fn new(sid: u32, context: DeliveryContext) -> Self {
         Self {
+            sid,
             events: VecDeque::new(),
             nreplace: 0,
             latest_only: false,
             ncollapse: 0,
             producer_gone: false,
             reader_gone: false,
+            end_reported: false,
+            context,
         }
     }
 
@@ -271,10 +366,10 @@ impl SubQ {
 /// The queue's mutable state. Everything here moves under one lock — C's
 /// `LOCKEVQUE`.
 struct QueInner {
-    /// Occupied ring entries, `Σ npend`. C derives this from `putix`/`getix`
-    /// (`ringSpace`); the port counts it because entries are taken in
-    /// per-subscription order (see the module's documented deviations).
-    total_pending: usize,
+    /// C `evque[getix..putix]`: the owning id of every occupied ring entry,
+    /// oldest first. Allocated at `size` up front — the quota keeps it short of
+    /// that — so a post never allocates here.
+    order: VecDeque<AttachId>,
     /// C `event_que::nDuplicates` (`dbEvent.c:80`) — entries queued beyond the
     /// first for their monitor, summed over every subscription attached HERE.
     /// This is what makes a duplicate on subscription B unblock the drain of
@@ -283,15 +378,11 @@ struct QueInner {
     /// C `event_read`'s drain loop is in flight: it empties the queue in one
     /// pass and does not re-consult `flowCtrlMode` per entry.
     draining: bool,
-    /// Wakers registered by [`EvQue::poll_next`] callers parked on this
-    /// queue. The poll-based twin of the `Notify` waiter list: a consumer
-    /// that multiplexes MANY subscriptions from ONE task (the QSRV group
-    /// drain) parks here instead of holding a `Notified` future per queue.
-    /// Flushed — woken and cleared — by `EvQue::wake_readers`, the single
-    /// owner of reader wakeup, on every transition that can make a parked
-    /// read Ready.
-    poll_wakers: Vec<std::task::Waker>,
-    subs: HashMap<u32, SubQ>,
+    /// This queue is on a [`PostBurst`]'s chain, owed one wake.
+    in_burst: bool,
+    /// The next queue on that chain.
+    burst_next: Option<Arc<EvQue>>,
+    subs: HashMap<AttachId, SubQ>,
     /// C `event_que::quota` (`dbEvent.c:79`) — ring entries reserved by the
     /// subscriptions attached here, `EVENT_ENTRIES` each. A subscription may
     /// attach while `quota < size - EVENT_ENTRIES` (`dbEvent.c:453`); this is
@@ -305,15 +396,15 @@ struct QueInner {
 impl QueInner {
     /// C `ringSpace` (`dbEvent.c:136-147`) — unused ring entries.
     fn ring_space(&self) -> usize {
-        self.size - self.total_pending
+        self.size - self.order.len()
     }
 
     /// C `event_remove` (`dbEvent.c:542-558`): take this monitor's oldest entry
     /// and keep `nDuplicates` / occupancy symmetric. The ONLY removal path —
     /// the reader, subscription teardown, and queue detach all go through it, so
     /// no caller can move one counter without the other.
-    fn remove_front(&mut self, sid: u32) -> Option<MonitorEvent> {
-        let sub = self.subs.get_mut(&sid)?;
+    fn remove_front(&mut self, id: AttachId) -> Option<MonitorEvent> {
+        let sub = self.subs.get_mut(&id)?;
         let event = sub.events.pop_front()?;
         // C: `npend == 1` ⇒ the monitor has no last log any more; otherwise the
         // entry just removed was one of its duplicates.
@@ -321,32 +412,70 @@ impl QueInner {
             debug_assert!(self.n_duplicates >= 1, "nDuplicates underflow");
             self.n_duplicates -= 1;
         }
-        self.total_pending -= 1;
+        // The oldest of this monitor's ring entries. It is the ring's head
+        // whenever the circuit drains in ring order; a per-monitor reader on a
+        // shared queue may take it from further back.
+        let at = self
+            .order
+            .iter()
+            .position(|&s| s == id)
+            .expect("every pending entry has its ring slot");
+        self.order.remove(at);
         // C's drain loop ends at `EVENTQEMPTY`.
-        self.draining = self.total_pending > 0;
+        self.draining = !self.order.is_empty();
         Some(event)
+    }
+
+    /// C `event_read`'s `evque[getix]`: the ring's oldest entry, if the
+    /// EVENTS_OFF gate lets it go.
+    fn take_oldest(&mut self, flow_ctrl_on: bool) -> Option<CircuitEvent> {
+        let id = *self.order.front()?;
+        if !self.may_drain(flow_ctrl_on) {
+            return None;
+        }
+        let context = self.subs.get(&id)?.context.clone();
+        self.draining = true;
+        let event = self.remove_front(id)?;
+        Some(CircuitEvent::Event {
+            id,
+            sid: self.subs[&id].sid,
+            context,
+            event,
+        })
+    }
+
+    /// A monitor whose producer is gone and whose entries are all delivered,
+    /// reported to the circuit consumer once — the end of stream
+    /// [`EventReader::recv`] answers with `None`.
+    fn take_ended(&mut self) -> Option<CircuitEvent> {
+        let (&id, sub) = self
+            .subs
+            .iter_mut()
+            .find(|(_, s)| s.producer_gone && !s.end_reported && s.events.is_empty())?;
+        sub.end_reported = true;
+        Some(CircuitEvent::Ended(id))
     }
 
     /// Drop every entry a departing subscription still holds, then release its
     /// quota. Symmetric by construction: it drains through `remove_front`
-    /// rather than zeroing counters, so `n_duplicates` / `total_pending` cannot
+    /// rather than zeroing counters, so `n_duplicates` / `order` cannot
     /// drift. C does the same per entry in `event_remove`, and releases the
     /// quota once the cancelled subscription has drained (`dbEvent.c:999-1002`).
-    fn detach(&mut self, sid: u32) {
-        while self.remove_front(sid).is_some() {}
-        if self.subs.remove(&sid).is_some() {
+    fn detach(&mut self, id: AttachId) {
+        while self.remove_front(id).is_some() {}
+        if self.subs.remove(&id).is_some() {
             self.quota -= EVENT_ENTRIES;
         }
     }
 
     /// C `db_add_event`'s attach test (`dbEvent.c:451-457`): take this queue if
     /// it still has room for one more monitor's reservation.
-    fn try_attach(&mut self, sid: u32) -> bool {
+    fn try_attach(&mut self, id: AttachId, sid: u32, context: &DeliveryContext) -> bool {
         if self.quota >= self.size - EVENT_ENTRIES {
             return false;
         }
         self.quota += EVENT_ENTRIES;
-        self.subs.insert(sid, SubQ::new());
+        self.subs.insert(id, SubQ::new(sid, context.clone()));
         true
     }
 
@@ -361,33 +490,31 @@ impl QueInner {
 /// attached to it.
 ///
 /// Exposes no mutating method: events enter through [`EventSink::post`] and
-/// leave through [`EventReader::recv`] / [`EventReader::try_recv`], which are
-/// the sole owners of C's two decisions. The accessors below are read-only
+/// leave through [`EventUser::poll_next`] or [`EventReader::recv`] /
+/// [`EventReader::try_recv`], which are the sole owners of C's two decisions. The accessors below are read-only
 /// views of C's counters for diagnostics and tests.
 pub struct EvQue {
     flow: Arc<FlowCtrl>,
     inner: Mutex<QueInner>,
-    /// Broadcast wakeup: a post, a flow-control change, or a producer/reader
-    /// teardown re-arms every reader on this queue. C signals the one
-    /// `ppendsem` per `event_user` for the same reason.
-    wake: Notify,
 }
 
 impl EvQue {
     fn new(flow: Arc<FlowCtrl>) -> Self {
+        let replace_threshold = events_per_que();
+        let size = EVENT_ENTRIES * replace_threshold;
         Self {
             flow,
             inner: Mutex::new(QueInner {
-                total_pending: 0,
+                order: VecDeque::with_capacity(size),
                 n_duplicates: 0,
                 draining: false,
-                poll_wakers: Vec::new(),
+                in_burst: false,
+                burst_next: None,
                 subs: HashMap::new(),
                 quota: 0,
-                size: event_que_size(),
-                replace_threshold: events_per_que(),
+                size,
+                replace_threshold,
             }),
-            wake: Notify::new(),
         }
     }
 
@@ -397,125 +524,98 @@ impl EvQue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Wake every reader parked on this queue — the `Notify` waiters that
-    /// [`Self::next`] suspends on AND the [`Self::poll_next`] wakers held in
-    /// [`QueInner::poll_wakers`].
+    /// C `epicsEventSignal(ppendsem)`: wake the consumer parked on this
+    /// queue's `event_user`.
     ///
-    /// SINGLE OWNER of reader wakeup: every transition that can make a
-    /// previously-parked read Ready (a post, a producer/reader teardown, an
-    /// EVENTS_ON release) MUST come through here and MUST NOT call
-    /// `wake.notify_waiters()` directly, so the two wake mechanisms cannot
-    /// diverge — a site that woke only the `Notify` would strand a
-    /// `poll_next` consumer forever (and on the RTEMS exec backend a task
-    /// whose waker is held nowhere live is dropped outright).
+    /// SINGLE OWNER of reader wakeup: every transition that can make a parked
+    /// read Ready (a burst's posts, a producer/reader teardown, an EVENTS_ON
+    /// release) comes through here. It frees nothing and allocates nothing,
+    /// because a [`PostBurst`] drops under the record hold.
     fn wake_readers(&self) {
-        let wakers = std::mem::take(&mut self.lock().poll_wakers);
-        self.wake.notify_waiters();
-        for waker in wakers {
+        if let Some(waker) = self.flow.ppendsem().take() {
             waker.wake();
         }
     }
 
-    /// C `db_queue_event_log` (`dbEvent.c:776-868`).
-    fn post(&self, sid: u32, event: MonitorEvent) -> PostOutcome {
-        let outcome = {
-            let mut q = self.lock();
-            let flow_on = self.flow.is_on();
-            let ring_space = q.ring_space();
-            let size = q.size;
-            let threshold = q.replace_threshold;
-            let Some(sub) = q.subs.get_mut(&sid) else {
-                return PostOutcome::Closed;
-            };
-            if sub.reader_gone {
-                return PostOutcome::Closed;
+    /// C `db_queue_event_log` (`dbEvent.c:776-868`), minus its
+    /// `epicsEventSignal(ppendsem)`: the wake is `burst`'s, at its drop.
+    fn post(
+        self: &Arc<Self>,
+        burst: &mut PostBurst,
+        id: AttachId,
+        event: MonitorEvent,
+    ) -> PostOutcome {
+        let mut q = self.lock();
+        let flow_on = self.flow.is_on();
+        let ring_space = q.ring_space();
+        let size = q.size;
+        let threshold = q.replace_threshold;
+        let Some(sub) = q.subs.get_mut(&id) else {
+            return PostOutcome::Closed;
+        };
+        if sub.reader_gone {
+            return PostOutcome::Closed;
+        }
+        let npend = sub.events.len();
+        // C `db_add_event`'s `useValque` decision (`dbEvent.c:493-500`),
+        // taken from the value because the port has no channel here. It is
+        // a latch, not a per-post test: C decides once per subscription and
+        // never revisits it.
+        if !event.snapshot.value.queues_by_value() {
+            sub.latest_only = true;
+        }
+        let outcome = if sub.latest_only && npend > 0 {
+            // C `db_queue_event_log`'s early-drop (`dbEvent.c:794-800`).
+            // C keeps the queued reference and frees the incoming log; the
+            // port keeps the incoming snapshot, because its queued one is a
+            // copy that would deliver a stale value where C's reference
+            // reads the record. Depth is C's — one entry — either way.
+            sub.overwrite_last(event);
+            sub.ncollapse += 1;
+            PostOutcome::Collapsed
+        } else if npend > 0 && (flow_on || ring_space <= threshold) {
+            // C: `db_delete_field_log(*pLastLog); *pLastLog = pLog;` — the
+            // ring does not grow and the earlier distinct entries stay put.
+            sub.overwrite_last(event);
+            sub.nreplace += 1;
+            PostOutcome::Replaced
+        } else {
+            sub.events.push_back(event);
+            // C: an entry appended while the monitor already had one queued
+            // is a duplicate — the queue-level count the EVENTS_OFF gate
+            // reads (`dbEvent.c:837-839`).
+            if npend > 0 {
+                q.n_duplicates += 1;
             }
-            let npend = sub.events.len();
-            // C `db_add_event`'s `useValque` decision (`dbEvent.c:493-500`),
-            // taken from the value because the port has no channel here. It is
-            // a latch, not a per-post test: C decides once per subscription and
-            // never revisits it.
-            if !event.snapshot.value.queues_by_value() {
-                sub.latest_only = true;
-            }
-            if sub.latest_only && npend > 0 {
-                // C `db_queue_event_log`'s early-drop (`dbEvent.c:794-800`).
-                // C keeps the queued reference and frees the incoming log; the
-                // port keeps the incoming snapshot, because its queued one is a
-                // copy that would deliver a stale value where C's reference
-                // reads the record. Depth is C's — one entry — either way.
-                sub.overwrite_last(event);
-                sub.ncollapse += 1;
-                PostOutcome::Collapsed
-            } else if npend > 0 && (flow_on || ring_space <= threshold) {
-                // C: `db_delete_field_log(*pLastLog); *pLastLog = pLog;` — the
-                // ring does not grow and the earlier distinct entries stay put.
-                sub.overwrite_last(event);
-                sub.nreplace += 1;
-                PostOutcome::Replaced
-            } else {
-                sub.events.push_back(event);
-                // C: an entry appended while the monitor already had one queued
-                // is a duplicate — the queue-level count the EVENTS_OFF gate
-                // reads (`dbEvent.c:837-839`).
-                if npend > 0 {
-                    q.n_duplicates += 1;
-                }
-                q.total_pending += 1;
-                debug_assert!(
-                    q.total_pending < size,
-                    "the quota reservation must keep the ring from filling"
-                );
-                PostOutcome::Appended {
-                    first_event: ring_space == size,
-                }
+            q.order.push_back(id);
+            debug_assert!(
+                q.order.len() < size,
+                "the quota reservation must keep the ring from filling"
+            );
+            PostOutcome::Appended {
+                first_event: ring_space == size,
             }
         };
-        if outcome != PostOutcome::Closed {
-            self.wake_readers();
+        if !q.in_burst {
+            q.in_burst = true;
+            q.burst_next = burst.head.replace(self.clone());
         }
         outcome
     }
 
     /// C `event_read` (`dbEvent.c:932-1014`), reader half.
-    async fn next(&self, sid: u32) -> Option<MonitorEvent> {
-        loop {
-            // Arm the wakeup BEFORE inspecting the queue: `notify_waiters()`
-            // stores no permit, so a post or an EVENTS_ON landing between the
-            // check and the await must find this waiter already registered.
-            let wake = self.wake.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
-            {
-                let mut q = self.lock();
-                let flow_on = self.flow.is_on();
-                let sub = q.subs.get(&sid)?;
-                let has_entry = !sub.events.is_empty();
-                let producer_gone = sub.producer_gone;
-                if has_entry {
-                    if q.may_drain(flow_on) {
-                        q.draining = true;
-                        return q.remove_front(sid);
-                    }
-                    // Suspended: C's event_read returns without delivering.
-                } else if producer_gone {
-                    return None;
-                }
-            }
-            wake.await;
-        }
+    async fn next(&self, id: AttachId) -> Option<MonitorEvent> {
+        std::future::poll_fn(|cx| self.poll_next(id, cx)).await
     }
 
-    /// Poll-based [`Self::next`]: the same gate and the same delivery, but
-    /// instead of suspending on the queue's `Notify` it registers `cx`'s
-    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`](std::task::Poll::Pending).
+    /// One poll of [`Self::next`]: deliver, or park `cx` as the `event_user`'s
+    /// consumer and return [`Poll::Pending`](std::task::Poll::Pending).
     ///
     /// This is what lets ONE task await MANY subscriptions — the QSRV group
     /// drain polls each of its member readers in turn and parks once, its
-    /// waker held by every queue it polled. Registration happens under the
-    /// queue lock and every Ready-making mutation wakes through
-    /// [`Self::wake_readers`] under the same lock, so a post landing between
-    /// the check and the `Pending` return cannot be lost.
+    /// waker held by each one's private `event_user`. Parking happens under
+    /// the queue lock, so a post landing between the check and the `Pending`
+    /// return finds it parked.
     ///
     /// [`Poll::Ready`](std::task::Poll::Ready)`(None)` matches [`Self::next`]'s `None`: the
     /// subscription is detached, or its producer is gone and the queue
@@ -525,13 +625,13 @@ impl EvQue {
     /// call `flow_ctrl_off` makes.
     fn poll_next(
         &self,
-        sid: u32,
+        id: AttachId,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<MonitorEvent>> {
         use std::task::Poll;
         let mut q = self.lock();
         let flow_on = self.flow.is_on();
-        let Some(sub) = q.subs.get(&sid) else {
+        let Some(sub) = q.subs.get(&id) else {
             return Poll::Ready(None);
         };
         let has_entry = !sub.events.is_empty();
@@ -539,24 +639,36 @@ impl EvQue {
         if has_entry {
             if q.may_drain(flow_on) {
                 q.draining = true;
-                return Poll::Ready(q.remove_front(sid));
+                return Poll::Ready(q.remove_front(id));
             }
             // Suspended by EVENTS_OFF: park, C's event_read returns without
             // delivering.
         } else if producer_gone {
             return Poll::Ready(None);
         }
-        if !q.poll_wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            q.poll_wakers.push(cx.waker().clone());
+        self.flow.park(cx);
+        Poll::Pending
+    }
+
+    /// The circuit consumer's read of this queue: the ring's oldest entry
+    /// whichever monitor it belongs to, else a monitor's end of stream, else
+    /// park `cx` in the circuit's `ppendsem` slot.
+    fn poll_oldest(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
+        use std::task::Poll;
+        let mut q = self.lock();
+        let flow_on = self.flow.is_on();
+        if let Some(step) = q.take_oldest(flow_on).or_else(|| q.take_ended()) {
+            return Poll::Ready(step);
         }
+        self.flow.park(cx);
         Poll::Pending
     }
 
     /// Non-blocking [`Self::next`]: same gate, no suspension.
-    fn try_next(&self, sid: u32) -> Result<MonitorEvent, TryRecvError> {
+    fn try_next(&self, id: AttachId) -> Result<MonitorEvent, TryRecvError> {
         let mut q = self.lock();
         let flow_on = self.flow.is_on();
-        let Some(sub) = q.subs.get(&sid) else {
+        let Some(sub) = q.subs.get(&id) else {
             return Err(TryRecvError::Disconnected);
         };
         if sub.events.is_empty() {
@@ -571,41 +683,41 @@ impl EvQue {
             return Err(TryRecvError::Empty);
         }
         q.draining = true;
-        q.remove_front(sid).ok_or(TryRecvError::Empty)
+        q.remove_front(id).ok_or(TryRecvError::Empty)
     }
 
     /// Is this subscription's reader gone (C: the monitor was cancelled)?
     /// Producer rows are reaped on this, replacing `mpsc::Sender::is_closed`.
-    fn reader_gone(&self, sid: u32) -> bool {
-        self.lock().subs.get(&sid).is_none_or(|s| s.reader_gone)
+    fn reader_gone(&self, id: AttachId) -> bool {
+        self.lock().subs.get(&id).is_none_or(|s| s.reader_gone)
     }
 
-    /// The producer row for `sid` is gone: no more posts, but what is already
+    /// The producer row for `id` is gone: no more posts, but what is already
     /// queued is still delivered.
-    fn close_producer(&self, sid: u32) {
+    fn close_producer(&self, id: AttachId) {
         {
             let mut q = self.lock();
-            let Some(sub) = q.subs.get_mut(&sid) else {
+            let Some(sub) = q.subs.get_mut(&id) else {
                 return;
             };
             sub.producer_gone = true;
             if sub.reader_gone {
-                q.detach(sid);
+                q.detach(id);
             }
         }
         self.wake_readers();
     }
 
-    /// The reader for `sid` is gone: its queued entries leave the ring through
+    /// The reader for `id` is gone: its queued entries leave the ring through
     /// the same accounting every other removal uses.
-    fn close_reader(&self, sid: u32) {
+    fn close_reader(&self, id: AttachId) {
         {
             let mut q = self.lock();
-            let Some(sub) = q.subs.get_mut(&sid) else {
+            let Some(sub) = q.subs.get_mut(&id) else {
                 return;
             };
             sub.reader_gone = true;
-            q.detach(sid);
+            q.detach(id);
         }
         self.wake_readers();
     }
@@ -617,26 +729,26 @@ impl EvQue {
     }
 
     /// C `nreplace` for one monitor — posts that overwrote its last entry.
-    pub fn nreplace(&self, sid: u32) -> u64 {
-        self.lock().subs.get(&sid).map_or(0, |s| s.nreplace)
+    pub fn nreplace(&self, id: AttachId) -> u64 {
+        self.lock().subs.get(&id).map_or(0, |s| s.nreplace)
     }
 
     /// C `npend` for one monitor — entries queued and not yet delivered.
-    pub fn npend(&self, sid: u32) -> usize {
-        self.lock().subs.get(&sid).map_or(0, |s| s.events.len())
+    pub fn npend(&self, id: AttachId) -> usize {
+        self.lock().subs.get(&id).map_or(0, |s| s.events.len())
     }
 
     /// Posts this monitor absorbed under the latest-only rule — the port's
     /// counter for C's uncounted early-drop (`dbEvent.c:794-800`).
-    pub fn ncollapse(&self, sid: u32) -> u64 {
-        self.lock().subs.get(&sid).map_or(0, |s| s.ncollapse)
+    pub fn ncollapse(&self, id: AttachId) -> u64 {
+        self.lock().subs.get(&id).map_or(0, |s| s.ncollapse)
     }
 
     /// C `useValque == FALSE` for one monitor: it has carried a value too wide
     /// for `union native_value`, so it keeps only its latest entry. C reports
     /// the same state as "queueing disabled" in `dbel` (`dbEvent.c:224-226`).
-    pub fn latest_only(&self, sid: u32) -> bool {
-        self.lock().subs.get(&sid).is_some_and(|s| s.latest_only)
+    pub fn latest_only(&self, id: AttachId) -> bool {
+        self.lock().subs.get(&id).is_some_and(|s| s.latest_only)
     }
 
     /// C `quota` — ring entries reserved by the monitors attached here.
@@ -651,9 +763,9 @@ impl EvQue {
     /// `ringSpace`, again in its `level > 2` block for `nDuplicates`
     /// (`dbEvent.c:198-233`) — so its two halves can disagree about a queue
     /// a producer is filling between them. One snapshot cannot.
-    pub fn report(&self, sid: u32) -> QueReport {
+    pub fn report(&self, id: AttachId) -> QueReport {
         let q = self.lock();
-        let sub = q.subs.get(&sid);
+        let sub = q.subs.get(&id);
         QueReport {
             npend: sub.map_or(0, |s| s.events.len()),
             ring_space: q.ring_space(),
@@ -684,6 +796,25 @@ pub struct QueReport {
     pub n_duplicates: usize,
 }
 
+/// What the circuit consumer delivers a monitor's entries with — C
+/// `user_sub`/`user_arg` — given to [`attach_with`].
+pub type DeliveryContext = Arc<dyn std::any::Any + Send + Sync>;
+
+/// What [`EventUser::poll_next`] took off the circuit's queues.
+pub enum CircuitEvent {
+    /// The oldest queued entry, the monitor (`id`) it was posted to, and
+    /// that monitor's [`DeliveryContext`].
+    Event {
+        id: AttachId,
+        /// The client's id for that monitor.
+        sid: u32,
+        context: DeliveryContext,
+        event: MonitorEvent,
+    },
+    /// Monitor `id`'s producer is gone and its entries are delivered.
+    Ended(AttachId),
+}
+
 /// C `event_user` (`dbEvent.c:84-105`) — one per CA circuit. Owns the EVENTS_OFF
 /// flag and the chain of queues subscriptions attach to.
 pub struct EventUser {
@@ -692,7 +823,15 @@ pub struct EventUser {
     /// spare quota, and a new queue is chained when none has
     /// (`dbEvent.c:450-469`). This — not the client — is the sharing granularity
     /// of `nDuplicates`.
-    ques: Mutex<Vec<Arc<EvQue>>>,
+    ques: Mutex<QueChain>,
+}
+
+/// The queue chain and where the circuit consumer's drain pass stands on it.
+struct QueChain {
+    ques: Vec<Arc<EvQue>>,
+    /// The queue `event_task`'s loop is on: `event_read` empties it before
+    /// the loop moves to `nextque`, and a new pass starts at `firstque`.
+    reading: usize,
 }
 
 impl Default for EventUser {
@@ -706,7 +845,10 @@ impl EventUser {
     pub fn new() -> Self {
         let flow = Arc::new(FlowCtrl::default());
         Self {
-            ques: Mutex::new(vec![Arc::new(EvQue::new(flow.clone()))]),
+            ques: Mutex::new(QueChain {
+                ques: vec![Arc::new(EvQue::new(flow.clone()))],
+                reading: 0,
+            }),
             flow,
         }
     }
@@ -719,21 +861,51 @@ impl EventUser {
     /// `nDuplicates` lives (R8-23). A duplicate queued for any monitor on the
     /// queue releases the EVENTS_OFF drain of every monitor on it, which
     /// per-subscription rings cannot express.
-    fn attach_que(&self, sid: u32) -> Arc<EvQue> {
-        let mut ques = self
+    fn attach_que(&self, id: AttachId, sid: u32, context: &DeliveryContext) -> Arc<EvQue> {
+        let mut chain = self
             .ques
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ques = &mut chain.ques;
         for que in ques.iter() {
-            if que.lock().try_attach(sid) {
+            if que.lock().try_attach(id, sid, context) {
                 return que.clone();
             }
         }
         let que = Arc::new(EvQue::new(self.flow.clone()));
-        let attached = que.lock().try_attach(sid);
+        let attached = que.lock().try_attach(id, sid, context);
         debug_assert!(attached, "a fresh queue must admit its first monitor");
         ques.push(que.clone());
+        // A circuit consumer parked before this queue existed is registered on
+        // `firstque` only; re-poll it so it registers here too.
+        ques[0].wake_readers();
         que
+    }
+
+    /// C `event_task` (`dbEvent.c:1056-1061`): the next entry in ring order,
+    /// one pass over the chain per wake. `event_read` empties a queue, posts
+    /// landing on it meanwhile included (`dbEvent.c:952`), before the loop
+    /// reaches `nextque`; a post to an earlier queue waits for the next pass,
+    /// so a busy `firstque` cannot starve the queues behind it. The single consumer of a circuit whose monitors are
+    /// delivered in the order they were posted; per-monitor
+    /// [`EventReader::recv`] calls on the same queues would take entries out
+    /// of that order.
+    pub fn poll_next(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<CircuitEvent> {
+        let mut chain = self
+            .ques
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = chain.ques.len();
+        for step in 0..n {
+            let at = (chain.reading + step) % n;
+            if let std::task::Poll::Ready(event) = chain.ques[at].poll_oldest(cx) {
+                chain.reading = at;
+                return std::task::Poll::Ready(event);
+            }
+        }
+        // Every queue is parked on `cx`; the next wake is a new pass.
+        chain.reading = 0;
+        std::task::Poll::Pending
     }
 
     /// C `db_event_flow_ctrl_mode_on` — EVENTS_OFF. Posts now replace each
@@ -747,11 +919,11 @@ impl EventUser {
     /// reader on this circuit; C posts `ppendsem` for the same reason.
     pub fn flow_ctrl_off(&self) {
         self.flow.on.store(false, Ordering::Release);
-        let ques = self
+        let chain = self
             .ques
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for que in ques.iter() {
+        for que in chain.ques.iter() {
             que.wake_readers();
         }
     }
@@ -792,7 +964,7 @@ impl std::error::Error for TryRecvError {}
 /// releasing its ring entries and its quota.
 pub struct EventReader {
     que: Arc<EvQue>,
-    sid: u32,
+    id: AttachId,
 }
 
 impl EventReader {
@@ -800,12 +972,12 @@ impl EventReader {
     /// `event_read` does (`flowCtrlMode && nDuplicates == 0`, no drain pass in
     /// flight). `None` = producer gone and queue drained.
     pub async fn recv(&mut self) -> Option<MonitorEvent> {
-        self.que.next(self.sid).await
+        self.que.next(self.id).await
     }
 
     /// Non-blocking [`Self::recv`].
     pub fn try_recv(&mut self) -> Result<MonitorEvent, TryRecvError> {
-        self.que.try_next(self.sid)
+        self.que.try_next(self.id)
     }
 
     /// Poll-based [`Self::recv`]: `Poll::Ready(None)` where `recv()` returns
@@ -819,7 +991,7 @@ impl EventReader {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<MonitorEvent>> {
-        self.que.poll_next(self.sid, cx)
+        self.que.poll_next(self.id, cx)
     }
 
     /// The queue this subscription is attached to — a read-only handle for
@@ -828,15 +1000,20 @@ impl EventReader {
         self.que.clone()
     }
 
+    /// This subscription's slot.
+    pub fn id(&self) -> AttachId {
+        self.id
+    }
+
     /// C `npend` for this subscription.
     pub fn npend(&self) -> usize {
-        self.que.npend(self.sid)
+        self.que.npend(self.id)
     }
 }
 
 impl Drop for EventReader {
     fn drop(&mut self) {
-        self.que.close_reader(self.sid);
+        self.que.close_reader(self.id);
     }
 }
 
@@ -845,44 +1022,73 @@ impl Drop for EventReader {
 /// goes away.
 pub struct EventSink {
     que: Arc<EvQue>,
-    sid: u32,
+    id: AttachId,
 }
 
 impl EventSink {
     /// C `db_queue_event_log` for this subscription: append, or replace this
     /// monitor's last queued entry in place. The single owner of that decision.
     pub fn post(&self, event: MonitorEvent) -> PostOutcome {
-        self.que.post(self.sid, event)
+        self.post_in(&mut PostBurst::new(), event)
+    }
+
+    /// [`Self::post`] as one of `burst`'s posts, woken when `burst` drops.
+    pub fn post_in(&self, burst: &mut PostBurst, event: MonitorEvent) -> PostOutcome {
+        self.que.post(burst, self.id, event)
+    }
+
+    /// This subscription's slot — what its producer row is removed by.
+    pub fn id(&self) -> AttachId {
+        self.id
     }
 
     /// The reader is gone — the producer row can be reaped. Replaces
     /// `mpsc::Sender::is_closed`.
     pub fn is_closed(&self) -> bool {
-        self.que.reader_gone(self.sid)
+        self.que.reader_gone(self.id)
     }
 
     /// This monitor's queue state, for `dbel`.
     pub fn report(&self) -> QueReport {
-        self.que.report(self.sid)
+        self.que.report(self.id)
     }
 }
 
 impl Drop for EventSink {
     fn drop(&mut self) {
-        self.que.close_producer(self.sid);
+        self.que.close_producer(self.id);
     }
 }
 
-/// C `db_add_event`: attach `sid` to `user`'s queue chain and hand back the
-/// producer and consumer halves.
+/// [`attach_with`] for a monitor read through its own [`EventReader`], which
+/// needs no delivery context.
 pub fn attach(user: &EventUser, sid: u32) -> (EventSink, EventReader) {
-    let que = user.attach_que(sid);
+    attach_with(user, sid, no_context())
+}
+
+/// The context of a monitor nobody delivers through [`EventUser::poll_next`].
+pub fn no_context() -> &'static DeliveryContext {
+    static NONE: std::sync::LazyLock<DeliveryContext> = std::sync::LazyLock::new(|| Arc::new(()));
+    &NONE
+}
+
+/// C `db_add_event`: attach client monitor `sid` to `user`'s queue chain in a
+/// fresh slot that carries `context` to the circuit consumer, and hand back
+/// the producer and consumer halves. The slot is deliverable at once, as a C
+/// `evSubscrip` is to `event_read` before `db_event_enable`.
+pub fn attach_with(
+    user: &EventUser,
+    sid: u32,
+    context: &DeliveryContext,
+) -> (EventSink, EventReader) {
+    let id = AttachId::next();
+    let que = user.attach_que(id, sid, context);
     (
         EventSink {
             que: que.clone(),
-            sid,
+            id,
         },
-        EventReader { que, sid },
+        EventReader { que, id },
     )
 }
 
@@ -945,7 +1151,7 @@ mod tests {
         assert_eq!(sink.post(ev(2)), PostOutcome::Replaced);
         assert_eq!(sink.post(ev(3)), PostOutcome::Replaced);
         assert_eq!(reader.npend(), 1, "the queue never grew past one entry");
-        assert_eq!(reader.queue().nreplace(1), 2);
+        assert_eq!(reader.queue().nreplace(reader.id()), 2);
         assert_eq!(reader.queue().n_duplicates(), 0);
         user.flow_ctrl_off();
         assert_eq!(
@@ -997,7 +1203,7 @@ mod tests {
             assert_eq!(sink.post(ev(v)), PostOutcome::Replaced);
         }
         assert_eq!(reader.npend(), appended, "the backlog did not grow");
-        assert_eq!(reader.queue().nreplace(1), 10);
+        assert_eq!(reader.queue().nreplace(reader.id()), 10);
         let got: Vec<i32> = (0..appended)
             .map(|_| val(&reader.try_recv().unwrap()))
             .collect();
@@ -1019,14 +1225,15 @@ mod tests {
         let user = EventUser::new();
         let (sink, reader) = attach(&user, 1);
         let que = reader.queue();
+        let id = reader.id();
         for v in 1..=3 {
             sink.post(ev(v)); // npend 3 ⇒ 2 duplicates
         }
         assert_eq!(que.n_duplicates(), 2);
-        assert_eq!(que.npend(1), 3);
+        assert_eq!(que.npend(id), 3);
         drop(reader);
         assert_eq!(que.n_duplicates(), 0, "teardown removed its duplicates");
-        assert_eq!(que.npend(1), 0, "its entries left the ring");
+        assert_eq!(que.npend(id), 0, "its entries left the ring");
         // The row is gone, so the producer reaps itself on the next post.
         assert_eq!(sink.post(ev(4)), PostOutcome::Closed);
         assert!(sink.is_closed());
@@ -1185,7 +1392,7 @@ mod tests {
         drop(reader_a);
         drop(sink_a);
         assert_eq!(que.n_duplicates(), 1, "only A's duplicates left the ring");
-        assert_eq!(que.npend(2), 2, "B's entries are untouched");
+        assert_eq!(que.npend(reader_b.id()), 2, "B's entries are untouched");
         drop(reader_b);
         drop(sink_b);
         assert_eq!(que.n_duplicates(), 0);
@@ -1277,8 +1484,8 @@ mod tests {
 
     /// Boundary EVENTS_OFF: an entry withheld by flow control parks
     /// `poll_recv` exactly where `recv()` suspends (`flowCtrlMode &&
-    /// nDuplicates == 0`), and EVENTS_ON releases it through the same
-    /// `wake_readers` the `Notify` waiters get.
+    /// nDuplicates == 0`), and EVENTS_ON releases it through
+    /// `wake_readers`.
     #[test]
     fn poll_recv_respects_events_off_and_wakes_on_events_on() {
         let user = EventUser::new();
@@ -1355,11 +1562,11 @@ mod tests {
         assert_eq!(reader.npend(), 1, "one snapshot's worth of memory, no more");
         assert_eq!(reader.queue().n_duplicates(), 0);
         assert_eq!(
-            reader.queue().nreplace(1),
+            reader.queue().nreplace(reader.id()),
             0,
             "C's early-drop is not a replacement and raises no nreplace"
         );
-        assert_eq!(reader.queue().ncollapse(1), posts as u64 - 1);
+        assert_eq!(reader.queue().ncollapse(reader.id()), posts as u64 - 1);
         assert_eq!(
             wide_val(&reader.recv().await.unwrap()),
             posts as i32 - 1,
@@ -1378,11 +1585,11 @@ mod tests {
         let user = EventUser::new();
         let (sink, reader) = attach(&user, 1);
         sink.post(wide(0));
-        assert!(reader.queue().latest_only(1));
+        assert!(reader.queue().latest_only(reader.id()));
         assert_eq!(sink.post(ev(7)), PostOutcome::Collapsed);
         assert_eq!(sink.post(ev(8)), PostOutcome::Collapsed);
         assert_eq!(reader.npend(), 1);
-        assert!(reader.queue().latest_only(1));
+        assert!(reader.queue().latest_only(reader.id()));
     }
 
     /// The other side of the boundary: a narrow backlog already queued when the
@@ -1422,8 +1629,255 @@ mod tests {
         for v in 1..=3 {
             assert!(matches!(sink.post(ev(v)), PostOutcome::Appended { .. }));
         }
-        assert!(!reader.queue().latest_only(1));
-        assert_eq!(reader.queue().ncollapse(1), 0);
+        assert!(!reader.queue().latest_only(reader.id()));
+        assert_eq!(reader.queue().ncollapse(reader.id()), 0);
         assert_eq!(reader.npend(), 3);
+    }
+
+    /// One poll of the circuit consumer with a waker nobody watches.
+    fn circuit_now(user: &EventUser) -> std::task::Poll<CircuitEvent> {
+        user.poll_next(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    fn circuit_event(user: &EventUser) -> (u32, i32) {
+        match circuit_now(user) {
+            std::task::Poll::Ready(CircuitEvent::Event { sid, event, .. }) => (sid, val(&event)),
+            std::task::Poll::Ready(CircuitEvent::Ended(id)) => panic!("{id:?} ended"),
+            std::task::Poll::Pending => panic!("nothing to take"),
+        }
+    }
+
+    /// C `event_read` walks `evque[getix]` (`dbEvent.c:957-1006`): a circuit's
+    /// monitors are delivered in the order their posts were queued, not one
+    /// monitor's backlog after another's.
+    #[epics_macros_rs::epics_test]
+    async fn the_circuit_takes_monitors_in_post_order() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1);
+        let (b, _rb) = attach(&user, 2);
+        a.post(ev(10));
+        b.post(ev(20));
+        a.post(ev(11));
+        b.post(ev(21));
+        let got: Vec<_> = (0..4).map(|_| circuit_event(&user)).collect();
+        assert_eq!(got, [(1, 10), (2, 20), (1, 11), (2, 21)]);
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// C replaces `*pLastLog` where it sits (`dbEvent.c:812-827`): the
+    /// replacing value goes out from the replaced entry's ring slot, ahead of
+    /// another monitor's entry posted in between.
+    #[epics_macros_rs::epics_test]
+    async fn a_replaced_entry_keeps_its_ring_slot() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1);
+        let (b, _rb) = attach(&user, 2);
+        user.flow_ctrl_on();
+        a.post(ev(10));
+        b.post(ev(20));
+        assert_eq!(a.post(ev(11)), PostOutcome::Replaced);
+        user.flow_ctrl_off();
+        assert_eq!(circuit_event(&user), (1, 11));
+        assert_eq!(circuit_event(&user), (2, 20));
+    }
+
+    /// A per-monitor take on a shared queue removes that monitor's ring slot,
+    /// so the circuit consumer still sees the rest in post order.
+    #[epics_macros_rs::epics_test]
+    async fn a_per_monitor_take_leaves_the_ring_order_of_the_rest() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1);
+        let (b, mut rb) = attach(&user, 2);
+        a.post(ev(10));
+        b.post(ev(20));
+        a.post(ev(11));
+        assert_eq!(val(&rb.try_recv().unwrap()), 20);
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert_eq!(circuit_event(&user), (1, 11));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// A monitor whose producer went away is reported ended once, after the
+    /// entries it had queued.
+    #[epics_macros_rs::epics_test]
+    async fn a_monitor_ends_once_after_its_backlog() {
+        let user = EventUser::new();
+        let (a, ra) = attach(&user, 1);
+        a.post(ev(10));
+        drop(a);
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert!(matches!(
+            circuit_now(&user),
+            std::task::Poll::Ready(CircuitEvent::Ended(id)) if id == ra.id()
+        ));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// Boundary: the entry a monitor's attach queued first (C
+    /// `db_post_single_event` before `db_event_enable`) is deliverable at
+    /// once, in post order with every other monitor's.
+    #[epics_macros_rs::epics_test]
+    async fn a_just_attached_monitor_is_deliverable_at_once() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1);
+        a.post(ev(10));
+        let (b, _rb) = attach(&user, 2);
+        b.post(ev(20));
+        a.post(ev(11));
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert_eq!(circuit_event(&user), (2, 20));
+        assert_eq!(circuit_event(&user), (1, 11));
+    }
+
+    /// Boundary: a client sub_id re-added while its cancelled reader has not
+    /// dropped yet (the blocking driver hands the cancel to its event thread).
+    /// Each attach owns its slot, so the new monitor posts, the circuit takes
+    /// both in post order, and the late drop releases only the old reservation.
+    #[epics_macros_rs::epics_test]
+    async fn a_sub_id_re_added_before_the_old_reader_drops_keeps_both_slots() {
+        let user = EventUser::new();
+        let (old, old_r) = attach_with(&user, 9, &(Arc::new("old") as DeliveryContext));
+        old.post(ev(1));
+        drop(old);
+        let que = old_r.queue();
+        let (new, new_r) = attach_with(&user, 9, &(Arc::new("new") as DeliveryContext));
+        assert_ne!(new.post(ev(2)), PostOutcome::Closed);
+        assert_eq!(que.quota(), 2 * EVENT_ENTRIES);
+        assert_eq!(circuit_event(&user), (9, 1));
+        assert_eq!(circuit_event(&user), (9, 2));
+        assert!(matches!(
+            circuit_now(&user),
+            std::task::Poll::Ready(CircuitEvent::Ended(id)) if id == old_r.id()
+        ));
+        drop(old_r);
+        assert_eq!(que.quota(), EVENT_ENTRIES);
+        assert_ne!(new.post(ev(3)), PostOutcome::Closed);
+        assert_eq!(circuit_event(&user), (9, 3));
+        drop(new_r);
+    }
+
+    /// A monitor id reused after its reader dropped carries the new
+    /// monitor's context, never the cancelled one's, and none of the
+    /// cancelled monitor's entries.
+    #[epics_macros_rs::epics_test]
+    async fn a_reused_monitor_id_delivers_with_its_own_context() {
+        let user = EventUser::new();
+        let (old, old_r) = attach_with(&user, 5, &(Arc::new("old") as DeliveryContext));
+        old.post(ev(1));
+        drop(old_r);
+        let (new, _new_r) = attach_with(&user, 5, &(Arc::new("new") as DeliveryContext));
+        new.post(ev(2));
+        match circuit_now(&user) {
+            std::task::Poll::Ready(CircuitEvent::Event {
+                sid: 5,
+                context,
+                event,
+                ..
+            }) => {
+                assert_eq!(context.downcast_ref::<&str>(), Some(&"new"));
+                assert_eq!(val(&event), 2);
+            }
+            _ => panic!("expected monitor 5's entry"),
+        }
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// A consumer parked before the quota chained a second queue is woken by
+    /// the chaining, and then drains `firstque` before `nextque`
+    /// (`dbEvent.c:1056-1061`).
+    #[epics_macros_rs::epics_test]
+    async fn a_chained_queue_reaches_a_parked_consumer() {
+        let user = EventUser::new();
+        let (count, waker) = count_waker();
+        assert!(
+            user.poll_next(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
+        let cap = event_que_size() / EVENT_ENTRIES - 1;
+        let held: Vec<_> = (0..cap as u32).map(|sid| attach(&user, sid)).collect();
+        let woken = count.0.load(Ordering::SeqCst);
+        let (late, _late_r) = attach(&user, cap as u32);
+        assert!(
+            count.0.load(Ordering::SeqCst) > woken,
+            "chaining a queue wakes the parked consumer"
+        );
+        late.post(ev(99));
+        held[0].0.post(ev(1));
+        assert_eq!(circuit_event(&user), (0, 1));
+        assert_eq!(circuit_event(&user), (cap as u32, 99));
+    }
+
+    /// Monitors `0..=cap` attached: `0..cap` fill `firstque`,
+    /// `cap` is chained onto `nextque`.
+    fn two_queues(user: &EventUser) -> (u32, Vec<(EventSink, EventReader)>) {
+        let cap = (event_que_size() / EVENT_ENTRIES - 1) as u32;
+        let held: Vec<_> = (0..=cap).map(|sid| attach(user, sid)).collect();
+        assert!(!Arc::ptr_eq(
+            &held[0].1.queue(),
+            &held[cap as usize].1.queue()
+        ));
+        (cap, held)
+    }
+
+    /// A post to `firstque` after the pass moved on to `nextque` waits for
+    /// the next pass (`dbEvent.c:1056-1061`).
+    #[epics_macros_rs::epics_test]
+    async fn a_pass_drains_nextque_before_returning_to_firstque() {
+        let user = EventUser::new();
+        let (cap, held) = two_queues(&user);
+        let (first, late) = (&held[0].0, &held[cap as usize].0);
+        first.post(ev(1));
+        late.post(ev(10));
+        late.post(ev(11));
+        assert_eq!(circuit_event(&user), (0, 1));
+        assert_eq!(circuit_event(&user), (cap, 10));
+        first.post(ev(2));
+        assert_eq!(circuit_event(&user), (cap, 11));
+        assert_eq!(circuit_event(&user), (0, 2));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// A post to the queue being read joins the same `event_read`
+    /// (`dbEvent.c:952`): the pass stays on `firstque` until it is empty.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_to_the_queue_being_read_joins_its_drain() {
+        let user = EventUser::new();
+        let (cap, held) = two_queues(&user);
+        let (first, late) = (&held[0].0, &held[cap as usize].0);
+        first.post(ev(1));
+        late.post(ev(10));
+        assert_eq!(circuit_event(&user), (0, 1));
+        first.post(ev(2));
+        assert_eq!(circuit_event(&user), (0, 2));
+        assert_eq!(circuit_event(&user), (cap, 10));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// A burst spanning both queues reaches a parked circuit consumer as ONE
+    /// wake, after its last post, and the consumer then takes it in C's
+    /// per-queue pass: all of `firstque`, then `nextque`
+    /// (`dbEvent.c:1056-1061`).
+    #[epics_macros_rs::epics_test]
+    async fn a_burst_across_two_queues_wakes_the_consumer_once() {
+        let user = EventUser::new();
+        let (cap, held) = two_queues(&user);
+        let (first, late) = (&held[0].0, &held[cap as usize].0);
+        let (count, waker) = count_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(user.poll_next(&mut cx).is_pending());
+        {
+            let mut burst = PostBurst::new();
+            first.post_in(&mut burst, ev(1));
+            late.post_in(&mut burst, ev(10));
+            first.post_in(&mut burst, ev(2));
+            late.post_in(&mut burst, ev(11));
+            assert_eq!(count.0.load(Ordering::SeqCst), 0, "no wake mid-burst");
+        }
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "one wake per burst");
+        assert_eq!(circuit_event(&user), (0, 1));
+        assert_eq!(circuit_event(&user), (0, 2));
+        assert_eq!(circuit_event(&user), (cap, 10));
+        assert_eq!(circuit_event(&user), (cap, 11));
+        assert!(circuit_now(&user).is_pending());
     }
 }

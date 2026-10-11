@@ -245,7 +245,6 @@ pub enum ServerConnectionEvent {
 
 use super::LongStringMode;
 use crate::protocol::*;
-use crate::server::monitor::spawn_monitor_sender;
 use crate::server::outbox::Outbox;
 // The accumulator is shared with the blocking driver, but this file's only
 // user of it is the async `handle_client`; same gate as that fn, which is
@@ -703,7 +702,17 @@ struct ChannelEntry {
     /// is stored with the id because revoking it is the one teardown step
     /// that must happen before the delete-confirmed echo is queued, and it is
     /// driver-neutral.
-    subscriptions: HashMap<u32, crate::server::outbox::MonitorGate>,
+    subscriptions: HashMap<u32, ChannelMonitor>,
+}
+
+/// One monitor as its channel knows it: what CLEAR_CHANNEL and an access
+/// re-evaluation need, whichever driver holds the producer.
+pub(crate) struct ChannelMonitor {
+    pub gate: crate::server::outbox::MonitorGate,
+    /// C `asCheckGet` as `read_reply` sees it; flipped by
+    /// [`reeval_access_rights`].
+    pub denied: Arc<AtomicBool>,
+    pub id: epics_base_rs::server::event_queue::AttachId,
 }
 
 impl ChannelEntry {
@@ -736,59 +745,23 @@ impl ChannelEntry {
     }
 }
 
-impl SubscriptionEntry {
-    /// C `pevext->msg` — the EVENT_ADD request header rsrv stores alongside
-    /// the subscription and echoes back on the error path (`read_reply`
-    /// `camessage.c:516-524`, `no_read_access_event` `camessage.c:450-480`).
-    /// Rebuilt from the fields the entry already keeps, so it is the header
-    /// the client actually sent.
-    fn request_header(&self) -> CaHeader {
-        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
-        h.data_type = self.data_type;
-        h.cid = self.channel_sid;
-        h.available = self.sub_id;
-        // The client framed this request itself, so it is V49-capable by
-        // construction whenever the count needs the extended form.
-        h.set_payload_size(0, self.data_count, CA_MINOR_VERSION)
-            .expect("the client framed this very request");
-        h
-    }
-}
-
 struct SubscriptionEntry {
     target: ChannelTarget,
     channel_sid: u32,
-    sub_id: u32,
     data_type: u16,
     /// Original requested element count from the EVENT_ADD that
     /// installed this subscription. C `event_add_action` stores
     /// `pevext->msg.m_count`; monitor delivery and the
     /// EVENT_CANCEL ack both echo it.
     data_count: u32,
-    /// Gate flipped by `reeval_access_rights` when read access is
-    /// revoked / restored for `channel_sid`. While `true`, the
-    /// producer task drops events at the send step (matches C
-    /// `casAccessRightsCB`, `rsrv/camessage.c:1085-1093`, which
-    /// calls `db_event_disable` rather than tearing the
-    /// subscription down — so an ACF reload that later restores
-    /// access can resume the same camonitor).
-    denied: Arc<AtomicBool>,
     /// Revoked before this subscription's cancel confirmation is queued, so
     /// no monitor frame for it can follow that confirmation — C's
     /// `db_cancel_event` barrier, minus the wait. See
     /// [`MonitorGate`](crate::server::outbox::MonitorGate).
     gate: crate::server::outbox::MonitorGate,
-    task: epics_base_rs::runtime::task::TaskHandle<()>,
-    /// What the producer reads each event through; stored here so the
-    /// access-restore path sends its single event through the same stage
-    /// without re-borrowing the channel entry.
-    stage: super::DeliveryStage,
-    /// The validated `DBE_*` mask this EVENT_ADD requested — C
-    /// `pevent->select` (`dbEvent.c:482`). `db_post_single_event` seeds
-    /// the synthetic log's mask from it (`:746-754`, `:914-927`), so the
-    /// access-revoked and access-restored posts below must run the
-    /// pre-chain under THIS mask rather than a hardcoded `DBE_VALUE`.
-    select_mask: u16,
+    /// The monitor's slot on the circuit's queue (C `evSubscrip`). Dropping
+    /// it is C `db_cancel_event`: the slot and its queued entries go at once.
+    reader: epics_base_rs::server::event_queue::EventReader,
 }
 
 /// Per-circuit CA server state. `pub(crate)` so the blocking
@@ -878,7 +851,11 @@ pub(crate) struct ClientState {
     /// it. `None` until the first WRITE_NOTIFY forks async, because most
     /// circuits never have one. See [`WriteNotifyQueue`].
     write_notify_queue: Option<WriteNotifyQueue>,
-    /// Server-wide stats handle, cloned into each monitor task so the
+    /// This circuit's event task — C `event_task`, the one consumer of
+    /// `event_user`. `None` until the first EVENT_ADD. See
+    /// [`run_circuit_monitors`].
+    circuit_monitors: Option<CircuitMonitors>,
+    /// Server-wide stats handle, cloned into each monitor's context so the
     /// `subscription_events_posted` / `subscription_events_processed`
     /// counters (PCAS `caServer` parity, feeding the gateway's
     /// `serverPostRate` / `serverEventRate`) advance from the delivery
@@ -954,14 +931,9 @@ impl ClientState {
     /// The single owner of the channel→monitor association, so both drivers
     /// register through it and [`destroy_channel`] can cancel a cleared
     /// channel's monitors without knowing which registry holds them.
-    pub(crate) fn link_subscription(
-        &mut self,
-        sid: u32,
-        sub_id: u32,
-        gate: crate::server::outbox::MonitorGate,
-    ) {
+    pub(crate) fn link_subscription(&mut self, sid: u32, sub_id: u32, monitor: ChannelMonitor) {
         if let Some(chan) = self.channels.get_mut(&sid) {
-            chan.subscriptions.insert(sub_id, gate);
+            chan.subscriptions.insert(sub_id, monitor);
         }
     }
 
@@ -1016,6 +988,7 @@ impl ClientState {
             #[cfg(feature = "cap-tokens")]
             tls_channel_binding: None,
             write_notify_queue: None,
+            circuit_monitors: None,
             stats: None,
         }
     }
@@ -1039,6 +1012,24 @@ impl ClientState {
                 .abort_handle();
             WriteNotifyQueue { tx, task }
         })
+    }
+
+    /// Start this circuit's event task if it is not running. Lazily, as
+    /// [`Self::write_notify_queue`] is, and for the same single-owner reason.
+    fn start_circuit_monitors(
+        &mut self,
+        outbox: &Outbox,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) {
+        if self.circuit_monitors.is_none() {
+            let task = reactor
+                .spawn(run_circuit_monitors(
+                    self.event_user.clone(),
+                    outbox.clone(),
+                ))
+                .abort_handle();
+            self.circuit_monitors = Some(CircuitMonitors { task });
+        }
     }
 
     /// Decide this circuit's ACF host identity + mTLS auth context, once,
@@ -1100,6 +1091,11 @@ impl ClientState {
             let pv = self.channels.get(&sid).map(|e| e.target.audit_name());
             self.audit(event, pv.as_deref().unwrap_or_default(), value, result);
         }
+    }
+
+    /// The circuit's event user, for the event task that drains it.
+    pub(crate) fn event_user(&self) -> Arc<epics_base_rs::server::event_queue::EventUser> {
+        self.event_user.clone()
     }
 
     fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
@@ -2451,17 +2447,17 @@ where
     // explicit EVENT_CANCEL (TCP RST, network drop, panic). Without
     // this, `active_subscriptions` reports a permanent leak after
     // every ungraceful disconnect.
-    let pending_subs: Vec<SubscriptionEntry> =
-        state.subscriptions.drain().map(|(_, sub)| sub).collect();
-    for sub in pending_subs {
+    let pending_subs: Vec<(u32, SubscriptionEntry)> = state.subscriptions.drain().collect();
+    for (sub_id, sub) in pending_subs {
         sub.gate.revoke();
-        sub.task.abort();
+        let id = sub.reader.id();
+        drop(sub.reader);
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
-                pv.remove_subscriber(sub.sub_id);
+                pv.remove_subscriber(id);
             }
             ChannelTarget::RecordField { record, .. } => {
-                record.write().remove_subscriber(sub.sub_id);
+                record.write().remove_subscriber(id);
             }
         }
         if let Some(tx) = &conn_events {
@@ -2473,7 +2469,7 @@ where
             let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
                 peer,
                 pv_name,
-                sub_id: sub.sub_id,
+                sub_id,
             });
         }
     }
@@ -2483,6 +2479,7 @@ where
     // emitted. Dropping it is what aborts it — see `impl Drop for
     // WriteNotifyQueue`.
     drop(state.write_notify_queue.take());
+    drop(state.circuit_monitors.take());
 
     // Emit a `ChannelCleared` event for every channel still open at
     // disconnect time. Without this, a client that drops without
@@ -2560,14 +2557,14 @@ fn destroy_channel(
     // whichever driver installed them; the async server finds each one in
     // `state.subscriptions` and finishes here, and what it does not find is
     // left for the driver that owns it via `retired_subscriptions`.
-    for gate in entry.subscriptions.values() {
+    for monitor in entry.subscriptions.values() {
         // Before the caller queues CLEAR_CHANNEL's delete-confirmed echo
         // (or SERVER_DISCONN): `task.abort()` only lands at the task's next
         // await point, so without this a delivery already past `recv()`
         // would be enqueued after the confirmation. C `clear_channel_reply`
         // calls `db_cancel_event` for every pevext on the channel before
         // SEND_LOCK (`camessage.c:1890-1903`).
-        gate.revoke();
+        monitor.gate.revoke();
     }
     let sub_ids: Vec<u32> = entry.subscriptions.keys().copied().collect();
     for sub_id in sub_ids {
@@ -2579,13 +2576,14 @@ fn destroy_channel(
             continue;
         };
         {
-            sub.task.abort();
+            let id = sub.reader.id();
+            drop(sub.reader);
             match &sub.target {
                 ChannelTarget::SimplePv(pv) => {
-                    pv.remove_subscriber(sub.sub_id);
+                    pv.remove_subscriber(id);
                 }
                 ChannelTarget::RecordField { record, .. } => {
-                    record.write().remove_subscriber(sub.sub_id);
+                    record.write().remove_subscriber(id);
                 }
             }
             if let Some(tx) = conn_events {
@@ -3794,10 +3792,14 @@ pub(crate) async fn dispatch_message(
 
         CA_PROTO_EVENT_ADD => {
             // Thin caller: the parity logic lives in `register_subscription`
-            // (shared with the blocking RTEMS driver). Async mode spawns the
-            // producer task and this arm records it in `state.subscriptions`.
+            // (shared with the blocking RTEMS driver). Async mode enables the
+            // monitor on the circuit's event task and this arm records it in
+            // `state.subscriptions`.
             let sid = hdr.cid;
             let sub_id = hdr.available;
+            if let Some(reactor) = delivery.spawn_on() {
+                state.start_circuit_monitors(writer, reactor);
+            }
             let sub_id_in_use = state.subscriptions.contains_key(&sub_id);
             let channel_sub_count = || {
                 state
@@ -3824,24 +3826,28 @@ pub(crate) async fn dispatch_message(
                          dispatch_message; it has no event thread here to multiplex on"
                     )
                 }
-                SubscriptionOutcome::Spawned(s) => {
+                SubscriptionOutcome::Circuit(s) => {
                     // C `event_add_action` links the new `event_ext` onto
                     // `pciu->eventq` (`camessage.c:1846`): the channel is what
                     // knows its monitors, so CLEAR_CHANNEL can cancel them.
-                    state.link_subscription(s.channel_sid, s.sub_id, s.gate.clone());
+                    state.link_subscription(
+                        s.channel_sid,
+                        s.sub_id,
+                        ChannelMonitor {
+                            gate: s.gate.clone(),
+                            denied: s.denied,
+                            id: s.reader.id(),
+                        },
+                    );
                     state.subscriptions.insert(
                         s.sub_id,
                         SubscriptionEntry {
                             target: s.target,
                             channel_sid: s.channel_sid,
-                            sub_id: s.sub_id,
                             data_type: s.data_type,
                             data_count: s.data_count,
-                            denied: s.denied,
                             gate: s.gate.clone(),
-                            task: s.task,
-                            stage: s.stage,
-                            select_mask: s.mask,
+                            reader: s.reader,
                         },
                     );
                     if let Some(tx) = conn_events {
@@ -3878,13 +3884,14 @@ pub(crate) async fn dispatch_message(
                 // `pciu->eventq` before `db_cancel_event` (`camessage.c:2019`).
                 state.unlink_subscription(hdr.cid, sub_id);
                 if let Some(sub) = state.subscriptions.remove(&sub_id) {
-                    sub.task.abort();
+                    let id = sub.reader.id();
+                    drop(sub.reader);
                     match &sub.target {
                         ChannelTarget::SimplePv(pv) => {
-                            pv.remove_subscriber(sub.sub_id);
+                            pv.remove_subscriber(id);
                         }
                         ChannelTarget::RecordField { record, .. } => {
-                            record.write().remove_subscriber(sub.sub_id);
+                            record.write().remove_subscriber(id);
                         }
                     }
                     if let Some(tx) = conn_events {
@@ -5314,13 +5321,13 @@ async fn get_read_snapshot(
 }
 
 /// How [`register_subscription`] wires delivery of a freshly-registered
-/// subscription. The async TCP server spawns a producer task per subscription;
-/// the blocking (RTEMS) driver has no async runtime, so it takes the raw
+/// subscription. The async TCP server enables it on the circuit's event task
+/// ([`run_circuit_monitors`]); the blocking (RTEMS) driver has no async runtime, so it takes the raw
 /// [`EventReader`](epics_base_rs::server::event_queue::EventReader) and multiplexes every subscription on one event thread.
 #[derive(Clone)]
 pub(crate) enum SubscriptionDelivery {
-    /// C `event_add_action` async path: spawn the producer task on the
-    /// carried executor. The capability rides in the variant so a driver
+    /// C `event_add_action` async path: the circuit's event task, started on
+    /// the carried executor, delivers. The capability rides in the variant so a driver
     /// with no reactor cannot ask for a spawn — the illegal pairing is
     /// unrepresentable rather than checked.
     ///
@@ -5329,7 +5336,7 @@ pub(crate) enum SubscriptionDelivery {
     /// neither does this variant there, and the same rule ("no async
     /// front-end, no spawn") holds by construction on both.
     ///
-    /// Which is also why `spawn_on`, `SubscriptionOutcome::Spawned` and
+    /// Which is also why `spawn_on`, `SubscriptionOutcome::Circuit` and
     /// `register_subscription` name it in a code span rather than linking it:
     /// all three are compiled on every target and this variant is not, so an
     /// intra-doc link to it resolves in no embedded configuration.
@@ -5340,7 +5347,7 @@ pub(crate) enum SubscriptionDelivery {
 }
 
 impl SubscriptionDelivery {
-    /// The executor the producer task belongs on, or `None` when the caller
+    /// The executor the circuit's tasks belong on, or `None` when the caller
     /// drives delivery itself. Always `None` on the embedded targets, which
     /// have no `AsyncSpawn` to ask with.
     fn spawn_on(&self) -> Option<&epics_base_rs::runtime::task::Reactor> {
@@ -5357,9 +5364,9 @@ pub(crate) enum SubscriptionOutcome {
     /// A refusal frame (CA_PROTO_ERROR) was already queued; the caller returns
     /// without registering anything. C's admission-failure branches.
     Refused,
-    /// `SubscriptionDelivery::AsyncSpawn`: the producer task is running; the
-    /// caller records it in its subscription map.
-    Spawned(SpawnedSubscription),
+    /// `SubscriptionDelivery::AsyncSpawn`: the monitor is attached to the
+    /// circuit's event queue; the caller records it in its subscription map.
+    Circuit(CircuitSubscription),
     /// [`SubscriptionDelivery::HandOff`]: the live reader plus the metadata the
     /// caller needs to frame deliveries; no task was spawned.
     HandedOff(RegisteredSubscription),
@@ -5367,8 +5374,8 @@ pub(crate) enum SubscriptionOutcome {
 
 /// Everything the async caller needs to record a spawned subscription and emit
 /// its `SubscriptionOpened` event.
-pub(crate) struct SpawnedSubscription {
-    pub task: epics_base_rs::runtime::task::TaskHandle<()>,
+pub(crate) struct CircuitSubscription {
+    pub reader: epics_base_rs::server::event_queue::EventReader,
     pub gate: crate::server::outbox::MonitorGate,
     pub target: ChannelTarget,
     pub channel_sid: u32,
@@ -5376,7 +5383,6 @@ pub(crate) struct SpawnedSubscription {
     pub data_type: u16,
     pub data_count: u32,
     pub denied: Arc<AtomicBool>,
-    pub stage: super::DeliveryStage,
     pub mask: u16,
 }
 
@@ -5394,11 +5400,8 @@ pub(crate) struct RegisteredSubscription {
     pub sub_id: u32,
     pub data_type: u16,
     pub data_count: u32,
-    pub denied: Arc<AtomicBool>,
     pub gate: crate::server::outbox::MonitorGate,
-    pub stage: super::DeliveryStage,
-    pub client_minor: u16,
-    pub stats: Option<Arc<super::stats::ServerStats>>,
+    pub denied: Arc<AtomicBool>,
 }
 
 /// The subscription metadata [`cancel_subscription_reply`] needs, looked up by
@@ -5420,10 +5423,10 @@ pub(crate) struct CancelInfo {
 /// initial `db_post_single_event` snapshot, extracted so the async TCP
 /// dispatch and the blocking (RTEMS) driver share ONE copy. It performs
 /// no `state.subscriptions` mutation and emits no connection events — the
-/// caller owns those. In `SubscriptionDelivery::AsyncSpawn` mode it spawns
-/// the monitor producer task and returns [`SubscriptionOutcome::Spawned`];
-/// in [`SubscriptionDelivery::HandOff`] mode it returns the live
-/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) as [`SubscriptionOutcome::HandedOff`] before spawning, so
+/// caller owns those. In `SubscriptionDelivery::AsyncSpawn` mode it returns
+/// [`SubscriptionOutcome::Circuit`]; in [`SubscriptionDelivery::HandOff`]
+/// mode it returns the live
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) as [`SubscriptionOutcome::HandedOff`], so
 /// the blocking driver's single event thread can multiplex it (the driver
 /// has no async runtime to spawn onto). `channel_sub_count` and
 /// `sub_id_in_use` are read from the caller's own subscription registry so
@@ -5640,654 +5643,142 @@ pub(crate) async fn register_subscription(
         )?;
         return Ok(SubscriptionOutcome::Refused);
     }
-    {
-        match &entry.target {
-            ChannelTarget::SimplePv(pv) => {
-                let rx_opt = pv.add_subscriber_on(&state.event_user, sub_id, native_type, mask);
-                let Some(rx) = rx_opt else {
-                    // per-PV subscriber cap reached.
-                    // Previously dropped silently
-                    // (let the client time out). Now sends
-                    // ECA_ALLOCMEM so the client surfaces the
-                    // refusal immediately and can fall back to
-                    // a different transport, retry strategy,
-                    // or operator alert. Mirrors the
-                    // already-existing per-channel-cap response
-                    // a few lines above — same ECA code, same
-                    // shape.
-                    tracing::warn!(
-                        pv = %pv.name,
-                        sub_id,
-                        "EVENT_ADD refused: PV subscriber cap reached"
-                    );
-                    // CA_PROTO_ERROR for the
-                    // admission failure (see comment above
-                    // on the per-channel cap branch).
-                    send_ca_error(
-                        writer,
-                        hdr,
-                        ECA_ALLOCMEM,
-                        entry.cid,
-                        "EVENT_ADD refused: per-PV subscriber cap",
-                        state.client_minor_version,
-                    )?;
-                    return Ok(SubscriptionOutcome::Refused);
-                };
-
-                // attach the channel filter chain to the
-                // just-added SimplePv subscriber so update delivery
-                // (`ProcessVariable::notify_subscribers`) runs the
-                // SAME chain as a record-field monitor. Pre-fix a
-                // `SimplePv` monitor on a `.{...}` channel always
-                // used the empty default chain — the filter suffix
-                // was ignored entirely. Symmetric with the
-                // record-field `attach_filter_to_last_subscriber`
-                // path below; both source the chain from the single
-                // `ChannelEntry::filter_chain` owner.
-                pv.attach_filters_to_subscriber(sub_id, pre_chain);
-
-                let denied = Arc::new(AtomicBool::new(access_denied));
-                // One gate per subscription, revoked by whichever teardown
-                // confirms its cancellation (C `db_cancel_event`).
-                let gate = crate::server::outbox::MonitorGate::open();
-                // initial event is the snapshot when read
-                // access is granted, `no_read_access_event` when
-                // denied (C `event_add_action` → `read_reply`
-                // routes denial through `no_read_access_event`,
-                // `rsrv/camessage.c:529-535`).
-                if access_denied {
-                    // an autosize (`count == 0`) request
-                    // must be normalised to the target's live
-                    // element count before sizing the zero-
-                    // filled denial payload. C `read_reply`
-                    // (`camessage.c:504-509`) maps `m_count==0`
-                    // to `paddr->no_elements`; the denial frame
-                    // must match so it carries a nonzero DBR
-                    // body. A zero-payload `CA_PROTO_EVENT_ADD`
-                    // is indistinguishable from the historical
-                    // cancel-ack no-op and is silently dropped
-                    // by the client before the `ECA_NORDACCESS`
-                    // status is read (`cac.cpp` eventRespAction
-                    // returns on `m_postsize == 0`).
-                    // C calls `db_post_single_event`
-                    // unconditionally at monitor creation
-                    // (`camessage.c:1853`, BEFORE the access
-                    // check at 1858), so even the initial
-                    // DENIED post runs through the event-context
-                    // pre-chain; the ECA_NORDACCESS frame is
-                    // gated by it (`db_queue_event_log` fires
-                    // only `if(pLog)`). Skip the frame when the
-                    // chain drops the post — the subscription is
-                    // still registered below.
-                    let snap = pv.snapshot();
-                    if entry
-                        .filter_chain()
-                        .split()
-                        .0
-                        .apply_to_event_value(
-                            snap.value.clone(),
-                            epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                        )
-                        .is_some()
-                    {
-                        let denied_count =
-                            no_read_access_count(requested_count, snap.value.count());
-                        send_no_read_access_event(
-                            writer,
-                            CA_PROTO_EVENT_ADD,
-                            requested_type,
-                            denied_count,
-                            sub_id,
-                            ECA_NORDACCESS,
-                            ReplyContext {
-                                req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
-                            },
-                        )?;
-                    }
-                } else {
-                    let mut snap = pv.snapshot();
-                    // the initial monitor event is a
-                    // CA monitor single-event post (C
-                    // `db_post_single_event` →
-                    // `db_create_event_log` with
-                    // `dbfl_context_event`), NOT a one-shot
-                    // read. Run the EVENT-context chain
-                    // (`dec`/`sync` DO decimate/gate, unlike
-                    // `READ`) on a fresh throwaway chain so the
-                    // subscriber's attached chain state stays
-                    // isolated (`dbnd` baseline / `dec`
-                    // counter). `None` means the chain dropped
-                    // the post (C `db_queue_event_log` fires
-                    // only `if(pLog)`), so send no initial
-                    // frame — never fall back to the unfiltered
-                    // value.
-                    // The pre chain on the post, then the post chain and
-                    // the long-string conversion as the event task reads it.
-                    let init_chain = entry.filter_chain().split().0;
-                    match init_chain
-                        .apply_to_event_value(
-                            snap.value.clone(),
-                            epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                        )
-                        .and_then(|v| {
-                            snap.value = v;
-                            stage.prepare_snapshot(snap, requested_count, mask)
-                        }) {
-                        Some(snap) => {
-                            // the initial event honours
-                            // the EVENT_ADD request count for
-                            // BOTH directions —
-                            // `send_monitor_snapshot` now pads
-                            // when `requested_count` exceeds
-                            // the live element count and
-                            // truncates when it is smaller, via
-                            // `size_dbr_reply` (C
-                            // `read_reply` parity). The
-                            // producer task already
-                            // pads/truncates future updates
-                            // through the same helper, so the
-                            // initial frame and later frames
-                            // now share one shape.
-                            send_monitor_snapshot(
-                                writer,
-                                sub_id,
-                                requested_type,
-                                requested_count,
-                                &snap,
-                                ReplyContext {
-                                    req_hdr: *hdr,
-                                    client_minor: state.client_minor_version,
-                                },
-                            )?;
-                            // Initial subscription value — C posts
-                            // it via `db_post_single_event` at
-                            // monitor creation (`camessage.c:1853`),
-                            // so it counts as one posted and one
-                            // processed subscription event (PCAS
-                            // parity). Future updates flow through
-                            // the monitor task below.
-                            if let Some(ref s) = state.stats {
-                                s.subscription_events_posted
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                s.subscription_events_processed
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        None => {}
-                    }
-                }
-
-                let Some(sub_reactor) = mode.spawn_on() else {
-                    return Ok(SubscriptionOutcome::HandedOff(RegisteredSubscription {
-                        reader: rx,
-                        target: ChannelTarget::SimplePv(pv.clone()),
-                        cid: entry_cid,
-                        channel_sid: sid,
-                        sub_id,
-                        data_type: requested_type,
-                        data_count: requested_count,
-                        denied: denied.clone(),
-                        gate: gate.clone(),
-                        stage: stage.clone(),
-                        client_minor: state.client_minor_version,
-                        stats: state.stats.clone(),
-                    }));
-                };
-                let task = spawn_monitor_sender(
-                    sub_reactor,
+    let target = entry.target.clone();
+    let denied = Arc::new(AtomicBool::new(access_denied));
+    // One gate per subscription, revoked by whichever teardown confirms its
+    // cancellation (C `db_cancel_event`).
+    let gate = crate::server::outbox::MonitorGate::open();
+    // C `pevext`, handed to `db_add_event` as `user_arg`: every entry of this
+    // monitor, the initial one included, is framed from it. C stores the
+    // EVENT_ADD request (`pevext->msg`) with it, so each delivery is framed for
+    // this client's negotiated version and echoes this header if unbuildable.
+    let monitor = Arc::new(CircuitMonitor {
+        target: target.clone(),
+        sub_id,
+        data_type: requested_type,
+        data_count: requested_count,
+        denied: denied.clone(),
+        gate: gate.clone(),
+        stage,
+        reply: ReplyContext {
+            req_hdr: *hdr,
+            client_minor: state.client_minor_version,
+        },
+        stats: state.stats.clone(),
+        ended: AtomicBool::new(false),
+    });
+    let context: epics_base_rs::server::event_queue::DeliveryContext = monitor.clone();
+    // C `event_add_action` queues the initial value with
+    // `db_post_single_event` (`camessage.c:1904`), through the monitor's own
+    // pre-chain and into the circuit's ring, so EVENTS_OFF holds it like any
+    // update and `read_reply` answers it with `no_read_access_event` when
+    // read access is denied.
+    let rx = match &target {
+        ChannelTarget::SimplePv(pv) => {
+            let Some(rx) =
+                pv.add_subscriber_on(&state.event_user, sub_id, native_type, mask, &context)
+            else {
+                tracing::warn!(
+                    pv = %pv.name,
                     sub_id,
-                    requested_type,
-                    requested_count,
-                    writer.clone(),
-                    rx,
-                    denied.clone(),
-                    gate.clone(),
-                    stage.clone(),
-                    state.stats.clone(),
-                    ReplyContext {
-                        req_hdr: *hdr,
-                        client_minor: state.client_minor_version,
-                    },
+                    "EVENT_ADD refused: PV subscriber cap reached"
                 );
-
-                Ok(SubscriptionOutcome::Spawned(SpawnedSubscription {
-                    task,
-                    gate,
-                    target: ChannelTarget::SimplePv(pv.clone()),
-                    channel_sid: sid,
-                    sub_id,
-                    data_type: requested_type,
-                    data_count: requested_count,
-                    denied,
-                    stage: stage.clone(),
-                    mask,
-                }))
-            }
-            ChannelTarget::RecordField { record, field } => {
-                // Guarded segment: register the record-field subscriber,
-                // attach its filter chain, and snapshot the initial (or
-                // denial) event. The data guard is released at the block
-                // close before the writer awaits below (parking_lot guards
-                // are `!Send`); `None` means the subscriber cap was reached.
-                // Hoisted above the write guard, deliberately: a link-backed
-                // field's metadata comes from the LINK TARGET's record, so
-                // `PvDatabase::snapshot_for_field` takes locks of its own and
-                // `parking_lot` is not reentrant — reading it from inside the
-                // guard below is a deadlock, and reading it from the record
-                // alone is the X2 defect (the served precision would be the
-                // source's own PREC, not the target's).
-                //
-                // Reading the value BEFORE the subscriber is registered can
-                // only duplicate the initial value — a change landing in the
-                // window is delivered again as an ordinary update — while the
-                // old order could not drop one either. The asymmetry matters
-                // and points this way: C `event_add_action` registers first and
-                // posts second (`camessage.c:1853`), so a duplicate is the
-                // C-compatible direction and a drop is not.
-                let hoisted_snap =
-                    record_field_snapshot_scan_locked(&state.db, record, field, false);
-                let registered = 'registered: {
-                    let mut instance = record.write();
-                    let Some(rx) = instance.add_subscriber_on(
+                // ECA_ALLOCMEM so the client surfaces the refusal at once
+                // instead of timing out.
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_ALLOCMEM,
+                    entry.cid,
+                    "EVENT_ADD refused: per-PV subscriber cap",
+                    state.client_minor_version,
+                )?;
+                return Ok(SubscriptionOutcome::Refused);
+            };
+            // The same chain a record-field monitor runs, sourced from the
+            // single `ChannelEntry::filter_chain` owner.
+            pv.attach_filters_to_subscriber(rx.id(), pre_chain);
+            pv.post_single_event(rx.id(), Arc::new(pv.snapshot()));
+            rx
+        }
+        ChannelTarget::RecordField { record, field } => {
+            // Read outside the record guard: a link-backed field's metadata
+            // comes from the link target's record, so this takes locks of its
+            // own and `parking_lot` is not reentrant. C registers before it
+            // posts, so a change landing in between is at worst delivered
+            // twice, never lost.
+            let snap =
+                record_field_snapshot_scan_locked(&state.db, record, field, false).map(Arc::new);
+            let registered = {
+                let mut instance = record.write();
+                instance
+                    .add_subscriber_on(
                         &state.event_user,
                         field,
                         sub_id,
                         native_type,
                         mask,
-                    ) else {
-                        // record-field subscriber cap reached.
-                        // Symmetric with the SimplePv path; send
-                        // ECA_ALLOCMEM so the client surfaces the
-                        // refusal instead of timing out silently.
-                        tracing::warn!(
-                            record = %instance.name,
-                            field = %field,
-                            sub_id,
-                            "EVENT_ADD refused: record-field subscriber cap reached"
-                        );
-                        break 'registered None;
-                    };
-
-                    // epics-base 3.15.7 channel filter — attach the
-                    // chain (parsed via the single
-                    // `ChannelEntry::filter_chain` owner, the same one
-                    // the READ path and the SimplePv monitor now use)
-                    // to the just-registered subscriber. The parser is
-                    // permissive: malformed JSON or unknown filters
-                    // degrade gracefully to an empty chain with a
-                    // tracing::warn!, so an empty chain is a no-op loop.
-                    for filt in pre_chain.iter() {
-                        instance.attach_filter_to_last_subscriber(field, filt.clone());
-                    }
-
-                    // snapshot when read access granted,
-                    // no_read_access_event when denied. Drop the
-                    // instance write lock before await on the
-                    // writer so the producer task can pick it up.
-                    //
-                    // even on the denied path we must read
-                    // the field's live element count under the
-                    // lock, so an autosize (`count == 0`) denial
-                    // frame can be sized to a nonzero DBR body
-                    // instead of the zero-payload cancel-ack shape.
-                    let initial_snap = if access_denied {
-                        None
-                    } else {
-                        hoisted_snap.clone().and_then(|mut snap| {
-                            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                snap.class_name = Some(instance.record.record_type().to_string());
-                            }
-                            // the initial record-field monitor
-                            // event is an EVENT-context single-event
-                            // post (see the SimplePv branch) — run the
-                            // event-context chain (`dec`/`sync` apply)
-                            // on a fresh throwaway chain so the
-                            // subscriber's attached chain state stays
-                            // isolated. `None` means the chain dropped
-                            // the post (C `db_queue_event_log` fires
-                            // only `if(pLog)`); fold it through so the
-                            // send below is skipped — never fall back
-                            // to the unfiltered value.
-                            // The pre chain on the post, then the stage the
-                            // event task reads every event through.
-                            let init_chain = entry.filter_chain().split().0;
-                            let v = init_chain.apply_to_event_value(
-                                snap.value.clone(),
-                                epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                            )?;
-                            snap.value = v;
-                            stage.prepare_snapshot(snap, requested_count, mask)
-                        })
-                    };
-                    // Derive the field's element
-                    // count for the autosize-denial frame AND run
-                    // the event-context chain under the lock (the
-                    // value is needed for both). `snapshot_for_field`
-                    // is the same accessor the granted path uses, so
-                    // the denial count matches what a granted monitor
-                    // on the same field would carry. C
-                    // `event_add_action` calls `db_post_single_event`
-                    // unconditionally (`camessage.c:1853`, before the
-                    // access check), so the DENIED initial post is
-                    // gated by the event-context chain too:
-                    // `Some(count)` => send the ECA_NORDACCESS frame,
-                    // `None` => the chain dropped the post, send
-                    // nothing. A missing field snapshot keeps the
-                    // prior count=1 fallback (no value to filter).
-                    let denied_event_count = if access_denied {
-                        match hoisted_snap.clone() {
-                            Some(snap) => {
-                                let count = snap.value.count();
-                                entry
-                                    .filter_chain()
-                                    .split()
-                                    .0
-                                    .apply_to_event_value(
-                                        snap.value,
-                                        epics_base_rs::server::recgbl::EventMask::from_bits(mask),
-                                    )
-                                    .map(|_| count)
-                            }
-                            None => Some(1),
+                        &context,
+                    )
+                    .inspect(|rx| {
+                        for filt in pre_chain.iter() {
+                            instance.attach_filter_to_last_subscriber(field, filt.clone());
                         }
-                    } else {
-                        None
-                    };
-                    Some((rx, initial_snap, denied_event_count))
-                };
-                // Release the data guard, then handle the refusal (send the
-                // ECA_ALLOCMEM error and return) or bind the registered
-                // subscriber for the writer awaits below.
-                let (rx, initial_snap, denied_event_count) = match registered {
-                    None => {
-                        // CA_PROTO_ERROR for admission failure (libca's
-                        // eventRespAction treats zero-payload EVENT_ADD as a
-                        // cancel ack, so the prior send_cmd_error path lost).
-                        send_ca_error(
-                            writer,
-                            hdr,
-                            ECA_ALLOCMEM,
-                            entry.cid,
-                            &format!(
-                                "subscription install into record {} failed",
-                                entry.target.rsrv_record_name()
-                            ),
-                            state.client_minor_version,
-                        )?;
-                        return Ok(SubscriptionOutcome::Refused);
-                    }
-                    Some(t) => t,
-                };
-                if access_denied {
-                    // normalise autosize before sizing
-                    // the zero-filled denial payload. See the
-                    // SimplePv branch above for the C
-                    // `read_reply` (`camessage.c:507-509`)
-                    // parity rationale.
-                    if let Some(field_count) = denied_event_count {
-                        let denied_count = no_read_access_count(requested_count, field_count);
-                        send_no_read_access_event(
-                            writer,
-                            CA_PROTO_EVENT_ADD,
-                            requested_type,
-                            denied_count,
-                            sub_id,
-                            ECA_NORDACCESS,
-                            ReplyContext {
-                                req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
-                            },
-                        )?;
-                    }
-                } else if let Some(snap) = initial_snap {
-                    // initial event honours the
-                    // EVENT_ADD request count in both
-                    // directions — `send_monitor_snapshot`
-                    // pads an over-requested count and
-                    // truncates an under-requested one via
-                    // `size_dbr_reply`.
-                    send_monitor_snapshot(
-                        writer,
-                        sub_id,
-                        requested_type,
-                        requested_count,
-                        &snap,
-                        ReplyContext {
-                            req_hdr: *hdr,
-                            client_minor: state.client_minor_version,
-                        },
-                    )?;
-                    // Initial subscription value posted and
-                    // processed (C `db_post_single_event` at
-                    // monitor creation, `camessage.c:1853`); PCAS
-                    // parity. Later updates flow through the
-                    // monitor task below.
-                    if let Some(ref s) = state.stats {
-                        s.subscription_events_posted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        s.subscription_events_processed
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
-                // Clone the outbox handle for the RecordField monitor
-                // task: it pushes framed EVENT_ADD deliveries into the
-                // per-connection outbox, never touching the socket.
-                let denied = Arc::new(AtomicBool::new(access_denied));
-                // One gate per subscription, revoked by whichever teardown
-                // confirms its cancellation (C `db_cancel_event`).
-                let gate = crate::server::outbox::MonitorGate::open();
-                let Some(sub_reactor) = mode.spawn_on() else {
-                    return Ok(SubscriptionOutcome::HandedOff(RegisteredSubscription {
-                        reader: rx,
-                        target: ChannelTarget::RecordField {
-                            record: record.clone(),
-                            field: field.clone(),
-                        },
-                        cid: entry_cid,
-                        channel_sid: sid,
-                        sub_id,
-                        data_type: requested_type,
-                        data_count: requested_count,
-                        denied: denied.clone(),
-                        gate: gate.clone(),
-                        stage: stage.clone(),
-                        client_minor: state.client_minor_version,
-                        stats: state.stats.clone(),
-                    }));
-                };
-                let outbox_clone = writer.clone();
-                let record_for_task = record.clone();
-                let denied_for_task = denied.clone();
-                let gate_for_task = gate.clone();
-                let stats_for_task = state.stats.clone();
-                let stage_for_task = stage.clone();
-                // C stores the EVENT_ADD request (`pevext->msg`) with
-                // the subscription: every later delivery is framed for
-                // this client's negotiated version, and echoes this
-                // header if the frame turns out to be unbuildable.
-                let client_minor = state.client_minor_version;
-                let req_hdr = *hdr;
-                let task = sub_reactor.spawn(async move {
-                    let mut reader = rx;
-                    loop {
-                        // C `event_read` on this circuit's queue — the
-                        // same single owner `spawn_monitor_sender` uses,
-                        // so a pause means the same thing on both monitor
-                        // paths: suspend only while `flowCtrlMode &&
-                        // nDuplicates == 0`, otherwise drain. A post that
-                        // arrived while the ring was short of room
-                        // replaced this monitor's LAST queued entry in
-                        // place, so the earlier distinct entries are
-                        // still queued and each goes out as its own
-                        // frame.
-                        let Some(mut event) = reader.recv().await else {
-                            break;
-                        };
-                        // One subscription update committed for
-                        // delivery this cycle (post-coalesce).
-                        // PCAS `subscriptionEventsPosted` parity —
-                        // counted before the read-access gate so a
-                        // suppressed delivery reads as
-                        // posted-but-not-processed, the same
-                        // `serverPostRate` > `serverEventRate`
-                        // divergence the gateway expects.
-                        if let Some(ref s) = stats_for_task {
-                            s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+                        if let Some(snap) = snap {
+                            instance.post_single_event(field, rx.id(), snap);
                         }
-                        // C `casAccessRightsCB`
-                        // (`rsrv/camessage.c:1085-1093`)
-                        // suppresses delivery via
-                        // `db_event_disable` while read access
-                        // is denied, without tearing the
-                        // subscription down. Producer task
-                        // stays alive so a later re-enable
-                        // resumes the same camonitor; drop
-                        // the event here while denied.
-                        if denied_for_task.load(Ordering::Acquire) {
-                            continue;
-                        }
-                        // CA-268 monitor parity: populate
-                        // class_name on every emitted event so
-                        // a `ca_create_subscription` against
-                        // DBR_CLASS_NAME sees the record_type
-                        // string instead of an empty 40-byte
-                        // pad.
-                        if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                            std::sync::Arc::make_mut(&mut event.snapshot).class_name =
-                                Some(record_for_task.read().record.record_type().to_string());
-                        }
-                        // The post chain and the long-string conversion.
-                        // Both this and the CLASS_NAME override are
-                        // per-subscription rewrites of a snapshot every
-                        // other subscriber shares, so they take the
-                        // copy-on-write path — and only when they have
-                        // something to write, so an identity stage (the
-                        // common case) never copies.
-                        let Some(event) = stage_for_task.prepare(event, requested_count) else {
-                            continue;
-                        };
-                        // Header space reserved up front, payload encoded
-                        // straight into it — see `server::frame` for the C
-                        // `cas_copy_in_header` shape this ports.
-                        let mut frame = FrameBuf::acquire(outbox_clone.pool(), 0);
-                        match encode_dbr_into(frame.dst(), requested_type, &event.snapshot) {
-                            Ok(()) => {}
-                            Err(epics_base_rs::error::CaError::GetConvertFailed(_)) => {
-                                // C `read_reply` serves EVENT_ADD from the same
-                                // body as READ_NOTIFY, so a refused conversion
-                                // is a zeroed ECA_GETFAIL update
-                                // (`camessage.c:540-557`), not a dropped
-                                // subscription. The client keeps the monitor
-                                // and sees the status on each update.
-                                let _ = send_no_read_access_event(
-                                    &outbox_clone,
-                                    CA_PROTO_EVENT_ADD,
-                                    requested_type,
-                                    requested_count,
-                                    sub_id,
-                                    ECA_GETFAIL,
-                                    ReplyContext {
-                                        req_hdr,
-                                        client_minor,
-                                    },
-                                );
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                        // CA-268: see GET path note — fixed 1.
-                        //
-                        // Pre-fix Rust framed every update at the
-                        // live `snapshot.value.count()`, so an
-                        // EVENT_ADD with explicit `count=1` on a
-                        // waveform received the full N-element
-                        // waveform on every update instead of just
-                        // one element. `size_dbr_reply` owns the
-                        // request-count rule.
-                        let element_count = size_dbr_reply(
-                            &mut frame,
-                            requested_type,
-                            event.snapshot.value.count() as u32,
-                            requested_count,
-                        );
-                        frame.align_payload();
-
-                        let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
-                        // C client TCP parser requires 8-byte aligned postsize.
-                        // C `read_reply` (`camessage.c:515-524`): a pre-V49
-                        // client that cannot parse the extended header gets
-                        // ECA_16KARRAYCLIENT instead of a de-syncing frame.
-                        if ev
-                            .set_payload_size(frame.payload_len(), element_count, client_minor)
-                            .is_err()
-                        {
-                            let _ = send_16k_array_client_err(
-                                &outbox_clone,
-                                &req_hdr,
-                                req_hdr.cid,
-                                client_minor,
-                            );
-                            continue;
-                        }
-                        ev.data_type = requested_type;
-                        ev.cid = 1; // ECA_NORMAL
-                        ev.available = sub_id;
-
-                        // Back-pressure, taken once this event is known to
-                        // become a frame — after `recv`, so an idle producer
-                        // holds nothing (`super::outbox` invariant). With the
-                        // outbox full this parks the producer and later posts
-                        // coalesce in the ring instead of queueing.
-                        let credit = outbox_clone.reserve().await;
-                        // Abort-safety: this monitor task can be
-                        // `task.abort()`ed mid-flight by EVENT_CANCEL /
-                        // CLEAR_CHANNEL / disconnect cleanup. `seal`
-                        // yields the whole EVENT_ADD frame as ONE
-                        // contiguous buffer, handed to the outbox with a
-                        // single synchronous `push_with`, so an abort can
-                        // only land at a frame boundary — the connection
-                        // loop never observes a partial frame, and an abort
-                        // at the `reserve` above strands no credit.
-                        // Same barrier as `spawn_monitor_sender`: the enqueue
-                        // happens inside the gate, so a cancel confirmation
-                        // queued after `revoke` cannot be overtaken by this
-                        // frame (C `db_cancel_event` before SEND_LOCK).
-                        if gate_for_task
-                            .deliver(|| outbox_clone.push_with(frame.seal(&ev), credit))
-                            .is_none()
-                        {
-                            break;
-                        }
-                        // Frame handed to the outbox — PCAS
-                        // `subscriptionEventsProcessed` parity
-                        // (gateway `serverEventRate`).
-                        if let Some(ref s) = stats_for_task {
-                            s.subscription_events_processed
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-
-                Ok(SubscriptionOutcome::Spawned(SpawnedSubscription {
-                    task,
-                    gate,
-                    target: ChannelTarget::RecordField {
-                        record: record.clone(),
-                        field: field.clone(),
-                    },
-                    channel_sid: sid,
+                    })
+            };
+            let Some(rx) = registered else {
+                tracing::warn!(
+                    record = %record.read().name,
+                    field = %field,
                     sub_id,
-                    data_type: requested_type,
-                    data_count: requested_count,
-                    denied,
-                    stage: stage.clone(),
-                    mask,
-                }))
-            }
+                    "EVENT_ADD refused: record-field subscriber cap reached"
+                );
+                // CA_PROTO_ERROR: libca's eventRespAction treats a
+                // zero-payload EVENT_ADD as a cancel ack.
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_ALLOCMEM,
+                    entry.cid,
+                    &format!(
+                        "subscription install into record {} failed",
+                        entry.target.rsrv_record_name()
+                    ),
+                    state.client_minor_version,
+                )?;
+                return Ok(SubscriptionOutcome::Refused);
+            };
+            rx
         }
+    };
+
+    if mode.spawn_on().is_none() {
+        return Ok(SubscriptionOutcome::HandedOff(RegisteredSubscription {
+            reader: rx,
+            target,
+            cid: entry_cid,
+            channel_sid: sid,
+            sub_id,
+            data_type: requested_type,
+            data_count: requested_count,
+            gate,
+            denied,
+        }));
     }
+    Ok(SubscriptionOutcome::Circuit(CircuitSubscription {
+        reader: rx,
+        gate,
+        target,
+        channel_sid: sid,
+        sub_id,
+        data_type: requested_type,
+        data_count: requested_count,
+        denied,
+        mask,
+    }))
 }
 
 /// Shared EVENT_CANCEL wire logic (C `event_cancel_reply`,
@@ -6376,7 +5867,7 @@ pub(crate) fn cancel_subscription_reply(
 
 /// One subscription's delivery context for the blocking driver's event thread —
 /// the fields [`run_event_task`] needs to frame updates byte-identically to the
-/// async producer (`spawn_monitor_sender` / the record-field producer loop).
+/// async server's event task ([`run_circuit_monitors`]).
 pub(crate) struct MonitorDelivery {
     pub reader: epics_base_rs::server::event_queue::EventReader,
     pub target: ChannelTarget,
@@ -6385,15 +5876,6 @@ pub(crate) struct MonitorDelivery {
     /// channel's target was destroyed, and the retirement frame is addressed
     /// by cid — see [`server_disconn_frame`].
     pub cid: u32,
-    pub sub_id: u32,
-    pub data_type: u16,
-    pub data_count: u32,
-    pub denied: Arc<AtomicBool>,
-    pub gate: crate::server::outbox::MonitorGate,
-    pub stage: super::DeliveryStage,
-    pub req_hdr: CaHeader,
-    pub client_minor: u16,
-    pub stats: Option<Arc<super::stats::ServerStats>>,
 }
 
 /// Control messages from the blocking dispatch thread to its single event
@@ -6402,7 +5884,7 @@ pub(crate) struct MonitorDelivery {
 /// disconnect signal (C `db_close_events`).
 pub(crate) enum EventTaskControl {
     Add(Box<MonitorDelivery>),
-    Cancel(u32),
+    Cancel(epics_base_rs::server::event_queue::AttachId),
     /// A WRITE_NOTIFY whose record chain went async ([`serve_write_head`]
     /// returned [`WriteHeadOutcome::AsyncPending`]). The event thread awaits its
     /// completion receiver alongside the monitor readers and sends the deferred
@@ -6414,10 +5896,15 @@ pub(crate) enum EventTaskControl {
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
 enum EventStep {
-    /// Subscription `idx` produced an event (`None` = its producer is gone).
-    /// Boxed: a `MonitorEvent` dwarfs the `Control` variant, so the box keeps
+    /// The circuit's oldest entry and the monitor it is for. Boxed: a
+    /// `MonitorEvent` dwarfs the `Control` variant, so the box keeps
     /// `EventStep` small.
-    Delivered(usize, Option<Box<epics_base_rs::server::pv::MonitorEvent>>),
+    Delivered(
+        epics_base_rs::server::event_queue::DeliveryContext,
+        Box<epics_base_rs::server::pv::MonitorEvent>,
+    ),
+    /// Subscription `idx`'s producer is gone and its entries are delivered.
+    Ended(usize),
     /// A control message (`None` = the dispatch thread dropped the sender).
     Control(Option<EventTaskControl>),
     /// Pending write-completion `idx` fired (`Ok` = the record's chain settled,
@@ -6462,29 +5949,38 @@ async fn next_settled_write_notify(
 /// cycle. An empty collection is stood in for by a never-ready `pending()` so the
 /// `select` shape stays uniform.
 async fn next_event_step(
+    events: &epics_base_rs::server::event_queue::EventUser,
     subs: &mut [MonitorDelivery],
     pending_writes: &mut [PendingWriteNotify],
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
 ) -> EventStep {
-    use futures_util::future::{Either, pending, select, select_all};
+    use epics_base_rs::server::event_queue::CircuitEvent;
+    use futures_util::future::{Either, select};
 
-    let readers = async {
-        if subs.is_empty() {
-            pending::<(Option<Box<epics_base_rs::server::pv::MonitorEvent>>, usize)>().await
-        } else {
-            let recvs: Vec<_> = subs.iter_mut().map(|s| Box::pin(s.reader.recv())).collect();
-            let (event, idx, _rest) = select_all(recvs).await;
-            (event.map(Box::new), idx)
+    // C `event_read`: the circuit's oldest entry, whichever monitor it is for,
+    // framed from its slot's context — its `Add` may still be in the control
+    // queue. A monitor not in `subs` yet has no end to report: `Add` retires a
+    // destroyed target itself.
+    let readers = std::future::poll_fn(|cx| {
+        loop {
+            match std::task::ready!(events.poll_next(cx)) {
+                CircuitEvent::Event { context, event, .. } => {
+                    return std::task::Poll::Ready(EventStep::Delivered(context, Box::new(event)));
+                }
+                CircuitEvent::Ended(id) => {
+                    if let Some(idx) = subs.iter().position(|s| s.reader.id() == id) {
+                        return std::task::Poll::Ready(EventStep::Ended(idx));
+                    }
+                }
+            }
         }
-    };
+    });
     let writes = next_settled_write_notify(pending_writes);
     let ctrl = control.recv();
     tokio::pin!(readers, writes, ctrl);
 
     match select(select(readers, writes), ctrl).await {
-        Either::Left((Either::Left(((event, idx), _writes)), _ctrl)) => {
-            EventStep::Delivered(idx, event)
-        }
+        Either::Left((Either::Left((step, _writes)), _ctrl)) => step,
         Either::Left((Either::Right(((res, idx), _readers)), _ctrl)) => {
             EventStep::WriteDone(idx, res)
         }
@@ -6499,13 +5995,14 @@ async fn next_event_step(
 /// send lock the dispatch thread holds (C `client->lock`, `server.h:74`).
 /// `db_post_events` stays enqueue-only; this thread is the sole consumer.
 ///
-/// It multiplexes every subscription's [`EventReader`](epics_base_rs::server::event_queue::EventReader) (added via the control
-/// channel by the dispatch thread on EVENT_ADD, removed on EVENT_CANCEL) and
+/// It takes the circuit's queued entries in post order
+/// ([`EventUser::poll_next`](epics_base_rs::server::event_queue::EventUser::poll_next)) for the subscriptions the dispatch thread
+/// adds via the control channel on EVENT_ADD and removes on EVENT_CANCEL, and
 /// frames each delivery with [`super::monitor::send_event`] — the same builder
-/// the async `spawn_monitor_sender` uses — so a blocking-driver monitor update
+/// the async `deliver_monitor_event` uses — so a blocking-driver monitor update
 /// is byte-identical to the async server's. The record-field DBR_CLASS_NAME
 /// override (C `event_add_action` populates `record_type` per event) is applied
-/// here for parity with the async record-field producer loop.
+/// here for parity with the async `deliver_record_field_event`.
 ///
 /// It is ALSO the single owner of async WRITE_NOTIFY completion writes: the
 /// dispatch thread, forbidden from blocking on a put-callback (C `camsgtask`),
@@ -6519,6 +6016,7 @@ async fn next_event_step(
 /// error (peer gone) the thread exits. It returns when the control sender is
 /// dropped (clean disconnect) so the dispatch thread can join it.
 pub(crate) async fn run_event_task<W>(
+    events: Arc<epics_base_rs::server::event_queue::EventUser>,
     mut control: tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     mut write_frame: W,
 ) where
@@ -6544,7 +6042,7 @@ pub(crate) async fn run_event_task<W>(
     // send lock.
     let (ev_outbox, mut ev_drain) = crate::server::outbox::channel();
     loop {
-        match next_event_step(&mut subs, &mut pending_writes, &mut control).await {
+        match next_event_step(&events, &mut subs, &mut pending_writes, &mut control).await {
             // Dispatch thread dropped the control sender: clean disconnect.
             EventStep::Control(None) => break,
             EventStep::Control(Some(EventTaskControl::Add(d))) => {
@@ -6564,7 +6062,7 @@ pub(crate) async fn run_event_task<W>(
                 }
             }
             EventStep::Control(Some(EventTaskControl::Cancel(id))) => {
-                subs.retain(|s| s.sub_id != id)
+                subs.retain(|s| s.reader.id() != id)
             }
             EventStep::Control(Some(EventTaskControl::WriteComplete(p))) => pending_writes.push(*p),
             // End of stream, which has two causes needing opposite answers.
@@ -6591,7 +6089,7 @@ pub(crate) async fn run_event_task<W>(
             // parked in a blocking `read` and cannot be woken by a broadcast.
             // Here the retirement rides the end-of-stream the destruction
             // already produced, so it needs no wake of its own.
-            EventStep::Delivered(idx, None) => {
+            EventStep::Ended(idx) => {
                 let d = subs.remove(idx);
                 if !d.target.is_destroyed() {
                     continue;
@@ -6611,7 +6109,10 @@ pub(crate) async fn run_event_task<W>(
                     break;
                 }
             }
-            EventStep::Delivered(idx, Some(mut event)) => {
+            EventStep::Delivered(context, mut event) => {
+                let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
+                    continue;
+                };
                 // The gate spans BUILD AND SOCKET WRITE here, not just the
                 // enqueue as on the async path: this driver's frames reach the
                 // socket through `write_frame` under the send lock, so that —
@@ -6627,70 +6128,49 @@ pub(crate) async fn run_event_task<W>(
                 // every log still queued for a cancelled subscription
                 // (`user_sub == NULL` under LOCKEVQUE), so dropping it is the
                 // C answer, not an approximation of one.
-                let gate = subs[idx].gate.clone();
-                let step = gate.deliver(|| {
-                    // Frame the event with an immutable borrow of the subscription,
-                    // then release it before mutating `subs`.
-                    let (encode_ok, deliver) = {
-                        let d = &subs[idx];
-                        // C `db_event_get_field`: one subscription update committed
-                        // this cycle (PCAS `subscriptionEventsPosted`), counted
-                        // before the read-access gate.
-                        if let Some(ref s) = d.stats {
-                            s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
-                        }
-                        if d.denied.load(Ordering::Acquire) {
-                            // C `casAccessRightsCB` suppresses delivery while read
-                            // access is denied, without tearing the sub down.
-                            (true, false)
-                        } else {
-                            // CA-268: a record-field DBR_CLASS_NAME monitor carries
-                            // the record's type string (C `event_add_action`); the
-                            // async record-field producer sets it per event.
-                            if d.data_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                if let ChannelTarget::RecordField { record, .. } = &d.target {
-                                    std::sync::Arc::make_mut(&mut event.snapshot).class_name =
-                                        Some(record.read().record.record_type().to_string());
-                                }
-                            }
-                            let ok = super::monitor::send_event(
-                                d.data_type,
-                                d.data_count,
-                                d.sub_id,
-                                &event,
-                                &ev_outbox,
-                                // `ev_outbox` is this task's private one-delivery
-                                // scratch buffer, drained to the socket under the
-                                // send lock immediately below, so the socket — not
-                                // credit — is already this producer's bound.
-                                crate::server::outbox::Credit::none(),
-                                &d.stage,
-                                ReplyContext {
-                                    req_hdr: d.req_hdr,
-                                    client_minor: d.client_minor,
-                                },
-                            )
-                            .is_ok();
-                            (ok, ok)
-                        }
-                    };
-                    if !encode_ok {
-                        // An unsupported DBR type ends this monitor's producer loop.
-                        return DeliverStep::EndSubscription;
+                let step = m.gate.deliver(|| {
+                    // C `db_event_get_field`: one subscription update committed
+                    // this cycle (PCAS `subscriptionEventsPosted`), counted
+                    // before the read-access gate.
+                    if let Some(ref s) = m.stats {
+                        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
                     }
-                    if deliver {
-                        let mut peer_gone = false;
-                        while let Some(frame) = ev_drain.try_next() {
-                            if write_frame(&frame).is_err() {
-                                peer_gone = true;
-                                break;
+                    let denied = m.denied.load(Ordering::Acquire);
+                    if denied {
+                        send_denied_event(m, &event, &ev_outbox);
+                    } else {
+                        // CA-268: a record-field DBR_CLASS_NAME monitor carries
+                        // the record's type string (C `event_add_action`); the
+                        // async `deliver_record_field_event` sets it per event.
+                        if m.data_type == epics_base_rs::types::DBR_CLASS_NAME {
+                            if let ChannelTarget::RecordField { record, .. } = &m.target {
+                                std::sync::Arc::make_mut(&mut event.snapshot).class_name =
+                                    Some(record.read().record.record_type().to_string());
                             }
                         }
-                        if peer_gone {
+                        super::monitor::send_event(
+                            m.data_type,
+                            m.data_count,
+                            m.sub_id,
+                            &event,
+                            &ev_outbox,
+                            // `ev_outbox` is this task's private one-delivery
+                            // scratch buffer, drained to the socket under the
+                            // send lock immediately below, so the socket — not
+                            // credit — is already this producer's bound.
+                            crate::server::outbox::Credit::none(),
+                            &m.stage,
+                            m.reply,
+                        );
+                    }
+                    while let Some(frame) = ev_drain.try_next() {
+                        if write_frame(&frame).is_err() {
                             return DeliverStep::PeerGone;
                         }
-                        // Frame written (PCAS `subscriptionEventsProcessed`).
-                        if let Some(ref s) = subs[idx].stats {
+                    }
+                    // Frame written (PCAS `subscriptionEventsProcessed`).
+                    if !denied {
+                        if let Some(ref s) = m.stats {
                             s.subscription_events_processed
                                 .fetch_add(1, Ordering::Relaxed);
                         }
@@ -6702,10 +6182,6 @@ pub(crate) async fn run_event_task<W>(
                     // reader stays in `subs` until the `Cancel` control
                     // message that follows the confirmation removes it.
                     None | Some(DeliverStep::Delivered) => {}
-                    Some(DeliverStep::EndSubscription) => {
-                        subs.remove(idx);
-                        continue;
-                    }
                     Some(DeliverStep::PeerGone) => break,
                 }
             }
@@ -6775,17 +6251,9 @@ fn try_get_read_snapshot_local(
     }
 }
 
-/// Send an initial / access-restore monitor snapshot as a
-/// `CA_PROTO_EVENT_ADD` frame.
-///
-/// `requested_count` is the element count from the originating
-/// `CA_PROTO_EVENT_ADD` request; the encoded DBR payload is sized by
-/// `size_dbr_reply`, exactly as the READ path and the steady-state
-/// monitor producer are. Without that the first monitor frame (and
-/// the access-restore frame) was framed at `snapshot.value.count()`,
-/// so a client requesting more elements than the PV currently holds
-/// saw a count/size discontinuity between the initial frame and
-/// later padded updates.
+/// Test shim: the frame a monitor entry carrying `snapshot` gets, built by
+/// the one builder every entry, the initial value included, goes through.
+#[cfg(test)]
 fn send_monitor_snapshot(
     writer: &Outbox,
     sub_id: u32,
@@ -6794,55 +6262,21 @@ fn send_monitor_snapshot(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
     reply: ReplyContext,
 ) -> CaResult<()> {
-    let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
-    // Header space reserved up front, payload encoded straight into it — see
-    // `server::frame` for the C `cas_copy_in_header` shape this ports.
-    let mut frame = FrameBuf::acquire(writer.pool(), 0);
-    match encode_dbr_into(frame.dst(), data_type, snapshot) {
-        Ok(()) => {}
-        // Same C branch as the steady-state producer: the initial monitor
-        // update carries ECA_GETFAIL with a zeroed body rather than failing
-        // the subscription (`camessage.c:540-556`).
-        Err(epics_base_rs::error::CaError::GetConvertFailed(_)) => {
-            return send_no_read_access_event(
-                writer,
-                CA_PROTO_EVENT_ADD,
-                data_type,
-                requested_count,
-                sub_id,
-                ECA_GETFAIL,
-                reply,
-            );
-        }
-        Err(e) => return Err(e),
-    }
-    // Size the payload to the request count *before* the 8-byte alignment
-    // resize, so the header count and the payload shape agree.
-    let element_count = size_dbr_reply(
-        &mut frame,
+    let event = epics_base_rs::server::pv::MonitorEvent {
+        snapshot: Arc::new(snapshot.clone()),
+        origin: 0,
+        mask: epics_base_rs::server::recgbl::EventMask::VALUE,
+    };
+    super::monitor::send_event(
         data_type,
-        snapshot.value.count() as u32,
         requested_count,
+        sub_id,
+        &event,
+        writer,
+        crate::server::outbox::Credit::none(),
+        &super::DeliveryStage::plain(),
+        reply,
     );
-    frame.align_payload();
-
-    let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
-    // C client TCP parser requires 8-byte aligned postsize
-    if resp
-        .set_payload_size(frame.payload_len(), element_count, client_minor)
-        .is_err()
-    {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
-    }
-    resp.data_type = data_type;
-    resp.cid = 1; // ECA_NORMAL
-    resp.available = sub_id;
-
-    // Abort-safety: `seal` yields header + payload as ONE contiguous frame,
-    // handed to the outbox with a single `push`, so a cancel (send_timeout
-    // / task abort) can only land at a frame boundary — the connection loop
-    // never observes a partial frame.
-    writer.push(frame.seal(&resp));
     Ok(())
 }
 
@@ -6925,175 +6359,47 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         if old_read == new_read {
             continue;
         }
-        let affected: Vec<u32> = state
-            .subscriptions
-            .iter()
-            .filter(|(_, s)| s.channel_sid == sid)
-            .map(|(&id, _)| id)
-            .collect();
-        if affected.is_empty() {
+        // The channel's own monitor list, so a monitor the blocking driver
+        // holds is re-armed as well as one on the async circuit.
+        let Some(entry) = state.channels.get(&sid) else {
+            continue;
+        };
+        if entry.subscriptions.is_empty() {
             continue;
         }
-        if !new_read {
-            // Read access REVOKED. C path: db_post_single_event
-            // (which emits `no_read_access_event` — ECA_NORDACCESS
-            // in m_cid plus a `dbr_size_n(type, count)` zero-filled
-            // payload sized from the stored EVENT_ADD request) then
-            // db_event_disable. Pre-fix Rust sent a header-only
-            // frame; use `send_no_read_access_event`
-            // so the wire frame matches C byte-for-byte (the stored
-            // request count drives the zero-fill).
-            for sub_id in &affected {
-                let (data_type, sub_id_v, data_count, target, req_hdr, select_mask) = {
-                    let Some(sub) = state.subscriptions.get(sub_id) else {
-                        continue;
-                    };
-                    sub.denied.store(true, Ordering::Release);
-                    (
-                        sub.data_type,
-                        sub.sub_id,
-                        sub.data_count,
-                        sub.target.clone(),
-                        sub.request_header(),
-                        sub.select_mask,
-                    )
-                };
-                // C posts the access-revoked event through
-                // `db_post_single_event` (event-context pre-chain)
-                // BEFORE `db_event_disable` (`camessage.c:1090-1092`);
-                // the ECA_NORDACCESS frame is only sent when the chain
-                // passes the post (`db_queue_event_log` fires only
-                // `if(pLog)`). Run a fresh event-context chain on the
-                // current value and skip the frame when it drops — the
-                // `denied` gate is already set, so the producer stays
-                // disabled either way. The denial frame is zero-filled,
-                // so only the chain's pass/drop decision matters, not
-                // the filtered value.
-                let snap = get_full_snapshot(&state.db, &target);
-                let dropped_by_filter = match (state.channels.get(&sid), &snap) {
-                    (Some(entry), Some(snap)) => entry
-                        .filter_chain()
-                        .split()
-                        .0
-                        .apply_to_event_value(
-                            snap.value.clone(),
-                            epics_base_rs::server::recgbl::EventMask::from_bits(select_mask),
-                        )
-                        .is_none(),
-                    _ => false,
-                };
-                if dropped_by_filter {
-                    continue;
-                }
-                // an autosize (`data_count == 0`) subscription
-                // revoked here must also be normalised to the live
-                // element count, otherwise the access-revoked
-                // notification is the same zero-payload
-                // `CA_PROTO_EVENT_ADD` the client drops as a
-                // cancel-ack. Same C `read_reply` autosize parity
-                // (`camessage.c:504-509`) as the initial EVENT_ADD
-                // denial path.
-                let denied_count = if data_count == 0 {
-                    let actual = snap.as_ref().map(|snap| snap.value.count()).unwrap_or(1);
-                    no_read_access_count(data_count, actual)
-                } else {
-                    data_count
-                };
-                send_no_read_access_event(
-                    writer,
-                    CA_PROTO_EVENT_ADD,
-                    data_type,
-                    denied_count,
-                    sub_id_v,
-                    ECA_NORDACCESS,
-                    ReplyContext {
-                        req_hdr,
-                        client_minor: state.client_minor_version,
-                    },
-                )?;
-            }
-            // Denial frames pushed to the outbox; the connection loop drains
-            // and flushes them (no writer to flush here).
-        } else {
-            // Read access RESTORED. C path: db_event_enable then
-            // db_post_single_event. Clear the gate so the producer
-            // task resumes deliveries, and emit one snapshot of
-            // the current value so the subscriber sees a fresh
-            // event the moment access comes back (rather than
-            // waiting for the next natural update).
-            //
-            // the restore snapshot honours the stored
-            // EVENT_ADD request count in BOTH directions.
-            // `send_monitor_snapshot` pads when the request asked
-            // for more elements than the PV currently holds and
-            // truncates when it asked for fewer, via
-            // `size_dbr_reply` — so the access-restore
-            // frame matches the request shape and later padded
-            // updates. C `read_reply` always honours the stored
-            // request count; pre-fix Rust framed the restore event
-            // at the live `snapshot.value.count()`, only truncating
-            // and never padding.
-            for sub_id in &affected {
-                let (target, data_type, data_count, sub_id_val, sub_stage, req_hdr, select_mask) = {
-                    let Some(sub) = state.subscriptions.get(sub_id) else {
-                        continue;
-                    };
-                    sub.denied.store(false, Ordering::Release);
-                    (
-                        sub.target.clone(),
-                        sub.data_type,
-                        sub.data_count,
-                        sub.sub_id,
-                        sub.stage.clone(),
-                        sub.request_header(),
-                        sub.select_mask,
-                    )
-                };
-                if let Some(mut snap) = get_full_snapshot(&state.db, &target) {
-                    // C enables the event (`db_event_enable`)
-                    // THEN posts the current value through the
-                    // event-context pre-chain
-                    // (`db_post_single_event`, `camessage.c:1086-1088`);
-                    // the restore frame is sent only when the chain
-                    // passes (`db_queue_event_log` fires only
-                    // `if(pLog)`) and carries the FILTERED value. The
-                    // `denied` gate is already cleared above so future
-                    // natural updates resume; a fresh event-context
-                    // chain per subscriber keeps `dec`/`sync`/`dbnd`
-                    // state isolated. `None` => send no restore frame.
-                    if let Some(entry) = state.channels.get(&sid) {
-                        match entry.filter_chain().split().0.apply_to_event_value(
-                            snap.value.clone(),
-                            epics_base_rs::server::recgbl::EventMask::from_bits(select_mask),
-                        ) {
-                            Some(v) => snap.value = v,
-                            None => continue,
-                        }
+        // Read before the record guard: a link-backed field's metadata
+        // takes the link target's lock.
+        let snap = get_full_snapshot(&state.db, &entry.target).map(Arc::new);
+        // C `casAccessRightsCB` (`camessage.c:1114-1122`): a monitor losing
+        // read access posts a single event, which `read_reply` answers with
+        // `no_read_access_event`, and is then disabled; one regaining it is
+        // enabled and then posts the current value. Both posts take the
+        // monitor's pre-chain and ring like any update.
+        for monitor in entry.subscriptions.values() {
+            monitor.denied.store(!new_read, Ordering::Release);
+            let id = monitor.id;
+            match &entry.target {
+                ChannelTarget::SimplePv(pv) => {
+                    if new_read {
+                        pv.set_subscriber_active(id, true);
                     }
-                    // Then the stage the producer reads every event through.
-                    let Some(snap) = sub_stage.prepare_snapshot(snap, data_count, select_mask)
-                    else {
-                        continue;
-                    };
-                    send_monitor_snapshot(
-                        writer,
-                        sub_id_val,
-                        data_type,
-                        data_count,
-                        &snap,
-                        ReplyContext {
-                            req_hdr,
-                            client_minor: state.client_minor_version,
-                        },
-                    )?;
-                    // Access-restore post — C `db_event_enable` then
-                    // `db_post_single_event` (`camessage.c:1086-1088`):
-                    // one posted and one processed subscription event,
-                    // same PCAS accounting as the initial value.
-                    if let Some(ref s) = state.stats {
-                        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
-                        s.subscription_events_processed
-                            .fetch_add(1, Ordering::Relaxed);
+                    if let Some(snap) = &snap {
+                        pv.post_single_event(id, snap.clone());
+                    }
+                    if !new_read {
+                        pv.set_subscriber_active(id, false);
+                    }
+                }
+                ChannelTarget::RecordField { record, field } => {
+                    let mut instance = record.write();
+                    if new_read {
+                        instance.set_subscriber_active(id, true);
+                    }
+                    if let Some(snap) = &snap {
+                        instance.post_single_event(field, id, snap.clone());
+                    }
+                    if !new_read {
+                        instance.set_subscriber_active(id, false);
                     }
                 }
             }
@@ -7194,6 +6500,27 @@ pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
     epics_base_rs::runtime::log::errlog_printf(&format!("CAS: forcing disconnect from {peer}\n"));
 }
 
+/// C `read_reply` without read access (`camessage.c:534-535`): a monitor
+/// entry is answered with `no_read_access_event`. While denied the subscriber
+/// is disabled, so what reaches here is the single-event post the access
+/// change queued, and entries queued before it.
+pub(crate) fn send_denied_event(
+    m: &CircuitMonitor,
+    event: &epics_base_rs::server::pv::MonitorEvent,
+    outbox: &Outbox,
+) {
+    let count = no_read_access_count(m.data_count, event.snapshot.value.count());
+    let _ = send_no_read_access_event(
+        outbox,
+        CA_PROTO_EVENT_ADD,
+        m.data_type,
+        count,
+        m.sub_id,
+        ECA_NORDACCESS,
+        m.reply,
+    );
+}
+
 /// Send a `no_read_access_event`-shaped reply: same wire frame as the
 /// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
 /// ECA status and a `dbr_buffer_size`-sized zero payload. C
@@ -7206,6 +6533,27 @@ pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
 /// callers on the EVENT_ADD denial path must pass a `count`
 /// already normalised through [`no_read_access_count`] so an autosize
 /// (`count == 0`) request does not produce a zero-payload frame.
+/// C `read_reply` on a subscription update whose `dbChannel_get` failed
+/// (`camessage.c:545-561`): a zeroed update, count 0 when autosized, with
+/// `m_cid = ECA_GETFAIL`. The subscription stays.
+pub(crate) fn send_get_fail_event(
+    writer: &Outbox,
+    data_type: u16,
+    data_count: u32,
+    sub_id: u32,
+    reply: ReplyContext,
+) {
+    let _ = send_no_read_access_event(
+        writer,
+        CA_PROTO_EVENT_ADD,
+        data_type,
+        data_count,
+        sub_id,
+        ECA_GETFAIL,
+        reply,
+    );
+}
+
 fn send_no_read_access_event(
     writer: &Outbox,
     cmd: u16,
@@ -7248,7 +6596,7 @@ pub(crate) fn status_event_frame(
     let hdr_bytes = hdr.to_bytes_extended();
     // Build header + zero payload as one contiguous frame so a
     // task abort can only land at a frame boundary (same abort-
-    // safety invariant as `send_event` / `send_monitor_snapshot`).
+    // safety invariant as `send_event`).
     let mut frame = Vec::with_capacity(hdr_bytes.len() + padded_size);
     frame.extend_from_slice(&hdr_bytes);
     frame.resize(frame.len() + padded_size, 0);
@@ -7496,6 +6844,171 @@ pub(crate) struct ReplyContext {
     pub(crate) client_minor: u16,
 }
 
+/// One async monitor's delivery context — C `user_sub`/`user_arg` — handed
+/// to the circuit's event task with each queued entry
+/// ([`EventReader::enable`](epics_base_rs::server::event_queue::EventReader::enable)).
+pub(crate) struct CircuitMonitor {
+    pub(crate) target: ChannelTarget,
+    pub(crate) sub_id: u32,
+    pub(crate) data_type: u16,
+    pub(crate) data_count: u32,
+    pub(crate) denied: Arc<AtomicBool>,
+    pub(crate) gate: crate::server::outbox::MonitorGate,
+    pub(crate) stage: super::DeliveryStage,
+    pub(crate) reply: ReplyContext,
+    pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
+    /// The monitor's frame could not be built; its later entries are dropped.
+    /// Only the event task touches it.
+    pub(crate) ended: AtomicBool,
+}
+
+/// C `event_task` for the async server: the one consumer of this circuit's
+/// event queues, so monitor updates reach the outbox in the order they were
+/// posted across every monitor on the circuit, as `event_read` walks the
+/// ring (`dbEvent.c:957-1006`).
+pub(crate) async fn run_circuit_monitors(
+    events: Arc<epics_base_rs::server::event_queue::EventUser>,
+    outbox: Outbox,
+) {
+    use epics_base_rs::server::event_queue::CircuitEvent;
+    loop {
+        // An ended stream needs nothing here: the connection loop retires a
+        // destroyed channel itself (`sweep_destroyed_channels`).
+        let CircuitEvent::Event { context, event, .. } =
+            std::future::poll_fn(|cx| events.poll_next(cx)).await
+        else {
+            continue;
+        };
+        let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
+            continue;
+        };
+        if m.ended.load(Ordering::Relaxed) {
+            continue;
+        }
+        match &m.target {
+            ChannelTarget::SimplePv(_) => {
+                super::monitor::deliver_monitor_event(m, event, &outbox).await
+            }
+            ChannelTarget::RecordField { record, .. } => {
+                deliver_record_field_event(m, record, event, &outbox).await
+            }
+        }
+    }
+}
+
+/// Deliver one queued entry of a record-field monitor.
+async fn deliver_record_field_event(
+    m: &CircuitMonitor,
+    record: &RecordCell,
+    mut event: epics_base_rs::server::pv::MonitorEvent,
+    outbox: &Outbox,
+) {
+    // One subscription update committed for delivery this cycle
+    // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
+    // counted before the read-access gate so a suppressed
+    // delivery reads as posted-but-not-processed, the same
+    // `serverPostRate` > `serverEventRate` divergence the gateway
+    // expects.
+    if let Some(ref s) = m.stats {
+        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+    }
+    if m.denied.load(Ordering::Acquire) {
+        m.gate.deliver(|| send_denied_event(m, &event, outbox));
+        return;
+    }
+    // CA-268 monitor parity: populate class_name on every emitted
+    // event so a `ca_create_subscription` against DBR_CLASS_NAME
+    // sees the record_type string instead of an empty 40-byte pad.
+    if m.data_type == epics_base_rs::types::DBR_CLASS_NAME {
+        std::sync::Arc::make_mut(&mut event.snapshot).class_name =
+            Some(record.read().record.record_type().to_string());
+    }
+    // The post chain and the long-string conversion. Both this and the
+    // CLASS_NAME override are per-subscription rewrites of a snapshot every
+    // other subscriber shares, so they take the copy-on-write path — and
+    // only when they have something to write, so an identity stage (the
+    // common case) never copies.
+    let Some(event) = m.stage.prepare(event, m.data_count) else {
+        return;
+    };
+    // Header space reserved up front, payload encoded straight into
+    // it — see `server::frame` for the C `cas_copy_in_header` shape
+    // this ports.
+    let mut frame = FrameBuf::acquire(outbox.pool(), 0);
+    if encode_dbr_into(frame.dst(), m.data_type, &event.snapshot).is_err() {
+        send_get_fail_event(outbox, m.data_type, m.data_count, m.sub_id, m.reply);
+        return;
+    }
+    // CA-268: an EVENT_ADD with explicit `count=1` on a waveform
+    // gets one element, not the live N; `size_dbr_reply` owns the
+    // request-count rule.
+    let element_count = size_dbr_reply(
+        &mut frame,
+        m.data_type,
+        event.snapshot.value.count() as u32,
+        m.data_count,
+    );
+    frame.align_payload();
+
+    let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
+    // C client TCP parser requires 8-byte aligned postsize.
+    // C `read_reply` (`camessage.c:515-524`): a pre-V49 client that
+    // cannot parse the extended header gets ECA_16KARRAYCLIENT
+    // instead of a de-syncing frame.
+    if ev
+        .set_payload_size(frame.payload_len(), element_count, m.reply.client_minor)
+        .is_err()
+    {
+        let _ = send_16k_array_client_err(
+            outbox,
+            &m.reply.req_hdr,
+            m.reply.req_hdr.cid,
+            m.reply.client_minor,
+        );
+        return;
+    }
+    ev.data_type = m.data_type;
+    ev.cid = 1; // ECA_NORMAL
+    ev.available = m.sub_id;
+
+    // Back-pressure, taken once this event is known to become a
+    // frame (`super::outbox` invariant). With the outbox full this
+    // parks the circuit's event task and later posts coalesce in the
+    // ring instead of queueing.
+    let credit = outbox.reserve().await;
+    // `seal` yields the whole EVENT_ADD frame as ONE contiguous
+    // buffer, handed to the outbox with a single synchronous
+    // `push_with`, so the disconnect abort can only land at a frame
+    // boundary. The enqueue happens inside the gate, so a cancel
+    // confirmation queued after `revoke` cannot be overtaken by this
+    // frame (C `db_cancel_event` before SEND_LOCK).
+    if m.gate
+        .deliver(|| outbox.push_with(frame.seal(&ev), credit))
+        .is_some()
+    {
+        // Frame handed to the outbox — PCAS
+        // `subscriptionEventsProcessed` parity (gateway
+        // `serverEventRate`).
+        if let Some(ref s) = m.stats {
+            s.subscription_events_processed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The connection loop's handle on its [`run_circuit_monitors`] task.
+/// Dropping it aborts the task, for the reason [`WriteNotifyQueue`]'s drop
+/// does.
+struct CircuitMonitors {
+    task: epics_base_rs::runtime::task::TaskAbortHandle,
+}
+
+impl Drop for CircuitMonitors {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// What the async server's connection loop tells its put-callback completion
 /// owner.
 enum WriteNotifyQueueMsg {
@@ -7552,8 +7065,6 @@ impl Drop for WriteNotifyQueue {
 enum DeliverStep {
     /// The frame went out, or was suppressed by the read-access gate.
     Delivered,
-    /// C: an unencodable field ends this monitor's producer loop.
-    EndSubscription,
     /// The socket write failed; the client is gone.
     PeerGone,
 }
@@ -9594,6 +9105,83 @@ mod non_graceful_disconnect_teardown_tests {
         );
         assert_eq!(hdr.data_type, 4, "long-string SimplePv advertises DBR_CHAR");
         assert_eq!(hdr.count, 40, "long-string SimplePv advertises 40 elements");
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// A SimplePv monitor whose get fails keeps its subscription, as softIoc
+    /// does for `stringin GF "abc"` under a DBR_DOUBLE count-0 EVENT_ADD
+    /// (`camessage.c:545-561`): two zeroed count-0 ECA_GETFAIL updates for
+    /// "abc" and "def", then the value of "1.5".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_pv_failed_get_keeps_the_monitor() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("gf:simple", EpicsValue::String("abc".into()))
+            .await
+            .expect("add string pv");
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55226".parse().unwrap();
+        let server_db = db.clone();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                server_db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xA2, "gf:simple"))
+            .await
+            .expect("create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        let mut add = event_add_frame(sid, 7);
+        add[4..6].copy_from_slice(&epics_base_rs::types::DBR_DOUBLE.to_be_bytes());
+        add[6..8].copy_from_slice(&0u16.to_be_bytes());
+        client.write_all(&add).await.expect("event_add");
+
+        async fn next_event_add(c: &mut tokio::io::DuplexStream) -> Vec<u8> {
+            loop {
+                let mut frame = vec![0u8; 16];
+                tokio::time::timeout(Duration::from_secs(3), c.read_exact(&mut frame))
+                    .await
+                    .expect("an EVENT_ADD within 3 s")
+                    .expect("read header");
+                let size = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+                frame.resize(16 + size, 0);
+                c.read_exact(&mut frame[16..]).await.expect("read body");
+                if u16::from_be_bytes([frame[0], frame[1]]) == CA_PROTO_EVENT_ADD {
+                    return frame;
+                }
+            }
+        }
+        let get_fail = vec![0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 152, 0, 0, 0, 7];
+        assert_eq!(next_event_add(&mut client).await, get_fail);
+        let pv = db.find_pv("gf:simple").await.expect("simple pv");
+        pv.set(EpicsValue::String("def".into()));
+        assert_eq!(next_event_add(&mut client).await, get_fail);
+        pv.set(EpicsValue::String("1.5".into()));
+        let value = next_event_add(&mut client).await;
+        assert_eq!(&value[2..12], &[0, 8, 0, 6, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(&value[16..], &1.5f64.to_be_bytes());
 
         drop(client);
         handle.abort();
@@ -12506,7 +12094,7 @@ mod destroyed_channel_teardown_tests {
     async fn a_late_handed_subscription_does_not_retire_the_channel_again() {
         use epics_base_rs::server::event_queue::EventUser;
         use epics_base_rs::server::recgbl::EventMask;
-        use epics_base_rs::types::{DBR_DOUBLE, DbFieldType};
+        use epics_base_rs::types::DbFieldType;
 
         const CID: u32 = 0x0BAD_1A7E;
         let db = Arc::new(PvDatabase::new());
@@ -12515,13 +12103,19 @@ mod destroyed_channel_teardown_tests {
             .expect("add_pv");
         let pv = db.find_pv("BR3:LATEADD").await.expect("just added");
 
-        let user = EventUser::new();
+        let user = Arc::new(EventUser::new());
         let mask = (EventMask::VALUE | EventMask::LOG).bits();
         let mut readers = Vec::new();
         for sub_id in [1u32, 2] {
             readers.push(
-                pv.add_subscriber_on(&user, sub_id, DbFieldType::Double, mask)
-                    .expect("under the per-PV cap"),
+                pv.add_subscriber_on(
+                    &user,
+                    sub_id,
+                    DbFieldType::Double,
+                    mask,
+                    epics_base_rs::server::event_queue::no_context(),
+                )
+                .expect("under the per-PV cap"),
             );
         }
         // Both readers exist before the death, which is the only order that
@@ -12530,33 +12124,28 @@ mod destroyed_channel_teardown_tests {
             .await
             .expect("was registered");
 
-        let delivery = |sub_id: u32, reader: epics_base_rs::server::event_queue::EventReader| {
+        let delivery = |reader: epics_base_rs::server::event_queue::EventReader| {
             Box::new(MonitorDelivery {
-                gate: crate::server::outbox::MonitorGate::open(),
                 reader,
                 target: ChannelTarget::SimplePv(pv.clone()),
                 cid: CID,
-                sub_id,
-                data_type: DBR_DOUBLE,
-                data_count: 1,
-                denied: Arc::new(AtomicBool::new(false)),
-                stage: crate::server::DeliveryStage::plain(),
-                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
-                client_minor: CA_MINOR_VERSION,
-                stats: None,
             })
         };
 
         let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let task = tokio::spawn(run_event_task(ctl_rx, move |bytes: &[u8]| {
-            let _ = frame_tx.send(bytes.to_vec());
-            Ok(())
-        }));
+        let task = tokio::spawn(run_event_task(
+            user.clone(),
+            ctl_rx,
+            move |bytes: &[u8]| {
+                let _ = frame_tx.send(bytes.to_vec());
+                Ok(())
+            },
+        ));
 
         let mut readers = readers.into_iter();
         ctl_tx
-            .send(EventTaskControl::Add(delivery(1, readers.next().unwrap())))
+            .send(EventTaskControl::Add(delivery(readers.next().unwrap())))
             .expect("event task is running");
 
         // Wait for the retirement the first subscription produces, so the
@@ -12571,7 +12160,7 @@ mod destroyed_channel_teardown_tests {
         );
 
         ctl_tx
-            .send(EventTaskControl::Add(delivery(2, readers.next().unwrap())))
+            .send(EventTaskControl::Add(delivery(readers.next().unwrap())))
             .expect("event task is running");
         drop(ctl_tx);
         task.await.expect("event task ends when the sender drops");
@@ -12647,7 +12236,7 @@ mod cancel_confirmation_ordering_tests {
     /// delivery on a DBR_TIME_DOUBLE monitor always carries a payload, so the
     /// two are distinguishable on the wire. Each round posts a burst while the
     /// cancel is in flight, which is the window the barrier closes: without it
-    /// the producer task is inside a delivery when the connection loop queues
+    /// the event task is inside a delivery when the connection loop queues
     /// the echo, and the frame lands behind it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_monitor_update_follows_its_cancel_confirmation() {
@@ -13392,5 +12981,263 @@ mod scalar_string_without_nul_tests {
             ]
         );
         epics_base_rs::runtime::log::errlog_remove_listener(listener);
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod circuit_event_order_tests {
+    //! C `event_read` delivers a circuit's monitors in the order their posts
+    //! were queued (`dbEvent.c:957-1006`), not one monitor's backlog after
+    //! another's.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The monitor ids of the next `n` EVENT_ADD frames, in wire order.
+    async fn event_add_ids(client: &mut tokio::io::DuplexStream, n: usize) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 1024];
+        while ids.len() < n {
+            let got = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                .await
+                .expect("read within timeout")
+                .expect("read ok");
+            assert!(got > 0, "server closed after {ids:?}");
+            acc.extend_from_slice(&buf[..got]);
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= acc.len() {
+                let (hdr, hdr_size) =
+                    CaHeader::from_bytes_extended(&acc[offset..]).expect("header parses");
+                let len = hdr_size + hdr.actual_postsize();
+                if offset + len > acc.len() {
+                    break;
+                }
+                if hdr.cmmd == CA_PROTO_EVENT_ADD {
+                    ids.push(hdr.available);
+                }
+                offset += len;
+            }
+            acc.drain(..offset);
+        }
+        ids
+    }
+
+    /// Posts to two monitors of one circuit, interleaved before the server
+    /// runs again, reach the wire interleaved. A task per monitor drained
+    /// each monitor's whole backlog in turn: 1, 1, 2, 2.
+    #[tokio::test]
+    async fn interleaved_posts_on_two_monitors_reach_the_wire_in_post_order() {
+        let db = Arc::new(PvDatabase::new());
+        for name in ["ORD:a", "ORD:b"] {
+            db.add_pv(name, EpicsValue::Double(0.0))
+                .await
+                .expect("add pv");
+        }
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_tx, acf_rx) = broadcast::channel::<()>(4);
+        let (mut client, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            "127.0.0.1:55401".parse().unwrap(),
+            db.clone(),
+            acf,
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+
+        client.write_all(&version_frame()).await.expect("version");
+        let mut sids = Vec::new();
+        for (cid, name) in [(1, "ORD:a"), (2, "ORD:b")] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .expect("create_chan");
+            client.flush().await.expect("flush");
+            sids.push(read_create_chan_sid(&mut client, Duration::from_secs(3)).await);
+        }
+        for (sub_id, sid) in [(1, sids[0]), (2, sids[1])] {
+            client
+                .write_all(&event_add_frame(sid, sub_id))
+                .await
+                .expect("event_add");
+        }
+        client.flush().await.expect("flush");
+        assert_eq!(
+            event_add_ids(&mut client, 2).await,
+            [1, 2],
+            "initial values"
+        );
+
+        let a = db.find_pv("ORD:a").await.expect("added");
+        let b = db.find_pv("ORD:b").await.expect("added");
+        a.set(EpicsValue::Double(1.0));
+        b.set(EpicsValue::Double(1.0));
+        a.set(EpicsValue::Double(2.0));
+        b.set(EpicsValue::Double(2.0));
+        assert_eq!(event_add_ids(&mut client, 4).await, [1, 2, 1, 2]);
+
+        drop(client);
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod access_change_walk_tests {
+    //! C `casAccessRightsCB` walks the channel's own `pciu->eventq`
+    //! (`camessage.c:1111-1126`), so a monitor whose producer the blocking
+    //! driver holds, outside `ClientState::subscriptions`, is re-armed too.
+    use super::*;
+    use crate::protocol::{CA_MINOR_VERSION, CA_PROTO_VERSION, pad_string};
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::event_queue::CircuitEvent;
+    use epics_base_rs::types::EpicsValue;
+    use futures_util::FutureExt;
+
+    const ACF: &str = "UAG(ops) { ops }\nASG(DEFAULT) {\n    RULE(1, READ) { UAG(ops) }\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+
+    fn frames(drain: &mut crate::server::outbox::OutboxDrain) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| drain.try_next().map(|f| f.to_vec())).collect()
+    }
+
+    /// The next queued entry, with the read-access verdict the event thread
+    /// reads from its delivery context when it frames it.
+    fn next_event(state: &ClientState) -> Option<(bool, f64)> {
+        let events = state.event_user();
+        std::future::poll_fn(|cx| events.poll_next(cx))
+            .now_or_never()
+            .map(|e| match e {
+                CircuitEvent::Event { context, event, .. } => {
+                    let m = context
+                        .downcast_ref::<CircuitMonitor>()
+                        .expect("a CA monitor");
+                    match event.snapshot.value {
+                        EpicsValue::Double(v) => (m.denied.load(Ordering::Acquire), v),
+                        ref v => panic!("unexpected value {v:?}"),
+                    }
+                }
+                CircuitEvent::Ended(_) => panic!("monitor ended"),
+            })
+    }
+
+    fn access_rights(frame: &[u8]) -> (u32, u32) {
+        assert_eq!(
+            u16::from_be_bytes([frame[0], frame[1]]),
+            CA_PROTO_ACCESS_RIGHTS
+        );
+        (
+            u32::from_be_bytes(frame[8..12].try_into().unwrap()),
+            u32::from_be_bytes(frame[12..16].try_into().unwrap()),
+        )
+    }
+
+    /// Through `hand_off_subscription`, not `handle_client_blocking`: nothing
+    /// reaches `reeval_access_rights` on that driver once a channel exists
+    /// (HOST_NAME and CLIENT_NAME are refused after the first channel, and it
+    /// has no ACF-reload listener), so this pins its link, not the wire.
+    // RTEMS-EXEC-MODEL-ALLOW(1): runs and passes under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+    #[tokio::test]
+    async fn an_access_change_reaches_a_monitor_held_outside_the_async_registry() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("AR:VAL", EpicsValue::Double(1.5)).await.unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell(Some(
+            epics_base_rs::server::access_security::parse_acf(ACF).unwrap(),
+        ));
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        state.username = "ops".into();
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let peer: SocketAddr = "127.0.0.1:55990".parse().unwrap();
+
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = CA_MINOR_VERSION;
+        let name = pad_string("AR:VAL");
+        let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        create.cid = 0x1234;
+        create.available = CA_MINOR_VERSION as u32;
+        create.postsize = name.len() as u16;
+        for (hdr, payload) in [(version, Vec::new()), (create, name)] {
+            dispatch_message(
+                &hdr,
+                &payload,
+                &mut state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
+            )
+            .await
+            .unwrap();
+        }
+        let sid = *state.channels.keys().next().unwrap();
+
+        // The blocking driver's registration: linked on the channel, the
+        // reader kept by the caller rather than in `state.subscriptions`.
+        let mut add = CaHeader::new(CA_PROTO_EVENT_ADD);
+        add.data_type = epics_base_rs::types::DBR_DOUBLE;
+        add.count = 1;
+        add.cid = sid;
+        add.available = 0xAB;
+        let mut mon_info = vec![0u8; 16];
+        mon_info[12..14].copy_from_slice(&5u16.to_be_bytes());
+        let Ok(SubscriptionOutcome::HandedOff(r)) = register_subscription(
+            &add,
+            &mon_info,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0,
+            false,
+        )
+        .await
+        else {
+            panic!("EVENT_ADD refused");
+        };
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut blk_subs = std::collections::HashMap::new();
+        crate::server::blocking::hand_off_subscription(&mut state, &mut blk_subs, &ev_tx, r);
+        let Some(EventTaskControl::Add(_delivery)) = ev_rx.recv().await else {
+            panic!("the reader goes to the event thread");
+        };
+        assert!(state.subscriptions.is_empty());
+        let _ = frames(&mut drain);
+        assert_eq!(next_event(&state), Some((false, 1.5)), "initial value");
+
+        // Revoke: AR 0, then one post, delivered as `no_read_access_event`.
+        state.username = "nobody".into();
+        reeval_access_rights(&mut state, &outbox).await.unwrap();
+        let out = frames(&mut drain);
+        assert_eq!(out.len(), 1);
+        assert_eq!(access_rights(&out[0]), (0x1234, 0));
+        assert_eq!(
+            next_event(&state),
+            Some((true, 1.5)),
+            "the revoke's single post"
+        );
+
+        // Restore: AR 3, then the current value.
+        state.username = "ops".into();
+        reeval_access_rights(&mut state, &outbox).await.unwrap();
+        let out = frames(&mut drain);
+        assert_eq!(out.len(), 1);
+        assert_eq!(access_rights(&out[0]), (0x1234, 3));
+        assert_eq!(next_event(&state), Some((false, 1.5)), "the restore frame");
+        assert_eq!(next_event(&state), None);
     }
 }

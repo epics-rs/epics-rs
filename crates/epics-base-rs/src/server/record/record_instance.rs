@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::database::LinkBacking;
-use crate::server::event_queue::{EventReader, EventUser};
+use crate::server::event_queue::{EventReader, EventUser, PostBurst};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{
@@ -3702,6 +3702,7 @@ impl RecordInstance {
     fn emit_process_posts_marked(&mut self) {
         use crate::server::recgbl::EventMask;
         use crate::server::record::CyclePostMask;
+        let mut burst = PostBurst::new();
         for (field, mask) in self.record.take_process_posted_fields() {
             // No change detector reads a marked-only field's published value,
             // so with no subscriber C's `db_post_events` leaves nothing to do —
@@ -3724,12 +3725,15 @@ impl RecordInstance {
                 | CyclePostMask::ResetValueLogOnAlarm => EventMask::VALUE | EventMask::LOG,
             };
             self.post_field(
+                Some(&mut burst),
                 field,
                 mask,
                 0,
                 LinkBacking::none(),
-                |inst| inst.resolve_field_upper(field),
-                |inst| inst.walk_skips(field),
+                (
+                    |inst: &Self| inst.resolve_field_upper(field),
+                    |inst: &Self| inst.walk_skips(field),
+                ),
             );
         }
     }
@@ -4889,6 +4893,7 @@ impl RecordInstance {
         let upper = upper_field(field);
         let desc = self.field_desc(&upper);
         self.written_if_changed(
+            None,
             &upper,
             is_metadata_cache_source(&upper),
             desc,
@@ -4910,6 +4915,7 @@ impl RecordInstance {
             return;
         };
         self.written_if_changed(
+            None,
             field,
             at.cache_source,
             at.field.desc,
@@ -4930,6 +4936,7 @@ impl RecordInstance {
     /// `desc` is `upper`'s declaration ([`Self::field_desc`]).
     fn written_if_changed(
         &mut self,
+        burst: Option<&mut PostBurst>,
         upper: &str,
         cache_source: bool,
         desc: Option<&'static FieldDesc>,
@@ -4961,8 +4968,17 @@ impl RecordInstance {
             // guards. The NULL field pointer is what makes it record-wide.
             // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
             let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            let mut own;
+            let burst = match burst {
+                Some(burst) => burst,
+                None => {
+                    own = PostBurst::new();
+                    &mut own
+                }
+            };
             for f in fields {
-                self.notify_field_with_origin(
+                self.notify_field_with_origin_in(
+                    burst,
                     &f,
                     crate::server::recgbl::EventMask::PROPERTY,
                     0,
@@ -6787,6 +6803,11 @@ impl RecordInstance {
     /// the ACKS it may lower, and the record-wide `DBE_ALARM` — and only when
     /// `ackt` actually changed (C returns 0 early otherwise).
     pub fn put_ackt(&mut self, value: u16, backing: LinkBacking<'_>) {
+        self.put_ackt_in(&mut PostBurst::new(), value, backing);
+    }
+
+    /// [`Self::put_ackt`] posting into the put body's `burst`.
+    pub fn put_ackt_in(&mut self, burst: &mut PostBurst, value: u16, backing: LinkBacking<'_>) {
         let new_ackt = value != 0;
         if new_ackt == self.common.ackt {
             return;
@@ -6794,15 +6815,15 @@ impl RecordInstance {
         use crate::server::recgbl::EventMask;
         let ack_mask = EventMask::VALUE | EventMask::ALARM;
         self.common.ackt = new_ackt;
-        self.notify_field_backed("ACKT", ack_mask, backing);
+        self.notify_field_backed_in(burst, "ACKT", ack_mask, backing);
         // C `:1294-1297`: turning transient acknowledgement off lowers a
         // sticky ACKS down to the current SEVR — an alarm that has already
         // cleared must not keep a higher unacknowledged severity.
         if !new_ackt && self.common.acks > self.common.sevr {
             self.common.acks = self.common.sevr;
-            self.notify_field_backed("ACKS", ack_mask, backing);
+            self.notify_field_backed_in(burst, "ACKS", ack_mask, backing);
         }
-        self.notify_record_alarm(backing);
+        self.notify_record_alarm_in(burst, backing);
     }
 
     /// C `dbAccess.c::putAcks` (`:1302-1315`) — the **only** runtime writer of
@@ -6816,14 +6837,19 @@ impl RecordInstance {
     /// nothing; an acknowledgement of an already-clear ACKS still posts, which
     /// is C's literal `if (*psev >= precord->acks)` (0 >= 0 holds).
     pub fn put_acks(&mut self, value: u16, backing: LinkBacking<'_>) {
+        self.put_acks_in(&mut PostBurst::new(), value, backing);
+    }
+
+    /// [`Self::put_acks`] posting into the put body's `burst`.
+    pub fn put_acks_in(&mut self, burst: &mut PostBurst, value: u16, backing: LinkBacking<'_>) {
         let sev = AlarmSeverity::from_u16(value);
         if sev < self.common.acks {
             return;
         }
         use crate::server::recgbl::EventMask;
         self.common.acks = AlarmSeverity::NoAlarm;
-        self.notify_field_backed("ACKS", EventMask::VALUE | EventMask::ALARM, backing);
-        self.notify_record_alarm(backing);
+        self.notify_field_backed_in(burst, "ACKS", EventMask::VALUE | EventMask::ALARM, backing);
+        self.notify_record_alarm_in(burst, backing);
     }
 
     /// Set a common field value from the `.db` loader, which in C is a
@@ -9338,6 +9364,9 @@ impl RecordInstance {
         // posts with the writer's origin, so the writer's own filtered
         // subscriptions do not hear its cascade. 0 outside any scope.
         let origin = ambient_write_origin();
+        // The cycle's posts are one burst: no reader wakes before the last
+        // is queued, as none could take C's `dbScanLock` until it was.
+        let mut burst = crate::server::event_queue::PostBurst::new();
 
         for (field, value, posting_mask) in snapshot.iter() {
             let posting_mask = *posting_mask;
@@ -9386,7 +9415,7 @@ impl RecordInstance {
                         // monitor's last queued entry in place when the queue
                         // is in flow control or nearly full. The queue owns
                         // that decision and counts the displaced value.
-                        sub.post(event);
+                        sub.post(&mut burst, event);
                     }
                 }
             }
@@ -9404,6 +9433,16 @@ impl RecordInstance {
         self.notify_field_with_origin(field, mask, 0, LinkBacking::none());
     }
 
+    /// [`Self::notify_field`] posting into the caller's `burst`.
+    pub fn notify_field_in(
+        &mut self,
+        burst: &mut PostBurst,
+        field: &str,
+        mask: crate::server::recgbl::EventMask,
+    ) {
+        self.notify_field_with_origin_in(burst, field, mask, 0, LinkBacking::none());
+    }
+
     /// [`Self::notify_field`] for a poster that may name a link-backed field
     /// and has resolved its backing.
     pub fn notify_field_backed(
@@ -9415,6 +9454,17 @@ impl RecordInstance {
         self.notify_field_with_origin(field, mask, 0, backing);
     }
 
+    /// [`Self::notify_field_backed`] posting into the caller's `burst`.
+    pub fn notify_field_backed_in(
+        &mut self,
+        burst: &mut PostBurst,
+        field: &str,
+        mask: crate::server::recgbl::EventMask,
+        backing: LinkBacking<'_>,
+    ) {
+        self.notify_field_with_origin_in(burst, field, mask, 0, backing);
+    }
+
     /// C `db_post_events(precord, NULL, DBE_ALARM)`: post a record-wide
     /// alarm event. Delivers to every subscriber on any field whose mask
     /// includes DBE_ALARM, each carrying its own monitored field's current
@@ -9422,12 +9472,22 @@ impl RecordInstance {
     /// intersection). Used by the alarm-acknowledge (ACKT/ACKS) put path so
     /// an alarm-mask monitor on any field observes the acknowledgement.
     pub fn notify_record_alarm(&mut self, backing: LinkBacking<'_>) {
+        self.notify_record_alarm_in(&mut PostBurst::new(), backing);
+    }
+
+    /// [`Self::notify_record_alarm`] posting into the caller's `burst`.
+    pub fn notify_record_alarm_in(&mut self, burst: &mut PostBurst, backing: LinkBacking<'_>) {
         // Every subscribed field, so a client monitoring a link-backed one
         // (`CALC.A`) is in the set — this poster takes a backing for that
         // reason and not because the alarm itself is link-backed.
         let fields: Vec<String> = self.subscribers.keys().cloned().collect();
         for field in fields {
-            self.notify_field_backed(&field, crate::server::recgbl::EventMask::ALARM, backing);
+            self.notify_field_backed_in(
+                burst,
+                &field,
+                crate::server::recgbl::EventMask::ALARM,
+                backing,
+            );
         }
     }
 
@@ -9451,12 +9511,39 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) {
         self.post_field(
+            None,
             field,
             mask,
             origin,
             backing,
-            |inst| inst.resolve_field(field),
-            |inst| inst.walk_skips(field),
+            (
+                |inst: &Self| inst.resolve_field(field),
+                |inst: &Self| inst.walk_skips(field),
+            ),
+        );
+    }
+
+    /// [`Self::notify_field_with_origin`] posting into the caller's `burst`:
+    /// readers wake once, when the burst drops. `put_ackt_in`/`put_acks_in`
+    /// share one; no `dbPut` body passes one yet.
+    pub fn notify_field_with_origin_in(
+        &mut self,
+        burst: &mut PostBurst,
+        field: &str,
+        mask: crate::server::recgbl::EventMask,
+        origin: u64,
+        backing: LinkBacking<'_>,
+    ) {
+        self.post_field(
+            Some(burst),
+            field,
+            mask,
+            origin,
+            backing,
+            (
+                |inst: &Self| inst.resolve_field(field),
+                |inst: &Self| inst.walk_skips(field),
+            ),
         );
     }
 
@@ -9470,27 +9557,36 @@ impl RecordInstance {
         backing: LinkBacking<'_>,
     ) {
         self.post_field(
+            None,
             field,
             mask,
             0,
             backing,
-            |inst| inst.resolve_field_upper_at(field, at.field.desc),
-            |_| at.walk_skip,
+            (
+                |inst: &Self| inst.resolve_field_upper_at(field, at.field.desc),
+                |_: &Self| at.walk_skip,
+            ),
         );
     }
 
     /// The body of [`Self::notify_field_with_origin`], with the field's read
-    /// and its [`Self::walk_skips`] answer supplied by the entry.
+    /// and its [`Self::walk_skips`] answer supplied by the entry as `access`.
+    /// `burst` `None` is a post that is its own burst, built only past the
+    /// early returns: a field no one monitors pays nothing for it.
     #[inline(always)]
     fn post_field(
         &mut self,
+        burst: Option<&mut PostBurst>,
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
         backing: LinkBacking<'_>,
-        read: impl FnOnce(&Self) -> Option<EpicsValue>,
-        walk_skip: impl FnOnce(&Self) -> bool,
+        access: (
+            impl FnOnce(&Self) -> Option<EpicsValue>,
+            impl FnOnce(&Self) -> bool,
+        ),
     ) {
+        let (read, walk_skip) = access;
         use crate::server::database::filters::FilteredMonitorEvent;
         // A poster that carries no origin of its own inherits the ambient
         // one (0 outside any scope): this is how every post inside an
@@ -9541,6 +9637,14 @@ impl RecordInstance {
         };
         {
             let mon_snap = Arc::new(snap);
+            let mut own;
+            let burst = match burst {
+                Some(burst) => burst,
+                None => {
+                    own = PostBurst::new();
+                    &mut own
+                }
+            };
             for sub in &self.subscribers[field] {
                 // Paused subscriber (`db_event_disable`): suppress at
                 // the source — no delivery, no coalesce.
@@ -9573,7 +9677,7 @@ impl RecordInstance {
                         continue;
                     };
                     // Same single post owner as the snapshot path.
-                    sub.post(event);
+                    sub.post(burst, event);
                 }
             }
         }
@@ -9603,7 +9707,14 @@ impl RecordInstance {
         data_type: DbFieldType,
         mask: u16,
     ) -> Option<EventReader> {
-        self.add_subscriber_on(&EventUser::new(), field, sid, data_type, mask)
+        self.add_subscriber_on(
+            &EventUser::new(),
+            field,
+            sid,
+            data_type,
+            mask,
+            crate::server::event_queue::no_context(),
+        )
     }
 
     /// Add a field subscriber whose events queue on `user`'s event queue —
@@ -9619,6 +9730,7 @@ impl RecordInstance {
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
+        context: &crate::server::event_queue::DeliveryContext,
     ) -> Option<EventReader> {
         let cap = crate::server::pv::max_subscribers_per_pv();
         // A destroyed record takes no new monitor, so `destroyed => no
@@ -9653,7 +9765,7 @@ impl RecordInstance {
             );
             return None;
         }
-        let (sink, reader) = crate::server::event_queue::attach(user, sid);
+        let (sink, reader) = crate::server::event_queue::attach_with(user, sid, context);
         let subscriber = Subscriber {
             sid,
             data_type,
@@ -9701,10 +9813,27 @@ impl RecordInstance {
         false
     }
 
-    /// Remove a subscriber by subscription ID from all fields.
-    pub fn remove_subscriber(&mut self, sid: u32) {
+    /// C `db_post_single_event` for the `field` subscriber holding slot `id`.
+    pub fn post_single_event(
+        &self,
+        field: &str,
+        id: crate::server::event_queue::AttachId,
+        snapshot: Arc<crate::server::snapshot::Snapshot>,
+    ) {
+        if let Some(sub) = self
+            .subscribers
+            .get(field)
+            .and_then(|subs| subs.iter().find(|s| s.id() == id))
+        {
+            sub.post_single(snapshot);
+        }
+    }
+
+    /// Remove the subscriber holding slot `id` (its reader's
+    /// [`EventReader::id`](crate::server::event_queue::EventReader::id)).
+    pub fn remove_subscriber(&mut self, id: crate::server::event_queue::AttachId) {
         for subs in self.subscribers.values_mut() {
-            subs.retain(|s| s.sid != sid);
+            subs.retain(|s| s.id() != id);
         }
     }
 
@@ -9762,13 +9891,17 @@ impl RecordInstance {
     /// doing per-event work for it. Entries already queued stay queued and are
     /// still delivered, exactly as in C: `db_event_disable` only unlinks the
     /// subscription from the record's monitor list (`dbEvent.c:524-535`) and
-    /// never reaches into the event queue. No-op if no subscriber has this
-    /// `sid`. The caller holds the record write lock, so this is exclusive with
+    /// never reaches into the event queue. No-op if no subscriber holds slot
+    /// `id`. The caller holds the record write lock, so this is exclusive with
     /// the read-locked post paths that consult `Subscriber::active`.
-    pub fn set_subscriber_active(&mut self, sid: u32, active: bool) {
+    pub fn set_subscriber_active(
+        &mut self,
+        id: crate::server::event_queue::AttachId,
+        active: bool,
+    ) {
         for subs in self.subscribers.values_mut() {
             for sub in subs.iter_mut() {
-                if sub.sid == sid {
+                if sub.id() == id {
                     sub.active = active;
                 }
             }
@@ -10069,6 +10202,50 @@ mod metadata_cache_tests {
             "a post that replaces an unobserved queued entry must record a \
              dropped monitor event (before={before}, after={after})"
         );
+    }
+
+    /// One put's posts of a by-reference field share its burst: the parked
+    /// reader is woken once, at the burst's drop, and finds one entry — C's
+    /// duplicate drop (`dbEvent.c:794-800`) — where a wake per post let it
+    /// take the first post before the second appended.
+    #[test]
+    fn posts_into_one_burst_wake_once_and_collapse() {
+        use crate::server::recgbl::EventMask;
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake, Waker};
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut inst = ai_instance();
+        let mut reader = inst
+            .add_subscriber(
+                "DESC",
+                1,
+                crate::types::DbFieldType::String,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscriber added");
+        let wakes = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        assert!(
+            Box::pin(reader.recv())
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        let mut burst = PostBurst::new();
+        inst.notify_field_in(&mut burst, "DESC", EventMask::VALUE);
+        inst.notify_field_in(&mut burst, "DESC", EventMask::VALUE);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "no wake mid-burst");
+        drop(burst);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert!(reader.try_recv().is_ok());
+        assert!(reader.try_recv().is_err(), "the second post collapsed");
     }
 
     /// A row whose reader dropped without unsubscribing is reaped by the
@@ -12775,10 +12952,10 @@ mod skipped_posted_tests {
             {
                 let inst = db.get_record(rec).unwrap();
                 let mut inst = inst.write();
-                let _rx = inst
+                let rx = inst
                     .add_subscriber(field, 1, DbFieldType::Double, EventMask::VALUE.bits())
                     .expect("subscriber");
-                inst.remove_subscriber(1);
+                inst.remove_subscriber(rx.id());
             }
             db.process_record_with_links(rec, &mut ProcStack::new())
                 .await

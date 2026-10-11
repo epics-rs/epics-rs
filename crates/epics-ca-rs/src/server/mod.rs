@@ -445,7 +445,7 @@ mod spawn_capability_guard {
             ("ca_server.rs", "pub async fn run("),
             ("tcp.rs", "fn write_notify_queue("),
             ("blocking.rs", "fn command_drives_without_spawn("),
-            ("monitor.rs", "fn spawn_monitor_sender"),
+            ("monitor.rs", "fn deliver_monitor_event"),
         ];
 
         let bare = concat!("tokio", "::spawn(");

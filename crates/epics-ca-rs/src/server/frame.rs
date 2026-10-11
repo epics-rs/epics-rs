@@ -374,8 +374,8 @@ mod tests {
         );
     }
 
-    /// Two producers at once — the async driver runs one monitor task per
-    /// subscription — and only one buffer. The second must allocate rather than
+    /// Two producers at once — the async driver's dispatch loop and its event
+    /// task — and only one buffer. The second must allocate rather than
     /// wait, and the slot must not end up holding the smaller of the two.
     #[test]
     fn a_second_concurrent_producer_allocates_and_the_slot_keeps_the_larger() {

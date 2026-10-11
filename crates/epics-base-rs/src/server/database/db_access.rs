@@ -251,10 +251,10 @@ pub struct DbSubscription {
     /// If non-zero, events with this origin are silently skipped.
     /// Used to filter out self-triggered events from the same writer.
     ignore_origin: u64,
-    /// Reference back to the record + this subscription's sid, for the
+    /// Reference back to the record + this subscription's slot, for the
     /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
     record: std::sync::Arc<crate::server::record::RecordCell>,
-    sid: u32,
+    id: crate::server::event_queue::AttachId,
     /// What is done to each event as it is read; `None` for most
     /// channels, which have neither.
     read: Option<Box<PostStage>>,
@@ -314,18 +314,18 @@ impl PostStage {
 }
 
 /// Detachable enable/disable handle for one [`DbSubscription`], holding
-/// only the record back-reference + the subscriber `sid` (an `Arc` + a
-/// `u32`, so it is cheap to clone and outlives the `DbSubscription`
+/// only the record back-reference + the subscriber's slot id (an `Arc` +
+/// an integer, so it is cheap to clone and outlives the `DbSubscription`
 /// itself). A consumer can keep the `DbSubscription` moved into its
 /// receive task while a separate owner toggles the same subscriber slot's
 /// event flow via this handle — the in-process equivalent of holding a
 /// `db_event_disable`/`db_event_enable` capability apart from the event
-/// queue. Both toggle the SAME subscriber (keyed by `sid`), so the view
+/// queue. Both toggle the SAME subscriber (keyed by its slot), so the view
 /// stays consistent.
 #[derive(Clone)]
 pub struct SubscriptionActivation {
     record: std::sync::Arc<crate::server::record::RecordCell>,
-    sid: u32,
+    id: crate::server::event_queue::AttachId,
 }
 
 impl SubscriptionActivation {
@@ -333,7 +333,7 @@ impl SubscriptionActivation {
     /// flow at the source. Same semantics as [`DbSubscription::set_active`]
     /// — see that method for the `db_event_disable` parity rationale.
     pub async fn set_active(&self, active: bool) {
-        self.record.write().set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.id, active);
     }
 }
 
@@ -393,11 +393,11 @@ impl DbSubscription {
             reader
         };
         Some(Self {
-            reader,
             pv_name: pv_name.to_string(),
             ignore_origin,
+            id: reader.id(),
             record: rec,
-            sid,
+            reader,
             read: PostStage::new(post, None).map(Box::new),
         })
     }
@@ -437,18 +437,18 @@ impl DbSubscription {
     /// the monitor from the record, it does not touch the event queue).
     /// Idempotent.
     pub async fn set_active(&self, active: bool) {
-        self.record.write().set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.id, active);
     }
 
     /// A detachable [`SubscriptionActivation`] for this subscription's
     /// subscriber slot. Lets a separate owner enable/disable the event
     /// flow after this `DbSubscription` has been moved into a receive
-    /// task — both toggle the same `sid`, so the source-side gating stays
+    /// task — both toggle the same slot, so the source-side gating stays
     /// consistent with the queue this handle was minted from.
     pub fn activation_handle(&self) -> SubscriptionActivation {
         SubscriptionActivation {
             record: self.record.clone(),
-            sid: self.sid,
+            id: self.id,
         }
     }
 
@@ -581,7 +581,7 @@ impl Drop for DbSubscription {
     /// gap for the in-process API.
     fn drop(&mut self) {
         let record = self.record.clone();
-        let sid = self.sid;
+        let id = self.id;
         // Drop runs in sync context but we need an async write lock, so the
         // unsubscribe is a fire-and-forget tail. It goes to the background
         // executor rather than the ambient seam because a subscription can be
@@ -594,7 +594,7 @@ impl Drop for DbSubscription {
         crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
             async move {
-                record.write().remove_subscriber(sid);
+                record.write().remove_subscriber(id);
             },
         );
     }

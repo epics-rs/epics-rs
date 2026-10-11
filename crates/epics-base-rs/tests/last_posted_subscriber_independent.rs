@@ -153,7 +153,10 @@ async fn move_with_emptied_bucket_then_subscribe_sees_move_start() {
     let mut first = subscribe(&db, "M", "DMOV", 1);
     move_once(&db).await;
     assert_eq!(drain(&mut first), ZERO_THEN_ONE);
-    db.get_record("M").unwrap().write().remove_subscriber(1);
+    db.get_record("M")
+        .unwrap()
+        .write()
+        .remove_subscriber(first.id());
     move_once(&db).await;
     let mut rx = subscribe(&db, "M", "DMOV", 2);
     move_once(&db).await;

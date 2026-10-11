@@ -74,8 +74,8 @@
 //!    channel state, whose `UnboundedSender` lives in `PumpShared` for the
 //!    pump's whole life (cleared only by the exit finalizer, after which
 //!    the thread returns without awaiting again);
-//! 2. member queues — waker held in each polled `EvQue::poll_wakers`,
-//!    inside the `Arc<EvQue>` the record's subscriber slot (the
+//! 2. member queues — waker held in each polled member's `event_user`
+//!    slot, inside the `Arc<EvQue>` the record's subscriber slot (the
 //!    `EventSink`) keeps alive; a record post flushes it via
 //!    `wake_readers` — the same contract the CA blocking driver's
 //!    per-connection drain loops already park on;

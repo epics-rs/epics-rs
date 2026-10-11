@@ -21673,6 +21673,67 @@ mod tests {
         );
     }
 
+    /// pvxs erases a finishing monitor from `opByIOID` (`cleanup()`,
+    /// `servermon.cpp:149`, `serverconn.cpp:519-522`) before it enqueues the
+    /// FINISH (`servermon.cpp:185`), so a client's re-INIT of the ioid never
+    /// meets the old op. The port keeps that order: the owner's signal is
+    /// queued before the frame, and at the instant it wakes the owner the
+    /// frame is not yet with the writer.
+    #[test]
+    fn monitor_finish_signals_the_owner_before_queuing_its_frame() {
+        struct Observe {
+            frames: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+            frame_at_wake: parking_lot::Mutex<Option<bool>>,
+        }
+        impl std::task::Wake for Observe {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                let queued = self.frames.lock().try_recv().is_ok();
+                self.frame_at_wake.lock().get_or_insert(queued);
+            }
+        }
+
+        let (tx, frames) = test_srv_tx(4);
+        let tx = ChannelTx::new(
+            tx,
+            crate::server_native::peers::ChannelStat::new(String::new()),
+        );
+        let (fin_tx, mut fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let observe = Arc::new(Observe {
+            frames: parking_lot::Mutex::new(frames),
+            frame_at_wake: parking_lot::Mutex::new(None),
+        });
+        let waker = std::task::Waker::from(observe.clone());
+        assert!(
+            fin_rx
+                .poll_recv(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        let fin = MonitorFinished {
+            sid: 1,
+            ioid: 2,
+            op_id: 3,
+        };
+        let reply = MonitorFinishGuard::new(fin_tx, fin)
+            .reply(&tx, build_monitor_finish(2, ByteOrder::Little));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::pin::pin!(reply).poll(&mut cx).is_ready());
+
+        assert_eq!(
+            *observe.frame_at_wake.lock(),
+            Some(false),
+            "the owner is signalled before the FINISH frame is queued"
+        );
+        assert!(fin_rx.try_recv().is_ok(), "the signal is queued");
+        assert!(
+            observe.frames.lock().try_recv().is_ok(),
+            "and the frame follows"
+        );
+    }
+
     #[cfg(tokio_backend)]
     /// Load-bearing regression: START a MONITOR through `handle_op`, let
     /// the source-close end the subscriber task, and prove the task
@@ -21814,21 +21875,27 @@ mod tests {
             "the signal identifies the exact op instance that ended"
         );
 
-        // The task emitted a MONITOR FINISH (subcmd 0x10) before ending.
-        let mut saw_finish = false;
-        while let Ok(buf) = rx.try_recv() {
-            if let Ok(Some((frame, _))) = try_parse_frame(&buf)
-                && frame.header.command == Command::Monitor.code()
-            {
-                let mut cur = frame.cursor();
-                let _ = cur.get_u32(order);
-                if let Ok(sub) = cur.get_u8()
-                    && sub & 0x10 != 0
+        // The task emits a MONITOR FINISH (subcmd 0x10) right AFTER the
+        // signal (`monitor_finish_signals_the_owner_before_queuing_its_frame`),
+        // so the frame is awaited, not assumed already queued.
+        let saw_finish = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(buf) = rx.recv().await {
+                if let Ok(Some((frame, _))) = try_parse_frame(&buf)
+                    && frame.header.command == Command::Monitor.code()
                 {
-                    saw_finish = true;
+                    let mut cur = frame.cursor();
+                    let _ = cur.get_u32(order);
+                    if let Ok(sub) = cur.get_u8()
+                        && sub & 0x10 != 0
+                    {
+                        return true;
+                    }
                 }
             }
-        }
+            false
+        })
+        .await
+        .unwrap_or(false);
         assert!(saw_finish, "source close emits a MONITOR FINISH frame");
 
         // Owner applies the signal: op removed, terminal Executing→Idle.

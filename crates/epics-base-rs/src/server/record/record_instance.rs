@@ -3783,6 +3783,18 @@ impl RecordInstance {
             EventMask::NONE
         };
 
+        // A record whose own reset ran earlier in the cycle posted the
+        // transition from the fields it marked; its closing one returns 0.
+        let tail_bits = if self
+            .monitor_plan
+            .hooks
+            .has(crate::server::record::CycleHooks::ALARM_RESET)
+            && self.record.take_alarm_reset()
+        {
+            EventMask::NONE
+        } else {
+            alarm_bits
+        };
         let (include_val, include_archive, marked) = self.value_include_classes();
         // The deadband-tracked field posts with the classes that actually
         // fired: MDEL crossing → DBE_VALUE, ADEL crossing → DBE_LOG, alarm
@@ -3790,7 +3802,7 @@ impl RecordInstance {
         // masks: motorRecord.cc:3476-3507 RBV, aiRecord.c VAL). A record
         // like motor deadbands its readback; its VAL then routes through
         // the change-detected loop in `collect_subscriber_posts`.
-        let deadband_mask = self.deadband_post(snapshot, alarm_bits, include_val, include_archive);
+        let deadband_mask = self.deadband_post(snapshot, tail_bits, include_val, include_archive);
         self.collect_subscriber_posts(snapshot, deadband_mask, alarm_bits, include_val, marked);
         // C waveform/aai/aao `monitor()` posts HASH with a literal
         // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
@@ -12785,6 +12797,161 @@ mod unanswerable_notify_tests {
             "the stale name must not evict the live notify"
         );
         assert!(target.has_notify());
+    }
+}
+
+#[cfg(test)]
+mod alarm_reset_tests {
+    use super::*;
+    use crate::server::recgbl::EventMask;
+    use crate::server::record::{CycleMarks, CyclePostMask};
+    use crate::types::DbFieldType;
+
+    static FIELDS: &[crate::server::record::FieldDesc] = &[
+        crate::server::record::FieldDesc::new("VAL", DbFieldType::Double, false),
+        crate::server::record::FieldDesc::new("SENT", DbFieldType::Double, false),
+    ];
+    static SENT_POST: [(&str, CyclePostMask); 1] = [("SENT", CyclePostMask::MonitorValueLog)];
+
+    /// Throttle's shape: `process()` marks SENT from inside its own reset's
+    /// scope (`valuePut`) and leaves VAL unmoved.
+    struct ResetsItself {
+        consumes: bool,
+        hooks: crate::server::record::CycleHooks,
+        raise: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        marked: bool,
+    }
+
+    impl Record for ResetsItself {
+        fn record_type(&self) -> &'static str {
+            "resets_itself"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            self.marked = true;
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" | "SENT" => Some(EpicsValue::Double(1.0)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+            FIELDS
+        }
+        fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+            if self.raise.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    common,
+                    crate::server::recgbl::alarm_status::SOFT_ALARM,
+                    AlarmSeverity::Major,
+                );
+            }
+        }
+        fn monitor_value_changed(&mut self) -> Option<bool> {
+            Some(false)
+        }
+        fn take_alarm_reset(&mut self) -> bool {
+            self.consumes
+        }
+        fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+            self.hooks
+        }
+        fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+            &["SENT"]
+        }
+        fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+            CycleMarks::of(&SENT_POST, std::mem::take(&mut self.marked) as u64)
+        }
+    }
+
+    /// One cycle's VAL and SENT posts.
+    fn cycle(consumes: bool, raise: bool) -> Vec<(String, EventMask)> {
+        cycle_with(consumes, crate::server::record::CycleHooks::ALL, raise)
+    }
+
+    fn cycle_with(
+        consumes: bool,
+        hooks: crate::server::record::CycleHooks,
+        raise: bool,
+    ) -> Vec<(String, EventMask)> {
+        let raised = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut inst = RecordInstance::new(
+            "R".to_string(),
+            ResetsItself {
+                consumes,
+                hooks,
+                raise: raised.clone(),
+                marked: false,
+            },
+        );
+        let all = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+        let _val = inst.add_subscriber("VAL", 1, DbFieldType::Double, all);
+        let _sent = inst.add_subscriber("SENT", 2, DbFieldType::Double, all);
+        inst.process_local().unwrap();
+        raised.store(raise, std::sync::atomic::Ordering::Relaxed);
+        let (snap, _) = inst.process_local().unwrap();
+        snap.iter()
+            .filter(|(f, _, _)| f == "VAL" || f == "SENT")
+            .map(|(f, _, m)| (f.to_string(), *m))
+            .collect()
+    }
+
+    /// Boundary consumed + transition: C's closing `recGblResetAlarms`
+    /// returns 0, so VAL posts nothing and the transition rides SENT's mark.
+    #[test]
+    fn a_consumed_transition_reaches_the_mark_and_not_the_tail() {
+        assert_eq!(
+            cycle(true, true),
+            [(
+                "SENT".to_string(),
+                EventMask::ALARM | EventMask::VALUE | EventMask::LOG
+            )]
+        );
+    }
+
+    /// Boundary not consumed + transition: the reset is the tail's, so VAL
+    /// posts DBE_ALARM as every other record's does.
+    #[test]
+    fn an_unconsumed_transition_reaches_the_tail_too() {
+        let posts = cycle(false, true);
+        assert!(
+            posts.contains(&("VAL".to_string(), EventMask::ALARM)),
+            "{posts:?}"
+        );
+        assert!(posts.contains(&(
+            "SENT".to_string(),
+            EventMask::ALARM | EventMask::VALUE | EventMask::LOG
+        )));
+    }
+
+    /// Boundary consumed, no transition: the mark posts its literal classes.
+    #[test]
+    fn a_consumed_cycle_without_a_transition_posts_only_the_mark() {
+        assert_eq!(
+            cycle(true, false),
+            [("SENT".to_string(), EventMask::VALUE | EventMask::LOG)]
+        );
+    }
+
+    /// Boundary hook not declared: the plan never asks, so a `true` the type
+    /// would give is not heard and VAL keeps the transition.
+    #[test]
+    fn a_type_without_the_hook_is_never_asked() {
+        use crate::server::record::CycleHooks;
+        let without = CycleHooks::PRE_INPUT
+            .union(CycleHooks::CYCLE_POSTED)
+            .union(CycleHooks::CONTEXT)
+            .union(CycleHooks::WRITE_POSTED)
+            .union(CycleHooks::PROCESS_POSTED);
+        let posts = cycle_with(true, without, true);
+        assert!(
+            posts.contains(&("VAL".to_string(), EventMask::ALARM)),
+            "{posts:?}"
+        );
     }
 }
 

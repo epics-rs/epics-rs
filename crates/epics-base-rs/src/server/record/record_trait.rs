@@ -1737,6 +1737,16 @@ pub enum ProcessAction {
         target_field: &'static str,
     },
 
+    /// C `dbGetLink` into a buffer the record owns rather than one of its
+    /// fields — throttle's `valueSync` reads `SINP` into `rpvt->sival` and
+    /// decides `VAL` and `STS` from the status (`throttleRecord.c:628-647`).
+    /// The framework reads `link_field` at the record's
+    /// [`Record::input_link_request`] class, raises the link alarm a failed
+    /// read raises, and hands the outcome to [`Record::link_read_result`].
+    /// From `process()` it runs with the cycle's link writes, ahead of the
+    /// alarm reset and the monitor post, where a C `process()` reads.
+    GetLink { link_field: &'static str },
+
     /// Schedule a re-process of this record after the given duration.
     /// The framework defers it through
     /// `database/processing.rs` (`schedule_delayed_reprocess`), which uses
@@ -1855,6 +1865,22 @@ pub struct CycleList<T>(std::mem::ManuallyDrop<Vec<T>>);
 /// The actions a record hands the framework for one cycle.
 pub type ProcessActions = CycleList<ProcessAction>;
 
+/// What one link read came back with — [`Record::link_read_result`]. C's
+/// `dbGetLink` hands back a status and fills the caller's buffer, so the value
+/// travels here only when the read named no field to fill.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkRead {
+    /// Status 0, and a [`ProcessAction::GetLink`] read delivered this value.
+    Value(EpicsValue),
+    /// Status 0 with no value in this report: a [`ProcessAction::ReadDbLink`]
+    /// (its `target_field` holds whatever the link delivered), or a `GetLink`
+    /// whose link wrote nothing — a CONSTANT link (`dbConstGetValue`,
+    /// `dbConstLink.c:219-225`) or one the record reads at no class.
+    Succeeded,
+    /// Non-zero status. The LINK/INVALID alarm is already raised.
+    Failed,
+}
+
 /// Which of the per-cycle hooks a type can answer with something other than
 /// the trait default. C has no such hooks (`dbCommon` is read as a struct
 /// member), so the cycle settles this once, in the plan, and a type that
@@ -1884,11 +1910,13 @@ impl CycleHooks {
     /// `Ok`: a put-only hook, outside [`Self::ALL`], declared by the type
     /// whose `special()` reports and still accepts the put.
     pub const PUT_REPORT: Self = Self(32);
+    /// [`Record::take_alarm_reset`].
+    pub const ALARM_RESET: Self = Self(64);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
     /// otherwise pays the call and never loses an action.
-    pub const ALL: Self = Self(31);
+    pub const ALL: Self = Self(31 | 64);
 
     /// Both sets together.
     pub const fn union(self, other: Self) -> Self {
@@ -3886,6 +3914,17 @@ pub trait Record: Send + Sync + 'static {
     /// Default: empty.
     fn take_process_posted_fields(&mut self) -> CycleMarks {
         CycleMarks::NONE
+    }
+
+    /// The record ran its own `recGblResetAlarms` this cycle (throttle
+    /// `valuePut`, `throttleRecord.c:603`), so the closing one (`:300`)
+    /// returns 0: the deadband field's post carries no `DBE_ALARM`, while the
+    /// fields the record marked still do. TAKE semantics; asked only of a type
+    /// with [`CycleHooks::ALARM_RESET`].
+    ///
+    /// Default: `false`.
+    fn take_alarm_reset(&mut self) -> bool {
+        false
     }
 
     /// Fields whose ONLY post path is the record's own per-cycle mark — C never
@@ -6007,12 +6046,30 @@ pub trait Record: Send + Sync + 'static {
     /// as failed). Additive, framework-set-hook pattern (same shape as
     /// [`Record::set_process_context`]). Default: ignore — most records
     /// derive nothing from the put's result, as their C originals do not.
+    ///
+    /// The actions returned run next, as [`Self::link_read_result`]'s do: C
+    /// throttle's `valuePut` calls `valueSync` straight after a landed
+    /// `dbPutLink` (`throttleRecord.c:571-572`).
     fn set_out_link_write_status(
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
         _failed: bool,
-    ) {
+    ) -> ProcessActions {
+        ProcessActions::new()
+    }
+
+    /// Called by the framework once for every [`ProcessAction::GetLink`] this
+    /// record emitted, and for every [`ProcessAction::ReadDbLink`] it emitted
+    /// outside [`Self::pre_input_link_actions`] and
+    /// [`Self::pre_process_actions`] (those report through
+    /// [`Self::set_resolved_input_links`]): C's `dbGetLink` status, with the
+    /// value when the read named no field to store it in.
+    ///
+    /// The actions returned run next, before the rest of the cycle's.
+    /// Default: ignore.
+    fn link_read_result(&mut self, _link_field: &'static str, _read: LinkRead) -> ProcessActions {
+        ProcessActions::new()
     }
 
     /// Called once by the framework when the record is registered
@@ -7259,6 +7316,9 @@ mod tests {
             }
             if !hooks.has(CycleHooks::PROCESS_POSTED) {
                 assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::ALARM_RESET) {
+                assert!(!r.take_alarm_reset(), "{record_type}");
             }
         }
     }

@@ -5650,13 +5650,7 @@ impl PvDatabase {
                 // notify (the Complete path runs them after the FLNK tail,
                 // which is deferred to async completion on this pending pass).
                 let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
-                    process_actions.into_iter().partition(|a| {
-                        matches!(
-                            a,
-                            crate::server::record::ProcessAction::WriteDbLink { .. }
-                                | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
-                        )
-                    });
+                    process_actions.into_iter().partition(runs_in_link_stage);
                 self.execute_process_actions_in(name, rec, link_writes, visited);
                 self.publish_post_write_fields(name, rec, post_write_fields);
                 {
@@ -6196,21 +6190,16 @@ impl PvDatabase {
             // hold no `!Send` guard (a self/cyclic OUT link would also dead-lock the
             // non-reentrant gate). The async device-write branch inside the
             // `out_info` match returns straight from the function.
-            // The cycle's link-carried writes, split off the record's other
-            // actions; `None` when it has none, which is the usual cycle.
+            // The cycle's link-carried writes and reads, split off the record's
+            // other actions; `None` when it has none, which is the usual cycle.
             let (link_writes, process_actions): (
                 Option<Vec<_>>,
                 crate::server::record::ProcessActions,
             ) = if process_actions.is_empty() {
                 (None, process_actions)
             } else {
-                let (writes, rest): (Vec<_>, Vec<_>) = process_actions.into_iter().partition(|a| {
-                    matches!(
-                        a,
-                        crate::server::record::ProcessAction::WriteDbLink { .. }
-                            | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
-                    )
-                });
+                let (writes, rest): (Vec<_>, Vec<_>) =
+                    process_actions.into_iter().partition(runs_in_link_stage);
                 ((!writes.is_empty()).then_some(writes), rest.into())
             };
             // Whether this cycle has an output stage at all — the one rule that
@@ -6995,12 +6984,56 @@ impl PvDatabase {
         target_field: &'static str,
         visited: &mut ProcStack,
     ) -> bool {
+        let (value, inheritance) = match self.fetch_input_link(rec, link_field, visited) {
+            InputFetch::Value(value, inheritance) => (value, inheritance),
+            InputFetch::Failed => return false,
+            // C `dbConstGetValue`: SUCCESS with nothing written. The target
+            // field keeps what it holds (a client's `caput SELN 5` survives a
+            // `field(SELL,"3")`), no LINK alarm is raised, and the link did NOT
+            // deliver. The constant reached the record once, at init, via
+            // `rec_gbl_init_constant_links`. Status 0 all the same, so the
+            // record is told the read SUCCEEDED — C's `dbGetLink` on a constant
+            // returns 0, and `motorRecord.cc:3690` stops the axis on non-zero.
+            InputFetch::Nothing => return true,
+        };
+        let mut instance = rec.write();
+        // A value the target field REJECTS is a failed read, not a
+        // silent no-op: C `dbGetLink`'s conversion failure comes back as
+        // a non-zero status and takes the `setLinkAlarm` path
+        // (`dbLink.c:316-323`) exactly like a dead target. Discarding it
+        // left the target field holding its previous value with no
+        // alarm to say so.
+        let stored = instance
+            .record
+            .put_field_internal(target_field, value)
+            .is_ok();
+        if !stored {
+            crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
+            return false;
+        }
+        if let Some((ms, alarm)) = inheritance {
+            super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
+        }
+        // sseq's `processCallback` posts each read as it lands
+        // (sseqRecord.c:668-681), under the alarm the record still holds.
+        super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+        true
+    }
+
+    /// The read half of [`Self::read_db_link_into_field`], shared with
+    /// [`ProcessAction::GetLink`](crate::server::record::ProcessAction::GetLink).
+    fn fetch_input_link(
+        &self,
+        rec: InFrame<'_>,
+        link_field: &'static str,
+        visited: &mut ProcStack,
+    ) -> InputFetch {
         // The instance's parsed link for this field, parsed once per put.
         // An empty link IS a CONSTANT link in C (`dbConstLink.c`'s lset with a
         // NULL string), and `dbConstGetValue` returns 0 for it.
         let parsed = rec.read().record_link(link_field).clone();
         if matches!(*parsed, crate::server::record::ParsedLink::None) {
-            return true;
+            return InputFetch::Nothing;
         }
         // The source's DBF class + element count (C `dbGetLinkDBFtype` /
         // `dbGetNelements` — the same lset accessors the OUT side asks of a
@@ -7010,56 +7043,68 @@ impl PvDatabase {
         // so `dbGetLink` is never called: nothing is attempted, the untouched
         // `status` raises no link alarm, and it is still zero.
         let Some(read_as) = self.input_link_read_as(rec, link_field, &parsed) else {
-            return true;
+            return InputFetch::Nothing;
         };
         use crate::server::recgbl::simm::LinkFetch;
         // One read for both halves — see
         // `PvDatabase::read_link_value_and_alarm_at_source`.
         let (fetch, source_alarm) = self.read_link_value_as_with_alarm(&parsed, read_as, visited);
         match fetch {
-            // C `dbConstGetValue`: SUCCESS with nothing written. The target
-            // field keeps what it holds (a client's `caput SELN 5` survives a
-            // `field(SELL,"3")`), no LINK alarm is raised, and the link did NOT
-            // deliver. The constant reached the record once, at init, via
-            // `rec_gbl_init_constant_links`. Status 0 all the same, so the
-            // record is told the read SUCCEEDED — C's `dbGetLink` on a constant
-            // returns 0, and `motorRecord.cc:3690` stops the axis on non-zero.
-            LinkFetch::NoData => true,
-            LinkFetch::Value(value) => {
-                // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
-                // folds the SOURCE's committed alarm into the READER per the
-                // link's MS class. The source has already been processed above
-                // (a PP link), so its alarm is the one this cycle sees.
-                let inheritance = self.input_link_inheritance(rec, &parsed, source_alarm);
-                let mut instance = rec.write();
-                // A value the target field REJECTS is a failed read, not a
-                // silent no-op: C `dbGetLink`'s conversion failure comes back as
-                // a non-zero status and takes the `setLinkAlarm` path
-                // (`dbLink.c:316-323`) exactly like a dead target. Discarding it
-                // left the target field holding its previous value with no
-                // alarm to say so.
-                let stored = instance
-                    .record
-                    .put_field_internal(target_field, value)
-                    .is_ok();
-                if !stored {
-                    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
-                    return false;
-                }
-                if let Some((ms, alarm)) = inheritance {
-                    super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
-                }
-                // sseq's `processCallback` posts each read as it lands
-                // (sseqRecord.c:668-681), under the alarm the record still holds.
-                super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
-                true
-            }
+            LinkFetch::NoData => InputFetch::Nothing,
+            // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
+            // folds the SOURCE's committed alarm into the READER per the
+            // link's MS class. The source has already been processed above
+            // (a PP link), so its alarm is the one this cycle sees.
+            LinkFetch::Value(value) => InputFetch::Value(
+                value,
+                self.input_link_inheritance(rec, &parsed, source_alarm),
+            ),
             LinkFetch::Failed => {
                 let mut instance = rec.write();
                 crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
-                false
+                InputFetch::Failed
             }
         }
+    }
+
+    /// Execute one [`ProcessAction::GetLink`](crate::server::record::ProcessAction::GetLink)
+    /// or a [`ProcessAction::ReadDbLink`](crate::server::record::ProcessAction::ReadDbLink)
+    /// outside the pre-process stage, and hand the record its outcome through
+    /// [`Record::link_read_result`](crate::server::record::Record::link_read_result).
+    /// Returns the actions the record answered with.
+    fn read_link_for_record(
+        &self,
+        rec: InFrame<'_>,
+        link_field: &'static str,
+        target_field: Option<&'static str>,
+        visited: &mut ProcStack,
+    ) -> crate::server::record::ProcessActions {
+        use crate::server::record::LinkRead;
+        let read = match target_field {
+            Some(target_field) => {
+                if self.read_db_link_into_field(rec, link_field, target_field, visited) {
+                    LinkRead::Succeeded
+                } else {
+                    LinkRead::Failed
+                }
+            }
+            None => match self.fetch_input_link(rec, link_field, visited) {
+                InputFetch::Failed => LinkRead::Failed,
+                InputFetch::Nothing => LinkRead::Succeeded,
+                InputFetch::Value(value, inheritance) => {
+                    if let Some((ms, alarm)) = inheritance {
+                        super::links::inherit_sevr_msg(&mut rec.write().common, ms, &alarm);
+                    }
+                    LinkRead::Value(value)
+                }
+            },
+        };
+        let mut instance = rec.write();
+        let more = instance.record.link_read_result(link_field, read);
+        // What the record posted deciding on the read (throttle's `VAL`,
+        // `throttleRecord.c:637`) goes out as the read's own posts do.
+        super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+        more
     }
 
     /// Execute the ReadDbLink actions of a stage, and report which
@@ -7074,7 +7119,7 @@ impl PvDatabase {
     /// the same answer whichever path read it.
     fn execute_read_db_links(
         &self,
-        _record_name: &str,
+        record_name: &str,
         rec: InFrame<'_>,
         actions: &[crate::server::record::ProcessAction],
         visited: &mut ProcStack,
@@ -7096,6 +7141,10 @@ impl PvDatabase {
                 // `checkLinks`-cached `lnk_field_type`).
                 ProcessAction::ResolveOutTarget { link_field } => {
                     self.resolve_out_target_into_record(rec, link_field);
+                }
+                ProcessAction::GetLink { link_field } => {
+                    let more = self.read_link_for_record(rec, link_field, None, visited);
+                    self.execute_process_actions_in(record_name, rec, more, visited);
                 }
                 _ => {}
             }
@@ -7123,6 +7172,7 @@ impl PvDatabase {
     /// Actions are executed in order:
     /// - ReadDbLink: reads a linked PV value and writes it into a record field
     ///   (bypasses read-only checks via put_field_internal)
+    /// - GetLink: reads a linked PV value and hands it to the record
     /// - WriteDbLink: writes a value to a linked PV
     /// - ReprocessAfter: schedules a delayed re-process via tokio::spawn
     pub(super) fn execute_process_actions_in(
@@ -7144,7 +7194,13 @@ impl PvDatabase {
                     // C `dbGetLink` -> `setLinkAlarm`) belongs to ONE owner, so
                     // an input link cannot fail silently on one stage and
                     // loudly on another.
-                    let _ = self.read_db_link_into_field(rec, link_field, target_field, visited);
+                    let more =
+                        self.read_link_for_record(rec, link_field, Some(target_field), visited);
+                    self.execute_process_actions_in(record_name, rec, more, visited);
+                }
+                ProcessAction::GetLink { link_field } => {
+                    let more = self.read_link_for_record(rec, link_field, None, visited);
+                    self.execute_process_actions_in(record_name, rec, more, visited);
                 }
                 // A pre-process action (the record asks for the target BEFORE it
                 // decides), so it is a no-op if it reaches the post-process
@@ -7183,9 +7239,11 @@ impl PvDatabase {
                         // told so — every emitted action reports exactly once,
                         // so a record deriving a field from the result cannot
                         // be left holding a stale one.
-                        rec.write()
+                        let more = rec
+                            .write()
                             .record
                             .set_out_link_write_status(link_field, &value, true);
+                        self.execute_process_actions_in(record_name, rec, more, visited);
                         continue;
                     }
                     // 2. Parse and write to the linked PV — DB *or*
@@ -7216,9 +7274,11 @@ impl PvDatabase {
                     // half was already raised by `write_out_link_value`; this
                     // is what lets a record keep a C-truthful status field
                     // (throttle STS) instead of committing its own intent.
-                    rec.write()
+                    let more = rec
+                        .write()
                         .record
                         .set_out_link_write_status(link_field, &value, failed);
+                    self.execute_process_actions_in(record_name, rec, more, visited);
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
                     let mut instance = rec.write();
@@ -10004,4 +10064,35 @@ mod ls_init_udf_tests {
         assert_eq!(udf_after_seed(DsetInit::Absent), 0);
         assert_eq!(udf_after_seed(DsetInit::Failed), 1);
     }
+}
+
+/// The actions `process()` queues that C makes inside `process()` itself —
+/// `dbPutLink` and `dbGetLink` — so they run in the cycle's link stage, before
+/// `monitor()` commits the alarm a failed one raises (`dbLink.c:316-323`).
+fn runs_in_link_stage(a: &crate::server::record::ProcessAction) -> bool {
+    matches!(
+        a,
+        crate::server::record::ProcessAction::WriteDbLink { .. }
+            | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
+            | crate::server::record::ProcessAction::GetLink { .. }
+            | crate::server::record::ProcessAction::ReadDbLink { .. }
+    )
+}
+
+/// [`PvDatabase::fetch_input_link`]'s answer: C `dbGetLink`'s status and what
+/// it wrote.
+enum InputFetch {
+    /// Status 0, nothing written.
+    Nothing,
+    /// Status 0: the value, and the source alarm a healthy read folds into the
+    /// reader.
+    Value(
+        EpicsValue,
+        Option<(
+            crate::server::record::MonitorSwitch,
+            super::links::LinkAlarm,
+        )>,
+    ),
+    /// Non-zero status, LINK/INVALID raised.
+    Failed,
 }

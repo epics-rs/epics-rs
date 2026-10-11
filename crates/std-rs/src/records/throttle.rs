@@ -3,8 +3,8 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{
-    FieldDesc, FieldMetadataOverride, LinkType, ProcessAction, ProcessOutcome, Record,
-    link_field_type,
+    FieldDesc, FieldMetadataOverride, LinkType, ProcessAction, ProcessActions, ProcessOutcome,
+    Record, link_field_type,
 };
 use epics_base_rs::server::records::link_status::{
     LINK_CON, LINK_EXT_NC, LinkStatusGen, classify_link,
@@ -795,13 +795,13 @@ impl Record for ThrottleRecord {
         link_field: &'static str,
         value: &EpicsValue,
         failed: bool,
-    ) {
+    ) -> ProcessActions {
         if link_field != "OUT" {
-            return;
+            return ProcessActions::new();
         }
         if failed {
             self.sts = THROTTLE_STS_ERR;
-            return;
+            return ProcessActions::new();
         }
         self.sts = THROTTLE_STS_SUC;
         // OSENT trails SENT by one send, as the tail of C `valuePut` keeps
@@ -819,6 +819,7 @@ impl Record for ThrottleRecord {
         if self.sync_flag {
             self.value_sync();
         }
+        ProcessActions::new()
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {

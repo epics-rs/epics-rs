@@ -7778,6 +7778,13 @@ impl PvDatabase {
                         .reprocess_generation
                         .fetch_add(1, Ordering::AcqRel);
                 }
+                ProcessAction::PostAfterEpilogue(marks) => {
+                    super::field_io::post_cycle_marks(
+                        &mut rec.write(),
+                        marks,
+                        super::LinkBacking::none(),
+                    );
+                }
             }
         }
     }

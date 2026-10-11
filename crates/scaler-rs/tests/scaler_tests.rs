@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{ProcessAction, ProcessOutcome, Record, RecordProcessResult};
 use epics_base_rs::types::EpicsValue;
 use scaler_rs::device_support::scaler_asyn::ScalerDriver;
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
@@ -309,37 +309,95 @@ fn test_process_idle_no_change() {
     assert_eq!(rec.us, 0);
 }
 
-// C `scalerRecord.c:471,770-772` — `process()` calls `monitor()` (the
-// S1..Snch DBE_LOG sweep) ONLY while `ss == SCALER_STATE_IDLE`. So the
-// record advertises the active-channel sweep set only when idle, and an
-// empty set while counting or waiting.
+// C `scalerRecord.c:770-772` — `monitor()` sweeps the active channels
+// S1..Snch with DBE_LOG. Whether a cycle reaches `monitor()` at all is the
+// `:470` outcome `process()` returns, so the set does not depend on `ss`.
 #[test]
-fn test_log_swept_fields_idle_active_channels_only() {
+fn test_log_swept_fields_active_channels_only() {
     let mut rec = ScalerRecord::default();
     rec.nch = 3;
-
-    rec.ss = 0; // IDLE — sweeps exactly the active channels S1..S3.
-    assert_eq!(rec.log_swept_fields(), &["S1", "S2", "S3"]);
-
-    rec.ss = 2; // COUNTING — C does not call monitor(); no sweep.
-    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
-
-    rec.ss = 1; // WAITING — also not idle; no sweep.
-    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
+    for ss in [0, 1, 2] {
+        rec.ss = ss;
+        assert_eq!(rec.log_swept_fields(), &["S1", "S2", "S3"], "ss {ss}");
+    }
 
     // nch is clamped to the channel cap, never out of bounds.
-    rec.ss = 0;
     rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
     assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
 }
 
-// Every C `scalerRecord.c` post outside the idle `monitor()` sweep is a literal
-// `DBE_VALUE`: the process/updateCounts posts of CNT/T/VAL/PR1/TP/FREQ and the
-// active channels' Sn (:316/322/329/334/372/425/427/430/478/530/582/588), AND
-// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :705-706, :719). The
-// only `DBE_LOG` post is the idle sweep of S1..Snch (line 771). The record
-// advertises all of them as value-only so the framework strips the LOG bit —
-// which for PRn/Gn/Dn means a DBE_LOG subscriber never sees them at all, as in C.
+fn emits(outcome: &ProcessOutcome) -> bool {
+    match outcome.result {
+        RecordProcessResult::Complete => true,
+        // C's :470 skip raises no alarm.
+        RecordProcessResult::CompleteNoEmit { raise: None } => false,
+        ref other => panic!("scaler process() returned {other:?}"),
+    }
+}
+
+// C `scalerRecord.c:470` — the stamp, alarm, `monitor()` and FLNK run only on
+// a cycle that reaches it with `ss` IDLE; one boundary per side.
+#[test]
+fn test_count_start_cycle_returns_no_emit_with_its_cout_write() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "COUNTING");
+    assert!(!emits(&outcome), "ss COUNTING at :470");
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "COUT",
+                ..
+            }
+        )),
+        "the :456 COUT put still runs: {:?}",
+        outcome.actions
+    );
+    assert!(!rec.should_fire_forward_link());
+}
+
+#[test]
+fn test_count_done_cycle_emits() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.ss = 2;
+    rec.us = 3;
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.set_done();
+    assert!(emits(&rec.process().unwrap()), "ss IDLE at :470");
+    assert!(rec.should_fire_forward_link());
+}
+
+#[test]
+fn test_autocount_waiting_cycle_returns_no_emit() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.ss = 1; // WAITING for the auto-count restart, its delay elapsed
+    assert!(!emits(&rec.process().unwrap()), "ss WAITING at :470");
+    assert_eq!(rec.ss, 2, "the auto-count started after :470");
+}
+
+#[test]
+fn test_idle_cycle_that_starts_autocount_emits_and_sweeps() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 2;
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "the auto-count block re-armed ss after :470");
+    assert!(emits(&outcome), "ss IDLE at :470");
+    assert_eq!(rec.log_swept_fields(), &["S1", "S2"]);
+}
+
 #[test]
 fn test_value_only_change_fields_scalars_plus_active_channels() {
     let mut rec = ScalerRecord::default();
@@ -852,6 +910,7 @@ fn test_process_done_during_autocount_does_not_clear_cnt() {
 fn test_process_zeroes_counts_while_waiting() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
+    rec.nch = 4; // C zeroes and posts `counts[0..nch]` (:574, :579)
     rec.dly = 100.0; // long delay so we stay WAITING
     rec.cnt = 1;
     rec.special("CNT", true).unwrap();
@@ -864,6 +923,30 @@ fn test_process_zeroes_counts_while_waiting() {
     assert_eq!(rec.s[0], 0, "S1 zeroed while WAITING");
     assert_eq!(rec.s[3], 0, "S4 zeroed while WAITING");
     assert_eq!(rec.t, 0.0, "T recomputed from zeroed S1");
+}
+
+/// C scalerRecord.c:579-588 — a WAITING cycle zeroes every active channel, so
+/// a 64-channel record posts all 64 `Sn` (:582) then T (:588) ahead of
+/// `monitor()`: 65 marks in the one take, in C's order.
+#[test]
+fn test_waiting_cycle_marks_t_and_every_channel() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = MAX_SCALER_CHANNELS as i16;
+    rec.dly = 100.0;
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    rec.s = [1; MAX_SCALER_CHANNELS];
+    rec.t = 1.0;
+    rec.process().unwrap();
+    let marked: Vec<&str> = rec.take_process_posted_fields().map(|(f, _)| f).collect();
+    let mut expected: Vec<String> = (1..=MAX_SCALER_CHANNELS).map(|i| format!("S{i}")).collect();
+    expected.push("T".to_string());
+    assert_eq!(marked, expected);
+    assert!(
+        rec.take_process_posted_fields().is_empty(),
+        "a take clears them"
+    );
 }
 
 /// C scalerRecord.c:487-490 — after a user count finishes, the
@@ -1023,6 +1106,28 @@ impl ScalerDriver for QuantizingDriver {
     fn num_channels(&self) -> usize {
         8
     }
+}
+
+/// C scalerRecord.c:453, :508-535 — an idle cycle marks its counts update
+/// (Sn :582, T :588); the autocount's FREQ (:530) follows the `:470` epilogue,
+/// so it is no mark (its order: `autocount_freq_post.rs`).
+#[test]
+fn test_autocount_freq_is_not_a_process_mark() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 1;
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+    rec.s[0] = 5; // QuantizingDriver reads 0
+    rec.t = 1.0;
+    rec.bind_dset(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+        QuantizingDriver::new(),
+    ))));
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "the auto-count started");
+    let marked: Vec<&str> = rec.take_process_posted_fields().map(|(f, _)| f).collect();
+    assert_eq!(marked, ["S1", "T"]);
+    assert_eq!(rec.freq, 1.25e7, "the driver's clock adopted");
 }
 
 /// C scalerRecord.c:405-432 — REQSTART: after the per-channel

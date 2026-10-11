@@ -30,7 +30,7 @@ const DEFAULT_SCALER_IOC: &str =
     "/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc";
 
 /// The camonitored PVs, without the prefix.
-const WATCHED: [&str; 5] = ["SC.CNT", "SC.US", "SC.SS", "SC.S1", "SCF"];
+const WATCHED: [&str; 6] = ["SC.CNT", "SC.US", "SC.SS", "SC.S1", "SC.T", "SCF"];
 
 /// `oracleScalerIoc` and the directory its `st-scaler.cmd` runs from.
 fn scaler_ioc() -> (PathBuf, PathBuf) {
@@ -250,6 +250,8 @@ fn caput(tools: &CTools, addr: &str, pv: &str, value: &str) {
 /// dropped, and the final `caget` of all five.
 struct Run {
     posts: BTreeMap<String, Vec<String>>,
+    /// Every post as `FIELD value…`, in camonitor's order across fields.
+    stream: Vec<String>,
     after: Vec<String>,
 }
 
@@ -295,6 +297,7 @@ fn drive(served: &Served, prefix: &str) -> Run {
     drop(monitor);
 
     let mut posts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut stream = Vec::new();
     for line in out.lock().unwrap().iter() {
         let mut words = line.split_whitespace();
         let Some(pv) = words.next() else { continue };
@@ -306,14 +309,17 @@ fn drive(served: &Served, prefix: &str) -> Run {
             2
         };
         let field = pv.strip_prefix(prefix).unwrap_or(pv).to_string();
-        posts
-            .entry(field)
-            .or_default()
-            .push(rest[skip.min(rest.len())..].join(" "));
+        let post = rest[skip.min(rest.len())..].join(" ");
+        stream.push(format!("{field} {post}"));
+        posts.entry(field).or_default().push(post);
     }
 
     let after = caget(served, prefix, &WATCHED);
-    Run { posts, after }
+    Run {
+        posts,
+        stream,
+        after,
+    }
 }
 
 fn both(prefix: &str) -> (Run, Run) {
@@ -356,12 +362,61 @@ fn the_control_scaler_boots_and_runs_as_oracle_scaler_ioc() {
     }
 }
 
+/// Each field's posts after its connect post, and S1/T in one stream: CNT's `:372` Done and
+/// S1's `:582` count carry the init alarm `monitor()` has not yet reset, and
+/// no count-start cycle reaches `monitor()` or the FLNK (`:470`).
 #[test]
-#[ignore = "needs records-b's scalerRecord.c:470 epilogue outcome (rs posts CNT's second Done and S1's first 1e+07 without C's UDF INVALID) and its local-record put action; the arm's zeroes are written by SoftScalerPorts' interim task until then"]
 fn cnt_and_s1_post_as_oracle_scaler_ioc_does() {
-    let (c, rs) = both("scs:");
-    for field in ["SC.CNT", "SC.S1"] {
-        assert_eq!(rs.posts.get(field), c.posts.get(field), "{field}");
+    let (c, rs) = both("scw:");
+    let c_s1: &[&str] = &["1e+07 UDF INVALID", "0", "1e+07"];
+    // CBUG-B19 (46be9a081): the first done cycle's LOG sweep carries the alarm reset.
+    let rs_s1: &[&str] = &["1e+07 UDF INVALID", "1e+07", "0", "1e+07"];
+    // Across fields, from the one stream: `updateCounts()` posts Sn (:582)
+    // before T (:588).
+    let c_s1_t: &[&str] = &[
+        "SC.S1 1e+07 UDF INVALID",
+        "SC.T 1 UDF INVALID",
+        "SC.S1 0",
+        "SC.T 0",
+        "SC.S1 1e+07",
+        "SC.T 1",
+    ];
+    let rs_s1_t: &[&str] = &[
+        "SC.S1 1e+07 UDF INVALID",
+        "SC.T 1 UDF INVALID",
+        "SC.S1 1e+07",
+        "SC.S1 0",
+        "SC.T 0",
+        "SC.S1 1e+07",
+        "SC.T 1",
+    ];
+    for (side, run, s1, s1_t) in [("C", &c, c_s1, c_s1_t), ("rs", &rs, rs_s1, rs_s1_t)] {
+        let expect: [(&str, &[&str]); 5] = [
+            (
+                "SC.CNT",
+                &["Count UDF INVALID", "Done UDF INVALID", "Count", "Done"],
+            ),
+            ("SC.S1", s1),
+            ("SCF", &["1", "2"]),
+            ("SC.US", &[]),
+            ("SC.SS", &[]),
+        ];
+        for (field, posts) in expect {
+            let got: Option<Vec<&str>> = run
+                .posts
+                .get(field)
+                .map(|p| p[1..].iter().map(String::as_str).collect());
+            assert_eq!(got.as_deref(), Some(posts), "{side} {field}");
+        }
+        // The two connect posts precede every put.
+        let got: Vec<&str> = run
+            .stream
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.starts_with("SC.S1 ") || l.starts_with("SC.T "))
+            .skip(2)
+            .collect();
+        assert_eq!(got, s1_t, "{side} S1/T order");
     }
 }
 
@@ -441,7 +496,6 @@ fn a_port_missing_an_input_fails_alone_as_in_oracle_scaler_ioc() {
 /// The failed port's scaler keeps its init alarm: its count never completes,
 /// so no cycle reaches `monitor()`'s `recGblResetAlarms`.
 #[test]
-#[ignore = "needs records-b's scalerRecord.c:470 epilogue outcome: rs resets SM's UDF INVALID on the count-start cycle"]
 fn a_failed_port_keeps_its_scalers_init_alarm_as_in_oracle_scaler_ioc() {
     let (c, rs) = missing_input("sma:", &["SM.SEVR", "SM.STAT"]);
     assert_eq!(rs, c);

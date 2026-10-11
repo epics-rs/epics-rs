@@ -161,15 +161,15 @@ async fn two_counts() -> Posts {
 
 /// C reads the counters at `:453`, after the count start's reset and arm
 /// (`:391-433`), so a count start shows the cleared counters: the DLY 0.5
-/// start posts `0`, never the previous count's `1e+07`.
+/// start posts `0`, never the previous count's `1e+07`. The second `1e+07` is
+/// the first done cycle's alarm-reset sweep (CBUG-B19, 46be9a081).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_count_start_reads_the_counters_its_arm_cleared() {
     let s1: Vec<f64> = two_counts().await.s1.iter().map(|p| p.0).collect();
-    assert_eq!(s1, [1e7, 0.0, 1e7], "S1");
+    assert_eq!(s1, [1e7, 1e7, 0.0, 1e7], "S1");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a process outcome that skips the scalerRecord.c:470 epilogue without holding PACT"]
 async fn control_scaler_matches_the_c_oracle_post_for_post() {
     let posts = two_counts().await;
     let udf = (UDF_ALARM, INVALID_ALARM);
@@ -182,6 +182,10 @@ async fn control_scaler_matches_the_c_oracle_post_for_post() {
     );
     assert_eq!(posts.us, [], "US is never posted");
     assert_eq!(posts.ss, [], "SS is never posted");
-    assert_eq!(posts.s1, [ev(1e7, udf), ev(0.0, ok), ev(1e7, ok)], "S1");
+    assert_eq!(
+        posts.s1,
+        [ev(1e7, udf), ev(1e7, ok), ev(0.0, ok), ev(1e7, ok)],
+        "S1, with the alarm-reset sweep post C drops (CBUG-B19, 46be9a081)"
+    );
     assert_eq!(posts.scf, [ev(1.0, ok), ev(2.0, ok)], "SCF (FLNK)");
 }

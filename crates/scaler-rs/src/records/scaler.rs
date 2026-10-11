@@ -214,12 +214,13 @@ pub struct ScalerRecord {
     /// exactly C's `recGblFwdLink` line; the hook only reports it.
     fire_fwd_link: bool,
 
-    /// C `scalerRecord.c:372` — `db_post_events(pscal,&(pscal->cnt),DBE_VALUE)`
-    /// from inside `process()`, ahead of the `monitor()` whose
-    /// `recGblResetAlarms` (`:764`) commits the cycle's alarm, so the post
-    /// carries the alarm still standing. Set where C posts, taken by
-    /// [`Record::take_process_posted_fields`].
-    cnt_posted: bool,
+    /// The `db_post_events` C's `process()` and `updateCounts()` make ahead of
+    /// `monitor()`, a bit per `PROCESS_POSTS` entry: CNT (`:372`), PR1/TP
+    /// (`:425-427`), FREQ (`:430`), `Sn` (`:582`), T (`:588`). Each
+    /// carries the alarm `recGblResetAlarms` (`:764`) has not yet committed,
+    /// and posts on a cycle that never reaches `monitor()` too. Set where C
+    /// posts, taken by [`Record::take_process_posted_fields`].
+    process_posts: u128,
 }
 
 impl ScalerRecord {
@@ -291,7 +292,7 @@ impl Default for ScalerRecord {
             special_actions: Vec::new(),
             side_effect_posts: &[],
             fire_fwd_link: false,
-            cnt_posted: false,
+            process_posts: 0,
         }
     }
 }
@@ -304,6 +305,10 @@ fn parse_indexed_field(name: &str, prefix: &str) -> Option<usize> {
 }
 
 impl ScalerRecord {
+    fn mark_post(&mut self, entry: usize) {
+        self.process_posts |= 1 << entry;
+    }
+
     pub fn update_time(&mut self) {
         if self.freq > 0.0 {
             self.t = self.s[0] as f64 / self.freq;
@@ -333,17 +338,30 @@ impl ScalerRecord {
         &mut self,
         dset: Option<&mut dyn ScalerDriver>,
     ) -> Option<std::time::Duration> {
+        // C ignores the read status (:572) and posts whatever its stack
+        // `counts[]` holds; the previous counts stand in for that.
+        let mut counts = self.s;
         if self.us == USER_STATE_WAITING {
-            self.s = [0; MAX_SCALER_CHANNELS];
+            counts = [0; MAX_SCALER_CHANNELS];
         } else if let Some(dset) = dset {
-            let mut counts = [0u32; MAX_SCALER_CHANNELS];
-            // C ignores the read status (:572) and posts whatever its stack
-            // `counts[]` holds; the previous counts stand in for that.
-            if dset.read(&mut counts).is_ok() {
-                self.s = counts;
+            let mut read = [0u32; MAX_SCALER_CHANNELS];
+            if dset.read(&mut read).is_ok() {
+                counts = read;
             }
         }
+        // C:579-584 — `s[]` is the counts last posted, so a changed channel is
+        // stored and posted here and nowhere else.
+        for (i, &count) in counts.iter().enumerate().take(self.active_channels()) {
+            if count != self.s[i] {
+                self.s[i] = count;
+                self.mark_post(POST_S1 + i);
+            }
+        }
+        let old_t = self.t;
         self.update_time();
+        if self.t != old_t {
+            self.mark_post(POST_T);
+        }
 
         if self.ss == SCALER_STATE_COUNTING {
             let rate = if self.us == USER_STATE_COUNTING {
@@ -491,6 +509,7 @@ impl ScalerRecord {
         let Some(dset) = dset else { return };
         let _ = dset.reset();
         let old_pr1 = self.reqstart_old_pr1;
+        let old_freq = self.freq;
         let save_pr1 = self.pr[0];
         for i in 0..self.active_channels() {
             if self.g[i] != 0 {
@@ -509,14 +528,21 @@ impl ScalerRecord {
         if let Some(rewrite) = self.count_start_rewrite_preset(save_pr1) {
             self.pr[0] = dset.write_preset(0, rewrite).unwrap_or(rewrite);
         }
-        // C:424-428.
+        // C:424-431.
         self.count_start_finalize_tp(old_pr1);
+        if old_pr1 != self.pr[0] {
+            self.mark_post(POST_PR1);
+            self.mark_post(POST_TP);
+        }
+        if old_freq != self.freq {
+            self.mark_post(POST_FREQ);
+        }
         let _ = dset.arm(true);
     }
 
     /// Auto-count start — C `scalerRecord.c:508-535`. Unlike REQSTART the
     /// user's PR1 is restored afterwards (`:532`) and TP is left alone; only a
-    /// driver-changed FREQ is adopted (posted by change detection, `:530`).
+    /// driver-changed FREQ is adopted and posted (`:530`).
     ///
     /// The `D` fields are the record's: C sets them here (`:525`) as it does
     /// at REQSTART (`:413`).
@@ -530,8 +556,10 @@ impl ScalerRecord {
         if self.tp1 < 1.0e-3 {
             self.copy_gates_to_directions();
         }
+        let mut actions = Vec::new();
         if let Some(dset) = dset {
             let old_pr1 = self.pr[0];
+            let old_freq = self.freq;
             let _ = dset.reset();
             if self.tp1 >= 1.0e-3 {
                 // C:513-514 — truncating cast, not NINT.
@@ -557,6 +585,13 @@ impl ScalerRecord {
             if let Some(freq) = dset.actual_frequency() {
                 self.freq = freq;
             }
+            // C:530, after the :470 epilogue.
+            if old_freq != self.freq {
+                static FREQ_POST: [(&str, CyclePostMask); 1] = [("FREQ", CyclePostMask::Value)];
+                actions.push(ProcessAction::PostAfterEpilogue(CycleMarks::of(
+                    &FREQ_POST, 1,
+                )));
+            }
             // C:532 — "Don't let autocount disturb user's channel-1 preset".
             self.pr[0] = old_pr1;
             let _ = dset.arm(true);
@@ -567,7 +602,6 @@ impl ScalerRecord {
         // 1.0/rat1)` when `rat1 > .1`. `update_counts()` has already run
         // earlier this process cycle (scalerRecord.c:453) and saw `ss !=
         // COUNTING`, so it could not queue this — emit it here directly.
-        let mut actions = Vec::new();
         if self.rat1 > 0.1 {
             let refresh = self.arm_reentry(
                 ReentryKind::DisplayRefresh,
@@ -602,15 +636,17 @@ impl ScalerRecord {
 /// fixed names (`PR1` among them: process posts it at :425/:427 whatever `nch`
 /// is), then one group per channel, so the first `nch` channels are a prefix.
 ///
-/// `PROCESS_POSTED_FIELDS` — every `db_post_events` C's scaler makes from a
-/// PROCESS cycle, [`ScalerRecord::process_posted_fields`]: `process()` posts
-/// `PR1` (:425, only when the count-start recompute moved it),
-/// `TP` (:427), `FREQ` (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T`
-/// (:588); `monitor()` posts `S1..Snch` (:771). C writes `D1..Dnch` in process
-/// (:413-414, :525-526) and posts none of them, and posts `Gn`/`PRn`(n>1) only
-/// from `special()`. Sliced to `nch`, so an absent channel's `Sn` stays out, as
-/// C's post loops are bounded by `nch`. `CNT` (:372) is the one process post
-/// outside the set: it is never change-detected, only marked (`cnt_posted`).
+/// `PROCESS_POSTED_FIELDS` — the fields a process cycle's epilogue may post,
+/// [`ScalerRecord::process_posted_fields`]: `VAL` (:478) and the `S1..Snch`
+/// `monitor()` sweep (:771). Every other process post precedes `monitor()` and
+/// is a mark in `PROCESS_POSTS`, but the autocount's FREQ (:530), which follows
+/// the epilogue and is a `PostAfterEpilogue` action. C writes `D1..Dnch` in process (:413-414,
+/// :525-526) and posts none of them, and posts `Gn`/`PRn`(n>1) only from
+/// `special()`. Sliced to `nch`, as C's post loops are bounded by `nch`.
+///
+/// `PROCESS_POSTS` — C's posts ahead of `monitor()`, each a literal
+/// `DBE_VALUE`, in C's order, which is the order the take posts them in: CNT
+/// (:372), PR1 (:425), TP (:427), FREQ (:430), `S1..S64` (:582), T (:588).
 macro_rules! channel_tables {
     ($first:literal $($n:literal)*) => {
         static SN_FIELD_NAMES: [&str; MAX_SCALER_CHANNELS] =
@@ -626,12 +662,25 @@ macro_rules! channel_tables {
             concat!("S", $first), concat!("D", $first), concat!("G", $first)
             $(, concat!("S", $n), concat!("PR", $n), concat!("D", $n), concat!("G", $n))*
         ];
-        static PROCESS_POSTED_FIELDS: [&str; 5 + MAX_SCALER_CHANNELS] = [
-            "VAL", "T", "PR1", "TP", "FREQ",
-            concat!("S", $first) $(, concat!("S", $n))*
+        static PROCESS_POSTED_FIELDS: [&str; 1 + MAX_SCALER_CHANNELS] = [
+            "VAL", concat!("S", $first) $(, concat!("S", $n))*
+        ];
+        static PROCESS_POSTS: [(&str, CyclePostMask); POST_T + 1] = [
+            ("CNT", CyclePostMask::Value), ("PR1", CyclePostMask::Value),
+            ("TP", CyclePostMask::Value), ("FREQ", CyclePostMask::Value),
+            (concat!("S", $first), CyclePostMask::Value)
+            $(, (concat!("S", $n), CyclePostMask::Value))*,
+            ("T", CyclePostMask::Value)
         ];
     };
 }
+const POST_CNT: usize = 0;
+const POST_PR1: usize = 1;
+const POST_TP: usize = 2;
+const POST_FREQ: usize = 3;
+const POST_S1: usize = 4;
+const POST_T: usize = POST_S1 + MAX_SCALER_CHANNELS;
+
 channel_tables!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64);
 
 /// C's `special()` posts, every one a literal `DBE_VALUE`: TP's (`:673-676`),
@@ -650,6 +699,15 @@ static PR1_POSTS: [(&str, CyclePostMask); 3] = [
 /// C `scalerRecord.c:735` writes the literal `*precision = 2` for `VERS`, the
 /// record-support version number.
 const SCALER_VERS_PRECISION: i16 = 2;
+
+/// The `scalerRecord.c:470` decision `process()` takes once per cycle.
+fn cycle_outcome(emit: bool, actions: Vec<ProcessAction>) -> ProcessOutcome {
+    if emit {
+        ProcessOutcome::complete_with(actions)
+    } else {
+        ProcessOutcome::complete_no_emit_with(actions)
+    }
+}
 
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
@@ -704,7 +762,8 @@ impl Record for ScalerRecord {
             None
         };
         if reentry == Some(ReentryKind::DisplayRefresh) && self.ss == SCALER_STATE_IDLE {
-            return Ok(ProcessOutcome::complete_with(Vec::new()));
+            // C never enters `process()` here, so nothing of its epilogue runs.
+            return Ok(ProcessOutcome::complete_no_emit());
         }
 
         let mut just_finished_user_count = false;
@@ -729,7 +788,7 @@ impl Record for ScalerRecord {
             // C:370 — an auto-count cycle is NOT allowed to reset CNT.
             if self.us == USER_STATE_COUNTING {
                 self.cnt = 0;
-                self.cnt_posted = true;
+                self.mark_post(POST_CNT);
                 self.us = USER_STATE_IDLE;
                 just_finished_user_count = true;
             }
@@ -847,11 +906,13 @@ impl Record for ScalerRecord {
             }
         }
 
-        // C scalerRecord.c:470-481 — "done counting?": while ss==IDLE,
-        // VAL takes T if we just left COUNTING, and `recGblFwdLink()`
-        // fires. Both are decided HERE, before the auto-count block
-        // below re-arms `ss`.
-        if self.ss == SCALER_STATE_IDLE && self.pcnt == 0 && self.us == USER_STATE_IDLE {
+        // C scalerRecord.c:470-481 — "done counting?": the stamp, `do_alarm`,
+        // `monitor()` and FLNK run only on a cycle that gets here with ss IDLE;
+        // any other returns with PACT cleared and its `dbPutLink`s made, which
+        // is `CompleteNoEmit`. Decided HERE, before the auto-count block below
+        // re-arms `ss`.
+        let emit = self.ss == SCALER_STATE_IDLE;
+        if emit && self.pcnt == 0 && self.us == USER_STATE_IDLE {
             if prev_scaler_state == SCALER_STATE_COUNTING {
                 self.val = self.t;
             }
@@ -878,7 +939,7 @@ impl Record for ScalerRecord {
                     epics_base_rs::runtime::time::duration_from_secs(dly_sec),
                 );
                 actions.push(auto);
-                return Ok(ProcessOutcome::complete_with(actions));
+                return Ok(cycle_outcome(emit, actions));
             } else if self.ss == SCALER_STATE_WAITING {
                 // Already WAITING: only start once the scheduled delay
                 // has actually elapsed (guards a premature reprocess).
@@ -897,7 +958,7 @@ impl Record for ScalerRecord {
                         epics_base_rs::runtime::time::duration_from_secs(remaining),
                     );
                     actions.push(auto);
-                    return Ok(ProcessOutcome::complete_with(actions));
+                    return Ok(cycle_outcome(emit, actions));
                 }
             } else {
                 // dly_sec <= 0 and not WAITING: start immediately.
@@ -906,7 +967,7 @@ impl Record for ScalerRecord {
             }
         }
 
-        Ok(ProcessOutcome::complete_with(actions))
+        Ok(cycle_outcome(emit, actions))
     }
 
     /// C's `special()` COUTP put (`scalerRecord.c:623-624`), handed to the
@@ -1337,13 +1398,12 @@ impl Record for ScalerRecord {
         dbd_generated::SCALER_NOACCESS
     }
 
-    /// C `scalerRecord.c:471,770-772`: `process()` calls `monitor()` only
-    /// while `ss == SCALER_STATE_IDLE`, and `monitor()` re-posts every
-    /// active channel `S1..Snch` with a literal `DBE_LOG` regardless of
-    /// change — so an archiver `camonitor SCALER:Sn` receives an event on
-    /// every idle scan, even when the count is unchanged. A counting or
-    /// WAITING cycle does not call `monitor()`, so the sweep is empty
-    /// there.
+    /// C `scalerRecord.c:471,770-772`: `monitor()` re-posts every active
+    /// channel `S1..Snch` with a literal `DBE_LOG` regardless of change — so
+    /// an archiver `camonitor SCALER:Sn` receives an event on every idle scan,
+    /// even when the count is unchanged. Only a cycle `process()` completed
+    /// (`ss` IDLE at `:470`) reaches the framework's `monitor()`; re-reading
+    /// `ss` here would see the auto-count block's re-arm (`:534`) instead.
     ///
     /// The sweep is INDEPENDENT of the change post, and the
     /// count-completion cycle is where that matters: the done-interrupt
@@ -1362,11 +1422,7 @@ impl Record for ScalerRecord {
     /// subscribed to `Sn` with `DBE_ALARM` receives nothing on a severity
     /// transition.
     fn log_swept_fields(&self) -> &'static [&'static str] {
-        if self.ss == SCALER_STATE_IDLE {
-            &SN_FIELD_NAMES[..self.active_channels()]
-        } else {
-            &[]
-        }
+        &SN_FIELD_NAMES[..self.active_channels()]
     }
 
     /// Every C scaler post outside the idle `monitor()` sweep is a literal
@@ -1397,15 +1453,22 @@ impl Record for ScalerRecord {
     /// `last_posted` not advanced by the put's own post) is fixed at the
     /// framework, in `RecordInstance::notify_field_with_origin`.
     ///
-    /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
-    /// count-start preset recompute moved it.
+    /// `PR1`, `TP`, `FREQ`, `T` and `CNT` stay outside it too: C posts them
+    /// ahead of `monitor()`, which `PROCESS_POSTS` marks where C posts, or
+    /// after the epilogue (FREQ `:530`), which `dset_start_autocount` hands
+    /// the framework as a `PostAfterEpilogue` action.
     fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&PROCESS_POSTED_FIELDS[..5 + self.active_channels()])
+        Some(&PROCESS_POSTED_FIELDS[..1 + self.active_channels()])
     }
 
     fn take_process_posted_fields(&mut self) -> CycleMarks {
-        static CNT_POST: [(&str, CyclePostMask); 1] = [("CNT", CyclePostMask::Value)];
-        CycleMarks::of(&CNT_POST, std::mem::take(&mut self.cnt_posted) as u128)
+        CycleMarks::of(&PROCESS_POSTS, std::mem::take(&mut self.process_posts))
+    }
+
+    /// `Sn` stays in `PROCESS_POSTED_FIELDS` for the `monitor()` sweep alone:
+    /// its `DBE_VALUE` post is the `:582` mark, never change detection.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SN_FIELD_NAMES[..self.active_channels()]
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that

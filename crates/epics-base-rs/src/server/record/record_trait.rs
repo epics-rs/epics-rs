@@ -1903,6 +1903,15 @@ pub enum ProcessAction {
     /// delay or `WAITn` wait; the record resets its own sequence state in
     /// the same `process()` cycle that emits this.
     CancelReprocess,
+
+    /// Posts C's `process()` makes after its epilogue — after `monitor()`'s
+    /// alarm commit and `recGblFwdLink`, or on a cycle that skipped both
+    /// (scaler's autocount FREQ, `scalerRecord.c:530`). Run with the cycle's
+    /// other deferred actions, past the FLNK tail on a completing cycle and
+    /// with the actions of a [`RecordProcessResult::CompleteNoEmit`] one. The
+    /// marks name a static table, so the action owns no allocation; a
+    /// `Reset*` entry has no meaning here.
+    PostAfterEpilogue(CycleMarks),
 }
 
 /// A list a record hands the framework for one cycle — the actions of

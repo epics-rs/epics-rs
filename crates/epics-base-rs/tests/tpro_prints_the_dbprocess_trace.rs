@@ -119,6 +119,6 @@ record(ai, "SC") { field(SCAN, "1 second") field(TPRO, "1") }
         .await
         .unwrap();
     let owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1500)).await;
     drop(owner);
 }

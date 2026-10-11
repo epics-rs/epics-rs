@@ -50,6 +50,11 @@ impl Ioc {
         let path = dir.path().join("t.db");
         std::fs::write(&path, db).expect("write db");
         let port = port_free_for_udp_and_tcp();
+        // stdout and stderr share one pipe, as on C's console, so the order
+        // lines are read in is the order they were written: errlog's line
+        // is on stderr and the dbpf echo on stdout, and `errlogVprintf`
+        // flushes the iocsh thread's line before returning (`errlog.c:186`).
+        let (out, out_w) = std::io::pipe().expect("pipe");
         let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
             .arg("-d")
             .arg(&path)
@@ -59,23 +64,17 @@ impl Ioc {
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(out_w.try_clone().expect("clone pipe"))
+            .stderr(out_w)
             .spawn()
             .expect("spawn softioc-rs");
         let stdin = child.stdin.take().unwrap();
         let (tx, lines) = mpsc::channel();
-        for out in [
-            Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
-            Box::new(child.stderr.take().unwrap()),
-        ] {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    let _ = tx.send(line);
-                }
-            });
-        }
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let line = lines

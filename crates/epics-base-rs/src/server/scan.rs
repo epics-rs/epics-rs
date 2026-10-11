@@ -1113,7 +1113,7 @@ fn spawn_helpers(
         return None;
     }
     if passes.len() > MAX_PARALLEL_THREADS {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "scanParallelThreads: {} scan rates exceed the {} the helper pool can serve, \
              running without helpers\n",
             passes.len(),
@@ -1124,7 +1124,7 @@ fn spawn_helpers(
     if n_pool + n_rate > MAX_PARALLEL_THREADS {
         // C drops pool helpers rather than dedicated ones (`dbScan.c:1366-1375`):
         // a rate asked for its own by name, the pool is whatever is left over.
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "scanParallelThreads: {} helpers exceed {}, dropping pool helpers\n",
             n_pool + n_rate,
             MAX_PARALLEL_THREADS

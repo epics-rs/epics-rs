@@ -92,6 +92,7 @@ async fn install_file_alias<H: InstallHost>(
 /// [`super::apply_fields_one_at_a_time`]'s; this site only decides where the
 /// report goes.
 fn apply_fields_one_at_a_time<T: super::LoadTarget + ?Sized>(
+    links: &crate::server::record::LinkList,
     record: &mut T,
     record_name: &str,
     fields: &[super::DbFieldDef],
@@ -99,6 +100,7 @@ fn apply_fields_one_at_a_time<T: super::LoadTarget + ?Sized>(
     faults: &mut DbFaults,
 ) {
     super::apply_fields_one_at_a_time(
+        links,
         record,
         record_name,
         fields,
@@ -270,6 +272,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                 {
                     let mut inst = rec_arc.write();
                     apply_fields_one_at_a_time(
+                        &host.db().link_list(),
                         &mut *inst,
                         &def.name,
                         &def.fields,
@@ -304,6 +307,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                 // creation sink; apply_fields only needs the LINR
                 // index, already resolved above.
                 apply_fields_one_at_a_time(
+                    &host.db().link_list(),
                     &mut record,
                     &def.name,
                     &def.fields,

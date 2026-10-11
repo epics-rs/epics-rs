@@ -282,6 +282,9 @@ pub(crate) enum LinkWhy {
     Unported(ReportString),
     /// `dbJLinkInit: Link type '%s' not found`.
     NotFound(ReportString),
+    /// `dbJLinkInit: Support for Link type '%s' not loaded`: declared by a
+    /// loaded `link()` line, bound to no support.
+    NotLoaded(ReportString),
     /// `dbJLinkInit: Illegal second link key '%s'`.
     SecondKey(ReportString),
     /// A `/*` with no `*/`, at this byte.
@@ -364,6 +367,7 @@ impl LinkRefusal {
         let owed = matches!(
             why,
             LinkWhy::NotFound(_)
+                | LinkWhy::NotLoaded(_)
                 | LinkWhy::SecondKey(_)
                 | LinkWhy::ConstStop(Some(_))
                 | LinkWhy::AllocFailed { .. }
@@ -420,6 +424,11 @@ impl std::fmt::Display for LinkRefusal {
             LinkWhy::NotFound(key) => {
                 write!(f, "dbJLinkInit: Link type '{}' not found", key.as_str())
             }
+            LinkWhy::NotLoaded(key) => write!(
+                f,
+                "dbJLinkInit: Support for Link type '{}' not loaded",
+                key.as_str()
+            ),
             LinkWhy::SecondKey(key) => {
                 write!(f, "dbJLinkInit: Illegal second link key '{}'", key.as_str())
             }

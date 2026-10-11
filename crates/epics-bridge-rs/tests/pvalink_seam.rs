@@ -1,6 +1,6 @@
 //! The `pva` link set (pvalink) must install at the base
 //! `AfterCaLinkInit` seam via
-//! [`IocApplication::register_link_set_installer`], so a `pva://` link
+//! [`IocApplication::register_link_type`], so a `pva://` link
 //! loaded before iocInit has its link set registered and its CP link
 //! opened (background connect started) while iocInit is still running —
 //! matching pvxs opening pvalink channels at `initHookAfterIocBuilt`
@@ -88,7 +88,7 @@ async fn pvalink_installs_at_iocinit_seam_and_not_in_external_link_wait() {
     // this is the only path that can register the `pva` scheme.
     let result = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
-        .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install)
+        .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install)
         .run(|config| async move {
             // By here iocInit has fired the seam installer (which
             // registered the `pva` lset and pre-opened the CP link) and

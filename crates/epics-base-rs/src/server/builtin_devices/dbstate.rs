@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::error::{CaError, CaResult, LinkRefusal};
-use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
+use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use crate::server::database::filters::sync::{DbState, db_state_registry};
 use crate::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
@@ -108,9 +108,9 @@ impl DeviceSupport for DbStateDeviceSupport {
                 } else {
                     "devBiDbState"
                 };
-                errlog_sev_printf(
+                errlog_sev_vprintf(
                     ErrlogSevEnum::Info,
-                    &format!("{devsup}: Creating new db state '{name}'\n"),
+                    format_args!("{devsup}: Creating new db state '{name}'\n"),
                 );
                 registry.get_or_create(name)
             }

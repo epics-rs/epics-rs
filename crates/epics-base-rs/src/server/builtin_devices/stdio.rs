@@ -13,7 +13,7 @@
 //! no known stream leaves `dpvt = NULL`, so the record writes nothing.
 
 use crate::error::{CaError, CaResult, LinkRefusal};
-use crate::runtime::log::errlog_printf;
+use crate::runtime::log::errlog_vprintf;
 use crate::server::device_support::{DeviceInitOutcome, DeviceSupport};
 use crate::server::record::Record;
 use crate::types::EpicsValue;
@@ -50,7 +50,7 @@ impl StdioStream {
         match self {
             StdioStream::Stdout => println!("{line}"),
             StdioStream::Stderr => eprintln!("{line}"),
-            StdioStream::Errlog => errlog_printf(&format!("{line}\n")),
+            StdioStream::Errlog => errlog_vprintf(format_args!("{line}\n")),
         }
     }
 }

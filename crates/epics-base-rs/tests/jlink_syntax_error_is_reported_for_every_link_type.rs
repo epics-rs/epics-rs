@@ -103,6 +103,8 @@ async fn a_link_yajl_rejects_prints_the_yajl_error() {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let shell_db = Arc::clone(&db);
     let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
         IocShell::new(shell_db, bridge).execute_line("dbLoadRecords(\"js.db\")")
     })
     .join();

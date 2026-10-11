@@ -83,6 +83,8 @@ async fn a_link_type_refusing_the_field_type_prints_both_lines() {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let shell_db = Arc::clone(&db);
     let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
         IocShell::new(shell_db, bridge).execute_line("dbLoadRecords(\"jf.db\")")
     })
     .join();

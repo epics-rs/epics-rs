@@ -263,6 +263,11 @@ test-group = 'ca_softioc'
 filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(interop_pvxs) | binary(caput_sends_the_string_c_caput_sends) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order)'
 test-group = 'ioc_unthrottled'
 
+# Capped because nobody has measured them unthrottled.
+[[profile.default.overrides]]
+filter = 'binary(boot_stderr_matches_softioc) | binary(softioc_a_ca_put_never_waits_on_the_console) | binary(softioc_errlog_reports_lost_messages) | binary(softioc_undeclared_json_link_type)'
+test-group = 'ca_softioc'
+
 [test-groups]
 # PVA listener-binding tests serialise process-wide. With max-threads
 # higher than 1 we observed flakes in `stability` (auto-reconnect,

@@ -1300,7 +1300,7 @@ impl CaServer {
         // counterpart and a caller must be able to read the ports it got;
         // that report goes through the errlog so `eltc 0` silences it.
         if self.ephemeral_requested {
-            epics_base_rs::runtime::log::errlog_printf(&format!(
+            epics_base_rs::runtime::log::errlog_vprintf(format_args!(
                 "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
                 udp_cfg.beacon_addrs.len()
             ));

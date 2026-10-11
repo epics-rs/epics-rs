@@ -82,6 +82,8 @@ async fn init_reports_follow_c_initdatabase_order() {
         libc::dup2(err_sink.as_file().as_raw_fd(), 2);
         saved
     };
+    // C `iocInit` raises its caller to ok-to-block (`iocInit.c:125-127`).
+    epics_base_rs::runtime::task::set_thread_ok_to_block(true);
     let built = builder.build().await;
     // SAFETY: restoring the descriptor this test replaced, before anything
     // can panic.

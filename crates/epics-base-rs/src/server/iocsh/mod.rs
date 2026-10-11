@@ -289,11 +289,20 @@ const MAX_SCRIPT_DEPTH: usize = 32;
 /// `iocshScope scope;`) — every exit path of the executors pops the
 /// scope via `Drop`, which is what makes the fresh `Continue` default
 /// hold for the caller's next line.
-struct ScopeGuard<'a>(&'a IocShell);
+///
+/// It also carries `iocshBody`'s ok-to-block bracket (`iocsh.cpp:1121-1122`,
+/// `:1326-1327`): a shell may wait for the errlog drain, so a line's errlog
+/// output comes out before the next line runs.
+struct ScopeGuard<'a> {
+    shell: &'a IocShell,
+    was_ok_to_block: bool,
+}
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        self.0.scopes.borrow_mut().pop();
+        self.shell.scopes.borrow_mut().pop();
+        crate::runtime::log::errlog_flush();
+        crate::runtime::task::set_thread_ok_to_block(self.was_ok_to_block);
     }
 }
 
@@ -451,7 +460,12 @@ impl IocShell {
     /// Enter one `iocshBody`-equivalent scope.
     fn enter_scope(&self, scope: IocshScope) -> ScopeGuard<'_> {
         self.scopes.borrow_mut().push(scope);
-        ScopeGuard(self)
+        let was_ok_to_block = crate::runtime::task::thread_is_ok_to_block();
+        crate::runtime::task::set_thread_ok_to_block(true);
+        ScopeGuard {
+            shell: self,
+            was_ok_to_block,
+        }
     }
 
     /// The innermost scope, `None` outside every `iocshBody` equivalent
@@ -739,26 +753,7 @@ impl IocShell {
                     let Some(cmd) = toks.get(1) else {
                         return (Ok(CommandOutcome::Continue), Dispatch::Ran);
                     };
-                    // C `iocsh.cpp:1078-1080`: reaching `iocshBody` with a
-                    // command line rather than a file "implies 'on error
-                    // break'", and it is a scope of its own — the mode
-                    // never reaches the caller's next line.
-                    let _scope = self.enter_scope(IocshScope::command_line());
-                    let (outcome, dispatch) = self.execute_line_dispatched(cmd);
-                    let failure = match &outcome {
-                        Err(e) => Some(e.clone()),
-                        // The command reported for itself, as C's
-                        // `iocshSetError` callers do.
-                        Ok(CommandOutcome::Failed) => Some(String::new()),
-                        Ok(_) => None,
-                    };
-                    self.record_line_result(failure, dispatch);
-                    // C reaches the reaction on the loop pass after
-                    // the failing line, before `if (raw != NULL)
-                    // break;` ends the single-line loop, so the
-                    // implied Break still reports itself.
-                    let _ = self.react_to_error();
-                    return (outcome, Dispatch::Ran);
+                    return (self.iocsh_cmd(cmd), Dispatch::Ran);
                 }
                 // `on error continue|break|halt|wait <delay>` —
                 // sets how the running script reacts to a failing
@@ -779,6 +774,28 @@ impl IocShell {
         }
 
         self.execute_command(cmd_line, None)
+    }
+
+    /// C `iocshCmd(cmd)`: one command line run as an `iocshBody` of its own.
+    pub fn iocsh_cmd(&self, cmd: &str) -> CommandResult {
+        // C `iocsh.cpp:1078-1080`: reaching `iocshBody` with a command line
+        // rather than a file "implies 'on error break'", and it is a scope
+        // of its own — the mode never reaches the caller's next line.
+        let _scope = self.enter_scope(IocshScope::command_line());
+        let (outcome, dispatch) = self.execute_line_dispatched(cmd);
+        let failure = match &outcome {
+            Err(e) => Some(e.clone()),
+            // The command reported for itself, as C's `iocshSetError`
+            // callers do.
+            Ok(CommandOutcome::Failed) => Some(String::new()),
+            Ok(_) => None,
+        };
+        self.record_line_result(failure, dispatch);
+        // C reaches the reaction on the loop pass after the failing line,
+        // before `if (raw != NULL) break;` ends the single-line loop, so the
+        // implied Break still reports itself.
+        let _ = self.react_to_error();
+        outcome
     }
 
     /// Execute a command, optionally redirecting output to a file.

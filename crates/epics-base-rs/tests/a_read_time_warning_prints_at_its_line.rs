@@ -61,7 +61,12 @@ fn stderr_of(line: &str) -> String {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let owned = line.to_string();
     let db = Arc::new(PvDatabase::new());
-    let ran = std::thread::spawn(move || IocShell::new(db, bridge).execute_line(&owned)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(db, bridge).execute_line(&owned)
+    })
+    .join();
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
     unsafe { libc::close(saved) };
     ran.expect("the shell thread").ok();

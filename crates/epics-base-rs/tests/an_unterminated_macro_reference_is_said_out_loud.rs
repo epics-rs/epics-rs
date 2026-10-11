@@ -77,7 +77,12 @@ fn stderr_of(line: &str, db: Arc<PvDatabase>) -> String {
 
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let owned = line.to_string();
-    let ran = std::thread::spawn(move || IocShell::new(db, bridge).execute_line(&owned)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(db, bridge).execute_line(&owned)
+    })
+    .join();
 
     // Restore BEFORE anything can panic on the assertion, or the failure
     // report has nowhere to go.

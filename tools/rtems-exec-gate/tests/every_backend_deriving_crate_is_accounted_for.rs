@@ -112,8 +112,14 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("asyn-rs", "tests/process_gate_tests.rs"),
     ("epics-base-rs", "tests/client_server.rs"),
     ("epics-bridge-rs", "tests/pva_gateway.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/qsrv_app_declares_pva_link_type.rs",
+    ),
     ("epics-bridge-rs", "tests/qsrv_app_group_file.rs"),
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
+    ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
+    ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_pva_link.rs"),
     ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),
@@ -169,6 +175,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
     ("epics-ca-rs", "tests/rsrv_error_frame_matches_softioc.rs"),
     ("epics-ca-rs", "tests/scalar_string_write_needs_a_nul.rs"),
+    (
+        "epics-ca-rs",
+        "tests/softioc_a_ca_put_never_waits_on_the_console.rs",
+    ),
     ("epics-ca-rs", "tests/softioc_db_channel_create_line.rs"),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
     (

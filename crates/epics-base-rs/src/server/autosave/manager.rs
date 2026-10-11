@@ -143,7 +143,7 @@ impl AutosaveManager {
         let set = match SaveSet::new_with_mode(cfg, self.compat).await {
             Ok(set) => Arc::new(set),
             Err(e) => {
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "autosave: save set '{name}' not built: {e} - its PVs are not saved\n"
                 ));
                 self.failed.lock().unwrap().push((name, e.to_string()));

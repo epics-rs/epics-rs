@@ -851,7 +851,7 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     // C's dbCa is linked into every softIoc. The `ca` link set installs at
     // `AfterCaLinkInit`; its client is made on the first link open, so a
     // database with no CA link starts no thread and opens no socket.
-    app = app.register_link_set_installer(epics_ca_rs::calink::calink_link_set_install);
+    app = app.register_link_type("ca", epics_ca_rs::calink::calink_link_set_install);
     if let Some(port) = args.port {
         app = app.port(port);
     }

@@ -297,7 +297,7 @@ impl Taskwd {
             if suspended {
                 // C's wording, because it is what an operator greps for
                 // (`taskwd.c:114-115`).
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "Thread {} ({}) suspended\n",
                     info.name, info.id.0
                 ));

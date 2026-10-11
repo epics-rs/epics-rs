@@ -252,7 +252,7 @@ mod tsel_stamp {
 
     #[cold]
     fn tse_failed(name: &str, tse: i16) {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {tse}\n"
         ));
     }
@@ -984,6 +984,10 @@ struct PvDatabaseInner {
     /// value was already `Arc`-shared, so the cell replaces the outer lock
     /// with nothing at all on the read side.
     breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
+    /// `pdbbase->linkList`. Read with no lock because a link put asks it with
+    /// the record held; written only by a `.dbd` load or a binary's
+    /// declaration.
+    link_list: SnapshotCell<crate::server::record::LinkList>,
 }
 
 thread_local! {
@@ -1503,6 +1507,7 @@ impl PvDatabase {
                 breaktable_registry: SnapshotCell::new(
                     crate::server::cvt_bpt::BreakTableRegistry::new(),
                 ),
+                link_list: SnapshotCell::new(crate::server::record::LinkList::base()),
             }),
         }
     }
@@ -3799,6 +3804,43 @@ impl PvDatabase {
     /// serialise against, since the cell is replaced wholesale.
     pub fn breaktable_registry(&self) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
         self.inner.breaktable_registry.load_full()
+    }
+
+    /// Declare and bind the JSON link type `key`: the binary's own `link()`
+    /// line and its `registryJLinkAdd`, ahead of any `.db` this database
+    /// loads. It appends: C's expanded `.dbd` sorts by jlif
+    /// (`DBD/Output.pm:92-95`), which puts pvxs's `lsetPVX` after every base
+    /// `lnk…If` (pvxs 1.5.3 `softIocPVX.dbd:18997-19002`). Reached only
+    /// through `register_link_type`, which carries the type's link set too.
+    ///
+    /// # Panics
+    ///
+    /// When this port implements no JSON link type `key`: a declaration names a
+    /// jlif the binary carries, and there is none to carry.
+    pub(crate) fn declare_link_type(&self, key: &str) {
+        let jlif = crate::server::record::implemented_jlif(key)
+            .unwrap_or_else(|| panic!("this port implements no JSON link type '{key}'"));
+        self.inner.link_list.update(|list| {
+            list.declare(key, jlif);
+            list.bind(key);
+        });
+    }
+
+    /// The `link()` lines one `dbLoadDatabase` read, through C's
+    /// `dbLinkType`, which declares and binds nothing: support is bound only
+    /// by registration (`registryJLinks.c:16-23`), so a loaded
+    /// `link("pva", "lsetPVX")` leaves `{pva:…}` refused as not loaded.
+    pub(crate) fn add_loaded_link_types(&self, types: &[crate::server::db_loader::DbdLinkType]) {
+        self.inner.link_list.update(|list| {
+            for t in types.iter().filter(|t| !t.key.is_empty()) {
+                list.declare(&t.key, &t.lset);
+            }
+        });
+    }
+
+    /// This database's `linkList`, as a lock-free snapshot.
+    pub(crate) fn link_list(&self) -> arc_swap::Guard<Arc<crate::server::record::LinkList>> {
+        self.inner.link_list.load()
     }
 
     /// Resolve an alias to its target record name, or `None` when the

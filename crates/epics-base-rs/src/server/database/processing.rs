@@ -3691,7 +3691,7 @@ impl PvDatabase {
                     crate::server::record::ParsedLink::Ca(ca) => ca.pv.to_string(),
                     _ => String::new(),
                 };
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "recGblGetTimeStampSimm: dbGetTimeStamp (sim mode) failed, {}.SIOL = {pvname}\n",
                     rec.unframed().name()
                 ));

@@ -2271,7 +2271,7 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // anything after the field part — `LSI.VAL$` — is `S_dbLib_recNotFound`.
     // The file and line are ours, as at `access_commands.rs`'s `errMessage`.
     if !find_field_ok {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "Record Not Found filename=\"{}\" line number={}  {name}\n",
             file!(),
             line!()
@@ -4313,7 +4313,7 @@ fn cmd_dbel() -> CommandDef {
                 // `" %s\n"` meeting the leading space C put in the literal.
                 // The file and line are ours, for the reason
                 // `access_commands.rs` gives at its own `errMessage` site.
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "Record Not Found filename=\"{}\" line number={}   dbNameToAddr failed\n",
                     file!(),
                     line!()
@@ -5585,7 +5585,7 @@ fn db_read_database_macros(
     super::dbstatic_commands::add_loaded_registrars(&parsed.dbd.registrars);
     // Same for `link()`: `dbLinkType` fills `pdbbase->linkList` from the same
     // parse, so a site's own `link(<key>, <jlif>)` line reaches `dbDumpLink`.
-    super::dbstatic_commands::add_loaded_link_types(&parsed.dbd.link_types);
+    ctx.db().add_loaded_link_types(&parsed.dbd.link_types);
 
     // One install path for `dbLoadDatabase`, `dbLoadRecords` and
     // `dbLoadTemplate`: each definition flows through the SAME per-record
@@ -6637,7 +6637,7 @@ fn cmd_db_put_attribute() -> CommandDef {
             ) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 Err(e) => {
-                    crate::runtime::log::errlog_printf(&format!(
+                    crate::runtime::log::errlog_vprintf(format_args!(
                         "{} filename=\"{}\" line number={}  dbPutAttribute failure\n",
                         e.message(),
                         file!(),

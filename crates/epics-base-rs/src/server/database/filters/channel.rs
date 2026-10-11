@@ -47,7 +47,7 @@ impl ChannelCreateError {
     /// `chf_map_key`'s on an unknown filter (`dbChannel.c:179`).
     pub fn report(&self) {
         if let Self::Filter(FilterParseError::UnknownFilter { name }) = self {
-            crate::runtime::log::errlog_printf(&format!(
+            crate::runtime::log::errlog_vprintf(format_args!(
                 "dbChannelCreate: Channel filter '{name}' not found\n"
             ));
         }

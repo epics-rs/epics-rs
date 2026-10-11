@@ -666,7 +666,7 @@ pub fn rec_gbl_get_prec(field_type: Option<DbFieldType>, seed: i16) -> i16 {
 /// non-positive statuses. C's `precord ? ... : "Unknown"` guard is for a null
 /// record, which this signature cannot express.
 pub fn rec_gbl_record_error(status_text: &str, record_name: &str, message: &str) {
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "recGblRecordError: {message} {status_text} PV: {record_name}\n"
     ));
 }
@@ -822,7 +822,7 @@ pub fn dev_sup_process_refusal(record_type: &str) -> Option<&'static str> {
 /// `sprintf`ed prefix and carries no newline of its own — C's format string
 /// owns the only one (`recGbl.c:87-90`), so the report is one console line.
 pub fn rec_gbl_dbaddr_error(status_text: &str, record_name: &str, field_name: &str, message: &str) {
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "recGblDbaddrError: {message} {status_text} PV: {record_name}.{field_name}\n"
     ));
 }
@@ -1021,7 +1021,7 @@ impl PutReport {
                 rec_gbl_record_error(status, record_name, message);
                 match then {
                     Some(ReportTail::InExpression { field, error, expr }) => {
-                        crate::runtime::log::errlog_printf(&format!(
+                        crate::runtime::log::errlog_vprintf(format_args!(
                             "{record_name}.{field}: {error} in expression \"{}\"\n",
                             expr.as_str()
                         ));
@@ -1046,7 +1046,7 @@ impl PutReport {
                 record_type,
                 support,
             } => {
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "recGblRecSupError: {message} missing record support entry table \
                      {record_type}::{support} PV: {record_name}.{field_name}\n"
                 ));

@@ -59,8 +59,12 @@ fn load_status(name: &str, body: &str) -> (Arc<PvDatabase>, String, String, bool
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let line = format!("dbLoadRecords(\"{name}\")");
     let shell_db = Arc::clone(&db);
-    let ran =
-        std::thread::spawn(move || IocShell::new(shell_db, bridge).execute_line(&line)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(shell_db, bridge).execute_line(&line)
+    })
+    .join();
 
     // Restore BEFORE anything can panic, or the failure report has nowhere
     // to go.

@@ -4269,7 +4269,7 @@ impl PvDatabase {
                     // (`dbLink.c:119-130`), refused silently.
                     (crate::server::record::ParsedLink::None, Some(scheme)) => {
                         if json {
-                            crate::runtime::log::errlog_printf(&format!(
+                            crate::runtime::log::errlog_vprintf(format_args!(
                                 "dbJLinkInit: Link type '{scheme}' not found\n"
                             ));
                         }
@@ -6264,7 +6264,7 @@ impl ExternalPutRefusal {
     /// What the refusal owes the errlog: nothing for a down link, as in C.
     pub(crate) fn report(&self, name: &str) {
         if let Self::Unserviceable(why) = self {
-            crate::runtime::log::errlog_printf(&format!(
+            crate::runtime::log::errlog_vprintf(format_args!(
                 "OUT-link write to external PV '{name}' failed: {why}\n"
             ));
         }

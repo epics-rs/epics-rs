@@ -812,9 +812,9 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     // subscriber-based application still sees every refusal. Nothing the
     // `warn!` carried is lost: its `peer` and `nth` are in this line, and its
     // `error` is `reason`'s parenthesised tail.
-    epics_base_rs::runtime::log::errlog_sev_printf(
+    epics_base_rs::runtime::log::errlog_sev_vprintf(
         epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-        &format!("{reason} — refused {peer} (refusal #{nth})\n"),
+        format_args!("{reason} — refused {peer} (refusal #{nth})\n"),
     );
 }
 

@@ -791,8 +791,8 @@ fn cmd_db_dump_driver() -> CommandDef {
 /// `link(<key>,<jlif>)` per declaration — BOTH columns, because both are what
 /// the `.dbd` line said: `dbLinkType` stores `name` and `jlif_name` verbatim
 /// (`dbLexRoutines.c:883-900`) and never resolves the symbol, exactly as it
-/// never resolves a `registrar()` name. The port's build-time declarations
-/// come from `PORTED_JSON_LINK_TYPES`, which carries the pair.
+/// never resolves a `registrar()` name. The list read is the database's own
+/// ([`PvDatabase::link_list`](crate::server::database::PvDatabase)).
 ///
 /// C's list is operative rather than descriptive: `dbFindLinkSup`
 /// (`dbJLink.c:262`) looks a `{…}` link's leading map key up in it, so a type
@@ -817,8 +817,9 @@ fn cmd_db_dump_driver() -> CommandDef {
 /// * `trace` (`lnkTraceIf`, `lnkDebug.c:1039`) — the same wrapper, differing
 ///   from `debug` only in its `alloc`; absent for the same reason.
 ///
-/// `pva` comes from pvxs (`ioc/pvxs7x.dbd:2`, `link("pva", "lsetPVX")`), so its
-/// second column is quoted from there. `ca` is this port's own extension with
+/// `pva` comes from pvxs (`ioc/pvxs7x.dbd:2`, `link("pva", "lsetPVX")`), so it
+/// is listed only by a binary that declares it, with its second column quoted
+/// from there. `ca` is this port's own extension with
 /// no upstream `link()` line at all, and `lnkCaIf` is this port's own symbol
 /// name for it.
 fn cmd_db_dump_link() -> CommandDef {
@@ -834,7 +835,7 @@ fn cmd_db_dump_link() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
-            for sup in link_sup_list().lock().unwrap().entries() {
+            for sup in ctx.db().link_list().entries() {
                 ctx.println(&format!("link({},{})", sup.key, sup.jlif_name));
             }
             Ok(CommandOutcome::Continue)
@@ -951,54 +952,6 @@ fn registrar_list() -> &'static std::sync::Mutex<DeclarationList<String>> {
         }
         std::sync::Mutex::new(list)
     })
-}
-
-/// One `link(<key>, <jlif>)` declaration as this process holds it — the port's
-/// `pdbbase->linkList` node. Owns its strings because a runtime
-/// `dbLoadDatabase` contributes them.
-#[derive(Clone, PartialEq, Eq)]
-struct LinkDeclaration {
-    key: String,
-    jlif_name: String,
-}
-
-impl DbdDeclaration for LinkDeclaration {
-    fn key(&self) -> &str {
-        &self.key
-    }
-}
-
-/// The port's `pdbbase->linkList`, under the same two-block rule as
-/// [`registrar_list`]: `dbdExpand.pl` sorts the build's `link()` lines
-/// (`DBD/Output.pm:92-97`) and a runtime `.dbd` appends in its own order.
-fn link_sup_list() -> &'static std::sync::Mutex<DeclarationList<LinkDeclaration>> {
-    static LIST: std::sync::OnceLock<std::sync::Mutex<DeclarationList<LinkDeclaration>>> =
-        std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let mut list = DeclarationList::default();
-        for sup in crate::server::record::PORTED_JSON_LINK_TYPES {
-            list.declare_built_in(LinkDeclaration {
-                key: sup.key.to_string(),
-                jlif_name: sup.jlif_name.to_string(),
-            });
-        }
-        std::sync::Mutex::new(list)
-    })
-}
-
-/// Record the `link()` declarations one `dbLoadDatabase` read, as
-/// [`add_loaded_registrars`] does for `registrar()`. A key the build already
-/// declares is dropped, which is C's gpHash test.
-pub(super) fn add_loaded_link_types(types: &[crate::server::db_loader::DbdLinkType]) {
-    let mut list = link_sup_list().lock().unwrap();
-    for t in types {
-        if !t.key.is_empty() {
-            list.declare_loaded(LinkDeclaration {
-                key: t.key.clone(),
-                jlif_name: t.lset.clone(),
-            });
-        }
-    }
 }
 
 /// The `registrar()` lines this crate's own compiled-in feature set declares —
@@ -1706,19 +1659,37 @@ variable(seqDLYprecision,int)
     /// leading key in the very list `dbDumpLink` prints — so the report and
     /// the parser cannot be allowed to drift here either. Every reported type
     /// must load, and the two C types this port refuses must not be reported
-    /// as available.
+    /// as available. `pva` is on both sides of that line: absent and refused
+    /// until the binary declares it, then last, where pvxs 1.5.3's
+    /// `softIocPVX.dbd:18997-19002` puts it, after `trace`.
     #[test]
     fn db_dump_link_lists_exactly_the_types_a_link_field_accepts() {
-        use crate::server::record::check_json_link_text;
-        let (_db, ctx) = make_ctx();
+        let (db, ctx) = make_ctx();
+        let check_json_link_text = |text: &str| {
+            crate::server::record::check_json_link_text_in(
+                text,
+                crate::server::record::LinkFieldType::In,
+                crate::server::record::LinkLookup::Database(&db.link_list()),
+            )
+        };
+        assert_eq!(
+            run(&ctx, "dbDumpLink", &["pdbbase"]).unwrap(),
+            "link(ca,lnkCaIf)\n\
+             link(calc,lnkCalcIf)\n\
+             link(const,lnkConstIf)\n\
+             link(state,lnkStateIf)\n"
+        );
+        assert!(check_json_link_text("{pva:\"X\"}").is_err());
+
+        db.declare_link_type("pva");
         let printed = run(&ctx, "dbDumpLink", &["pdbbase"]).unwrap();
         assert_eq!(
             printed,
             "link(ca,lnkCaIf)\n\
              link(calc,lnkCalcIf)\n\
              link(const,lnkConstIf)\n\
-             link(pva,lsetPVX)\n\
-             link(state,lnkStateIf)\n"
+             link(state,lnkStateIf)\n\
+             link(pva,lsetPVX)\n"
         );
         for text in [
             "{const:1}",
@@ -1728,7 +1699,7 @@ variable(seqDLYprecision,int)
             "{state:\"x\"}",
         ] {
             assert!(
-                check_json_link_text(text, crate::server::record::LinkFieldType::In).is_ok(),
+                check_json_link_text(text).is_ok(),
                 "{text} is reported by dbDumpLink and must load"
             );
         }
@@ -1737,11 +1708,41 @@ variable(seqDLYprecision,int)
             ("trace", "{trace:{const:1}}"),
         ] {
             assert!(
-                check_json_link_text(text, crate::server::record::LinkFieldType::In).is_err(),
+                check_json_link_text(text).is_err(),
                 "{text} is refused, so it must stay out of the report"
             );
             assert!(!printed.contains(&format!("link({key},")));
         }
+    }
+
+    /// A runtime `.dbd` carrying pvxs's `link("pva", "lsetPVX")` declares the
+    /// type and binds no support, so `{pva:…}` is refused as not loaded — the
+    /// second of `dbjl_map_key`'s two refusals (`dbJLink.c:270-275`). Measured
+    /// on softIoc R7.0.10-146-g8f5015b66 from the same two lines.
+    #[test]
+    fn a_loaded_pva_link_line_declares_but_does_not_bind_the_type() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+        let mut tmp = tempfile::Builder::new().suffix(".dbd").tempfile().unwrap();
+        writeln!(tmp, "link(\"pva\", \"lsetPVX\")").unwrap();
+        run(&ctx, "dbLoadDatabase", &[tmp.path().to_str().unwrap()]).unwrap();
+
+        let refusal = crate::server::record::check_json_link_text_in(
+            "{pva:\"X\"}",
+            crate::server::record::LinkFieldType::In,
+            crate::server::record::LinkLookup::Database(&db.link_list()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("dbJLinkInit: Support for Link type 'pva' not loaded"),
+            "{refusal}"
+        );
+        assert!(
+            run(&ctx, "dbDumpLink", &["pdbbase"])
+                .unwrap()
+                .ends_with("link(state,lnkStateIf)\nlink(pva,lsetPVX)\n")
+        );
     }
 
     /// A `link()` line read at run time appends after the build's block and
@@ -1752,8 +1753,8 @@ variable(seqDLYprecision,int)
         use std::io::Write;
         let (_db, ctx) = make_ctx();
         let mut tmp = tempfile::Builder::new().suffix(".dbd").tempfile().unwrap();
-        // Sorts ahead of every built-in key, so only the two-block rule can
-        // put it last.
+        // Sorts ahead of every built-in key, so only insertion order can put
+        // it last.
         writeln!(tmp, "link(aaa, jlifAaa)").unwrap();
         run(&ctx, "dbLoadDatabase", &[tmp.path().to_str().unwrap()]).unwrap();
 
@@ -1762,7 +1763,6 @@ variable(seqDLYprecision,int)
             "link(ca,lnkCaIf)\n\
              link(calc,lnkCalcIf)\n\
              link(const,lnkConstIf)\n\
-             link(pva,lsetPVX)\n\
              link(state,lnkStateIf)\n\
              link(aaa,jlifAaa)\n"
         );

@@ -137,9 +137,8 @@ enum ActiveBackend {
 impl ActiveBackend {
     /// Choose, open, and say which — on RTEMS, where there is a choice.
     ///
-    /// The line is an `eprintln!` from the construction path for the same
-    /// reason [`report_lock_protocol`](crate::runtime::sync::report_lock_protocol)
-    /// is one: the RTEMS target has no iocsh to ask afterwards, and a
+    /// The line is an `eprintln!` from the construction path because the
+    /// RTEMS target has no iocsh to ask afterwards, and a
     /// diagnostic that reports which guarantee the process got must not
     /// itself depend on a `tracing` subscriber being installed and unfiltered.
     /// It is printed after the backend opened, so it never names one that

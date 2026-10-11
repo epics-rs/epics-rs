@@ -1525,20 +1525,6 @@ pub async fn build_qsrv_mount(
     }
 }
 
-/// The handles [`QsrvMount::install_sources`] hands back when QSRV2 is on.
-///
-/// Only the pvalink resolver: the two channel sources go straight onto the
-/// caller's [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource)
-/// and are never touched again, whereas the resolver still owes the caller
-/// its link count for the boot banner. Empty when QSRV2 is disabled — which
-/// is the whole point of returning a value rather than `()`.
-#[derive(Default)]
-pub struct Qsrv2Sources {
-    /// The resolver `pvalink_enable()` installed, `None` when QSRV2 is off.
-    #[cfg(feature = "pvalink")]
-    pub pvalink: Option<crate::pvalink::PvaLinkResolver>,
-}
-
 impl QsrvMount {
     /// Mount everything the QSRV2 enable decision turns on — all of it or
     /// none of it.
@@ -1546,10 +1532,11 @@ impl QsrvMount {
     /// pvxs runs `single_enable(); group_enable(); pvalink_enable();` as
     /// three statements inside ONE `if(enableQ)` (`ioc/iochooks.cpp:485-496`),
     /// so a C IOC with `PVXS_QSRV_ENABLE=NO` serves no single record, no
-    /// group and resolves no `pva://` link. Three separate `if`s at a call
-    /// site are three chances to gate one and forget the others; this is
-    /// that one block, on the type that already carries the decision, so
-    /// there is no second place the answer can be re-derived.
+    /// group and resolves no `pva://` link. The two sources are that block,
+    /// on the type that already carries the decision; the resolver is
+    /// [`install_pvalink`], gated by the same `qsrv2_decision`, because it
+    /// must be in place at `dbCaLinkInit`, before the database these sources
+    /// serve has finished building.
     ///
     /// Registration uses pvxs's own source names and orders, "lower order
     /// first": `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and
@@ -1564,35 +1551,39 @@ impl QsrvMount {
         &self,
         db: &Arc<epics_base_rs::server::database::PvDatabase>,
         composite: &epics_pva_rs::server_native::composite::CompositeSource,
-    ) -> Result<Qsrv2Sources, String> {
+    ) -> Result<(), String> {
         if !self.enabled {
-            return Ok(Qsrv2Sources::default());
+            return Ok(());
         }
         composite.add_source(
             "qsrvSingle",
             Arc::new(epics_pva_rs::server::PvDatabaseSource::new(db.clone())),
             0,
         )?;
-        composite.add_source("qsrvGroup", self.store.clone(), 1)?;
-        #[cfg(feature = "pvalink")]
-        {
-            Ok(Qsrv2Sources {
-                pvalink: Some(crate::pvalink::install_pvalink_resolver(db).await),
-            })
-        }
-        #[cfg(not(feature = "pvalink"))]
-        {
-            Ok(Qsrv2Sources::default())
-        }
+        composite.add_source("qsrvGroup", self.store.clone(), 1)
     }
 }
 
+/// pvxs `pvalink_enable()` under its `if(enableQ)`: the pvalink resolver on
+/// `db`, or `None` when QSRV2 is off. For a binary that keeps the resolver;
+/// [`pvalink_link_set_install`] is the same call for one that does not.
+#[cfg(feature = "pvalink")]
+pub async fn install_pvalink(
+    db: &Arc<epics_base_rs::server::database::PvDatabase>,
+) -> Option<crate::pvalink::PvaLinkResolver> {
+    if !qsrv2_decision().enabled {
+        return None;
+    }
+    Some(crate::pvalink::install_pvalink_resolver(db).await)
+}
+
 /// Async link-set installer for
-/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`].
 ///
 /// Installs the `"pva"` link set (pvalink) on `db` and returns the
 /// `pvxr` / `dbpvxr` / `pvalink_enable` / `pvalink_disable` iocsh
-/// commands. Registered at IOC construction, it is fired by
+/// commands. [`run_qsrv_ioc_app`] registers it for every QSRV route; only a
+/// custom runner registers it itself. It is fired by
 /// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
 /// `setup_cp_links` and before record processing (PINI), so a `pva://`
 /// CP link is opened and its background connect kicked off while iocInit
@@ -1618,13 +1609,11 @@ impl QsrvMount {
 pub async fn pvalink_link_set_install(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
-    if !qsrv2_decision().enabled {
-        return Vec::new();
-    }
     #[cfg(feature = "pvalink")]
     {
-        let resolver = crate::pvalink::install_pvalink_resolver(&db).await;
-        crate::pvalink::register_pvalink_commands(resolver)
+        install_pvalink(&db)
+            .await
+            .map_or_else(Vec::new, crate::pvalink::register_pvalink_commands)
     }
     #[cfg(not(feature = "pvalink"))]
     {
@@ -1712,6 +1701,14 @@ where
     // pvxsBaseRegistrar's point: the decision and its INFO line come before
     // the st.cmd, not at iocInit.
     qsrv2_decision();
+    // pvxs's `link("pva", "lsetPVX")` (`ioc/pvxs7x.dbd:2`) is in the `.dbd`
+    // whether or not QSRV2 then enables pvalink, so `{pva:…}` loads either way.
+    // Both link sets are installed here, the one place for every QSRV route:
+    // at `AfterCaLinkInit`, before link init refuses a scheme with no set.
+    // `ca` because softIocPVX links dbCa as every softIoc does.
+    let app = app
+        .register_link_type("ca", epics_ca_rs::calink::calink_link_set_install)
+        .register_link_type("pva", pvalink_link_set_install);
     let slot = Arc::new(parking_lot::Mutex::new(None::<QsrvMount>));
     let built = slot.clone();
     let app = app.register_after_init_database(move |db, acf| async move {
@@ -1764,9 +1761,9 @@ async fn serve_ca_pva_qsrv(
     // ── External links (`calink` + `pvalink`) ──
     // Neither external link set is installed in this Phase-3 runner. Both
     // register at the base `AfterCaLinkInit` hook via
-    // `IocApplication::register_link_set_installer(...)`:
-    //   * `"ca"`  — `calink_link_set_install`
-    //   * `"pva"` — `pvalink_link_set_install`
+    // `IocApplication::register_link_type(...)`:
+    //   * `"ca"`  — `calink_link_set_install`, by `run_qsrv_ioc_app`
+    //   * `"pva"` — `pvalink_link_set_install`, by `run_qsrv_ioc_app`
     // The hook fires BEFORE `setup_cp_links` (which warms Passive `ca://`
     // CP holders) and before record processing, so both link sets' CP
     // links are opened while iocInit runs. Installing either set here in
@@ -2037,7 +2034,7 @@ mod tests {
         let (db, mount) = mount_with(false).await;
         let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
 
-        let sources = mount
+        mount
             .install_sources(&db, &composite)
             .await
             .expect("mounting nothing cannot fail");
@@ -2048,12 +2045,6 @@ mod tests {
              registered; got {:?}",
             composite.list_source()
         );
-        #[cfg(feature = "pvalink")]
-        assert!(
-            sources.pvalink.is_none(),
-            "QSRV2 is disabled, so pvalink_enable() must not have run"
-        );
-        let _ = sources;
     }
 
     /// QSRV2 on mounts both sources under pvxs's own names and orders —
@@ -2065,7 +2056,7 @@ mod tests {
         let (db, mount) = mount_with(true).await;
         let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
 
-        let sources = mount
+        mount
             .install_sources(&db, &composite)
             .await
             .expect("a fresh composite accepts both sources");
@@ -2076,12 +2067,6 @@ mod tests {
             got,
             vec![("qsrvSingle".to_string(), 0), ("qsrvGroup".to_string(), 1)]
         );
-        #[cfg(feature = "pvalink")]
-        assert!(
-            sources.pvalink.is_some(),
-            "QSRV2 is enabled, so pvalink_enable() must have installed a resolver"
-        );
-        let _ = sources;
     }
 
     #[tokio::test]

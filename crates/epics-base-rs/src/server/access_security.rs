@@ -529,7 +529,7 @@ fn report_asg_inp_refused(
         let user = std::env::var("USER").unwrap_or_default();
         c.check_access_asl(&asg, &crate::runtime::env::hostname(), &user, asl)
     });
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "dbCa:exceptionCallback stat \"Unable to allocate additional dynamic memory\" \
          channel \"{record}.{field}\" context \"subscription install into record {record} failed\"\n \
          nativeType {} requestType DBR_STS_DOUBLE nativeCount {} requestCount 0 {} {}\n",

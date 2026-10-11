@@ -927,7 +927,7 @@ impl DbNotice {
     pub fn print(&self) {
         match self {
             DbNotice::Stderr(text) => eprintln!("{text}"),
-            DbNotice::Errlog(text) => crate::runtime::log::errlog_printf(&format!("{text}\n")),
+            DbNotice::Errlog(text) => crate::runtime::log::errlog_vprintf(format_args!("{text}\n")),
         }
     }
 }
@@ -3577,6 +3577,29 @@ fn check_link_syntax(record_type: &str, fields: &[DbFieldDef]) -> CaResult<()> {
     Ok(())
 }
 
+/// The JSON half of [`check_link_syntax`] against a database's `linkList` —
+/// the part of `dbParseLink` only a database can answer: is each type the
+/// text names declared there, and is its support bound
+/// (`dbJLink.c:262-275`). [`apply_fields`] has no database and asks only
+/// whether this port implements the type, so a loader that has one runs this
+/// first.
+pub(crate) fn check_link_types(
+    links: &crate::server::record::LinkList,
+    record_type: &str,
+    fields: &[DbFieldDef],
+) -> CaResult<()> {
+    for DbFieldDef { name, value, .. } in fields {
+        if let Some(class) = crate::types::dbf_link_class(record_type, &name.to_uppercase()) {
+            crate::server::record::check_json_link_text_in(
+                &value.as_str_lossy(),
+                crate::server::record::LinkFieldType::for_class(class),
+                crate::server::record::LinkLookup::Database(links),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// C's `pflddes->field_type == DBF_NOACCESS`, read from the two places the
 /// generated tables keep the declaration.
 ///
@@ -3689,9 +3712,13 @@ fn field_refusal_line(
 /// in the block's field order, because a refusal prints whatever an earlier
 /// one left in `pdbentry->message` ([`EntryMessage`]).
 ///
+/// Each field's JSON link type is asked of `links` first ([`check_link_types`]),
+/// so an undeclared or unbound type costs that field as `dbParseLink` does.
+///
 /// `refused` gets the field, the applier's error if it was the applier that
 /// refused, and C's lines for it. Returns whether any field was refused.
 pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
+    links: &crate::server::record::LinkList,
     target: &mut T,
     record_name: &str,
     fields: &[DbFieldDef],
@@ -3730,7 +3757,10 @@ pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
                 continue;
             }
         }
-        let Err(e) = apply_fields(target, std::slice::from_ref(f), common_fields) else {
+        let field = std::slice::from_ref(f);
+        let Err(e) = check_link_types(links, target.record().record_type(), field)
+            .and_then(|()| apply_fields(target, field, common_fields))
+        else {
             continue;
         };
         let line = field_refusal_line(&mut entry, target, record_name, f, &e);

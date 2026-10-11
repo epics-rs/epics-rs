@@ -1791,19 +1791,13 @@ impl ParsedLink {
     /// installed for it.
     ///
     /// Parsing a link and being able to service it are two different facts,
-    /// and this is the second one. C conflates them because its registry is
-    /// the DBD `link()` table: an IOC that never loaded `pvxs7x.dbd` has no
-    /// `pva` entry, so `dbjl_map_key` refuses the FIELD at load
-    /// (`dbFindLinkSup`, `dbJLink.c:262-266`) and the record reaches iocInit
-    /// with an empty link. This port's accepted-type table
-    /// (`PORTED_JSON_LINK_TYPES`) is static, so `{pva:…}` parses in every
-    /// binary — including one that never installed a `pva`
-    /// [`LinkSet`](crate::server::database::LinkSet) — and the lset dispatch
-    /// then hands the bare name to whatever OTHER lset happens to be
-    /// registered. `PvDatabase::db_init_link_locality` asks this and refuses,
-    /// which is C's outcome one phase later (the port cannot know at
-    /// `dbLoadRecords` time what a binary will install: the installers fire
-    /// at `initHookAfterCaLinkInit`).
+    /// and this is the second one. The first is `{pva:…}` loading at all,
+    /// which needs the database to declare the type ([`LinkList`]) as C needs
+    /// `pvxs7x.dbd`'s `link()` line. A declared type can still reach iocInit
+    /// with no link set installed, and so can `pva://`, which C has no
+    /// `link()` gate for; `PvDatabase::db_init_link_locality` asks this and
+    /// refuses both rather than letting the lset dispatch hand the bare name
+    /// to whatever OTHER lset is registered.
     ///
     /// `Ca` deliberately answers `None`. The parse erases the difference
     /// between `ca://X`, `{ca:{pv:"X"}}`, the `X CA` modifier and the
@@ -1815,7 +1809,7 @@ impl ParsedLink {
     pub fn required_link_set_scheme(&self) -> Option<&'static str> {
         match self {
             // Produced only by `pva://…` and `{pva:…}` — see the `pva` row of
-            // `PORTED_JSON_LINK_TYPES`, whose `lsetPVX` is what
+            // `IMPLEMENTED_JSON_LINK_TYPES`, whose `lsetPVX` is what
             // `epics-bridge-rs` installs as the `"pva"` link set.
             ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => Some("pva"),
             _ => None,
@@ -2050,53 +2044,118 @@ fn json_string_value(value: &str) -> Option<String> {
     decode_json_string_token(v)
 }
 
-/// One `link(<key>, <jlif>)` declaration, which is a PAIR: C's `linkSup` node
-/// keeps `name` and `jlif_name` side by side (`dbLexRoutines.c:883-900`) and
-/// `dbDumpLink` prints both (`dbStaticLib.c:1099-1102`). Carrying only the key
-/// made the second column unprintable.
-///
-/// Like a `registrar()` line, both strings are declaration TEXT: `dbLinkType`
-/// stores them verbatim and whether the symbol exists is settled far later, by
-/// `dbFindLinkSup` when a `.db` actually uses the key.
-pub(crate) struct JsonLinkSup {
-    /// C `plinkSup->name` — the first map key a `{…}` link may carry.
-    pub(crate) key: &'static str,
-    /// C `plinkSup->jlif_name` — the `jlif` symbol the DBD line named.
-    pub(crate) jlif_name: &'static str,
-}
-
-/// The JSON link types this port serves. C looks the first map key up in the
-/// registry built from `link(<name>, <jlif>)` DBD lines (`dbFindLinkSup`,
-/// `dbJLink.c:262`): base registers `const`/`calc`/`state`/`debug`/`trace`
-/// (`links.dbd.pod:39,79,171,208,224`) and pvxs registers `pva`
-/// (`ioc/pvxs7x.dbd:2`, `link("pva", "lsetPVX")`).
+/// The JSON link types this port has a jlif for — what a C binary has LINKED,
+/// as `(key, jlif)`: the `jlif` objects `registerRecordDeviceDriver` can hand
+/// `registryJLinkAdd`. Base's `const`/`calc`/`state` are
+/// `links.dbd.pod:39,79,171`, and `pva` is pvxs's `link("pva", "lsetPVX")`
+/// (`ioc/pvxs7x.dbd:2`).
 ///
 /// `ca` has no `link()` line in base or pvxs — it is this port's own
 /// extension, kept because `.db` files in this workspace already use it, and
 /// `lnkCaIf` is therefore this port's own symbol name rather than one quoted
 /// from upstream.
-pub(crate) const PORTED_JSON_LINK_TYPES: &[JsonLinkSup] = &[
-    JsonLinkSup {
-        key: "const",
-        jlif_name: "lnkConstIf",
-    },
-    JsonLinkSup {
-        key: "calc",
-        jlif_name: "lnkCalcIf",
-    },
-    JsonLinkSup {
-        key: "state",
-        jlif_name: "lnkStateIf",
-    },
-    JsonLinkSup {
-        key: "pva",
-        jlif_name: "lsetPVX",
-    },
-    JsonLinkSup {
-        key: "ca",
-        jlif_name: "lnkCaIf",
-    },
+///
+/// Whether a database then FINDS a type is not this table's question: that is
+/// the database's [`LinkList`].
+pub(crate) const IMPLEMENTED_JSON_LINK_TYPES: [(&str, &str); 5] = [
+    ("const", "lnkConstIf"),
+    ("calc", "lnkCalcIf"),
+    ("state", "lnkStateIf"),
+    ("pva", "lsetPVX"),
+    ("ca", "lnkCaIf"),
 ];
+
+/// The base types every database starts with: the build's `link()` lines
+/// (`softIoc.dbd`), which `registerAllRecordDeviceDrivers` binds before any
+/// `.db` loads. In `dbdExpand.pl`'s order — sorted by jlif
+/// (`DBD/Output.pm:92-95`). `pva` is not one: a binary adds it.
+const BASE_JSON_LINK_TYPES: [&str; 4] = ["ca", "calc", "const", "state"];
+
+/// One `linkSup` node: C keeps `name` and `jlif_name` side by side
+/// (`dbLexRoutines.c:883-900`) and `dbDumpLink` prints both
+/// (`dbStaticLib.c:1099-1102`). Both strings are declaration TEXT, stored
+/// verbatim; `bound` is `plinkSup->pjlif != NULL`.
+#[derive(Clone)]
+pub(crate) struct LinkSup {
+    pub(crate) key: String,
+    pub(crate) jlif_name: String,
+    bound: bool,
+}
+
+/// A database's `pdbbase->linkList`, in insertion order — `dbLinkType`
+/// `ellAdd`s and `dbWriteLinkFP` walks the list unsorted.
+///
+/// It belongs to the database, not the process: two databases in one process
+/// (every test, every builder) must not see each other's declarations.
+#[derive(Clone)]
+pub(crate) struct LinkList {
+    sups: Vec<LinkSup>,
+}
+
+impl LinkList {
+    /// What a database holds before its first `dbLoadDatabase`.
+    pub(crate) fn base() -> Self {
+        let mut list = Self { sups: Vec::new() };
+        for key in BASE_JSON_LINK_TYPES {
+            let jlif = implemented_jlif(key).expect("a base type is implemented");
+            list.declare(key, jlif);
+            list.bind(key);
+        }
+        list
+    }
+
+    /// C `dbLinkType` (`dbLexRoutines.c:883-900`): a key already in the list
+    /// is dropped, anything else appends.
+    pub(crate) fn declare(&mut self, key: &str, jlif_name: &str) {
+        if self.find(key).is_none() {
+            self.sups.push(LinkSup {
+                key: key.to_string(),
+                jlif_name: jlif_name.to_string(),
+                bound: false,
+            });
+        }
+    }
+
+    /// C `registryJLinkAdd` (`registryJLinks.c:16-23`): binds support only to
+    /// a type the list already declares, and says whether it did.
+    pub(crate) fn bind(&mut self, key: &str) -> bool {
+        match self.sups.iter_mut().find(|s| s.key == key) {
+            Some(sup) => {
+                sup.bound = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn entries(&self) -> &[LinkSup] {
+        &self.sups
+    }
+
+    fn find(&self, key: &str) -> Option<&LinkSup> {
+        // `dbFindLinkSup` is a `gphFind`: the name matches case-sensitively.
+        self.sups.iter().find(|s| s.key == key)
+    }
+}
+
+/// The `jlif` this port carries for `key`, if it carries one.
+pub(crate) fn implemented_jlif(key: &str) -> Option<&'static str> {
+    IMPLEMENTED_JSON_LINK_TYPES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, jlif)| *jlif)
+}
+
+/// Who answers C's `dbFindLinkSup` for one parse.
+#[derive(Clone, Copy)]
+pub(crate) enum LinkLookup<'a> {
+    /// A database's `linkList`: the load and put gates of that database.
+    Database(&'a LinkList),
+    /// No database — the text is re-read after its database admitted it, or
+    /// built by a caller that has none. Only whether this port implements
+    /// the type is asked.
+    Implemented,
+}
 
 /// JSON link types epics-base registers that this port has not implemented.
 /// They are rejected like an unknown type — the point of rejecting at all is
@@ -2170,21 +2229,25 @@ fn key_before(prefix: &str) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
-/// The refusal for a link type key this port does not serve.
-fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
-    // `dbFindLinkSup` is a `gphFind`: the type name matches case-sensitively.
+/// The refusal for a link type key `lookup` does not serve — C `dbjl_map_key`
+/// (`dbJLink.c:262-275`): a key the list lacks, then a key with no support.
+fn unknown_link_type(key: impl AsRef<str>, lookup: LinkLookup<'_>) -> Option<LinkRefusal> {
     let key = key.as_ref();
     if UNPORTED_C_JSON_LINK_TYPES.contains(&key) {
         return Some(LinkRefusal::new(LinkWhy::Unported(
             crate::server::recgbl::ReportString::new(key),
         )));
     }
-    if !PORTED_JSON_LINK_TYPES.iter().any(|s| s.key == key) {
-        return Some(LinkRefusal::new(LinkWhy::NotFound(
-            crate::server::recgbl::ReportString::new(key),
-        )));
+    let bound = match lookup {
+        LinkLookup::Database(list) => list.find(key).map(|sup| sup.bound),
+        LinkLookup::Implemented => implemented_jlif(key).map(|_| true),
+    };
+    let key = crate::server::recgbl::ReportString::new(key);
+    match bound {
+        None => Some(LinkRefusal::new(LinkWhy::NotFound(key))),
+        Some(false) => Some(LinkRefusal::new(LinkWhy::NotLoaded(key))),
+        Some(true) => None,
     }
-    None
 }
 
 /// Read a link field's text as a JSON link — the single owner of "is this a
@@ -2198,11 +2261,21 @@ fn unknown_link_type(key: impl AsRef<str>) -> Option<LinkRefusal> {
 /// Both come back here as [`JsonLinkParse::Rejected`], so brace-delimited
 /// text never reaches PV-name parsing on any path.
 pub fn parse_json_link(s: &str, ftype: LinkFieldType) -> JsonLinkParse {
+    parse_json_link_in(s, ftype, LinkLookup::Implemented)
+}
+
+/// [`parse_json_link`] with `dbFindLinkSup` answered by `lookup`, for every
+/// key the text names — the first and each embedded one.
+pub(crate) fn parse_json_link_in(
+    s: &str,
+    ftype: LinkFieldType,
+    lookup: LinkLookup<'_>,
+) -> JsonLinkParse {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') || s.len() < 2 {
         return JsonLinkParse::NotJson;
     }
-    if let Some(refusal) = jlink_syntax_refusal(s, ftype) {
+    if let Some(refusal) = jlink_syntax_refusal(s, ftype, lookup) {
         return JsonLinkParse::Rejected(refusal);
     }
     // Read the link type from the NORMALIZED text. A comment is whitespace in
@@ -2215,7 +2288,9 @@ pub fn parse_json_link(s: &str, ftype: LinkFieldType) -> JsonLinkParse {
             // yajl hands `dbjl_map_key` the key before it reaches the
             // unterminated comment, so an unknown type is reported first.
             let crate::json5::Json5Error::UnterminatedBlockComment { offset } = e;
-            if let Some(refusal) = key_before(&s[..offset]).and_then(unknown_link_type) {
+            if let Some(refusal) =
+                key_before(&s[..offset]).and_then(|k| unknown_link_type(k, lookup))
+            {
                 return JsonLinkParse::Rejected(refusal);
             }
             return JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::UnterminatedComment(offset)));
@@ -2228,12 +2303,12 @@ pub fn parse_json_link(s: &str, ftype: LinkFieldType) -> JsonLinkParse {
             return JsonLinkParse::Rejected(LinkRefusal::new(LinkWhy::NoTypeKey));
         }
     };
-    if let Some(refusal) = unknown_link_type(key) {
+    if let Some(refusal) = unknown_link_type(key, lookup) {
         return JsonLinkParse::Rejected(refusal);
     }
     // The body reader splits on `:` and matches barewords too, so it needs the
     // same normalized text.
-    match try_parse_json_link_body(&normalized) {
+    match try_parse_json_link_body(&normalized, lookup) {
         Some(parsed) => JsonLinkParse::Parsed(parsed),
         // DEVIATION, deliberate. A registered type whose jlif merely IGNORES a
         // token it does not want (pvxs `pva_parse_integer` at
@@ -2393,14 +2468,15 @@ impl Jlif {
 /// C `dbjl_callbacks` (`dbJLink.c:56-376`): the stack of open jlinks, each
 /// fed by its own type's callbacks, a child allocated with the link field
 /// type its parent's `parse_start_map` asked for.
-struct Dbjl {
+struct Dbjl<'a> {
+    lookup: LinkLookup<'a>,
     stack: Vec<Jlink>,
     slot: ChildSlot,
     /// What stopped the parse, if a callback or `dbjl` itself said why.
     said: Said,
 }
 
-impl Dbjl {
+impl Dbjl<'_> {
     /// `dbjl_value`: a value that leaves its link at depth 0 completes it,
     /// and the parent's `end_child` takes it.
     fn value(&mut self, ok: bool) -> bool {
@@ -2421,7 +2497,7 @@ impl Dbjl {
     }
 }
 
-impl crate::server::db_convert_json::Callbacks for Dbjl {
+impl crate::server::db_convert_json::Callbacks for Dbjl<'_> {
     fn null(&mut self) -> bool {
         let ok = self.top().is_some_and(|(top, _)| top.jlif.null());
         self.value(ok)
@@ -2476,7 +2552,7 @@ impl crate::server::db_convert_json::Callbacks for Dbjl {
             };
         };
         let key = String::from_utf8_lossy(key);
-        if let Some(refusal) = unknown_link_type(&*key) {
+        if let Some(refusal) = unknown_link_type(&*key, self.lookup) {
             self.said = Some(refusal);
             return false;
         }
@@ -2522,11 +2598,16 @@ impl crate::server::db_convert_json::Callbacks for Dbjl {
 /// C `dbJLinkParse` (`dbJLink.c:379-445`) as a gate: text yajl rejects is
 /// reported with yajl's rendered error; a callback's stop prints only what
 /// the callbacks said.
-fn jlink_syntax_refusal(s: &str, ftype: LinkFieldType) -> Option<LinkRefusal> {
+fn jlink_syntax_refusal(
+    s: &str,
+    ftype: LinkFieldType,
+    lookup: LinkLookup<'_>,
+) -> Option<LinkRefusal> {
     use crate::server::db_convert_json::{Parser, Status};
 
     let txt = s.as_bytes();
     let mut parser = Parser::new(Dbjl {
+        lookup,
         stack: Vec::new(),
         slot: Some(ftype),
         said: None,
@@ -2815,7 +2896,16 @@ fn calc_stop(said: &mut Said, why: CalcSaid) {
 /// text is a brace-delimited link C would refuse to load
 /// (`dbStaticLib.c:2281-2283` → `S_dbLib_badField`).
 pub fn check_json_link_text(text: &str, ftype: LinkFieldType) -> CaResult<()> {
-    match parse_json_link(text, ftype) {
+    check_json_link_text_in(text, ftype, LinkLookup::Implemented)
+}
+
+/// [`check_json_link_text`] against `lookup`.
+pub(crate) fn check_json_link_text_in(
+    text: &str,
+    ftype: LinkFieldType,
+    lookup: LinkLookup<'_>,
+) -> CaResult<()> {
+    match parse_json_link_in(text, ftype, lookup) {
         JsonLinkParse::Rejected(refusal) => Err(CaError::BadLink(refusal)),
         JsonLinkParse::NotJson | JsonLinkParse::Parsed(_) => Ok(()),
     }
@@ -2841,7 +2931,7 @@ fn check_hw_link_text(text: &str) -> CaResult<()> {
 /// Read a link body that has ALREADY been through
 /// [`crate::json5::relaxed_to_strict`]. Every key here is quoted and every
 /// comment is gone, so the `:` split below is safe.
-fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
+fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
         return None;
@@ -2972,7 +3062,7 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
                     }
                     elems
                         .iter()
-                        .map(json_calc_arg)
+                        .map(|v| json_calc_arg(v, lookup))
                         .collect::<Option<Vec<_>>>()?
                 }
             };
@@ -3007,14 +3097,14 @@ fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
 
 /// One `args` element: a numeric literal, or an embedded JSON link.
 ///
-/// Embedded links go back through [`parse_json_link`], the single owner, so a
+/// Embedded links go back through [`parse_json_link_in`], the single owner, so a
 /// nested unknown type is refused exactly as a top-level one is.
-fn json_calc_arg(v: &serde_json::Value) -> Option<CalcArg> {
+fn json_calc_arg(v: &serde_json::Value, lookup: LinkLookup<'_>) -> Option<CalcArg> {
     match v {
         serde_json::Value::Number(n) => Some(CalcArg::Literal(n.as_f64()?)),
         // `lnkCalc_start_map` asks for `jlif_key_child_inlink` (`lnkCalc.c:234-235`).
         serde_json::Value::Object(_) => {
-            match parse_json_link(&serde_json::to_string(v).ok()?, LinkFieldType::In) {
+            match parse_json_link_in(&serde_json::to_string(v).ok()?, LinkFieldType::In, lookup) {
                 JsonLinkParse::Parsed(parsed) => Some(CalcArg::Link(Box::new(parsed))),
                 JsonLinkParse::NotJson | JsonLinkParse::Rejected(_) => None,
             }
@@ -4962,7 +5052,8 @@ mod json_link_tests {
         let link = parse_link_field(r#"{state:"GREEN"}"#, LinkFieldType::In);
         assert_eq!(link.db_link_type(), DbLinkType::JsonLink);
         assert!(
-            PORTED_JSON_LINK_TYPES
+            LinkList::base()
+                .entries()
                 .iter()
                 .any(|s| s.key == "state" && s.jlif_name == "lnkStateIf"),
             "`link(state, lnkStateIf)` is `links.dbd.pod:171`"

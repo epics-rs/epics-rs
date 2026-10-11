@@ -1120,14 +1120,7 @@ impl AdIoc {
         // The runner paired with C's `rsrvRegistrar`, because `casr` has to
         // answer from the script's first line and `.run(runner)` reaches only
         // the interactive shell.
-        epics_ca_rs::server::run_ca_ioc_app(
-            app.startup_script(script)
-                // CA links resolve with zero further setup: the `ca` link set
-                // installs at the base `AfterCaLinkInit` hook, before
-                // `setup_cp_links` warms Passive CP holders.
-                .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install),
-        )
-        .await
+        epics_ca_rs::server::run_ca_ioc_app(app.startup_script(script)).await
     }
 
     /// Run the IOC with both CA and PVA protocols (QSRV bridge).
@@ -1144,16 +1137,7 @@ impl AdIoc {
         let app = self.app.unwrap();
 
         // Runner plus both protocol registrars — see [`Self::run`].
-        epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-            app.startup_script(script)
-                // External links resolve with zero further setup: both link
-                // sets install at the base `AfterCaLinkInit` hook — before
-                // `setup_cp_links` warms Passive CP holders and before the
-                // iocInit external-link wait, both `ca` and `pva`.
-                .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-                .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-        )
-        .await
+        epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(script)).await
     }
 
     /// Run the IOC with PVA from command-line args.

@@ -128,7 +128,7 @@ impl Diag {
     /// with listeners, not a stream. Collapsing it onto stderr would lose
     /// the IOC log client and every `errlogAddListener` consumer.
     pub(crate) fn errlog(self, args: fmt::Arguments<'_>) {
-        epics_base_rs::runtime::log::errlog_printf(&format!("{args}"));
+        epics_base_rs::runtime::log::errlog_vprintf(args);
     }
 }
 

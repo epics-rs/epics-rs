@@ -79,7 +79,7 @@ pub(super) async fn publish_copy(src: &Path, dst: &Path) -> AutosaveResult<()> {
     // trace of it, so a backup silently stopped being written while the
     // set went on reporting successful saves.
     if let Err(ref e) = published {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "autosave: backup {} -> {} not written: {e}\n",
             src.display(),
             dst.display()
@@ -194,7 +194,7 @@ async fn ensure_savb(
         return Ok(SavbState::Ok);
     }
 
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "autosave: backup file ({}) bad or not found. Writing a new one.\n",
         savb.display()
     ));
@@ -212,7 +212,7 @@ async fn ensure_savb(
         // Announced here for the same reason `publish_copy` announces its
         // own failures: this is the one backup write that does not go
         // through it, and C prints the equivalent line before returning.
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "autosave: backup {} not written: {e}\n",
             savb.display()
         ));

@@ -184,10 +184,10 @@ impl MenuScan {
         // message exists to name.
         for (choice, period) in choices[SCAN_1ST_PERIODIC as usize..].iter().zip(&periods) {
             match period {
-                None => crate::runtime::log::errlog_printf(&format!(
+                None => crate::runtime::log::errlog_vprintf(format_args!(
                     "initPeriodic: Bad menuScan choice '{choice}'\n"
                 )),
-                Some(p) if !is_achievable(*p) => crate::runtime::log::errlog_printf(&format!(
+                Some(p) if !is_achievable(*p) => crate::runtime::log::errlog_vprintf(format_args!(
                     "initPeriodic: Scan rate '{choice}' is not achievable.\n"
                 )),
                 Some(_) => {}

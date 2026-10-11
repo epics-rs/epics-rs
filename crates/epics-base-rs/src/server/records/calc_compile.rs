@@ -140,7 +140,7 @@ impl CalcCompile {
     pub fn report_in_expression(&self, name: &str, pmessage: &str, field: &str, expr: &str) {
         if let Some(why) = self.error_str() {
             self.report_record_error(name, pmessage);
-            crate::runtime::log::errlog_printf(&format!(
+            crate::runtime::log::errlog_vprintf(format_args!(
                 "{name}.{field}: {why} in expression \"{expr}\"\n"
             ));
         }

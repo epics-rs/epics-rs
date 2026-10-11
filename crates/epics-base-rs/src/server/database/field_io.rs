@@ -271,16 +271,18 @@ fn refuse_link_field(
 /// own value stands.
 ///
 /// `dtyp` is the record's `DTYP` text, empty when the `.db` never spelled it;
-/// `field` must already be upper-cased.
+/// `field` must already be upper-cased. `links` is the database's `linkList`,
+/// which `dbParseLink` asks before `dbCanSetLink` runs.
 fn check_link_put(
+    links: &crate::server::record::LinkList,
     record_type: &str,
     dtyp: &str,
     field: &str,
     value: &EpicsValue,
 ) -> CaResult<Option<EpicsValue>> {
-    if crate::types::dbf_link_class(record_type, field).is_none() {
+    let Some(class) = crate::types::dbf_link_class(record_type, field) else {
         return Ok(None);
-    }
+    };
     // C's request-type switch (`dbAccess.c:1084-1096`), which is the whole of
     // what a link field accepts: `DBR_STRING`, or a `DBR_CHAR`/`DBR_UCHAR`
     // buffer whose LAST element is the NUL — `pstring[nRequest - 1] != '\0'`
@@ -341,6 +343,11 @@ fn check_link_put(
         }
         _ => return Err(bad_type()),
     };
+    crate::server::record::check_json_link_text_in(
+        &text,
+        crate::server::record::LinkFieldType::for_class(class),
+        crate::server::record::LinkLookup::Database(links),
+    )?;
     crate::server::record::check_link_assignment(record_type, Some(dtyp), field, &text)?;
     Ok(Some(EpicsValue::String(text.into())))
 }
@@ -505,7 +512,7 @@ fn snam_special_after_put(
             // (`aSubRecord.c:560-561`). A record that answers `parks_pact()`
             // therefore owes this line; `enter_pact()` in `special_after_put`
             // takes the park itself, on the same predicate, straight after.
-            crate::runtime::log::errlog_printf(&format!("{}.SNAM is empty\n", instance.name));
+            crate::runtime::log::errlog_vprintf(format_args!("{}.SNAM is empty\n", instance.name));
         } else {
             instance.subroutine = None;
         }
@@ -3352,6 +3359,7 @@ impl PvDatabase {
             // field can still take comes from `dbPutSpecial(paddr, 0)`
             // (`dbAccess.c:1174` -> `:124`), which runs AFTER `dbCanSetLink`.
             if let Some(text) = check_link_put(
+                &self.link_list(),
                 instance.record.record_type(),
                 instance.common.dtyp.as_str(),
                 &field,
@@ -4107,6 +4115,7 @@ impl PvDatabase {
             {
                 let instance = rec.read();
                 if let Some(text) = check_link_put(
+                    &self.link_list(),
                     instance.record.record_type(),
                     instance.common.dtyp.as_str(),
                     &field,
@@ -5316,7 +5325,15 @@ mod tests {
                     exempt.push(format!("{record_type}.{}", desc.name));
                     continue;
                 }
-                if super::check_link_put(record_type, "", desc.name, &hw).is_err() {
+                if super::check_link_put(
+                    &crate::server::record::LinkList::base(),
+                    record_type,
+                    "",
+                    desc.name,
+                    &hw,
+                )
+                .is_err()
+                {
                     gated += 1;
                 } else {
                     accepted.push(format!("{record_type}.{}", desc.name));
@@ -5359,7 +5376,14 @@ mod tests {
             ("fanout", "LNK1"),
         ] {
             assert!(
-                super::check_link_put(record_type, "", field, &hw).is_err(),
+                super::check_link_put(
+                    &crate::server::record::LinkList::base(),
+                    record_type,
+                    "",
+                    field,
+                    &hw
+                )
+                .is_err(),
                 "{record_type}.{field} must refuse a VME_IO link"
             );
         }
@@ -5371,7 +5395,15 @@ mod tests {
     /// as one NUL byte, and a `DBR_STRING` put takes exactly one element.
     #[test]
     fn a_link_put_takes_one_string_or_a_terminated_char_buffer() {
-        let clear = |v: EpicsValue| super::check_link_put("ai", "", "SDIS", &v);
+        let clear = |v: EpicsValue| {
+            super::check_link_put(
+                &crate::server::record::LinkList::base(),
+                "ai",
+                "",
+                "SDIS",
+                &v,
+            )
+        };
 
         // DBR_CHAR / DBR_UCHAR by count: 0 clears, 1 NUL clears, an
         // unterminated buffer refuses, a terminated one takes its text.

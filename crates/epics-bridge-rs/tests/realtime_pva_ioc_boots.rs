@@ -181,7 +181,8 @@ mod exec_model {
         // search for, which is what drives the search engine and the dial.
         std::fs::write(
             &db,
-            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n",
+            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n\
+             record(ai, \"LOCAL:JSON\") { field(INP, {pva:\"UPSTREAM:AI\"}) }\n",
         )
         .expect("write the db");
 
@@ -244,6 +245,11 @@ mod exec_model {
             std::thread::sleep(Duration::from_millis(50));
             console = read_log();
         }
+        // The resolver must be in place at link init, not mounted after it.
+        assert!(
+            !console.contains("refused"),
+            "link init refused a pva link:\n{console}"
+        );
 
         // Phase 2 — wait for the client to report that it is searching. The
         // search engine's first tick and the first name-server dial happen after

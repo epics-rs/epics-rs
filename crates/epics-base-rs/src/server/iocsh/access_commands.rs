@@ -633,7 +633,7 @@ fn cmd_astac() -> CommandDef {
                     // `asDbLib.c:251` would name a file this binary
                     // does not contain, which is the one part of C's
                     // line that must not be copied.
-                    crate::runtime::log::errlog_printf(&format!(
+                    crate::runtime::log::errlog_vprintf(format_args!(
                         "Record Not Found filename=\"{}\" line number={}  dbNameToAddr error\n",
                         file!(),
                         line!()

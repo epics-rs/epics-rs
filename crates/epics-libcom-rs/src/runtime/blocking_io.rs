@@ -231,9 +231,9 @@ pub fn is_socket_timeout(kind: io::ErrorKind) -> bool {
 /// console whatever the log configuration — including an RTEMS console whose
 /// subscriber is the in-tree one — and printing it is what a C IOC does.
 fn pump_thread_lost(role: &str, label: &str, what: &str) {
-    crate::runtime::log::errlog_sev_printf(
+    crate::runtime::log::errlog_sev_vprintf(
         crate::runtime::log::ErrlogSevEnum::Major,
-        &format!(
+        format_args!(
             "{label}: the {role} thread {what}; this connection is being torn \
              down. Other connections are unaffected.\n"
         ),

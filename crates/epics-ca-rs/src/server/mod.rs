@@ -261,9 +261,15 @@ impl DeliveryStage {
 /// `IocApplication::run(run_ca_ioc)` still works and still registers `casr`
 /// on the INTERACTIVE shell — it is the startup shell, the one `st.cmd`
 /// executes on, that only this entry point can reach.
+///
+/// The `ca` link set comes with it for the same reason: C's dbCa is in every
+/// IOC, so it is the runner's to install, not each head's.
 #[cfg(tokio_backend)]
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
-    iocsh::register_rsrv_commands(app).run(run_ca_ioc).await
+    iocsh::register_rsrv_commands(app)
+        .register_link_type("ca", crate::calink::calink_link_set_install)
+        .run(run_ca_ioc)
+        .await
 }
 
 /// Run an IOC with the Channel Access protocol.

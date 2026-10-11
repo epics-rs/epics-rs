@@ -27,7 +27,7 @@ impl LinkSet for RemoteLset {
 #[epics_macros_rs::epics_test]
 async fn a_pini_record_reads_its_external_link_through_the_installed_set() {
     let ioc = IocBuilder::new()
-        .register_link_set_installer(|db| async move {
+        .register_link_type("ca", |db| async move {
             db.register_link_set("ca", Arc::new(RemoteLset)).await;
             Vec::new()
         })

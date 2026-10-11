@@ -1129,7 +1129,7 @@ impl BridgeProvider {
                 } else {
                     "WARN"
                 };
-                log::errlog_printf(&format!(
+                log::errlog_vprintf(format_args!(
                     "{} {warn} pvxs.ioc.group.processor\n     \
                      Group {} defines no +trigger mappings.  \
                      Default to individual/split monitor updates.\n",

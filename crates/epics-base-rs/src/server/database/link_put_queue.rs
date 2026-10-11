@@ -627,7 +627,7 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
          tokio runtime, so no link set can reach the network",
         key.name
     );
-    crate::runtime::log::errlog_printf(&format!("dbCa: {msg}\n"));
+    crate::runtime::log::errlog_vprintf(format_args!("dbCa: {msg}\n"));
     if let Some(c) = staged.completion {
         c.resolve(Err(msg));
     }
@@ -670,7 +670,7 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     if let Err(e) = &result
         && lsets.iter().any(|lset| lset.is_connected(&key.name))
     {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "dbCa: external link put to '{}' failed: {e}\n",
             key.name
         ));

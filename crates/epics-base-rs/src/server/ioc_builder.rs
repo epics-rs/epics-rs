@@ -47,6 +47,8 @@ pub struct IocBuilder {
     subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
     autosave_config: Option<autosave::SaveSetConfig>,
     link_set_installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
+    /// The link types those installers serve ([`Self::register_link_type`]).
+    json_link_types: Vec<String>,
 }
 
 /// Whether the build runs the link passes of C `initDatabase`.
@@ -131,6 +133,7 @@ impl IocBuilder {
             subroutine_registry: HashMap::new(),
             autosave_config: None,
             link_set_installers: Vec::new(),
+            json_link_types: Vec::new(),
         }
     }
 
@@ -289,16 +292,26 @@ impl IocBuilder {
         self
     }
 
-    /// Register an external link-set installer, run at C `dbCaLinkInit`
+    /// Add the link type `key`, declared on the database ahead of its
+    /// records, and the installer of its link set, run at C `dbCaLinkInit`
     /// before any record initialises — the builder twin of
-    /// [`IocApplication::register_link_set_installer`](crate::server::ioc_app::IocApplication::register_link_set_installer).
-    pub fn register_link_set_installer<F, Fut>(mut self, installer: F) -> Self
+    /// [`IocApplication::register_link_type`](crate::server::ioc_app::IocApplication::register_link_type).
+    ///
+    /// # Panics
+    ///
+    /// When `key` already has an installer.
+    pub fn register_link_type<F, Fut>(mut self, key: &str, installer: F) -> Self
     where
         F: FnOnce(Arc<PvDatabase>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Vec<crate::server::iocsh::registry::CommandDef>>
             + Send
             + 'static,
     {
+        assert!(
+            !self.json_link_types.iter().any(|k| k == key),
+            "link type '{key}' already has its link set installer"
+        );
+        self.json_link_types.push(key.to_string());
         self.link_set_installers
             .push(Box::new(move |db| Box::pin(installer(db))));
         self
@@ -354,6 +367,9 @@ impl IocBuilder {
         link_init: LinkInit,
     ) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>, T)> {
         let db = Arc::new(PvDatabase::new());
+        for key in &self.json_link_types {
+            db.declare_link_type(key);
+        }
 
         // A build is a load plus C's `iocInit`: records are created here, and
         // the link-status classifications they issue are queued until
@@ -523,6 +539,16 @@ impl Default for IocBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A head adding the link set its runner already installs is refused at
+    /// the call, not left to install two.
+    #[test]
+    #[should_panic(expected = "link type 'ca' already has its link set installer")]
+    fn a_second_installer_for_one_link_type_is_refused() {
+        let _ = IocBuilder::new()
+            .register_link_type("ca", |_db| async { Vec::new() })
+            .register_link_type("ca", |_db| async { Vec::new() });
+    }
 
     /// An inline record's `init_record` runs after `iocBuild_1`, as a `.db`
     /// record's does: the build is in its LOAD phase when step 2 adds it.

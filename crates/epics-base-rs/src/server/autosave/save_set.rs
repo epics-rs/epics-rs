@@ -405,7 +405,7 @@ pub async fn restore_from_entries_with_mode(
         // (`dbrestore.c:998-1001`); it aborts only when the site has
         // cleared `save_restoreIncompleteSetsOk`, which defaults to 1.
         let n = result.not_connected_at_save;
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "autosave: {n} {} had no saved value.\n",
             if n == 1 { "PV" } else { "PVs" }
         ));

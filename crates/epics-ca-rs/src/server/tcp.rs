@@ -6494,10 +6494,10 @@ pub(crate) fn print_log_header(
     mnum: u32,
     paddr: Option<*const ()>,
 ) {
-    use epics_base_rs::runtime::log::errlog_printf;
+    use epics_base_rs::runtime::log::errlog_vprintf;
     let paddr = paddr.map_or_else(|| "(nil)".to_string(), |p| format!("{p:p}"));
-    errlog_printf(&format!("CAS: request from {peer} => {context}\n"));
-    errlog_printf(&format!(
+    errlog_vprintf(format_args!("CAS: request from {peer} => {context}\n"));
+    errlog_vprintf(format_args!(
         "CAS: Request from {peer} => cmmd={} cid={:#x} type={} count={} postsize={}\n",
         hdr.cmmd,
         hdr.cid,
@@ -6505,7 +6505,7 @@ pub(crate) fn print_log_header(
         hdr.actual_count(),
         hdr.actual_postsize()
     ));
-    errlog_printf(&format!(
+    errlog_vprintf(format_args!(
         "CAS: Request from {peer} =>   available={:#x} \tN={mnum} paddr={paddr}\n",
         hdr.available
     ));
@@ -6514,7 +6514,9 @@ pub(crate) fn print_log_header(
 /// `log_header`'s first line for a refusal of this port's own that has no
 /// request header to print, on the errlog beside C's so `eltc 0` silences it.
 pub(crate) fn log_circuit(peer: impl std::fmt::Display, context: impl std::fmt::Display) {
-    epics_base_rs::runtime::log::errlog_printf(&format!("CAS: request from {peer} => {context}\n"));
+    epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+        "CAS: request from {peer} => {context}\n"
+    ));
 }
 
 /// C `log_header` from a message handler, which passes `mnum` 0 and finds
@@ -6548,7 +6550,9 @@ pub(crate) fn refuse_bad_tcp_command(
 /// C `camsgtask.c:151`: the line every RSRV_ERROR from message handling
 /// prints as it ends the circuit, whichever handler refused.
 pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
-    epics_base_rs::runtime::log::errlog_printf(&format!("CAS: forcing disconnect from {peer}\n"));
+    epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+        "CAS: forcing disconnect from {peer}\n"
+    ));
 }
 
 /// C `read_reply` without read access (`camessage.c:534-535`): a monitor

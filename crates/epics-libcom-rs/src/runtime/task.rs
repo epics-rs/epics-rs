@@ -1463,13 +1463,14 @@ pub fn apply_to_current_thread_under(
 thread_local! {
     /// C `epicsThreadOSD::isOkToBlock` (`osdThread.c`).
     ///
-    /// `true` here and `false` set by [`enter_ioc_thread`] reproduces C's two
-    /// defaults without a second registry: `create_threadInfo` `calloc`s the
-    /// field to 0 for every `epicsThreadCreate` thread, and `createImplicit`
-    /// (`osdThread.c:710`) sets it to 1 for every thread that reaches the
-    /// epicsThread API without having been created by it. Our EPICS threads are
-    /// exactly the ones that pass the prologue.
-    static OK_TO_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// `false` for every thread, as C leaves it for every `epicsThreadCreate`
+    /// thread and for `_main_`, which is `calloc`ed (`osdThread.c:406`); only
+    /// an iocsh scope and `iocInit` raise it, as in C. C's `createImplicit`
+    /// default of 1 (`osdThread.c:710`) is deliberately not taken: it is for
+    /// foreign OS threads, which do not exist here, and the only threads this
+    /// port did not create are async executor workers, where an `errlog_flush`
+    /// wait would block the executor.
+    static OK_TO_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// C `epicsThreadIsOkToBlock` (`osdThread.c:1145-1150`).
@@ -1486,10 +1487,8 @@ pub fn thread_is_ok_to_block() -> bool {
 /// C `epicsThreadSetOkToBlock` (`osdThread.c:1152-1157`).
 ///
 /// C's callers are `iocsh` around a script (`iocsh.cpp:1122`, restored at
-/// `:1327`) and `iocInit` (`iocInit.c:126`): both raise a thread that WAS
-/// created by `epicsThreadCreate` back to blocking for the duration of a boot,
-/// because a boot is not real-time work. A thread that never passed
-/// [`enter_ioc_thread`] is already blocking and needs no call.
+/// `:1327`) and `iocInit` (`iocInit.c:126`): both raise their thread to
+/// blocking for the duration of a boot, because a boot is not real-time work.
 pub fn set_thread_ok_to_block(ok: bool) {
     OK_TO_BLOCK.with(|c| c.set(ok));
 }
@@ -1528,17 +1527,6 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
-    // C `create_threadInfo` leaves `isOkToBlock` at 0 for every thread
-    // `epicsThreadCreate` makes, and `iocsh` raises it back to 1 for the
-    // thread running a shell (`iocsh.cpp:1122`, restored at `:1327`) — as
-    // does `iocInit` for the thread that boots (`iocInit.c:126`), which here
-    // is that same thread running the script's `iocInit` line. The band is
-    // the identity: `ThreadPriority::Iocsh` is taken by the three iocsh
-    // threads and by nothing else, which `ioc_app.rs`'s
-    // `iocsh_threads_take_the_iocsh_band` pins. Deciding it here rather than
-    // at those three spawns keeps one owner for the flag, so a fourth shell
-    // cannot start without it.
-    set_thread_ok_to_block(priority == ThreadPriority::Iocsh);
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
     band_and_register(priority)
@@ -4357,45 +4345,32 @@ mod tests {
         );
     }
 
-    /// Both of C's `isOkToBlock` defaults, and they differ by exactly one
-    /// thing: whether the thread passed the prologue.
-    ///
-    /// C sets 1 in `createImplicit` (`osdThread.c:710`) for a thread that
-    /// reaches the epicsThread API without having been created by it, and
-    /// leaves the `calloc`ed 0 for every `epicsThreadCreate` thread. A test
-    /// thread is the first kind; anything spawned through this module is the
-    /// second. `runtime::log`'s errlog reads it to decide whether a producer
-    /// may wait for the log drain, so getting this backwards either stalls a
-    /// scan thread on the log or lets the log's own worker wait for itself.
+    /// No thread may block on the errlog drain until it says so: not a banded
+    /// thread, not an iocsh-band one (its `iocshBody` scope raises it), and
+    /// not a thread the port did not create — the tokio workers process
+    /// records too. The flag is per-thread.
     #[test]
-    fn only_a_thread_that_ran_the_prologue_is_not_ok_to_block() {
-        assert!(
-            thread_is_ok_to_block(),
-            "a thread this module did not create is C's implicit context"
-        );
-        let banded = std::thread::spawn(|| {
-            let _ = enter_ioc_thread(ThreadPriority::ScanLow);
-            let after_prologue = thread_is_ok_to_block();
+    fn no_thread_is_ok_to_block_until_it_says_so() {
+        assert!(!thread_is_ok_to_block(), "a thread the port did not create");
+        for band in [ThreadPriority::ScanLow, ThreadPriority::Iocsh] {
+            let after_prologue = std::thread::spawn(move || {
+                let _ = enter_ioc_thread(band);
+                thread_is_ok_to_block()
+            })
+            .join()
+            .expect("the banded thread");
+            assert!(!after_prologue, "{band:?}");
+        }
+        let raised = std::thread::spawn(|| {
             set_thread_ok_to_block(true);
-            (after_prologue, thread_is_ok_to_block())
-        })
-        .join()
-        .expect("the banded thread");
-        assert_eq!(banded, (false, true));
-
-        // The one band that is a shell, so the prologue does what C's
-        // `iocsh`/`iocInit` do to their own thread rather than leaving it at
-        // the `epicsThreadCreate` default.
-        let shell = std::thread::spawn(|| {
-            let _ = enter_ioc_thread(ThreadPriority::Iocsh);
             thread_is_ok_to_block()
         })
         .join()
-        .expect("the shell thread");
-        assert!(shell, "an iocsh thread boots a database and may block");
+        .expect("the raised thread");
+        assert!(raised);
         assert!(
-            thread_is_ok_to_block(),
-            "the flag is per-thread: the child's prologue must not clear ours"
+            !thread_is_ok_to_block(),
+            "the flag is per-thread: the child's raise must not reach ours"
         );
     }
 

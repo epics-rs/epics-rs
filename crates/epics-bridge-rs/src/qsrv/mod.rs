@@ -45,9 +45,11 @@ pub use provider::{
     AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
     Channel, ChannelProvider, ClientCreds, PvaMonitor, WriteGrant,
 };
+#[cfg(all(feature = "qsrv-core", feature = "pvalink"))]
+pub use pva_adapter::install_pvalink;
 #[cfg(feature = "qsrv-core")]
 pub use pva_adapter::{
-    PvaPvHandle, Qsrv2Sources, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
+    PvaPvHandle, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
     register_pva_pv_global, take_registered_pva_pvs,
 };
 // The host dual-protocol runner: gated with its definition, and the predicate

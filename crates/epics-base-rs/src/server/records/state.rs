@@ -79,7 +79,7 @@ impl Record for StateRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             let name = self.name.as_deref().unwrap_or("<unknown>");
-            crate::runtime::log::errlog_printf(&format!(
+            crate::runtime::log::errlog_vprintf(format_args!(
                 "WARNING: Using deprecated record type \"state\" for record \"{name}\".\n\
                  This record type will be removed beginning with EPICS 7.1. Please replace it\n\
                  by a stringin record.\n"

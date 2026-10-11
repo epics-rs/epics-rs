@@ -291,7 +291,7 @@ fn cmd_errlog_init() -> CommandDef {
         }],
         concat!(
             "Initialize error log client buffer size\n",
-            "  bufSize - size of circular buffer (default = 1280 bytes)",
+            "  bufSize - size of circular buffer (default = 2560 bytes)",
         ),
         |args: &[ArgValue], _ctx: &CommandContext| {
             let bufsize = int_arg(args.first()).max(0) as usize;
@@ -317,8 +317,8 @@ fn cmd_errlog_init2() -> CommandDef {
         ],
         concat!(
             "Initialize error log client buffer size and maximum message size\n",
-            "  bufSize    - size of circular buffer       (default = 1280 bytes)\n",
-            "  maxMsgSize - maximum size of error message (default =  256 bytes)",
+            "  bufSize    - size of circular buffer       (default = 2560 bytes)\n",
+            "  maxMsgSize - maximum size of error message (default =  512 bytes)",
         ),
         |args: &[ArgValue], _ctx: &CommandContext| {
             let bufsize = int_arg(args.first()).max(0) as usize;
@@ -334,9 +334,7 @@ fn cmd_errlog_init2() -> CommandDef {
 /// asking an IOC what its error log is doing got `Command 'errlogShow' not
 /// registered.`
 ///
-/// The three level bands and their help text are C's;
-/// [`crate::runtime::log::errlog_show`] states where the level-2 dump departs
-/// from C's arena bytes and why.
+/// The three level bands, their help text and the level-2 arena dump are C's.
 fn cmd_errlog_show() -> CommandDef {
     CommandDef::new(
         "errlogShow",
@@ -377,7 +375,7 @@ fn cmd_errlog() -> CommandDef {
                 Some(ArgValue::String(s)) => s.clone(),
                 _ => String::new(),
             };
-            crate::runtime::log::errlog_printf_no_console(&format!("{message}\n"));
+            crate::runtime::log::errlog_printf_no_console(format_args!("{message}\n"));
             crate::runtime::log::errlog_flush();
             Ok(CommandOutcome::Continue)
         },
@@ -1826,14 +1824,9 @@ mod tests {
     /// ```text
     /// errlogShow 0 -> Error log: / buffer size: N / max message size: M
     /// errlogShow 1 -> ... + "  number of listeners: 0"
-    /// errlogShow 2 -> ... + "  buffer(log) contents:" and the print pair
+    /// errlogShow 2 -> ... + "  buffer(log) contents:" / "" / "^" and the
+    ///                  print triple, both arenas empty after the shell's flush
     /// ```
-    ///
-    /// The two SIZES differ from that binary — it is built from the 7.0
-    /// branch, where `MIN_BUFFER_SIZE` is 2560 and the default max message
-    /// size 512 (`errlog.c:44-45`, unreleased); released R7.0.10, which this
-    /// port carries, has 1280 and 256. So the numbers here are the port's own
-    /// constants and the LAYOUT is C's.
     #[test]
     fn errlog_show_reports_the_three_level_bands() {
         let ctx = make_ctx();
@@ -1855,7 +1848,7 @@ mod tests {
         let sizes = format!(
             "Error log:\n  buffer size: {}\n  max message size: {}\n",
             crate::runtime::log::MIN_BUFFER_SIZE,
-            crate::runtime::log::MIN_MESSAGE_SIZE
+            crate::runtime::log::DEFAULT_MAX_MSG_SIZE
         );
         assert_eq!(show("0"), sizes);
 
@@ -1869,17 +1862,15 @@ mod tests {
         );
         assert!(crate::runtime::log::errlog_remove_listener(id));
 
-        // Level 2 adds both buffers. The port names the write position
-        // instead of drawing C's caret into an arena it does not keep.
+        // Level 2 adds both arenas: C's `%s` of the base, empty here, and the
+        // caret at `pos` 0.
+        crate::runtime::log::errlog_flush();
         assert_eq!(
             show("2"),
             format!(
                 "{sizes}  number of listeners: 0\n\
-                 \x20 buffer(log) contents:\n\
-                 \x20 buffer(log) position: 0 of {size} bytes\n\
-                 \x20 buffer(print) contents:\n\
-                 \x20 buffer(print) position: 0 of {size} bytes\n",
-                size = crate::runtime::log::MIN_BUFFER_SIZE
+                 \x20 buffer(log) contents:\n\n^\n\
+                 \x20 buffer(print) contents:\n\n^\n"
             )
         );
     }

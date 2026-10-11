@@ -298,7 +298,7 @@ pub fn ioc_run() -> i32 {
 fn ioc_run_begin() -> Option<IocRunStarted> {
     let from = get_ioc_state();
     if from != IocState::Paused && from != IocState::Built {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "iocRun: {} IOC not paused\n",
             crate::runtime::log::erl_warning()
         ));
@@ -343,7 +343,7 @@ impl IocRunStarted {
 /// because there is no `dbCaPause` to call.
 pub fn ioc_pause() -> i32 {
     if get_ioc_state() != IocState::Running {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "iocPause: {} IOC not running\n",
             crate::runtime::log::erl_warning()
         ));
@@ -527,7 +527,7 @@ pub type DynamicDeviceSupportFactory =
     Box<dyn Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync>;
 
 /// An async external link-set installer, registered on an
-/// [`IocApplication`] via [`IocApplication::register_link_set_installer`]
+/// [`IocApplication`] via [`IocApplication::register_link_type`]
 /// and invoked by [`IocApplication::run`] at the C `initHookAfterCaLinkInit`
 /// point — BEFORE [`PvDatabase::setup_cp_links`] warms Passive CP holders.
 ///
@@ -760,6 +760,9 @@ fn run_startup_phase(
     lines: &[String],
     script: Option<&str>,
 ) -> Result<(), IocRunFailure> {
+    // softMain runs argv's steps on `_main_`, which is not ok to block
+    // (`osdThread.c:406`), and outside any `iocshBody`: their errlog lines
+    // come out after the loader's own stderr. The script's scope raises it.
     for line in lines {
         shell
             .execute_line_reported(line)
@@ -1158,6 +1161,8 @@ impl BareBuild {
             crate::runtime::log::errlog_printf(&build_refusal());
             return None;
         }
+        // C raises the caller to ok-to-block here (`iocInit.c:125-127`).
+        crate::runtime::task::set_thread_ok_to_block(true);
         crate::runtime::log::errlog_printf("Starting iocInit\n");
         for line in crate::server::iocsh::misc_commands::core_release_block() {
             println!("{line}");
@@ -1462,7 +1467,9 @@ impl IocBuild {
         // the errlog sink sees the boot start exactly as it sees every later
         // `iocInit:` line. It is what `epics_oracle_rs::ioc`'s boot classifier
         // reads to tell "the IOC began initialising" from "the process printed
-        // nothing", and this port emitted it nowhere.
+        // nothing", and this port emitted it nowhere. C raises the caller to
+        // ok-to-block first (`iocInit.c:125-127`).
+        crate::runtime::task::set_thread_ok_to_block(true);
         crate::runtime::log::errlog_printf("Starting iocInit\n");
         announce!(InitHookState::AtBeginning);
         // C `coreRelease()` stands between the announce and the assignment
@@ -1822,6 +1829,9 @@ pub struct IocApplication {
     /// `AfterCaLinkInit` hook in [`Self::run`] — before `setup_cp_links`
     /// — so a Passive holder of an external CP link warms at iocInit.
     link_set_installers: Vec<LinkSetInstaller>,
+    /// The link types those installers serve ([`Self::register_link_type`]),
+    /// declared on the database the moment it exists.
+    json_link_types: Vec<String>,
     /// Async `initHookAfterInitDatabase` consumers
     /// ([`Self::register_after_init_database`]).
     after_init_database_hooks: Vec<AfterInitDatabaseHook>,
@@ -1865,6 +1875,7 @@ impl IocApplication {
             inline_records: Vec::new(),
             after_init_hooks: Vec::new(),
             link_set_installers: Vec::new(),
+            json_link_types: Vec::new(),
             after_init_database_hooks: Vec::new(),
             ioc_init_gate: None,
         }
@@ -1971,7 +1982,12 @@ impl IocApplication {
         self
     }
 
-    /// Register an async external link-set installer.
+    /// Add the link type `key` and the installer of its link set: C's
+    /// `link(key, jlif)` line in the `.dbd` and the registrar that binds its
+    /// support, which a C binary links together. The type is declared and
+    /// bound before any startup line loads a `.db`, so a link of this type
+    /// loads; one call for both means no binary can accept a link it has no
+    /// set to service.
     ///
     /// The installer is invoked by [`Self::run`] at the C
     /// `initHookAfterCaLinkInit` point — BEFORE
@@ -1985,13 +2001,24 @@ impl IocApplication {
     /// runner is too late, because `setup_cp_links`'s `resolve_external_pv`
     /// warm has already run and found no matching link set, so a Passive
     /// holder of an external CP/CPP link never opens its monitor. A
-    /// CA-serving IOC wires `epics_ca_rs::calink::calink_link_set_install`
-    /// here so CA links resolve with no further setup.
-    pub fn register_link_set_installer<F, Fut>(mut self, installer: F) -> Self
+    /// IOC runner wires `epics_ca_rs::calink::calink_link_set_install`
+    /// here under `"ca"` so CA links resolve with no further setup.
+    ///
+    /// # Panics
+    ///
+    /// When `key` already has an installer: a type has one link set, and a
+    /// head adding one its runner already installs would install two. In
+    /// [`Self::run`] when this port implements no JSON link type `key`.
+    pub fn register_link_type<F, Fut>(mut self, key: &str, installer: F) -> Self
     where
         F: FnOnce(Arc<PvDatabase>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Vec<CommandDef>> + Send + 'static,
     {
+        assert!(
+            !self.json_link_types.iter().any(|k| k == key),
+            "link type '{key}' already has its link set installer"
+        );
+        self.json_link_types.push(key.to_string());
         self.link_set_installers
             .push(Box::new(move |db| Box::pin(installer(db))));
         self
@@ -2219,9 +2246,13 @@ impl IocApplication {
             inline_records,
             after_init_hooks,
             link_set_installers,
+            json_link_types,
             after_init_database_hooks,
             ioc_init_gate,
         } = self;
+        for key in &json_link_types {
+            db.declare_link_type(key);
+        }
 
         // The IOC's single live policy cell, created BEFORE the startup
         // script runs so the script's `asInit` and the servers built
@@ -2495,7 +2526,8 @@ impl IocApplication {
                     // `db*` commands that answer a bare non-zero do the
                     // same). Reading only `Err` dropped the second kind
                     // from this summary.
-                    match shell.execute_line(&line) {
+                    // C runs each through `iocshCmd` (`afterIocRunning.c:49`).
+                    match shell.iocsh_cmd(&line) {
                         Err(e) => errs.push(format!("{line}: {e}")),
                         Ok(iocsh::registry::CommandOutcome::Failed) => {
                             errs.push(format!("{line}: failed"));
@@ -2765,7 +2797,7 @@ pub(crate) fn wire_subroutine(
             // through to the tail below.
             instance.subroutine = None;
             if rt == "sub" {
-                crate::runtime::log::errlog_printf(&format!("{name}.SNAM is empty\n"));
+                crate::runtime::log::errlog_vprintf(format_args!("{name}.SNAM is empty\n"));
                 instance.enter_pact();
                 return false;
             }
@@ -3816,6 +3848,24 @@ mod lifecycle_tests {
         assert_eq!(ioc_pause(), 0);
         assert_eq!(ioc_pause(), -1, "already paused");
         assert_eq!(get_ioc_state(), IocState::Paused);
+    }
+
+    /// `iocShutdown` lets go of the database `initialProcess` published, so
+    /// the next build's `initial_process` is not handed the old one's
+    /// leftovers and the old one's records are freed.
+    #[test]
+    fn shutdown_releases_the_published_database() {
+        let build = BareBuild::begin().expect("void");
+        let db = Arc::new(PvDatabase::new());
+        initial_process(&db);
+        build.finish();
+        assert_eq!(ioc_run(), 0);
+        let published = Arc::downgrade(&db);
+        drop(db);
+        assert_eq!(published.strong_count(), 1, "the lifecycle holds it");
+
+        assert_eq!(ioc_shutdown(), 0);
+        assert_eq!(published.strong_count(), 0);
     }
 
     /// BOUNDARY: `iocShutdown` from `iocPaused`. C shuts down from any

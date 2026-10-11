@@ -47,7 +47,9 @@ pub use link::{
     parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
     pvajson_identity_key,
 };
-pub(crate) use link::{DbLinkAnswer, PORTED_JSON_LINK_TYPES, json_const_value};
+pub(crate) use link::{
+    DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif, json_const_value,
+};
 pub(crate) use menu_choices::{EnumChoice, enum_state_choice};
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,

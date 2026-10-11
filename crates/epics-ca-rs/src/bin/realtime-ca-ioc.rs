@@ -962,7 +962,7 @@ mod ioc {
         // callback pool, never a tokio runtime. Kept for the link report.
         let resolver = Arc::new(std::sync::OnceLock::new());
         let installed = Arc::clone(&resolver);
-        let mut builder = IocBuilder::new().register_link_set_installer(move |db| async move {
+        let mut builder = IocBuilder::new().register_link_type("ca", move |db| async move {
             let _ = installed.set(install_calink_resolver(&db).await);
             Vec::new()
         });
@@ -1119,12 +1119,6 @@ mod ioc {
         //      location and the backtrace note all survive.
         epics_base_rs::runtime::log::install_panic_hook();
 
-        // (0d) …and say which lock protocol the process got. C prints the
-        //      same fact from `epicsMutexShowAll`; we have no iocsh to ask,
-        //      so it goes on the console at boot. Before any thread that can
-        //      take a record gate exists, so the line cannot be read as a
-        //      report about a process that already ran without it.
-        epics_base_rs::runtime::sync::report_lock_protocol();
         // The board's epoch is fixed for the life of the boot, so this is the
         // one moment the message can be acted on. Every stamp served past the
         // EPICS time stamp's range wraps exactly as C's `epicsTimeFromTime_t`
@@ -1709,7 +1703,7 @@ mod tests {
             prod.find(needle)
                 .unwrap_or_else(|| panic!("this entry point no longer calls `{needle}`"))
         };
-        let registered = at(concat!("register_link_set_", "installer("));
+        let registered = at(concat!("register_link_", "type(\"ca\", "));
         let mount = at(concat!("install_calink_", "resolver(&db)"));
         let build = at(concat!("builder.build_", "ioc()"));
         assert!(

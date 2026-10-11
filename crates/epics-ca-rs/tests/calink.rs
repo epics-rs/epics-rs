@@ -739,7 +739,7 @@ fn ca_modifier_link_classifies_as_ca() {
 /// The calink `ca` link set
 /// must install at the base `AfterCaLinkInit` seam (BEFORE `setup_cp_links`)
 /// when an IOC is built with
-/// [`IocApplication::register_link_set_installer`], so a Passive CP holder
+/// [`IocApplication::register_link_type`], so a Passive CP holder
 /// warms through the PRODUCTION `IocApplication::run` path — not only when a
 /// test hand-replicates the ordering with a manual `install_calink_resolver`
 /// + `setup_cp_links` (the [`ca_cp_holder_processes_on_remote_change`] path).
@@ -801,7 +801,7 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     // wiring, no feature opt-in.
     let result = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
-        .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
+        .register_link_type("ca", epics_ca_rs::calink::calink_link_set_install)
         .run(|config| async move {
             // By here iocInit has already run `setup_cp_links` and the
             // external-link wait. Poll the holder until the warm's monitor

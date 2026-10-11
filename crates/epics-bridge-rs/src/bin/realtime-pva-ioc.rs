@@ -42,10 +42,9 @@
 //!
 //! A C IOC linked against pvxs gets pvalink through `pvalink_enable()`
 //! (`ioc/iochooks.cpp:495`), so `INP=pva://...` resolves. This one does too:
-//! [`install_pvalink_resolver`](epics_bridge_rs::pvalink::install_pvalink_resolver)
-//! mounts the pva:// external record-link resolver on the database as a fourth
-//! step at init, and the startup banner reports it installed and the link count
-//! it pre-registered.
+//! [`install_pvalink`](epics_bridge_rs::qsrv::install_pvalink) mounts the pva://
+//! external record-link resolver on the database at C `dbCaLinkInit`, and the
+//! startup banner reports it installed and the link count it pre-registered.
 //!
 //! The client that backs it is the blocking PVA client (design stages 1-3): on
 //! the target it dials over TCP and reaches upstream servers through
@@ -274,7 +273,6 @@ mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process::ExitCode;
-    #[cfg(feature = "bringup-probes")]
     use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
@@ -350,9 +348,19 @@ mod ioc {
     /// has to name itself there. A named file that fails to load is already an
     /// error and stays one: falling back to the demo database on a load
     /// failure would be the same defect with a louder cause.
-    fn load_database(db_files: &[String]) -> CaResult<BareIoc> {
+    fn load_database(
+        db_files: &[String],
+    ) -> CaResult<(BareIoc, Option<epics_bridge_rs::pvalink::PvaLinkResolver>)> {
         let macros = HashMap::new();
-        let mut builder = IocBuilder::new();
+        // pvxs's `link("pva", "lsetPVX")` and its link set, installed by the
+        // build at C `dbCaLinkInit` so link init finds it. `None` when QSRV2
+        // is off. Kept for the banner and the probe report.
+        let resolver = Arc::new(std::sync::OnceLock::new());
+        let installed = Arc::clone(&resolver);
+        let mut builder = IocBuilder::new().register_link_type("pva", move |db| async move {
+            let _ = installed.set(epics_bridge_rs::qsrv::install_pvalink(&db).await);
+            Vec::new()
+        });
         #[cfg(feature = "bench-subroutines")]
         {
             builder = builder.register_subroutine("benchNoop", |_r| Ok(0));
@@ -383,8 +391,9 @@ mod ioc {
                 builder = builder.db_file(path, &macros)?;
             }
         }
-        block_on_sync(builder.build_ioc())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
+        let ioc = block_on_sync(builder.build_ioc())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")?;
+        Ok((ioc, resolver.get().cloned().flatten()))
     }
 
     /// `01020304…` — the GUID as the wire carries it, so a console line can be
@@ -658,12 +667,6 @@ mod ioc {
         //      the backtrace note all survive.
         epics_base_rs::runtime::log::install_panic_hook();
 
-        // (0d) …and say which lock protocol the process got. C prints the
-        //      same fact from `epicsMutexShowAll`; we have no iocsh to ask,
-        //      so it goes on the console at boot. Before any thread that can
-        //      take a record gate exists, so the line cannot be read as a
-        //      report about a process that already ran without it.
-        epics_base_rs::runtime::sync::report_lock_protocol();
         // The board's epoch is fixed for the life of the boot, so this is the
         // one moment the message can be acted on. Every stamp served past the
         // EPICS time stamp's range wraps exactly as C's `epicsTimeFromTime_t`
@@ -681,8 +684,8 @@ mod ioc {
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a file to load, split by suffix below.
         let (db_files, group_files) = split_load_args(&boot_args);
-        let ioc = match load_database(&db_files) {
-            Ok(ioc) => ioc,
+        let (ioc, resolver) = match load_database(&db_files) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("realtime-pva-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
@@ -715,17 +718,13 @@ mod ioc {
             }
         };
 
-        // (2c) Everything the QSRV2 enable decision turns on, through the one
-        //      owner that turns all of it on together: the `qsrvSingle`
-        //      database source, the `qsrvGroup` QSRV store, and the pva://
-        //      external record-link resolver so `INP=pva://...` /
-        //      `OUT=pva://...` fields resolve. C runs its three equivalents as
-        //      three statements inside one `if(enableQ)` during iocInit
-        //      (`ioc/iochooks.cpp:485-496`), after the database exists. Run
-        //      here — after the database and the QSRV mount, before the PVA
-        //      front-end and before scanning starts — so every record's link
-        //      fields are pre-registered before the first client and before the
-        //      first scan pass.
+        // (2c) The two QSRV2 sources, through the one owner that turns both
+        //      on together: the `qsrvSingle` database source and the
+        //      `qsrvGroup` QSRV store. C runs these and `pvalink_enable()`
+        //      inside one `if(enableQ)` (`ioc/iochooks.cpp:485-496`); the
+        //      pva:// resolver, under the same decision, was installed by the
+        //      build at `dbCaLinkInit`, because link init refuses a `{pva:…}`
+        //      link whose set is not there yet.
         //
         //      On this target the PVA client reaches upstream servers over TCP
         //      name servers alone (`EPICS_PVA_NAME_SERVERS`): the UDP SEARCH
@@ -735,16 +734,12 @@ mod ioc {
         //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
         //      number of pva:// links pre-registered from the loaded database.
         let composite = CompositeSource::new();
-        let sources = match block_on_sync(mount.install_sources(&db, &composite))
+        if let Err(e) = block_on_sync(mount.install_sources(&db, &composite))
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
         {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("realtime-pva-ioc: cannot register the QSRV2 sources: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let resolver = sources.pvalink;
+            eprintln!("realtime-pva-ioc: cannot register the QSRV2 sources: {e}");
+            return ExitCode::FAILURE;
+        }
         let link_count = resolver.as_ref().map_or(0, |r| r.link_count());
 
         // (2b) Periodic scan + PINI. C `iocInit` owns `scanInit` (`dbScan.c`)
@@ -1402,13 +1397,14 @@ mod tests {
         );
     }
 
-    /// Every QSRV2 facility is mounted through the one gated owner, and the
+    /// Every QSRV2 facility is mounted through a gated owner, and the
     /// banner reports what came up.
     ///
     /// This is the whole reason the binary moved crates. The three facilities
     /// C turns on together in one `if(enableQ)` — the single-record source,
-    /// the group source and the pvalink resolver — are mounted here by one
-    /// call to `QsrvMount::install_sources`. A regression that opened any of
+    /// the group source and the pvalink resolver — are mounted here by
+    /// `QsrvMount::install_sources` and `install_pvalink`, both reading the
+    /// one QSRV2 decision. A regression that opened any of
     /// them back up at this call site would leave an IOC that still boots,
     /// still answers searches and still passes every other guard here, while
     /// serving a facility a C IOC with the same environment does not. There
@@ -1423,8 +1419,12 @@ mod tests {
         assert!(
             prod.contains(concat!("install_", "sources(&db, &composite)")),
             "the QSRV2 sources are no longer mounted through the one owner that \
-             gates all three together; single records, groups and pva:// links \
-             can drift apart again"
+             gates both together; single records and groups can drift apart again"
+        );
+        assert!(
+            prod.contains(concat!("register_link_type(", "\"pva\", ")),
+            "the pva:// resolver is no longer installed by the build, so link init \
+             refuses every pva link this IOC loads"
         );
         assert!(
             !prod.contains(concat!("add_", "source(")),

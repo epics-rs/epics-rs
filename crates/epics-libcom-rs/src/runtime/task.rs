@@ -1473,6 +1473,16 @@ thread_local! {
     static OK_TO_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The refusal of a binary that cannot run on the backend this build selects:
+/// `message` on stderr, then exit status 1, because a binary that refuses to
+/// start has failed to start. Every such refusal goes through here, which is
+/// how `target-cfg-gate` finds them: a test that runs the binary must be
+/// declared under a cfg where the call is compiled out.
+pub fn refuse_backend(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1)
+}
+
 /// C `epicsThreadIsOkToBlock` (`osdThread.c:1145-1150`).
 ///
 /// "May this thread wait on something that is not bounded by its own work?" —

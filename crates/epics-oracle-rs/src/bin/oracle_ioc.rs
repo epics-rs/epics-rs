@@ -265,7 +265,8 @@ fn announce(key: &str, port: u16) -> std::io::Result<()> {
 /// would be read by the harness as a Rust-side deviation.
 #[cfg(exec_backend)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Err("oracle-ioc needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread"
-        .into())
+    epics_base_rs::runtime::task::refuse_backend(
+        "oracle-ioc needs the tokio backend; this build selects \
+         EPICS_RS_BUILD_EXEC_BACKEND=thread",
+    )
 }

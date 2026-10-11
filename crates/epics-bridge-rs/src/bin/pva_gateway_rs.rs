@@ -671,13 +671,12 @@ async fn main() -> ExitCode {
 /// half exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "pva-gateway-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream PVA client \
          and the downstream PVA server need a tokio reactor. Unset that variable \
-         and rebuild to run the gateway."
-    );
-    ExitCode::FAILURE
+         and rebuild to run the gateway.",
+    )
 }
 
 #[cfg(test)]

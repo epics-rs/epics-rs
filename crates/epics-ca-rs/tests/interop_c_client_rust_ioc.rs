@@ -4,16 +4,10 @@
 //! implementation so we can prove wire-level compatibility in the
 //! direction Rust-server → C-client.
 //!
-//! Both backends. The `softioc-rs` these tests spawn is built with the test's
-//! own feature set, and its async `CaServer` takes the listener capability
-//! from the tokio runtime rather than from the seam `Reactor`, so the C client
-//! reaches it under `EPICS_RS_BUILD_EXEC_BACKEND=thread` as well: all five
-//! cases pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
-//! --profile interop -p epics-ca-rs --run-ignored all`.
-//!
-//! Note this file carries no census marker: its tests are plain `#[test]`
-//! whose reactor dependency lives in a *child process*, which the
-//! `rtems_exec_model_gate` anchors cannot see.
+//! Tokio backend only: on the exec backend `softioc-rs`'s `main` refuses
+//! before it serves, so the C tools have nothing to reach.
+
+#![cfg(tokio_backend)]
 
 mod common;
 

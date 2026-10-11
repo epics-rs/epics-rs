@@ -271,13 +271,12 @@ fn format_join(which: &str, r: Result<CaResult<()>, tokio::task::JoinError>) -> 
 /// CA+PVA IOC up on this execution model.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "dual-ioc-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the CA and the PVA server front-ends \
          need a tokio reactor. Use `realtime-pva-ioc` on this backend, or \
-         rebuild without that feature."
-    );
-    ExitCode::FAILURE
+         rebuild without that feature.",
+    )
 }
 
 #[cfg(test)]

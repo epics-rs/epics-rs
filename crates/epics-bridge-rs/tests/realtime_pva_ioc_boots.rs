@@ -26,11 +26,16 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
         .stdin(Stdio::null())
         .output()
         .expect("spawn realtime-pva-ioc");
-    assert!(!out.status.success(), "expected a refusal exit status");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("EPICS_RS_BUILD_EXEC_BACKEND"),
-        "the refusal must name the variable that fixes it; got: {stderr}"
+    // `runtime::task::refuse_backend`: the text on stderr, exit status 1.
+    assert_eq!(out.status.code(), Some(1), "a refusal is a failed start");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "realtime-pva-ioc: built with the tokio task backend, which this entry point \
+         does not start a runtime for.\n\
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread, which routes the \
+         `runtime::task` seam to the same std-thread executor the target uses.\n"
     );
 }
 

@@ -1485,13 +1485,12 @@ fn main() -> ExitCode {
 
 #[cfg(tokio_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "realtime-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
          Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
-         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
-    ExitCode::FAILURE
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }
 
 #[cfg(test)]

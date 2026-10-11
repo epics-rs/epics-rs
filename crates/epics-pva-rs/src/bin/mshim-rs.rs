@@ -512,12 +512,11 @@ async fn futures_join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
 /// mshim.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mshim-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the UDP forwarder needs a \
-         tokio reactor. Unset that variable and rebuild."
-    );
-    std::process::ExitCode::FAILURE
+         tokio reactor. Unset that variable and rebuild.",
+    )
 }
 
 #[cfg(test)]

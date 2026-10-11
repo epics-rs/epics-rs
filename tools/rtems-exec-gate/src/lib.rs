@@ -60,10 +60,12 @@
 //!    file may carry one marker at the top counting everything below it, or
 //!    one marker beside each site counting just that site.
 //!
-//! A "reactor-dependent test site" is a `#[tokio::test]` attribute, or a line
-//! in test code that builds a tokio runtime by hand. Both spellings obtain the
-//! ambient reactor that the exec backend does not provide, so both are
-//! counted.
+//! A "reactor-dependent test site" is a `#[tokio::test]` attribute, a line
+//! in test code that builds a tokio runtime by hand, or the first line of an
+//! `#[epics_test]` body that names a tokio timer, spawn or socket. The first
+//! two obtain the ambient reactor that the exec backend does not provide; the
+//! third uses one without obtaining it, and panics "there is no reactor
+//! running" there, where `runtime::task` is the spelling that works.
 //!
 //! # Why this fails closed
 //!
@@ -129,8 +131,10 @@ pub const CENSUS_MARKER: &str = "RTEMS-EXEC-MODEL-ALLOW(";
 /// Printed with every violation so the failure explains itself without the
 /// reader having to find this file first.
 pub const RULE: &str = "\
-exec-backend gating rule: every #[tokio::test] and every hand-built tokio
-runtime in test code must be accounted for by exactly one of
+exec-backend gating rule: every #[tokio::test], every hand-built tokio
+runtime in test code, and every #[epics_test] body naming tokio::time,
+tokio::spawn or tokio::net (spell those through epics_base_rs::runtime::task
+instead) must be accounted for by exactly one of
   (1) a file-level #![cfg(..)] gate
   (2) an enclosing column-0 mod carrying a #[cfg(..)] gate
   (3) a per-test #[cfg(..)] gate directly above it
@@ -230,6 +234,7 @@ pub fn removal_cost(path: &str, text: &str, integration: bool) -> GateCost {
 fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: bool) -> Audit {
     let lines: Vec<&str> = text.lines().collect();
     let attrs = Attrs::collect(&lines);
+    let in_literal = opens_inside_a_literal(&lines);
     let file_gated = removed_by_parent
         || lines.iter().enumerate().any(|(i, l)| {
             l.trim_start().starts_with("#![")
@@ -261,8 +266,17 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
     // Gated reactor-free test attributes, each with whether a runtime-building
     // line below it has claimed it — a claimed entry is a site, not collateral.
     let mut gated_tests: Vec<(usize, bool)> = Vec::new();
+    // The `epics_test` whose body this line is in: its 0-based attribute
+    // line, that line's indent, which the body's closing `}` shares, and
+    // whether the body has already been counted as a site.
+    let mut epics_body: Option<(usize, usize, bool)> = None;
 
     for (idx, raw) in lines.iter().enumerate() {
+        // A `.db` fixture's column-0 `}` in a raw string is not the end of
+        // the test around it.
+        if in_literal[idx] {
+            continue;
+        }
         let trimmed = raw.trim_start();
         let col0 = !raw.is_empty() && raw.len() == trimmed.len();
 
@@ -296,8 +310,23 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
 
         // -- reactor-dependent sites ----------------------------------------
         let is_tokio_test = trimmed.starts_with(concat!("#[tokio", "::test"));
+        if is_tokio_test || is_reactor_free_test(trimmed) {
+            epics_body = is_epics_test(trimmed).then_some((idx, raw.len() - trimmed.len(), false));
+        } else if epics_body.is_some_and(|(_, indent, _)| {
+            trimmed.starts_with('}') && raw.len() - trimmed.len() == indent
+        }) {
+            epics_body = None;
+        }
         let builds_runtime = region.is_test && builds_a_runtime(trimmed);
-        if !is_tokio_test && !builds_runtime {
+        // One site per body: the census counts tests that need a reactor.
+        let reactor_in_body = match epics_body.as_mut() {
+            Some((attr, _, counted)) if region.is_test && !*counted && names_a_reactor(trimmed) => {
+                *counted = true;
+                Some(*attr)
+            }
+            _ => None,
+        };
+        if !is_tokio_test && !builds_runtime && reactor_in_body.is_none() {
             continue;
         }
         if file_gated || region.is_gated {
@@ -314,6 +343,9 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
             continue;
         }
         if is_tokio_test && per_test_gated(&lines, &attrs, idx) {
+            continue;
+        }
+        if reactor_in_body.is_some_and(|attr| per_test_gated(&lines, &attrs, attr)) {
             continue;
         }
         ungated.push(idx + 1);
@@ -427,6 +459,34 @@ fn is_reactor_free_test(trimmed: &str) -> bool {
     }
     let last = path.rsplit("::").next().unwrap_or(path);
     last == "test" || last == concat!("epics", "_test")
+}
+
+/// `#[epics_test]` by any path: the reactor-free test whose body runs on the
+/// `runtime::task` seam, so on the exec backend it has no reactor either.
+fn is_epics_test(trimmed: &str) -> bool {
+    is_reactor_free_test(trimmed)
+        && trimmed
+            .split(['(', ']'])
+            .next()
+            .is_some_and(|p| p.ends_with(concat!("epics", "_test")))
+}
+
+/// A line of code naming a tokio item that needs the ambient reactor: a timer
+/// or a spawn panics "there is no reactor running" on the exec backend, where
+/// `runtime::task::{sleep, timeout, spawn}` are the spellings that work.
+/// `tokio::sync`, `select!` and in-memory `io` need no reactor and are not
+/// sites.
+fn names_a_reactor(trimmed: &str) -> bool {
+    const NEEDS_REACTOR: [&str; 6] = [
+        concat!("tokio::", "time::sleep"),
+        concat!("tokio::", "time::timeout"),
+        concat!("tokio::", "time::interval"),
+        concat!("tokio::", "spawn"),
+        concat!("tokio::", "task::spawn"),
+        concat!("tokio::", "net::"),
+    ];
+    let code = trimmed.split("//").next().unwrap_or(trimmed);
+    NEEDS_REACTOR.iter().any(|path| code.contains(path))
 }
 
 /// `mod foo {` / `pub mod foo {` at column 0 — an inline module opening.
@@ -764,6 +824,83 @@ impl Attrs {
             continuation,
         }
     }
+}
+
+/// Per line: does it begin inside a string literal or a block comment?
+fn opens_inside_a_literal(lines: &[&str]) -> Vec<bool> {
+    enum In {
+        Code,
+        Str,
+        Raw(usize),
+        Comment(usize),
+    }
+    let mut state = In::Code;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        out.push(!matches!(state, In::Code));
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match state {
+                In::Code => match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => break,
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        state = In::Comment(1);
+                        i += 1;
+                    }
+                    b'"' => state = In::Str,
+                    b'r' if !b[..i]
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+                    {
+                        let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                        if b.get(i + 1 + hashes) == Some(&b'"') {
+                            state = In::Raw(hashes);
+                            i += hashes + 1;
+                        }
+                    }
+                    // A char literal, so `'"'` opens nothing; a lifetime has
+                    // no closing quote within two bytes.
+                    b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                        i += b[i + 2..]
+                            .iter()
+                            .position(|c| *c == b'\'')
+                            .map_or(b.len(), |p| p + 2);
+                    }
+                    b'\'' if b.get(i + 2) == Some(&b'\'') => i += 2,
+                    _ => {}
+                },
+                In::Str => match b[i] {
+                    b'\\' => i += 1,
+                    b'"' => state = In::Code,
+                    _ => {}
+                },
+                In::Raw(n) => {
+                    if b[i] == b'"'
+                        && b[i + 1..].iter().take(n).filter(|c| **c == b'#').count() == n
+                    {
+                        state = In::Code;
+                        i += n;
+                    }
+                }
+                In::Comment(depth) => {
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        state = if depth == 1 {
+                            In::Code
+                        } else {
+                            In::Comment(depth - 1)
+                        };
+                        i += 1;
+                    } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        state = In::Comment(depth + 1);
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 fn bracket_depth(line: &str) -> i32 {
@@ -1657,6 +1794,56 @@ mod fixtures {
         );
         let audit = audit_source("src/x.rs", &src, false);
         assert_eq!(audit.ungated.len(), 1, "{:?}", audit.ungated);
+    }
+
+    fn epics_test_sleeping(head: &str, sleep: &str) -> String {
+        format!(
+            "{head}\n#[epics_macros_rs::epics_test]\nasync fn t() {{\n    let db = r#\"\nrecord(ai, \"X\") {{\n}}\n\"#;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n}}\n"
+        )
+    }
+
+    /// The third spelling: an `#[epics_test]` body that sleeps on tokio has no
+    /// reactor on the exec backend. One site per body, at its first such line,
+    /// and a fixture's column-0 `}` inside a raw string does not end the body.
+    #[test]
+    fn a_tokio_timer_in_an_epics_test_body_is_a_site() {
+        let src = epics_test_sleeping("", concat!("tokio::", "time::sleep"));
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert_eq!(audit.ungated, vec![8], "{src}");
+        assert_eq!(audit.violations.len(), 1, "{:?}", audit.violations);
+    }
+
+    /// ...accounted for by a file gate, which makes it a site, not collateral...
+    #[test]
+    fn a_file_gate_accounts_for_a_tokio_timer_in_an_epics_test_body() {
+        let src = epics_test_sleeping(FILE_GATE_ATTR, concat!("tokio::", "time::sleep"));
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert!(audit.violations.is_empty(), "{:?}", audit.violations);
+        assert_eq!(audit.scope_gated, vec![8]);
+        assert!(audit.collateral.is_empty(), "{:?}", audit.collateral);
+    }
+
+    /// ...and absent when the body sleeps through `runtime::task`.
+    #[test]
+    fn a_runtime_task_timer_in_an_epics_test_body_is_not_a_site() {
+        let src = epics_test_sleeping("", "epics_base_rs::runtime::task::sleep");
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert!(audit.ungated.is_empty(), "{:?}", audit.ungated);
+        assert!(audit.violations.is_empty(), "{:?}", audit.violations);
+    }
+
+    /// `tokio::sync` needs no reactor, and a tokio timer in a `#[tokio::test]`
+    /// body is that attribute's site, not a second one.
+    #[test]
+    fn tokio_sync_in_an_epics_test_and_a_timer_in_a_tokio_test_are_not_sites() {
+        let src = format!(
+            "#[epics_macros_rs::epics_test]\nasync fn a() {{\n    let (tx, rx) = {}();\n}}\n\n{}\nasync fn b() {{\n    {}(d).await;\n}}\n",
+            concat!("tokio::", "sync::oneshot::channel"),
+            tokio_test(),
+            concat!("tokio::", "time::sleep"),
+        );
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert_eq!(audit.ungated, vec![6], "{src}");
     }
 
     /// ...but the same call in production code is not a test site, so the

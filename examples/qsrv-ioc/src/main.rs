@@ -242,10 +242,9 @@ fn expand_macros(s: &str, macros: &HashMap<String, String>) -> String {
 /// backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "qsrv-ioc serves CA and PVA through the async servers; this build \
          selects the reactor-free backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), \
-         which does not have them."
-    );
-    Ok(())
+         which does not have them.",
+    )
 }

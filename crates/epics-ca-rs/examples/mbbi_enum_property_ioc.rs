@@ -147,9 +147,8 @@ record(mbbi, "RIG:MBBI") {
 /// this backend does not compile.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mbbi_enum_property_ioc: needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
-    Ok(())
+         EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }

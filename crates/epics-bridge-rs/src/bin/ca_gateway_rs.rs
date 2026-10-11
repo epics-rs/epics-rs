@@ -481,11 +481,10 @@ async fn async_main(args: Args) -> ExitCode {
 /// exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "ca-gateway-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream CA client and the \
          downstream CA server need a tokio reactor. Rebuild without that \
-         feature."
-    );
-    ExitCode::FAILURE
+         feature.",
+    )
 }

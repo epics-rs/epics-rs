@@ -1326,14 +1326,13 @@ impl ServerOptions {
 /// background worker, makes a wrong build a startup message.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "softioc-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the async CA server front-end \
          needs a tokio reactor.\nRun `realtime-ca-ioc`, which serves CA through \
          the blocking driver on this backend, or unset that variable and rebuild \
-         softioc-rs."
-    );
-    std::process::ExitCode::FAILURE
+         softioc-rs.",
+    )
 }
 
 #[cfg(test)]

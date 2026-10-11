@@ -5685,9 +5685,12 @@ ASG(PLAIN) {
             .expect("subscribes");
         for (put, want) in [("world", 111), ("ab", 98), ("x", 0)] {
             dollar_put(&source, "FS.VAL", string(put)).await;
-            let posted = tokio::time::timeout(std::time::Duration::from_secs(5), mon.recv())
-                .await
-                .expect("a monitor update");
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
             assert_eq!(
                 dollar_value(posted),
                 Some(PvField::Scalar(ScalarValue::Byte(want))),
@@ -5769,9 +5772,12 @@ ASG(PLAIN) {
                 .await
                 .expect("subscribes");
             dollar_put(&source, name, second).await;
-            let posted = tokio::time::timeout(std::time::Duration::from_secs(5), mon.recv())
-                .await
-                .expect("a monitor update");
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
             assert_eq!(dollar_value(posted), want, "{name}$");
         }
     }
@@ -5802,9 +5808,12 @@ ASG(PLAIN) {
                 PvField::Scalar(ScalarValue::String(put.into())),
             )
             .await;
-            let posted = tokio::time::timeout(std::time::Duration::from_secs(5), mon.recv())
-                .await
-                .expect("a monitor update");
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
             assert_eq!(dollar_value(posted), dollar_chars(want), "{put}");
         }
     }
@@ -5904,16 +5913,17 @@ ASG(PLAIN) {
                 string("abc"),
                 "{sizv}"
             );
-            let posted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let v = text(mon.recv().await);
-                    if v != string("") {
-                        return v;
+            let posted =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let v = text(mon.recv().await);
+                        if v != string("") {
+                            return v;
+                        }
                     }
-                }
-            })
-            .await
-            .expect("a monitor update");
+                })
+                .await
+                .expect("a monitor update");
             assert_eq!(posted, string("abc"), "{sizv}");
         }
     }

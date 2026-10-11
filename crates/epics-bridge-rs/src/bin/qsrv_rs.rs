@@ -135,10 +135,9 @@ fn iocsh_quote(s: &str) -> String {
 /// is the entry point for this execution model.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "qsrv-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the PVA server front-end needs \
-         a tokio reactor. Unset that variable and rebuild."
-    );
-    ExitCode::FAILURE
+         a tokio reactor. Unset that variable and rebuild.",
+    )
 }

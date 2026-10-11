@@ -306,8 +306,8 @@ criterion_main!(e2e);
 /// the reactor-free backend there is nothing to measure.
 #[cfg(exec_backend)]
 fn main() {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "end_to_end_bench: needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
+         EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }

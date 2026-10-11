@@ -174,9 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// example to demonstrate.
 #[cfg(exec_backend)]
 fn main() {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "custom_discovery_backend: needs the tokio backend; this build selects \
          EPICS_RS_BUILD_EXEC_BACKEND=thread, which has no reactor for a discovery backend to \
-         await on."
-    );
+         await on.",
+    )
 }

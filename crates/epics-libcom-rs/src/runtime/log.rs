@@ -193,8 +193,9 @@ impl Console {
 /// support from a terminal that declines to say what it is, and it is the half
 /// that makes a captured Rust IOC's bytes match a captured C IOC's.
 fn is_a_tty(stream: &impl std::io::IsTerminal) -> bool {
-    let term_names_itself = std::env::var_os("TERM").is_some_and(|t| !t.is_empty());
-    stream.is_terminal() && term_names_itself
+    // C's order: `$TERM` is read only for a terminal, so a piped console asks
+    // nothing of the environment.
+    stream.is_terminal() && std::env::var_os("TERM").is_some_and(|t| !t.is_empty())
 }
 
 /// The same bytes as a `tracing` record, which is one event and not a byte
@@ -817,8 +818,24 @@ pub const fn max_message_size(bufsize: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ErrlogListenerId(u64);
 
-/// A registered listener, shared with the worker's per-drain snapshot.
+/// A registered listener. Shared so the worker can call it with the list's
+/// `RefCell` released, which is what lets a callback add or remove listeners.
 type ErrlogListenerFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// C `listenerNode` (`errlog.c:79-85`).
+struct ListenerNode {
+    id: ErrlogListenerId,
+    listener: ErrlogListenerFn,
+    /// The worker is inside this listener's callback.
+    active: bool,
+    /// Removed by its own callback; the worker drops it when the call returns.
+    removed: bool,
+}
+
+/// C `pvt.listenerList` under `pvt.listenerLock` (`errlog.c:96-97`), an
+/// `epicsMutex` and so recursive: a callback may add or remove listeners,
+/// and the worker sees the change from the next listener of the same message.
+type ErrlogListeners = parking_lot::ReentrantMutex<std::cell::RefCell<Vec<ListenerNode>>>;
 
 /// C `ERL_STATE_READY` (`errlog.c:56`): the flag byte of a committed message.
 const ERL_STATE_READY: u8 = 0x40;
@@ -918,14 +935,15 @@ struct Errlog {
     /// High logging an alarm waited behind a Low worker for as long as
     /// anything in between cared to run.
     ///
-    /// Contention can allocate: parking_lot_core grows its hashtable on a
-    /// thread's first park whenever live threads outgrow it, not once per process.
+    /// Contention allocates on a thread's first park unless the thread came
+    /// through [`enter_ioc_thread`](crate::runtime::task::enter_ioc_thread),
+    /// which builds that park state at entry.
     queue: PriorityInheritanceMutex<ErrlogQueue>,
     /// C `pvt.waitForWork` (`errlog.c:93`) — one waiter, the worker.
     work: Event,
     /// Signalled once, when the worker sets `stopped`.
     exited: Event,
-    listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
+    listeners: ErrlogListeners,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -973,7 +991,7 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             }),
             work: Event::new(),
             exited: Event::new(),
-            listeners: std::sync::Mutex::new(Vec::new()),
+            listeners: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(Vec::new())),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }));
         // C `epicsThreadCreateOpt("errlog", …)` at `epicsThreadPriorityLow`
@@ -1043,9 +1061,6 @@ fn errlog_exit_handler() {
 fn errlog_worker(errlog: &'static Errlog) {
     let _ = WORKER.set(std::thread::current().id());
     let parked = errlog.work.waiter();
-    // Refilled each pass and never shrunk: delivery allocates only when the
-    // listener list outgrows every pass before it.
-    let mut listeners: Vec<ErrlogListenerFn> = Vec::new();
     let mut q = errlog.queue.lock();
     loop {
         q.flush_seq += 1;
@@ -1088,39 +1103,26 @@ fn errlog_worker(errlog: &'static Errlog) {
         let mut print = std::mem::replace(&mut q.print, ErrlogBuf::new(0));
         drop(q);
 
-        // A snapshot, not the live list: a listener that removes itself from
-        // inside its own callback is C's `active`/`removed` dance
-        // (`errlog.c:684-697`), and taking a copy makes that state
-        // unrepresentable — `errlog_remove_listener` can never deadlock
-        // against a running callback, and the removal simply takes effect on
-        // the next drain.
-        listeners.extend(
-            errlog
-                .listeners
-                .lock()
-                .expect("errlog listeners")
-                .iter()
-                .map(|(_, f)| std::sync::Arc::clone(f)),
-        );
-
         print.drain(|echo, record| {
             // Only `accept` writes the arena, and it copies whole characters.
             // C writes the console first, from this thread, for a message
-            // posted with local echo while `pvt.toConsole` holds
-            // (`errlog.c:790-796`).
+            // posted with local echo while `pvt.toConsole` holds, stripped
+            // in the record unless the console is a terminal (`errlog.c:789-795`);
+            // the listeners always get it stripped (`:798-799`).
+            let mut len = None;
             if echo && to_console {
-                let text = std::str::from_utf8(record).unwrap_or_default();
-                console().write(format_args!("{text}"));
+                let mut console = console();
+                if !console.paints() {
+                    len = Some(strip_ansi_in_place(record));
+                }
+                let text =
+                    std::str::from_utf8(&record[..len.unwrap_or(record.len())]).unwrap_or_default();
+                console.write(format_args!("{text}"));
             }
-            // C strips before the listeners see it, always (`errlog.c:678-681`),
-            // in the record itself.
-            let len = strip_ansi_in_place(record);
+            let len = len.unwrap_or_else(|| strip_ansi_in_place(record));
             let text = std::str::from_utf8(&record[..len]).unwrap_or_default();
-            for listener in &listeners {
-                listener(text);
-            }
+            deliver(&errlog.listeners, text);
         });
-        listeners.clear();
         // C `errlog.c:823-824`.
         print.base.fill(0);
         print.pos = 0;
@@ -1138,6 +1140,38 @@ fn errlog_worker(errlog: &'static Errlog) {
     q.stopped = true;
     drop(q);
     errlog.exited.signal();
+}
+
+/// C `errlogThread`'s listener walk (`errlog.c:801-815`): the live list, under
+/// its lock, once per message. The next node is found after the call, so a
+/// listener added by a callback hears this message, and one removed by it
+/// hears nothing more.
+fn deliver(listeners: &ErrlogListeners, text: &str) {
+    let list = listeners.lock();
+    let mut at = 0;
+    loop {
+        let listener = {
+            let mut nodes = list.borrow_mut();
+            let Some(node) = nodes.get_mut(at) else {
+                return;
+            };
+            node.active = true;
+            std::sync::Arc::clone(&node.listener)
+        };
+        listener(text);
+        let mut nodes = list.borrow_mut();
+        // The callback may have removed a node ahead of this one.
+        let Some(here) = nodes.iter().position(|n| n.active) else {
+            return;
+        };
+        if nodes[here].removed {
+            nodes.remove(here);
+            at = here;
+        } else {
+            nodes[here].active = false;
+            at = here + 1;
+        }
+    }
 }
 
 /// Whether this call site puts the message on the console at all — C's
@@ -1370,11 +1404,12 @@ where
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
-    errlog
-        .listeners
-        .lock()
-        .expect("errlog listeners")
-        .push((id, std::sync::Arc::new(listener)));
+    errlog.listeners.lock().borrow_mut().push(ListenerNode {
+        id,
+        listener: std::sync::Arc::new(listener),
+        active: false,
+        removed: false,
+    });
     id
 }
 
@@ -1382,26 +1417,30 @@ where
 ///
 /// C's `errlogRemoveListeners(listener, pPrivate)` returns how many nodes
 /// matched the pair (`errlog.c:434-462`); a token matches at most one, so the
-/// count degenerates to a boolean. Safe to call from inside a listener: the
-/// worker drains against a snapshot, so this takes the lock immediately and
-/// the removal applies from the next message on.
+/// count degenerates to a boolean. When this returns the listener is never
+/// called again, as in C: from another thread it waits out the message being
+/// delivered, and from inside a callback the lock is this thread's already.
 pub fn errlog_remove_listener(id: ErrlogListenerId) -> bool {
-    let errlog = errlog_pvt();
-    let mut listeners = errlog.listeners.lock().expect("errlog listeners");
-    let before = listeners.len();
-    listeners.retain(|(other, _)| *other != id);
-    listeners.len() != before
+    let list = errlog_pvt().listeners.lock();
+    let mut nodes = list.borrow_mut();
+    let Some(at) = nodes.iter().position(|n| n.id == id && !n.removed) else {
+        return false;
+    };
+    // C `errlog.c:450-455`: a callback removing itself is only marked.
+    if nodes[at].active {
+        nodes[at].removed = true;
+    } else {
+        nodes.remove(at);
+    }
+    true
 }
 
 /// How many listeners are registered — C has no such call; this exists for
 /// the tests and for `iocLogShow`.
 #[must_use]
 pub fn errlog_listener_count() -> usize {
-    errlog_pvt()
-        .listeners
-        .lock()
-        .expect("errlog listeners")
-        .len()
+    let list = errlog_pvt().listeners.lock();
+    list.borrow().iter().filter(|n| !n.removed).count()
 }
 
 /// C `errlogShow(level)` (`errlog.c:694-720`). Returns the lines rather than
@@ -2854,9 +2893,8 @@ mod tests {
     }
 
     /// Boundary: a listener that removes itself from inside its own callback.
-    /// C guards this with `active`/`removed` flags; the port drains against a
-    /// snapshot, so the call cannot deadlock and the removal takes effect on
-    /// the next message.
+    /// C's `active`/`removed` flags: the call cannot deadlock on the
+    /// recursive list lock, and the removal takes effect on the next message.
     #[test]
     #[serial(errlog)]
     fn a_listener_can_remove_itself_from_inside_its_own_callback() {

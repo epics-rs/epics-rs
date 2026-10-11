@@ -1527,9 +1527,31 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
+    build_park_state();
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
     band_and_register(priority)
+}
+
+/// `parking_lot_core` builds a thread's park state on its first park, and
+/// that thread grows the process-wide table whenever live threads outgrow it:
+/// two allocations, inside whichever lock acquire first met contention — a
+/// record hold's errlog post, say. Building it at entry keeps them there.
+fn build_park_state() {
+    let key = 0u8;
+    // SAFETY: the key is this frame's address, which no other thread parks
+    // on, and `validate` refuses, so the call returns without sleeping and
+    // without running the other callbacks.
+    unsafe {
+        parking_lot_core::park(
+            std::ptr::from_ref(&key) as usize,
+            || false,
+            || {},
+            |_, _| {},
+            parking_lot_core::DEFAULT_PARK_TOKEN,
+            None,
+        );
+    }
 }
 
 /// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that

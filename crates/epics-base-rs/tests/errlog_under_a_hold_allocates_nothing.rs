@@ -13,7 +13,9 @@ use epics_base_rs::runtime::log::{
     errlog_add_listener, errlog_flush, errlog_remove_listener, errlog_vprintf,
     install_console_subscriber,
 };
-use epics_base_rs::runtime::task::thread_is_ok_to_block;
+use epics_base_rs::runtime::task::{
+    MandatoryThread, StackSizeClass, ThreadPriority, thread_is_ok_to_block,
+};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
 thread_local! {
@@ -63,7 +65,10 @@ async fn a_thousand_reports_under_a_hold_allocate_nothing() {
         DELIVERED.fetch_add(1, Ordering::Relaxed);
     });
 
-    let posted = std::thread::spawn(move || {
+    // An IOC thread, as a scan thread is: its first contended park on the
+    // queue lock must not be the one that builds its park state.
+    let (tx, rx) = std::sync::mpsc::channel();
+    MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(move || {
         assert!(!thread_is_ok_to_block(), "a scan thread is not ok-to-block");
         // The callsite registers with `tracing` once, and the worker sizes its
         // listener snapshot on its first pass.
@@ -80,9 +85,9 @@ async fn a_thousand_reports_under_a_hold_allocate_nothing() {
         COUNTING.with(|c| c.set(false));
         drop(guard);
         errlog_flush();
-        (ALLOCS.with(Cell::get), before)
+        tx.send((ALLOCS.with(Cell::get), before)).unwrap();
     });
-    let (poster, before) = posted.join().unwrap();
+    let (poster, before) = rx.recv().unwrap();
     errlog_remove_listener(listener);
 
     assert_eq!(

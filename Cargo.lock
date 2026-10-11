@@ -1127,6 +1127,7 @@ dependencies = [
  "if-addrs",
  "libc",
  "parking_lot",
+ "parking_lot_core",
  "rtems-exec-gate",
  "serial_test",
  "socket2 0.5.10",

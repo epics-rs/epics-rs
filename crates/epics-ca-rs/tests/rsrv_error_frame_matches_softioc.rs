@@ -816,6 +816,9 @@ async fn an_empty_pv_name_is_logged_at_each_refusal() {
 fn errlog_lines(f: impl FnOnce()) -> Vec<String> {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = seen.clone();
+    // A listener hears every message still queued when it is added, as C's
+    // live list does (`errlog.c:801-815`): the server's start-up line first.
+    epics_base_rs::runtime::log::errlog_flush();
     let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
         sink.lock().unwrap().push(line.to_string());
     });

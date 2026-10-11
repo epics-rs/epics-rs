@@ -125,6 +125,7 @@ pub mod reference;
 // this crate too, so the split cost zero call-site edits.
 pub use epics_libcom_rs::{net, runtime};
 pub mod server;
+pub mod sync;
 pub mod types;
 
 // The `exec_backend` / `tokio_backend` cfg is derived twice — once by

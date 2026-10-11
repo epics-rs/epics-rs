@@ -1433,6 +1433,7 @@ record(calc, "K") { field(CALC, "C+1") field(INPC, "K") field(INPA, "TC.SEVR NPP
     };
     put("VAL", 1).await;
     assert_eq!(get("K").await, EpicsValue::Double(1.0));
+    assert_eq!(get("K.A").await, EpicsValue::Double(3.0));
     put("VAL", 2).await;
     put("SYNC", 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;

@@ -640,6 +640,7 @@ async fn the_cooldown_forward_link_runs_ahead_of_the_reset() {
     let get = |db: &PvDatabase, pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
     put(&db, "TK", "VAL", 1.0).await;
     assert_eq!(get(&db, "K"), 1.0);
+    assert_eq!(get(&db, "K.A"), 3.0);
     put(&db, "TK", "VAL", 2.0).await;
     put(&db, "TK", "SYNC", 1.0).await;
     assert_eq!(get(&db, "K"), 1.0);

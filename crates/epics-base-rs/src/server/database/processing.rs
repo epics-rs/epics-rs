@@ -6833,7 +6833,7 @@ impl PvDatabase {
             // posts ahead of the `monitor()` commit below.
             if plan.hooks.has(CycleHooks::HAND_POSTED) {
                 guard.release();
-                self.drain_cycle_marks(rec);
+                self.drain_cycle_marks(rec, visited);
             }
 
             // Segment E (guarded): commit alarms, build the snapshot, resolve the
@@ -6849,7 +6849,13 @@ impl PvDatabase {
             let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
             let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
 
-            let flnk_name = instance.forward_target();
+            // An own-stamp type's FLNK is its `valuePut`'s, fired by the drain
+            // above; its `process()` has none (`throttleRecord.c:308`).
+            let flnk_name = if plan.hooks.stamps_at_own_reset() {
+                crate::server::record::record_instance::ForwardTarget::None
+            } else {
+                instance.forward_target()
+            };
 
             // Put-notify completion is NOT fired here. Firing before the
             // OUT/FLNK/process-action tail (below) would report the
@@ -7122,22 +7128,12 @@ impl PvDatabase {
         // process-only trigger of the remote target. Both halves come from the
         // one resolution `RecordInstance::forward_target` made under the
         // monitor segment's guard, so the tail re-reads nothing.
-        match flnk {
-            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
-                guard.release();
-                self.process_target(
-                    link,
-                    super::links::ProcessTargetGate::ScanPassive,
-                    *putf,
-                    notify.as_ref(),
-                    visited,
-                );
-            }
-            crate::server::record::record_instance::ForwardTarget::External(pv) => {
-                guard.release();
-                self.scan_forward_external_flnk(rec, pv);
-            }
-            crate::server::record::record_instance::ForwardTarget::None => {}
+        if !matches!(
+            flnk,
+            crate::server::record::record_instance::ForwardTarget::None
+        ) {
+            guard.release();
+            self.scan_forward_target(rec, flnk, visited);
         }
 
         // 6. CP link targets -- holders of a CP/CPP link on this record,
@@ -7192,6 +7188,31 @@ impl PvDatabase {
                     },
                 );
             }
+        }
+    }
+
+    /// C `dbScanFwdLink` on what [`RecordInstance::forward_target`] resolved.
+    #[inline(always)]
+    fn scan_forward_target(
+        &self,
+        rec: InFrame<'_>,
+        flnk: &crate::server::record::record_instance::ForwardTarget,
+        visited: &mut ProcStack,
+    ) {
+        match flnk {
+            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
+                self.process_target(
+                    link,
+                    super::links::ProcessTargetGate::ScanPassive,
+                    *putf,
+                    notify.as_ref(),
+                    visited,
+                );
+            }
+            crate::server::record::record_instance::ForwardTarget::External(pv) => {
+                self.scan_forward_external_flnk(rec, pv);
+            }
+            crate::server::record::record_instance::ForwardTarget::None => {}
         }
     }
 
@@ -7402,12 +7423,15 @@ impl PvDatabase {
     }
 
     /// What a [`CycleHooks::HAND_POSTED`] `process()` marked, posted ahead of
-    /// `monitor()`, and for a [`CycleHooks::HAND_POSTED_OWN_STAMP`] type the
-    /// tail of a `valuePut` the cycle ran (`throttleRecord.c:602-612`).
+    /// `monitor()`, and for a [`CycleHooks::HAND_POSTED_OWN_STAMP`] type what
+    /// remains of a `valuePut` the cycle ran: `recGblFwdLink` (`:578`), then
+    /// the tail (`throttleRecord.c:602-612`).
     #[inline(never)]
-    fn drain_cycle_marks(&self, rec: InFrame<'_>) {
+    fn drain_cycle_marks(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
         super::field_io::emit_cycle_posts(&mut rec.write(), super::LinkBacking::none());
         if rec.process_plan().hooks.stamps_at_own_reset() {
+            let flnk = rec.read().forward_target();
+            self.scan_forward_target(rec, &flnk, visited);
             self.post_value_put_tail(rec);
         }
     }

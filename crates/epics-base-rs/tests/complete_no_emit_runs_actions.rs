@@ -172,3 +172,37 @@ async fn a_complete_cycle_runs_the_epilogue_the_no_emit_cycle_skips() {
     assert_eq!(num(&ioc.db, "F.VAL"), 1.0);
     assert_eq!(num(&ioc.db, "N.PACT"), 0.0);
 }
+
+/// STAT, SEVR and TIME: what `recGblGetTimeStamp` and `monitor()`'s
+/// `recGblResetAlarms` would move.
+fn stamp_and_alarm(db: &PvDatabase) -> (u16, u16, std::time::SystemTime) {
+    let rec = db.get_record("N").unwrap();
+    let g = rec.read();
+    (g.common.stat, g.common.sevr as u16, g.common.time)
+}
+
+/// `scalerRecord.c:470`: a non-idle cycle runs no stamp and no alarm reset,
+/// so the init UDF/INVALID survives it on either dispatch path; the
+/// completing cycle is what commits and stamps.
+#[epics_macros_rs::epics_test]
+async fn a_no_emit_cycle_leaves_the_stamp_and_the_alarm() {
+    let mut ioc = ioc(false).await;
+    let init = stamp_and_alarm(&ioc.db);
+    assert_eq!((init.0, init.1), (17, 3), "init UDF/INVALID");
+    cycle(&mut ioc).await;
+    assert_eq!(stamp_and_alarm(&ioc.db), init, "engine path");
+    {
+        let rec = ioc.db.get_record("N").unwrap();
+        rec.write().process_local().unwrap();
+    }
+    assert_eq!(stamp_and_alarm(&ioc.db), init, "process_local");
+    assert_eq!(count(&mut ioc.x), 1, "process_local posts the mark too");
+
+    ioc.db
+        .put_record_field_from_ca("N", "EMIT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    cycle(&mut ioc).await;
+    let done = stamp_and_alarm(&ioc.db);
+    assert_ne!(done.2, init.2, "the completing cycle stamps");
+}

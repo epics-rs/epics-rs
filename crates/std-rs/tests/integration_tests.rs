@@ -1358,7 +1358,7 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
         let inst = &mut *guard;
         inst.record
             .set_process_context(&epics_base_rs::server::record::ProcessContext {
-                udf: false,
+                udf: 0,
                 udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
                 nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
                 phas: 0,
@@ -1367,12 +1367,12 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
                 soft: inst.common.dtyp.soft(),
                 callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
             });
-        assert!(
-            !inst
-                .record
-                .pre_input_link_actions(false, &mut inst.dpvt)
-                .is_empty()
-        );
+        inst.record.pre_input_link_actions(false, &mut inst.dpvt);
+        let writes = inst
+            .record
+            .gate_after_pre_input_reads(&[], &mut inst.dpvt)
+            .unwrap();
+        assert!(!writes.is_empty());
         assert!(matches!(inst.dpvt, Dpvt::Triggered));
         inst.enter_pact();
     }
@@ -1566,4 +1566,213 @@ record(ao, "P") { field(FLNK, "TX") }
     assert_eq!(alarm("TV").await, no_alarm);
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     assert_eq!(alarm("TU").await, udf_invalid);
+}
+
+/// softIoc, `epid(E1|E2){KP 1, INP CV, HIGH -1, HSV MINOR}`, `ao(W1){OUT
+/// "E1.UDF NPP"}`, `ao(W2){OUT "E2.UDF NPP"}`, `dbpf W1 1; dbpf W2 2; dbpf
+/// E1.PROC 1; dbpf E2.PROC 1`: E1 reads UDF 1, INVALID/UDF, P 0, ERR 0; E2
+/// reads UDF 2, HIGH/MINOR, P -0.5, ERR -0.5. P and ERR need the `:195` test
+/// exact, HIGH needs `:309`'s.
+#[tokio::test]
+async fn epid_tests_udf_exactly() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E1") { field(KP, "1") field(INP, "CV") field(HIGH, "-1") field(HSV, "MINOR") }
+record(epid, "E2") { field(KP, "1") field(INP, "CV") field(HIGH, "-1") field(HSV, "MINOR") }
+record(ao, "W1") { field(OUT, "E1.UDF NPP") }
+record(ao, "W2") { field(OUT, "E2.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (w, v) in [("W1", 1.0), ("W2", 2.0)] {
+        db.put_record_field_from_ca(w, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for e in ["E1", "E2"] {
+        db.put_record_field_from_ca(e, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let read = |e: &str| {
+        let num = |f: &str| db.get_pv(&format!("{e}.{f}")).unwrap().to_f64().unwrap();
+        let rec = db.get_record(e).unwrap();
+        let g = rec.read();
+        let (udf, stat, sevr) = (g.common.udf, g.common.stat, g.common.sevr as u16);
+        drop(g);
+        (udf, stat, sevr, num("P"), num("ERR"))
+    };
+    assert_eq!(read("E1"), (1, 17, 3, 0.0, 0.0));
+    assert_eq!(read("E2"), (2, 4, 1, -0.5, -0.5));
+}
+
+/// The softIoc run above reads E1.CVAL 0 and E2.CVAL 0.5: C reads INP inside
+/// `do_pid` (`devEpidSoft.c:113`), which E1's `udf == TRUE` return skips.
+#[tokio::test]
+async fn epid_reads_inp_inside_do_pid() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E1") { field(KP, "1") field(INP, "CV") }
+record(epid, "E2") { field(KP, "1") field(INP, "CV") }
+record(ao, "W1") { field(OUT, "E1.UDF NPP") }
+record(ao, "W2") { field(OUT, "E2.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (w, v) in [("W1", 1.0), ("W2", 2.0)] {
+        db.put_record_field_from_ca(w, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for e in ["E1", "E2"] {
+        db.put_record_field_from_ca(e, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    let cval = |e: &str| db.get_pv(&format!("{e}.CVAL")).unwrap().to_f64().unwrap();
+    assert_eq!((cval("E1"), cval("E2")), (0.0, 0.5));
+}
+
+/// softIoc, `ao(CV){VAL 0.5}`, `epid(E){KP 1, INP CV}`, `ao(W){OUT "E.UDF
+/// NPP"}`, `dbpf W 0; dbpf E.PROC 1; dbpf W 1; dbpf CV 0.7; dbpf E.PROC 1`: E
+/// reads NO_ALARM after both cycles and CVAL 0.5; then `dbpf W 0; dbpf E.PROC
+/// 1` reads UDF/INVALID and one more `dbpf E.PROC 1` NO_ALARM. The `udf ==
+/// TRUE` return (`epidRecord.c:201`) skips `recGblResetAlarms`, leaving its
+/// UDF raise (:199) for the next cycle to commit.
+#[tokio::test]
+async fn epid_skipped_cycle_commits_no_alarm() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E") { field(KP, "1") field(INP, "CV") }
+record(ao, "W") { field(OUT, "E.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let put = |rec: &'static str, field: &'static str, v: EpicsValue| {
+        let db = db.clone();
+        async move { db.put_record_field_from_ca(rec, field, v).await.unwrap() }
+    };
+    let alarm = || {
+        let rec = db.get_record("E").unwrap();
+        let g = rec.read();
+        (g.common.stat, g.common.sevr as u16)
+    };
+    put("W", "VAL", EpicsValue::Double(0.0)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+    put("W", "VAL", EpicsValue::Double(1.0)).await;
+    put("CV", "VAL", EpicsValue::Double(0.7)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64().unwrap(), 0.5);
+    put("W", "VAL", EpicsValue::Double(0.0)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (17, 3));
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+}
+
+/// One owner judges the UDF gate after the STPL read; INP and TRIG follow
+/// it. softIoc, all with `KP 1, INP CV` (CV 0.5), each PROCed once after
+/// `dbpf WD 0; dbpf WC 1`:
+/// EF{closed_loop, STPL NOSUCH}: UDF 1, UDF/INVALID, CVAL 0.
+/// ED{closed_loop, STPL NOSUCH}, UDF put 0: UDF 0, LINK/INVALID, CVAL 0.5.
+/// EA{Async Soft Channel, TRIG "T PP", TVAL 7} and EB{the same, closed_loop,
+/// STPL NOSUCH, TRIG "T2 PP"}: T and T2 stay 0.
+/// EC{STPL "2"}, UDF put 1: UDF 1, UDF/INVALID, CVAL 0.
+/// EE{closed_loop, STPL empty}: UDF 0, NO_ALARM, CVAL 0.5.
+#[tokio::test]
+async fn epid_gate_follows_the_stpl_read() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(ao, "T") { field(VAL, "0") }
+record(ao, "T2") { field(VAL, "0") }
+record(epid, "EF") { field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") }
+record(epid, "ED") { field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") }
+record(ao, "WD") { field(OUT, "ED.UDF NPP") }
+record(epid, "EA") { field(DTYP, "Async Soft Channel") field(KP, "1") field(INP, "CV") field(TRIG, "T PP") field(TVAL, "7") }
+record(epid, "EB") { field(DTYP, "Async Soft Channel") field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") field(TRIG, "T2 PP") field(TVAL, "7") }
+record(epid, "EC") { field(STPL, "2") field(KP, "1") field(INP, "CV") }
+record(ao, "WC") { field(OUT, "EC.UDF NPP") }
+record(epid, "EE") { field(SMSL, "closed_loop") field(KP, "1") field(INP, "CV") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (rec, v) in [("WD", 0.0), ("WC", 1.0)] {
+        db.put_record_field_from_ca(rec, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for rec in ["EF", "ED", "EA", "EB", "EC", "EE"] {
+        db.put_record_field_from_ca(rec, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    let num = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+    let read = |e: &str| {
+        let cval = num(&format!("{e}.CVAL"));
+        let rec = db.get_record(e).unwrap();
+        let g = rec.read();
+        (g.common.udf, g.common.stat, g.common.sevr as u16, cval)
+    };
+    use epics_base_rs::server::recgbl::alarm_status::{LINK_ALARM, UDF_ALARM};
+    assert_eq!(read("EF"), (1, UDF_ALARM, 3, 0.0));
+    assert_eq!(read("ED"), (0, LINK_ALARM, 3, 0.5));
+    assert_eq!((num("T"), num("T2")), (0.0, 0.0));
+    assert_eq!(read("EC"), (1, UDF_ALARM, 3, 0.0));
+    assert_eq!(read("EE"), (0, 0, 0, 0.5));
+}
+
+/// The softIoc sequence of `epid_skipped_cycle_commits_no_alarm` through
+/// `process_local` (`db.process_record`, QSRV group members): the skipped
+/// cycle's UDF raise is committed by the next cycle on this path too.
+#[tokio::test]
+async fn epid_skipped_cycle_raise_survives_process_local() {
+    let db_str = r#"
+record(epid, "E") { field(KP, "1") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let rec = db.get_record("E").unwrap();
+    let cycle = |udf: u8| {
+        let mut g = rec.write();
+        g.common.udf = udf;
+        g.process_local().unwrap();
+        (g.common.stat, g.common.sevr as u16)
+    };
+    assert_eq!(cycle(0), (0, 0));
+    assert_eq!(cycle(1), (0, 0));
+    assert_eq!(cycle(0), (17, 3));
+    assert_eq!(cycle(0), (0, 0));
 }

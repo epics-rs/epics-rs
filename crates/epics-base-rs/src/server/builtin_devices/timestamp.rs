@@ -401,7 +401,7 @@ mod tests {
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
     fn ctx_device_time(time: SystemTime) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: AlarmSeverity::Invalid,
             nsev: AlarmSeverity::NoAlarm,
             phas: 0,

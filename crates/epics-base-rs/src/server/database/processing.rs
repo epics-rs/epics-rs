@@ -4314,6 +4314,32 @@ impl PvDatabase {
             let is_read = |a: &crate::server::record::ProcessAction| {
                 matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
             };
+            let mut pre_input_actions = pre_input_actions;
+            if plan
+                .hooks
+                .has(crate::server::record::CycleHooks::PRE_INPUT_GATE)
+            {
+                // C `epidRecord.c:189-201`: what the reads delivered decides
+                // whether the writes after them happen at all.
+                let (reads, mut others): (Vec<_>, Vec<_>) = std::mem::take(&mut pre_input_actions)
+                    .into_iter()
+                    .partition(is_read);
+                if !reads.is_empty() {
+                    pre_input_resolved = self.execute_read_db_links(name, rec, &reads, visited);
+                }
+                let inst = guard.hold();
+                match inst
+                    .record
+                    .gate_after_pre_input_reads(&pre_input_resolved, &mut inst.dpvt)
+                {
+                    Some(more) => others.extend(more.into_vec()),
+                    None => others.clear(),
+                }
+                if !others.is_empty() {
+                    guard.release();
+                    self.execute_process_actions_in(name, rec, others, visited);
+                }
+            }
             if !pre_input_actions.is_empty() && pre_input_actions.iter().all(is_read) {
                 // Nothing to split off: the list is its own `reads`.
                 pre_input_resolved =
@@ -5850,7 +5876,7 @@ impl PvDatabase {
             if async_pending
                 || matches!(
                     process_result,
-                    crate::server::record::RecordProcessResult::CompleteNoEmit
+                    crate::server::record::RecordProcessResult::CompleteNoEmit { .. }
                 )
             {
                 // This path calls `record.process()` directly, not through
@@ -5858,6 +5884,11 @@ impl PvDatabase {
                 // for the entry guard to refuse the next `dbProcess`.
                 if async_pending {
                     guard.hold().enter_pact();
+                } else if let crate::server::record::RecordProcessResult::CompleteNoEmit {
+                    raise: Some((stat, sevr)),
+                } = process_result
+                {
+                    crate::server::recgbl::rec_gbl_set_sevr(&mut guard.hold().common, stat, sevr);
                 }
                 guard.release();
 

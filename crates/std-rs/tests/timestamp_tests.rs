@@ -275,7 +275,7 @@ use epics_base_rs::server::record::{EPICS_TIME_EVENT_DEVICE_TIME, ProcessContext
 
 fn ctx_with_tse(tse: i16) -> ProcessContext {
     ProcessContext {
-        udf: false,
+        udf: 0,
         udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
         nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
         phas: 0,

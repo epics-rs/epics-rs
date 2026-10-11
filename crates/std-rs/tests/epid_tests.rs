@@ -3,6 +3,14 @@ use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::types::EpicsValue;
 use std_rs::EpidRecord;
+
+/// The limit checks run only past `epidRecord.c:309`'s `udf == TRUE` return.
+fn defined_common() -> CommonFields {
+    CommonFields {
+        udf: 0,
+        ..CommonFields::default()
+    }
+}
 use std_rs::device_support::epid_soft::EpidSoftDeviceSupport;
 
 // ============================================================
@@ -183,7 +191,7 @@ fn test_check_alarms_hysteresis() {
     // First alarm triggers at 100. The trait hook commits LALM to the
     // alarmed threshold only after `recGblSetSevr` raises the severity.
     rec.val = 100.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(rec.lalm, 100.0);
 
@@ -210,7 +218,7 @@ fn test_check_alarms_lalm_gated_on_severity_raise() {
     rec.val = 85.0;
     let lalm_before = rec.lalm;
 
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     // Pre-seed a higher pending severity, as an upstream MS link would.
     common.nsev = AlarmSeverity::Invalid;
     common.nsta = alarm_status::COMM_ALARM;
@@ -230,7 +238,7 @@ fn test_check_alarms_lalm_gated_on_severity_raise() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(common.nsev, AlarmSeverity::Minor);
     assert_eq!(
@@ -252,7 +260,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -270,7 +278,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.hihi = 100.0;
     rec.hhsv = 2; // MAJOR
     rec.val = 110.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -294,7 +302,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.lsv = 1;
     rec.llsv = 2;
     rec.val = 50.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -317,7 +325,7 @@ fn test_check_alarms_hook_maximizes_severity() {
     rec.hihi = 100.0;
     rec.hhsv = 2; // MAJOR
     rec.val = 110.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
 
     // Pre-seed a lower pending severity, as an upstream MS link would.
     common.nsev = AlarmSeverity::Minor;
@@ -336,7 +344,7 @@ fn test_check_alarms_hook_maximizes_severity() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     common.nsev = AlarmSeverity::Invalid;
     common.nsta = alarm_status::COMM_ALARM;
     Record::check_alarms(&mut rec, &mut common);
@@ -1176,6 +1184,22 @@ use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::record::{LinkType, ProcessAction, link_field_type};
 use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
 
+/// The pre-input stage as the cycle runs it: the record's reads, then the
+/// gate's writes, with `resolved` the reads that succeeded.
+fn pre_input(
+    rec: &mut EpidRecord,
+    dpvt: &mut Dpvt,
+    resolved: &[&'static str],
+) -> epics_base_rs::server::record::ProcessActions {
+    let mut actions = rec.pre_input_link_actions(true, dpvt);
+    if let Some(writes) = rec.gate_after_pre_input_reads(resolved, dpvt) {
+        for a in writes.into_vec() {
+            actions.push(a);
+        }
+    }
+    actions
+}
+
 /// C `devEpidSoft.c:110-112`: a CONSTANT `INP` link means "nothing to
 /// control" — `do_pid` must skip the PID compute and the record must
 /// be flagged SOFT_ALARM/INVALID_ALARM by the `check_alarms` hook.
@@ -1251,7 +1275,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     // The TRIG write is a pre-input-link action emitted by the record,
     // gated on the callback DSET (DTYP "Async Soft Channel").
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
-    let pre = rec.pre_input_link_actions(true, &mut dpvt);
+    let pre = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         pre.iter().any(|a| matches!(
             a,
@@ -1295,7 +1319,7 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
     assert!(
-        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "non-callback DSET must not drive the TRIG link"
     );
 }
@@ -1317,7 +1341,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 
     // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
     // PID compute is deferred to the re-process pass.
-    let actions = rec.pre_input_link_actions(true, &mut dpvt);
+    let actions = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -1339,7 +1363,7 @@ fn test_ca_trig_link_deferred_second_pass() {
     // `if (!pepid->pact)` skips the whole trigger block, so nothing is
     // re-fired and the PID runs.
     assert!(
-        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "second pass must not re-trigger"
     );
 }
@@ -1369,15 +1393,15 @@ fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
         })
     };
 
-    assert!(fires(&rec.pre_input_link_actions(true, &mut dpvt)));
+    assert!(fires(&pre_input(&mut rec, &mut dpvt, &[])));
     // `rebind_device_link` takes the record's dpvt and installs the new
     // dset's, which `devEpidSoftCB` leaves NULL.
     dpvt = Dpvt::Null;
     assert!(
-        fires(&rec.pre_input_link_actions(true, &mut dpvt)),
+        fires(&pre_input(&mut rec, &mut dpvt, &[])),
         "the callback after a device-link put fires the trigger again"
     );
-    assert!(!fires(&rec.pre_input_link_actions(true, &mut dpvt)));
+    assert!(!fires(&pre_input(&mut rec, &mut dpvt, &[])));
 }
 
 /// TASK 2 — bumpless transfer: on the feedback OFF->ON edge in PID
@@ -1444,7 +1468,7 @@ fn test_no_bumpless_readback_when_no_edge() {
 // ============================================================
 use epics_base_rs::server::record::ProcessContext;
 
-fn ctx_with_udf(udf: bool) -> ProcessContext {
+fn ctx_with_udf(udf: u8) -> ProcessContext {
     ProcessContext {
         udf,
         udfs: AlarmSeverity::Invalid,
@@ -1459,7 +1483,7 @@ fn ctx_with_udf(udf: bool) -> ProcessContext {
 
 fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
     ProcessContext {
-        udf: false,
+        udf: 0,
         udfs: AlarmSeverity::Invalid,
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
@@ -1487,7 +1511,7 @@ fn test_process_skips_do_pid_while_udf_set() {
     let p_before = rec.p;
 
     // Framework pushes udf=TRUE before process() (record uninitialized).
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.process().unwrap();
 
     assert_eq!(
@@ -1515,7 +1539,7 @@ fn test_process_runs_do_pid_once_udf_cleared() {
     std::thread::sleep(std::time::Duration::from_millis(5));
 
     // Framework pushes udf=FALSE — record now has a defined value.
-    rec.set_process_context(&ctx_with_udf(false));
+    rec.set_process_context(&ctx_with_udf(0));
     rec.process().unwrap();
 
     // P = KP * (VAL - CVAL) = 2.0 * 90.0 = 180.0 — proves do_pid ran.
@@ -1528,10 +1552,9 @@ fn test_process_runs_do_pid_once_udf_cleared() {
 
 /// C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a successful
 /// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check.
-/// The framework fetches STPL->VAL before process() and reports the
-/// fetch success via `set_resolved_input_links(ResolvedInputLinks::of_names(&["STPL"]))`; with that
-/// signal, a closed-loop epid runs do_pid that cycle even though the
-/// pushed `udf` is still the stale-TRUE from before the fetch.
+/// The STPL read is a pre-input read whose success reaches the gate; with
+/// it, a closed-loop epid runs do_pid that cycle even though the pushed
+/// `udf` is still the stale-TRUE from before the fetch.
 #[test]
 fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
     let mut rec = EpidRecord::default();
@@ -1546,10 +1569,8 @@ fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
 
     // Framework reports the STPL fetch succeeded this cycle, then
     // pushes the stale udf=TRUE (recomputed only after process()).
-    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
-        &["STPL"],
-    ));
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
+    pre_input(&mut rec, &mut Dpvt::Null, &["STPL"]);
     rec.process().unwrap();
 
     assert!(
@@ -1584,7 +1605,7 @@ fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
     rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
         &[],
     ));
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.process().unwrap();
 
     assert_eq!(
@@ -1592,11 +1613,10 @@ fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
         "closed-loop epid whose STPL fetch failed must keep udf set and \
          skip do_pid — !val.is_nan() must NOT proxy fetch success"
     );
-    assert!(
-        rec.value_is_undefined(),
-        "value_is_undefined() must stay true so the framework keeps \
-         common.udf set for the next cycle"
-    );
+    let mut common = epics_base_rs::server::record::CommonFields::default();
+    common.udf = 1;
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(common.udf, 1, "a failed STPL fetch leaves UDF set");
 }
 
 /// The UDF gate applies only on the non-callback pass. When device
@@ -1614,7 +1634,7 @@ fn test_process_with_device_did_compute_ignores_udf_gate() {
     let oval_before = rec.oval;
     let p_before = rec.p;
 
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.set_device_did_compute(true); // device support already ran do_pid
     rec.process().unwrap();
 
@@ -1667,7 +1687,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
     // --- Trigger pass: pre_input_link_actions fires the CA trigger ---
-    let actions1 = rec.pre_input_link_actions(true, &mut dpvt);
+    let actions1 = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         actions1.iter().any(|a| matches!(
             a,
@@ -1699,7 +1719,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 
     // --- Reprocess (callback) pass: the trigger block is skipped ---
     assert!(
-        rec.pre_input_link_actions(true, &mut dpvt).is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "reprocess pass must not re-trigger"
     );
     rec.set_device_did_compute(false);

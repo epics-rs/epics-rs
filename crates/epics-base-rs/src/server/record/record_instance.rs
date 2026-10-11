@@ -8906,7 +8906,7 @@ impl RecordInstance {
             // _guard drops here, clearing the processing flag
             return Ok((changed_fields, Vec::new()));
         }
-        if process_result == RecordProcessResult::CompleteNoEmit {
+        if let RecordProcessResult::CompleteNoEmit { raise } = process_result {
             // The record accumulated this cycle without emitting (compress
             // `status == 1`). C `compressRecord.c:365` runs the completion
             // epilogue (udf clear, timestamp, monitor, FLNK) only on an emit
@@ -8917,6 +8917,9 @@ impl RecordInstance {
             // invariant holds by construction, not by "process_local never
             // produces it". CompleteNoEmit is synchronous (PACT already
             // cleared); the `_guard` drops here, clearing the processing flag.
+            if let Some((stat, sevr)) = raise {
+                crate::server::recgbl::rec_gbl_set_sevr(&mut self.common, stat, sevr);
+            }
             return Ok((ProcessSnapshot::new(), Vec::new()));
         }
 

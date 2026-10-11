@@ -223,7 +223,7 @@ mod tests {
 
     fn ctx_with_phas(phas: i16) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
             nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,
@@ -239,7 +239,7 @@ mod tests {
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
     fn ctx_device_time(phas: i16, time: SystemTime) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
             nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,

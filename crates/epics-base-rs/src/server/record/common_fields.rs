@@ -241,7 +241,7 @@ impl CommonFields {
     /// device support's `read()` needs to observe during the cycle.
     pub fn process_context(&self) -> super::record_trait::ProcessContext {
         super::record_trait::ProcessContext {
-            udf: self.udf != 0,
+            udf: self.udf,
             udfs: AlarmSeverity::from_u16(self.udfs as u16),
             nsev: self.nsev,
             phas: self.phas,

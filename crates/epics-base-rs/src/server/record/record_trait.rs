@@ -1988,6 +1988,9 @@ impl CycleHooks {
     /// tail's owners stamp.
     pub const HAND_POSTED_OWN_STAMP: Self = Self(Self::HAND_POSTED.0 | Self::OWN_STAMP);
     const OWN_STAMP: u16 = 256;
+    /// [`Record::gate_after_pre_input_reads`]: outside [`Self::ALL`],
+    /// declared by the type whose cycle hangs on a pre-input read.
+    pub const PRE_INPUT_GATE: Self = Self(512);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2014,6 +2017,27 @@ impl CycleHooks {
 
 // The stamp bit never stands without the drain that stamps.
 const _: () = assert!(CycleHooks::HAND_POSTED_OWN_STAMP.has(CycleHooks::HAND_POSTED));
+// Every single-bit hook is one bit, and no two share it.
+const _: () = {
+    let bits = [
+        CycleHooks::PRE_INPUT.0,
+        CycleHooks::CYCLE_POSTED.0,
+        CycleHooks::CONTEXT.0,
+        CycleHooks::WRITE_POSTED.0,
+        CycleHooks::PROCESS_POSTED.0,
+        CycleHooks::PUT_REPORT.0,
+        CycleHooks::HAND_POSTED.0,
+        CycleHooks::OWN_STAMP,
+        CycleHooks::PRE_INPUT_GATE.0,
+    ];
+    let mut seen = 0;
+    let mut i = 0;
+    while i < bits.len() {
+        assert!(bits[i].count_ones() == 1 && seen & bits[i] == 0);
+        seen |= bits[i];
+        i += 1;
+    }
+};
 
 impl<T> CycleList<T> {
     /// An empty list.
@@ -2126,7 +2150,13 @@ pub enum RecordProcessResult {
     /// ProcessActions are still executed: the `dbPutLink`s C makes inside
     /// `process()` before that return (a scaler's COUT on a non-idle cycle,
     /// `scalerRecord.c:456-466`) have already happened.
-    CompleteNoEmit,
+    ///
+    /// `raise` is a `recGblSetSevr` made before that return (`epidRecord.c:199`
+    /// ahead of `:201`): the framework puts it in `nsta`/`nsev` on either
+    /// dispatch path, and the next cycle's `recGblResetAlarms` commits it.
+    CompleteNoEmit {
+        raise: Option<(u16, crate::server::record::AlarmSeverity)>,
+    },
     /// Ran the value-publication epilogue NOW (UDF clear / timestamp / monitor —
     /// VAL and the alarm fields are posted this cycle), but the OUTPUT side (OUT
     /// link write / OEVT / forward link) is deferred to a scheduled
@@ -2233,10 +2263,20 @@ impl ProcessOutcome {
     /// timestamp / monitor / FLNK). See `RecordProcessResult::CompleteNoEmit`.
     pub fn complete_no_emit() -> Self {
         Self {
-            result: RecordProcessResult::CompleteNoEmit,
+            result: RecordProcessResult::CompleteNoEmit { raise: None },
             actions: Vec::new(),
             device_did_compute: false,
             post_write_fields: Vec::new(),
+        }
+    }
+
+    /// [`Self::complete_no_emit`] that leaves `stat`/`sevr` pending.
+    pub fn complete_no_emit_raising(stat: u16, sevr: crate::server::record::AlarmSeverity) -> Self {
+        Self {
+            result: RecordProcessResult::CompleteNoEmit {
+                raise: Some((stat, sevr)),
+            },
+            ..Self::complete_no_emit()
         }
     }
 
@@ -2312,9 +2352,9 @@ pub enum CommonFieldPutResult {
 /// no `process()` / `read()` signature change.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessContext {
-    /// `dbCommon.udf` — value is undefined. C records check this at the
-    /// top of `process()` (e.g. `epidRecord.c:195`).
-    pub udf: bool,
+    /// `dbCommon.udf`, the raw `DBF_UCHAR` byte: `epidRecord.c:195` tests
+    /// `udf == TRUE`, which a byte of 2 does not pass.
+    pub udf: u8,
     /// `dbCommon.udfs` — alarm severity raised for a UDF record.
     pub udfs: crate::server::record::AlarmSeverity,
     /// `dbCommon.nsev` — the *pending* (new) alarm severity this cycle has
@@ -6106,6 +6146,20 @@ pub trait Record: Send + Sync + 'static {
         _dpvt: &mut crate::server::device_support::Dpvt,
     ) -> ProcessActions {
         ProcessActions::new()
+    }
+
+    /// Asked between this cycle's [`Self::pre_input_link_actions`] reads
+    /// (`resolved`: the links that read successfully) and everything after
+    /// them, by a type that declares [`CycleHooks::PRE_INPUT_GATE`]. `Some`
+    /// carries writes to make before the input fetch; `None` drops the
+    /// cycle's remaining pre-input writes. C `epidRecord.c:189-201` reads STPL
+    /// and returns ahead of `do_pid`'s TRIG put and INP read while UDF holds.
+    fn gate_after_pre_input_reads(
+        &mut self,
+        _resolved: &[&'static str],
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> Option<ProcessActions> {
+        Some(ProcessActions::new())
     }
 
     /// Called by the framework immediately before `process()` to push a

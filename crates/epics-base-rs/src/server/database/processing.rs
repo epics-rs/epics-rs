@@ -99,8 +99,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
-    CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell, RecordInstance,
-    SoftRead, SoftReading,
+    CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
+    RecordInstance, SoftRead, SoftReading,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -2689,6 +2689,67 @@ impl PvDatabase {
                 }
             }
         });
+    }
+
+    /// Schedule [`ProcessAction::ValuePutAfter`](crate::server::record::ProcessAction::ValuePutAfter):
+    /// C throttle's `callbackRequestDelayed(&delayFuncCb, delay)`
+    /// (`throttleRecord.c:593`). Shares the record's reprocess generation, so
+    /// a newer arm supersedes a pending one as C's single callback does.
+    fn schedule_value_put(&self, name: &str, rec: InFrame<'_>, delay: std::time::Duration) {
+        let token = Self::mint_async_token_in(name, rec);
+        let prio = rec.read().common.callback_priority();
+        let db = self.clone();
+        crate::runtime::task::spawn_background(prio, async move {
+            crate::runtime::task::sleep_background(delay).await;
+            if !token.is_current() {
+                return;
+            }
+            let Some(rec) = db.get_record_no_resolve(&token.name) else {
+                return;
+            };
+            let gate = FrameGate::Taken(db.lock_instance(&rec));
+            db.value_put_in(&token.name, gate.frame(&rec), &mut ProcStack::new());
+        });
+    }
+
+    /// C `delayFuncCallback` (`throttleRecord.c:530-538`): `valuePut` under
+    /// `dbScanLock`, never `dbProcess` — no disable test, no PACT, no TPRO
+    /// line and no `monitor()`; the record's own marks carry its posts, stamp
+    /// and alarm reset.
+    fn value_put_in(&self, name: &str, rec: InFrame<'_>, visited: &mut ProcStack) {
+        let actions = rec.write().record.delayed_value_put();
+        self.execute_process_actions_in(name, rec, actions, visited);
+        let forward = {
+            let mut instance = rec.write();
+            super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+            instance.record.should_fire_forward_link()
+        };
+        // `recGblFwdLink` (`:578`) runs ahead of `valuePut`'s stamp and reset.
+        if forward {
+            let posts = CyclePosts(crate::server::recgbl::EventMask::default());
+            self.run_forward_link_tail(name, rec, posts, visited);
+            finish_cycle(&mut rec.write());
+        }
+        // `checkAlarms` (`:604`) on both arms, ahead of the reset; the stamp
+        // the tail takes first reads no alarm state.
+        {
+            let mut instance = rec.write();
+            let instance = &mut *instance;
+            instance.record.check_alarms(&mut instance.common);
+            instance.evaluate_alarms();
+        }
+        self.post_value_put_tail(rec);
+    }
+
+    /// [`Record::take_value_put_tail`](crate::server::record::Record::take_value_put_tail)
+    /// for its two owners, [`Self::value_put_in`] and the cycle's hand drain:
+    /// `recGblGetTimeStamp` (`:602`), then the reset and the SENT post.
+    fn post_value_put_tail(&self, rec: InFrame<'_>) {
+        let tail = rec.write().record.take_value_put_tail();
+        if !tail.is_empty() {
+            self.rec_gbl_get_time_stamp_in(rec);
+            super::field_io::post_cycle_marks(&mut rec.write(), tail, super::LinkBacking::none());
+        }
     }
 
     /// (Re)arm a record's monitor watchdog — the single owner of the
@@ -6768,6 +6829,13 @@ impl PvDatabase {
             }
             let push_alarm = dispatched.alarm;
 
+            // What `process()` marked by hand, its own alarm reset included,
+            // posts ahead of the `monitor()` commit below.
+            if plan.hooks.has(CycleHooks::HAND_POSTED) {
+                guard.release();
+                self.drain_cycle_marks(rec);
+            }
+
             // Segment E (guarded): commit alarms, build the snapshot, resolve the
             // FLNK target, and yield the `'epilogue` tuple. Re-acquire the data lock.
             let instance = guard.hold();
@@ -7326,12 +7394,22 @@ impl PvDatabase {
                 }
             },
         };
-        let mut instance = rec.write();
-        let more = instance.record.link_read_result(link_field, read);
+        let more = rec.write().record.link_read_result(link_field, read);
         // What the record posted deciding on the read (throttle's `VAL`,
         // `throttleRecord.c:637`) goes out as the read's own posts do.
-        super::field_io::emit_cycle_posts(&mut instance, super::LinkBacking::none());
+        super::field_io::emit_cycle_posts(&mut rec.write(), super::LinkBacking::none());
         more
+    }
+
+    /// What a [`CycleHooks::HAND_POSTED`] `process()` marked, posted ahead of
+    /// `monitor()`, and for a [`CycleHooks::HAND_POSTED_OWN_STAMP`] type the
+    /// tail of a `valuePut` the cycle ran (`throttleRecord.c:602-612`).
+    #[inline(never)]
+    fn drain_cycle_marks(&self, rec: InFrame<'_>) {
+        super::field_io::emit_cycle_posts(&mut rec.write(), super::LinkBacking::none());
+        if rec.process_plan().hooks.stamps_at_own_reset() {
+            self.post_value_put_tail(rec);
+        }
     }
 
     /// Execute the ReadDbLink actions of a stage, and report which
@@ -7531,6 +7609,9 @@ impl PvDatabase {
                     // mutation lives in `delayed_callback_fire`, not in
                     // `process()`, so only this timer can perform it.
                     self.schedule_delayed_callback(record_name, rec, delay);
+                }
+                ProcessAction::ValuePutAfter(delay) => {
+                    self.schedule_value_put(record_name, rec, delay);
                 }
                 ProcessAction::ReprocessAfter(delay) => {
                     // Owner-driven delayed re-entry, mirroring C

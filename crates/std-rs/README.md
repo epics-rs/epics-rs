@@ -37,7 +37,7 @@ Rate-limiting output forwarder:
 - Rate limit RMAX (units/sec)
 - Minimum delay RMIN between writes
 - SYNC input for forced re-sync to current INP value
-- Async delayed reprocess via `ReprocessAfter` action
+- DLY cooldown via the `ValuePutAfter` action, never a process cycle
 
 ### timestamp Record
 Wall-clock timestamp string with 11 format options:

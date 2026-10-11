@@ -394,7 +394,8 @@ pub(crate) fn put_drives_processing_of(
 /// into monitor posts — the put-path counterpart of the `db_post_events` calls a
 /// C `special()` makes by hand. Its callers are the two after-pass owners,
 /// [`special_after_put`] and [`put_common`], and the link read that lands in
-/// a record field. Only a type whose `cycle_hooks` says `WRITE_POSTED` is asked.
+/// a record field. Only a type whose `cycle_hooks` says `WRITE_POSTED` or
+/// `HAND_POSTED` is asked.
 #[inline(always)]
 pub(crate) fn emit_cycle_posts(
     instance: &mut crate::server::record::RecordInstance,
@@ -403,7 +404,10 @@ pub(crate) fn emit_cycle_posts(
     use crate::server::record::CycleHooks;
     // The gate stays in every put body; the drain is out of line so a type
     // with nothing to post pays no call.
-    if instance.cycle_hooks().has(CycleHooks::WRITE_POSTED) {
+    if instance
+        .cycle_hooks()
+        .has(CycleHooks::WRITE_POSTED.union(CycleHooks::HAND_POSTED))
+    {
         drain_cycle_posts(instance, backing);
     }
 }
@@ -413,10 +417,21 @@ fn drain_cycle_posts(
     instance: &mut crate::server::record::RecordInstance,
     backing: crate::server::database::LinkBacking<'_>,
 ) {
+    let marks = instance.record.take_cycle_posted_fields();
+    post_cycle_marks(instance, marks, backing);
+}
+
+/// Post `marks` as [`drain_cycle_posts`] does, committing the alarm at the
+/// first `Reset*` entry.
+pub(crate) fn post_cycle_marks(
+    instance: &mut crate::server::record::RecordInstance,
+    marks: crate::server::record::CycleMarks,
+    backing: crate::server::database::LinkBacking<'_>,
+) {
     use crate::server::record::{CyclePostMask, EventMask};
     // The alarm a `monitor()` run from `special()` committed, once per put.
     let mut reset_alarm = None;
-    for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
+    for (sf, cycle_mask) in marks {
         let mask = match cycle_mask {
             // No `monitor_mask` exists on a put path (no alarm transition is
             // being resolved), so each `Monitor*` variant reduces to its
@@ -426,13 +441,17 @@ fn drain_cycle_posts(
             CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
                 EventMask::VALUE | EventMask::LOG
             }
-            CyclePostMask::ResetValueLog | CyclePostMask::ResetValueLogOnAlarm => {
+            CyclePostMask::ResetValueLog
+            | CyclePostMask::ResetValueLogOnAlarm
+            | CyclePostMask::ResetAlarm => {
                 let alarm =
                     *reset_alarm.get_or_insert_with(|| commit_special_reset_alarm(instance));
-                if cycle_mask == CyclePostMask::ResetValueLogOnAlarm && alarm.is_empty() {
-                    continue;
+                match cycle_mask {
+                    CyclePostMask::ResetValueLog => alarm | EventMask::VALUE | EventMask::LOG,
+                    _ if alarm.is_empty() => continue,
+                    CyclePostMask::ResetAlarm => alarm,
+                    _ => alarm | EventMask::VALUE | EventMask::LOG,
                 }
-                alarm | EventMask::VALUE | EventMask::LOG
             }
         };
         instance.notify_field_backed(sf, mask, backing);

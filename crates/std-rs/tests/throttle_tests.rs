@@ -116,11 +116,11 @@ fn test_process_sends_value_with_delay() {
     // (throttleRecord.c:575): the value is written, nothing is queued, so
     // WAIT is clear through the cooldown even though the timer is armed.
     assert_eq!(rec.wait, 0, "immediate send wrote the value -> WAIT clear");
-    // Should have ReprocessAfter action and WriteDbLink for OUT
+    // Should arm the cooldown and write OUT
     let has_reprocess = actions
         .iter()
-        .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
-    assert!(has_reprocess, "Should have ReprocessAfter action");
+        .any(|a| matches!(a, ProcessAction::ValuePutAfter(_)));
+    assert!(has_reprocess, "Should have ValuePutAfter action");
     let has_write = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
@@ -148,7 +148,7 @@ fn test_process_queues_during_delay() {
     // the first send is still pending and will drain this value.
     let has_reprocess = actions
         .iter()
-        .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
+        .any(|a| matches!(a, ProcessAction::ValuePutAfter(_)));
     assert!(
         !has_reprocess,
         "queuing must not re-arm the cooldown — C `enterValue` requests no callback"
@@ -181,12 +181,14 @@ fn test_process_osent_tracking() {
     rec.val = 10.0;
     process_ok(&mut rec);
     assert_eq!(rec.sent, 10.0);
-    assert_eq!(rec.osent, 0.0); // Previous sent was 0
+    // softIoc `dbpf TO 5; dbgf TO.OSENT` reads 5: `valuePut`'s tail
+    // (throttleRecord.c:606-612) catches OSENT up with SENT.
+    assert_eq!(rec.osent, 10.0);
 
     rec.val = 20.0;
     process_ok(&mut rec);
     assert_eq!(rec.sent, 20.0);
-    assert_eq!(rec.osent, 10.0); // Previous sent was 10
+    assert_eq!(rec.osent, 20.0);
 }
 
 // ============================================================
@@ -559,11 +561,7 @@ fn test_no_forward_link_on_drain_with_nothing_queued() {
     assert!(rec.should_fire_forward_link());
 
     // Fire the cooldown timer with NOTHING queued.
-    rec.set_process_continuation(
-        true,
-        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
-    );
-    rec.process().unwrap();
+    rec.delayed_value_put();
     assert!(
         !rec.should_fire_forward_link(),
         "a drain cycle with nothing queued writes no OUT — no FLNK"
@@ -756,6 +754,7 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
     // self.dly > 0.0 now, so process() builds a Duration and arms the
     // delay timer. Must not panic.
     let outcome = rec.process().unwrap();
+    report_put(&mut rec, &outcome.actions, false);
     // The value was written on this immediate cycle; the timer is armed
     // but nothing is queued, so WAIT is clear (C `valuePut`:575).
     assert_eq!(
@@ -770,9 +769,8 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
 //
 // C keeps two paths: `process()` -> `enterValue` for a client value, and
 // `delayFuncCallback` -> `valuePut` for the cooldown expiring
-// (throttleRecord.c:517-538). The port reaches both through `process()`, so
-// the framework's continuation marker — not a clock reading — is what says
-// which one this is. Boundary matrix: {DLY unchanged, raised, lowered,
+// (throttleRecord.c:517-538); the port's are `process()` and
+// `delayed_value_put`. Boundary matrix: {DLY unchanged, raised, lowered,
 // zeroed} x {value queued, nothing queued}.
 // ============================================================
 
@@ -798,14 +796,11 @@ fn put_dly(rec: &mut ThrottleRecord, dly: f64) -> Vec<ProcessAction> {
     rec.take_special_actions()
 }
 
-/// The cooldown timer firing — C `delayFuncCallback` (:530-538). The
-/// framework marks its own `ReprocessAfter` re-entry; nothing else does.
+/// The cooldown timer firing — C `delayFuncCallback` (:530-538).
 fn fire_timer(rec: &mut ThrottleRecord) -> Vec<ProcessAction> {
-    rec.set_process_continuation(
-        true,
-        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
-    );
-    process_ok(rec)
+    let actions: Vec<_> = rec.delayed_value_put().into_iter().collect();
+    report_put(rec, &actions, false);
+    actions
 }
 
 fn writes(actions: &[ProcessAction]) -> Vec<f64> {
@@ -925,7 +920,7 @@ fn timer_fire_with_value_queued_and_dly_zeroed_sends_it_once() {
 
 /// C `special()` DLY (:400-408) cancels the in-flight callback and re-requests
 /// it with the new delay, but ONLY while one is in flight. The port's
-/// re-anchor rides out as a fresh `ReprocessAfter` whose minted token
+/// re-anchor rides out as a fresh `ValuePutAfter` whose minted token
 /// supersedes the pending one.
 #[test]
 fn dly_put_reanchors_the_running_cooldown() {
@@ -935,7 +930,7 @@ fn dly_put_reanchors_the_running_cooldown() {
         actions
             .iter()
             .filter_map(|a| match a {
-                ProcessAction::ReprocessAfter(d) => Some(d.as_secs_f64()),
+                ProcessAction::ValuePutAfter(d) => Some(d.as_secs_f64()),
                 _ => None,
             })
             .collect::<Vec<_>>(),
@@ -972,6 +967,8 @@ fn report_put(rec: &mut ThrottleRecord, actions: &[ProcessAction], failed: bool)
             rec.set_out_link_write_status(link_field, value, failed);
         }
     }
+    // The framework then posts `valuePut`'s tail, which catches OSENT up.
+    let _ = rec.take_value_put_tail();
 }
 
 /// One full cycle: `process()` plus the framework's report that the OUT put
@@ -1008,13 +1005,13 @@ fn successful_out_put_sets_sts_success_and_advances_sent() {
     report_put(&mut rec, &first.actions, false);
     assert_eq!(rec.sts, 2, "STS=Success (C :565)");
     assert_eq!(rec.sent, 5.0, "SENT takes the value that landed (C :566)");
-    assert_eq!(rec.osent, 0.0);
+    assert_eq!(rec.osent, 5.0, "the tail catches OSENT up (C :606-612)");
 
     rec.val = 7.0;
     let second = rec.process().unwrap();
     report_put(&mut rec, &second.actions, false);
     assert_eq!(rec.sent, 7.0);
-    assert_eq!(rec.osent, 5.0, "OSENT trails SENT by one send");
+    assert_eq!(rec.osent, 7.0, "softIoc reads OSENT 7 after `dbpf TO 7`");
 }
 
 #[test]

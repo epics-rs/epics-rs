@@ -920,6 +920,12 @@ pub enum CyclePostMask {
     /// the `alarm_mask ||` half of compress's NUSE condition (`:105`), marked
     /// when the record's own half did not fire.
     ResetValueLogOnAlarm,
+    /// The record's own `recGblResetAlarms`, committed as for
+    /// [`Self::ResetValueLog`], whose `DBE_ALARM` alone is posted when that
+    /// commit moved the alarm: throttle `valuePut` on a SENT that did not
+    /// move (`throttleRecord.c:607-614`). In a cycle whose alarm is already
+    /// committed it is that commit's `DBE_ALARM`.
+    ResetAlarm,
 }
 
 /// One take's marks: a bit per entry of the record type's static post table,
@@ -1782,6 +1788,14 @@ pub enum ProcessAction {
     /// cannot take the one-shot the timer owns.
     DelayedCallbackAfter(std::time::Duration),
 
+    /// C throttle's `callbackRequestDelayed(&delayFuncCb, ..)`
+    /// (`throttleRecord.c:593`), whose handler runs `valuePut` under
+    /// `dbScanLock` and never calls `dbProcess` (`:530-538`). The fire runs
+    /// [`Record::delayed_value_put`] and the actions it returns, then posts
+    /// the record's marks and fires FLNK if
+    /// [`Record::should_fire_forward_link`]; it is not a process cycle.
+    ValuePutAfter(std::time::Duration),
+
     /// C `scanOnce(precord)` — queue ONE process of this record, now.
     ///
     /// A record's `special()` emits this when a put changed state the record
@@ -1912,7 +1926,7 @@ impl<'a> Pact<'a> {
 /// member), so the cycle settles this once, in the plan, and a type that
 /// claims a bit not set here is never asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CycleHooks(u8);
+pub struct CycleHooks(u16);
 
 impl Default for CycleHooks {
     fn default() -> Self {
@@ -1936,13 +1950,24 @@ impl CycleHooks {
     /// `Ok`: a put-only hook, outside [`Self::ALL`], declared by the type
     /// whose `special()` reports and still accepts the put.
     pub const PUT_REPORT: Self = Self(32);
-    /// [`Record::take_alarm_reset`].
-    pub const ALARM_RESET: Self = Self(64);
+    /// [`Record::take_cycle_posted_fields`] drained in the cycle where the
+    /// marks are made, never by `monitor()`: a C record that posts by hand
+    /// from `process()` (throttle `valuePut`, `throttleRecord.c:540-615`).
+    /// Outside [`Self::ALL`].
+    pub const HAND_POSTED: Self = Self(128);
+    /// [`Self::HAND_POSTED`], and `recGblGetTimeStamp` runs only ahead of the
+    /// record's own `recGblResetAlarms`, posted from
+    /// [`Record::take_value_put_tail`]: throttle stamps in `valuePut` alone
+    /// (`throttleRecord.c:602`), so a rejected or queued cycle keeps the
+    /// previous TIME. The stamp bit has no constant of its own: only the
+    /// tail's owners stamp.
+    pub const HAND_POSTED_OWN_STAMP: Self = Self(Self::HAND_POSTED.0 | Self::OWN_STAMP);
+    const OWN_STAMP: u16 = 256;
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
     /// otherwise pays the call and never loses an action.
-    pub const ALL: Self = Self(31 | 64);
+    pub const ALL: Self = Self(31);
 
     /// Both sets together.
     pub const fn union(self, other: Self) -> Self {
@@ -1954,7 +1979,16 @@ impl CycleHooks {
     pub const fn has(self, hook: Self) -> bool {
         self.0 & hook.0 != 0
     }
+
+    /// Whether these are [`Self::HAND_POSTED_OWN_STAMP`].
+    #[inline(always)]
+    pub const fn stamps_at_own_reset(self) -> bool {
+        self.0 & Self::OWN_STAMP != 0
+    }
 }
+
+// The stamp bit never stands without the drain that stamps.
+const _: () = assert!(CycleHooks::HAND_POSTED_OWN_STAMP.has(CycleHooks::HAND_POSTED));
 
 impl<T> CycleList<T> {
     /// An empty list.
@@ -3966,17 +4000,6 @@ pub trait Record: Send + Sync + 'static {
         CycleMarks::NONE
     }
 
-    /// The record ran its own `recGblResetAlarms` this cycle (throttle
-    /// `valuePut`, `throttleRecord.c:603`), so the closing one (`:300`)
-    /// returns 0: the deadband field's post carries no `DBE_ALARM`, while the
-    /// fields the record marked still do. TAKE semantics; asked only of a type
-    /// with [`CycleHooks::ALARM_RESET`].
-    ///
-    /// Default: `false`.
-    fn take_alarm_reset(&mut self) -> bool {
-        false
-    }
-
     /// Fields whose ONLY post path is the record's own per-cycle mark — C never
     /// change-detects them, so a value change alone must post nothing.
     ///
@@ -4933,6 +4956,22 @@ pub trait Record: Send + Sync + 'static {
     /// [`ProcessAction::ReprocessAfter`].
     fn delayed_callback_fire(&mut self, _pact: bool) -> DelayedCallbackOutcome {
         DelayedCallbackOutcome::Reprocess
+    }
+
+    /// The [`ProcessAction::ValuePutAfter`] handler, run under the record
+    /// gate: C throttle's `valuePut` (`throttleRecord.c:540-613`). Its posts
+    /// go out as [`Self::take_cycle_posted_fields`] marks.
+    fn delayed_value_put(&mut self) -> ProcessActions {
+        ProcessActions::new()
+    }
+
+    /// C `valuePut`'s tail (`throttleRecord.c:602-612`): what
+    /// `recGblResetAlarms` and the SENT post mark, taken by the owner only
+    /// after `recGblFwdLink` and stamped just ahead of the reset. Never part
+    /// of [`Self::take_cycle_posted_fields`], which a link read inside
+    /// `valuePut` drains. Empty unless a `valuePut` ran since the last take.
+    fn take_value_put_tail(&mut self) -> CycleMarks {
+        CycleMarks::NONE
     }
 
     /// Whether this record type's support reads SIML through the `recGbl`
@@ -7369,14 +7408,15 @@ mod tests {
                     "{record_type}"
                 );
             }
-            if !hooks.has(CycleHooks::CYCLE_POSTED.union(CycleHooks::WRITE_POSTED)) {
+            if !hooks.has(
+                CycleHooks::CYCLE_POSTED
+                    .union(CycleHooks::WRITE_POSTED)
+                    .union(CycleHooks::HAND_POSTED),
+            ) {
                 assert!(r.take_cycle_posted_fields().is_empty(), "{record_type}");
             }
             if !hooks.has(CycleHooks::PROCESS_POSTED) {
                 assert!(r.take_process_posted_fields().is_empty(), "{record_type}");
-            }
-            if !hooks.has(CycleHooks::ALARM_RESET) {
-                assert!(!r.take_alarm_reset(), "{record_type}");
             }
         }
     }

@@ -13,7 +13,7 @@ use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
 
 // ============================================================
-// Throttle: ReprocessAfter integration test
+// Throttle: ValuePutAfter integration test
 // ============================================================
 
 #[tokio::test]
@@ -97,7 +97,7 @@ record(throttle, "TEST:THR") {
         "Second value should NOT be sent yet"
     );
 
-    // Wait for DLY to expire — framework's ReprocessAfter will drain the pending value
+    // Wait for DLY to expire — framework's ValuePutAfter will drain the pending value
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
@@ -1380,4 +1380,137 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
         .await
         .unwrap();
     assert!(matches!(rec.read().dpvt, Dpvt::Null));
+}
+
+// ============================================================
+// Throttle: the cooldown's forward link runs ahead of valuePut's reset.
+//
+// softIoc, `throttle(TC){SINP SS, OUT DST2, DLY 1, FLNK K}`,
+// `calc(K){CALC "C+1", INPC K, INPA "TC.SEVR NPP"}`, `dbpf TC 1; dbpf TC 2;
+// dbpf TC.SYNC 1`: K 2, K.A 0 and TC.SEVR INVALID after the first cooldown,
+// K 2 after the second. K.A 0 is `recGblFwdLink` (throttleRecord.c:578)
+// ahead of the reset that commits the deferred sync's failed SINP read;
+// K 2 after the empty second fire is FLNK on the write arm alone.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_cooldown_flnk_runs_ahead_of_the_reset() {
+    let db_str = r#"
+record(ao, "DST2") {}
+record(stringin, "SS") { field(VAL, "abc") }
+record(throttle, "TC") { field(SINP, "SS") field(OUT, "DST2") field(DLY, "1") field(FLNK, "K") }
+record(calc, "K") { field(CALC, "C+1") field(INPC, "K") field(INPA, "TC.SEVR NPP") }
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .register_record_type("stringin", || {
+            Box::new(epics_base_rs::server::records::stringin::StringinRecord::default())
+        })
+        .register_record_type("calc", || {
+            Box::new(epics_base_rs::server::records::calc::CalcRecord::new("C+1"))
+        })
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let put = |field: &'static str, v: i16| {
+        let db = db.clone();
+        async move {
+            db.put_record_field_from_ca("TC", field, EpicsValue::Short(v))
+                .await
+                .unwrap()
+        }
+    };
+    let get = |pv: &'static str| {
+        let server = &server;
+        async move { server.get(pv).await.unwrap() }
+    };
+    put("VAL", 1).await;
+    assert_eq!(get("K").await, EpicsValue::Double(1.0));
+    put("VAL", 2).await;
+    put("SYNC", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert_eq!(get("K").await, EpicsValue::Double(2.0));
+    assert_eq!(get("K.A").await, EpicsValue::Double(0.0));
+    assert_eq!(get("TC.SEVR").await, EpicsValue::Short(3));
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    assert_eq!(get("K").await, EpicsValue::Double(2.0));
+}
+
+// ============================================================
+// Throttle: valuePut's checkAlarms is C's `udf == TRUE` test
+// (throttleRecord.c:479), and process() clears UDF (:239).
+//
+// softIoc, `throttle(TU|TV){OUT DST, DLY 1}`, `ao(W){OUT "TU.UDF NPP"}`,
+// `ao(W2){OUT "TV.UDF NPP"}`, `dbpf TU 1; dbpf TU 2; dbpf W 1; dbpf TV 1;
+// dbpf W2 2`: after the first cooldown TU reads INVALID/UDF, TV (UDF 2)
+// NO_ALARM; after the second TU still INVALID/UDF. `throttle(TX){OUT DST}`,
+// `ao(W3){OUT "TX.UDF NPP"}`, `ao(P){FLNK TX}`, `dbpf TX 1; dbpf W3 1;
+// dbpf P 1`: TX reads UDF 0 and NO_ALARM.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_udf_alarm_follows_check_alarms() {
+    let db_str = r#"
+record(ao, "DST") {}
+record(throttle, "TU") { field(OUT, "DST") field(DLY, "1") }
+record(throttle, "TV") { field(OUT, "DST") field(DLY, "1") }
+record(ao, "W") { field(OUT, "TU.UDF NPP") }
+record(ao, "W2") { field(OUT, "TV.UDF NPP") }
+record(throttle, "TX") { field(OUT, "DST") }
+record(ao, "W3") { field(OUT, "TX.UDF NPP") }
+record(ao, "P") { field(FLNK, "TX") }
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let put = |rec: &'static str, v: f64| {
+        let db = db.clone();
+        async move {
+            db.put_record_field_from_ca(rec, "VAL", EpicsValue::Double(v))
+                .await
+                .unwrap()
+        }
+    };
+    let alarm = |rec: &'static str| {
+        let server = &server;
+        async move {
+            let sevr = server.get(&format!("{rec}.SEVR")).await.unwrap();
+            let stat = server.get(&format!("{rec}.STAT")).await.unwrap();
+            (stat, sevr)
+        }
+    };
+    let udf_invalid = (EpicsValue::Short(17), EpicsValue::Short(3));
+    let no_alarm = (EpicsValue::Short(0), EpicsValue::Short(0));
+    put("TU", 1.0).await;
+    put("TU", 2.0).await;
+    put("W", 1.0).await;
+    put("TV", 1.0).await;
+    put("W2", 2.0).await;
+    put("TX", 1.0).await;
+    put("W3", 1.0).await;
+    put("P", 1.0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.get("TX.UDF").await.unwrap(), EpicsValue::UChar(0));
+    assert_eq!(alarm("TX").await, no_alarm);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(alarm("TU").await, udf_invalid);
+    assert_eq!(alarm("TV").await, no_alarm);
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    assert_eq!(alarm("TU").await, udf_invalid);
 }

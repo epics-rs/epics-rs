@@ -2577,7 +2577,8 @@ impl Record for AcalcoutRecord {
                 CyclePostMask::MonitorValue
                 | CyclePostMask::MonitorLog
                 | CyclePostMask::ResetValueLog
-                | CyclePostMask::ResetValueLogOnAlarm => {
+                | CyclePostMask::ResetValueLogOnAlarm
+                | CyclePostMask::ResetAlarm => {
                     unreachable!("NUSE and AMEM post no one-sided or reset mask")
                 }
             }

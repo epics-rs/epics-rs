@@ -2743,12 +2743,14 @@ impl PvDatabase {
 
     /// [`Record::take_value_put_tail`](crate::server::record::Record::take_value_put_tail)
     /// for its two owners, [`Self::value_put_in`] and the cycle's hand drain:
-    /// `recGblGetTimeStamp` (`:602`), then the reset and the SENT post.
+    /// the STS post (`:592`), `recGblGetTimeStamp` (`:602`), then the reset
+    /// and the SENT post.
     fn post_value_put_tail(&self, rec: InFrame<'_>) {
-        let tail = rec.write().record.take_value_put_tail();
-        if !tail.is_empty() {
+        let (head, reset) = rec.write().record.take_value_put_tail().split_at_reset();
+        super::field_io::post_cycle_marks(&mut rec.write(), head, super::LinkBacking::none());
+        if !reset.is_empty() {
             self.rec_gbl_get_time_stamp_in(rec);
-            super::field_io::post_cycle_marks(&mut rec.write(), tail, super::LinkBacking::none());
+            super::field_io::post_cycle_marks(&mut rec.write(), reset, super::LinkBacking::none());
         }
     }
 

@@ -955,6 +955,31 @@ impl CycleMarks {
     pub fn is_empty(self) -> bool {
         self.bits == 0
     }
+
+    /// The marks ahead of the first marked `Reset*` entry, and the rest.
+    pub fn split_at_reset(self) -> (Self, Self) {
+        let mut bits = self.bits;
+        while bits != 0 {
+            let i = bits.trailing_zeros();
+            if matches!(
+                self.table[i as usize].1,
+                CyclePostMask::ResetValueLog
+                    | CyclePostMask::ResetValueLogOnAlarm
+                    | CyclePostMask::ResetAlarm
+            ) {
+                let head = self.bits & ((1 << i) - 1);
+                return (
+                    Self { bits: head, ..self },
+                    Self {
+                        bits: self.bits & !head,
+                        ..self
+                    },
+                );
+            }
+            bits &= bits - 1;
+        }
+        (self, Self::NONE)
+    }
 }
 
 impl Iterator for CycleMarks {
@@ -4965,9 +4990,10 @@ pub trait Record: Send + Sync + 'static {
         ProcessActions::new()
     }
 
-    /// C `valuePut`'s tail (`throttleRecord.c:602-612`): what
-    /// `recGblResetAlarms` and the SENT post mark, taken by the owner only
-    /// after `recGblFwdLink` and stamped just ahead of the reset. Never part
+    /// C `valuePut`'s tail (`throttleRecord.c:592-612`): the STS post, then
+    /// what `recGblResetAlarms` and the SENT post mark, taken by the owner
+    /// only after `recGblFwdLink` and stamped just ahead of the first `Reset*`
+    /// entry. Never part
     /// of [`Self::take_cycle_posted_fields`], which a link read inside
     /// `valuePut` drains. Empty unless a `valuePut` ran since the last take.
     fn take_value_put_tail(&mut self) -> CycleMarks {

@@ -18,26 +18,26 @@ const THROTTLE_STS_SUC: i16 = 2; // throttleSTS_SUC
 const THROTTLE_SYNC_IDLE: i16 = 0; // throttleSYNC_IDLE
 const THROTTLE_SYNC_PROCESS: i16 = 1; // throttleSYNC_PROC
 
-/// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the tail, in C
-/// order (`throttleRecord.c:568-589`, `:637-652`).
-static POSTS: [(&str, CyclePostMask); 6] = [
+/// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the forward link,
+/// in C order (`throttleRecord.c:568-584`, `:637-652`).
+static POSTS: [(&str, CyclePostMask); 5] = [
     ("SENT", CyclePostMask::Value),
     ("VAL", CyclePostMask::Value),
     ("STS", CyclePostMask::Value),
     ("SYNC", CyclePostMask::Value),
     ("WAIT", CyclePostMask::Value),
-    ("STS", CyclePostMask::Value),
 ];
 const POST_SENT: u64 = 1;
 const POST_SYNC_VAL: u64 = 1 << 1;
 const POST_SYNC_STS: u64 = 1 << 2;
 const POST_SYNC: u64 = 1 << 3;
 const POST_WAIT: u64 = 1 << 4;
-const POST_STS: u64 = 1 << 5;
 
-/// `valuePut`'s tail post (`throttleRecord.c:606-612`): SENT with VALUE|LOG
-/// when it moved, the reset's alarm bits alone otherwise.
-static TAIL: [(&str, CyclePostMask); 2] = [
+/// `valuePut`'s posts after the forward link: STS (`throttleRecord.c:592`),
+/// then SENT with VALUE|LOG when it moved, the reset's alarm bits alone
+/// otherwise (:606-612).
+static TAIL: [(&str, CyclePostMask); 3] = [
+    ("STS", CyclePostMask::Value),
     ("SENT", CyclePostMask::ResetValueLog),
     ("SENT", CyclePostMask::ResetAlarm),
 ];
@@ -121,6 +121,8 @@ pub struct ThrottleRecord {
     process_posts: u64,
     /// A `valuePut` ran whose tail is not yet taken.
     tail_due: bool,
+    /// `valuePut` ran a wait arm: STS posts after the forward link (:592).
+    tail_sts: bool,
     /// The last `process()` found VAL off OVAL (C :298).
     val_moved: bool,
     /// A SYNC request has been made but not yet carried out — C
@@ -195,6 +197,7 @@ impl Default for ThrottleRecord {
             process_posts: 0,
             val_moved: false,
             tail_due: false,
+            tail_sts: false,
             sync_flag: false,
             special_actions: Vec::new(),
             out_written: false,
@@ -408,7 +411,8 @@ impl ThrottleRecord {
     /// C :575-589 — WAIT clears and STS posts on both OUT arms.
     fn value_put_done(&mut self) {
         self.wait = 0;
-        self.posts |= POST_WAIT | POST_STS;
+        self.posts |= POST_WAIT;
+        self.tail_sts = true;
         self.value_put_tail();
     }
 
@@ -801,7 +805,8 @@ impl Record for ThrottleRecord {
         }
         let moved = self.osent != self.sent;
         self.osent = self.sent;
-        CycleMarks::of(&TAIL, if moved { 1 } else { 1 << 1 })
+        let sts = std::mem::take(&mut self.tail_sts) as u64;
+        CycleMarks::of(&TAIL, sts | if moved { 1 << 1 } else { 1 << 2 })
     }
 
     fn take_process_posted_fields(&mut self) -> CycleMarks {

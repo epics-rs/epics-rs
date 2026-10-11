@@ -1445,6 +1445,58 @@ record(calc, "K") { field(CALC, "C+1") field(INPC, "K") field(INPA, "TC.SEVR NPP
 }
 
 // ============================================================
+// Throttle: valuePut posts STS after its forward link.
+//
+// softIoc, `throttle(TC){OUT DST, FLNK K}`, `ao(K){VAL 1, OUT "TC.SYNC NPP"}`,
+// `caput TC 5` under `camonitor -m v TC.STS`: Error, Error. K's SYNC put runs
+// valueSync (constant SINP: Error, posted) inside `recGblFwdLink`
+// (throttleRecord.c:578), then valuePut posts STS (:592). An STS post ahead
+// of the forward link would read Success first.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_posts_sts_after_the_forward_link() {
+    let db_str = r#"
+record(ao, "DST") {}
+record(throttle, "TC") { field(OUT, "DST") field(FLNK, "K") }
+record(ao, "K") { field(VAL, "1") field(OUT, "TC.SYNC NPP") }
+"#;
+    let (name, factory) = (
+        "throttle",
+        || -> Box<dyn epics_base_rs::server::record::Record> {
+            Box::new(std_rs::ThrottleRecord::default())
+        },
+    );
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut rx = {
+        let inst = db.get_record("TC").unwrap();
+        let mut g = inst.write();
+        g.add_subscriber(
+            "STS",
+            1,
+            epics_base_rs::types::DbFieldType::Short,
+            epics_base_rs::server::recgbl::EventMask::VALUE.bits(),
+        )
+        .unwrap()
+    };
+    while rx.try_recv().is_ok() {}
+    db.put_record_field_from_ca("TC", "VAL", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    let mut sts = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        sts.push(e.snapshot.value.to_f64().unwrap());
+    }
+    assert_eq!(sts, [1.0, 1.0]);
+}
+
+// ============================================================
 // Throttle: valuePut's checkAlarms is C's `udf == TRUE` test
 // (throttleRecord.c:479), and process() clears UDF (:239).
 //

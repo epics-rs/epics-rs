@@ -36,23 +36,22 @@ use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 const STS_ERR: i16 = 1;
 const STS_SUC: i16 = 2;
 
-/// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the tail, in C
-/// order.
-static POSTS: [(&str, CyclePostMask); 5] = [
+/// `valuePut`'s and `valueSync`'s `db_post_events` ahead of the forward link,
+/// in C order.
+static POSTS: [(&str, CyclePostMask); 4] = [
     ("SENT", CyclePostMask::Value),
     ("VAL", CyclePostMask::Value),
     ("STS", CyclePostMask::Value),
     ("WAIT", CyclePostMask::Value),
-    ("STS", CyclePostMask::Value),
 ];
 const POST_SENT: u64 = 1;
 const POST_SYNC_VAL: u64 = 1 << 1;
 const POST_SYNC_STS: u64 = 1 << 2;
 const POST_WAIT: u64 = 1 << 3;
-const POST_STS: u64 = 1 << 4;
 
-/// `valuePut`'s tail post (`throttleRecord.c:606-612`).
-static TAIL: [(&str, CyclePostMask); 2] = [
+/// `valuePut`'s posts after the forward link (`throttleRecord.c:592-612`).
+static TAIL: [(&str, CyclePostMask); 3] = [
+    ("STS", CyclePostMask::Value),
     ("SENT", CyclePostMask::ResetValueLog),
     ("SENT", CyclePostMask::ResetAlarm),
 ];
@@ -80,6 +79,8 @@ struct Throttle {
     process_tail: bool,
     /// A `valuePut` ran whose tail is not yet taken.
     tail_due: bool,
+    /// `valuePut` ran a wait arm: STS posts after the forward link (:592).
+    tail_sts: bool,
     /// `valuePut` took its non-CONSTANT arm, the one `recGblFwdLink` is on.
     forward: bool,
     posts: u64,
@@ -134,7 +135,8 @@ impl Throttle {
 
     fn value_put_done(&mut self) {
         self.wait = 0;
-        self.posts |= POST_WAIT | POST_STS;
+        self.posts |= POST_WAIT;
+        self.tail_sts = true;
         self.value_put_tail();
     }
 
@@ -229,7 +231,8 @@ impl Record for Throttle {
         }
         let moved = self.osent != self.sent;
         self.osent = self.sent;
-        CycleMarks::of(&TAIL, if moved { 1 } else { 1 << 1 })
+        let sts = std::mem::take(&mut self.tail_sts) as u64;
+        CycleMarks::of(&TAIL, sts | if moved { 1 << 1 } else { 1 << 2 })
     }
     fn take_process_posted_fields(&mut self) -> CycleMarks {
         CycleMarks::of(&PROCESS_POSTS, std::mem::take(&mut self.process_posts))

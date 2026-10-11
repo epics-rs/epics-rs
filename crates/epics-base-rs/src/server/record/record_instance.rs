@@ -3732,13 +3732,21 @@ pub(crate) fn menu_choices_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
 ) -> Option<&'static [&'static str]> {
-    // `DTYP` is `DBF_DEVICE`: its choices are the record type's DEVICE menu
+    menu_choices_with(record, field, field_desc_of(record, field))
+}
+
+/// [`menu_choices_of`] for a caller that already looked up `desc`.
+pub(crate) fn menu_choices_with<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    desc: Option<&'static FieldDesc>,
+) -> Option<&'static [&'static str]> {
+    // A `DBF_DEVICE` field's choices are the record type's DEVICE menu
     // (C `dbDeviceMenu`, built from the `device()` declarations), which is
     // per-record-type and so cannot live in the shared `dbCommon` FieldDesc.
-    if field.eq_ignore_ascii_case("DTYP") {
+    if is_device(desc) {
         return super::dbd_generated::device_menu(record.record_type());
     }
-    let desc = field_desc_of(record, field);
     desc.and_then(|f| f.menu)
         .or_else(|| record.menu_field_choices(field))
         .or_else(|| {
@@ -3750,6 +3758,11 @@ pub(crate) fn menu_choices_of<R: Record + ?Sized>(
                 super::menu_choices::shared_menu_choices(field)
             }
         })
+}
+
+/// `desc` is declared `DBF_DEVICE` (dbCommon's `DTYP`).
+pub(crate) fn is_device(desc: Option<&FieldDesc>) -> bool {
+    desc.is_some_and(|f| f.declared_dbf == crate::types::DbfCode::Device)
 }
 
 /// The `DBF_*` type `field` is SERVED as, for a caller that holds only a
@@ -6054,13 +6067,14 @@ impl RecordInstance {
     /// [`EnumOverflow`](crate::server::snapshot::EnumOverflow)); the index is
     /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
-        if field.eq_ignore_ascii_case("DTYP") {
+        let desc = field_desc_of(self.record.as_ref(), field);
+        if is_device(desc) {
             // `None` propagates C's `goto nostrs` (`dbAccess.c:178`): a record
             // type with no `device()` declaration supplies no choice list, so
             // the leaf is omitted rather than marked empty.
             return self.device_choices().map(EnumStringForm::device);
         }
-        if let Some(choices) = self.menu_choices_for(field) {
+        if let Some(choices) = menu_choices_with(self.record.as_ref(), field, desc) {
             return Some(EnumStringForm::menu(
                 choices.iter().map(|c| PvString::from(*c)),
             ));
@@ -6181,9 +6195,16 @@ impl RecordInstance {
     /// state's is cloned from where it lives, without building the form under
     /// the read's hold.
     fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
-        if !field.eq_ignore_ascii_case("DTYP")
-            && let Some(choices) = self.menu_choices_for(field)
-        {
+        let desc = field_desc_of(self.record.as_ref(), field);
+        if is_device(desc) {
+            // `cvt_device_st`: a type with no device menu reads ""
+            // (`dbFastLinkConv.c:1615-1618`).
+            return Some(
+                self.device_choices()
+                    .map_or_else(PvString::default, |c| EnumStringForm::device(c).render(idx)),
+            );
+        }
+        if let Some(choices) = menu_choices_with(self.record.as_ref(), field, desc) {
             return Some(match choices.get(idx as usize) {
                 Some(choice) => PvString::from(*choice),
                 None => PvString::from(idx.to_string().as_str()),
@@ -6474,7 +6495,7 @@ impl RecordInstance {
         // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
         // string re-synthesized from the condition code. Empty for records
         // that raise no message (C's plain `recGblSetSevr` clears namsg).
-        snap.alarm.amsg = self.common.amsg.as_str().to_owned();
+        snap.alarm.amsg = String::from(&self.common.amsg);
 
         // Pull display/control/enums from the metadata cache (build on
         // first call, hit thereafter until invalidated by a metadata-class
@@ -6868,8 +6889,8 @@ impl RecordInstance {
             "NSEV" => Some(EpicsValue::Short(self.common.nsev as i16)),
             "NSTA" => Some(EpicsValue::Short(self.common.nsta as i16)),
             // epics-base PR #568 / #566 — alarm message string.
-            "AMSG" => Some(EpicsValue::String(self.common.amsg.as_str().into())),
-            "NAMSG" => Some(EpicsValue::String(self.common.namsg.as_str().into())),
+            "AMSG" => Some(EpicsValue::String(String::from(&self.common.amsg).into())),
+            "NAMSG" => Some(EpicsValue::String(String::from(&self.common.namsg).into())),
             "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
             // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
             // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu

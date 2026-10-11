@@ -206,12 +206,15 @@ enum Choice {
 
 /// The report a [`Choice::String`] refusal still owes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owed {
+pub(crate) enum Owed {
     Nothing,
+    /// `cvt_st_e` / `putStringEnum`'s
     /// `recGblRecordError(S_db_badChoice, precord, from)`.
-    Record,
-    /// `recGblDbaddrError(S_db_badChoice, paddr, converter)`.
-    Dbaddr(&'static str),
+    RecordError,
+    /// `cvt_st_menu`'s `recGblDbaddrError` (`dbFastLinkConv.c:314`).
+    CvtStMenu,
+    /// `cvt_st_device`'s `recGblDbaddrError` (`dbFastLinkConv.c:347`).
+    CvtStDevice,
 }
 
 use crate::server::recgbl::ReportString;
@@ -225,25 +228,19 @@ impl ChoiceRefusal {
             field: ReportString::new(field),
             from: ReportString::new(from),
             count: count as u16,
-            owed: Owed::Record,
+            owed: Owed::RecordError,
         })
     }
 
     /// `from` names no menu choice of `field` and is no index below `count`.
-    /// `converter` is the C converter whose `recGblDbaddrError` the refusal
-    /// owes (`cvt_st_menu` / `cvt_st_device`, `dbFastLinkConv.c:314`, `:347`);
-    /// the loader's `dbPutStringNum` prints none.
-    pub(crate) fn menu(
-        field: &str,
-        from: &str,
-        count: usize,
-        converter: Option<&'static str>,
-    ) -> Self {
+    /// `owed` is its converter's line; the loader's `dbPutStringNum` prints
+    /// none.
+    pub(crate) fn menu(field: &str, from: &str, count: usize, owed: Owed) -> Self {
         Self(Choice::String {
             field: ReportString::new(field),
             from: ReportString::new(from),
             count: count as u16,
-            owed: converter.map_or(Owed::Nothing, Owed::Dbaddr),
+            owed,
         })
     }
 
@@ -263,10 +260,14 @@ impl ChoiceRefusal {
             Choice::String { from, owed, .. } => {
                 let report = match *owed {
                     Owed::Nothing => None,
-                    Owed::Record => Some(PutReport::IllegalChoice { from: *from }),
-                    Owed::Dbaddr(converter) => Some(PutReport::DbaddrError {
+                    Owed::RecordError => Some(PutReport::IllegalChoice { from: *from }),
+                    Owed::CvtStMenu => Some(PutReport::DbaddrError {
                         status: "Illegal choice",
-                        message: converter,
+                        message: "dbFastLinkConv(cvt_st_menu)",
+                    }),
+                    Owed::CvtStDevice => Some(PutReport::DbaddrError {
+                        status: "Illegal choice",
+                        message: "dbFastLinkConv(cvt_st_device)",
                     }),
                 };
                 *owed = Owed::Nothing;

@@ -564,10 +564,10 @@ impl CpRegistry {
 #[derive(Clone)]
 struct ScanKey {
     phas: i16,
-    /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
-    /// vendored `.dbd` declares sorts after every one that is declared; C
-    /// places it by name among them.
-    record_type: u32,
+    /// The type's name: C's `recordTypeList` is name-sorted (`dbdExpand.pl`
+    /// writes the expanded `.dbd` sorted, `DBD/Output.pm:61`), so a type
+    /// registered at runtime sorts among the declared ones as there.
+    record_type: &'static str,
     load_order: u64,
     /// An `Arc` and not a `String` because the cursor hands this name out once
     /// per record per scan cycle, and a `String` there made every sweep
@@ -580,7 +580,7 @@ struct ScanKey {
 }
 
 impl ScanKey {
-    fn sort_fields(&self) -> (i16, u32, u64, &str) {
+    fn sort_fields(&self) -> (i16, &'static str, u64, &str) {
         (self.phas, self.record_type, self.load_order, &self.name)
     }
 }
@@ -622,18 +622,14 @@ impl Ord for ScanKey {
 impl ScanKey {
     fn new(
         phas: i16,
-        record_type: &str,
+        record_type: &'static str,
         load_order: u64,
         name: &str,
         handle: Option<Arc<RecordCell>>,
     ) -> Self {
-        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
         Self {
             phas,
-            record_type: RECORD_TYPE_ORDER
-                .iter()
-                .position(|t| *t == record_type)
-                .unwrap_or(RECORD_TYPE_ORDER.len()) as u32,
+            record_type,
             load_order,
             name: Arc::from(name),
             handle,

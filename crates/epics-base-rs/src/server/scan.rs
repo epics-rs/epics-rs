@@ -2335,7 +2335,7 @@ mod tests {
 
         impl Record for CountRecord {
             fn record_type(&self) -> &'static str {
-                "scan_live_count"
+                "scan_live_late"
             }
             fn process(&mut self) -> CaResult<ProcessOutcome> {
                 self.runs.fetch_add(1, Ordering::AcqRel);
@@ -2373,8 +2373,9 @@ mod tests {
             let release = Arc::new(AtomicBool::new(false));
             let runs = Arc::new(AtomicI32::new(0));
 
-            // `a_gate` sorts ahead of `z_late` at the same PHAS, so the walk
-            // reaches the gate first and the late record is still ahead of it.
+            // `scan_live_gate` sorts ahead of `scan_live_late` at the same
+            // PHAS, so the walk reaches the gate first and the late record is
+            // still ahead of it.
             db.add_record(
                 "a_gate",
                 Box::new(GateRecord {

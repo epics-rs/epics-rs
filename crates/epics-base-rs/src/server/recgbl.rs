@@ -1,4 +1,4 @@
-use crate::server::record::{AlarmSeverity, CommonFields};
+use crate::server::record::{AlarmSeverity, CommonFields, SparseText};
 use crate::types::{DbFieldType, DbfCode};
 
 pub mod simm;
@@ -246,12 +246,12 @@ pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
-    msg: impl AsRef<str>,
+    msg: impl Into<SparseText>,
 ) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
-        common.namsg.set(msg.as_ref());
+        common.namsg = msg.into();
         return true;
     }
     false
@@ -285,13 +285,22 @@ pub fn rec_gbl_set_sevr_msg(
 /// NOT used for `dbTryGetLink`, which does not call `setLinkAlarm`:
 /// `recGblGetSimm`'s SIML read (recGbl.c:453-454) instead writes
 /// `nsta = LINK_ALARM` directly, leaving SEVR untouched.
-pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
+#[cold]
+pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &'static str) {
     rec_gbl_set_sevr_msg(
         common,
         alarm_status::LINK_ALARM,
         AlarmSeverity::Invalid,
-        format!("field {field}"),
+        SparseText::link_field(field),
     );
+}
+
+/// C `strcpy(amsg, namsg); namsg[0] = '\0';` — rare, and kept out of the
+/// inlined reset so the old text's drop does not cost the cycle registers.
+#[cold]
+#[inline(never)]
+fn transfer_amsg(common: &mut CommonFields) {
+    common.amsg = std::mem::take(&mut common.namsg);
 }
 
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
@@ -336,7 +345,7 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     // on every failing read).
     let amsg_changed = common.namsg != common.amsg;
     if amsg_changed {
-        common.amsg = std::mem::take(&mut common.namsg);
+        transfer_amsg(common);
     }
 
     // Transfer new alarm state
@@ -901,6 +910,13 @@ pub enum PutReport {
     /// `putStringEnum`'s `recGblRecordError(S_db_badChoice, precord, pfrom)`
     /// (`dbConvert.c:1189`): the put's own string is the message.
     IllegalChoice { from: ReportString },
+    /// `recGblRecSupError(S_db_noRSET, paddr, message, support)`
+    /// (`recGbl.c:93-116`): the record type has no `support` rset entry.
+    RecSupError {
+        message: &'static str,
+        record_type: &'static str,
+        support: &'static str,
+    },
 }
 
 /// The line a [`PutReport::RecordError`] is followed by.
@@ -992,7 +1008,9 @@ impl std::fmt::Debug for ReportText {
 
 impl PutReport {
     /// Print the report for `record_name`.`field_name`, on C's streams. Only
-    /// the put's owner calls this, with the hold down.
+    /// the put's owner calls this: a client put once its gate is down, a
+    /// link put inside the cycle under the hold, as C reports under
+    /// `dbScanLock`.
     pub(crate) fn emit(&self, record_name: &str, field_name: &str) {
         match *self {
             PutReport::RecordError {
@@ -1022,6 +1040,16 @@ impl PutReport {
             }
             PutReport::IllegalChoice { from } => {
                 rec_gbl_record_error("Illegal choice", record_name, from.as_str());
+            }
+            PutReport::RecSupError {
+                message,
+                record_type,
+                support,
+            } => {
+                crate::runtime::log::errlog_printf(&format!(
+                    "recGblRecSupError: {message} missing record support entry table \
+                     {record_type}::{support} PV: {record_name}.{field_name}\n"
+                ));
             }
         }
     }

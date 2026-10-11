@@ -156,7 +156,7 @@ impl PvDatabase {
         &self,
         scan: ScanType,
         phas: i16,
-        record_type: &str,
+        record_type: &'static str,
         load_order: u64,
         name: &str,
     ) {
@@ -409,7 +409,7 @@ impl PvDatabase {
         // Out of the map before any record lock: `update_scan_index` takes a
         // record's lock and then the map.
         let cells: Vec<Arc<RecordCell>> = self.inner.records.read().values().cloned().collect();
-        let mut records: Vec<(u32, u64, Arc<RecordCell>)> = cells
+        let mut records: Vec<(&'static str, u64, Arc<RecordCell>)> = cells
             .into_iter()
             .map(|rec| {
                 let key = super::ScanKey::new(

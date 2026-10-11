@@ -84,6 +84,15 @@ impl ProcStack {
 }
 
 use std::mem::ManuallyDrop;
+
+/// One of C `dbProcess`'s TPRO lines, `"%s: ..."` on stdout. C's context is
+/// the server client's name or else the thread's (`dbAccess.c:527-534`); the
+/// port has no client to hand here, so it is the thread's.
+#[cold]
+fn trace_dbprocess(line: std::fmt::Arguments<'_>) {
+    let thread = std::thread::current();
+    println!("{}: {line}", thread.name().unwrap_or("?"));
+}
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -542,7 +551,7 @@ impl AsyncDbHandle {
     pub async fn put_link_notify(
         &self,
         record_name: &str,
-        link_field: &str,
+        link_field: &'static str,
         link_str: &str,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
@@ -2948,7 +2957,6 @@ impl PvDatabase {
     /// in the same cycle as an alarm transition omits a `DBE_ALARM` C sets.
     pub(crate) fn publish_post_write_fields(
         &self,
-        name: &str,
         rec: InFrame<'_>,
         fields: crate::server::record::CycleList<(String, EpicsValue)>,
     ) {
@@ -2957,8 +2965,9 @@ impl PvDatabase {
         }
         let mut inst = rec.write();
         for (field, value) in fields {
-            if let Err(e) = inst.put_internal_field(&field, value) {
-                eprintln!("{name}.{field}: post-write publication failed: {e:?}");
+            // C's `db_post_events` result is never read nor printed
+            // (`scalerRecord.c:316`).
+            if inst.put_internal_field(&field, value).is_err() {
                 continue;
             }
             // Snapshot-cache contract, as `post_fields_with_mask`: invalidate
@@ -3207,7 +3216,7 @@ impl PvDatabase {
     pub async fn put_link_notify(
         &self,
         record_name: &str,
-        link_field: &str,
+        link_field: &'static str,
         link_str: &str,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
@@ -3454,18 +3463,12 @@ impl PvDatabase {
     fn count_refused_active_entry(&self, rec: InFrame<'_>) {
         let mut instance = rec.write();
 
-        // C `dbAccess.c:539-541` — when TPRO is set on a record whose PACT is
-        // true, print the diagnostic line before the bail decision. The C path
-        // emits "%s: dbProcess of Active '%s' with RPRO=%d", mirroring the
-        // context format the regular trace path uses (thread/client name +
-        // record name + current RPRO bit). Without this, an operator debugging
-        // a stuck async record sees NO sign that the entry guard is firing —
-        // they only notice the eventual SCAN_ALARM after MAX_LOCK=10 attempts.
+        // C `dbAccess.c:539-541`, printed before the bail decision.
         if instance.common.tpro != 0 {
-            eprintln!(
-                "[TPRO] {}: dbProcess of Active '{}' with RPRO={}",
-                instance.name, instance.name, instance.common.rpro,
-            );
+            trace_dbprocess(format_args!(
+                "dbProcess of Active '{}' with RPRO={}",
+                instance.name, instance.common.rpro,
+            ));
         }
 
         let snapshot = instance.max_lock_refusal();
@@ -4898,6 +4901,10 @@ impl PvDatabase {
             if disa == disv {
                 let notify = {
                     let instance = guard.hold();
+                    // C `dbAccess.c:570-571`.
+                    if instance.common.tpro != 0 {
+                        trace_dbprocess(format_args!("dbProcess of Disabled '{}'", instance.name));
+                    }
                     // C `dbAccess.c:575-577` — clear rpro/putf and arm
                     // notifyCompletion BEFORE the alarm check. Disabled
                     // records skip processing entirely, so any pending
@@ -5534,8 +5541,10 @@ impl PvDatabase {
                                     device_actions = Some(read_outcome.actions);
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("device read error on {}: {e}", instance.name);
+                            // C prints nothing for a failed `read_ai`
+                            // (`aiRecord.c:482`, `dbAccess.c:612`); the device
+                            // support says what it has to.
+                            Err(_) => {
                                 use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
                                 rec_gbl_set_sevr(
                                     &mut instance.common,
@@ -5659,17 +5668,12 @@ impl PvDatabase {
                     instance.record.set_device_did_compute(true);
                 }
 
-                // TPRO: trace processing (C EPICS dbProcess prints context when TPRO>0)
+                // C `dbAccess.c:608-609`.
                 if instance.common.tpro != 0 {
                     // `as_str`: the record's address, which `process_and_drain`'s
                     // hooked path takes, is then not computed for this branch
                     // ahead of the test.
-                    eprintln!(
-                        "[TPRO] {}: process (SCAN={:?}, PACT={})",
-                        instance.name.as_str(),
-                        instance.common.scan,
-                        instance.is_processing()
-                    );
+                    trace_dbprocess(format_args!("dbProcess of '{}'", instance.name.as_str()));
                 }
 
                 // MS-class alarm propagation from input links. Mirrors C
@@ -5802,7 +5806,7 @@ impl PvDatabase {
                 // cycle usually arms cannot overtake this: the continuation
                 // enters through `process_record_continuation`, which acquires
                 // the same per-record gate this body still holds.
-                self.publish_post_write_fields(name, rec, post_write_fields);
+                self.publish_post_write_fields(rec, post_write_fields);
                 // A record left idle replays a queued notify straight away; one
                 // that went async again (the SIM continuation released the SDLY
                 // PACT and the body re-entered it) leaves the queue head where it
@@ -5882,7 +5886,7 @@ impl PvDatabase {
                 let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
                     process_actions.into_iter().partition(runs_in_link_stage);
                 self.execute_process_actions_in(name, rec, link_writes, visited);
-                self.publish_post_write_fields(name, rec, post_write_fields);
+                self.publish_post_write_fields(rec, post_write_fields);
                 {
                     let inst = rec.read();
                     inst.notify_from_snapshot(&snapshot, link_backing);
@@ -6618,11 +6622,9 @@ impl PvDatabase {
                                     // as after a synchronous write.
                                     Ok(WriteStart::Completed) => {}
                                     Ok(WriteStart::Synchronous) => {
-                                        if let Err(e) = dev.write(&mut *instance.record) {
-                                            eprintln!(
-                                                "device write error on {}: {e}",
-                                                instance.name
-                                            );
+                                        // C prints nothing for a failed `write_ao`
+                                        // (`aoRecord.c:565`, `dbAccess.c:612`).
+                                        if dev.write(&mut *instance.record).is_err() {
                                             // C device support raises the write failure
                                             // through `recGblSetSevr` (a PENDING alarm),
                                             // and `process()`'s `monitor()` commits it in
@@ -6637,11 +6639,7 @@ impl PvDatabase {
                                             );
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "device write_begin error on {}: {e}",
-                                            instance.name
-                                        );
+                                    Err(_) => {
                                         crate::server::recgbl::rec_gbl_set_sevr(
                                             &mut instance.common,
                                             crate::server::recgbl::alarm_status::WRITE_ALARM,
@@ -6750,7 +6748,7 @@ impl PvDatabase {
                 // withheld stores become visible here — still ahead of Segment
                 // E, which therefore change-detects against the published value
                 // and does not post it a second time.
-                self.publish_post_write_fields(name, rec, post_write_fields);
+                self.publish_post_write_fields(rec, post_write_fields);
                 dispatched
             };
 
@@ -7772,8 +7770,7 @@ impl PvDatabase {
                 // device support raises it ahead of the record's own
                 // (devAsynFloat64.c:668-671), so on an INVALID tie the WRITE
                 // status is the one that reaches STAT.
-                if let Some(e) = &write_error {
-                    eprintln!("device write error on {name}: {e}");
+                if write_error.is_some() {
                     crate::server::recgbl::rec_gbl_set_sevr(
                         &mut instance.common,
                         crate::server::recgbl::alarm_status::WRITE_ALARM,
@@ -8443,7 +8440,7 @@ impl PvDatabase {
     pub(crate) fn db_get_link_in(
         &self,
         reader: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
     ) -> crate::server::recgbl::simm::LinkFetch {
         self.db_get_link_rendered_in(reader, link_field, link, false)
@@ -8455,7 +8452,7 @@ impl PvDatabase {
     pub(crate) fn db_get_link_rendered_in(
         &self,
         reader: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         render: bool,
     ) -> (
@@ -8476,7 +8473,7 @@ impl PvDatabase {
     pub(crate) fn db_get_input_link_in(
         &self,
         reader: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         render: bool,
         visited: &mut ProcStack,
@@ -8492,6 +8489,11 @@ impl PvDatabase {
 
     /// [`Self::execute_process_actions_in`] for a caller holding no frame
     /// (`field_io.rs`): the record's set is taken for the actions.
+    ///
+    /// With no frame of its own on the chain, the record is claimed for the
+    /// actions as C `processTarget` claims its source (`psrc->pact = TRUE`,
+    /// `dbDbLink.c:457`), so a link they process that leads back to it finds
+    /// it active.
     pub(super) fn execute_process_actions(
         &self,
         record_name: &str,
@@ -8499,8 +8501,13 @@ impl PvDatabase {
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
     ) {
+        let claimed = visited.claim(rec);
         let gate = FrameGate::Taken(self.lock_instance(rec));
         self.execute_process_actions_in(record_name, gate.frame(rec), actions, visited);
+        drop(gate);
+        if claimed {
+            visited.release(rec);
+        }
     }
 
     /// Apply the reader's declared `dbrType` request
@@ -8525,7 +8532,7 @@ impl PvDatabase {
     fn convert_link_fetch(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         fetch: crate::server::recgbl::simm::LinkFetch,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -8553,7 +8560,7 @@ impl PvDatabase {
     fn convert_link_fetch_as(
         &self,
         record: &dyn crate::server::record::Record,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
@@ -8579,7 +8586,7 @@ impl PvDatabase {
     fn convert_link_value(
         &self,
         record: &dyn crate::server::record::Record,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
@@ -8644,7 +8651,7 @@ impl PvDatabase {
     fn db_get_link_deferred(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         target: Option<&crate::server::record::record_instance::ResolvedTarget>,
         request: crate::server::record::InputLinkRequest,
@@ -8669,7 +8676,7 @@ impl PvDatabase {
     fn db_try_get_link_deferred(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         target: Option<&crate::server::record::record_instance::ResolvedTarget>,
         request: crate::server::record::InputLinkRequest,
@@ -8713,7 +8720,7 @@ impl PvDatabase {
     fn input_link_read_as(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
     ) -> Option<crate::server::record::LinkReadAs> {
         let instance = rec.read();
@@ -8727,7 +8734,7 @@ impl PvDatabase {
     fn link_read_as(
         &self,
         record: &dyn crate::server::record::Record,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
     ) -> Option<crate::server::record::LinkReadAs> {
@@ -8750,7 +8757,7 @@ impl PvDatabase {
     fn typed_input_value_requested(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
         value: EpicsValue,
@@ -8769,7 +8776,7 @@ impl PvDatabase {
     fn typed_input_value(
         &self,
         rec: InFrame<'_>,
-        link_field: &str,
+        link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -10072,7 +10079,7 @@ impl Drop for CycleEndGuard<'_> {
 /// silent -1, any other failed read `setLinkAlarm`.
 fn db_get_link_failed(
     rec: InFrame<'_>,
-    link_field: &str,
+    link_field: &'static str,
     link: &crate::server::record::ParsedLink,
 ) {
     if matches!(link, crate::server::record::ParsedLink::Removed(_)) {

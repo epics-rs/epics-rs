@@ -73,17 +73,17 @@ impl Record for StateRecord {
         "state"
     }
 
-    /// C `stateRecord.c::init_record` pass 0 warns that the record type is
-    /// deprecated (`stateRecord.c:96-104`). Mirror the message, naming the
-    /// record as C does (`prec->name`).
+    /// C `stateRecord.c::init_record` pass 0 warns through `errlogPrintf`
+    /// that the record type is deprecated (`stateRecord.c:84-90`), so `eltc 0`
+    /// silences it and a log listener receives it.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             let name = self.name.as_deref().unwrap_or("<unknown>");
-            eprintln!(
+            crate::runtime::log::errlog_printf(&format!(
                 "WARNING: Using deprecated record type \"state\" for record \"{name}\".\n\
                  This record type will be removed beginning with EPICS 7.1. Please replace it\n\
-                 by a stringin record."
-            );
+                 by a stringin record.\n"
+            ));
         }
         Ok(())
     }

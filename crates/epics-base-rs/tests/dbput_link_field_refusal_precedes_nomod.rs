@@ -17,6 +17,8 @@
 //! prints both: `ao W5 OUT "WF.NELM" FLNK W6`, `ao W6 OUT "A.SUBL"`,
 //! `dfanout DF OUTA "WF.NELM" OUTB "A.SUBL"` and `seq SQ` (SELM All, LNK1
 //! `WF.NELM`, LNK2 `A.SUBL`) each print the WF.NELM line, then A.SUBL's.
+//! So does `ao E5` (SCAN Event, EVNT 5, OUT `WF.NELM`, FLNK W6) on
+//! `postEvent 5`, leaving E5 and W6 LINK/INVALID.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,10 @@ record(bo, "B") { field(ZNAM, "Off") field(ONAM, "On") }
 record(stringout, "W4") { field(OUT, "B.VAL") }
 record(ao, "W6") { field(OUT, "A.SUBL") }
 record(ao, "W5") { field(OUT, "WF.NELM") field(FLNK, "W6") }
+record(ao, "E5") {
+    field(SCAN, "Event") field(EVNT, "5") field(VAL, "5")
+    field(OUT, "WF.NELM") field(FLNK, "W6")
+}
 record(dfanout, "DF") { field(OUTA, "WF.NELM") field(OUTB, "A.SUBL") }
 record(seq, "SQ") {
     field(SELM, "All")
@@ -130,6 +136,14 @@ record(seq, "SQ") {
             said.extend(heard());
         }
         assert_eq!(said, [NOMOD.to_string(), line("A.SUBL")], "{rec}");
+    }
+
+    // An event-driven chain: the scan thread's cycle prints both.
+    db.post_event_named("5").await;
+    assert_eq!(heard(), [NOMOD.to_string(), line("A.SUBL")], "E5");
+    for rec in ["E5", "W6"] {
+        let num = |f: &str| db.get_pv(&format!("{rec}.{f}")).unwrap().to_f64();
+        assert_eq!([num("STAT"), num("SEVR")], [Some(14.0), Some(3.0)], "{rec}");
     }
 
     // The other `dbPut` body answers the same status and print.

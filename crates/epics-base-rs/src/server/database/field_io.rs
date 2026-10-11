@@ -1035,12 +1035,13 @@ impl<'a, 'h> HeldPuts<'a, 'h> {
         value: EpicsValue,
     ) -> CaResult<()> {
         let LockedRecord(record, _) = record;
-        let mut tail = PutTail::default();
+        let mut visited = super::ProcStack::new();
+        let mut chain = PutChain::root(&mut visited);
         let put = self
             .db
-            .put_record_pv_body(record, field, value, &mut tail)
+            .put_record_pv_body(record, field, value, &mut chain)
             .unwrap_or_else(|| Err(CaError::ChannelNotFound(record.to_string())));
-        self.owe(record, field, false, put, tail)
+        self.owe(record, field, false, put, chain.tail)
     }
 
     /// [`PvDatabase::put_record_field_from_ca_no_notify_already_locked`] for
@@ -1677,10 +1678,11 @@ impl PvDatabase {
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let held = self.lock_for_put(base, field, &value);
-        let mut tail = PutTail::default();
-        let put = self.put_pv_body(name, value, &mut tail);
+        let mut visited = super::ProcStack::new();
+        let mut chain = PutChain::root(&mut visited);
+        let put = self.put_pv_body(name, value, &mut chain);
         // The body refuses every link field, so no link text lands.
-        self.settle_held(held, false, put, tail)
+        self.settle_held(held, false, put, chain.tail)
     }
 
     /// `put_pv` variant for a caller already holding the
@@ -1690,11 +1692,12 @@ impl PvDatabase {
     /// This is the whole `dbPut` body — the gate-held region, and it is a
     /// `fn`. See `acquire_put_gate`.
     pub fn put_pv_already_locked(&self, held: HeldRecord<'_>, value: EpicsValue) -> CaResult<()> {
-        let mut tail = PutTail::default();
+        let mut visited = super::ProcStack::new();
+        let mut chain = PutChain::root(&mut visited);
         let put = self
-            .put_record_pv_body(held.record, held.field, value, &mut tail)
+            .put_record_pv_body(held.record, held.field, value, &mut chain)
             .unwrap_or_else(|| Err(CaError::ChannelNotFound(held.record.to_string())));
-        self.settle_held(held, false, put, tail)
+        self.settle_held(held, false, put, chain.tail)
     }
 
     /// The gate a put of `value` to `record`.`field` takes — `dbScanLock`,
@@ -1955,7 +1958,7 @@ impl PvDatabase {
         &self,
         name: &str,
         value: EpicsValue,
-        tail: &mut PutTail,
+        chain: &mut PutChain<'_>,
     ) -> CaResult<()> {
         // Check simple PVs first. The lookup is its own statement so the
         // `!Send` directory guard is down before `pv.set(…).await` — see the
@@ -1967,7 +1970,7 @@ impl PvDatabase {
         }
 
         let (base, field) = super::parse_pv_name(name);
-        self.put_record_pv_body(base, field, value, tail)
+        self.put_record_pv_body(base, field, value, chain)
             .unwrap_or_else(|| Err(CaError::ChannelNotFound(name.to_string())))
     }
 
@@ -1977,7 +1980,7 @@ impl PvDatabase {
         base: &str,
         field: &str,
         value: EpicsValue,
-        tail: &mut PutTail,
+        chain: &mut PutChain<'_>,
     ) -> Option<CaResult<()>> {
         let field = field.to_ascii_uppercase();
         // No `link_field_write` obligation: this body refuses every link
@@ -1988,7 +1991,7 @@ impl PvDatabase {
         // Records — alias-aware (epics-base PR #336).
         let (canonical, rec) = self.lookup_record(base)?;
         let at = crate::server::record::record_instance::PutAddr::resolve_in(&rec, &field);
-        Some(self.put_record_body(&canonical, &rec, &field, &at, value, tail))
+        Some(self.put_record_body(&canonical, &rec, &field, &at, value, chain))
     }
 
     /// [`Self::put_pv_body`] for a record already resolved — C's `dbPut` on a
@@ -2003,8 +2006,9 @@ impl PvDatabase {
         field: &str,
         at: &crate::server::record::record_instance::PutAddr,
         value: EpicsValue,
-        tail: &mut PutTail,
+        chain: &mut PutChain<'_>,
     ) -> CaResult<()> {
+        let tail = &mut chain.tail;
         // The caller holds the advisory write gate (`dbScanLock`
         // analogue) for `canonical_base` — see `acquire_put_gate`.
         // It is held to the `return Ok(())` below, and that is the point:
@@ -2196,8 +2200,9 @@ impl PvDatabase {
         // C `dbPut` runs `dbPutSpecial(paddr, 1)` to completion — the
         // `dbPutLink` calls a `special()` makes included — before it returns
         // to `dbPutField`. This is the last statement of the `dbPut`
-        // analogue, so it is that point.
-        self.run_special_actions(canonical, rec, special_actions);
+        // analogue, so it is that point. `visited` is the chain the put came
+        // from, so a record active on it stays active for those link writes.
+        self.run_special_actions(canonical, rec, special_actions, chain.visited);
 
         // mirror the CA-write path's ASG-field notifier so
         // restore scripts / autosave / admin tools that go via
@@ -2537,7 +2542,12 @@ impl PvDatabase {
                 CommonFieldPutResult::NoChange => {}
             }
 
-            self.run_special_actions(&canonical_base, &rec, special_actions);
+            self.run_special_actions(
+                &canonical_base,
+                &rec,
+                special_actions,
+                &mut super::ProcStack::new(),
+            );
 
             // same SPC_AS parity as `put_pv` / `put_pv_no_process`
             // / the CA-write path — a gateway mirroring `.ASG` via
@@ -2593,12 +2603,12 @@ impl PvDatabase {
         record_name: &str,
         rec: &std::sync::Arc<crate::server::record::RecordCell>,
         actions: Vec<crate::server::record::ProcessAction>,
+        visited: &mut super::ProcStack,
     ) {
         if actions.is_empty() {
             return;
         }
-        let mut visited = crate::server::database::ProcStack::new();
-        self.execute_process_actions(record_name, rec, actions, &mut visited);
+        self.execute_process_actions(record_name, rec, actions, visited);
     }
 
     /// CA client's unified entry point for record field put.
@@ -2747,10 +2757,18 @@ impl PvDatabase {
     /// `prec->name` does: canonical, whatever alias the put used.
     #[cold]
     #[inline(never)]
-    fn emit_put_report(&self, record_name: &str, field: &str, report: PutReport) {
-        let canonical = self.lookup_record(record_name).map(|(name, _)| name);
-        let name = canonical.as_deref().unwrap_or(record_name);
-        report.emit(name, &field.to_ascii_uppercase());
+    pub(super) fn emit_put_report(&self, record_name: &str, field: &str, report: PutReport) {
+        let at = self.lookup_record(record_name);
+        let name = at.as_ref().map_or(record_name, |(name, _)| name);
+        // C prints `pfldDes->name` (`recGbl.c:86-89`), the descriptor's
+        // spelling whatever the put's, so no case conversion is made here.
+        let field = at
+            .as_ref()
+            .and_then(|(_, rec)| {
+                crate::server::record::record_instance::field_desc_in(rec.rdes().fields, field)
+            })
+            .map_or(field, |desc| desc.name);
+        report.emit(name, field);
     }
 
     /// The one router for an EXTERNAL client PUT that carries pvxs's
@@ -3859,7 +3877,12 @@ impl PvDatabase {
         // C `dbPutField` reaches `dbProcess` only after `dbPut` — and therefore
         // after `dbPutSpecial(paddr, 1)` and every `dbPutLink` it made — has run
         // to completion. Execute them here, ahead of the `pp(TRUE)` process.
-        self.run_special_actions(record_name, &rec, std::mem::take(&mut special_actions));
+        self.run_special_actions(
+            record_name,
+            &rec,
+            std::mem::take(&mut special_actions),
+            &mut super::ProcStack::new(),
+        );
 
         // Update scan index if SCAN or PHAS changed
         match common_result {
@@ -4303,7 +4326,12 @@ impl PvDatabase {
 
             // The link writes the after pass queued, run once the record lock
             // is down — C reaches them from inside `dbPut`.
-            self.run_special_actions(&canonical_base, &rec, special_actions);
+            self.run_special_actions(
+                &canonical_base,
+                &rec,
+                special_actions,
+                &mut super::ProcStack::new(),
+            );
 
             // same SPC_AS parity as `put_pv` / the CA-write
             // path — autosave-style restores writing `.ASG` at IOC
@@ -4343,6 +4371,27 @@ enum PutGate {
     Many {
         _held: super::record_lock::ManyRecordWriteGuard,
     },
+}
+
+/// A `dbPut` body's frame: the [`PutTail`] its entry settles, and the chain
+/// its `special()` link writes run on, so a record active on that chain stays
+/// active for them. Not the spec's `LinkTail`, which carries one special's
+/// remainder across its own link writes; this is the whole put's. `repr(C)`
+/// with `tail` first keeps `&mut chain.tail` the chain pointer.
+#[repr(C)]
+pub(super) struct PutChain<'v> {
+    pub(super) tail: PutTail,
+    pub(super) visited: &'v mut super::ProcStack,
+}
+
+impl<'v> PutChain<'v> {
+    /// A put entering from outside any cycle, on `visited` (a fresh stack).
+    pub(super) fn root(visited: &'v mut super::ProcStack) -> Self {
+        Self {
+            tail: PutTail::default(),
+            visited,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5688,7 +5737,7 @@ record(ai, "OTHER") {
             let refused = db.put_pv_body(
                 name,
                 EpicsValue::String("OTHER".into()),
-                &mut super::PutTail::default(),
+                &mut super::PutChain::root(&mut crate::server::database::ProcStack::new()),
             );
             assert!(
                 matches!(refused, Err(CaError::BadDbrType(_))),

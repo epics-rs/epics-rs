@@ -16,10 +16,9 @@
 //! _main_: dbProcess of 'PG'
 //! ```
 //!
-//! The whole stderr up to the port's `CA server:` line, which C's RSRV does
-//! not print and `CaServer::run` writes after the ready line, is compared, so
-//! a line C does not print fails the case. The TPRO line's text is not C's
-//! yet (and C writes it to stdout), so it compares as the record name.
+//! The whole merged output past the banner, up to the port's `CA server:`
+//! line, which C's RSRV does not print and `CaServer::run` writes after the
+//! ready line, is compared, so a line C does not print fails the case.
 //!
 //! `oracle-ioc` has no shell, so its `iocPause`/`iocRun` cycle is pinned on
 //! the same `build_ioc` path in-process, by `epics-base-rs`'s
@@ -38,37 +37,42 @@ record(ao, \"SRC\") {}
 record(calc, \"DST\") { field(INPA, \"SRC CP\") field(TPRO, \"1\") field(CALC, \"A\") }
 ";
 
-/// A TPRO line as its record's name; every other line as written.
+/// A `dbProcess` line as its record's name; every other line as written.
 fn normalized(line: &str) -> &str {
-    line.strip_prefix("[TPRO] ")
-        .and_then(|rest| rest.split_once(": process "))
-        .map_or(line, |(name, _)| name)
+    line.split_once(": dbProcess of '")
+        .and_then(|(_, rest)| rest.strip_suffix('\''))
+        .unwrap_or(line)
 }
 
 #[test]
 fn pini_passes_bracket_the_ioc_run_line_as_in_oracle_ioc() {
     let db = std::env::temp_dir().join(format!("oracle-pini-{}.db", std::process::id()));
     std::fs::write(&db, DB).expect("write db");
+    // The TPRO line is on stdout and the rest on stderr; one pipe takes both
+    // in the order they are written, as `2>&1` does.
+    let (output, writer) = std::io::pipe().expect("pipe");
     let mut child = Command::new(env!("CARGO_BIN_EXE_oracle-ioc"))
         .arg("--db")
         .arg(&db)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stdout(writer.try_clone().expect("clone the pipe"))
+        .stderr(writer)
         .spawn()
         .expect("spawn oracle-ioc");
     // The process serves until killed, so the stream is read up to the server
     // line, which follows every PINI pass.
     let mut stderr = String::new();
     let mut seen = Vec::new();
-    for line in BufReader::new(child.stderr.take().expect("piped stderr"))
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in BufReader::new(output).lines().map_while(Result::ok) {
         stderr.push_str(&line);
         stderr.push('\n');
         if line.starts_with("CA server: UDP search on port ") {
             break;
+        }
+        // The banner, elided above, and the harness's `ORACLE_IOC_` handshake,
+        // which oracleIoc does not print.
+        if line.starts_with('#') || line.starts_with("ORACLE_IOC_") {
+            continue;
         }
         seen.push(normalized(&line).to_string());
     }

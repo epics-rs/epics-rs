@@ -182,7 +182,7 @@ record(ai, "ASYNC") {
         let rec = db.get_record(name).unwrap();
         let inst = rec.read();
         assert_eq!(
-            (inst.common.stat, inst.common.amsg.as_str()),
+            (inst.common.stat, String::from(&inst.common.amsg).as_str()),
             (stat, amsg),
             "{name}"
         );

@@ -428,7 +428,7 @@ pub(crate) struct OutLinkSrc<'a> {
     pub putf: bool,
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
     pub alarm: &'a LinkAlarm,
-    pub field: &'a str,
+    pub field: &'static str,
 }
 
 /// Which of C's two gates a `processTarget` call is coming through — the two
@@ -1249,8 +1249,33 @@ impl PvDatabase {
         };
         let at = self.db_link_addr(db)?;
         let mut source = at.rec.write();
-        let states = source.record.enum_state_strings()?;
-        match crate::server::record::enum_state_choice(&*source.record, &states, &s)? {
+        // Named only by a refusal, so a delivered read never looks it up.
+        let field = || at.put.field.desc.map_or("VAL", |d| d.name);
+        // C's `cvt_st_e` reports both refusals under the reader's lock set
+        // (`dbFastLinkConv.c:255-256`, `:277-280`); printed here once the
+        // source's data lock is down.
+        let Some(states) = source.record.enum_state_strings() else {
+            let record_type = source.record.record_type();
+            drop(source);
+            let report = crate::server::recgbl::PutReport::RecSupError {
+                message: "dbPutField",
+                record_type,
+                support: "put_enum_str",
+            };
+            self.emit_put_report(&at.name, field(), report);
+            return None;
+        };
+        let Some(choice) = crate::server::record::enum_state_choice(&*source.record, &states, &s)
+        else {
+            drop(source);
+            let mut refusal =
+                crate::error::ChoiceRefusal::enum_state(field(), &s.as_str_lossy(), states.len());
+            if let Some(report) = refusal.take_report() {
+                self.emit_put_report(&at.name, field(), report);
+            }
+            return None;
+        };
+        match choice {
             EnumChoice::Named(i) => {
                 source
                     .record
@@ -2436,11 +2461,13 @@ impl PvDatabase {
             if !gate.admits(tg.common.scan) {
                 return;
             }
-            let pact = tg.is_processing();
-            if !pact {
+            // C's `pdst->pact` is both halves: a cycle on this chain (C's
+            // `processTarget` marker, `claim_dst` false) or an async wait.
+            let on_chain = visited.holds(target_rec);
+            if !on_chain && !tg.is_processing() {
                 tg.common.putf = src_putf;
                 tg.join_put_notify(src_notify);
-            } else if src_putf && !visited.holds(target_rec) {
+            } else if src_putf && !on_chain {
                 tg.common.rpro = 1;
                 tg.common.putf = false;
             }
@@ -2524,21 +2551,21 @@ impl PvDatabase {
         // A cycle's write has no put gate to drop: a refusal's report prints
         // here, under the cycle's hold as in C, and `special()`'s after-gate
         // work is discarded.
-        let mut tail = super::field_io::PutTail::default();
+        let mut chain = super::field_io::PutChain::root(&mut *visited);
         let put_result = match (&addr, shadow) {
             (Some(at), _) => {
-                self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value, &mut tail)
+                self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value, &mut chain)
             }
             // `put_pv_body`'s simple-PV arm, with the PV already settled.
             (None, Some(pv)) => {
                 pv.set(value);
                 Ok(())
             }
-            (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut tail),
+            (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut chain),
         };
-        if tail.has_report() {
+        if chain.tail.has_report() {
             let record = addr.as_ref().map_or(target.record.as_str(), |at| &at.name);
-            self.emit_cycle_report(record, &target.field, tail);
+            self.emit_cycle_report(record, &target.field, chain.tail);
         }
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
@@ -3739,8 +3766,10 @@ impl PvDatabase {
                             {
                                 // C `processCallback`'s `dbScanLock` /
                                 // `dbScanUnlock` pair (`seqRecord.c:252`,
-                                // `:274`) — held for this group alone.
+                                // `:274`) — held for this group alone. The
+                                // seq is claimed as `processTarget`'s source.
                                 let mut visited = crate::server::database::ProcStack::new();
+                                visited.claim(&rec);
                                 db.with_frame(&rec, |frame| {
                                     db.seq_group_step(frame, &rec_name, grp, &mut visited)
                                 });
@@ -4208,12 +4237,6 @@ impl PvDatabase {
         use crate::server::record::record_instance::COMMON_LINK_FIELDS;
         let names = self.all_record_names().await;
         let mut converted = 0usize;
-        let mut refused = 0usize;
-        let installed_schemes = {
-            let mut s = self.inner.link_sets.load().schemes();
-            s.sort();
-            s
-        };
         for name in &names {
             let Some(rec) = self.get_record(name) else {
                 continue;
@@ -4246,20 +4269,19 @@ impl PvDatabase {
                 {
                     continue;
                 }
+                let json = matches!(parsed, crate::server::record::ParsedLink::PvaJson(_));
                 let next = self.db_init_link_locality(parsed);
                 match (&next, unserviceable) {
                     (crate::server::record::ParsedLink::Ca(_), _) => rewrites.push((field, next)),
-                    // The refusal `db_init_link_locality` just made, said out
-                    // loud. This is the only pass that runs once per IOC, so
-                    // it is the only place the operator can be told without
-                    // the message repeating on every `record_link_fields`.
+                    // C names a `{pva:...}` with no `link(pva, ...)` loaded
+                    // (`dbJLink.c:264`); a `pva://` text is a CA link to C
+                    // (`dbLink.c:119-130`), refused silently.
                     (crate::server::record::ParsedLink::None, Some(scheme)) => {
-                        eprintln!(
-                            "iocInit: {name}.{field} names link type '{scheme}' but no \
-                             '{scheme}' link set is installed in this IOC (installed: \
-                             {installed_schemes:?}); the link is refused: {text}"
-                        );
-                        refused += 1;
+                        if json {
+                            crate::runtime::log::errlog_printf(&format!(
+                                "dbJLinkInit: Link type '{scheme}' not found\n"
+                            ));
+                        }
                         rewrites.push((field, next));
                     }
                     _ => {}
@@ -4278,12 +4300,6 @@ impl PvDatabase {
         }
         if converted > 0 {
             tracing::debug!("iocInit: {converted} non-local DB link(s) made external");
-        }
-        if refused > 0 {
-            eprintln!(
-                "iocInit: {refused} link(s) refused — no link set is installed for the \
-                 scheme they name"
-            );
         }
         converted
     }

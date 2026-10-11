@@ -611,7 +611,7 @@ impl CalcoutRecord {
             .enumerate()
             .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link))
             .collect();
-        links.push(("OUTV", self.out.as_str().to_owned()));
+        links.push(("OUTV", String::from(&self.out)));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),

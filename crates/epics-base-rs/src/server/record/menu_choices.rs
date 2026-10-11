@@ -41,7 +41,7 @@
 //! the tables are generated and not written: a hand copy can drift, and the
 //! drift is silent.
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, Owed};
 use crate::server::snapshot::EnumStringForm;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -396,14 +396,14 @@ pub fn resolve_menu_field_string(
 /// `putStringMenu`/`dbPutStringNum` hand back to `dbPut`, which aborts before
 /// storing anything (`dbAccess.c:1362` `if (status) goto done`), so the field
 /// keeps its previous value and the record is not processed.
-/// `converter` is the C converter whose `recGblDbaddrError` report the
-/// refusal owes; the loader's `dbPutStringNum` prints none.
-fn bad_choice(field: &str, choices: &[&str], s: &str, converter: Option<&'static str>) -> CaError {
+/// `owed` is the converter's report; the loader's `dbPutStringNum` prints
+/// none.
+fn bad_choice(field: &str, choices: &[&str], s: &str, owed: Owed) -> CaError {
     CaError::BadChoice(crate::error::ChoiceRefusal::menu(
         field,
         s,
         choices.len(),
-        converter,
+        owed,
     ))
 }
 
@@ -422,7 +422,7 @@ pub(crate) fn resolve_device_field_string(
         dbf_type,
         s,
         MenuBound::DbPut,
-        Some("dbFastLinkConv(cvt_st_device)"),
+        Owed::CvtStDevice,
     )
 }
 
@@ -641,8 +641,11 @@ pub(crate) fn resolve_menu_field_string_bounded(
     s: &str,
     bound: MenuBound,
 ) -> CaResult<EpicsValue> {
-    let converter = matches!(bound, MenuBound::DbPut).then_some("dbFastLinkConv(cvt_st_menu)");
-    resolve_choice(field, choices, dbf_type, s, bound, converter)
+    let owed = match bound {
+        MenuBound::DbPut => Owed::CvtStMenu,
+        MenuBound::DbLoad => Owed::Nothing,
+    };
+    resolve_choice(field, choices, dbf_type, s, bound, owed)
 }
 
 fn resolve_choice(
@@ -651,10 +654,10 @@ fn resolve_choice(
     dbf_type: DbFieldType,
     s: &str,
     bound: MenuBound,
-    converter: Option<&'static str>,
+    owed: Owed,
 ) -> CaResult<EpicsValue> {
     let index = menu_index_from_string(choices, s, bound)
-        .ok_or_else(|| bad_choice(field, choices, s, converter))?;
+        .ok_or_else(|| bad_choice(field, choices, s, owed))?;
     Ok(menu_index_value(dbf_type, index))
 }
 

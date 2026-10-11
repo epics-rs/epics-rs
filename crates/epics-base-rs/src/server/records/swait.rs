@@ -401,7 +401,7 @@ impl SwaitRecord {
         let handle = handle.clone();
         let mut links: Vec<String> = self.inp_names.to_vec();
         links.push(self.doln.clone());
-        links.push(self.out.as_str().to_owned());
+        links.push(String::from(&self.out));
         // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
         let token = self.link_gen.next();
         let sched = handle.clone();

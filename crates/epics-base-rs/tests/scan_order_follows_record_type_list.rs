@@ -1,7 +1,7 @@
 //! A periodic scan walks same-`PHAS` records in C's `recordTypeList` order,
 //! which is name order: an IOC loads its expanded `.dbd`, whose record types
 //! `dbdExpand.pl` writes sorted (`DBD/Output.pm:61`). softIoc R7.0.10 on the
-//! fixture below, stderr, one period:
+//! fixture below, stdout, one period:
 //!
 //! ```text
 //! scan-1: dbProcess of 'X3'
@@ -11,10 +11,10 @@
 //! ```
 //!
 //! `aSub` sorts before `aai` and `ai`; `stdRecords.dbd` include order puts it
-//! after both. The port's TPRO line is not C's text, so the pin is the order of
-//! the records it names.
+//! after both. The context is the scan thread's name, which differs, so the pin
+//! is the order of the records the lines name.
 //!
-//! Unix only: what is asserted is the process stderr, reached by pointing fd 2
+//! Unix only: what is asserted is the process stdout, reached by pointing fd 1
 //! at a file and putting it back.
 
 #![cfg(unix)]
@@ -44,12 +44,12 @@ async fn same_phas_records_scan_in_record_type_list_order() {
         .unwrap()
         .0;
 
-    let err_sink = tempfile::NamedTempFile::new().expect("stderr capture");
+    let out_sink = tempfile::NamedTempFile::new().expect("stdout capture");
     // SAFETY: nextest runs this test in its own process; nothing else holds
-    // fd 2 while it is swapped.
-    let saved_err = unsafe {
-        let saved = libc::dup(2);
-        libc::dup2(err_sink.as_file().as_raw_fd(), 2);
+    // fd 1 while it is swapped.
+    let saved_out = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(out_sink.as_file().as_raw_fd(), 1);
         saved
     };
     let owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
@@ -58,15 +58,15 @@ async fn same_phas_records_scan_in_record_type_list_order() {
     // SAFETY: restoring the descriptor this test replaced, before anything
     // can panic.
     unsafe {
-        libc::dup2(saved_err, 2);
-        libc::close(saved_err);
+        libc::dup2(saved_out, 1);
+        libc::close(saved_out);
     }
 
-    let err = std::fs::read_to_string(err_sink.path()).unwrap();
-    let scanned: Vec<&str> = err
+    let out = std::fs::read_to_string(out_sink.path()).unwrap();
+    let scanned: Vec<&str> = out
         .lines()
-        .filter_map(|l| l.strip_prefix("[TPRO] ")?.split(':').next())
+        .filter_map(|l| l.split_once(": dbProcess of '")?.1.strip_suffix('\''))
         .collect();
-    assert!(scanned.len() >= 4, "stderr was:\n{err}");
-    assert_eq!(scanned[..4], SOFTIOC, "stderr was:\n{err}");
+    assert!(scanned.len() >= 4, "stdout was:\n{out}");
+    assert_eq!(scanned[..4], SOFTIOC, "stdout was:\n{out}");
 }

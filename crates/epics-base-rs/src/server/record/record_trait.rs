@@ -6736,28 +6736,26 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
         Err(value) => value,
     };
     if let EpicsValue::String(s) = &value {
-        // DTYP (DBF_DEVICE) validates against the record type's FULL device
+        // A DBF_DEVICE field validates against the record type's FULL device
         // menu — static `device()` lines PLUS runtime-contributed device
         // support — the same set the read/announce path exposes via
-        // `RecordInstance::device_choices`. `menu_choices_of`'s DTYP branch
+        // `RecordInstance::device_choices`. `menu_choices_with`'s device branch
         // returns only the static half, so a contributed device-support name
         // (asyn's `asynInt32`, scaler-rs's `Asyn Scaler`, ...) would wrongly
         // fail this put even though a client can read it in the DTYP choices.
-        // Resolve DTYP against the merged menu to keep put and read symmetric.
-        if field.eq_ignore_ascii_case("DTYP") {
+        // An empty menu refuses every string, as `cvt_st_device` does.
+        let desc = super::record_instance::field_desc_of(record, field);
+        if super::record_instance::is_device(desc) {
             let choices = super::merged_device_menu(record.record_type());
-            if !choices.is_empty() {
-                return super::menu_choices::resolve_device_field_string(
-                    field,
-                    &choices,
-                    target,
-                    &s.as_str_lossy(),
-                )
-                .map(Converted::Stored);
-            }
-            // No device menu declared or contributed for this record type: fall
-            // through to the generic handling below (unchanged behavior).
-        } else if let Some(choices) = super::record_instance::menu_choices_of(record, field) {
+            return super::menu_choices::resolve_device_field_string(
+                field,
+                &choices,
+                target,
+                &s.as_str_lossy(),
+            )
+            .map(Converted::Stored);
+        }
+        if let Some(choices) = super::record_instance::menu_choices_with(record, field, desc) {
             return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy())
                 .map(Converted::Stored);
         }

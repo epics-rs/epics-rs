@@ -56,11 +56,7 @@ fn lcnt_of(db: &PvDatabase, rec: &str) -> i16 {
 fn alarm_of(db: &PvDatabase, rec: &str) -> (u16, AlarmSeverity, String) {
     let inst = db.get_record(rec).expect("record exists");
     let g = inst.read();
-    (
-        g.common.stat,
-        g.common.sevr,
-        g.common.amsg.as_str().to_owned(),
-    )
+    (g.common.stat, g.common.sevr, String::from(&g.common.amsg))
 }
 
 /// Boundary: the SYNCHRONOUS half — a record already on the current process

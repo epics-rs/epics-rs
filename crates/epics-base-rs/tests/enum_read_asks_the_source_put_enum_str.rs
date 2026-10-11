@@ -26,6 +26,11 @@ record(bi, "BSRC5") {
     field(ONAM, "High")
     field(DESC, "5")
 }
+record(bi, "BSRCX") {
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+    field(DESC, "Bogus")
+}
 record(mbbi, "MSRC") {
     field(ZRST, "zero")
     field(ONST, "one")
@@ -155,6 +160,59 @@ async fn a_source_without_put_enum_str_fails() {
     for source in ["SI", "W1"] {
         let db = ioc("mbbi", source).await;
         read_both(&db, source, 0, READ).await;
+    }
+}
+
+/// softIoc: each refused read prints `cvt_st_e`'s line, naming the source:
+///
+/// ```text
+/// recGblRecordError: 5 Illegal choice PV: BSRC5
+/// recGblRecordError: Bogus Illegal choice PV: BSRCX
+/// recGblRecSupError: dbPutField missing record support entry table stringin::put_enum_str PV: SI.VAL
+/// recGblRecSupError: dbPutField missing record support entry table waveform::put_enum_str PV: W1.VAL
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_refused_read_prints_cvt_st_es_line() {
+    let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&heard);
+    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+        sink.lock().unwrap().push(m.trim_end().to_string())
+    });
+    for (rtype, source, line) in [
+        (
+            "bi",
+            "BSRC5.DESC",
+            "recGblRecordError: 5 Illegal choice PV: BSRC5",
+        ),
+        (
+            "bi",
+            "BSRCX.DESC",
+            "recGblRecordError: Bogus Illegal choice PV: BSRCX",
+        ),
+        (
+            "mbbi",
+            "SI",
+            "recGblRecSupError: dbPutField missing record support entry table \
+             stringin::put_enum_str PV: SI.VAL",
+        ),
+        (
+            "mbbi",
+            "W1",
+            "recGblRecSupError: dbPutField missing record support entry table \
+             waveform::put_enum_str PV: W1.VAL",
+        ),
+    ] {
+        let db = ioc(rtype, source).await;
+        epics_base_rs::runtime::log::errlog_flush();
+        heard.lock().unwrap().clear();
+        db.process_record("HELD").await.unwrap();
+        settle(&db, "HELD").await;
+        epics_base_rs::runtime::log::errlog_flush();
+        let said: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
+            .into_iter()
+            .filter(|m| m.starts_with("recGbl"))
+            .collect();
+        assert_eq!(said, [line], "{source}");
     }
 }
 

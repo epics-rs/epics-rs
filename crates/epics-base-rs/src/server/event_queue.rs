@@ -94,12 +94,13 @@
 //!   place, so the ring stays contiguous. C has one reader per queue.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::runtime::sync::Arc;
 use crate::server::pv::{LogData, LogParts, MonitorEvent, PostLog};
 use crate::server::recgbl::EventMask;
 use crate::server::record::{FieldDesc, Special};
+use crate::sync::{RetireGuard, RetiringSwap};
 use crate::types::EpicsValue;
 
 /// C `EVENTENTRIES` (`dbEvent.c:62`) — ring entries reserved per attached
@@ -1307,6 +1308,297 @@ pub fn attach_with(
         },
         EventReader { que, id },
     )
+}
+
+/// A record's monitors keyed by field index, C's `mlis` — read lock-free by
+/// the cycle, replaced whole by EVENT_ADD/CANCEL without the record lock.
+///
+/// Entries are sorted by field and in attach order within a field, so a post
+/// walks only its field's run. Readers get a [`RetireGuard`]: the map they
+/// see is freed by a later writer, never by their guard's drop.
+pub struct SubscriberList<S> {
+    map: RetiringSwap<SubscriberMap<S>>,
+    /// Never below the map's length: an add raises it before its store and a
+    /// remove lowers it after, so a zero read means the map is empty.
+    count: AtomicUsize,
+    /// Serialises the copy-modify-store; a cycle thread never takes it.
+    writer: parking_lot::Mutex<()>,
+}
+
+/// One version of a [`SubscriberList`]'s map.
+pub struct SubscriberMap<S> {
+    entries: Vec<(u16, S)>,
+}
+
+impl<S> SubscriberMap<S> {
+    /// The run of `field`'s monitors, in attach order.
+    pub fn of(&self, field: u16) -> impl Iterator<Item = &S> {
+        let start = self.entries.partition_point(|(f, _)| *f < field);
+        self.entries[start..]
+            .iter()
+            .take_while(move |(f, _)| *f == field)
+            .map(|(_, s)| s)
+    }
+
+    /// Every monitor with its field index, by field then attach order.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &S)> {
+        self.entries.iter().map(|(f, s)| (*f, s))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl<S> Default for SubscriberList<S> {
+    fn default() -> Self {
+        Self {
+            map: RetiringSwap::new(Arc::new(SubscriberMap {
+                entries: Vec::new(),
+            })),
+            count: AtomicUsize::new(0),
+            writer: parking_lot::Mutex::new(()),
+        }
+    }
+}
+
+impl<S: Clone> SubscriberList<S> {
+    /// The current map, for one phase on this thread.
+    pub fn load(&self) -> RetireGuard<'_, SubscriberMap<S>> {
+        self.map.load()
+    }
+
+    /// No map load: the cycle's "anyone watching" test.
+    pub fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
+
+    /// C `db_add_event`'s `ellAdd` onto `mlis`, behind `field`'s earlier
+    /// monitors.
+    ///
+    /// EVENT_ADD seeds after this returns, reading the field and queueing the
+    /// seed inside one scan-lock hold (C `db_post_single_event`'s
+    /// `dbScanLock`). That order delivers a racing change at most twice and
+    /// never loses it; a seed read before the add, or outside a hold, can.
+    pub fn add(&self, field: u16, sub: S) {
+        let _w = self.writer.lock();
+        let cur = self.map.load();
+        let at = cur.entries.partition_point(|(f, _)| *f <= field);
+        let mut entries = Vec::with_capacity(cur.entries.len() + 1);
+        entries.extend_from_slice(&cur.entries[..at]);
+        entries.push((field, sub));
+        entries.extend_from_slice(&cur.entries[at..]);
+        drop(cur);
+        self.count.fetch_add(1, Ordering::Release);
+        self.map.store(Arc::new(SubscriberMap { entries }));
+    }
+
+    /// Remove every monitor `keep` refuses, returning them so their drops run
+    /// after the writer mutex is released. No store when nothing goes.
+    pub fn retain(&self, mut keep: impl FnMut(u16, &S) -> bool) -> Vec<S> {
+        let mut gone = Vec::new();
+        {
+            let _w = self.writer.lock();
+            let cur = self.map.load();
+            let kept: Vec<bool> = cur.entries.iter().map(|(f, s)| keep(*f, s)).collect();
+            if kept.iter().all(|k| *k) {
+                return gone;
+            }
+            let mut entries = Vec::with_capacity(cur.entries.len());
+            for (entry, kept) in cur.entries.iter().zip(kept) {
+                if kept {
+                    entries.push(entry.clone());
+                } else {
+                    gone.push(entry.1.clone());
+                }
+            }
+            drop(cur);
+            self.map.store(Arc::new(SubscriberMap { entries }));
+            self.count.fetch_sub(gone.len(), Ordering::Release);
+        }
+        gone
+    }
+}
+
+#[cfg(test)]
+mod subscriber_list_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::thread::{self, ThreadId};
+
+    type Drops = Arc<StdMutex<Vec<(u32, ThreadId)>>>;
+
+    /// Each clone is its own value, so freeing a map version shows up as
+    /// drops of that version's copies, on the thread that freed it.
+    struct Probe {
+        id: u32,
+        drops: Drops,
+    }
+
+    impl Clone for Probe {
+        fn clone(&self) -> Self {
+            Self {
+                id: self.id,
+                drops: self.drops.clone(),
+            }
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.drops
+                .lock()
+                .unwrap()
+                .push((self.id, thread::current().id()));
+        }
+    }
+
+    fn probe(id: u32, drops: &Drops) -> Probe {
+        Probe {
+            id,
+            drops: drops.clone(),
+        }
+    }
+
+    fn ids(map: &SubscriberMap<Probe>, field: u16) -> Vec<u32> {
+        map.of(field).map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn empty_to_one_and_attach_order_within_a_field() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        assert!(list.is_empty() && list.load().is_empty());
+        list.add(3, probe(1, &drops));
+        assert!(!list.is_empty());
+        assert_eq!(ids(&list.load(), 3), [1]);
+        assert!(ids(&list.load(), 2).is_empty());
+        list.add(3, probe(2, &drops));
+        list.add(1, probe(3, &drops));
+        list.add(5, probe(4, &drops));
+        let map = list.load();
+        assert_eq!(ids(&map, 3), [1, 2]);
+        let order: Vec<_> = map.iter().map(|(f, p)| (f, p.id)).collect();
+        assert_eq!(order, [(1, 3), (3, 1), (3, 2), (5, 4)]);
+    }
+
+    #[test]
+    fn last_removed_empties_and_a_no_op_retain_stores_nothing() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        list.add(0, probe(1, &drops));
+        assert!(list.retain(|_, _| true).is_empty());
+        // Had the retain stored, this add would free the map the first add
+        // made, dropping its copy of 1.
+        list.add(0, probe(2, &drops));
+        assert!(drops.lock().unwrap().is_empty(), "the no-op retain stored");
+        let gone = list.retain(|_, _| false);
+        assert_eq!(gone.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 2]);
+        assert!(list.is_empty() && list.load().is_empty());
+    }
+
+    /// A reader's guard keeps the removed monitor visible; its drop frees
+    /// nothing, and the next writer frees the old map on its own thread.
+    #[test]
+    fn remove_during_a_load() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        list.add(7, probe(1, &drops));
+        let (to_writer, from_reader) = std::sync::mpsc::channel();
+        let (to_reader, from_writer) = std::sync::mpsc::channel::<()>();
+        let reader = thread::scope(|s| {
+            let list = &list;
+            let reader = s.spawn(move || {
+                let guard = list.load();
+                to_writer.send(()).unwrap();
+                from_writer.recv().unwrap();
+                assert_eq!(ids(&guard, 7), [1], "the guard's map changed");
+                drop(guard);
+                to_writer.send(()).unwrap();
+                thread::current().id()
+            });
+            from_reader.recv().unwrap();
+            let gone = list.retain(|_, p| p.id != 1);
+            assert!(list.load().is_empty());
+            drop(gone);
+            to_reader.send(()).unwrap();
+            from_reader.recv().unwrap();
+            reader.join().unwrap()
+        });
+        let held = drops.lock().unwrap().len();
+        list.add(7, probe(2, &drops));
+        let drops = drops.lock().unwrap().clone();
+        assert!(drops.len() > held, "the next writer freed nothing");
+        assert!(drops.iter().all(|(_, t)| *t != reader), "{drops:?}");
+    }
+
+    /// Two writers' copy-modify-stores serialise: no add is lost, and each
+    /// writer's field keeps its attach order.
+    #[test]
+    fn two_writers_lose_no_add() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        thread::scope(|s| {
+            for field in [1u16, 2] {
+                let (list, drops) = (&list, &drops);
+                s.spawn(move || {
+                    for id in 0..300 {
+                        list.add(field, probe(id, drops));
+                    }
+                });
+            }
+        });
+        let map = list.load();
+        assert_eq!(map.len(), 600);
+        for field in [1, 2] {
+            assert_eq!(ids(&map, field), (0..300).collect::<Vec<_>>());
+        }
+        drop(map);
+        assert_eq!(list.retain(|f, _| f == 2).len(), 300);
+        assert!(!list.is_empty());
+        assert_eq!(list.retain(|_, _| false).len(), 300);
+        assert!(list.is_empty());
+    }
+
+    /// A reader loading and walking the map while a writer adds and removes
+    /// never frees a map version: every free lands on the writer's thread.
+    #[test]
+    fn a_racing_reader_never_frees_a_map() {
+        let drops = Drops::default();
+        let list = SubscriberList::default();
+        let stop = AtomicBool::new(false);
+        let (reader, writer) = thread::scope(|s| {
+            let (list, stop, drops) = (&list, &stop, &drops);
+            let reader = s.spawn(move || {
+                crate::sync::prime_current_thread();
+                let mut walked = 0usize;
+                while !stop.load(Ordering::Acquire) {
+                    let map = list.load();
+                    walked += map.of(4).count();
+                }
+                std::hint::black_box(walked);
+                thread::current().id()
+            });
+            let writer = s.spawn(move || {
+                for id in 0..2000 {
+                    list.add(4, probe(id, drops));
+                    if id % 2 == 1 {
+                        drop(list.retain(|_, p| p.id != id - 1));
+                    }
+                }
+                stop.store(true, Ordering::Release);
+                thread::current().id()
+            });
+            (reader.join().unwrap(), writer.join().unwrap())
+        });
+        let drops = drops.lock().unwrap().clone();
+        assert!(drops.iter().any(|(_, t)| *t == writer));
+        assert!(drops.iter().all(|(_, t)| *t != reader), "a reader freed");
+    }
 }
 
 #[cfg(test)]

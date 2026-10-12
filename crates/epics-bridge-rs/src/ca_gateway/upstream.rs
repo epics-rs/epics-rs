@@ -49,12 +49,13 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
+use epics_base_rs::runtime::sync::broadcast;
 use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
-use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
+use epics_ca_rs::client::{AccessRights, CaChannel, CaClient, ConnectionEvent, MonitorHandle};
 use epics_ca_rs::protocol::DBE_PROPERTY;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::AccessRightsNotifier;
@@ -200,7 +201,32 @@ struct UpstreamSubscription {
     /// watcher that keeps `upstream_write` in the access hook
     /// closure up-to-date. Aborted on drop (when the subscription is
     /// removed via `unsubscribe`).
-    _access_rights_watcher: EventWatcher,
+    _access_rights_watcher: AbortOnDrop,
+}
+
+/// Aborts the access-rights watcher with the subscription that owns it.
+struct AbortOnDrop(TaskHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The rights the coordinator broadcasts right after `Connected`, from a
+/// receiver taken with the channel. `None` once the client is gone.
+async fn connect_rights(rx: &mut broadcast::Receiver<ConnectionEvent>) -> Option<AccessRights> {
+    let mut connected = false;
+    loop {
+        match rx.recv().await {
+            Ok(ConnectionEvent::Connected) => connected = true,
+            Ok(ConnectionEvent::AccessRightsChanged { read, write }) if connected => {
+                return Some(AccessRights { read, write });
+            }
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
 }
 
 /// Shared state every upstream subscription's WriteHook needs. Hoisted
@@ -375,7 +401,7 @@ pub struct UpstreamManager {
     /// exists (the manager is built first), so it is wrapped in an
     /// `ArcSwapOption` for lock-free interior mutability. Fired whenever a
     /// gateway-side change flips a channel's computed downstream access —
-    /// an upstream IOC write-access event (`on_access_rights_change`) or an
+    /// an upstream IOC access-rights event (the subscription's watcher) or an
     /// `.acf`/`.pvlist` reload re-resolving per-PV ACLs
     /// ([`Self::notify_downstream_access_change`]). Mirrors C ca-gateway
     /// `postAccessRights` / `gateChan::resetAsClient` (gateVc.cc:170-199,
@@ -578,7 +604,10 @@ impl UpstreamManager {
         // Create one CA channel and reuse it for both monitor and
         // direct PUT/GET. Stored as Arc so the lifecycle guard fires
         // exactly once when the subscription is dropped.
-        let channel = Arc::new(self.client.create_channel(upstream_name));
+        // The receiver is taken with the channel, before its search starts:
+        // a connect that wins the race publishes its rights only once.
+        let (channel, mut conn_rx) = self.client.create_channel_with_events(upstream_name);
+        let channel = Arc::new(channel);
 
         // only register a shadow PV once the upstream channel
         // actually connects. Without this gate the get() below times out,
@@ -593,23 +622,37 @@ impl UpstreamManager {
         // reaper uses to drop stuck Connecting entries (cache.rs:323) —
         // one owner, so a longer CLI/API connect-timeout governs lazy
         // resolution too instead of being overridden by a local constant.
-        if let Err(e) = channel.wait_connected(self.connect_timeout).await {
-            // Drop the Connecting cache entry created above; no shadow PV
-            // is registered, so the resolver answers does-not-exist. The
-            // dedup PendingGuard notifies waiters, who then see no live
-            // subscription and propagate the same miss.
-            self.cache.write().await.remove(served_name);
-            tracing::info!(
-                pv = upstream_name,
-                served = served_name,
-                error = %e,
-                "ca-gateway-rs: upstream did not connect within connect_timeout; \
-                 treating search as a miss"
-            );
-            return Err(BridgeError::PutRejected(format!(
-                "upstream PV did not connect: {upstream_name}"
-            )));
-        }
+        let connected = match channel.wait_connected(self.connect_timeout).await {
+            Ok(()) => epics_base_rs::runtime::task::timeout(
+                self.connect_timeout,
+                connect_rights(&mut conn_rx),
+            )
+            .await
+            .ok()
+            .flatten()
+            .ok_or(CaError::Shutdown),
+            Err(e) => Err(e),
+        };
+        let initial_rights = match connected {
+            Ok(rights) => rights,
+            Err(e) => {
+                // Drop the Connecting cache entry created above; no shadow PV
+                // is registered, so the resolver answers does-not-exist. The
+                // dedup PendingGuard notifies waiters, who then see no live
+                // subscription and propagate the same miss.
+                self.cache.write().await.remove(served_name);
+                tracing::info!(
+                    pv = upstream_name,
+                    served = served_name,
+                    error = %e,
+                    "ca-gateway-rs: upstream did not connect within connect_timeout; \
+                     treating search as a miss"
+                );
+                return Err(BridgeError::PutRejected(format!(
+                    "upstream PV did not connect: {upstream_name}"
+                )));
+            }
+        };
 
         // DBR negotiation: best-effort initial GET so the shadow
         // PV's first registered value matches upstream's native type.
@@ -660,21 +703,11 @@ impl UpstreamManager {
                 }
             };
 
-        // read initial upstream read+write access and create the flags
-        // the access hook AND write-hook closures share. `channel.info()`
-        // reads a cached snapshot — no round-trip — and succeeds here
-        // because `channel.get()` above already waited for connection.
-        // Defaults to true (permissive) on the rare timeout/error path so
-        // we match the C gateway's connect-time behaviour (activate() reads
-        // ca_read_access/ca_write_access only after the channel is
-        // operational). One `info()` snapshot feeds both flags so read and
-        // write can't come from inconsistent reads.
-        let (upstream_read_init, upstream_write_init) = match channel.info().await {
-            Ok(i) => (i.access_rights.read, i.access_rights.write),
-            Err(_) => (true, true),
-        };
-        let upstream_write = Arc::new(AtomicBool::new(upstream_write_init));
-        let upstream_read = Arc::new(AtomicBool::new(upstream_read_init));
+        // The flags the access hook AND write-hook closures share, seeded
+        // from the rights the connect carried; the watcher below continues
+        // on the same receiver, so no event falls between seed and watch.
+        let upstream_write = Arc::new(AtomicBool::new(initial_rights.write));
+        let upstream_read = Arc::new(AtomicBool::new(initial_rights.read));
 
         // Atomically register the shadow PV WITH its WriteHook
         // attached. `add_pv_with_hook` constructs the PV with the
@@ -878,25 +911,45 @@ impl UpstreamManager {
         // level changed. Gated on an observed transition so a no-op
         // callback does not wake every client; the downstream side applies
         // the further `oldaccess != access` filter.
-        let access_rights_watcher = channel.on_access_rights_change({
+        let access_rights_watcher = AbortOnDrop(self.reactor.spawn({
             let write_flag = upstream_write.clone();
             let read_flag = upstream_read.clone();
             let notifier = self.access_notifier.clone();
-            move |rights| {
+            let channel = Arc::downgrade(&channel);
+            async move {
                 // C accessCB (gatePv.cc:1851-1852) updates BOTH read and
                 // write from ca_read_access/ca_write_access; postAccessRights
                 // re-pushes when the computed level changed on either bit.
                 // Track both flags and wake downstream clients if either
                 // flipped.
-                let prev_w = write_flag.swap(rights.write, Ordering::Relaxed);
-                let prev_r = read_flag.swap(rights.read, Ordering::Relaxed);
-                if prev_w != rights.write || prev_r != rights.read {
-                    if let Some(n) = notifier.load_full() {
-                        n.notify();
+                let apply = |rights: AccessRights| {
+                    let prev_w = write_flag.swap(rights.write, Ordering::Relaxed);
+                    let prev_r = read_flag.swap(rights.read, Ordering::Relaxed);
+                    if prev_w != rights.write || prev_r != rights.read {
+                        if let Some(n) = notifier.load_full() {
+                            n.notify();
+                        }
+                    }
+                };
+                loop {
+                    match conn_rx.recv().await {
+                        Ok(ConnectionEvent::AccessRightsChanged { read, write }) => {
+                            apply(AccessRights { read, write })
+                        }
+                        Ok(_) => {}
+                        // A lagged receiver lost events: the snapshot holds
+                        // the current rights (`connection_events`).
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let Some(ch) = channel.upgrade() else { break };
+                            if let Ok(info) = ch.info().await {
+                                apply(info.access_rights);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
-        });
+        }));
 
         // Spawn the monitor-forwarding task. CACHED: spawn now, seeded
         // with the monitor subscribed above. NO-CACHE: `initial_monitor`
@@ -2515,6 +2568,84 @@ ASG(NewGroup) {
             !mgr.update_acl(name, Some("NewGroup".to_string()), 0),
             "an unchanged ASG/ASL reports false"
         );
+
+        mgr.shutdown().await;
+    }
+
+    /// An upstream rights change that lands after the connect-time seed but
+    /// before the watcher reads its first event still reaches the shadow
+    /// PV's access hook — the decision the downstream server pushes to its
+    /// clients. The watcher used to subscribe its own receiver once the PV
+    /// was registered, so a change published in between was never seen and
+    /// the gateway kept granting a write the IOC had revoked.
+    // Same in-process `CaServer` gate as the test above.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn an_upstream_write_revoked_after_the_connect_reaches_the_access_hook() {
+        let name = "AS:revoke:pv";
+        let dir = tempfile::tempdir().expect("temp");
+        let acf = dir.path().join("rights.acf");
+        std::fs::write(&acf, "ASG(DEFAULT) {\n RULE(1, READ)\n RULE(1, WRITE)\n}\n")
+            .expect("write acf");
+        let server = Arc::new(
+            CaServer::builder()
+                .port(0)
+                .pv(name, EpicsValue::Double(1.0))
+                .acf_file(acf.to_str().unwrap())
+                .expect("load acf")
+                .build()
+                .await
+                .expect("CA server"),
+        );
+        let port = server.udp_port();
+        let _server = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = Arc::new(pinned_manager(db.clone()).await);
+        let subscribe = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.ensure_subscribed(name, name, None, 0).await }
+        });
+
+        // The shadow PV is registered after the seed and before the watcher.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pv = loop {
+            if let Some(pv) = db.find_pv(name).await {
+                break pv;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shadow PV never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let hook = pv.access_hook().expect("shadow PV carries the access hook");
+        assert!(
+            hook("alice", "host1").write,
+            "the ACF grants WRITE at connect"
+        );
+
+        std::fs::write(&acf, "ASG(DEFAULT) {\n RULE(1, READ)\n}\n").expect("rewrite acf");
+        server.reload_acf().await.expect("reload acf");
+        subscribe
+            .await
+            .expect("join")
+            .expect("ensure_subscribed connects to the hosted upstream");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while hook("alice", "host1").write {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gateway still grants a write the upstream revoked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(hook("alice", "host1").read, "READ is still granted");
 
         mgr.shutdown().await;
     }

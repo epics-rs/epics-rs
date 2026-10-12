@@ -228,6 +228,54 @@ pub fn pick_localhost_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+/// softIocPVX on `db` with `-S`, its output in `dir`'s `ioc.out`/`ioc.err`,
+/// and the PVA TCP port it serves. A port [`pick_localhost_port`] released
+/// can be taken before the IOC binds it, so a run that does not bind is
+/// respawned on fresh ports.
+pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, u16) {
+    let text = || {
+        ["ioc.out", "ioc.err"]
+            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap_or_default())
+            .join("\n")
+    };
+    for _ in 0..3 {
+        let tcp = pick_localhost_port();
+        let child = pvxs_command(ioc_bin)
+            .arg("-D")
+            .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
+            .arg("-d")
+            .arg(db)
+            .arg("-S")
+            .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
+            .env(
+                "EPICS_PVAS_BROADCAST_PORT",
+                pick_localhost_port().to_string(),
+            )
+            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+            .env("EPICS_CAS_SERVER_PORT", "0")
+            .env("EPICS_CA_SERVER_PORT", "0")
+            .stdout(std::fs::File::create(dir.join("ioc.out")).expect("ioc.out"))
+            .stderr(std::fs::File::create(dir.join("ioc.err")).expect("ioc.err"))
+            .spawn()
+            .expect("spawn softIocPVX");
+        let ioc = DropChild { child };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], tcp));
+        for _ in 0..50 {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+                .is_ok()
+            {
+                return (ioc, tcp);
+            }
+            if text().contains("Address already in use") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    panic!("softIocPVX did not bind in three tries:\n{}", text());
+}
+
 /// A helper's "I am listening" handshake file, on a path no other process can
 /// pick.
 ///

@@ -58,7 +58,7 @@
 //! marked leaf sets unioned (pvxs's monitor FIFO squash). A post never
 //! blocks, so one slow subscriber cannot stall the drain for other groups.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -75,6 +75,7 @@ use epics_pva_rs::server_native::{MonitorOutbox, MonitorUpdate};
 
 use super::group::{EventMark, GroupChannel, GroupMonitor, MemberEventKind};
 use super::group_config::GroupPvDef;
+use super::pvif::FieldMapping;
 
 /// The EPICS priority of the `qsrvGroup` drain thread — deliberately ONE
 /// BELOW the PVA connection threads, where pvxs puts its pump one ABOVE.
@@ -105,6 +106,21 @@ pub(crate) struct GroupDelivery {
     member_props: Vec<PropertySupport>,
     group_channel: GroupChannel,
     updates: MonitorOutbox<MonitorUpdate>,
+    /// Until the first post; touched by the drain alone.
+    prime: parking_lot::Mutex<Option<GroupPrime>>,
+}
+
+/// pvxs `subscriptionPost`'s `eventsPrimed` (`groupsource.cpp:256-264`):
+/// nothing is posted until every member subscription has delivered once,
+/// and the first post carries every leaf those events marked.
+struct GroupPrime {
+    /// C `hadValueEvent` / `hadPropertyEvent` per member; a member with no
+    /// such subscription starts seen (`fieldsubscriptionctx.h:51-54`).
+    seen: Vec<[bool; 2]>,
+    /// What `onSubscribe` assigns before any event: the two
+    /// `record._options` leaves and each member's assigned leaves
+    /// (`:401-424`).
+    marked: Vec<String>,
 }
 
 impl GroupDelivery {
@@ -114,12 +130,70 @@ impl GroupDelivery {
         group_channel: GroupChannel,
         updates: MonitorOutbox<MonitorUpdate>,
     ) -> Self {
+        let mut marked = vec![
+            "record._options.queueSize".to_string(),
+            "record._options.atomic".to_string(),
+        ];
+        let seen = def
+            .channels
+            .iter()
+            .map(|m| {
+                let value = m.has_channel();
+                if value || m.def.mapping == FieldMapping::Const {
+                    marked.extend(super::pvif::assigned_leaf_paths(
+                        &m.def.field_name,
+                        m.def.mapping,
+                        m.is_value_field(),
+                    ));
+                }
+                let property =
+                    value && matches!(m.def.mapping, FieldMapping::Scalar | FieldMapping::Meta);
+                [!value, !property]
+            })
+            .collect();
         Self {
             def,
             member_props,
             group_channel,
             updates,
+            prime: parking_lot::Mutex::new(Some(GroupPrime { seen, marked })),
         }
+    }
+
+    /// A member subscription that was not made, so the first post does not
+    /// wait for it.
+    pub(crate) fn not_subscribed(&self, member_index: usize, kind: MemberEventKind) {
+        let _ = self.primed(member_index, kind, EventMark::Skip);
+    }
+
+    /// The leaves to post for one member event, `None` for no post: before
+    /// the first post this event's marks are held back and merged.
+    fn primed(
+        &self,
+        member_index: usize,
+        kind: MemberEventKind,
+        mark: EventMark,
+    ) -> Option<Vec<String>> {
+        let mut prime = self.prime.lock();
+        let Some(p) = prime.as_mut() else {
+            return match mark {
+                EventMark::Marked(marked) => Some(marked),
+                EventMark::Skip => None,
+            };
+        };
+        if let Some(seen) = p.seen.get_mut(member_index) {
+            seen[kind as usize] = true;
+        }
+        if let EventMark::Marked(marked) = mark {
+            p.marked.extend(marked);
+        }
+        if !p.seen.iter().all(|s| s[0] && s[1]) {
+            return None;
+        }
+        let mut marked = prime.take()?.marked;
+        marked.sort_unstable();
+        marked.dedup();
+        Some(marked)
     }
 }
 
@@ -150,7 +224,7 @@ impl EventDelivery for MemberDelivery {
                 self.member_index,
             ),
         };
-        let EventMark::Marked(marked) = mark else {
+        let Some(marked) = group.primed(self.member_index, self.kind, mark) else {
             return;
         };
         // A value event serves its own member from the log; a property
@@ -553,6 +627,108 @@ mod tests {
         }
 
         mon.stop().await;
+        wait_drain_stopped(&pump).await;
+    }
+    /// softIocPVX 1.5.3's first update of `G` (`pvxmonitor -F delta G`, the
+    /// same with any `record[DBE=..]`) on `A` (ai, VAL 1.5, EGU mm, PREC 2)
+    /// and `B` (longin, VAL 3), the group below: `m` and `p` trigger nothing,
+    /// so no event marks them, and `a`'s value leaves come from `b`'s trigger.
+    const SEEDED_G: &str = "a.alarm.message a.alarm.severity a.alarm.status \
+        a.control.limitHigh a.control.limitLow a.display.description \
+        a.display.form.choices a.display.form.index a.display.limitHigh \
+        a.display.limitLow a.display.precision a.display.units \
+        a.timeStamp.nanoseconds a.timeStamp.secondsPastEpoch a.timeStamp.userTag \
+        a.value a.valueAlarm.highAlarmLimit a.valueAlarm.highWarningLimit \
+        a.valueAlarm.lowAlarmLimit a.valueAlarm.lowWarningLimit b.alarm.message \
+        b.alarm.severity b.alarm.status b.control.limitHigh b.control.limitLow \
+        b.display.description b.display.form.choices b.display.form.index \
+        b.display.limitHigh b.display.limitLow b.display.units \
+        b.timeStamp.nanoseconds b.timeStamp.secondsPastEpoch b.timeStamp.userTag \
+        b.value b.valueAlarm.highAlarmLimit b.valueAlarm.highWarningLimit \
+        b.valueAlarm.lowAlarmLimit b.valueAlarm.lowWarningLimit \
+        record._options.atomic record._options.queueSize";
+
+    /// START enables every member subscription, and the first post waits
+    /// for all of them and marks what their events assign
+    /// (`groupsource.cpp:256-297`).
+    #[tokio::test]
+    async fn the_first_group_update_marks_what_its_member_seeds_assign_as_softiocpvx() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_base_rs::types::EpicsValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        db.add_record("B", Box::new(LonginRecord::new(3)))
+            .await
+            .unwrap();
+        for (field, v) in [
+            ("EGU", EpicsValue::String("mm".into())),
+            ("PREC", EpicsValue::Short(2)),
+        ] {
+            db.get_record("A")
+                .unwrap()
+                .write()
+                .record
+                .put_field(field, v)
+                .unwrap();
+        }
+        let cfg = r#"{ "G": {
+            "a": {"+channel": "A.VAL"},
+            "m": {"+channel": "A.VAL", "+type": "meta"},
+            "p": {"+channel": "A.VAL", "+type": "plain"},
+            "b": {"+channel": "B.VAL", "+trigger": "a,b"}
+        } }"#;
+        let def = parse_group_config(cfg).unwrap().pop().unwrap();
+        let pump = GroupPump::new();
+        let mut mon = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
+        mon.start().await.expect("start");
+        let mut ring = mon.take_updates().expect("the ring");
+        for h in mon.activation_handles() {
+            h.enable(&db).await;
+        }
+        let first = tokio::time::timeout(Duration::from_secs(2), ring.recv())
+            .await
+            .expect("the first update")
+            .expect("ring open");
+        // A marked structure is every leaf under it on the wire.
+        fn leaves(at: &PvField, path: String, out: &mut Vec<String>) {
+            match at {
+                PvField::Structure(s) => {
+                    for (name, f) in &s.fields {
+                        leaves(f, format!("{path}.{name}"), out);
+                    }
+                }
+                _ => out.push(path),
+            }
+        }
+        let PvField::Structure(root) = &*first.value else {
+            panic!("a group is a structure");
+        };
+        let mut marked = Vec::new();
+        for path in first.marked.expect("a marked update").into_vec() {
+            let mut at = root
+                .get_field(path.split('.').next().unwrap())
+                .expect("marked");
+            for name in path.split('.').skip(1) {
+                let PvField::Structure(s) = at else {
+                    panic!("{path}")
+                };
+                at = s.get_field(name).expect("marked");
+            }
+            leaves(at, path, &mut marked);
+        }
+        marked.sort_unstable();
+        let want: Vec<&str> = SEEDED_G.split_whitespace().collect();
+        assert_eq!(marked, want);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ring.recv())
+                .await
+                .is_err(),
+            "the seeds post once"
+        );
+        drop(mon);
         wait_drain_stopped(&pump).await;
     }
 }

@@ -253,6 +253,19 @@ pub fn read_leaf_paths(
 ) -> Vec<String> {
     let everything = EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY;
     let mut paths = change_leaf_paths(prefix, mapping, everything, props);
+    paths.extend(assigned_leaf_paths(prefix, mapping, is_value_field));
+    paths
+}
+
+/// The leaves a member carries with no event behind them: a Scalar's
+/// `IOCSource::initialize` form and a Const's `info.cval`, both assigned at
+/// `onSubscribe` (`groupsource.cpp:414-424`) and again on every read.
+pub fn assigned_leaf_paths(
+    prefix: &str,
+    mapping: FieldMapping,
+    is_value_field: bool,
+) -> Vec<String> {
+    let mut paths = Vec::new();
     match mapping {
         // `IOCSource::initialize` — Scalar only.
         FieldMapping::Scalar => {

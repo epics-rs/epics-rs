@@ -886,36 +886,34 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     })
                 }
                 OpenedMonitor::Db(monitor) => {
-                    // Seed a group monitor from the monitor-stamped value path
-                    // (`GroupMonitor::seed`), not the GET path, so the initial
-                    // DATA frame's `record._options` (atomic = true, negotiated
-                    // queueSize) match the update stream that `poll()` drains
-                    // from the same `group_channel`. pvxs delivers the first
-                    // group post through the monitor-stamped `currentValue`
-                    // (ioc/groupsource.cpp:401-405), whereas the GET path stamps
-                    // the operation atomicity and queueSize = 0 (:480-485); the
-                    // old GET seed made the first frame disagree with every
-                    // later one. The subscription
-                    // is already armed (open_monitor started it), so any event
-                    // between seed and stream is buffered in the monitor's
-                    // update ring rather than lost or doubled.
-                    //
-                    // The seed carries the leaves the read assigned, like any
-                    // other framed read — plus `record._options.queueSize`,
-                    // which `onSubscribe` assigns on the monitor's
-                    // `currentValue` and `onGet` does not
-                    // (`groupsource.cpp:401-405` vs `:484`).
-                    let name = checked.pv_name().to_string();
-                    let initial = match monitor.seed().await.map(PvField::Structure) {
-                        Some(value) => {
-                            let mut marked =
-                                read_marks(&provider_seed, &pva_pvs_seed, &name, &value).await;
-                            if let Some(paths) = marked.as_mut() {
-                                paths.push("record._options.queueSize".to_string());
+                    // START is pvxs `onStartSubscription`: an `enable()` per
+                    // member subscription, whose posts the drain holds until
+                    // each has delivered once (`groupsource.cpp:256-297`), so
+                    // the first update marks only what those events assign.
+                    // A group with no member subscription has nothing to wait
+                    // for and posts at once; that post is read here, through
+                    // the monitor-stamped `GroupMonitor::seed` so its
+                    // `record._options` match the update stream (`:401-405`).
+                    let mut monitor = monitor;
+                    let handles = std::sync::Arc::new(monitor.activation_handles());
+                    let initial = if handles.is_empty() {
+                        let name = checked.pv_name().to_string();
+                        match monitor.seed().await.map(PvField::Structure) {
+                            Some(value) => {
+                                let mut marked =
+                                    read_marks(&provider_seed, &pva_pvs_seed, &name, &value).await;
+                                if let Some(paths) = marked.as_mut() {
+                                    paths.push("record._options.queueSize".to_string());
+                                }
+                                Some(epics_pva_rs::server_native::source::SourceRead {
+                                    value,
+                                    marked,
+                                })
                             }
-                            Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
+                            None => self.read_checked(checked, ctx).await,
                         }
-                        None => self.read_checked(checked, ctx).await,
+                    } else {
+                        None
                     };
                     // The source's drain posts into the monitor's ring, which
                     // the op reads directly: no task per monitor. The gate
@@ -923,16 +921,20 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     // the gate) cancels its subscriptions — pvxs's
                     // subscription context owns both its `dbChannel`s and
                     // its `onStart`.
-                    let mut monitor = monitor;
                     let updates = monitor.take_updates()?;
-                    let handles = std::sync::Arc::new(monitor.activation_handles());
+                    let db = provider_seed.database().clone();
                     let gate =
                         epics_pva_rs::server_native::source::MonitorGate::new(move |active| {
                             let _owner = &monitor;
                             let handles = handles.clone();
+                            let db = db.clone();
                             async move {
                                 for h in handles.iter() {
-                                    h.set_active(active).await;
+                                    if active {
+                                        h.enable(&db).await;
+                                    } else {
+                                        h.set_active(false).await;
+                                    }
                                 }
                             }
                         });

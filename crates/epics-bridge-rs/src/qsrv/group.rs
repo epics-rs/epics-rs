@@ -2300,9 +2300,9 @@ impl GroupChannel {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MemberEventKind {
     /// Value or alarm change (DBE_VALUE | DBE_ALARM).
-    Value,
+    Value = 0,
     /// Property change — display limits, enum choices, etc. (DBE_PROPERTY).
-    Property,
+    Property = 1,
 }
 
 /// A PVA monitor for a group PV that subscribes to all member records.
@@ -2749,6 +2749,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     if let Some(e) = refused(why) {
                         return Err(e);
                     }
+                    delivery.not_subscribed(idx, MemberEventKind::Value);
                 }
             }
 
@@ -2782,6 +2783,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                         if let Some(e) = refused(why) {
                             return Err(e);
                         }
+                        delivery.not_subscribed(idx, MemberEventKind::Property);
                     }
                 }
             }

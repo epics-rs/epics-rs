@@ -3866,24 +3866,13 @@ impl PvDatabase {
     }
 
     /// Internal: synchronous existence check without resolver.
+    ///
+    /// C `dbChannelTest` (`dbChannel.c:331-342`): the record name up to the
+    /// first `.`, then the field name's identifier prefix
+    /// (`dbStaticLib.c:1800-1802`); what follows is not read, so
+    /// `R.VAL$garbage` is found and refused at create.
     fn has_name_no_resolve(&self, name: &str) -> bool {
-        self.channel_name_found(name, false)
-    }
-
-    /// `dbChannelCreate`'s existence half, which also judges the `$`
-    /// modifier against the field (`dbChannel.c:486-503`); the search side,
-    /// `dbChannelTest`, does not.
-    pub(crate) fn channel_create_found(&self, name: &str) -> bool {
-        self.channel_name_found(name, true)
-    }
-
-    fn channel_name_found(&self, name: &str, create: bool) -> bool {
-        // strip the channel-filter suffix before lookup so a
-        // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
-        // resolves to its underlying PV at UDP-search time. This is the
-        // search-side twin of `find_entry_no_resolve`; without it a
-        // filtered SimplePv never answers a SEARCH and the client never
-        // reaches CREATE_CHAN. See that function for the full rationale.
+        // A filtered simple PV (`SP.{"arr":...}`) answers by its base name.
         let record_path = filters::split_channel_name(name).record_path;
         if self
             .inner
@@ -3893,32 +3882,55 @@ impl PvDatabase {
         {
             return true;
         }
-        // C's search-side test is `dbChannelTest` (`dbChannel.c:441-464`),
-        // which resolves the FIELD too — `REC.NOSUCH` answers "does not
-        // exist" rather than drawing the client into a CREATE_CHAN it must
-        // then refuse (pvxs#193). Validate an explicit suffix; a bare name
-        // binds `VAL`, which every record type declares, so the record's
-        // existence alone answers it — that also keeps this function
-        // lock-free per record for the DB-link locality callers, which
-        // pass suffix-less record names.
+        let (base, rest) = name.split_once('.').unwrap_or((name, ""));
+        let Some(rec) = self.record_or_alias(base) else {
+            return false;
+        };
+        let len = match rest.as_bytes().first() {
+            Some(c) if c.is_ascii_alphabetic() || *c == b'_' => rest
+                .bytes()
+                .position(|c| !(c.is_ascii_alphanumeric() || c == b'_'))
+                .unwrap_or(rest.len()),
+            // An absent field name binds `VAL`.
+            _ => return true,
+        };
+        self.names_field(&rec, &rest[..len])
+    }
+
+    fn record_or_alias(&self, name: &str) -> Option<Arc<RecordCell>> {
+        self.inner.records.read().get(name).cloned().or_else(|| {
+            let target = self.alias_target(name);
+            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
+        })
+    }
+
+    /// `dbChannelCreate`'s existence half, which also judges the `$`
+    /// modifier against the field (`dbChannel.c:486-503`); the search side,
+    /// `dbChannelTest`, does not.
+    pub(crate) fn channel_create_found(&self, name: &str) -> bool {
+        // A filtered channel (`REC.{"dbnd":{"d":0.5}}`) resolves to its
+        // underlying PV, as in `find_entry_no_resolve`.
+        let record_path = filters::split_channel_name(name).record_path;
+        if self
+            .inner
+            .simple_pvs
+            .lock()
+            .contains_key(record_path.as_str())
+        {
+            return true;
+        }
         let (base, explicit_field) = match record_path.rsplit_once('.') {
             Some((base, field)) => (base, Some(field)),
             None => (record_path.as_str(), None),
         };
-        let rec = self.inner.records.read().get(base).cloned().or_else(|| {
-            // Alias entry exists and points to a live record
-            // (epics-base PR #336).
-            let target = self.alias_target(base);
-            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
-        });
-        let Some(rec) = rec else {
+        let Some(rec) = self.record_or_alias(base) else {
             return false;
         };
         let Some(field) = explicit_field else {
             return true;
         };
         match field.strip_suffix('$') {
-            Some(core) => self.channel_field_found(&rec, core, create),
+            Some(core) => self.channel_field_found(&rec, core, true),
             None => self.names_field(&rec, field),
         }
     }
@@ -4702,6 +4714,11 @@ mod tests {
         assert!(db.has_name("TARGET.VAL$").await);
         assert!(db.has_name("WF.VAL$").await);
         assert!(!db.has_name("TARGET.NOSUCH$").await);
+        // Nor does it read past the field name's identifier prefix.
+        assert!(db.has_name("TARGET.VAL$garbage").await);
+        assert!(db.has_name("TARGET.VAL.{bad").await);
+        assert!(db.has_name("TARGET.1abc").await);
+        assert!(!db.has_name("TARGET.NOSUCH$garbage").await);
         db.add_record(
             "WS",
             Box::new(crate::server::records::waveform::WaveformRecord::new(

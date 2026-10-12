@@ -125,6 +125,7 @@ impl PvDatabaseSource {
         checked: epics_base_rs::server::access_security::AccessChecked,
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
+        gate_seeds: bool,
     ) -> Option<(
         MonitorStream<crate::server_native::source::MonitorUpdate>,
         Option<crate::server_native::source::MonitorGate>,
@@ -158,6 +159,7 @@ impl PvDatabaseSource {
         // are the scalars its descriptor advertised.
         let render = record_channel_render(&rec, cn, value_filters)?;
 
+        let is_value_field = epics_base_rs::server::database::is_value_field(&cn.field);
         let door = MetaDoor::new(
             db.clone(),
             rec,
@@ -181,7 +183,18 @@ impl PvDatabaseSource {
             },
             || {
                 let mut ring = PostRing::new(held, door.read()?);
-                Some(move |ev| marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read()))
+                // Only a stream the gate seeds has a first post to wait for; the
+                // ungated one carries updates alone (`subscribe_checked_opts_marked`).
+                let mut prime = gate_seeds.then(|| Prime::new(is_value_field));
+                Some(move |ev: MonitorEvent| {
+                    use epics_base_rs::server::recgbl::EventMask;
+                    // A value-half event never carries PROPERTY, a property-half
+                    // event always does (`pLog->mask = caEventMask & select`).
+                    let property = ev.mask().intersects(EventMask::PROPERTY);
+                    let update =
+                        marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read());
+                    Prime::gate(&mut prime, property, update)
+                })
             },
         )
         .map_err(|why| report_subscribe_refused(why, peer, &name))
@@ -190,11 +203,19 @@ impl PvDatabaseSource {
         // STOP takes both halves off the record, so posts made while
         // stopped are never queued: pvxs `onStart(false)` ⇒
         // `db_event_disable` (`singlesource.cpp:170-179`, `dbEvent.c:524`).
+        // START is pvxs's `enable()` on each half, which also posts the
+        // half's current value under its own mask: that pair is the
+        // monitor's first update, so its leaves follow `DBE`.
         let gate = crate::server_native::source::MonitorGate::new(move |active| {
             let halves = halves.clone();
+            let db = db.clone();
             async move {
                 for h in &halves {
-                    h.set_active(active).await;
+                    if active {
+                        h.enable(&db).await;
+                    } else {
+                        h.set_active(false).await;
+                    }
                 }
             }
         });
@@ -1548,7 +1569,7 @@ impl ChannelSource for PvDatabaseSource {
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> Option<MonitorStream<crate::server_native::source::MonitorUpdate>> {
-        self.open_monitor(checked, ctx, opts)
+        self.open_monitor(checked, ctx, opts, false)
             .await
             .map(|(stream, _)| stream)
     }
@@ -1562,9 +1583,14 @@ impl ChannelSource for PvDatabaseSource {
         crate::server_native::source::SubscriptionSeed<crate::server_native::source::MonitorUpdate>,
     > {
         let (updates, on_start) = self
-            .open_monitor(checked.clone(), ctx.clone(), opts)
+            .open_monitor(checked.clone(), ctx.clone(), opts, true)
             .await?;
-        let initial = self.read_checked(checked, ctx).await;
+        // A record monitor's gate seeds it (see `open_monitor`); a mailbox
+        // has no gate and is seeded by a read.
+        let initial = match on_start {
+            Some(_) => None,
+            None => self.read_checked(checked, ctx).await,
+        };
         Some(crate::server_native::source::SubscriptionSeed {
             initial,
             updates,
@@ -1963,6 +1989,62 @@ impl MetaDoor {
     /// drain or the subscribing task, neither holding another record lock.
     fn read(&self) -> Option<Snapshot> {
         record_snapshot(&self.db, &self.rec, &self.field, self.render, &self.filters)
+    }
+}
+
+/// pvxs's first monitor post waits for an event from each half
+/// (`singlesource.cpp:61-63`) and carries every leaf assigned meanwhile,
+/// from the `display.form` pair `IOCSource::initialize` assigns on.
+struct Prime {
+    value: bool,
+    property: bool,
+    marked: Vec<String>,
+}
+
+impl Prime {
+    fn new(is_value_field: bool) -> Self {
+        let mut marked = vec!["display.form.choices".to_string()];
+        if is_value_field {
+            marked.push("display.form.index".into());
+        }
+        Self {
+            value: false,
+            property: false,
+            marked,
+        }
+    }
+
+    /// `update` as the client sees it: held back, with its leaves kept,
+    /// until both halves have delivered; then the first post with them all.
+    fn gate(
+        prime: &mut Option<Self>,
+        property: bool,
+        update: Option<crate::server_native::source::MonitorUpdate>,
+    ) -> Option<crate::server_native::source::MonitorUpdate> {
+        let Some(p) = prime else {
+            return update;
+        };
+        if property {
+            p.property = true;
+        } else {
+            p.value = true;
+        }
+        let mut update = update?;
+        for leaf in update
+            .marked
+            .take()
+            .map(crate::server_native::source::Marks::into_vec)
+            .unwrap_or_default()
+        {
+            if !p.marked.contains(&leaf) {
+                p.marked.push(leaf);
+            }
+        }
+        if !(p.value && p.property) {
+            return None;
+        }
+        update.marked = prime.take().map(|p| p.marked.into());
+        Some(update)
     }
 }
 
@@ -5091,9 +5173,10 @@ ASG(DEFAULT) {
     }
 
     /// STOP takes both subscriptions off the record, so a post made while
-    /// stopped is never queued and RESUME delivers only the next post: pvxs
-    /// `onStart(false)` ⇒ `db_event_disable` (`singlesource.cpp:170-179`,
-    /// `dbEvent.c:524`), which unlinks the event from `mlis`.
+    /// stopped is never queued: pvxs `onStart(false)` ⇒ `db_event_disable`
+    /// (`singlesource.cpp:170-179`, `dbEvent.c:524`), which unlinks the event
+    /// from `mlis`. START and RESUME post the current value instead
+    /// (`subscriptionctx.h:56-57`; pinned in `monitor_seed_mask.rs`).
     #[epics_macros_rs::epics_test]
     async fn a_stopped_record_monitor_drops_posts_until_resumed() {
         use epics_base_rs::server::records::ai::AiRecord;
@@ -5135,17 +5218,30 @@ ASG(DEFAULT) {
         let quiet = std::time::Duration::from_millis(300);
         let within = std::time::Duration::from_secs(2);
 
+        let double = |v: f64| Some(PvField::Scalar(ScalarValue::Double(v)));
+
         gate.set_active(true).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("START posts the current value");
+        assert_eq!(value(u.expect("open")), double(0.0));
         put(1.0).await;
         let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
             .await
-            .expect("a started monitor posts")
-            .expect("open");
-        assert_eq!(value(u), Some(PvField::Scalar(ScalarValue::Double(1.0))));
+            .expect("a started monitor posts");
+        assert_eq!(value(u.expect("open")), double(1.0));
 
         gate.set_active(false).await;
         put(2.0).await;
+        put(2.5).await;
         gate.set_active(true).await;
+        // RESUME is `enable()` again: each half posts the current value.
+        for half in ["value", "property"] {
+            let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("RESUME posts the {half} half's current value"));
+            assert_eq!(value(u.expect("open")), double(2.5));
+        }
         assert!(
             epics_base_rs::runtime::task::timeout(quiet, rx.recv())
                 .await
@@ -5156,9 +5252,8 @@ ASG(DEFAULT) {
         put(3.0).await;
         let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
             .await
-            .expect("a resumed monitor posts")
-            .expect("open");
-        assert_eq!(value(u), Some(PvField::Scalar(ScalarValue::Double(3.0))));
+            .expect("a resumed monitor posts");
+        assert_eq!(value(u.expect("open")), double(3.0));
     }
 
     /// The record's post carries its raw stamp (`dbEvent.c:710`); the PVA

@@ -51,6 +51,9 @@ mod harness_paths;
 #[path = "interop_pvxs_mods/large_array.rs"]
 mod large_array;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/monitor_seed_mask.rs"]
+mod monitor_seed_mask;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/monitor_stream.rs"]
 mod monitor_stream;
 #[cfg(unix)]
@@ -68,6 +71,9 @@ mod reverse_complex_types;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/rpc_and_get_field.rs"]
 mod rpc_and_get_field;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/search_prefix.rs"]
+mod search_prefix;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/server_ports_env.rs"]
 mod server_ports_env;

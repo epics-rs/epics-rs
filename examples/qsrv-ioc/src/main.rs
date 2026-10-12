@@ -89,14 +89,6 @@ async fn main() -> CaResult<()> {
     let provider = Arc::new(provider);
     let store = Arc::new(QsrvPvStore::new(reactor.clone(), provider));
 
-    // ── Simulator ──
-    spawn_simulator(&reactor, db.clone());
-
-    // ── Scan start (C iocInit owns it, the servers do not scan) ──
-    // One core-owned scan owner covers both front-ends; held to the end
-    // of main so periodic SCAN fields stay live while the IOC serves.
-    let _scan_owner = ioc.run().await;
-
     // ── Build both servers from the same database ──
     // One policy cell for both protocols, so an `asInit` from the shell
     // (or a future ACF reload) gates CA and PVA together.
@@ -120,6 +112,15 @@ async fn main() -> CaResult<()> {
     for pv in &pv_list {
         eprintln!("    {pv}");
     }
+
+    // ── Simulator ──
+    spawn_simulator(&reactor, db.clone());
+
+    // ── Scan start (C iocInit owns it, the servers do not scan) ──
+    // One core-owned scan owner covers both front-ends; held to the end
+    // of main so periodic SCAN fields stay live while the IOC serves.
+    let _scan_owner = ioc.run().await;
+
     let ca_server =
         CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await?;
     let pva_server = PvaServer::from_parts(db, None, acf, None, None);

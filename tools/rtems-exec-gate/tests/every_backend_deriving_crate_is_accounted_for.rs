@@ -205,6 +205,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/interop_pvxs_mods/field_projection.rs",
     ),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/monitor_seed_mask.rs",
+    ),
     ("epics-pva-rs", "tests/interop_pvxs_mods/pipeline_r20.rs"),
     (
         "epics-pva-rs",
@@ -214,6 +218,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/interop_pvxs_mods/server_ports_env.rs",
     ),
+    ("epics-pva-rs", "tests/interop_pvxs_mods/search_prefix.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tcp_search_r11.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_interop.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_mtls.rs"),

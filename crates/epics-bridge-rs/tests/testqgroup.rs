@@ -87,6 +87,43 @@ fn empty_request() -> PvStructure {
     PvStructure::new("epics:nt/NTRequest:1.0")
 }
 
+/// MONITOR START as the PVA server issues it, pvxs `onStartSubscription`:
+/// start, enable every member subscription, and take the post their seeds
+/// make, so what follows is deltas.
+async fn start_seeded(mon: &mut epics_bridge_rs::qsrv::group::GroupMonitor, db: &PvDatabase) {
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    mon.start().await.expect("start");
+    for h in mon.activation_handles() {
+        h.enable(db).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+        .await
+        .expect("the seeds post within 2s")
+        .expect("the seed post");
+}
+
+/// A group monitor's first update: START (`onStartSubscription`) and the
+/// post its member seeds make; there is no read seed beside it.
+async fn first_update(
+    mut seed: epics_pva_rs::server_native::source::SubscriptionSeed<
+        epics_pva_rs::server_native::MonitorUpdate,
+    >,
+) -> epics_pva_rs::server_native::MonitorUpdate {
+    assert!(
+        seed.initial.is_none(),
+        "a group with members has no read seed"
+    );
+    seed.on_start
+        .as_ref()
+        .expect("a group monitor has a START gate")
+        .set_active(true)
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), seed.updates.recv())
+        .await
+        .expect("the seeds post within 2s")
+        .expect("the seed post")
+}
+
 async fn make_db() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:level", Box::new(AiRecord::new(1.5)))
@@ -346,7 +383,7 @@ async fn group_monitor_subscribes_archive_log_events() {
         .cloned()
         .expect("grp_trig registered");
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
@@ -376,7 +413,7 @@ async fn group_monitor_subscribes_archive_log_events() {
         .cloned()
         .expect("grp registered");
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
@@ -650,11 +687,7 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
             .subscribe_seeded(checked, ctx, opts)
             .await
             .expect("group monitor subscribes");
-        let initial = match seed
-            .initial
-            .expect("a group monitor seeds from its monitor-stamped value")
-            .value
-        {
+        let initial = match first_update(seed).await.value.into_owned() {
             PvField::Structure(s) => s,
             other => panic!("group seed must be a structure: {other:?}"),
         };
@@ -944,7 +977,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     );
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // The monitor is purely delta-driven: the wire layer owns the full
     // initial frame, so poll() carries only fresh member deltas with
@@ -1012,7 +1045,7 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
     );
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // Delta-driven monitor: a single `level` post yields one delta carrying
     // the self member's leaves — assigned-not-changed, so it is a pure
@@ -1062,7 +1095,7 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
         .expect("grp registered");
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // Only `level` changes after start; `count` never posts.
     {
@@ -1550,7 +1583,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
         .expect("grp registered");
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     let handles = mon.activation_handles();
     assert!(
         !handles.is_empty(),
@@ -2277,9 +2310,8 @@ async fn group_monitor_seed_marks_the_negotiated_queue_size() {
         .subscribe_seeded(checked, ctx, MonitorOptions::default())
         .await
         .expect("group monitor subscribes");
-    let marked = seed
-        .initial
-        .expect("a group monitor seeds from its monitor-stamped value")
+    let marked = first_update(seed)
+        .await
         .marked
         .expect("a group seed frames by what it assigned");
     for path in ["record._options.queueSize", "record._options.atomic"] {
@@ -2411,7 +2443,7 @@ async fn a_dollar_text_member_serves_what_softiocpvx_serves() {
     assert_eq!(member(&got, "fs.value"), text("world"));
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     put("again").await;
     let mut posted = Vec::new();
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await {

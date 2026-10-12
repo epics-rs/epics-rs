@@ -275,10 +275,12 @@ struct SubscriberSlot {
 }
 
 impl SubscriberSlot {
-    fn activation_handle(&self) -> SubscriptionActivation {
+    /// `field` is the slot's upper-cased field.
+    fn activation_handle(&self, field: &str) -> SubscriptionActivation {
         SubscriptionActivation {
             record: self.record.clone(),
             id: self.id,
+            field: field.into(),
         }
     }
 }
@@ -377,6 +379,7 @@ pub struct GetFailed;
 pub struct SubscriptionActivation {
     record: std::sync::Arc<crate::server::record::RecordCell>,
     id: crate::server::event_queue::AttachId,
+    field: std::sync::Arc<str>,
 }
 
 impl SubscriptionActivation {
@@ -385,6 +388,23 @@ impl SubscriptionActivation {
     /// — see that method for the `db_event_disable` parity rationale.
     pub async fn set_active(&self, active: bool) {
         self.record.write().set_subscriber_active(self.id, active);
+    }
+
+    /// pvxs's `enable()` (`subscriptionctx.h:56-57`): `db_event_enable`,
+    /// then `db_post_single_event`, so the field's current value reaches
+    /// this subscriber under its own `select`. The read is
+    /// `dbChannelGet` under the scan lock, as the CA seed reads it.
+    pub async fn enable(&self, db: &PvDatabase) {
+        self.set_active(true).await;
+        let snap = {
+            let _scan_lock = db.lock_instance(&self.record);
+            db.channel_snapshot_for_field(&self.record, &self.field, false)
+        };
+        if let Some(snap) = snap {
+            self.record
+                .read()
+                .post_single_event(&self.field, self.id, std::sync::Arc::new(snap));
+        }
     }
 }
 
@@ -510,7 +530,7 @@ impl DbSubscription {
     /// task — both toggle the same slot, so the source-side gating stays
     /// consistent with the queue this handle was minted from.
     pub fn activation_handle(&self) -> SubscriptionActivation {
-        self.slot.activation_handle()
+        self.slot.activation_handle(&self.channel.field)
     }
 
     /// Await the next event from this subscription's queue (C `event_read`).
@@ -683,6 +703,9 @@ struct Route<D> {
     field: String,
     read: Option<PostStage>,
     delivery: D,
+    /// C `user_sub = NULL`: set by the attachment's drop under
+    /// [`DrainSync::in_flight`].
+    canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Give a log that holds no value (C `dbfl_type_ref`) the field read now,
@@ -723,10 +746,67 @@ pub struct DbEventSource<D> {
 /// The live drain of a [`DbEventSource`].
 struct Drain {
     user: std::sync::Arc<crate::server::event_queue::EventUser>,
+    sync: std::sync::Arc<DrainSync>,
     /// Dropped with the last attachment; the drain thread returns on it.
     _stop: tokio::sync::oneshot::Sender<()>,
     #[cfg(test)]
     probe: std::sync::Arc<DrainProbe>,
+}
+
+/// C `callBackInProgress` and `db_sync_event` (`dbEvent.c:567-632`): a
+/// [`DbAttachment`] dropped while the drain delivers one of its entries
+/// waits for that delivery, and one dropped before it starts cancels it.
+#[derive(Default)]
+struct DrainSync {
+    /// The attachment whose entry the drain is delivering.
+    in_flight: parking_lot::Mutex<Option<crate::server::event_queue::AttachId>>,
+    done: parking_lot::Condvar,
+    /// The drain thread, which never waits on itself (C compares `taskid`).
+    thread: std::sync::OnceLock<std::thread::ThreadId>,
+}
+
+impl DrainSync {
+    /// Start delivering `id`'s entry, unless its attachment is dropped.
+    fn begin(
+        &self,
+        id: crate::server::event_queue::AttachId,
+        canceled: &std::sync::atomic::AtomicBool,
+    ) -> Option<InFlight<'_>> {
+        let mut in_flight = self.in_flight.lock();
+        if canceled.load(Ordering::Relaxed) {
+            return None;
+        }
+        *in_flight = Some(id);
+        Some(InFlight(self))
+    }
+
+    /// C `db_cancel_event`'s sync: on return the drain delivers nothing
+    /// more to `id`.
+    fn cancel(
+        &self,
+        id: crate::server::event_queue::AttachId,
+        canceled: &std::sync::atomic::AtomicBool,
+    ) {
+        let mut in_flight = self.in_flight.lock();
+        canceled.store(true, Ordering::Relaxed);
+        if self.thread.get() == Some(&std::thread::current().id()) {
+            return;
+        }
+        while *in_flight == Some(id) {
+            self.done.wait(&mut in_flight);
+        }
+    }
+}
+
+/// One delivery in progress; ends on every exit, a panicking delivery's
+/// included, so no drop waits on a drain that is gone.
+struct InFlight<'a>(&'a DrainSync);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        *self.0.in_flight.lock() = None;
+        self.0.done.notify_all();
+    }
 }
 
 /// What the pins read off a drain: how often it parked on an empty chain
@@ -742,16 +822,28 @@ struct DrainProbe {
 /// source's drain and nothing else, so it has no `recv`: a second consumer
 /// on the shared `ppendsem` would steal the drain's wakes. Dropping it
 /// cancels the slot (C `db_cancel_event`) and removes the record's row.
+/// The drop waits for a delivery of this attachment's entry already under
+/// way: it runs on server threads, never a scan thread, and holds no
+/// record lock.
 pub struct DbAttachment {
     reader: EventReader,
     slot: SubscriberSlot,
-    _drain: std::sync::Arc<Drain>,
+    /// Upper-cased.
+    field: Box<str>,
+    canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drain: std::sync::Arc<Drain>,
+}
+
+impl Drop for DbAttachment {
+    fn drop(&mut self) {
+        self.drain.sync.cancel(self.reader.id(), &self.canceled);
+    }
 }
 
 impl DbAttachment {
     /// See [`DbSubscription::activation_handle`].
     pub fn activation_handle(&self) -> SubscriptionActivation {
-        self.slot.activation_handle()
+        self.slot.activation_handle(&self.field)
     }
 
     /// C `db_event_enable`: put an [`DbEventSource::attach_disabled`]
@@ -822,11 +914,13 @@ impl<D: EventDelivery> DbEventSource<D> {
             .get_record(record_name)
             .ok_or(SubscribeRefused::NoRecord)?;
         let (pre, post) = filters.map(|chain| chain.split()).unwrap_or_default();
+        let canceled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let context: crate::server::event_queue::DeliveryContext = std::sync::Arc::new(Route {
             record: rec.clone(),
             field: field.clone(),
             read: PostStage::new(post, dollar),
             delivery,
+            canceled: canceled.clone(),
         });
         let drain = self.drain();
         let reader = {
@@ -851,7 +945,9 @@ impl<D: EventDelivery> DbEventSource<D> {
                 id: reader.id(),
             },
             reader,
-            _drain: drain,
+            field: field.into(),
+            canceled,
+            drain,
         })
     }
 
@@ -869,14 +965,17 @@ impl<D: EventDelivery> DbEventSource<D> {
         }
         let user = std::sync::Arc::new(crate::server::event_queue::EventUser::new());
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let sync = std::sync::Arc::new(DrainSync::default());
         let drain = std::sync::Arc::new(Drain {
             user: user.clone(),
+            sync: sync.clone(),
             _stop: stop,
             #[cfg(test)]
             probe: Default::default(),
         });
         let task = DrainTask::<D> {
             user,
+            sync,
             stop: stop_rx,
             #[cfg(test)]
             probe: drain.probe.clone(),
@@ -911,6 +1010,7 @@ impl<D: EventDelivery> DbEventSource<D> {
 /// What the drain thread owns.
 struct DrainTask<D> {
     user: std::sync::Arc<crate::server::event_queue::EventUser>,
+    sync: std::sync::Arc<DrainSync>,
     stop: tokio::sync::oneshot::Receiver<()>,
     #[cfg(test)]
     probe: std::sync::Arc<DrainProbe>,
@@ -923,6 +1023,7 @@ impl<D: EventDelivery> DrainTask<D> {
     async fn run(mut self) {
         use crate::server::event_queue::CircuitEvent;
         use std::task::Poll;
+        let _ = self.sync.thread.set(std::thread::current().id());
         #[cfg(test)]
         let mut parked = false;
         loop {
@@ -949,8 +1050,13 @@ impl<D: EventDelivery> DrainTask<D> {
             .await;
             match next {
                 None => return,
-                Some(CircuitEvent::Event { context, event, .. }) => {
+                Some(CircuitEvent::Event {
+                    id, context, event, ..
+                }) => {
                     let Some(route) = context.downcast_ref::<Route<D>>() else {
+                        continue;
+                    };
+                    let Some(_in_flight) = self.sync.begin(id, &route.canceled) else {
                         continue;
                     };
                     let mut event = event;
@@ -966,6 +1072,7 @@ impl<D: EventDelivery> DrainTask<D> {
                 Some(CircuitEvent::Ended(id)) => {
                     if let Some(context) = self.user.context(id)
                         && let Some(route) = context.downcast_ref::<Route<D>>()
+                        && let Some(_in_flight) = self.sync.begin(id, &route.canceled)
                     {
                         route.delivery.ended();
                     }
@@ -1078,7 +1185,7 @@ mod tests {
     use crate::server::recgbl::EventMask;
     use crate::server::records::ai::AiRecord;
 
-    // RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the
+    // RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the
     // exec-backend suite.
 
     /// Counts entries per subscription and keeps each one's last value; the
@@ -1210,7 +1317,7 @@ mod tests {
         };
         let subs = attach_all(&db, &source, N, &tally);
         let probe = probe(&source);
-        assert!(subs.iter().all(|s| Arc::ptr_eq(&s._drain, &subs[0]._drain)));
+        assert!(subs.iter().all(|s| Arc::ptr_eq(&s.drain, &subs[0].drain)));
         let before = settled_wakes(&probe);
 
         post(&db, 0, 1.0);
@@ -1298,5 +1405,73 @@ mod tests {
             })
             .collect();
         wait_until("every monitor's last value", || *tally.last.lock() == want);
+    }
+    /// Records a delivery that finishes after its attachment's drop returned.
+    struct Late {
+        entered: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+        late: Arc<AtomicUsize>,
+    }
+
+    impl EventDelivery for Late {
+        fn deliver(&self, _: MonitorEvent) -> impl std::future::Future<Output = ()> + Send {
+            self.entered.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(2));
+            if self.dropped.load(Ordering::Acquire) {
+                self.late.fetch_add(1, Ordering::AcqRel);
+            }
+            std::future::ready(())
+        }
+    }
+
+    /// C `db_cancel_event` syncs with `event_task` (`dbEvent.c:613-631`):
+    /// once an attachment's drop returns, the drain delivers nothing more to
+    /// it, whether the drop lands mid-delivery or between entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nothing_is_delivered_to_an_attachment_after_its_drop_returns() {
+        let db = ai_db(1).await;
+        let source = DbEventSource::<Late>::new(
+            "dbEvPin",
+            crate::runtime::task::ThreadPriority::Custom(17),
+            crate::runtime::task::StackSizeClass::Medium,
+        );
+        let late = Arc::new(AtomicUsize::new(0));
+        for round in 0..100u64 {
+            let (entered, dropped) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let sub = source
+                .attach(
+                    &db,
+                    "EV:0",
+                    EventMask::VALUE.bits(),
+                    None,
+                    None,
+                    Late {
+                        entered: entered.clone(),
+                        dropped: dropped.clone(),
+                        late: late.clone(),
+                    },
+                )
+                .unwrap();
+            for n in 0..3 {
+                post(&db, 0, (round * 3 + n) as f64);
+            }
+            if round % 2 == 0 {
+                wait_until("a delivery under way", || entered.load(Ordering::Acquire));
+            } else {
+                std::thread::sleep(Duration::from_micros(round % 7 * 300));
+            }
+            let at = Instant::now();
+            drop(sub);
+            dropped.store(true, Ordering::Release);
+            assert!(
+                at.elapsed() < Duration::from_secs(2),
+                "round {round}: drop hung"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(late.load(Ordering::Acquire), 0, "deliveries after drop");
     }
 }

@@ -37,10 +37,10 @@
 //! events arrive). On terminal failure the entry transitions to the
 //! `Disconnect` state, which the cleanup tick eventually evicts.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - `cached_old_for_audit_boundaries` runs
-// and passes in the exec-backend suite (it touches the cache only, never the
-// upstream client). The other twelve take gate (3); see the comment on
-// `manager_construct`.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - `cached_old_for_audit_boundaries` and
+// `connect_rights_resyncs_a_lagged_receiver` run and pass in the exec-backend
+// suite (the cache, and a bare broadcast channel; never the upstream client).
+// The others take gate (3); see the comment on `manager_construct`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -213,17 +213,54 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The rights the coordinator broadcasts right after `Connected`, from a
-/// receiver taken with the channel. `None` once the client is gone.
-async fn connect_rights(rx: &mut broadcast::Receiver<ConnectionEvent>) -> Option<AccessRights> {
+/// `ensure_subscribed` hands its channel to `reached` and waits on `release`
+/// before it starts the access-rights watcher.
+#[cfg(test)]
+struct WatchGate {
+    reached: epics_base_rs::runtime::sync::oneshot::Sender<Arc<CaChannel>>,
+    release: epics_base_rs::runtime::sync::oneshot::Receiver<()>,
+}
+
+/// The channel's current rights, for a receiver that lagged: the events it
+/// lost may be the ones that said so. `None` while disconnected.
+async fn current_rights(channel: &CaChannel) -> Option<AccessRights> {
+    channel.info().await.ok().map(|i| i.access_rights)
+}
+
+/// The rights the coordinator broadcasts with `Connected`, before it (C order,
+/// `camessage.c:1180/1201`) or after it, from a receiver taken with the
+/// channel, or from `resync` ([`current_rights`]) once the receiver has
+/// lagged. `None` once the client is gone.
+async fn connect_rights<F>(
+    rx: &mut broadcast::Receiver<ConnectionEvent>,
+    resync: impl Fn() -> F,
+) -> Option<AccessRights>
+where
+    F: std::future::Future<Output = Option<AccessRights>>,
+{
     let mut connected = false;
+    // Rights since the last `Disconnected`, which a following `Connected` owns.
+    let mut held = None;
     loop {
         match rx.recv().await {
-            Ok(ConnectionEvent::Connected) => connected = true,
-            Ok(ConnectionEvent::AccessRightsChanged { read, write }) if connected => {
-                return Some(AccessRights { read, write });
+            Ok(ConnectionEvent::Connected) => match held {
+                Some(rights) => return Some(rights),
+                None => connected = true,
+            },
+            Ok(ConnectionEvent::AccessRightsChanged { read, write }) => {
+                let rights = AccessRights { read, write };
+                if connected {
+                    return Some(rights);
+                }
+                held = Some(rights);
             }
-            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Ok(ConnectionEvent::Disconnected) => (connected, held) = (false, None),
+            Ok(_) => {}
+            // What is left in the receiver may be a past connect's pair.
+            Err(broadcast::error::RecvError::Lagged(_)) => match resync().await {
+                Some(rights) => return Some(rights),
+                None => (connected, held) = (false, None),
+            },
             Err(broadcast::error::RecvError::Closed) => return None,
         }
     }
@@ -395,6 +432,10 @@ pub struct UpstreamManager {
     /// unless `-mask l` was configured. Mirrors ca-gateway passing
     /// `GR->eventMask()` to `ca_create_subscription` (gatePv.cc:771-774).
     event_mask: u16,
+    /// Test-only pause between the rights seed and the watcher's first read,
+    /// where a rights event must not be lost.
+    #[cfg(test)]
+    watch_gate: parking_lot::Mutex<Option<WatchGate>>,
     /// Detachable handle that re-pushes `CA_PROTO_ACCESS_RIGHTS` to
     /// already-connected downstream clients. Installed via
     /// [`Self::install_access_notifier`] once the downstream `CaServer`
@@ -467,6 +508,8 @@ impl UpstreamManager {
             metadata_seed_timeout: Duration::from_millis(500),
             cache_mode: cfg.cache_mode,
             event_mask: cfg.event_mask,
+            #[cfg(test)]
+            watch_gate: parking_lot::Mutex::new(None),
             access_notifier: Arc::new(ArcSwapOption::empty()),
         })
     }
@@ -625,7 +668,7 @@ impl UpstreamManager {
         let connected = match channel.wait_connected(self.connect_timeout).await {
             Ok(()) => epics_base_rs::runtime::task::timeout(
                 self.connect_timeout,
-                connect_rights(&mut conn_rx),
+                connect_rights(&mut conn_rx, || current_rights(&channel)),
             )
             .await
             .ok()
@@ -911,6 +954,13 @@ impl UpstreamManager {
         // level changed. Gated on an observed transition so a no-op
         // callback does not wake every client; the downstream side applies
         // the further `oldaccess != access` filter.
+        #[cfg(test)]
+        let gate = self.watch_gate.lock().take();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(channel.clone());
+            let _ = gate.release.await;
+        }
         let access_rights_watcher = AbortOnDrop(self.reactor.spawn({
             let write_flag = upstream_write.clone();
             let read_flag = upstream_read.clone();
@@ -937,12 +987,10 @@ impl UpstreamManager {
                             apply(AccessRights { read, write })
                         }
                         Ok(_) => {}
-                        // A lagged receiver lost events: the snapshot holds
-                        // the current rights (`connection_events`).
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             let Some(ch) = channel.upgrade() else { break };
-                            if let Ok(info) = ch.info().await {
-                                apply(info.access_rights);
+                            if let Some(rights) = current_rights(&ch).await {
+                                apply(rights);
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -1616,7 +1664,8 @@ impl UpstreamManager {
 ///
 /// `upstream_write`/`upstream_read` mirror the upstream IOC's
 /// `ca_write_access(chID)`/`ca_read_access(chID)`, set at connect time and
-/// kept live by `on_access_rights_change`. The decisions are
+/// kept live by the subscription's watcher on the channel's connection
+/// events. The decisions are
 /// `local_acf_write && upstream_write` and `local_acf_read && upstream_read`,
 /// matching C `gateVcChan::writeAccess`/`readAccess` (gateVc.cc:341/326):
 /// `asclient->writeAccess() && vc->writeAccess()` /
@@ -2025,6 +2074,103 @@ mod tests {
     // this module is one of the gated ones.
     #[cfg(tokio_backend)]
     use serial_test::serial;
+
+    /// `connect_rights` takes the rights on either side of `Connected`, and
+    /// across its lag boundary. Eighteen events into the
+    /// 16-slot receiver drop the first pair, and the oldest kept pair is a
+    /// past connect's — so a lagged read must take the resync, not that.
+    #[tokio::test]
+    async fn connect_rights_resyncs_a_lagged_receiver() {
+        use ConnectionEvent::*;
+        let rights = |read, write| AccessRights { read, write };
+        let send_all = |tx: &broadcast::Sender<ConnectionEvent>, events: &[ConnectionEvent]| {
+            for e in events {
+                tx.send(*e).expect("receiver alive");
+            }
+        };
+        let bound = Duration::from_secs(1);
+        let granted = AccessRightsChanged {
+            read: true,
+            write: true,
+        };
+
+        // No lag, no resync: the rights on either side of `Connected`, never
+        // a pair from before a `Disconnected`.
+        let read_only = AccessRightsChanged {
+            read: true,
+            write: false,
+        };
+        for events in [
+            [granted, Disconnected, Connected, read_only],
+            [granted, Disconnected, read_only, Connected],
+        ] {
+            let (tx, mut rx) = broadcast::channel(16);
+            send_all(&tx, &events);
+            let got = tokio::time::timeout(
+                bound,
+                connect_rights(&mut rx, || async { panic!("no lag, no resync") }),
+            )
+            .await
+            .expect("bounded");
+            assert_eq!(
+                got.map(|r| (r.read, r.write)),
+                Some((true, false)),
+                "{events:?}"
+            );
+        }
+
+        // Lagged while connected: the resync's rights.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut flap = vec![Connected, granted];
+        for _ in 0..7 {
+            flap.extend([Connected, granted]);
+        }
+        flap.extend([
+            Connected,
+            AccessRightsChanged {
+                read: true,
+                write: false,
+            },
+        ]);
+        assert_eq!(flap.len(), 18);
+        send_all(&tx, &flap);
+        let got = tokio::time::timeout(
+            bound,
+            connect_rights(&mut rx, || async { Some(rights(true, false)) }),
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(
+            got.map(|r| (r.read, r.write)),
+            Some((true, false)),
+            "not a past connect's grant"
+        );
+
+        // Lagged while disconnected: the next connect's pair.
+        let (tx, mut rx) = broadcast::channel(16);
+        send_all(&tx, &[Disconnected; 18]);
+        let next = tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                send_all(
+                    &tx,
+                    &[
+                        Connected,
+                        AccessRightsChanged {
+                            read: false,
+                            write: false,
+                        },
+                    ],
+                );
+            }
+        });
+        let got = tokio::time::timeout(bound, connect_rights(&mut rx, || async { None }))
+            .await
+            .expect("bounded");
+        next.await.expect("sender");
+        assert_eq!(got.map(|r| (r.read, r.write)), Some((false, false)));
+    }
 
     #[test]
     fn native_placeholder_preserves_upstream_type_and_count() {
@@ -2575,14 +2721,15 @@ ASG(NewGroup) {
     /// An upstream rights change that lands after the connect-time seed but
     /// before the watcher reads its first event still reaches the shadow
     /// PV's access hook — the decision the downstream server pushes to its
-    /// clients. The watcher used to subscribe its own receiver once the PV
-    /// was registered, so a change published in between was never seen and
-    /// the gateway kept granting a write the IOC had revoked.
+    /// clients. `ensure_subscribed` is held at that point while the upstream
+    /// revokes WRITE and the channel's own state shows the change published,
+    /// so a watcher that subscribes only now has already missed it.
     // Same in-process `CaServer` gate as the test above.
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn an_upstream_write_revoked_after_the_connect_reaches_the_access_hook() {
+        let bound = Duration::from_secs(5);
         let name = "AS:revoke:pv";
         let dir = tempfile::tempdir().expect("temp");
         let acf = dir.path().join("rights.acf");
@@ -2607,24 +2754,24 @@ ASG(NewGroup) {
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
         let mgr = Arc::new(pinned_manager(db.clone()).await);
+        let (reached, reached_rx) = epics_base_rs::runtime::sync::oneshot::channel();
+        let (release_tx, release) = epics_base_rs::runtime::sync::oneshot::channel();
+        *mgr.watch_gate.lock() = Some(WatchGate { reached, release });
         let subscribe = tokio::spawn({
             let mgr = mgr.clone();
             async move { mgr.ensure_subscribed(name, name, None, 0).await }
         });
 
-        // The shadow PV is registered after the seed and before the watcher.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let pv = loop {
-            if let Some(pv) = db.find_pv(name).await {
-                break pv;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shadow PV never registered"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        let hook = pv.access_hook().expect("shadow PV carries the access hook");
+        let channel = tokio::time::timeout(bound, reached_rx)
+            .await
+            .expect("ensure_subscribed reaches the watcher")
+            .expect("gate sender kept");
+        let hook = db
+            .find_pv(name)
+            .await
+            .expect("the shadow PV is registered before the watcher")
+            .access_hook()
+            .expect("shadow PV carries the access hook");
         assert!(
             hook("alice", "host1").write,
             "the ACF grants WRITE at connect"
@@ -2632,12 +2779,23 @@ ASG(NewGroup) {
 
         std::fs::write(&acf, "ASG(DEFAULT) {\n RULE(1, READ)\n}\n").expect("rewrite acf");
         server.reload_acf().await.expect("reload acf");
-        subscribe
+        // The coordinator updates the snapshot after it broadcasts the event.
+        let deadline = std::time::Instant::now() + bound;
+        while channel.info().await.expect("connected").access_rights.write {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upstream channel never saw WRITE revoked"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release_tx.send(()).expect("ensure_subscribed is waiting");
+        tokio::time::timeout(bound, subscribe)
             .await
+            .expect("ensure_subscribed returns")
             .expect("join")
             .expect("ensure_subscribed connects to the hosted upstream");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + bound;
         while hook("alice", "host1").write {
             assert!(
                 std::time::Instant::now() < deadline,

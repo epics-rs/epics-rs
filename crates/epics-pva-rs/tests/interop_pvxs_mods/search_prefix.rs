@@ -6,6 +6,7 @@
 // `server::PvaServer` exists only on the tokio backend.
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{
     PVXGET, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, require_pvxs, spawn_soft_ioc_pvx,
 };
@@ -61,7 +62,7 @@ fn class(pvxget: &Path, tcp: u16, name: &str) -> Answer {
         .env("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{tcp}"))
         .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_PVA_ADDR_LIST", "")
-        .output()
+        .pvxs_output()
         .expect("spawn pvxget");
     let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
     if out.status.success() {

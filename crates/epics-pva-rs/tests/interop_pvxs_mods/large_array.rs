@@ -18,6 +18,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -91,7 +92,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await
@@ -144,38 +145,9 @@ async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
     }
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("large_arr_ready");
 
-    let mut child = match std::process::Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .env(env_key(), pvxs_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server not ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &[]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -186,14 +158,12 @@ async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
     let decoded = match client.pvget("L:DBL").await {
         Ok(v) => v,
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(srv);
             panic!("pvget on L:DBL failed: {e:?}");
         }
     };
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     let PvField::Structure(s) = &decoded else {
         panic!("expected struct, got {decoded:?}");

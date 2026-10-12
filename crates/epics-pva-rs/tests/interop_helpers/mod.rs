@@ -179,7 +179,7 @@ pub fn require_pvxs_tls() -> bool {
         .arg("-D")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .pvxs_output()
     {
         Ok(out) => out,
         Err(e) => panic!("`pvxinfo` at {} would not run: {e}", pvxinfo.display()),
@@ -196,6 +196,119 @@ pub fn require_pvxs_tls() -> bool {
         pvxs_home(),
     );
     false
+}
+
+/// How many times a pvxs process is started before its failure stands.
+const RANDOM_UDP_ATTEMPTS: usize = 8;
+
+/// Whether a pvxs process's output shows its client context failing to bind
+/// its search socket.
+///
+/// pvxs binds a random UDP4 port, then the same port on UDP6
+/// (`client.cpp:576-594`), and no variable skips the second bind; on a busy
+/// host the port can be taken on UDP6 alone. The context throws before it
+/// sends anything, so a rerun on a fresh port repeats nothing. Every process
+/// linked to pvxs that builds a client — the tools, softIocPVX's pvalink, a
+/// client helper — is rerun on it through [`rerun_pvxs`] or [`start_pvxs`].
+fn context_bind_failed(text: &str) -> bool {
+    text.contains("Unable to bind random UDP")
+}
+
+/// Run `attempt` until the output `text` reads from its result does not show
+/// [`context_bind_failed`], at most [`RANDOM_UDP_ATTEMPTS`] times.
+pub fn rerun_pvxs<T>(mut attempt: impl FnMut() -> T, text: impl Fn(&T) -> String) -> T {
+    for _ in 1..RANDOM_UDP_ATTEMPTS {
+        let out = attempt();
+        if !context_bind_failed(&text(&out)) {
+            return out;
+        }
+    }
+    attempt()
+}
+
+/// `Command::output` for a pvxs process that runs to completion, through
+/// [`rerun_pvxs`].
+pub trait PvxsOutput {
+    fn pvxs_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl PvxsOutput for Command {
+    fn pvxs_output(&mut self) -> std::io::Result<std::process::Output> {
+        rerun_pvxs(
+            || self.output(),
+            |out| match out {
+                Ok(out) => String::from_utf8_lossy(&out.stderr).into_owned(),
+                Err(_) => String::new(),
+            },
+        )
+    }
+}
+
+/// Where a [`start_pvxs`] process writes its stdout and stderr.
+pub struct PvxsLogs {
+    pub out: PathBuf,
+    pub err: PathBuf,
+}
+
+impl PvxsLogs {
+    /// `<tag>.out` / `<tag>.err` in `dir`.
+    pub fn in_dir(dir: &Path, tag: &str) -> Self {
+        Self {
+            out: dir.join(format!("{tag}.out")),
+            err: dir.join(format!("{tag}.err")),
+        }
+    }
+
+    /// Both logs, stdout first.
+    pub fn text(&self) -> String {
+        [&self.out, &self.err]
+            .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+            .join("\n")
+    }
+}
+
+/// Start a long-running pvxs process: `build` makes one attempt's command and
+/// the value `ready` is judged against, and the process is returned once
+/// `ready` holds on its logs. An attempt that shows [`context_bind_failed`] or
+/// `Address already in use`, exits, or is not ready within 5 s is killed and
+/// built afresh, at most [`RANDOM_UDP_ATTEMPTS`] times; the last attempt's logs
+/// are the error.
+pub fn start_pvxs<T>(
+    logs: &PvxsLogs,
+    mut build: impl FnMut() -> (Command, T),
+    mut ready: impl FnMut(&T, &str) -> bool,
+) -> Result<(DropChild, T), String> {
+    for _ in 0..RANDOM_UDP_ATTEMPTS {
+        let (mut cmd, value) = build();
+        let child = cmd
+            .stdout(std::fs::File::create(&logs.out).expect("create stdout log"))
+            .stderr(std::fs::File::create(&logs.err).expect("create stderr log"))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {:?}: {e}", cmd.get_program()));
+        let mut proc = DropChild { child };
+        for _ in 0..50 {
+            let text = logs.text();
+            if ready(&value, &text) {
+                return Ok((proc, value));
+            }
+            if context_bind_failed(&text)
+                || text.contains("Address already in use")
+                || proc.child.try_wait().is_ok_and(|s| s.is_some())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Err(logs.text())
+}
+
+/// An IOC is ready once iocInit has ended and `addr` accepts. The listen
+/// socket accepts before iocInit runs, and the pvalink client context built
+/// inside iocInit can still abort, so the connect alone proves nothing.
+pub fn ioc_ready(addr: &std::net::SocketAddr, text: &str) -> bool {
+    text.contains("All initialization complete")
+        && std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_millis(100)).is_ok()
 }
 
 /// Build a `Command` for a pvxs binary, with `DYLD_LIBRARY_PATH`
@@ -230,18 +343,13 @@ pub fn pick_localhost_port() -> u16 {
 
 /// softIocPVX on `db` with `-S`, its output in `dir`'s `ioc.out`/`ioc.err`,
 /// and the PVA TCP port it serves. A port [`pick_localhost_port`] released
-/// can be taken before the IOC binds it, so a run that does not bind is
-/// respawned on fresh ports.
+/// can be taken before the IOC binds it, so each attempt takes fresh ports.
 pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, u16) {
-    let text = || {
-        ["ioc.out", "ioc.err"]
-            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap_or_default())
-            .join("\n")
-    };
-    for _ in 0..3 {
+    let logs = PvxsLogs::in_dir(dir, "ioc");
+    let build = || {
         let tcp = pick_localhost_port();
-        let child = pvxs_command(ioc_bin)
-            .arg("-D")
+        let mut cmd = pvxs_command(ioc_bin);
+        cmd.arg("-D")
             .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
             .arg("-d")
             .arg(db)
@@ -254,26 +362,42 @@ pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, 
             .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
             .env("EPICS_CAS_SERVER_PORT", "0")
-            .env("EPICS_CA_SERVER_PORT", "0")
-            .stdout(std::fs::File::create(dir.join("ioc.out")).expect("ioc.out"))
-            .stderr(std::fs::File::create(dir.join("ioc.err")).expect("ioc.err"))
-            .spawn()
-            .expect("spawn softIocPVX");
-        let ioc = DropChild { child };
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], tcp));
-        for _ in 0..50 {
-            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-                .is_ok()
-            {
-                return (ioc, tcp);
-            }
-            if text().contains("Address already in use") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+            .env("EPICS_CA_SERVER_PORT", "0");
+        (cmd, std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+    };
+    match start_pvxs(&logs, build, ioc_ready) {
+        Ok((ioc, addr)) => (ioc, addr.port()),
+        Err(text) => panic!("softIocPVX did not come up:\n{text}"),
     }
-    panic!("softIocPVX did not bind in three tries:\n{}", text());
+}
+
+/// [`start_pvxs`] for a `cpp_helpers` server, ready once it writes `ready`,
+/// and the port it serves. Its logs go next to the ready file and are gone
+/// once it is up.
+pub fn start_cpp_server(helper: &Path, ready: &ReadyFile, extra: &[&str]) -> (DropChild, u16) {
+    let logs = PvxsLogs {
+        out: ready.path().with_extension("out"),
+        err: ready.path().with_extension("err"),
+    };
+    let build = || {
+        // A failed attempt's file would read as this one's.
+        let _ = std::fs::remove_file(ready.path());
+        let port = pick_localhost_port();
+        let mut cmd = pvxs_command(helper);
+        cmd.arg("--port")
+            .arg(port.to_string())
+            .arg("--ready")
+            .arg(ready.path())
+            .args(extra);
+        (cmd, port)
+    };
+    let started = start_pvxs(&logs, build, |_, _| ready.is_up());
+    let _ = std::fs::remove_file(&logs.out);
+    let _ = std::fs::remove_file(&logs.err);
+    match started {
+        Ok(started) => started,
+        Err(text) => panic!("{} did not become ready:\n{text}", helper.display()),
+    }
 }
 
 /// A helper's "I am listening" handshake file, on a path no other process can

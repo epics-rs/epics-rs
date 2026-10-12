@@ -14,6 +14,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -112,7 +113,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxcall exec")
     })
     .await
@@ -173,7 +174,7 @@ async fn interop_get_field_pvxinfo_against_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxinfo exec")
     })
     .await

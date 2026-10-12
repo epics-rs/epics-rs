@@ -11,7 +11,7 @@
 
 use super::interop_helpers::{
     DropChild, PVXMONITOR, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, require_pvxs,
-    spawn_soft_ioc_pvx,
+    rerun_pvxs, spawn_soft_ioc_pvx,
 };
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -44,30 +44,36 @@ const CASES: [(&str, &str); 10] = [
 fn first_leaves(pvxmonitor: &Path, tcp: u16, dir: &Path, n: usize) -> BTreeSet<String> {
     let (name, request) = CASES[n];
     let out = dir.join(format!("mon{n}.txt"));
-    // A file stdout is block-buffered, and the monitor is killed, not ended.
-    let mut cmd = pvxs_command(Path::new("stdbuf"));
-    cmd.arg("-oL").arg(pvxmonitor).args(["-F", "delta"]);
-    if !request.is_empty() {
-        cmd.args(["-r", request]);
-    }
-    let child = cmd
-        .arg(name)
-        .env("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{tcp}"))
-        .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_PVA_ADDR_LIST", "")
-        .stdout(std::fs::File::create(&out).expect("monitor out"))
-        .stderr(std::fs::File::create(dir.join(format!("err{n}.txt"))).expect("err"))
-        .spawn()
-        .expect("spawn pvxmonitor");
-    let _mon = DropChild { child };
+    let err = dir.join(format!("err{n}.txt"));
     let read = || std::fs::read_to_string(&out).unwrap_or_default();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while !read().lines().any(|l| l.starts_with("    ")) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // The update is printed whole by one write; give a second one no room
-    // to be mistaken for part of it.
-    std::thread::sleep(Duration::from_millis(300));
+    rerun_pvxs(
+        || {
+            // A file stdout is block-buffered, and the monitor is killed, not ended.
+            let mut cmd = pvxs_command(Path::new("stdbuf"));
+            cmd.arg("-oL").arg(pvxmonitor).args(["-F", "delta"]);
+            if !request.is_empty() {
+                cmd.args(["-r", request]);
+            }
+            let child = cmd
+                .arg(name)
+                .env("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{tcp}"))
+                .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+                .env("EPICS_PVA_ADDR_LIST", "")
+                .stdout(std::fs::File::create(&out).expect("monitor out"))
+                .stderr(std::fs::File::create(&err).expect("err"))
+                .spawn()
+                .expect("spawn pvxmonitor");
+            let _mon = DropChild { child };
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !read().lines().any(|l| l.starts_with("    ")) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The update is printed whole by one write; give a second one no room
+            // to be mistaken for part of it.
+            std::thread::sleep(Duration::from_millis(300));
+        },
+        |()| std::fs::read_to_string(&err).unwrap_or_default(),
+    );
     read()
         .lines()
         .skip_while(|l| *l != name)

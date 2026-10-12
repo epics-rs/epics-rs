@@ -20,6 +20,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -76,7 +77,7 @@ fn pvxs_has_tls() -> bool {
         .stderr(Stdio::piped());
     // Located, so a refusal to run is a broken checkout, not a missing one.
     let out = cmd
-        .output()
+        .pvxs_output()
         .unwrap_or_else(|e| panic!("{} was located but would not run: {e}", pvxinfo.display()));
     let s =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
@@ -241,7 +242,7 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await

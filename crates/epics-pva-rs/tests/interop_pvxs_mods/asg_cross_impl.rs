@@ -19,6 +19,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{PVXPUT, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -93,7 +94,7 @@ ASG(DEFAULT) {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxput exec")
     })
     .await

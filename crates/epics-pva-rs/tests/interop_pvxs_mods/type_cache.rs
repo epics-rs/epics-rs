@@ -17,6 +17,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::pv_builders::complex_pv_matrix;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
@@ -82,7 +83,7 @@ async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
             .env(env_key, lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await

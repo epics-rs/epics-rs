@@ -26,6 +26,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::pv_builders::complex_pv_matrix;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
@@ -34,7 +35,7 @@ use epics_pva_rs::pvdata::ScalarValue;
 use epics_pva_rs::server_native::PvaServer;
 use epics_pva_rs::server_native::SharedSource;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,7 +118,7 @@ async fn interop_be_a_rust_server_emits_be_to_pvxget() {
                 .env(env_key(), lib)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .output()
+                .pvxs_output()
                 .expect("pvxget exec")
         })
         .await
@@ -160,39 +161,9 @@ async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
     }
     let helper = super::interop_helpers::cpp_helper("be_reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("be_rev_ready");
 
-    let mut child = match Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .env(env_key(), pvxs_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn be_reverse_server: {e}"),
-    };
-
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("be_reverse_server did not become ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &[]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -236,8 +207,7 @@ async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
         Err(e) => failures.push(format!("T:DBL pvget: {e:?}")),
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     assert!(
         failures.is_empty(),

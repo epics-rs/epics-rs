@@ -10,6 +10,7 @@
 // `server::PvaServer` exists only on the tokio backend.
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{PVXGET, pick_localhost_port, pvxs_command, require_pvxs};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
@@ -32,7 +33,7 @@ fn pvxget(pvxget: &std::path::Path, env: &[(&str, String)]) -> std::process::Out
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().expect("spawn pvxget")
+    cmd.pvxs_output().expect("spawn pvxget")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -26,6 +26,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{PVXMONITOR, PVXPUT, pvxs_command, pvxs_lib_dir, require_pvxs};
+use super::interop_helpers::{PvxsOutput, rerun_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 #[cfg(tokio_backend)]
@@ -94,24 +95,30 @@ async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
     let server_str_c = server_str.clone();
     let lib = pvxs_lib_dir().into_os_string();
     let out = tokio::task::spawn_blocking(move || {
-        let mut child = pvxs_command(&pvxmonitor_p)
-            .arg("M:STREAM")
-            .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-            .env("EPICS_PVA_NAME_SERVERS", &server_str_c)
-            .env(env_key(), lib)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("pvxmonitor spawn");
-        std::thread::sleep(Duration::from_millis(1500));
-        // SIGTERM so the child has a chance to flush stdout.
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(150));
-        // Fallback hard-kill if still alive.
-        let _ = child.kill();
-        child.wait_with_output().expect("wait")
+        // Killed rather than ended, so `pvxs_output` cannot run it.
+        rerun_pvxs(
+            || {
+                let mut child = pvxs_command(&pvxmonitor_p)
+                    .arg("M:STREAM")
+                    .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+                    .env("EPICS_PVA_NAME_SERVERS", &server_str_c)
+                    .env(env_key(), &lib)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("pvxmonitor spawn");
+                std::thread::sleep(Duration::from_millis(1500));
+                // SIGTERM so the child has a chance to flush stdout.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                // Fallback hard-kill if still alive.
+                let _ = child.kill();
+                child.wait_with_output().expect("wait")
+            },
+            |out| String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     })
     .await
     .expect("join");
@@ -162,39 +169,9 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     }
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("mon_b_ready");
 
-    let mut child = match std::process::Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .arg("--writable")
-        .env(env_key(), pvxs_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server not ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &["--writable"]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -239,9 +216,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
                 .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
                 .env("EPICS_PVA_NAME_SERVERS", &s)
                 .env(env_key(), l)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .pvxs_output()
         })
         .await;
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -249,8 +224,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     handle.stop();
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     let seen = received.lock().unwrap().clone();
     // 5 puts fire, but the subscribe-establishment race can swallow

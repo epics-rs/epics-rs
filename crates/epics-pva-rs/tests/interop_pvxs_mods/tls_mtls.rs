@@ -10,6 +10,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -189,7 +190,7 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             .env(env_key(), lib_os)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await

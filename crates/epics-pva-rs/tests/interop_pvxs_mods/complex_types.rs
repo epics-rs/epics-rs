@@ -22,6 +22,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::pv_builders::{PvBuild, complex_pv_matrix, encode_pv_fixture};
 use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
 
@@ -53,7 +54,7 @@ async fn pvxget_capture(
             .env("EPICS_PVA_NAME_SERVERS", &server_str)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        cmd.output().expect("pvxget exec")
+        cmd.pvxs_output().expect("pvxget exec")
     })
     .await
     .expect("join pvxget")

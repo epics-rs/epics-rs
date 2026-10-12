@@ -19,6 +19,8 @@ fn longin_metadata_override(
         })
 }
 
+const LONGIN_POSTED: [&str; 1] = ["VAL"];
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `longinRecord.c:148` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold anywhere in
@@ -28,9 +30,12 @@ fn longin_metadata_override(
 // `processLi:1057-1060` writes `pr->udf = 0` itself before returning 0.
 // `soft_input_read_as`: devLiSoft and devLiSoftCallback read INP as
 // `DBR_LONG` (`devLiSoft.c:51`, `devLiSoftCallback.c:62`).
+// `process_posted_fields`: `monitor()` posts VAL alone (`longinRecord.c:373-396`);
+// the SVAL and SIMM a cycle reads from SIOL/SIML stay silent.
 #[record(
     type = "longin",
     metadata_override = longin_metadata_override,
+    process_posted_fields = LONGIN_POSTED,
     dset_owns_udf_on_computed,
     soft_input_read_as = Long
 )]

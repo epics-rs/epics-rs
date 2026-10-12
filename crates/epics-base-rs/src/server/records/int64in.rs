@@ -31,6 +31,8 @@ fn int64in_metadata_override(
 // Alarm threshold fields (HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV) are intentionally absent
 // from the field list so they route to RecordInstance::common.analog_alarm via
 // put_common_field, matching the path used by longin/ao/ai.
+const INT64IN_POSTED: [&str; 1] = ["VAL"];
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `int64inRecord.c:144` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold, the longin
@@ -38,9 +40,12 @@ fn int64in_metadata_override(
 // never 2.
 // `soft_input_read_as`: devI64inSoft and devI64inSoftCallback read INP as
 // `DBR_INT64` (`devI64inSoft.c:40`, `devI64inSoftCallback.c:62`).
+// `process_posted_fields`: `monitor()` posts VAL alone (`int64inRecord.c:366-389`);
+// the SVAL and SIMM a cycle reads from SIOL/SIML stay silent.
 #[record(
     type = "int64in",
     metadata_override = int64in_metadata_override,
+    process_posted_fields = INT64IN_POSTED,
     dset_owns_udf_on_computed,
     soft_input_read_as = Int64
 )]

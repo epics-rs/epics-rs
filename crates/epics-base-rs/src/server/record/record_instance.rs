@@ -3754,6 +3754,8 @@ thread_local! {
     static NAME_BYTE_COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many snapshots reached the delivery loop.
     static DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many log heads were built.
+    static HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A type-erased record instance stored in the database.
@@ -9843,11 +9845,13 @@ impl RecordInstance {
 
     /// The record's half of every field log a post makes now
     /// (`db_create_field_log`, `dbEvent.c:704-713`).
-    fn log_head(&self) -> crate::server::pv::LogHead<'_> {
+    fn log_head(&self) -> crate::server::pv::LogHead {
+        #[cfg(test)]
+        HEADS.with(|n| n.set(n.get() + 1));
         crate::server::pv::LogHead {
             stat: self.common.stat,
             sevr: self.common.sevr as u16,
-            amsg: self.common.amsg.parts(),
+            amsg: crate::server::pv::log_amsg(self.common.amsg.parts()),
             time: self.common.time.into(),
             utag: self.common.utag as i32,
         }
@@ -10597,7 +10601,10 @@ impl RecordInstance {
         // The cycle's posts are one burst: no reader wakes before the last
         // is queued, as none could take C's `dbScanLock` until it was.
         let mut burst = crate::server::event_queue::PostBurst::new();
-        let head = self.log_head();
+        // Built for the first post that passes a mask, as C builds a log only
+        // past `select` (`dbEvent.c:896-900`): an attached cycle that posts
+        // nothing cuts no amsg.
+        let mut head = None;
 
         for (field, value, posting_mask) in snapshot.iter() {
             let posting_mask = *posting_mask;
@@ -10626,14 +10633,12 @@ impl RecordInstance {
                     // its projected log value.
                     let value: &Option<Cow<'_, EpicsValue>> = logged
                         .get_or_insert_with(|| value.as_value().map(|v| entry.declared_view(v)));
-                    let Some(event) = sub.filtered_log(head, value.as_deref(), origin, mask) else {
-                        continue;
-                    };
                     // C `db_queue_event_log`: append, or replace this
                     // monitor's last queued entry in place when the queue
                     // is in flow control or nearly full. The queue owns
                     // that decision and counts the displaced value.
-                    sub.post(&mut burst, event);
+                    let head = head.get_or_insert_with(|| self.log_head());
+                    sub.post(&mut burst, head, value.as_deref(), origin, mask);
                 }
             }
         }
@@ -10794,7 +10799,7 @@ impl RecordInstance {
             return;
         };
         {
-            let head = self.log_head();
+            let mut head = None;
             let mut logged = None;
             let mut own;
             let burst = match burst {
@@ -10823,12 +10828,9 @@ impl RecordInstance {
                     // this event for this subscriber only.
                     let logged: &Option<Cow<'_, EpicsValue>> = logged
                         .get_or_insert_with(|| value.as_value().map(|v| entry.declared_view(v)));
-                    let Some(event) = sub.filtered_log(head, logged.as_deref(), origin, mask)
-                    else {
-                        continue;
-                    };
                     // Same single post owner as the snapshot path.
-                    sub.post(burst, event);
+                    let head = head.get_or_insert_with(|| self.log_head());
+                    sub.post(burst, head, logged.as_deref(), origin, mask);
                 }
             }
         }
@@ -14191,6 +14193,24 @@ mod mlis_tests {
         DELIVERIES.with(|n| n.set(0));
         post(&inst, "VAL", EventMask::VALUE);
         assert_eq!(DELIVERIES.with(|n| n.get()), 0);
+    }
+
+    /// A post no monitor's mask passes builds no log head; one passing post
+    /// builds it once for all its monitors.
+    #[test]
+    fn a_log_head_is_built_only_for_a_passing_post() {
+        let mut inst = ao();
+        let _readers: Vec<_> = (0..2)
+            .map(|_| attach(&mut inst, "VAL", EventMask::VALUE))
+            .collect();
+        HEADS.with(|n| n.set(0));
+        post(&inst, "VAL", EventMask::ALARM);
+        inst.notify_field("VAL", EventMask::ALARM);
+        assert_eq!(HEADS.with(|n| n.get()), 0);
+        post(&inst, "VAL", EventMask::VALUE);
+        assert_eq!(HEADS.with(|n| n.get()), 1);
+        inst.notify_field("VAL", EventMask::VALUE);
+        assert_eq!(HEADS.with(|n| n.get()), 2);
     }
 
     /// A cycle's declared-field posts — the deadband VAL, the forced OVAL and

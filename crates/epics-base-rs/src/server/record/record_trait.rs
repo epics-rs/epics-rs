@@ -2695,10 +2695,43 @@ struct SnapshotPosts {
 impl Drop for ProcessSnapshot {
     #[inline]
     fn drop(&mut self) {
-        if self.0.head.is_some() || self.0.rest.capacity() != 0 {
+        if self.0.rest.capacity() != 0 || self.0.head.as_ref().is_some_and(owns_heap) {
             Self::release(&mut self.0);
         }
     }
+}
+
+/// Whether dropping `post` frees anything. A monitored cycle's one post is
+/// a declared field's scalar, and its drop glue was a call per cycle.
+#[inline]
+fn owns_heap(post: &FieldPost) -> bool {
+    use EpicsValue as V;
+    !matches!(
+        post,
+        (
+            PostName::Declared(_),
+            PostedValue::Ref
+                | PostedValue::Val(
+                    V::Short(_)
+                        | V::Float(_)
+                        | V::Enum(_)
+                        | V::Char(_)
+                        | V::Long(_)
+                        | V::Double(_)
+                        | V::Int64(_)
+                        | V::UInt64(_)
+                        | V::UShort(_)
+                        | V::ULong(_)
+                        | V::UChar(_)
+                ),
+            _,
+        )
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl ProcessSnapshot {
@@ -2710,6 +2743,8 @@ impl ProcessSnapshot {
     #[cold]
     #[inline(never)]
     fn release(posts: &mut std::mem::ManuallyDrop<SnapshotPosts>) {
+        #[cfg(test)]
+        RELEASES.with(|n| n.set(n.get() + 1));
         // SAFETY: called once, from `drop`, on a field nothing else drops.
         unsafe { std::mem::ManuallyDrop::drop(posts) }
     }
@@ -7482,6 +7517,50 @@ pub const FORCE_GENERAL: &[(&str, &str)] = &[];
 mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
+
+    /// A snapshot whose posts own no heap drops without the out-of-line
+    /// release; one that does still frees through it.
+    #[test]
+    fn a_snapshot_releases_only_what_owns_heap() {
+        use crate::server::recgbl::EventMask;
+        let releases = |posts: Vec<FieldPost>| {
+            let before = RELEASES.with(|n| n.get());
+            let mut snap = ProcessSnapshot::new();
+            for post in posts {
+                snap.push(post);
+            }
+            drop(snap);
+            RELEASES.with(|n| n.get()) - before
+        };
+        let val = |v| {
+            (
+                PostName::Declared("VAL"),
+                PostedValue::Val(v),
+                EventMask::VALUE,
+            )
+        };
+        assert_eq!(releases(vec![]), 0);
+        assert_eq!(releases(vec![val(EpicsValue::Double(1.0))]), 0);
+        assert_eq!(
+            releases(vec![(
+                PostName::Declared("VAL"),
+                PostedValue::Ref,
+                EventMask::VALUE
+            )]),
+            0
+        );
+        assert_eq!(releases(vec![val(EpicsValue::String("s".into()))]), 1);
+        assert_eq!(
+            releases(vec![(
+                PostName::Named(String::from("X").into()),
+                PostedValue::Ref,
+                EventMask::VALUE
+            )]),
+            1
+        );
+        let two = vec![val(EpicsValue::Double(1.0)), val(EpicsValue::Double(2.0))];
+        assert_eq!(releases(two), 1, "a spilled post's Vec is freed");
+    }
 
     /// Every module-owned type too: the sweeps below cover `RECORD_TYPES`.
     fn any_record(record_type: &str) -> Box<dyn Record> {

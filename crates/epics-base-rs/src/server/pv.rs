@@ -282,22 +282,40 @@ const AMSG_SIZE: usize = 40;
 /// The poster's side of a field log: what `db_create_field_log` copies off
 /// the record (`dbEvent.c:704-713`), borrowed until the log copies it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LogHead<'a> {
+pub(crate) struct LogHead {
     pub(crate) stat: u16,
     pub(crate) sevr: u16,
-    /// A prefix and a remainder, as [`SparseText`](crate::server::record::SparseText)
-    /// holds a link failure's `"field %s"` without rendering it.
-    pub(crate) amsg: (&'static str, &'a str),
+    /// Cut once per post, not once per subscriber.
+    pub(crate) amsg: [u8; AMSG_SIZE],
     pub(crate) time: WallTime,
     pub(crate) utag: i32,
 }
 
-impl<'a> LogHead<'a> {
-    pub(crate) fn of(snapshot: &'a Snapshot) -> Self {
+/// `amsg` as a log holds it: NUL-terminated, cut to `AMSG_SIZE - 1` bytes on
+/// a char boundary (`strncpy` + `pbuffer[DB_AMSG_SIZE-1] = '\0'`,
+/// `dbAccess.c:368-373`). A prefix and a remainder, as
+/// [`SparseText`](crate::server::record::SparseText) holds a link failure's
+/// `"field %s"` without rendering it.
+pub(crate) fn log_amsg(parts: (&str, &str)) -> [u8; AMSG_SIZE] {
+    let mut amsg = [0u8; AMSG_SIZE];
+    let mut at = 0;
+    for text in [parts.0, parts.1] {
+        let mut n = text.len().min(AMSG_SIZE - 1 - at);
+        while !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        amsg[at..at + n].copy_from_slice(&text.as_bytes()[..n]);
+        at += n;
+    }
+    amsg
+}
+
+impl LogHead {
+    pub(crate) fn of(snapshot: &Snapshot) -> Self {
         Self {
             stat: snapshot.alarm.status,
             sevr: snapshot.alarm.severity,
-            amsg: ("", &snapshot.alarm.amsg),
+            amsg: log_amsg(("", &snapshot.alarm.amsg)),
             time: snapshot.timestamp,
             utag: snapshot.user_tag,
         }
@@ -311,8 +329,7 @@ impl<'a> LogHead<'a> {
 pub struct PostLog {
     stat: u16,
     sevr: u16,
-    /// NUL-terminated, cut to `AMSG_SIZE - 1` bytes on a char boundary
-    /// (`strncpy` + `pbuffer[DB_AMSG_SIZE-1] = '\0'`, `dbAccess.c:368-373`).
+    /// As [`log_amsg`] cut it.
     amsg: [u8; AMSG_SIZE],
     time: WallTime,
     utag: i32,
@@ -332,25 +349,15 @@ pub struct PostLog {
 
 impl PostLog {
     fn new(
-        head: LogHead<'_>,
+        head: LogHead,
         value: LogData,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
     ) -> Self {
-        let mut amsg = [0u8; AMSG_SIZE];
-        let mut at = 0;
-        for text in [head.amsg.0, head.amsg.1] {
-            let mut n = text.len().min(AMSG_SIZE - 1 - at);
-            while !text.is_char_boundary(n) {
-                n -= 1;
-            }
-            amsg[at..at + n].copy_from_slice(&text.as_bytes()[..n]);
-            at += n;
-        }
         Self {
             stat: head.stat,
             sevr: head.sevr,
-            amsg,
+            amsg: head.amsg,
             time: head.time,
             utag: head.utag,
             mask,
@@ -363,9 +370,29 @@ impl PostLog {
         self.mask
     }
 
+    pub(crate) fn value(&self) -> &LogData {
+        &self.value
+    }
+
     /// Fold in the classes of a post this log absorbed.
     pub(crate) fn set_mask_or(&mut self, mask: crate::server::recgbl::EventMask) {
         self.mask |= mask;
+    }
+}
+
+/// A log not yet made: what a post with no pre chain hands the event queue,
+/// which builds the [`PostLog`] in the ring slot it lands in.
+pub(crate) struct LogParts<'h> {
+    pub(crate) head: &'h LogHead,
+    pub(crate) value: LogData,
+    pub(crate) origin: u64,
+    pub(crate) mask: crate::server::recgbl::EventMask,
+}
+
+impl LogParts<'_> {
+    #[inline]
+    pub(crate) fn into_log(self) -> PostLog {
+        PostLog::new(*self.head, self.value, self.origin, self.mask)
     }
 }
 
@@ -413,7 +440,7 @@ impl MonitorEvent {
 
     /// [`Self::post_log`] of `head` and `value`.
     pub(crate) fn posted(
-        head: LogHead<'_>,
+        head: LogHead,
         value: &EpicsValue,
         origin: u64,
         mask: crate::server::recgbl::EventMask,
@@ -456,7 +483,7 @@ impl MonitorEvent {
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(AMSG_SIZE);
-        // `PostLog::new` cut on a char boundary.
+        // `log_amsg` cut on a char boundary.
         std::str::from_utf8(&self.log.amsg[..n]).unwrap_or_default()
     }
 
@@ -636,11 +663,45 @@ impl Subscriber {
     /// displaced before the consumer ever saw it (C `nreplace`, plus the
     /// latest-only collapse that C leaves uncounted; both mean one value the
     /// consumer will never see). The readers wake when `burst` drops.
-    pub(crate) fn post(&self, burst: &mut PostBurst, event: MonitorEvent) {
-        if matches!(
-            self.sink.post_in(burst, event),
-            PostOutcome::Replaced | PostOutcome::Collapsed
-        ) {
+    ///
+    /// C `db_create_event_log` then `dbChannelRunPreChain` first: this
+    /// monitor's log of `head` and `value` (`None` for a post that carries
+    /// none), of the kind fixed at attach. With no pre chain the queue writes
+    /// the log straight into its ring slot; a pre chain runs on the log as it
+    /// is, copying nothing (`dbnd.c:75` reads only a `dbfl_type_val`,
+    /// `sync.c:150`), and may drop it. The post chain's copies (`arr`, `ts`)
+    /// are the consumer's.
+    pub(crate) fn post(
+        &self,
+        burst: &mut PostBurst,
+        head: &LogHead,
+        value: Option<&EpicsValue>,
+        origin: u64,
+        mask: crate::server::recgbl::EventMask,
+    ) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        let value = match (self.sink.kind(), value) {
+            (crate::server::event_queue::LogKind::Val, Some(value)) => {
+                NativeValue::of(value).map_or(LogData::Ref, LogData::Val)
+            }
+            _ => LogData::Ref,
+        };
+        let parts = LogParts {
+            head,
+            value,
+            origin,
+            mask,
+        };
+        let outcome = if self.filters.is_empty() {
+            self.sink.post_parts(burst, parts)
+        } else {
+            let event = MonitorEvent::of_log(parts.into_log());
+            let Some(fe) = self.filters.apply(FilteredMonitorEvent::new(event)) else {
+                return;
+            };
+            self.sink.post_in(burst, fe.event)
+        };
+        if matches!(outcome, PostOutcome::Replaced | PostOutcome::Collapsed) {
             DROPPED_MONITOR_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -656,46 +717,14 @@ impl Subscriber {
         self.sink.id()
     }
 
-    /// C `db_create_event_log` then `dbChannelRunPreChain`: this monitor's
-    /// log of `head` and `value` (`None` for a post that carries none), of
-    /// the kind fixed at attach, or `None` when
-    /// a filter drops it. The pre chain runs on that log as it is, copying
-    /// nothing (`dbnd.c:75` reads only a `dbfl_type_val`, `sync.c:150`); the
-    /// post chain's copies (`arr`, `ts`) are the consumer's.
-    pub(crate) fn filtered_log(
-        &self,
-        head: LogHead<'_>,
-        value: Option<&EpicsValue>,
-        origin: u64,
-        mask: crate::server::recgbl::EventMask,
-    ) -> Option<MonitorEvent> {
-        use crate::server::database::filters::FilteredMonitorEvent;
-        let value = match (self.sink.kind(), value) {
-            (crate::server::event_queue::LogKind::Val, Some(value)) => {
-                NativeValue::of(value).map_or(LogData::Ref, LogData::Val)
-            }
-            _ => LogData::Ref,
-        };
-        let event = MonitorEvent::of_log(PostLog::new(head, value, origin, mask));
-        if self.filters.is_empty() {
-            return Some(event);
-        }
-        self.filters
-            .apply(FilteredMonitorEvent::new(event))
-            .map(|fe| fe.event)
-    }
-
     /// C `db_post_single_event`: queue `snapshot` for this monitor alone,
     /// under its `select` (`db_create_event_log`) and through its pre-chain.
     /// `active` does not gate it; C posts before `db_event_enable` and
     /// before `db_event_disable`.
     pub(crate) fn post_single(&self, snapshot: Arc<Snapshot>) {
         let mask = crate::server::recgbl::EventMask::from_bits(self.mask);
-        if let Some(event) =
-            self.filtered_log(LogHead::of(&snapshot), Some(&snapshot.value), 0, mask)
-        {
-            self.post(&mut PostBurst::new(), event);
-        }
+        let head = LogHead::of(&snapshot);
+        self.post(&mut PostBurst::new(), &head, Some(&snapshot.value), 0, mask);
     }
 }
 
@@ -1130,6 +1159,7 @@ impl ProcessVariable {
         // Remove subscribers whose consumer has been dropped.
         subs.retain(|sub| !sub.is_closed());
         let mut burst = PostBurst::new();
+        let mut head = None;
         for sub in subs.iter() {
             // Paused subscribers (`db_event_disable`) receive nothing —
             // skip before any work so a disabled monitor stops the event
@@ -1144,16 +1174,11 @@ impl ProcessVariable {
             };
             // The channel-filter chain may suppress this event (e.g.
             // `dbnd` deadband not crossed); the event's mask tells value
-            // filters whether to pass through (446e0d4a).
-            let Some(event) =
-                sub.filtered_log(LogHead::of(&snapshot), Some(&snapshot.value), origin, mask)
-            else {
-                continue;
-            };
-            // C `db_queue_event_log`: the queue appends, or replaces this
-            // monitor's last entry in place when it is in flow control or
-            // nearly full. Earlier distinct entries are never discarded.
-            sub.post(&mut burst, event);
+            // filters whether to pass through (446e0d4a). The queue appends,
+            // or replaces this monitor's last entry in place when it is in
+            // flow control or nearly full.
+            let head = head.get_or_insert_with(|| LogHead::of(&snapshot));
+            sub.post(&mut burst, head, Some(&snapshot.value), origin, mask);
         }
     }
 
@@ -1518,6 +1543,38 @@ impl Drop for PvSubscription {
     /// paid to build an event for a reader that was gone.
     fn drop(&mut self) {
         self.pv.remove_subscriber(self.reader.id());
+    }
+}
+
+#[cfg(test)]
+mod log_amsg_tests {
+    use super::*;
+
+    fn logged(parts: (&str, &str)) -> String {
+        let head = LogHead {
+            stat: 0,
+            sevr: 0,
+            amsg: log_amsg(parts),
+            time: WallTime::UNIX_EPOCH,
+            utag: 0,
+        };
+        let mask = crate::server::recgbl::EventMask::VALUE;
+        MonitorEvent::of_log(PostLog::new(head, LogData::Ref, 0, mask))
+            .amsg()
+            .to_owned()
+    }
+
+    /// The 39-byte cut lands where the per-subscriber copy put it.
+    #[test]
+    fn a_long_amsg_is_cut_to_39_bytes_on_a_char_boundary() {
+        let a41 = "a".repeat(41);
+        assert_eq!(logged(("", &a41)), a41[..39]);
+        // `é` would take bytes 39 and 40: the cut drops it whole.
+        let a38 = "a".repeat(38);
+        assert_eq!(logged(("", &format!("{a38}é"))), a38);
+        assert_eq!(logged(("", "")), "");
+        let name = "N".repeat(40);
+        assert_eq!(logged(("field ", &name)), format!("field {}", &name[..33]));
     }
 }
 

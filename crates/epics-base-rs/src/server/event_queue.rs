@@ -97,7 +97,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::runtime::sync::Arc;
-use crate::server::pv::{MonitorEvent, PostLog};
+use crate::server::pv::{LogData, LogParts, MonitorEvent, PostLog};
+use crate::server::recgbl::EventMask;
 use crate::server::record::{FieldDesc, Special};
 use crate::types::EpicsValue;
 
@@ -394,6 +395,61 @@ struct Entry {
     log: PostLog,
 }
 
+/// Ring index `i` of a `size`-entry ring, for any `i < 2 * size`: no divide
+/// on the post path.
+fn wrap(i: usize, size: usize) -> usize {
+    debug_assert!(i < 2 * size);
+    if i >= size { i - size } else { i }
+}
+
+/// What a post writes into its ring slot: a [`LogParts`] the slot's log is
+/// built from in place, or a log a pre chain already made.
+pub(crate) trait LogSource {
+    fn value(&self) -> &LogData;
+    fn mask(&self) -> EventMask;
+    /// Make a copied scalar a reference.
+    fn drop_val(&mut self);
+    /// The log, its mask widened by `also`.
+    fn into_log_or(self, also: EventMask) -> PostLog;
+}
+
+impl LogSource for PostLog {
+    fn value(&self) -> &LogData {
+        PostLog::value(self)
+    }
+    fn mask(&self) -> EventMask {
+        PostLog::mask(self)
+    }
+    fn drop_val(&mut self) {
+        if matches!(self.value, LogData::Val(_)) {
+            self.value = LogData::Ref;
+        }
+    }
+    fn into_log_or(mut self, also: EventMask) -> PostLog {
+        self.set_mask_or(also);
+        self
+    }
+}
+
+impl LogSource for LogParts<'_> {
+    fn value(&self) -> &LogData {
+        &self.value
+    }
+    fn mask(&self) -> EventMask {
+        self.mask
+    }
+    fn drop_val(&mut self) {
+        if matches!(self.value, LogData::Val(_)) {
+            self.value = LogData::Ref;
+        }
+    }
+    #[inline]
+    fn into_log_or(mut self, also: EventMask) -> PostLog {
+        self.mask |= also;
+        self.into_log()
+    }
+}
+
 /// The queue's mutable state. Everything here moves under one lock — C's
 /// `LOCKEVQUE`.
 struct QueInner {
@@ -450,9 +506,9 @@ impl QueInner {
         self.size - self.used
     }
 
-    /// The ring index `k` entries past `getix`.
+    /// The ring index `k <= size` entries past `getix`.
     fn ix(&self, k: usize) -> usize {
-        (self.getix + k) % self.size
+        wrap(self.getix + k, self.size)
     }
 
     /// C `event_remove`'s accounting for one entry of `id` leaving the ring
@@ -489,7 +545,7 @@ impl QueInner {
             return None;
         }
         let Entry { id, log } = self.ring[self.getix].take().expect("occupied");
-        self.getix = (self.getix + 1) % self.size;
+        self.getix = self.ix(1);
         self.used -= 1;
         let live = self.release(id);
         // C's drain loop ends at `EVENTQEMPTY`.
@@ -541,8 +597,8 @@ impl QueInner {
             }
             let (getix, size) = (self.getix, self.size);
             for sub in self.subs.iter_mut().flatten() {
-                if sub.npend > 0 && (sub.last + size - getix) % size < k {
-                    sub.last = (sub.last + 1) % size;
+                if sub.npend > 0 && wrap(sub.last + size - getix, size) < k {
+                    sub.last = wrap(sub.last + 1, size);
                 }
             }
         }
@@ -660,9 +716,8 @@ impl EvQue {
         self: &Arc<Self>,
         burst: &mut PostBurst,
         id: AttachId,
-        event: MonitorEvent,
+        mut log: impl LogSource,
     ) -> PostOutcome {
-        use crate::server::pv::LogData;
         let mut guard = self.lock();
         let flow_on = self.flow.is_on();
         let q = &mut *guard;
@@ -673,18 +728,17 @@ impl EvQue {
         else {
             return PostOutcome::Closed;
         };
-        let mut log = event.into_log();
         // A by-reference subscription copies no value (`dbEvent.c:727-730`);
         // a copy a filter made is the filter's (M7).
-        if sub.kind == LogKind::Ref && matches!(log.value, LogData::Val(_)) {
-            log.value = LogData::Ref;
+        if sub.kind == LogKind::Ref {
+            log.drop_val();
         }
         let npend = sub.npend;
         let last = q.ring[sub.last].as_mut().filter(|_| npend > 0);
         match last {
             // C's early-drop (`dbEvent.c:794-800`): the queued reference
             // reads the field at delivery, so the post adds nothing.
-            Some(last) if log.value.is_ref() && last.log.value.is_ref() => {
+            Some(last) if log.value().is_ref() && last.log.value.is_ref() => {
                 last.log.set_mask_or(log.mask());
                 sub.ncollapse += 1;
                 PostOutcome::Collapsed
@@ -692,15 +746,17 @@ impl EvQue {
             // C: `db_delete_field_log(*pLastLog); *pLastLog = pLog;` — the
             // ring does not grow and the earlier distinct entries stay put.
             Some(last) if flow_on || ring_space <= q.replace_threshold => {
-                log.set_mask_or(last.log.mask());
-                last.log = log;
+                last.log = log.into_log_or(last.log.mask());
                 sub.nreplace += 1;
                 PostOutcome::Replaced
             }
             _ => {
-                let at = (q.getix + q.used) % q.size;
+                let at = wrap(q.getix + q.used, q.size);
                 debug_assert!(q.ring[at].is_none(), "the ring is contiguous");
-                q.ring[at] = Some(Entry { id, log });
+                q.ring[at] = Some(Entry {
+                    id,
+                    log: log.into_log_or(EventMask::NONE),
+                });
                 sub.npend += 1;
                 sub.last = at;
                 // C: an entry appended while the monitor already had one
@@ -1184,7 +1240,12 @@ impl EventSink {
 
     /// [`Self::post`] as one of `burst`'s posts, woken when `burst` drops.
     pub fn post_in(&self, burst: &mut PostBurst, event: MonitorEvent) -> PostOutcome {
-        self.que.post(burst, self.id, event)
+        self.que.post(burst, self.id, event.into_log())
+    }
+
+    /// [`Self::post_in`] of a log the queue builds in its ring slot.
+    pub(crate) fn post_parts(&self, burst: &mut PostBurst, parts: LogParts<'_>) -> PostOutcome {
+        self.que.post(burst, self.id, parts)
     }
 
     /// This subscription's slot — what its producer row is removed by.
@@ -1687,6 +1748,25 @@ mod tests {
 
     /// An armed consumer slot sees every `ppendsem` take a post makes. Only
     /// the post that makes the ring non-empty takes it.
+    /// Three laps of the ring, a sibling's entry taken ahead of the older one
+    /// each time, keep both monitors' order.
+    #[test]
+    fn entries_keep_their_order_across_the_ring_wrap() {
+        let user = EventUser::new();
+        let (sink_a, mut reader_a) = attach(&user, 1, LogKind::Val);
+        let (sink_b, mut reader_b) = attach(&user, 2, LogKind::Val);
+        let size = reader_a.queue().report(reader_a.id()).ring_size;
+        for v in 0..3 * size as i32 {
+            sink_a.post(ev(v));
+            sink_a.post(ev(v + 1));
+            sink_b.post(ev(-v));
+            assert_eq!(val(&reader_b.try_recv().unwrap()), -v);
+            assert_eq!(val(&reader_a.try_recv().unwrap()), v);
+            assert_eq!(val(&reader_a.try_recv().unwrap()), v + 1);
+        }
+        assert_eq!(reader_a.queue().report(reader_a.id()).ring_space, size);
+    }
+
     #[test]
     fn only_the_post_that_fills_an_empty_ring_wakes() {
         let user = EventUser::new();
@@ -1714,6 +1794,52 @@ mod tests {
 
     /// EVENTS_OFF parks the reader on a non-empty ring: a replace-last post
     /// leaves it parked, and EVENTS_ON is its one wake.
+    /// A log built in its ring slot from the poster's parts is the log a
+    /// built event would have queued, on append, replace and collapse.
+    #[test]
+    fn parts_land_as_the_log_they_make() {
+        use crate::server::pv::{LogHead, NativeValue};
+        let head = LogHead::of(&Snapshot::new(
+            EpicsValue::Long(0),
+            3,
+            2,
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let parts = |v: i32, mask| LogParts {
+            head: &head,
+            value: LogData::Val(NativeValue::Long(v)),
+            origin: 9,
+            mask,
+        };
+        for kind in [LogKind::Val, LogKind::Ref] {
+            let taken = |by_parts: bool| {
+                let user = EventUser::new();
+                user.flow_ctrl_on();
+                let (sink, mut reader) = attach(&user, 1, kind);
+                let mut outcomes = Vec::new();
+                for (v, mask) in [(1, EventMask::VALUE), (2, EventMask::LOG)] {
+                    let mut burst = PostBurst::new();
+                    outcomes.push(if by_parts {
+                        sink.post_parts(&mut burst, parts(v, mask))
+                    } else {
+                        sink.post_in(&mut burst, MonitorEvent::of_log(parts(v, mask).into_log()))
+                    });
+                }
+                user.flow_ctrl_off();
+                (outcomes, format!("{:?}", reader.try_recv().unwrap()))
+            };
+            let (outcomes, log) = taken(true);
+            assert_eq!((outcomes.clone(), log.clone()), taken(false), "{kind:?}");
+            assert_eq!(
+                outcomes[1],
+                match kind {
+                    LogKind::Val => PostOutcome::Replaced,
+                    LogKind::Ref => PostOutcome::Collapsed,
+                },
+            );
+        }
+    }
+
     #[test]
     fn a_replace_under_events_off_wakes_no_one() {
         let user = EventUser::new();

@@ -296,16 +296,22 @@ pub(crate) struct LogHead {
 /// `dbAccess.c:368-373`). A prefix and a remainder, as
 /// [`SparseText`](crate::server::record::SparseText) holds a link failure's
 /// `"field %s"` without rendering it.
-pub(crate) fn log_amsg(parts: (&str, &str)) -> [u8; AMSG_SIZE] {
+pub(crate) fn log_amsg((prefix, text): (&'static str, &str)) -> [u8; AMSG_SIZE] {
     let mut amsg = [0u8; AMSG_SIZE];
+    // C copies the rendered amsg once per log. The prefix is SparseText's
+    // short ASCII constant, stored bytewise, so `text` is the one copy, and
+    // an empty one is none.
     let mut at = 0;
-    for text in [parts.0, parts.1] {
-        let mut n = text.len().min(AMSG_SIZE - 1 - at);
-        while !text.is_char_boundary(n) {
-            n -= 1;
-        }
+    for (slot, byte) in amsg[..AMSG_SIZE - 1].iter_mut().zip(prefix.bytes()) {
+        *slot = byte;
+        at += 1;
+    }
+    let mut n = text.len().min(AMSG_SIZE - 1 - at);
+    while !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    if n != 0 {
         amsg[at..at + n].copy_from_slice(&text.as_bytes()[..n]);
-        at += n;
     }
     amsg
 }
@@ -1550,7 +1556,7 @@ impl Drop for PvSubscription {
 mod log_amsg_tests {
     use super::*;
 
-    fn logged(parts: (&str, &str)) -> String {
+    fn logged(parts: (&'static str, &str)) -> String {
         let head = LogHead {
             stat: 0,
             sevr: 0,
@@ -1575,6 +1581,7 @@ mod log_amsg_tests {
         assert_eq!(logged(("", "")), "");
         let name = "N".repeat(40);
         assert_eq!(logged(("field ", &name)), format!("field {}", &name[..33]));
+        assert_eq!(logged(("field ", "")), "field ");
     }
 }
 

@@ -811,8 +811,8 @@ impl Record for AiRecord {
     /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// inside `if (monitor_mask)` (aiRecord.c:461-464): ORAW advances only
     /// on a cycle that posts VAL.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        if field == "RVAL" && self.oraw != self.rval {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        if index == 0 && self.oraw != self.rval {
             self.oraw = self.rval;
             true
         } else {

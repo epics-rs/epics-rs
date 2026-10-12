@@ -1111,6 +1111,25 @@ impl CycleMarks {
         }
         (self, Self::NONE)
     }
+
+    /// The post table the bits index.
+    pub(crate) fn table(self) -> &'static [(&'static str, CyclePostMask)] {
+        self.table
+    }
+
+    /// The masks of the marks among `of`, in table order.
+    pub(crate) fn masks_among(self, of: u128) -> impl Iterator<Item = CyclePostMask> {
+        Self {
+            bits: self.bits & of,
+            ..self
+        }
+        .map(|(_, mask)| mask)
+    }
+
+    /// Whether a mark is among `of`.
+    pub(crate) fn any_among(self, of: u128) -> bool {
+        self.bits & of != 0
+    }
 }
 
 impl Iterator for CycleMarks {
@@ -1210,24 +1229,30 @@ impl AuxPostMask {
         }
     }
 
+    /// Which of the three declarations holds `field`, first match: 1, 2, 3,
+    /// or 0 for none. Read once per field, when its entry is made.
+    pub(crate) fn class_of(&self, field: &str) -> u8 {
+        [self.value_only, self.monitor_masked, self.no_alarm_bits]
+            .iter()
+            .position(|list| list.contains(&field))
+            .map_or(0, |i| i as u8 + 1)
+    }
+
+    /// The mask a change-detected post of a `class_of` field carries.
     /// `alarm_bits` is this cycle's `recGblResetAlarms` result; `deadband_mask`
     /// is VAL's own monitor mask (those alarm bits, plus `DBE_VALUE` when MDEL
     /// crossed and `DBE_LOG` when ADEL crossed).
-    pub(crate) fn mask_for(
-        &self,
-        field: &str,
+    pub(crate) fn mask_of_class(
+        class: u8,
         alarm_bits: crate::server::recgbl::EventMask,
         deadband_mask: crate::server::recgbl::EventMask,
     ) -> crate::server::recgbl::EventMask {
         use crate::server::recgbl::EventMask;
-        if self.value_only.contains(&field) {
-            alarm_bits | EventMask::VALUE
-        } else if self.monitor_masked.contains(&field) {
-            deadband_mask | EventMask::VALUE
-        } else if self.no_alarm_bits.contains(&field) {
-            EventMask::VALUE | EventMask::LOG
-        } else {
-            alarm_bits | EventMask::VALUE | EventMask::LOG
+        match class {
+            1 => alarm_bits | EventMask::VALUE,
+            2 => deadband_mask | EventMask::VALUE,
+            3 => EventMask::VALUE | EventMask::LOG,
+            _ => alarm_bits | EventMask::VALUE | EventMask::LOG,
         }
     }
 }
@@ -2604,12 +2629,13 @@ impl PostedValue {
 
 pub type FieldPost = (PostName, PostedValue, crate::server::recgbl::EventMask);
 
-/// The field a post names. `Declared` is the field's own [`FieldDesc::name`],
-/// so two declared names are one field exactly when they are one pointer —
-/// what lets a post find its subscribers without reading a byte of either name.
+/// The field a post names. `Declared` is the field's own [`FieldDesc`], so
+/// two declared fields are one field exactly when they are one pointer — what
+/// lets a post find its subscribers and its published entry without reading a
+/// byte of either name.
 #[derive(Debug, Clone)]
 pub enum PostName {
-    Declared(&'static str),
+    Declared(&'static FieldDesc),
     Named(std::borrow::Cow<'static, str>),
 }
 
@@ -2618,7 +2644,7 @@ impl std::ops::Deref for PostName {
 
     fn deref(&self) -> &str {
         match self {
-            Self::Declared(name) => name,
+            Self::Declared(desc) => desc.name,
             Self::Named(name) => name,
         }
     }
@@ -4497,9 +4523,12 @@ pub trait Record: Send + Sync + 'static {
     /// in the compute step makes the next guarded cycle see no change and
     /// withhold an event C sends.
     ///
+    /// `index` is the field's position in [`Self::fields_posted_with_value_mask`],
+    /// so the cycle names no field by its bytes.
+    ///
     /// Default: `false` — nothing declared, nothing to test.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        let _ = field;
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        let _ = index;
         false
     }
 
@@ -7533,6 +7562,9 @@ mod tests {
     #[test]
     fn a_snapshot_releases_only_what_owns_heap() {
         use crate::server::recgbl::EventMask;
+        let ao_val = crate::server::record::declared_field_registry::declared_fields("ao")
+            .find(|d| d.name == "VAL")
+            .unwrap();
         let releases = |posts: Vec<FieldPost>| {
             let before = RELEASES.with(|n| n.get());
             let mut snap = ProcessSnapshot::new();
@@ -7544,7 +7576,7 @@ mod tests {
         };
         let val = |v| {
             (
-                PostName::Declared("VAL"),
+                PostName::Declared(ao_val),
                 PostedValue::Val(v),
                 EventMask::VALUE,
             )
@@ -7553,7 +7585,7 @@ mod tests {
         assert_eq!(releases(vec![val(EpicsValue::Double(1.0))]), 0);
         assert_eq!(
             releases(vec![(
-                PostName::Declared("VAL"),
+                PostName::Declared(ao_val),
                 PostedValue::Ref,
                 EventMask::VALUE
             )]),

@@ -169,8 +169,8 @@ impl Record for BiRecord {
     /// (`biRecord.c:297-303`), minus the post. Outside init, `monitor()` is
     /// the only writer of `oraw`, so an RVAL put posts again from its cycle
     /// unless the cycle reads back the value `oraw` already holds.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        if field == "RVAL" && self.oraw != self.rval {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        if index == 0 && self.oraw != self.rval {
             self.oraw = self.rval;
             return true;
         }

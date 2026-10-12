@@ -546,13 +546,13 @@ impl Record for AoRecord {
     /// minus the post. `oraw`/`orbv` are written NOWHERE else — `convert()`
     /// used to assign `oraw = rval` eagerly, which made this comparison
     /// unable to ever be true.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        match field {
-            "RVAL" if self.oraw != self.rval => {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        match index {
+            1 if self.oraw != self.rval => {
                 self.oraw = self.rval;
                 true
             }
-            "RBV" if self.orbv != self.rbv => {
+            2 if self.orbv != self.rbv => {
                 self.orbv = self.rbv;
                 true
             }

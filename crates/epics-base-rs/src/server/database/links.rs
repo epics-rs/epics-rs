@@ -707,6 +707,25 @@ pub(super) enum LinkTarget {
     External,
 }
 
+/// The render a string read of `field` takes. Cold: only a `DBR_STRING`
+/// read of a non-string field asks for it, and inlined into the read path
+/// it cost every numeric link read.
+#[cold]
+#[inline(never)]
+fn link_source_render(
+    instance: &crate::server::record::RecordInstance,
+    db: &crate::server::record::DbLink,
+    field: &str,
+    v: &EpicsValue,
+) -> crate::server::record::record_instance::SourceRender {
+    let render = instance.source_render_of(field, v);
+    // C makes a CP/CPP link a `CA_LINK` whatever its target.
+    match db.policy.cp_passive_only() {
+        Some(_) => render.through_ca(),
+        None => render,
+    }
+}
+
 impl PvDatabase {
     /// See [`LinkTarget`]. The records map is asked FIRST — a link target is
     /// overwhelmingly a record, and only the miss then pays the `simple_pvs`
@@ -915,7 +934,7 @@ impl PvDatabase {
                         && !target.string_view
                         && !matches!(v, EpicsValue::String(_) | EpicsValue::StringArray(_)) =>
                 {
-                    Some(instance.source_render_of(&target.field, v))
+                    Some(link_source_render(&instance, db, &target.field, v))
                 }
                 _ => None,
             };

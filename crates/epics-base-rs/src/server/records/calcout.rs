@@ -824,8 +824,8 @@ impl Record for CalcoutRecord {
     /// (`calcoutRecord.c:687-690`), minus the post. Outside init, `monitor()`
     /// is the only writer of `povl`, so an OVAL put posts again from its cycle
     /// unless the cycle sets back the value `povl` holds.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        if field == "OVAL" && self.povl != self.oval {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        if index == 0 && self.povl != self.oval {
             self.povl = self.oval;
             return true;
         }

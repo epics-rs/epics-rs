@@ -151,13 +151,13 @@ impl Record for BusyRecord {
     /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }` and
     /// its RBV twin (`busyRecord.c:371-380`), minus the post. Outside init,
     /// `monitor()` is the only writer of `oraw`/`orbv`.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        match field {
-            "RVAL" if self.oraw != self.rval => {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        match index {
+            0 if self.oraw != self.rval => {
                 self.oraw = self.rval;
                 true
             }
-            "RBV" if self.orbv != self.rbv => {
+            1 if self.orbv != self.rbv => {
                 self.orbv = self.rbv;
                 true
             }

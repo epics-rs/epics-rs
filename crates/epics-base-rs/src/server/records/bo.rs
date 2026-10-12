@@ -335,13 +335,13 @@ impl Record for BoRecord {
     /// `monitor()` is the only writer of `oraw`/`orbv`: a client that put
     /// RVAL is left holding its own value when the cycle converts back to
     /// the old one.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        match field {
-            "RVAL" if self.oraw != self.rval => {
+    fn take_secondary_value_change(&mut self, index: usize) -> bool {
+        match index {
+            0 if self.oraw != self.rval => {
                 self.oraw = self.rval;
                 true
             }
-            "RBV" if self.orbv != self.rbv => {
+            1 if self.orbv != self.rbv => {
                 self.orbv = self.rbv;
                 true
             }

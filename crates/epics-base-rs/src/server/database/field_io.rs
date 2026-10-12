@@ -2224,9 +2224,15 @@ impl PvDatabase {
             .resolve_alias(record)
             .unwrap_or_else(|| record.to_string());
         let value = EpicsValue::String(text.as_str().into());
-        let link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
+        // C `dbPutFieldLink` → `dbAddLink`: a link naming no record here is
+        // CA from this put on, as at iocInit.
+        let mut link = PreparedLink::for_put(rec.rdes().fields, &field, &value);
+        if let Some(l) = link.as_mut() {
+            l.relink(|parsed, ftype| self.add_link(parsed, ftype));
+        }
         let mut common = PreparedCommonLink::for_put(&canonical, &field, &value);
         if let Some(l) = common.as_mut() {
+            l.relink(|parsed, ftype| self.add_link(parsed, ftype));
             l.ask_add_record(self, &rec);
         }
         LinkPutParses {
@@ -2978,7 +2984,7 @@ impl PvDatabase {
     /// re-entrant database work C also does under `dbScanLock`:
     /// `execute_process_actions` → `write_out_link_value` →
     /// `write_db_link_value` re-entering `put_pv_already_locked` and
-    /// `process_target`, plus the cached-state `LinkSet::put_admission` probe
+    /// `process_target_at`, plus the cached-state `LinkSet::put_admission` probe
     /// both production lsets answer from a map lookup and an atomic — C's
     /// `if (!pca->isConnected …)` (`dbCa.c:529-532`).
     fn run_special_actions(

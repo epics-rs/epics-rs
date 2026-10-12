@@ -805,9 +805,16 @@ pub struct PvaJsonLink {
     /// case [`parse_link_v2`] yields a plain [`ParsedLink::Pva`] rather
     /// than this variant.
     pub options: Vec<(String, JlinkValue)>,
+    /// [`Self::link_identity_key`], made once by [`Self::new`].
+    key: Box<str>,
 }
 
 impl PvaJsonLink {
+    pub fn new(pv: String, options: Vec<(String, JlinkValue)>) -> Self {
+        let key = pvajson_identity_key(&pv, &options).into_boxed_str();
+        Self { pv, options, key }
+    }
+
     /// Stable per-link identity key for the base→bridge link-set
     /// boundary — `pv` plus a canonical encoding of this link's options.
     ///
@@ -824,8 +831,8 @@ impl PvaJsonLink {
     ///
     /// Delegates to [`pvajson_identity_key`] so the bridge can compute
     /// the identical key from the same `(pv, options)` at registration.
-    pub fn link_identity_key(&self) -> String {
-        pvajson_identity_key(&self.pv, &self.options)
+    pub fn link_identity_key(&self) -> &str {
+        &self.key
     }
 }
 
@@ -1004,6 +1011,10 @@ struct DbAddrCell {
     /// not a local record.
     current: std::sync::atomic::AtomicPtr<super::record_instance::ResolvedTarget>,
     lent: parking_lot::Mutex<Vec<std::sync::Arc<super::record_instance::ResolvedTarget>>>,
+    /// C `dbDbInitLink`'s `precord` for a forward link: the target's
+    /// record-table index, bound when the link is initialised or put
+    /// (`dbInitLink` / `dbAddLink`) and only read by a dispatch; `0` unbound.
+    forward: std::sync::atomic::AtomicU32,
 }
 
 impl Default for DbAddrCell {
@@ -1013,6 +1024,7 @@ impl Default for DbAddrCell {
             revision: std::sync::atomic::AtomicU64::new(NO_REVISION),
             current: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             lent: parking_lot::Mutex::new(Vec::new()),
+            forward: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -1054,6 +1066,22 @@ impl std::fmt::Debug for DbAddrCell {
 }
 
 impl DbLink {
+    /// Bind this forward link to its local target, as `dbDbInitLink` sets
+    /// `precord`; only the init pass and a link put bind.
+    pub(crate) fn bind_forward(&self, target: crate::server::database::RecordIdx) {
+        self.addr
+            .forward
+            .store(target.raw(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The target [`Self::bind_forward`] bound, `None` before a bind.
+    #[inline(always)]
+    pub(crate) fn forward(&self) -> Option<crate::server::database::RecordIdx> {
+        crate::server::database::RecordIdx::from_raw(
+            self.addr.forward.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// The answer at name-map `revision`: the cached one while the maps are
     /// at the revision it was resolved under, else `resolve`'s, cached.
     pub(crate) fn answer(
@@ -1309,6 +1337,26 @@ pub struct CaLink {
     /// with `CP`/`CPP` and matched *before* `CP`, so `"OTHER:PV CP CA"` is
     /// `pvlOptCA` alone — a plain CA link whose holder never processes.
     pub policy: LinkProcessPolicy,
+    /// C `pvlOptFWD`: a `DBF_FWDLINK` whose PV names a PROC field, the only
+    /// CA forward link dbCa's `scanForward` puts through (`dbLink.c:131-136`,
+    /// `:186-191`; `dbCa.c:643-648`). See [`ca_forward_flag`].
+    pub fwd: bool,
+}
+
+/// C's `pvlOptFWD` test for a CA link in a field of type `ftype`:
+/// `strrchr(pvname, '.')` then `strstr(pperiod, "PROC")`.
+pub fn ca_forward_flag(ftype: LinkFieldType, pv: &str) -> bool {
+    ftype == LinkFieldType::Fwd && pv.rfind('.').is_some_and(|dot| pv[dot..].contains("PROC"))
+}
+
+/// What C `dbScanFwdLink` hands an external forward link's lset, borrowed
+/// from the parse ([`ParsedLink::external_forward`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalForward<'a> {
+    /// dbCa: put 1 through `pv` when `fwd` ([`CaLink::fwd`]), else nothing.
+    Ca { pv: &'a str, fwd: bool },
+    /// The `pva` lset's `scanForward`, handed this name.
+    Pva(&'a str),
 }
 
 impl CaLink {
@@ -1320,6 +1368,7 @@ impl CaLink {
             pv: pv.into(),
             monitor_switch: MonitorSwitch::NoMaximize,
             policy: LinkProcessPolicy::NoProcess,
+            fwd: false,
         }
     }
 }
@@ -1770,6 +1819,20 @@ impl ParsedLink {
                 // is why calc is a readable link and state is both.
                 | ParsedLink::State(_)
         )
+    }
+
+    /// This link as a forward link's external target, or `None` when it is
+    /// not one. Borrowed from the parse, so dispatch allocates nothing.
+    pub fn external_forward(&self) -> Option<ExternalForward<'_>> {
+        match self {
+            ParsedLink::Ca(ca) => Some(ExternalForward::Ca {
+                pv: &ca.pv,
+                fwd: ca.fwd,
+            }),
+            ParsedLink::Pva(name) => Some(ExternalForward::Pva(name)),
+            ParsedLink::PvaJson(j) => Some(ExternalForward::Pva(j.link_identity_key())),
+            _ => None,
+        }
     }
 
     /// Boundary identity string for an external (`Ca`/`Pva`/`PvaJson`)
@@ -3012,7 +3075,7 @@ fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLin
                         if options.is_empty() {
                             Some(ParsedLink::Pva(pv))
                         } else {
-                            Some(ParsedLink::PvaJson(PvaJsonLink { pv, options }))
+                            Some(ParsedLink::PvaJson(PvaJsonLink::new(pv, options)))
                         }
                     }
                 }
@@ -3704,6 +3767,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
             // drives holder processing;
             // pre-fix it was discarded into a bare latest-value link.
             policy,
+            fwd: ca_forward_flag(ftype, pv),
         });
     }
     if let Some(rest) = s.strip_prefix("pva://") {
@@ -3790,6 +3854,7 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
             pv: link_part.to_string(),
             monitor_switch: ms,
             policy,
+            fwd: ca_forward_flag(ftype, link_part),
         });
     }
 
@@ -3981,13 +4046,13 @@ mod json_link_tests {
         // reconstructs PvaLinkConfig from map keys, matching pvxs.
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar", Q: "4" }}"#),
-            ParsedLink::PvaJson(PvaJsonLink {
-                pv: "FOO:bar".to_string(),
+            ParsedLink::PvaJson(PvaJsonLink::new(
+                "FOO:bar".to_string(),
                 // `Q: "4"` is QUOTED, so its kind is a JSON string, not an
                 // integer — the kind survives parsing (pvxs would later
                 // ignore a string `Q`, which only accepts an integer).
-                options: vec![("Q".to_string(), JlinkValue::Str("4".to_string()))],
-            })
+                vec![("Q".to_string(), JlinkValue::Str("4".to_string()))],
+            ))
         );
     }
 
@@ -4429,6 +4494,7 @@ mod json_link_tests {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         // `CA NMS` carries the explicit NoMaximize switch.
@@ -4438,6 +4504,7 @@ mod json_link_tests {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::NoMaximize,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
@@ -4471,6 +4538,7 @@ mod json_link_tests {
                 pv: "OTHER:PV".to_string(),
                 monitor_switch: MonitorSwitch::NoMaximize,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         // "REC PP CA" → PP is matched BEFORE CA, so no CA|CP|CPP bit is set
@@ -4544,6 +4612,7 @@ mod json_link_tests {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         assert_eq!(
@@ -4552,6 +4621,7 @@ mod json_link_tests {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::MaximizeIfInvalid,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         assert_eq!(
@@ -4560,6 +4630,7 @@ mod json_link_tests {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::MaximizeStatus,
                 policy: LinkProcessPolicy::NoProcess,
+                fwd: false,
             })
         );
         // Bare `ca://PV` → default NoMaximize, PV name intact.

@@ -50,39 +50,39 @@ pub struct FanoutRecord {
     // SELN is `DBF_USHORT` (fanoutRecord.dbd.pod:117): unsigned 0..65535.
     #[field(type = "UShort")]
     pub seln: u16,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk0: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk1: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk2: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk3: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk4: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk5: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk6: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk7: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk8: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnk9: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnka: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnkb: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnkc: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnkd: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnke: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub lnkf: String,
-    #[field(type = "String")]
+    #[field(type = "String", link)]
     pub sell: String,
     #[field(type = "Short")]
     pub offs: i16,

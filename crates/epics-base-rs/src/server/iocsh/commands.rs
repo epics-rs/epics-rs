@@ -1990,7 +1990,7 @@ fn render_dbpr_link(
     let ftype = crate::server::record::LinkFieldType::for_class(class);
     let parsed = ctx
         .db()
-        .db_init_link_locality(crate::server::record::parse_link_field(raw, ftype));
+        .db_init_link_locality(crate::server::record::parse_link_field(raw, ftype), ftype);
     format!(
         "{} {rendered}",
         parsed.link_type_after_init(raw, ftype).c_name()

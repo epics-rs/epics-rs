@@ -2950,6 +2950,8 @@ mod tests {
             inst.put_common_field("FLNK", EpicsValue::String("DOWNSTREAM".into()))
                 .expect("set FLNK");
         }
+        // The forward links bind at iocInit, as C's do.
+        db.ioc_init().await;
 
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
@@ -3609,9 +3611,9 @@ mod tests {
         };
         assert_eq!(
             j,
-            PvaJsonLink {
-                pv: "TARGET:AI".to_string(),
-                options: vec![
+            PvaJsonLink::new(
+                "TARGET:AI".to_string(),
+                vec![
                     (
                         "field".to_string(),
                         JlinkValue::Str("display.precision".to_string())
@@ -3619,7 +3621,7 @@ mod tests {
                     ("proc".to_string(), JlinkValue::Str("CPP".to_string())),
                     ("sevr".to_string(), JlinkValue::Str("MS".to_string())),
                 ],
-            },
+            ),
             "pvalink options preserved as structured JLink members"
         );
 

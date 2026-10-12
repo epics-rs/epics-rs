@@ -596,8 +596,8 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
 /// `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` and finishes without
 /// running any step (sseqRecord.c:319-323). The async start path must
 /// raise the same alarm AND dispatch no `LNKn` — the regression the old
-/// `MultiOut::Sseq` dispatch covered via `apply_selm_alarm` and the
-/// per-step machine dropped (it finished silently).
+/// `MultiOut::Sseq` dispatch covered and the per-step machine dropped (it
+/// finished silently).
 #[epics_macros_rs::epics_test]
 async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     let db = PvDatabase::new();

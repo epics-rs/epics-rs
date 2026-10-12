@@ -13,6 +13,7 @@ mod processing;
 mod reads_leak_tests;
 pub(crate) use processing::{AlarmPosts, alarm_field_posts};
 mod record_lock;
+mod record_table;
 pub(crate) mod scan_index;
 mod snapshot;
 
@@ -32,6 +33,7 @@ pub use processing::{
 };
 pub(crate) use record_lock::{FrameGate, InFrame, LockRecord, SetGuard};
 pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
+pub(crate) use record_table::RecordIdx;
 
 use crate::error::{CaError, CaResult};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -716,6 +718,9 @@ struct PvDatabaseInner {
     /// share of it rather than a copy. A name-keyed map that owned `String`s
     /// made a scan step allocate the name of every record it touched.
     records: RecursiveReadLock<HashMap<Arc<str>, Arc<RecordCell>>>,
+    /// Every record registered, by [`RecordIdx`]: where a resolved forward
+    /// link finds its target without the name map or a count.
+    record_table: record_table::RecordTable,
     /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
     /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
@@ -1521,6 +1526,7 @@ impl PvDatabase {
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
                 records: RecursiveReadLock::new(HashMap::new()),
+                record_table: record_table::RecordTable::default(),
                 scan_index: scan_index::ScanIndex::new(),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(CpRegistry::default()),
@@ -2166,16 +2172,19 @@ impl PvDatabase {
             // `INP`/`OUT`/`TSEL`/`SDIS`/`FLNK` live on `CommonFields` as raw
             // String and are absent from `field_list()`, so the declaration
             // says they exist and only the instance can say what they hold.
+            // A link the type leaves to the framework (mca's SIML/SIOL) keeps
+            // its text on the instance, not the rset: `link_text` reads both.
             let raw = match inst.common_link_text(desc.name) {
                 Some(raw) => raw.to_string(),
-                None => match inst.record.get_field(desc.name) {
-                    Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                    // Declared but not served by this instance's rset — a
-                    // downstream type whose generated table outruns its
-                    // `get_field`. C would have the `dbFldDes` and an empty
-                    // link; the port has no text to offer, so the field is
-                    // simply absent rather than reported as an empty link.
-                    _ => continue,
+                None => match inst.link_text(desc.name) {
+                    Some(text) => text,
+                    None if inst.record.get_field(desc.name).is_some() => String::new(),
+                    // Declared but held by no owner — a downstream type whose
+                    // generated table outruns its `get_field`. C would have
+                    // the `dbFldDes` and an empty link; the port has no text
+                    // to offer, so the field is simply absent rather than
+                    // reported as an empty link.
+                    None => continue,
                 },
             };
             out.push((desc.name.to_string(), raw, ftype));
@@ -2218,25 +2227,30 @@ impl PvDatabase {
         };
         // The texts leave the hold before any is parsed.
         let texts = Self::link_field_texts(&rec.read());
-        let mut out: Vec<(String, String, crate::server::record::ParsedLink)> = texts
+        let (mut out, ftypes): (
+            Vec<(String, String, crate::server::record::ParsedLink)>,
+            Vec<_>,
+        ) = texts
             .into_iter()
             .filter(|(_, raw, _)| !raw.is_empty())
             .map(|(field, raw, ftype)| {
                 let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                (field, raw, parsed)
+                ((field, raw, parsed), ftype)
             })
-            .filter(|(_, _, parsed)| !matches!(parsed, crate::server::record::ParsedLink::None))
-            .collect();
+            .filter(|((_, _, parsed), _)| {
+                !matches!(parsed, crate::server::record::ParsedLink::None)
+            })
+            .unzip();
         // Apply C `dbInitLink`'s locality fallthrough once, here, so no
         // consumer re-derives it. Done after dropping the record-instance
         // guard: the locality query reads the database's record map, and
         // this is the only place that would otherwise hold an instance lock
         // across it.
-        for entry in &mut out {
-            entry.2 = self.db_init_link_locality(std::mem::replace(
-                &mut entry.2,
-                crate::server::record::ParsedLink::None,
-            ));
+        for (entry, ftype) in out.iter_mut().zip(ftypes) {
+            entry.2 = self.db_init_link_locality(
+                std::mem::replace(&mut entry.2, crate::server::record::ParsedLink::None),
+                ftype,
+            );
         }
         out
     }
@@ -2784,6 +2798,9 @@ impl PvDatabase {
                 owed.extend(queued);
             }
         }
+        // Every link's text is final. After the switch, so a record added
+        // concurrently is either swept here or initialises its own forwards.
+        self.init_forward_links();
         // Sequential, in issue order: each classification is a short read of a
         // now-immutable record set, and C's `init_record` pass is a loop too.
         for init in owed {
@@ -3372,7 +3389,9 @@ impl PvDatabase {
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rec_arc = Arc::new(RecordCell::new(instance, seq, defer));
+        let index = self.inner.record_table.reserve();
+        let rec_arc = Arc::new(RecordCell::new(instance, seq, defer).indexed(index));
+        self.inner.record_table.publish(index, rec_arc.clone());
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
         // adopted before the record is reachable by anyone.
@@ -3421,6 +3440,11 @@ impl PvDatabase {
         // over an already-built database, holding no registration lock.
         self.rec_gbl_init_simm(&rec_arc);
         self.arm_watchdog(name);
+        // A record added after `iocInit` initialises its own forward links;
+        // one added before is swept by the barrier.
+        if self.ioc_is_running() {
+            self.init_record_forwards(&rec_arc);
+        }
         Ok(())
     }
 
@@ -3653,22 +3677,15 @@ impl PvDatabase {
                 break (rec_arc, record_gate, gate);
             }
         };
-        // 1) Remove from main map; keep scan + phas for scan-index cleanup.
+        // 1) Remove from main map.
         self.inner.records.write().remove(name);
-        let scan = {
-            let inst = rec_arc.read();
-            inst.common.scan
-        };
 
-        // 2) Drop from scan index if it was scheduled.
-        self.delete_from_scan_list(scan, name);
-
-        // 3) Drop from CP-link tables. Removed both as source (channel
+        // 2) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
         // CP lists may still reference this name).
         self.inner.cp_links.update(|cp| cp.remove_record(name));
 
-        // 4) Purge aliases that pointed AT the
+        // 3) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
@@ -3680,13 +3697,23 @@ impl PvDatabase {
             .write()
             .retain(|_alias, node| node.target != name);
 
-        // Same rule as `remove_simple_pv`: removal IS destruction. The
-        // record's own `Arc` outlives the map entry for as long as a CA
-        // channel holds it, so without the mark a downstream monitor would
-        // keep serving a record the database no longer has.
-        rec_arc.write().destroy();
-        self.signal_destroyed();
+        self.destroy_record(&rec_arc, name);
         Some(rec_arc)
+    }
+
+    /// The finalizer of a removed record, and the only one: the record
+    /// table keeps the cell for the IOC's life (C never frees a record), so
+    /// what a dropped cell used to let go of — its scan-list key, monitors,
+    /// lent link addresses, queued put-notifies — is released here.
+    ///
+    /// Same rule as `remove_simple_pv`: removal IS destruction. The cell
+    /// outlives the map entry, so without the mark a downstream monitor or a
+    /// bound forward would keep serving a record the database no longer has.
+    fn destroy_record(&self, rec: &RecordCell, name: &str) {
+        let scan = rec.read().common.scan;
+        self.delete_from_scan_list(scan, name);
+        rec.write().destroy();
+        self.signal_destroyed();
     }
 
     /// Internal: synchronous lookup without invoking the search resolver.
@@ -4093,6 +4120,13 @@ impl PvDatabase {
         let records = self.inner.records.read();
         let (canonical, rec) = records.get_key_value(target.as_str())?;
         Some((canonical.clone(), rec.clone()))
+    }
+
+    /// The record registered at `index` — a removed one too, which its own
+    /// `is_destroyed` refuses.
+    #[inline(always)]
+    pub(crate) fn record_at(&self, index: RecordIdx) -> Option<&Arc<RecordCell>> {
+        self.inner.record_table.get(index)
     }
 
     /// Strict variant of [`Self::get_record`] — does NOT consult the
@@ -4883,8 +4917,9 @@ mod tests {
         let b = db.get_record("CYC:B").unwrap();
         assert_eq!(
             (Arc::strong_count(&a), Arc::strong_count(&b)),
-            (3, 3),
-            "the map, this test and the other record's handle each hold the cell"
+            (4, 4),
+            "the map, the record table, this test and the other record's handle \
+             each hold the cell"
         );
         let (weak_a, weak_b) = (Arc::downgrade(&a), Arc::downgrade(&b));
         drop((a, b, db));
@@ -4915,13 +4950,13 @@ mod tests {
         let src = db.get_record("REL:SRC").unwrap();
         assert_eq!(
             Arc::strong_count(&src),
-            3,
-            "the map, the reader's handle, this test"
+            4,
+            "the map, the record table, the reader's handle, this test"
         );
         assert!(db.remove_record("REL:SRC").await);
         assert_eq!(
             Arc::strong_count(&src),
-            1,
+            2,
             "the reader's handle outlived the removal"
         );
     }
@@ -5490,8 +5525,9 @@ mod tests {
     /// replaced spelled, and the names they did NOT spell.
     ///
     /// The old lists were `COMMON_LINK_FIELDS`, `Record::multi_input_links`
-    /// and `links::CP_INPUT_LINK_FIELDS`; the third is deleted, so its content
-    /// is repeated here as the oracle rather than read from it. It carried one
+    /// and `links::CP_INPUT_LINK_FIELDS`; the first and third are deleted, so
+    /// their content is repeated here as the oracle rather than read from it.
+    /// The third carried one
     /// hard-won fact worth keeping visible — `SVL` and not `SGNL`, because
     /// `histogramRecord.dbd.pod:212` declares `field(SVL,DBF_INLINK)` while
     /// `SGNL` (:202) is the `DBF_DOUBLE` the link reads INTO. The declaration
@@ -5522,7 +5558,7 @@ mod tests {
         // SGNL is the value, not the link — the bug the old list carried.
         assert_eq!(dbf_link_class("histogram", "SGNL"), None);
 
-        for (field, _) in crate::server::record::record_instance::COMMON_LINK_FIELDS {
+        for field in ["INP", "OUT", "TSEL", "SDIS", "FLNK"] {
             assert!(
                 dbf_link_class("ai", field).is_some() || dbf_link_class("ao", field).is_some(),
                 "{field} was a COMMON_LINK_FIELDS name and must still resolve"

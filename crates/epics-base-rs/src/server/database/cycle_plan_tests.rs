@@ -341,7 +341,8 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "DB link INP variants",
-        arms: "DDDGGDDDD",
+        // `NoSuch` names no record here: `dbAddLink` makes it CA.
+        arms: "DDDGGDGDD",
         db: with_fixtures!(
             r#"record(ai, "S") { field(VAL, "1") field(HIHI, "5") field(HHSV, "MAJOR") }
                record(ai, "T") { field(INP, "S NPP MS") field(DTYP, "Soft Channel")

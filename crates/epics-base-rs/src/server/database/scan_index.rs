@@ -1192,13 +1192,15 @@ mod tests {
             .write()
             .set_scan(ScanType::SEC01);
         db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "SCAN:GONE");
-        let weak = std::sync::Arc::downgrade(&db.get_record("SCAN:GONE").unwrap());
+        let cell = db.get_record("SCAN:GONE").unwrap();
 
         assert!(db.remove_record("SCAN:GONE").await);
 
-        assert!(
-            weak.upgrade().is_none(),
-            "the scan bucket's key outlived the removal and kept the record alive"
+        // The record table keeps the cell; nothing else may.
+        assert_eq!(
+            std::sync::Arc::strong_count(&cell),
+            2,
+            "the scan bucket's key outlived the removal"
         );
     }
 

@@ -956,8 +956,8 @@ mod tests {
     /// `LockSetEdit`, so the merge has to be asked for. Merging is idempotent,
     /// which is why a second call costs nothing.
     fn set_flnk(db: &PvDatabase, from: &str, to: &str) {
+        let rec = db.get_record(from).expect("record");
         {
-            let rec = db.get_record(from).expect("record");
             let mut inst = rec.write();
             inst.common.flnk = to.to_string();
             inst.set_link_cache(
@@ -968,6 +968,8 @@ mod tests {
                 ),
             );
         }
+        // The poke stands in for a load, so it gets the load's `dbInitLink`.
+        db.init_record_forwards(&rec);
         db.build_lock_sets();
     }
 

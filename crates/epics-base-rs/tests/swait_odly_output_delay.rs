@@ -358,6 +358,8 @@ async fn swait_odly_defers_forward_link_to_continuation() {
         inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
             .unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
 
     // Delaying cycle: FLNK must NOT fire (C defers recGblFwdLink to execOutput).
     let mut v1 = epics_base_rs::server::database::ProcStack::new();

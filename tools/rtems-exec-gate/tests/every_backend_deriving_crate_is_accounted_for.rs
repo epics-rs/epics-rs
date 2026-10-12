@@ -240,6 +240,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-pva-rs", "tests/set_byte_order_renegotiate.rs"),
     ("epics-pva-rs", "tests/tls.rs"),
     ("epics-pva-rs", "tests/ui25_same_process_discovery.rs"),
+    ("mca-rs", "tests/a_remote_siml_is_a_ca_link.rs"),
     ("optics-rs", "tests/integration_tests.rs"),
     ("optics-rs", "tests/table_link_kind.rs"),
     ("regression-ioc", "tests/families.rs"),

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -920,56 +919,32 @@ pub enum AlarmAck {
     Severity,
 }
 
+/// This cycle's forward link, as one copied handle: no arm holds a share of
+/// a link or a record, so nothing is cloned for a dispatch and nothing of the
+/// source's link is borrowed across the target's processing, which may put
+/// that link.
+#[derive(Clone, Copy)]
 pub(crate) enum ForwardTarget {
     /// Nothing to forward: the record vetoed its own FLNK this cycle
     /// ([`Record::should_fire_forward_link`]), or `FLNK` is unset / constant /
     /// hardware — every kind C's `dbScanFwdLink` walks past.
     None,
     /// A local database record, C `dbScanFwdLink` → `dbScanPassive` →
-    /// `processTarget`, with what that call carries: C `processTarget`
-    /// (dbDbLink.c:460-474) hands each target `psrc->putf` and `psrc->ppn`
-    /// as a unit — the PUTF bit and the put-notify wait-set always travel
-    /// together. Resolved here, under the guard that resolved the target, so
-    /// a cycle with no DB forward link reads neither.
+    /// `processTarget`: the target `dbDbInitLink` bound
+    /// ([`DbLink::forward`](crate::server::record::DbLink::forward)), the
+    /// source's PUTF, and whether it has a put-notify wait-set, which the
+    /// dispatch reads as C's `processTarget` reads `psrc->ppn`.
     Db {
-        link: ManuallyDrop<Arc<crate::server::record::DbLink>>,
+        target: crate::server::database::RecordIdx,
         putf: bool,
-        notify: ManuallyDrop<Option<Arc<crate::server::record::NotifyWaitSet>>>,
+        notify: bool,
     },
     /// An external `pva://` / `ca://` PV, C `dbScanFwdLink` → the link set's
-    /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger.
-    External(ManuallyDrop<String>),
+    /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger. The
+    /// dispatch reads FLNK again, as C reads `plink` there.
+    External,
 }
 
-/// The owning variants hold their payload in [`ManuallyDrop`] and this `Drop`
-/// is the one place that releases it, so [`ForwardTarget::None`] — the record
-/// with no forward link, which is nearly every cycle — has no payload glue
-/// to run: its drop is the one tag test below, inlined.
-impl Drop for ForwardTarget {
-    #[inline(always)]
-    fn drop(&mut self) {
-        if !matches!(self, Self::None) {
-            self.drop_payload();
-        }
-    }
-}
-
-impl ForwardTarget {
-    #[inline(never)]
-    fn drop_payload(&mut self) {
-        // SAFETY: `drop` runs once, and nothing reads the payload afterwards.
-        unsafe {
-            match self {
-                Self::Db { link, notify, .. } => {
-                    ManuallyDrop::drop(link);
-                    ManuallyDrop::drop(notify);
-                }
-                Self::External(pv) => ManuallyDrop::drop(pv),
-                Self::None => {}
-            }
-        }
-    }
-}
 /// What C's `readValue`/`writeValue` reaches as struct members — `prec->sims`,
 /// `->sdly` — and which stage of the cycle C put the SIOL read in. `siml` and
 /// `siol` are links, read through their slots ([`RecordInstance::sim_link`]).
@@ -1299,6 +1274,7 @@ mod link_cache {
     /// dropped after the hold.
     pub(crate) struct PreparedCommonLink {
         pub(super) field: &'static str,
+        ftype: LinkFieldType,
         pub(super) text: String,
         pub(super) parsed: Arc<ParsedLink>,
         /// The new dset of a device-link put, prepared before the hold by
@@ -1378,6 +1354,7 @@ mod link_cache {
             }
             Some(PreparedCommonLink {
                 field,
+                ftype,
                 parsed: parse(&text, ftype),
                 text,
                 device: None,
@@ -1387,6 +1364,17 @@ mod link_cache {
 
         pub(crate) fn parsed(&self) -> &ParsedLink {
             &self.parsed
+        }
+
+        /// C `dbAddLink`'s view of the parse: `relink` answers what the link
+        /// becomes in this IOC, `None` for unchanged.
+        pub(crate) fn relink(
+            &mut self,
+            relink: impl FnOnce(&ParsedLink, LinkFieldType) -> Option<ParsedLink>,
+        ) {
+            if let Some(parsed) = relink(&self.parsed, self.ftype) {
+                self.parsed = Arc::new(parsed);
+            }
         }
 
         pub(crate) fn field(&self) -> &'static str {
@@ -1605,6 +1593,7 @@ mod link_cache {
     /// moves it in ([`super::RecordInstance::put_link_field`]).
     pub(crate) struct PreparedLink {
         field: &'static str,
+        ftype: LinkFieldType,
         parsed: Arc<ParsedLink>,
         #[cfg(debug_assertions)]
         text: String,
@@ -1631,6 +1620,7 @@ mod link_cache {
             let text = text.as_str_lossy();
             Some(PreparedLink {
                 field: desc.name,
+                ftype,
                 parsed: parse(&text, ftype),
                 #[cfg(debug_assertions)]
                 text: text.into_owned(),
@@ -1644,20 +1634,35 @@ mod link_cache {
         pub(crate) fn parsed(&self) -> &ParsedLink {
             &self.parsed
         }
+
+        /// [`PreparedCommonLink::relink`].
+        pub(crate) fn relink(
+            &mut self,
+            relink: impl FnOnce(&ParsedLink, LinkFieldType) -> Option<ParsedLink>,
+        ) {
+            if let Some(parsed) = relink(&self.parsed, self.ftype) {
+                self.parsed = Arc::new(parsed);
+            }
+        }
     }
 
     /// [`PreparedLink`]s for a batch of puts stored under one hold.
     pub(crate) struct PreparedLinks(Vec<PreparedLink>);
 
     impl PreparedLinks {
+        /// Each link put of the batch parsed and relinked as a field put is
+        /// ([`PvDatabase::add_link`](crate::server::database::PvDatabase)).
         pub(crate) fn for_puts<'a>(
+            db: &crate::server::database::PvDatabase,
             rec: &super::RecordCell,
             puts: impl IntoIterator<Item = (&'a str, &'a crate::types::EpicsValue)>,
         ) -> Self {
             PreparedLinks(
                 puts.into_iter()
                     .filter_map(|(field, value)| {
-                        PreparedLink::for_put(rec.rdes().fields, field, value)
+                        let mut link = PreparedLink::for_put(rec.rdes().fields, field, value)?;
+                        link.relink(|parsed, ftype| db.add_link(parsed, ftype));
+                        Some(link)
                     })
                     .collect(),
             )
@@ -1707,10 +1712,17 @@ mod link_cache {
 
         /// Slot `i` takes `parsed`: every write after the build comes here.
         fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) {
+            let mut parsed = parsed;
+            self.swap(i, &mut parsed);
+        }
+
+        /// [`Self::set`] handing the old parse back in `parsed`, for a caller
+        /// that drops it after the hold.
+        pub(super) fn swap(&mut self, i: usize, parsed: &mut Arc<ParsedLink>) {
             if usize::from(self.1.slot) == i {
-                self.1.const_lset = has_const_lset(&parsed);
+                self.1.const_lset = has_const_lset(parsed);
             }
-            self.0[i].parsed = parsed;
+            std::mem::swap(&mut self.0[i].parsed, parsed);
         }
 
         #[inline(always)]
@@ -1970,8 +1982,9 @@ pub(crate) struct ProcessPlan {
     /// This type declares at least one string-input link.
     pub(crate) string_input: bool,
     /// This type's `fanout`/`dfanout`/`seq` link array is driven by
-    /// `PvDatabase::dispatch_multi_output`. Gates all three of its call sites
-    /// — the pre-commit value phase and both forward-link tails.
+    /// `PvDatabase::dispatch_multi_output`, which runs in the pre-commit
+    /// output stage (C `dbScanFwdLink`s from `process()` ahead of `monitor()`);
+    /// neither forward-link tail reads it.
     pub(crate) multi_output_dispatch: bool,
     /// This type reads `SELL` into `SELN` at some phase of the cycle.
     pub(crate) reads_sell: bool,
@@ -2234,6 +2247,9 @@ pub struct RecordCell {
     /// cell the sequence is born with the node, cannot go missing from it, and
     /// dies with it.
     load_order: u64,
+    /// This record's slot in the database's record table, given at
+    /// registration; `None` for a cell no database registered.
+    index: Option<crate::server::database::RecordIdx>,
     /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
     /// set — C's null `lset` before `dbLockInitRecords`, made lockable — and
     /// moved onto a set of its own by the registry, which adopts this very
@@ -3117,6 +3133,7 @@ impl RecordCell {
                 .collect(),
             plan: ProcessPlan::of(&*instance.record),
             load_order,
+            index: None,
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
@@ -3126,6 +3143,17 @@ impl RecordCell {
     /// This record's database load sequence, without taking its lock set.
     pub(crate) fn load_order(&self) -> u64 {
         self.load_order
+    }
+
+    /// The cell as registered at record-table index `index`.
+    pub(crate) fn indexed(mut self, index: crate::server::database::RecordIdx) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// This record's record-table index; see [`Self::indexed`].
+    pub(crate) fn index(&self) -> Option<crate::server::database::RecordIdx> {
+        self.index
     }
 
     /// Is this record's `init_record` still owed to `iocInit`?
@@ -4884,26 +4912,6 @@ pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
     }
 }
 
-/// The `dbCommon` link fields, each with the C link-field type its text is
-/// parsed under (`dbStaticLib.c:2380-2391`): `INP`/`TSEL`/`SDIS` are
-/// `DBF_INLINK`, `OUT` is `DBF_OUTLINK`, `FLNK` is `DBF_FWDLINK`.
-///
-/// These five — and only these five — have a parse cache on
-/// [`RecordInstance`], which is what lets a one-shot init decision (C
-/// `dbInitLink` setting `DBLINK_FLAG_INITIALIZED`) be committed for them.
-/// The list has one owner because it is read from three places that must not
-/// drift: the per-field parse in `put_common_field`, the database's
-/// `record_link_fields` enumeration, and the `initialize_link_locality`
-/// commit. `FLNK` missing from just one of them is exactly how an external
-/// forward link went un-opened at init.
-pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
-    ("INP", super::link::LinkFieldType::In),
-    ("OUT", super::link::LinkFieldType::Out),
-    ("TSEL", super::link::LinkFieldType::In),
-    ("SDIS", super::link::LinkFieldType::In),
-    ("FLNK", super::link::LinkFieldType::Fwd),
-];
-
 /// The previous-value trackers a C `monitor()` compares against and never
 /// posts: `oraw`/`orbv` (the last RVAL/RBV) on the raw-value records, and
 /// `mlst`/`alst`/`lalm` (the last VAL the deadbands compare to) on every type,
@@ -4940,7 +4948,7 @@ impl RecordInstance {
         Self::new_boxed(name, Box::new(record))
     }
 
-    /// The raw text of one `COMMON_LINK_FIELDS` entry, or `None` for any
+    /// The raw text of one `dbCommon` link field, or `None` for any
     /// other field name.
     pub fn common_link_text(&self, field: &str) -> Option<&str> {
         Some(match field {
@@ -4953,19 +4961,26 @@ impl RecordInstance {
         })
     }
 
-    /// Install `link` as the parse cache of one `COMMON_LINK_FIELDS` entry
-    /// and return the parse it replaced, or hand `link` back for any other
-    /// field name. Either way nothing is allocated or freed here: the caller
-    /// builds the `Arc` before the record's hold and drops what comes back
-    /// after it, as C `dbPutFieldLink` parses ahead of `dbScanLock`. The only
-    /// writer of the five caches (`LinkCache` has no other way in), so the
-    /// plan stamp they feed is bumped here and cannot be skipped.
+    /// Install `link` as the stored link of `field` — its slot, else its
+    /// `dbCommon` link cache, the order [`Self::stored_link`] reads —
+    /// and return the parse it replaced, or hand `link` back for a field that
+    /// is not one of the record's links. Either way nothing is allocated or
+    /// freed here: the caller builds the `Arc` before the record's hold and
+    /// drops what comes back after it, as C `dbPutFieldLink` parses ahead of
+    /// `dbScanLock`. The only writer of the five caches (`LinkCache` has no
+    /// other way in), so the plan stamp they feed is bumped here and cannot
+    /// be skipped.
     pub fn install_link_cache(
         &mut self,
         field: &str,
         link: Arc<ParsedLink>,
     ) -> Result<Arc<ParsedLink>, Arc<ParsedLink>> {
         let mut link = link;
+        if let Some(i) = self.link_slots.position(field) {
+            self.invalidate_plan_for(field);
+            self.link_slots.swap(i, &mut link);
+            return Ok(link);
+        }
         if self.swap_link_cache(field, &mut link) {
             Ok(link)
         } else {
@@ -5456,23 +5471,30 @@ impl RecordInstance {
             return ForwardTarget::None;
         }
         match self.parsed_flnk.link() {
-            ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
-                link: ManuallyDrop::new(l.clone()),
-                putf: self.common.putf,
-                notify: ManuallyDrop::new(self.notify.clone()),
+            // Unbound only before `iocInit`, when C's link is still a
+            // PV_LINK with no lset to forward through.
+            ParsedLink::Db(l) if self.record.should_fire_forward_link() => match l.forward() {
+                Some(target) => ForwardTarget::Db {
+                    target,
+                    putf: self.common.putf,
+                    notify: self.notify.is_some(),
+                },
+                None => ForwardTarget::None,
             },
             ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_)
                 if self.record.should_fire_forward_link() =>
             {
-                self.parsed_flnk
-                    .external_pv_name()
-                    .map_or(ForwardTarget::None, |s| {
-                        ForwardTarget::External(ManuallyDrop::new(s.to_string()))
-                    })
+                ForwardTarget::External
             }
             // Constant / Hw / Calc / None carry no forward action.
             _ => ForwardTarget::None,
         }
+    }
+
+    /// The `FLNK` [`Self::forward_target`] reads.
+    #[inline(always)]
+    pub(crate) fn flnk(&self) -> &ParsedLink {
+        self.parsed_flnk.link()
     }
 
     /// The parse of multi-input link `slot` for a reader that holds the
@@ -6757,7 +6779,8 @@ impl RecordInstance {
     /// C `restartCheck` (dbNotify.c:149-170) — promote the queue head once the
     /// record is free, or leave it queued for the next completion.
     ///
-    /// **The only drain.** The freedom test lives here rather than at the call
+    /// **The only drain** of a live record ([`Self::destroy`] discards the
+    /// list of a removed one). The freedom test lives here rather than at the call
     /// site, so promoting onto a record that is still PACT or still carries a
     /// wait-set is not expressible.
     pub(crate) fn take_next_notify_restart(&mut self) -> Option<DeferredNotify> {
@@ -11605,7 +11628,10 @@ impl RecordInstance {
     }
 
     /// Destroy this record: drop every field monitor and refuse every future
-    /// one, and drop every link target handle it holds. The record-backed
+    /// one, drop every link target handle it holds, and drop every queued
+    /// put-notify, whose client then sees its completion dropped. The cell
+    /// itself is kept by the record table, so these releases happen here or
+    /// not at all. The record-backed
     /// half of the rule [`crate::server::pv::ProcessVariable::destroy`]
     /// states for simple PVs, so one sweep in a server closes both kinds of
     /// channel; and the one place a record lets go of the records its links
@@ -11615,6 +11641,7 @@ impl RecordInstance {
         let first = !self.destroyed;
         self.destroyed = true;
         self.subscribers.clear();
+        self.notify_restart_list.clear();
         for entry in self.parsed_inputs.iter_mut().flatten() {
             entry.release_target();
         }

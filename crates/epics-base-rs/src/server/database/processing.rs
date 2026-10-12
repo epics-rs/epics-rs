@@ -2927,6 +2927,7 @@ impl PvDatabase {
         };
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
         let mut links = crate::server::record::PreparedLinks::for_puts(
+            self,
             &rec,
             post.writes.iter().map(|(f, v)| (f.as_str(), v)),
         );
@@ -2978,6 +2979,7 @@ impl PvDatabase {
         };
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
         let mut links = crate::server::record::PreparedLinks::for_puts(
+            self,
             &rec,
             fields.iter().map(|p| (p.field(), p.value())),
         );
@@ -7179,24 +7181,51 @@ impl PvDatabase {
         flnk: &crate::server::record::record_instance::ForwardTarget,
         visited: &mut ProcStack,
     ) {
-        match flnk {
-            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
-                self.process_target(
-                    link,
-                    super::links::ProcessTargetGate::ScanPassive,
-                    *putf,
-                    notify.as_ref(),
-                    visited,
-                );
-            }
-            crate::server::record::record_instance::ForwardTarget::External(pv) => {
-                self.scan_forward_external_flnk(rec, pv);
+        match *flnk {
+            crate::server::record::record_instance::ForwardTarget::Db {
+                target,
+                putf,
+                notify,
+            } => self.scan_forward_db(rec, target, putf, notify, visited),
+            crate::server::record::record_instance::ForwardTarget::External => {
+                self.scan_forward_external(rec, ForwardLink::Flnk);
             }
             crate::server::record::record_instance::ForwardTarget::None => {}
         }
     }
 
-    /// Fire a non-DB (external `pva://`/`ca://`) forward link (FLNK).
+    /// C `dbDbScanFwdLink` → `dbScanPassive` → `processTarget` on a bound
+    /// target: the cell comes off the record table, and the source's
+    /// wait-set is read here, as `processTarget` reads `psrc->ppn` — a share
+    /// of it is taken only by a source that has one.
+    pub(super) fn scan_forward_db(
+        &self,
+        rec: InFrame<'_>,
+        target: super::RecordIdx,
+        putf: bool,
+        notify: bool,
+        visited: &mut ProcStack,
+    ) {
+        let Some(target) = self.record_at(target) else {
+            return;
+        };
+        let notify = if notify {
+            rec.read().notify.clone()
+        } else {
+            None
+        };
+        self.process_target_at(
+            target,
+            super::links::ProcessTargetGate::ScanPassive,
+            putf,
+            notify.as_ref(),
+            None,
+            visited,
+        );
+    }
+
+    /// Fire a non-DB (external `pva://`/`ca://`) forward link — an FLNK or a
+    /// fanout `LNKn`.
     ///
     /// C `recGblFwdLink` → `dbScanFwdLink` (`dbLink.c:475-480`) dispatches
     /// every FLNK uniformly through `plink->lset->scanForward`: a DB lset
@@ -7215,9 +7244,21 @@ impl PvDatabase {
     /// promoted by the next `recGblResetAlarms` — exactly as the C late-set
     /// inside `recGblFwdLink` (after the record's own alarm/monitor stage)
     /// is.
-    fn scan_forward_external_flnk(&self, rec: InFrame<'_>, target: &str) {
-        if let Err(e) = self.scan_forward_external_pv(target) {
-            let _ = e;
+    ///
+    /// The link is read here, under the frame's shared borrow, and the lset
+    /// is called under it: neither lset touches a record, and no parse is
+    /// cloned for the dispatch.
+    pub(super) fn scan_forward_external(&self, rec: InFrame<'_>, link: ForwardLink) {
+        let failed = {
+            let instance = rec.read();
+            let link = match link {
+                ForwardLink::Flnk => instance.flnk(),
+                ForwardLink::Row(i) => instance.out_row_link(i),
+            };
+            link.external_forward()
+                .is_some_and(|fwd| self.scan_forward_external_pv(fwd).is_err())
+        };
+        if failed {
             let mut instance = rec.write();
             crate::server::recgbl::rec_gbl_set_sevr_msg(
                 &mut instance.common,
@@ -8089,8 +8130,9 @@ impl PvDatabase {
             // Notify subscribers, still under this segment's own guard.
             let posts = publish_cycle(&mut instance, &cycle_snapshot, cycle_alarm_posts);
 
-            // The FLNK's PUTF + put-notify wait-set ride in `flnk_name`
-            // (see `ForwardTarget::Db`). On the async-completion path PUTF
+            // The FLNK's PUTF rides in `flnk_name` and its put-notify wait-set
+            // is read at dispatch (see `ForwardTarget::Db`). On the
+            // async-completion path PUTF
             // was set when the put landed on the record; it (and wait-set
             // membership) must propagate through the (now-completing) FLNK
             // chain so an async target reached here also defers
@@ -8119,21 +8161,7 @@ impl PvDatabase {
         // guard, exactly as on the synchronous tail (C `dbScanFwdLink` →
         // `dbScanPassive` for a DB target, → lset `scanForward` for an
         // external one).
-        match &flnk_name {
-            crate::server::record::record_instance::ForwardTarget::Db { link, putf, notify } => {
-                self.process_target(
-                    link,
-                    super::links::ProcessTargetGate::ScanPassive,
-                    *putf,
-                    notify.as_ref(),
-                    visited,
-                );
-            }
-            crate::server::record::record_instance::ForwardTarget::External(pv) => {
-                self.scan_forward_external_flnk(rec, pv);
-            }
-            crate::server::record::record_instance::ForwardTarget::None => {}
-        }
+        self.scan_forward_target(rec, &flnk_name, visited);
 
         // CP link targets — gated on what this cycle posted, as on the
         // synchronous tail.
@@ -10364,4 +10392,13 @@ enum InputFetch {
     ),
     /// Non-zero status, LINK/INVALID raised.
     Failed,
+}
+
+/// Which of the record's forward links [`PvDatabase::scan_forward_external`]
+/// dispatches.
+#[derive(Clone, Copy)]
+pub(super) enum ForwardLink {
+    Flnk,
+    /// Link `i` of the output row (fanout `LNKn`).
+    Row(usize),
 }

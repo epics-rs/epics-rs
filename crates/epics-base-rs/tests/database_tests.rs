@@ -45,6 +45,8 @@ async fn test_write_notify_follows_flnk() {
             .unwrap();
     }
 
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("REC_A", &mut visited)
         .await
@@ -3128,6 +3130,8 @@ async fn test_complete_async_record() {
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
             .unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC", &mut visited)
         .await
@@ -4054,6 +4058,8 @@ async fn test_put_notify_defers_for_async_flnk_target() {
             .unwrap();
     }
 
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let result = db
         .put_record_field_from_ca("PN_FLNK_SRC", "VAL", EpicsValue::Double(4.0))
         .await
@@ -5605,6 +5611,8 @@ async fn test_fanout_all() {
         tgt.init_record(0).unwrap();
         db.add_record(name, Box::new(tgt)).await.unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("FANOUT", &mut visited)
         .await
@@ -6169,6 +6177,8 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
             .unwrap();
     }
 
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("WF_PRODUCER", &mut visited)
         .await
@@ -8702,6 +8712,8 @@ async fn test_simulation_mode_still_fires_forward_link() {
             .unwrap();
     }
 
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM:AI", &mut visited)
         .await
@@ -8829,6 +8841,8 @@ async fn test_fanout_resolves_sell_link_into_seln() {
         .unwrap();
     db.add_record("FANSELL:FAN", Box::new(fan)).await.unwrap();
 
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("FANSELL:FAN", &mut visited)
         .await
@@ -10624,6 +10638,8 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     // FLNK target must NOT process (C returns before recGblFwdLink). The
     // delaying-cycle FLNK fires synchronously inside process_record_with_links
     // if at all, so this assertion is race-free.
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO6_SRC", &mut visited)
         .await

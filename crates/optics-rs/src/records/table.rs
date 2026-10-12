@@ -12,8 +12,8 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget,
-    ProcessAction, ProcessActions, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, LinkRead,
+    OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -2136,18 +2136,45 @@ impl TableRecord {
         actions
     }
 
-    /// Build ReadDbLink actions to read encoders.
-    fn build_read_encoder_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        for i in 0..6 {
-            if self.lnk_stat[i].can_read_position {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: ENCODER_LINK[i],
-                    target_field: ENCODER_VAL[i],
-                });
+    /// C's closing `GetReadback` then `ReadEncoders` (tableRecord.c:587-592,
+    /// :1094-1138) from loop position `from`: readbacks 0..6, encoders 6..12.
+    /// Zeroes each axis the loop passes and returns the next read; past the
+    /// end, transforms both into user coordinates.
+    ///
+    /// They run in the link stage after the cycle's drive writes, one at a
+    /// time, because a failed readback ends `GetReadback` early.
+    fn next_final_read(&mut self, from: usize) -> Option<ProcessAction> {
+        for k in from..12 {
+            let i = k % 6;
+            if k < 6 {
+                let mut r = self.motor_readback();
+                r[i] = 0.0;
+                self.set_motor_readback(&r);
+                if self.lnk_stat[i].can_rw_drive {
+                    return Some(ProcessAction::ReadDbLink {
+                        link_field: MOTOR_RBV_LINK[i],
+                        target_field: MOTOR_RBV_VAL[i],
+                    });
+                }
+            } else {
+                let mut e = self.encoder_motor();
+                e[i] = 0.0;
+                self.set_encoder_motor(&e);
+                if self.lnk_stat[i].can_read_position {
+                    return Some(ProcessAction::ReadDbLink {
+                        link_field: ENCODER_LINK[i],
+                        target_field: ENCODER_VAL[i],
+                    });
+                }
             }
         }
-        actions
+        let r = self.motor_readback();
+        let rb = self.do_motor_to_user(&r);
+        self.set_user_readback(&rb);
+        let e = self.encoder_motor();
+        let eu = self.do_motor_to_user(&e);
+        self.set_encoder_user(&eu);
+        None
     }
 
     /// Build ReadDbLink actions to read motor limits.
@@ -2569,17 +2596,7 @@ impl Record for TableRecord {
         // Calculate user limits
         self.do_calc_user_limits();
 
-        // Read motor drive values and transform to offset user coordinates
-        let r = self.motor_readback();
-        let rb = self.do_motor_to_user(&r);
-        self.set_user_readback(&rb);
-
-        // Read encoders and transform to offset user coordinates
-        let e = self.encoder_motor();
-        let eu = self.do_motor_to_user(&e);
-        self.set_encoder_user(&eu);
-
-        // Pre-process actions (read links) are done via pre_process_actions
+        actions.extend(self.next_final_read(0));
         Ok(ProcessOutcome::complete_with(actions))
     }
 
@@ -2619,11 +2636,28 @@ impl Record for TableRecord {
             .copied()
             .map(|link_field| ProcessAction::ResolveOutTarget { link_field })
             .collect();
-        actions.extend(self.build_read_rbv_actions());
-        actions.extend(self.build_read_encoder_actions());
+        // Only sync and init read the readbacks before deciding.
+        if self.zero == 0 && self.read == 0 && (self.sync != 0 || self.init != 0) {
+            actions.extend(self.build_read_rbv_actions());
+        }
         actions.extend(self.build_read_limit_actions());
         actions.extend(self.build_read_speed_actions());
         actions.into()
+    }
+
+    fn link_read_result(&mut self, link_field: &'static str, read: LinkRead) -> ProcessActions {
+        let k = match MOTOR_RBV_LINK.iter().position(|&l| l == link_field) {
+            Some(_) if matches!(read, LinkRead::Failed) => 6,
+            Some(i) => i + 1,
+            None => match ENCODER_LINK.iter().position(|&l| l == link_field) {
+                Some(i) => 7 + i,
+                None => return ProcessActions::new(),
+            },
+        };
+        self.next_final_read(k)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

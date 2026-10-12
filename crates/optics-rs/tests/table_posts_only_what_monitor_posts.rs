@@ -10,7 +10,7 @@
 //! never on an alarm move. `table_monitor_posts_from_its_saved_copy` pins the
 //! values.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed on the
+// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread`); no CA server is built.
 
 use std::collections::HashMap;
@@ -181,21 +181,44 @@ const FIELDS: [(&str, DbFieldType); 138] = [
     ("STAT", DbFieldType::Double),
 ];
 
-/// Appends the name of each PV an event reaches.
-struct Name {
+/// C's `%g`, the format `camonitor` prints a double in.
+fn g(v: f64) -> String {
+    let e = format!("{v:.5e}");
+    let (mantissa, exp) = e.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    if v == 0.0 {
+        "0".into()
+    } else if !(-4..6).contains(&exp) {
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        let fixed = format!("{v:.*}", (5 - exp) as usize);
+        fixed.trim_end_matches('0').trim_end_matches('.').into()
+    }
+}
+
+/// Appends each event it passes, as `camonitor` prints it without the time.
+struct Line {
     pv: String,
     stream: Arc<Mutex<String>>,
 }
 
-impl SubscriptionFilter for Name {
+impl SubscriptionFilter for Line {
     fn name(&self) -> &'static str {
-        "name"
+        "line"
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
+        let value = match event.event.value().as_value().and_then(EpicsValue::to_f64) {
+            Some(v) => g(v),
+            None => panic!("{}: {:?}", self.pv, event.event.value()),
+        };
         let mut stream = self.stream.lock().unwrap();
-        stream.push_str(&self.pv);
-        stream.push('\n');
+        stream.push_str(&format!("{} {value}\n", self.pv));
         Some(event)
     }
 }
@@ -203,14 +226,16 @@ impl SubscriptionFilter for Name {
 /// Starts each step's posts in a stream.
 const STEP: &str = "--\n";
 
-/// A stream as each step's posts, sorted: C posts an axis's fields together in
-/// `monitor()`'s loop, the port in its walk's order.
+/// A stream as each step's posts, grouped by PV in each PV's own order: C posts
+/// an axis's fields together in `monitor()`'s loop, the port in its walk's.
 fn steps_of(stream: &str) -> Vec<Vec<&str>> {
-    stream
-        .split(STEP)
+    let mut steps: Vec<&str> = stream.split(STEP).collect();
+    assert_eq!(steps.remove(0), "", "a stream starts with its first step");
+    steps
+        .into_iter()
         .map(|step| {
             let mut posts: Vec<&str> = step.lines().collect();
-            posts.sort_unstable();
+            posts.sort_by_key(|post| post.split_once(' ').map_or(*post, |(pv, _)| pv));
             posts
         })
         .collect()
@@ -240,7 +265,7 @@ async fn streams(db: &str) -> Vec<String> {
                 sid += 1;
                 assert!(inst.attach_filter_to_last_subscriber(
                     field,
-                    Arc::new(Name {
+                    Arc::new(Line {
                         pv: format!("T.{field}"),
                         stream: stream.clone(),
                     }),
@@ -269,100 +294,100 @@ record(table, "T") {
 const VALUE: &str = "\
 --
 --
-T.X
-T.XL
-T.HLX
-T.LLX
-T.M0X
-T.M2X
+T.X 1
+T.XL 1
+T.HLX 1
+T.LLX 0.999999
+T.M0X 1
+T.M2X 1
 --
 --
-T.Y
-T.YL
-T.HLY
-T.LLY
-T.M0Y
-T.M1Y
-T.M2Y
+T.Y 2
+T.YL 2
+T.HLY 2
+T.LLY 2
+T.M0Y 2
+T.M1Y 2
+T.M2Y 2
 --
-T.AX
-T.AXL
-T.M2Y
+T.AX 0.5
+T.AXL 0.5
+T.M2Y 3.74531
 --
-T.AX
-T.AXRB
-T.EAX
-T.AX0
-T.X
-T.XRB
-T.X0
-T.Y
-T.YRB
-T.Y0
-T.UHAXR
-T.HLX
-T.EX
-T.UHXR
-T.HLY
-T.EY
-T.UHYR
-T.ULAXR
-T.ULXR
-T.ULYR
-T.ZERO
-T.ZERO
-T.ZERO
+T.AX 0
+T.AXRB -0.5
+T.EAX -0.5
+T.AX0 0.5
+T.X 0
+T.XRB -1
+T.X0 1
+T.Y 0
+T.YRB -2
+T.Y0 2
+T.UHAXR -0.5
+T.HLX 1e+09
+T.EX -1
+T.UHXR -1
+T.HLY 1e+09
+T.EY -2
+T.UHYR -2
+T.ULAXR -0.5
+T.ULXR -1
+T.ULYR -2
+T.ZERO 1
+T.ZERO 1
+T.ZERO 0
 --
-T.LVIO
+T.LVIO 1
 --
-T.X
-T.X
+T.X 1
+T.X 0
 --
-T.READ
-T.READ
-T.READ
-T.LVIO
+T.READ 1
+T.READ 1
+T.READ 0
+T.LVIO 0
 --
-T.SYNC
-T.SYNC
-T.SYNC
-T.AX
-T.AXL
-T.X
-T.XL
-T.Y
-T.YL
-T.LLX
-T.LLY
-T.M0X
-T.M0Y
-T.M1Y
-T.M2X
-T.M2Y
+T.SYNC 1
+T.SYNC 1
+T.SYNC 0
+T.AX -0.5
+T.AXL 0
+T.X -1
+T.XL 0
+T.Y -2
+T.YL 0
+T.LLX -1e-06
+T.LLY -1e-06
+T.M0X 0
+T.M0Y 0
+T.M1Y 0
+T.M2X 0
+T.M2Y 0
 --
-T.AX
-T.AXRB
-T.EAX
-T.AX0
-T.X
-T.XRB
-T.X0
-T.Y
-T.YRB
-T.Y0
-T.UHAXR
-T.HLX
-T.EX
-T.UHXR
-T.HLY
-T.EY
-T.UHYR
-T.ULAXR
-T.ULXR
-T.ULYR
-T.INIT
-T.INIT
-T.INIT
+T.AX 0
+T.AXRB 0
+T.EAX 0
+T.AX0 0
+T.X 0
+T.XRB 0
+T.X0 0
+T.Y 0
+T.YRB 0
+T.Y0 0
+T.UHAXR 0
+T.HLX 1e-06
+T.EX 0
+T.UHXR 0
+T.HLY 1e-06
+T.EY 0
+T.UHYR 0
+T.ULAXR 0
+T.ULXR 0
+T.ULYR 0
+T.INIT 1
+T.INIT 1
+T.INIT 0
 --
 ";
 
@@ -384,23 +409,23 @@ const ALARM: &str = "\
 const LOG: &str = "\
 --
 --
-T.X
+T.X 1
 --
 --
-T.Y
+T.Y 2
 --
-T.AX
+T.AX 0.5
 --
-T.ZERO
+T.ZERO 1
 --
 --
-T.X
+T.X 1
 --
-T.READ
+T.READ 1
 --
-T.SYNC
+T.SYNC 1
 --
-T.INIT
+T.INIT 1
 --
 ";
 
@@ -444,6 +469,190 @@ record(table, "T") {
 }
 "#;
 
+/// `LINKED` less the limits, from a readback of 0: what C's `init_record`
+/// reads then is what the port starts with.
+const ZEROED: &str = r#"
+record(ao, "T:RB") {
+}
+record(ao, "T:V") {
+  field(VAL, "2")
+}
+record(table, "T") {
+  field(LX, "100")
+  field(LZ, "200")
+  field(M0XL, "T:RB")
+  field(R0XI, "T:RB")
+  field(E0XI, "T:RB")
+  field(V0XI, "T:V")
+  field(V0XL, "T:V")
+}
+"#;
+
+const ZEROED_VALUE: &str = "\
+--
+--
+T.X 1
+T.AYRB 0.286659
+T.XRB 1.00125
+T.XL 1
+T.ZRB -0.247653
+T.EAY 0.286659
+T.HLX 1
+T.LLX 0.999999
+T.EX 1.00125
+T.EZ -0.247653
+T.M0X 1
+T.E0X 1
+T.M2X 1
+--
+--
+T.Y 2
+T.YL 2
+T.HLY 2
+T.LLY 2
+T.M0Y 2
+T.M1Y 2
+T.M2Y 2
+--
+T.AX 0.5
+T.AXL 0.5
+T.M2Y 3.74531
+--
+T.AX 0
+T.AXRB -0.5
+T.EAX -0.5
+T.AX0 0.5
+T.X 0
+T.XRB 0.00125157
+T.X0 1
+T.Y 0
+T.YRB -2
+T.Y0 2
+T.UHAXR -0.5
+T.HLX 1e+09
+T.EX 0.00125157
+T.UHXR -1
+T.HLY 1e+09
+T.EY -2
+T.UHYR -2
+T.ULAXR -0.5
+T.ULXR -1
+T.ULYR -2
+T.ZERO 1
+T.ZERO 1
+T.ZERO 0
+--
+T.LVIO 1
+--
+T.X 1
+T.X 0
+--
+T.READ 1
+T.READ 1
+T.READ 0
+T.LVIO 0
+--
+T.AX -0.5
+T.AXL 0
+T.AY 0.286659
+T.AYL 0.286659
+T.X 0.00125157
+T.XL 1.00125
+T.Y -2
+T.YL 0
+T.Z -0.247653
+T.ZL -0.247653
+T.LLX 1.00125
+T.LLY -1e-06
+T.HLZ -0.247652
+T.LLZ -0.247654
+T.M0Y 0
+T.M1Y 0
+T.M2X 0
+T.M2Y 0
+T.SYNC 1
+T.SYNC 1
+T.SYNC 0
+--
+T.AX 0
+T.AXRB 0
+T.EAX 0
+T.AX0 0
+T.X 1.00125
+T.XRB 1.00125
+T.X0 0
+T.Y 0
+T.YRB 0
+T.Y0 0
+T.UHAXR 0
+T.HLX 1.00125
+T.EX 1.00125
+T.UHXR 0
+T.HLY 1e-06
+T.EY 0
+T.UHYR 0
+T.ULAXR 0
+T.ULXR 0
+T.ULYR 0
+T.INIT 1
+T.INIT 1
+T.INIT 0
+--
+";
+
+const ZEROED_ALARM: &str = "\
+--
+--
+--
+--
+--
+--
+--
+--
+--
+--
+--
+--
+";
+
+const ZEROED_LOG: &str = "\
+--
+--
+T.X 1
+--
+--
+T.Y 2
+--
+T.AX 0.5
+--
+T.ZERO 1
+--
+--
+T.X 1
+--
+T.READ 1
+--
+T.SYNC 1
+--
+T.INIT 1
+--
+";
+
+/// A cycle reads the readback and encoder after it writes the drive, as C's
+/// `process()` does (`tableRecord.c:570-592`): XRB and EX carry this cycle's
+/// M0X, not the last.
+#[tokio::test]
+async fn table_reads_its_motors_after_the_drive_write() {
+    let got = streams(ZEROED).await;
+    for (got, want, class) in [
+        (&got[0], ZEROED_VALUE, "DBE_VALUE"),
+        (&got[1], ZEROED_ALARM, "DBE_ALARM"),
+        (&got[2], ZEROED_LOG, "DBE_LOG"),
+    ] {
+        assert_eq!(steps_of(got), steps_of(want), "{class}");
+    }
+}
+
 /// The fields outside C's post list; none posts in the oracle's run of
 /// `LINKED`, in any class.
 const NEVER_POSTED: [&str; 55] = [
@@ -454,9 +663,9 @@ const NEVER_POSTED: [&str; 55] = [
     "UDF", "SEVR", "STAT",
 ];
 
-/// Only the silence is compared: the port reads the motor links before the
-/// cycle writes the drive, where C reads them after, so its readbacks trail
-/// C's by a cycle and the posted values differ.
+/// Only the silence is compared: C's `init_record` reads the motors and
+/// limits (`tableRecord.c:383-403`), which the port does not, so every value
+/// after it differs. `ZEROED` pins the values.
 #[tokio::test]
 async fn table_never_posts_the_motor_fields_it_writes() {
     for (stream, class) in streams(LINKED)
@@ -466,7 +675,10 @@ async fn table_never_posts_the_motor_fields_it_writes() {
     {
         let posted: Vec<&str> = stream
             .lines()
-            .filter(|pv| NEVER_POSTED.contains(&pv.trim_start_matches("T.")))
+            .filter(|post| {
+                let pv = post.split_once(' ').map_or(*post, |(pv, _)| pv);
+                NEVER_POSTED.contains(&pv.trim_start_matches("T."))
+            })
             .collect();
         assert!(posted.is_empty(), "{class}: {posted:?}");
     }

@@ -6694,6 +6694,19 @@ pub trait Record: Send + Sync + 'static {
     fn monitor_value_view(&self) -> Option<ValueView<'_>> {
         None
     }
+
+    /// C `dbPut` of one element into the primary array field: the convert
+    /// routine writes `pfield[0]` of the existing buffer and `put_array_info`
+    /// sets NORD to 1 (`dbAccess.c:1350-1367`). `src` is an [`OutView::Str`]
+    /// or [`OutView::Num`]. `false`: nothing was stored — the type has no such
+    /// buffer, another holder shares it, or the request does not convert
+    /// cleanly — and the general put takes it. The caller skips both
+    /// `dbPutSpecial` passes, so only a type whose `special()` and `on_put`
+    /// do nothing for its primary field may store here.
+    fn put_primary_element0(&mut self, src: OutView<'_>) -> bool {
+        let _ = src;
+        false
+    }
 }
 
 /// The body of [`Record::put_field_internal`] — the framework's internal write

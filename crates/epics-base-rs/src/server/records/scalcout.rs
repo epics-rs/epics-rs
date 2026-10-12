@@ -1470,6 +1470,35 @@ impl Record for ScalcoutRecord {
         SCALCOUT_STRING_INPUT_LINKS
     }
 
+    /// C `fetch_values` (`sCalcoutRecord.c:912-935`) switches on the source:
+    /// a `DBF_CHAR`/`DBF_UCHAR` array is read as its bytes, anything else as
+    /// `DBR_STRING`, which a float source renders at its own PREC (`cvt_d_st`).
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        if SCALCOUT_STRING_INPUT_LINKS
+            .iter()
+            .any(|(lf, _)| *lf == link_field)
+        {
+            InputLinkRequest::FromSource
+        } else {
+            InputLinkRequest::As(LinkReadAs::Native)
+        }
+    }
+
+    fn input_link_read_as_from_source(
+        &self,
+        _link_field: &str,
+        source: &crate::server::record::OutTarget,
+    ) -> Option<crate::server::record::LinkReadAs> {
+        use crate::server::record::LinkReadAs;
+        Some(match source.field_type {
+            Some(DbFieldType::Char | DbFieldType::UChar) if source.element_count > 1 => {
+                LinkReadAs::Native
+            }
+            _ => LinkReadAs::String,
+        })
+    }
+
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
     }

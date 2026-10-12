@@ -2606,24 +2606,27 @@ impl PvDatabase {
             },
         };
         // C `dbPutLinkLS` (`dbLink.c:527-538`): only a `DBF_CHAR`/`DBF_UCHAR`
-        // field takes the characters; any other takes one `DBR_STRING`.
-        let src = match (src.value(), at) {
+        // field takes the characters; any other takes one `DBR_STRING`, lent
+        // from the source's buffer (a reference-count bump keeps it).
+        let ls_chars = match (src.value(), at) {
             (EpicsValue::CharArray(chars), Some(at))
                 if ls && !takes_chars(held, at, &target.field) =>
             {
-                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-                super::field_io::PutSrc::Owned(EpicsValue::String(PvString::from(&chars[..end])))
+                Some(chars.clone())
             }
-            _ => src,
+            _ => None,
         };
         if at.is_none() && !self.has_name_no_resolve(&target.record) {
             let external = db.pvname();
-            let failed = match self.write_external_pv(&external, src.into_value(), notify) {
-                Ok(()) => false,
-                Err(refusal) => {
-                    refusal.report(&external);
-                    true
-                }
+            let failed = match self.external_put_value(&external, src, ls) {
+                None => false,
+                Some(value) => match self.write_external_pv(&external, value, notify) {
+                    Ok(()) => false,
+                    Err(refusal) => {
+                        refusal.report(&external);
+                        true
+                    }
+                },
             };
             return DbLinkWrite::untargeted(failed);
         }
@@ -2643,7 +2646,13 @@ impl PvDatabase {
                     field: &target.field,
                     at: &at.put,
                 },
-                src,
+                match &ls_chars {
+                    Some(chars) => {
+                        let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                        super::field_io::PutReq::Str(&chars[..end])
+                    }
+                    None => src.into(),
+                },
                 0,
                 super::field_io::PutVia::DbPut,
                 &mut tail,
@@ -2862,6 +2871,33 @@ impl PvDatabase {
     /// put to `name` would be issued right now.
     pub(crate) fn external_put_admitted(&self, name: &str) -> Result<(), ExternalPutRefusal> {
         self.external_put_gate(name).map(|_| ())
+    }
+
+    /// What an OUT put sends over an external link; `ls` is C
+    /// `dbPutLinkLS` (`dbLink.c:527-538`), whose `dbGetLinkDBFtype` is the
+    /// channel's native type, or -1 while it is down (`pcaGetCheck`,
+    /// `dbCa.c:650-660`): then nothing is put and the status is 0. A
+    /// `DBF_CHAR`/`DBF_UCHAR` channel takes the characters; any other one
+    /// `DBR_STRING`.
+    fn external_put_value(
+        &self,
+        name: &str,
+        src: super::field_io::PutSrc<'_>,
+        ls: bool,
+    ) -> Option<EpicsValue> {
+        if !ls {
+            return Some(src.into_value());
+        }
+        match self.external_link_metadata(name)?.dbf_type? {
+            LinkDbfType::Char | LinkDbfType::UChar => Some(src.into_value()),
+            _ => match src.value() {
+                EpicsValue::CharArray(chars) => {
+                    let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                    Some(EpicsValue::String(PvString::from(&chars[..end])))
+                }
+                _ => Some(src.into_value()),
+            },
+        }
     }
 
     /// Write a value to an external (`ca://` / `pva://`) OUT link
@@ -3356,17 +3392,16 @@ impl PvDatabase {
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
+        // The `dbPutLinkLS` callers (`lsoRecord.c:286`, `devLsoSoft.c:21`,
+        // `devPrintfSoft.c:19`) are the sources whose output is a long string.
+        let ls = matches!(value.value(), EpicsValue::CharArray(_))
+            && matches!(
+                src_rec.read().record.output_view(),
+                Some(crate::server::record::OutView::Chars(_))
+            );
         let failed = match &*link {
             crate::server::record::ParsedLink::Db(_) => {
                 let held = Some(src_rec.set());
-                // The `dbPutLinkLS` callers (`lsoRecord.c:286`,
-                // `devLsoSoft.c:21`, `devPrintfSoft.c:19`) are the sources
-                // whose output is a long string.
-                let ls = matches!(value.value(), EpicsValue::CharArray(_))
-                    && matches!(
-                        src_rec.read().record.output_view(),
-                        Some(crate::server::record::OutView::Chars(_))
-                    );
                 let mut staged = None;
                 let mut out = LinkWriteOut {
                     staged: &mut staged,
@@ -3382,12 +3417,15 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                match self.write_external_pv(&name, value.into_value(), src.notify) {
-                    Ok(()) => false,
-                    Err(refusal) => {
-                        refusal.report(&name);
-                        true
-                    }
+                match self.external_put_value(&name, value, ls) {
+                    None => false,
+                    Some(value) => match self.write_external_pv(&name, value, src.notify) {
+                        Ok(()) => false,
+                        Err(refusal) => {
+                            refusal.report(&name);
+                            true
+                        }
+                    },
                 }
             }
             // C `lnkState_putValue` (`lnkState.c:153-203`) drives the named
@@ -4810,14 +4848,23 @@ fn takes_chars(
     let Some(desc) = addr.desc else {
         return false;
     };
-    let value = desc.runtime_typed.then(|| {
-        let guard = match held {
-            Some(held) => at.rec.read_in(held),
-            None => at.rec.read(),
-        };
-        guard.resolve_field(field)
-    });
-    let code = super::char_view::field_addr_types(desc, value.flatten().as_ref()).0;
+    if !desc.runtime_typed {
+        let code = super::char_view::field_addr_types(desc, None).0;
+        return matches!(code, DbfCode::Char | DbfCode::UChar);
+    }
+    let guard = match held {
+        Some(held) => at.rec.read_in(held),
+        None => at.rec.read(),
+    };
+    // The primary field's variant, lent: a waveform VAL is not cloned.
+    if field == guard.record.primary_field()
+        && let Some(view) = guard.record.monitor_value_view()
+    {
+        use crate::server::record::ValueView;
+        return matches!(view, ValueView::Char(_) | ValueView::UChar(_));
+    }
+    let value = guard.resolve_field(field);
+    let code = super::char_view::field_addr_types(desc, value.as_ref()).0;
     matches!(code, DbfCode::Char | DbfCode::UChar)
 }
 

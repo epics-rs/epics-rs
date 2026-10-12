@@ -1594,6 +1594,43 @@ pub(crate) enum PutSrc<'a> {
     Value(&'a EpicsValue),
 }
 
+/// What [`PvDatabase::db_put_at`] stores: a [`PutSrc`], or C `dbPutLinkLS`'s
+/// one `DBR_STRING` (`dbLink.c:537`), lent from the source record's buffer up
+/// to its NUL as C passes `prec->val`.
+pub(crate) enum PutReq<'a> {
+    Src(PutSrc<'a>),
+    Str(&'a [u8]),
+}
+
+impl<'a> From<PutSrc<'a>> for PutReq<'a> {
+    fn from(src: PutSrc<'a>) -> Self {
+        PutReq::Src(src)
+    }
+}
+
+impl PutReq<'_> {
+    /// The general arm's owned value; a lent string is copied here only.
+    fn into_value(self) -> EpicsValue {
+        match self {
+            PutReq::Src(src) => src.into_value(),
+            PutReq::Str(bytes) => EpicsValue::String(crate::types::PvString::from(bytes)),
+        }
+    }
+
+    /// The request as one scalar element; `None` for an array or a value
+    /// with no numeric row.
+    fn element(&self) -> Option<crate::server::record::OutView<'_>> {
+        use crate::server::record::OutView;
+        match self {
+            PutReq::Str(bytes) => Some(OutView::Str(bytes)),
+            PutReq::Src(src) => match src.value() {
+                EpicsValue::String(s) => Some(OutView::Str(s.as_bytes())),
+                v => v.num().map(OutView::Num),
+            },
+        }
+    }
+}
+
 impl PutSrc<'_> {
     pub(crate) fn value(&self) -> &EpicsValue {
         match self {
@@ -1747,17 +1784,55 @@ fn finish_put(
 
 /// The lean arm's store (spec §1.2), `false` where it does not apply and the
 /// general arm takes the put: a slot whose variant or reserve does not hold,
-/// or a request this arm does not convert (a string into a number or menu,
-/// whose parse wants text the general arm already builds).
+/// or a request this arm does not convert (a string into a menu, or one
+/// `cvt_st_*` refuses, whose report the general arm makes).
 #[inline(always)]
 fn store_lean(
     record: &mut dyn crate::server::record::Record,
     put: crate::server::record::record_instance::PutFn,
-    src: &PutSrc<'_>,
+    src: &PutReq<'_>,
 ) -> bool {
-    match src.value() {
-        EpicsValue::String(s) => store_lean_str(record, put, s.as_bytes()),
-        v => v.num().is_some_and(|n| store_lean_num(record, put, n)),
+    match src {
+        PutReq::Str(bytes) => store_lean_text(record, put, bytes),
+        PutReq::Src(src) => match src.value() {
+            EpicsValue::String(s) => store_lean_text(record, put, s.as_bytes()),
+            v => v.num().is_some_and(|n| store_lean_num(record, put, n)),
+        },
+    }
+}
+
+/// A `DBR_STRING` request: `putStringString` into a string slot, else C's
+/// scalar `cvt_st_*` row (`dbFastLinkConv.c:1698`) through
+/// [`crate::types::c_parse::put_string`].
+#[inline(always)]
+fn store_lean_text(
+    record: &mut dyn crate::server::record::Record,
+    put: crate::server::record::record_instance::PutFn,
+    bytes: &[u8],
+) -> bool {
+    use crate::server::record::record_instance::PutFn as F;
+    use crate::types::c_parse::{Converted, NumericField as N, put_string};
+    let target = match put {
+        F::Str { .. } => return store_lean_str(record, put, bytes),
+        F::General | F::Enum(_) => return false,
+        F::F64(_) => N::Double,
+        F::F32(_) => N::Float,
+        F::I8(_) => N::Char,
+        F::U8(_) => N::UChar,
+        F::I16(_) => N::Short,
+        F::U16(_) => N::UShort,
+        F::I32(_) => N::Long,
+        F::U32(_) => N::ULong,
+        F::I64(_) => N::Int64,
+        F::U64(_) => N::UInt64,
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    match put_string("", target, text) {
+        Ok(Converted::Stored(v)) => v.num().is_some_and(|n| store_lean_num(record, put, n)),
+        Ok(Converted::Unchanged) => true,
+        Err(_) => false,
     }
 }
 
@@ -2469,7 +2544,7 @@ impl PvDatabase {
         let stage = self.db_put_at(
             None,
             target,
-            PutSrc::Owned(value),
+            PutSrc::Owned(value).into(),
             0,
             PutVia::DbPut,
             &mut chain.tail,
@@ -2508,7 +2583,7 @@ impl PvDatabase {
         &self,
         held: Option<&super::SetGuard>,
         target: PutTarget<'f>,
-        src: PutSrc<'_>,
+        src: PutReq<'_>,
         origin: u64,
         mut via: PutVia<'_>,
         tail: &mut PutTail,
@@ -2530,6 +2605,17 @@ impl PvDatabase {
         {
             finish_put(&mut instance, field, at, &None, origin, &mut burst);
             return Ok(None);
+        }
+        // A scalar into the primary array field: element 0 of the buffer in
+        // place, `put_array_info(paddr, 1)` (`dbAccess.c:1350-1367`).
+        if at.dbaddr() && !at.field().char_view() && field == instance.record.primary_field() {
+            if let Some(element) = src.element() {
+                let old_nord = array_nord_before_put(&instance, field);
+                if instance.record.put_primary_element0(element) {
+                    finish_put(&mut instance, field, at, &old_nord, origin, &mut burst);
+                    return Ok(None);
+                }
+            }
         }
 
         let value = src.into_value();
@@ -2831,7 +2917,7 @@ impl PvDatabase {
             let stage = self.db_put_at(
                 None,
                 target,
-                PutSrc::Owned(value),
+                PutSrc::Owned(value).into(),
                 origin,
                 PutVia::DbPut,
                 tail,
@@ -3821,7 +3907,7 @@ impl PvDatabase {
                     common: &mut None,
                     refused_processes: None,
                 };
-                self.db_put_at(None, target, PutSrc::Owned(value), 0, via, tail)
+                self.db_put_at(None, target, PutSrc::Owned(value).into(), 0, via, tail)
                     .and_then(|stage| {
                         self.finish_put_stage(
                             record_name,
@@ -3909,7 +3995,7 @@ impl PvDatabase {
             refused_processes: Some(&mut refused_processes),
         };
         let put = self
-            .db_put_at(None, target, PutSrc::Owned(value), 0, via, tail)
+            .db_put_at(None, target, PutSrc::Owned(value).into(), 0, via, tail)
             .and_then(|stage| {
                 self.finish_put_stage(record_name, &rec, stage, None, &mut super::ProcStack::new())
             });
@@ -4188,7 +4274,7 @@ impl PvDatabase {
                 refused_processes: None,
             };
             let put = self
-                .db_put_at(None, target, PutSrc::Owned(value), 0, via, tail)
+                .db_put_at(None, target, PutSrc::Owned(value).into(), 0, via, tail)
                 .and_then(|stage| {
                     self.finish_put_stage(
                         &canonical_base,

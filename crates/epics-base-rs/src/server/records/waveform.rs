@@ -903,6 +903,63 @@ impl Record for WaveformRecord {
         })
     }
 
+    /// [`Self::put_val`]'s scalar row without building the one-element array:
+    /// the same parse or `to_<ty>` cast, into `bptr[0]` of the unshared buffer.
+    fn put_primary_element0(&mut self, src: crate::server::record::OutView<'_>) -> bool {
+        use crate::server::record::OutView;
+        let n = match src {
+            OutView::Num(n) => n,
+            OutView::Str(text) => {
+                let (Some(numeric), Ok(text)) = (
+                    c_parse::NumericField::of(self.ftvl_element_type()),
+                    std::str::from_utf8(text),
+                ) else {
+                    return false;
+                };
+                match c_parse::put_string_element("VAL", numeric, text) {
+                    Ok(c_parse::Converted::Stored(v)) => match v.num() {
+                        Some(n) => n,
+                        None => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            OutView::Chars(_) | OutView::Array(_) => return false,
+        };
+        macro_rules! put {
+            ($buf:expr, $x:expr) => {
+                match $buf.head_mut() {
+                    Some([e0, ..]) => {
+                        *e0 = $x;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+        }
+        // `to_field`'s row per element type; `Char` keeps the epicsInt8 bits.
+        let stored = self.val_capacity() > 0
+            && match &mut self.val {
+                EpicsValue::DoubleArray(b) => put!(b, n.to_f64()),
+                EpicsValue::FloatArray(b) => put!(b, n.to_f32()),
+                EpicsValue::ShortArray(b) => put!(b, n.to_i16()),
+                EpicsValue::UShortArray(b) => put!(b, n.to_u16()),
+                EpicsValue::EnumArray(b) => put!(b, n.to_u16()),
+                EpicsValue::CharArray(b) => put!(b, n.to_i8() as u8),
+                EpicsValue::UCharArray(b) => put!(b, n.to_u8()),
+                EpicsValue::LongArray(b) => put!(b, n.to_i32()),
+                EpicsValue::ULongArray(b) => put!(b, n.to_u32()),
+                EpicsValue::Int64Array(b) => put!(b, n.to_i64()),
+                EpicsValue::UInt64Array(b) => put!(b, n.to_u64()),
+                _ => false,
+            };
+        if stored {
+            self.nord = 1;
+            self.inp_read_failed = false;
+        }
+        stored
+    }
+
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::PRE_INPUT
     }

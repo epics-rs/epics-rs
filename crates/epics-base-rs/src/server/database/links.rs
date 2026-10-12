@@ -2591,13 +2591,15 @@ impl PvDatabase {
         };
         // C `dbPutLinkLS` (`dbLink.c:527-538`): only a `DBF_CHAR`/`DBF_UCHAR`
         // field takes the characters; any other takes one `DBR_STRING`, lent
-        // from the source's buffer (a reference-count bump keeps it).
-        let ls_chars = match (src.value(), at) {
-            (EpicsValue::CharArray(chars), Some(at))
-                if ls && !takes_chars(held, at, &target.field) =>
-            {
-                Some(chars.clone())
-            }
+        // from the source's buffer up to its NUL.
+        let ls_str = match (ls, at) {
+            (true, Some(at)) => match src.value() {
+                EpicsValue::CharArray(chars) if !takes_chars(held, at, &target.field) => {
+                    let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                    Some(&chars[..end])
+                }
+                _ => None,
+            },
             _ => None,
         };
         if at.is_none() && !self.has_name_no_resolve(&target.record) {
@@ -2630,11 +2632,8 @@ impl PvDatabase {
                     field: &target.field,
                     at: &at.put,
                 },
-                match &ls_chars {
-                    Some(chars) => {
-                        let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-                        super::field_io::PutReq::Str(&chars[..end])
-                    }
+                match ls_str {
+                    Some(bytes) => super::field_io::PutReq::Str(bytes),
                     None => src.into(),
                 },
                 0,

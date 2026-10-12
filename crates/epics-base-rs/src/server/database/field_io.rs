@@ -1792,13 +1792,16 @@ fn store_lean(
     put: crate::server::record::record_instance::PutFn,
     src: &PutReq<'_>,
 ) -> bool {
-    match src {
-        PutReq::Str(bytes) => store_lean_text(record, put, bytes),
+    // One `store_lean_text` site: a second inlined copy takes the string
+    // store out of line.
+    let bytes = match src {
+        PutReq::Str(bytes) => *bytes,
         PutReq::Src(src) => match src.value() {
-            EpicsValue::String(s) => store_lean_text(record, put, s.as_bytes()),
-            v => v.num().is_some_and(|n| store_lean_num(record, put, n)),
+            EpicsValue::String(s) => s.as_bytes(),
+            v => return v.num().is_some_and(|n| store_lean_num(record, put, n)),
         },
-    }
+    };
+    store_lean_text(record, put, bytes)
 }
 
 /// A `DBR_STRING` request: `putStringString` into a string slot, else C's
@@ -1811,10 +1814,28 @@ fn store_lean_text(
     bytes: &[u8],
 ) -> bool {
     use crate::server::record::record_instance::PutFn as F;
+    match put {
+        // `putStringString`: at most `field_size - 1` bytes.
+        F::Str { slot, cap } => {
+            store_str_slot(record, slot, &bytes[..bytes.len().min(usize::from(cap))])
+        }
+        F::General | F::Enum(_) => false,
+        _ => store_lean_parsed(record, put, bytes),
+    }
+}
+
+/// [`store_lean_text`] into a numeric slot, out of line: the parse is no
+/// part of a string put's path.
+#[inline(never)]
+fn store_lean_parsed(
+    record: &mut dyn crate::server::record::Record,
+    put: crate::server::record::record_instance::PutFn,
+    bytes: &[u8],
+) -> bool {
+    use crate::server::record::record_instance::PutFn as F;
     use crate::types::c_parse::{Converted, NumericField as N, put_string};
     let target = match put {
-        F::Str { .. } => return store_lean_str(record, put, bytes),
-        F::General | F::Enum(_) => return false,
+        F::Str { .. } | F::General | F::Enum(_) => return false,
         F::F64(_) => N::Double,
         F::F32(_) => N::Float,
         F::I8(_) => N::Char,
@@ -1874,21 +1895,6 @@ fn store_lean_num(
             let text = text.as_bytes();
             text.len() <= usize::from(cap) && store_str_slot(record, slot, text)
         }
-    }
-}
-
-/// `putStringString`: at most `field_size - 1` bytes.
-#[inline(always)]
-fn store_lean_str(
-    record: &mut dyn crate::server::record::Record,
-    put: crate::server::record::record_instance::PutFn,
-    bytes: &[u8],
-) -> bool {
-    match put {
-        crate::server::record::record_instance::PutFn::Str { slot, cap } => {
-            store_str_slot(record, slot, &bytes[..bytes.len().min(usize::from(cap))])
-        }
-        _ => false,
     }
 }
 

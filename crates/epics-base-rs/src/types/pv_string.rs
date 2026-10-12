@@ -63,9 +63,17 @@ impl PvString {
 
     /// Replace the bytes in the buffer this string already has, so a slot
     /// reserved at load does not grow (or reallocate) under the record lock.
+    #[inline(always)]
     pub fn set_bytes(&mut self, bytes: &[u8]) {
-        self.0.clear();
-        self.0.extend_from_slice(bytes);
+        // Overwrite in place and extend by the tail only: `clear` then
+        // `extend_from_slice` goes through `Vec`'s out-of-line append even
+        // when the length does not change.
+        self.0.truncate(bytes.len());
+        let (head, tail) = bytes.split_at(self.0.len());
+        self.0.copy_from_slice(head);
+        if !tail.is_empty() {
+            self.0.extend_from_slice(tail);
+        }
     }
 
     /// Bytes the buffer holds without growing.

@@ -1327,25 +1327,55 @@ pub struct SubscriberList<S> {
 }
 
 /// One version of a [`SubscriberList`]'s map.
+///
+/// A reader sees what each entry points at, never the entry: an
+/// `Arc<Subscriber>` yields `&Subscriber`, so no cycle thread can clone a
+/// handle out of a guard and become the subscriber's last holder.
+///
+/// ```
+/// use std::sync::Arc;
+/// use epics_base_rs::server::event_queue::SubscriberList;
+/// let list = SubscriberList::default();
+/// list.add(0, Arc::new(1u32), || ());
+/// let _seen: &u32 = list.load().of(0).next().unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use epics_base_rs::server::event_queue::SubscriberList;
+/// let list = SubscriberList::default();
+/// list.add(0, Arc::new(1u32), || ());
+/// let _owned: Arc<u32> = list.load().of(0).next().unwrap().clone();
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use epics_base_rs::server::event_queue::SubscriberList;
+/// let list = SubscriberList::default();
+/// list.add(0, Arc::new(1u32), || ());
+/// let _owned: Arc<u32> = list.load().iter().next().unwrap().1.clone();
+/// ```
 pub struct SubscriberMap<S> {
     entries: Vec<(u16, S)>,
 }
 
-impl<S> SubscriberMap<S> {
+impl<S: std::ops::Deref> SubscriberMap<S> {
     /// The run of `field`'s monitors, in attach order.
-    pub fn of(&self, field: u16) -> impl Iterator<Item = &S> {
+    pub fn of(&self, field: u16) -> impl Iterator<Item = &S::Target> {
         let start = self.entries.partition_point(|(f, _)| *f < field);
         self.entries[start..]
             .iter()
             .take_while(move |(f, _)| *f == field)
-            .map(|(_, s)| s)
+            .map(|(_, s)| &**s)
     }
 
     /// Every monitor with its field index, by field then attach order.
-    pub fn iter(&self) -> impl Iterator<Item = (u16, &S)> {
-        self.entries.iter().map(|(f, s)| (*f, s))
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &S::Target)> {
+        self.entries.iter().map(|(f, s)| (*f, &**s))
     }
+}
 
+impl<S> SubscriberMap<S> {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1385,13 +1415,13 @@ impl<S: Clone> SubscriberList<S> {
     }
 
     /// C `db_add_event`'s `ellAdd` onto `mlis`, behind `field`'s earlier
-    /// monitors.
+    /// monitors, then `seed` — EVENT_ADD's first value, read and queued inside
+    /// one scan-lock hold (C `db_post_single_event`'s `dbScanLock`).
     ///
-    /// EVENT_ADD seeds after this returns, reading the field and queueing the
-    /// seed inside one scan-lock hold (C `db_post_single_event`'s
-    /// `dbScanLock`). That order delivers a racing change at most twice and
-    /// never loses it; a seed read before the add, or outside a hold, can.
-    pub fn add(&self, field: u16, sub: S) {
+    /// The seed runs once `sub` is published and the writer mutex released, so
+    /// a racing change is delivered at most twice and never lost. C seeds
+    /// before the enable (`camessage.c:1907`, `:1913`) and can lose it.
+    pub fn add<R>(&self, field: u16, sub: S, seed: impl FnOnce() -> R) -> R {
         let _w = self.writer.lock();
         let cur = self.map.load();
         let at = cur.entries.partition_point(|(f, _)| *f <= field);
@@ -1403,6 +1433,7 @@ impl<S: Clone> SubscriberList<S> {
         let freed = self.publish(entries, 1, 0);
         drop(_w);
         drop(freed);
+        seed()
     }
 
     /// Remove every monitor `keep` refuses, returning them so their drops run
@@ -1441,19 +1472,23 @@ impl<S: Clone> SubscriberList<S> {
     ) -> crate::sync::Freed<SubscriberMap<S>> {
         self.count.fetch_add(added, Ordering::Release);
         #[cfg(test)]
-        self.midpoint();
+        self.midpoint(true);
         let freed = self.map.store_deferred(Arc::new(SubscriberMap { entries }));
         #[cfg(test)]
-        self.midpoint();
+        self.midpoint(false);
         self.count.fetch_sub(removed, Ordering::Release);
         freed
     }
 
-    /// The count and the published map's length between `publish`'s steps.
+    /// The count and the published map's length between `publish`'s steps,
+    /// and a test's hook just before the store.
     #[cfg(test)]
-    fn midpoint(&self) {
+    fn midpoint(&self, before_store: bool) {
         let seen = (self.count.load(Ordering::Acquire), self.map.load().len());
         subscriber_list_tests::MIDPOINTS.with(|m| m.borrow_mut().push(seen));
+        if before_store && let Some(hook) = subscriber_list_tests::BEFORE_STORE.take() {
+            hook();
+        }
     }
 }
 
@@ -1468,6 +1503,77 @@ mod subscriber_list_tests {
     thread_local! {
         pub(super) static MIDPOINTS: std::cell::RefCell<Vec<(usize, usize)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static BEFORE_STORE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A record whose posts load the list inside the hold that wrote the
+    /// value, and whose monitors each queue what they are sent.
+    #[derive(Default)]
+    struct Rec {
+        hold: StdMutex<i32>,
+        list: SubscriberList<Arc<StdMutex<Vec<i32>>>>,
+    }
+
+    impl Rec {
+        fn post(&self, v: i32) {
+            let mut val = self.hold.lock().unwrap();
+            *val = v;
+            for q in self.list.load().of(0) {
+                q.lock().unwrap().push(v);
+            }
+        }
+
+        /// EVENT_ADD: attach a monitor and seed it inside one hold.
+        fn event_add(&self) -> Arc<StdMutex<Vec<i32>>> {
+            let q = Arc::<StdMutex<Vec<i32>>>::default();
+            self.list.add(0, q.clone(), || {
+                let val = self.hold.lock().unwrap();
+                q.lock().unwrap().push(*val);
+            });
+            q
+        }
+    }
+
+    /// The C-loss case: a post after the seed's read but before the monitor
+    /// is published. Seeding after the publish reads it instead.
+    #[test]
+    fn a_post_racing_the_add_is_not_lost() {
+        let rec = Arc::new(Rec::default());
+        rec.post(1);
+        let poster = rec.clone();
+        BEFORE_STORE.set(Some(Box::new(move || poster.post(2))));
+        let q = rec.event_add();
+        assert_eq!(*q.lock().unwrap(), [2], "the monitor's last value is stale");
+    }
+
+    /// A post between the publish and the seed: delivered, and the seed
+    /// repeats it — the at-most-twice bound. The writer mutex stays a leaf.
+    #[test]
+    fn a_post_between_the_publish_and_the_seed_is_delivered_at_most_twice() {
+        let rec = Rec::default();
+        rec.post(1);
+        let q = Arc::<StdMutex<Vec<i32>>>::default();
+        rec.list.add(0, q.clone(), || {
+            assert!(
+                !rec.list.writer.is_locked(),
+                "the seed ran under the writer"
+            );
+            rec.post(2);
+            let val = rec.hold.lock().unwrap();
+            q.lock().unwrap().push(*val);
+        });
+        assert_eq!(*q.lock().unwrap(), [2, 2]);
+    }
+
+    /// A post after the seed: delivered once.
+    #[test]
+    fn a_post_after_the_seed_is_delivered_once() {
+        let rec = Rec::default();
+        rec.post(1);
+        let q = rec.event_add();
+        rec.post(2);
+        assert_eq!(*q.lock().unwrap(), [1, 2]);
     }
 
     /// Between the count update and the store of every add and removal, the
@@ -1477,7 +1583,7 @@ mod subscriber_list_tests {
         let drops = Drops::default();
         let list = SubscriberList::default();
         for id in 0..3 {
-            list.add(id as u16, probe(id, &drops));
+            list.add(id as u16, probe(id, &drops), || ());
         }
         drop(list.retain(|f, _| f != 1));
         drop(list.retain(|_, _| false));
@@ -1503,6 +1609,13 @@ mod subscriber_list_tests {
         }
     }
 
+    impl std::ops::Deref for Probe {
+        type Target = u32;
+        fn deref(&self) -> &u32 {
+            &self.id
+        }
+    }
+
     impl Drop for Probe {
         fn drop(&mut self) {
             self.drops
@@ -1520,7 +1633,7 @@ mod subscriber_list_tests {
     }
 
     fn ids(map: &SubscriberMap<Probe>, field: u16) -> Vec<u32> {
-        map.of(field).map(|p| p.id).collect()
+        map.of(field).copied().collect()
     }
 
     #[test]
@@ -1528,16 +1641,16 @@ mod subscriber_list_tests {
         let drops = Drops::default();
         let list = SubscriberList::default();
         assert!(list.is_empty() && list.load().is_empty());
-        list.add(3, probe(1, &drops));
+        list.add(3, probe(1, &drops), || ());
         assert!(!list.is_empty());
         assert_eq!(ids(&list.load(), 3), [1]);
         assert!(ids(&list.load(), 2).is_empty());
-        list.add(3, probe(2, &drops));
-        list.add(1, probe(3, &drops));
-        list.add(5, probe(4, &drops));
+        list.add(3, probe(2, &drops), || ());
+        list.add(1, probe(3, &drops), || ());
+        list.add(5, probe(4, &drops), || ());
         let map = list.load();
         assert_eq!(ids(&map, 3), [1, 2]);
-        let order: Vec<_> = map.iter().map(|(f, p)| (f, p.id)).collect();
+        let order: Vec<_> = map.iter().map(|(f, id)| (f, *id)).collect();
         assert_eq!(order, [(1, 3), (3, 1), (3, 2), (5, 4)]);
     }
 
@@ -1545,11 +1658,11 @@ mod subscriber_list_tests {
     fn last_removed_empties_and_a_no_op_retain_stores_nothing() {
         let drops = Drops::default();
         let list = SubscriberList::default();
-        list.add(0, probe(1, &drops));
+        list.add(0, probe(1, &drops), || ());
         assert!(list.retain(|_, _| true).is_empty());
         // Had the retain stored, this add would free the map the first add
         // made, dropping its copy of 1.
-        list.add(0, probe(2, &drops));
+        list.add(0, probe(2, &drops), || ());
         assert!(drops.lock().unwrap().is_empty(), "the no-op retain stored");
         let gone = list.retain(|_, _| false);
         assert_eq!(gone.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 2]);
@@ -1562,7 +1675,7 @@ mod subscriber_list_tests {
     fn remove_during_a_load() {
         let drops = Drops::default();
         let list = SubscriberList::default();
-        list.add(7, probe(1, &drops));
+        list.add(7, probe(1, &drops), || ());
         let (to_writer, from_reader) = std::sync::mpsc::channel();
         let (to_reader, from_writer) = std::sync::mpsc::channel::<()>();
         let reader = thread::scope(|s| {
@@ -1585,7 +1698,7 @@ mod subscriber_list_tests {
             reader.join().unwrap()
         });
         let held = drops.lock().unwrap().len();
-        list.add(7, probe(2, &drops));
+        list.add(7, probe(2, &drops), || ());
         let drops = drops.lock().unwrap().clone();
         assert!(drops.len() > held, "the next writer freed nothing");
         assert!(drops.iter().all(|(_, t)| *t != reader), "{drops:?}");
@@ -1602,7 +1715,7 @@ mod subscriber_list_tests {
                 let (list, drops) = (&list, &drops);
                 s.spawn(move || {
                     for id in 0..300 {
-                        list.add(field, probe(id, drops));
+                        list.add(field, probe(id, drops), || ());
                     }
                 });
             }
@@ -1637,14 +1750,14 @@ mod subscriber_list_tests {
         }
         let list = *LIST.get_or_init(|| Box::leak(Box::default()));
         // add's store frees the map that held the first.
-        list.add(0, Arc::new(Chk));
+        list.add(0, Arc::new(Chk), || ());
         drop(list.retain(|_, _| false));
-        list.add(0, Arc::new(Chk));
+        list.add(0, Arc::new(Chk), || ());
         assert_eq!(LOCKED_AT_DROP.lock().unwrap().len(), 1);
         // A guard keeps the second's map past add's sweep, so retain frees it.
         let guard = list.load();
         drop(list.retain(|_, _| false));
-        list.add(0, Arc::new(Chk));
+        list.add(0, Arc::new(Chk), || ());
         drop(guard);
         drop(list.retain(|_, _| false));
         assert_eq!(*LOCKED_AT_DROP.lock().unwrap(), [false, false]);
@@ -1671,7 +1784,7 @@ mod subscriber_list_tests {
             });
             let writer = s.spawn(move || {
                 for id in 0..2000 {
-                    list.add(4, probe(id, drops));
+                    list.add(4, probe(id, drops), || ());
                     if id % 2 == 1 {
                         drop(list.retain(|_, p| p.id != id - 1));
                     }

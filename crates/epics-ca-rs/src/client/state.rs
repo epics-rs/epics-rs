@@ -1,6 +1,10 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use epics_base_rs::runtime::sync::broadcast;
 
 use crate::channel::AccessRights;
 use epics_base_rs::types::DbFieldType;
@@ -66,11 +70,126 @@ pub(crate) struct ChannelInner {
     /// Waiters for connection (oneshot senders)
     pub connect_waiters: Vec<epics_base_rs::runtime::sync::oneshot::Sender<()>>,
     /// Connection event broadcaster
-    pub conn_tx: epics_base_rs::runtime::sync::broadcast::Sender<ConnectionEvent>,
+    pub conn_tx: ConnEvents,
     /// Consecutive short-lived disconnects (for reconnection backoff)
     pub reconnect_count: u32,
     /// When the last successful connection was established
     pub last_connected_at: Option<Instant>,
+}
+
+/// A channel's connection-event sender, owned by the coordinator (its only
+/// writer). Every event is folded into [`ConnFold`] before it is sent, so a
+/// receiver that lagged can take the state it would hold had it lost
+/// nothing — an outage it never saw included — rather than a guess from the
+/// channel's current state, which cannot show an outage that is over.
+pub(crate) struct ConnEvents {
+    tx: broadcast::Sender<ConnectionEvent>,
+    fold: Arc<AtomicU64>,
+}
+
+/// The receiving side of [`ConnEvents`], held by every `CaChannel`.
+#[derive(Clone)]
+pub(crate) struct ConnEventsView {
+    tx: broadcast::Sender<ConnectionEvent>,
+    fold: Arc<AtomicU64>,
+}
+
+/// The fold of every event a [`ConnEvents`] has sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnFold {
+    pub connected: bool,
+    /// The rights of the last `AccessRightsChanged` sent while connected,
+    /// `true`/`true` before the first. One sent while disconnected (the
+    /// outage's no-rights) is not folded: dbCa reads rights only while
+    /// connected (`dbCa.c:1022-1023`).
+    pub read: bool,
+    pub write: bool,
+    /// Connected → `Disconnected` edges sent.
+    pub outages: u64,
+}
+
+impl ConnFold {
+    const CONNECTED: u64 = 1;
+    const READ: u64 = 2;
+    const WRITE: u64 = 4;
+    const OUTAGE: u64 = 8;
+
+    fn unpack(v: u64) -> Self {
+        Self {
+            connected: v & Self::CONNECTED != 0,
+            read: v & Self::READ != 0,
+            write: v & Self::WRITE != 0,
+            outages: v / Self::OUTAGE,
+        }
+    }
+
+    fn pack(self) -> u64 {
+        (self.outages * Self::OUTAGE)
+            | if self.connected { Self::CONNECTED } else { 0 }
+            | if self.read { Self::READ } else { 0 }
+            | if self.write { Self::WRITE } else { 0 }
+    }
+
+    fn after(mut self, evt: &ConnectionEvent) -> Self {
+        match *evt {
+            ConnectionEvent::Connected => self.connected = true,
+            ConnectionEvent::Disconnected => {
+                if self.connected {
+                    self.outages += 1;
+                }
+                self.connected = false;
+            }
+            ConnectionEvent::AccessRightsChanged { read, write } if self.connected => {
+                self.read = read;
+                self.write = write;
+            }
+            ConnectionEvent::AccessRightsChanged { .. }
+            | ConnectionEvent::NativeTypeChanged { .. } => {}
+        }
+        self
+    }
+}
+
+impl ConnEvents {
+    pub fn new(capacity: usize) -> (Self, broadcast::Receiver<ConnectionEvent>) {
+        let (tx, rx) = broadcast::channel(capacity);
+        let fold = ConnFold {
+            connected: false,
+            read: true,
+            write: true,
+            outages: 0,
+        };
+        let fold = Arc::new(AtomicU64::new(fold.pack()));
+        (Self { tx, fold }, rx)
+    }
+
+    pub fn view(&self) -> ConnEventsView {
+        ConnEventsView {
+            tx: self.tx.clone(),
+            fold: self.fold.clone(),
+        }
+    }
+
+    /// Fold `evt`, then send it: a receiver woken by it reads a fold that
+    /// already includes it.
+    pub fn send(
+        &self,
+        evt: ConnectionEvent,
+    ) -> Result<usize, broadcast::error::SendError<ConnectionEvent>> {
+        let now = ConnFold::unpack(self.fold.load(Ordering::Relaxed)).after(&evt);
+        self.fold.store(now.pack(), Ordering::Release);
+        self.tx.send(evt)
+    }
+}
+
+impl ConnEventsView {
+    pub fn subscribe(&self) -> broadcast::Receiver<ConnectionEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn fold(&self) -> ConnFold {
+        ConnFold::unpack(self.fold.load(Ordering::Acquire))
+    }
 }
 
 /// Connection state change events
@@ -103,4 +222,47 @@ pub enum ConnectionEvent {
         previous: Option<DbFieldType>,
         current: DbFieldType,
     },
+}
+
+#[cfg(test)]
+mod conn_fold_tests {
+    use super::*;
+
+    /// One case per boundary of the fold: a disconnect counts only from
+    /// connected, and rights fold only while connected, so the outage's
+    /// no-rights does not read as a change at the reconnect.
+    #[test]
+    fn the_fold_counts_edges_and_connected_rights() {
+        let (tx, _rx) = ConnEvents::new(4);
+        let view = tx.view();
+        let at = |connected, read, write, outages| ConnFold {
+            connected,
+            read,
+            write,
+            outages,
+        };
+        assert_eq!(view.fold(), at(false, true, true, 0));
+
+        let _ = tx.send(ConnectionEvent::Disconnected);
+        assert_eq!(view.fold().outages, 0, "never connected: no edge");
+
+        let _ = tx.send(ConnectionEvent::Connected);
+        let _ = tx.send(ConnectionEvent::AccessRightsChanged {
+            read: true,
+            write: false,
+        });
+        assert_eq!(view.fold(), at(true, true, false, 0));
+
+        let _ = tx.send(ConnectionEvent::Disconnected);
+        let _ = tx.send(ConnectionEvent::AccessRightsChanged {
+            read: false,
+            write: false,
+        });
+        let _ = tx.send(ConnectionEvent::Disconnected);
+        assert_eq!(
+            view.fold(),
+            at(false, true, false, 1),
+            "one edge; the outage's no-rights is not folded"
+        );
+    }
 }

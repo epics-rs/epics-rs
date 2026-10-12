@@ -226,13 +226,17 @@ async fn a_connected_but_write_denied_link_is_refused() {
 }
 
 /// The resolver's rights come from the events its watcher receives, so the
-/// receiver must exist before the channel can connect. Reading it only after
-/// the connect is the worst case a preempted `open` can hit, where a receiver
-/// taken then from `connection_events` had missed both events and the write
-/// right stayed at its default `true` — the loaded-run failure above.
+/// receiver must exist before the channel can connect. Both arms read only
+/// after the connect is OVER: `wait_connected` wakes on the state change,
+/// and a second `WaitConnected` is answered by the coordinator after the
+/// handler that sent `Connected` + `AccessRightsChanged` has returned. The
+/// receiver made with the channel holds both; one taken then — what a
+/// preempted `open` used to do — holds neither, and its write right stayed
+/// at the default `true`.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to() {
+    use epics_base_rs::runtime::sync::broadcast::error::TryRecvError;
     use epics_ca_rs::client::ConnectionEvent;
     let port = serve_acf_pv().await;
     pin_env(port);
@@ -241,22 +245,33 @@ async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to()
         .expect("CA client");
     client.set_host_name(DENIED_HOST);
     let (channel, mut with_channel) = client.create_channel_with_events(PV, 0);
-    channel
-        .wait_connected(fact_budget::FACT_BUDGET)
-        .await
-        .expect("READ is granted to everyone");
+    for _ in 0..2 {
+        channel
+            .wait_connected(fact_budget::FACT_BUDGET)
+            .await
+            .expect("READ is granted to everyone");
+    }
+    let mut late = channel.connection_events();
 
+    let mut next = async || {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, with_channel.recv())
+            .await
+            .expect("the receiver made with the channel holds the connect")
+            .ok()
+    };
+    assert_eq!(next().await, Some(ConnectionEvent::Connected));
     assert_eq!(
-        with_channel.recv().await.ok(),
-        Some(ConnectionEvent::Connected)
-    );
-    assert_eq!(
-        with_channel.recv().await.ok(),
+        next().await,
         Some(ConnectionEvent::AccessRightsChanged {
             read: true,
             write: false
         }),
         "the ACF's WRITE rule names a HAG this client is not in"
+    );
+    assert_eq!(
+        late.try_recv(),
+        Err(TryRecvError::Empty),
+        "a receiver taken after the connect holds neither event"
     );
 }
 

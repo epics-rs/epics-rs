@@ -2297,13 +2297,10 @@ async fn first_connect_does_not_emit_native_type_changed() {
     // so this test needs no `#[serial]` and cannot race the env other tests set.
     let client = CaClient::new().await.expect("client");
     client.add_address(([127, 0, 0, 1], port).into());
-    let channel = client.create_channel("NTC:FIRST:PV");
-    // Subscribe to the event stream synchronously, before the async connect can
-    // complete: the connect involves a UDP search + TCP handshake (ms), this
-    // subscribe is µs, so `Connected` cannot slip past. The `saw_connected`
-    // assertion below fails loudly if it ever does, so a missed window can never
-    // masquerade as "no NativeTypeChanged".
-    let mut events = channel.connection_events();
+    // The receiver is made with the channel, before its search starts, so the
+    // first connect's events are in it by construction; the `saw_connected`
+    // assertion below holds it to that.
+    let (channel, mut events) = client.create_channel_with_events("NTC:FIRST:PV", 0);
 
     channel
         .wait_connected(fact_budget::FACT_BUDGET)

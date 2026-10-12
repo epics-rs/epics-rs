@@ -1229,4 +1229,89 @@ mod tests {
         let second = render_timestamp(both, s2.into(), c2, start, &mut st);
         assert_eq!(second, format!("{}{}", srv_diff(3.0), cli_diff(10.0)));
     }
+
+    /// `monitor_pv` decides "*** Not connected" from the receiver it is
+    /// handed, so it must be the one `create_pvs` made with the channel. The
+    /// monitor starts only after the connect is over (`wait_connected`, then
+    /// a second `WaitConnected` the coordinator answers after the handler
+    /// that sent `Connected`), the window a slow first `await` used to open:
+    /// a receiver taken now holds nothing, and a `monitor_pv` that subscribed
+    /// for itself would never set the flag.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_pv_counts_a_connect_that_beat_it() {
+        use epics_base_rs::runtime::sync::broadcast::error::TryRecvError;
+        use epics_ca_rs::EpicsValue;
+        use epics_ca_rs::client::{CaClient, CaClientConfig};
+        use epics_ca_rs::server::CaServer;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = CaServer::builder()
+            .port(0)
+            .pv("CAMON:PIN", EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let port = server.udp_port();
+        tokio::spawn(async move { server.run().await });
+        // SAFETY: nextest runs each test in its own process, and nothing else
+        // in this one reads the environment concurrently.
+        unsafe {
+            std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+        }
+        let client = CaClient::new_with_config(CaClientConfig::default())
+            .await
+            .expect("CA client");
+
+        let (channel, conn_rx) =
+            epics_ca_rs::cli::create_pvs(&client, &["CAMON:PIN".to_string()], 0)
+                .expect("a creatable name")
+                .pop()
+                .unwrap();
+        for _ in 0..2 {
+            channel
+                .wait_connected(fact_budget::FACT_BUDGET)
+                .await
+                .expect("connects");
+        }
+        assert_eq!(
+            channel.connection_events().try_recv(),
+            Err(TryRecvError::Empty),
+            "a receiver taken after the connect holds nothing"
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let m = matches_of(&["CAMON:PIN"]);
+        let fmt = <Args as clap::FromArgMatches>::from_arg_matches(&m)
+            .unwrap()
+            .value_format(&mut TOOL.scan(&m));
+        let task = tokio::spawn(super::monitor_pv(
+            channel,
+            conn_rx,
+            "CAMON:PIN".to_string(),
+            flag.clone(),
+            Arc::new(fmt),
+            false,
+            None,
+            mask_of(&[]),
+            spec_of(&[]),
+            SystemTime::now(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        ));
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while !flag.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor_pv missed the connect: camonitor would print \
+                 \"*** Not connected (PV not found)\" for a connected PV"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        task.abort();
+    }
 }

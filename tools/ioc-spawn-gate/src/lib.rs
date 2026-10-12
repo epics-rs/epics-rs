@@ -94,56 +94,31 @@ struct BinTarget {
     path: PathBuf,
 }
 
-/// Close one `[[bin]]` block, applying cargo's default path.
-fn flush_bin(
-    block: &mut Option<(Option<String>, Option<String>)>,
-    out: &mut Vec<BinTarget>,
-    seen: &mut BTreeSet<String>,
-    claimed: &mut BTreeSet<PathBuf>,
-) {
-    let Some((name, path)) = block.take() else {
-        return;
-    };
-    let Some(name) = name else { return };
-    let path = PathBuf::from(path.unwrap_or_else(|| format!("src/bin/{name}.rs")));
-    if seen.insert(name.clone()) {
-        claimed.insert(path.clone());
-        out.push(BinTarget { name, path });
-    }
-}
-
 /// Every bin target of one crate: `[[bin]]` blocks, then the `src/bin/*.rs`
 /// and `src/main.rs` cargo infers.
 fn bin_targets(crate_dir: &Path) -> Vec<BinTarget> {
-    let manifest = read(&crate_dir.join("Cargo.toml"));
+    let manifest = manifest(&crate_dir.join("Cargo.toml"));
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     // Paths an explicit `[[bin]]` already owns. `epics-oracle-rs` names one
     // `oracle-ioc` with `path = "src/bin/oracle_ioc.rs"`; inferring a second
     // target from that file's stem would invent a binary cargo never builds.
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut block: Option<(Option<String>, Option<String>)> = None;
-    for line in manifest.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            flush_bin(&mut block, &mut out, &mut seen, &mut claimed);
-            if t == "[[bin]]" {
-                block = Some((None, None));
-            }
-            continue;
-        }
-        let Some((name, path)) = block.as_mut() else {
+    let bins = manifest.get("bin").and_then(|b| b.as_array());
+    for bin in bins.into_iter().flatten().filter_map(|b| b.as_table()) {
+        let Some(name) = bin.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
-        for (key, slot) in [("name", &mut *name), ("path", &mut *path)] {
-            if let Some(rest) = t.strip_prefix(key)
-                && let Some(rest) = rest.trim_start().strip_prefix('=')
-            {
-                *slot = Some(rest.trim().trim_matches(['"', '\'']).to_string());
-            }
+        let path = bin.get("path").and_then(|p| p.as_str());
+        let path = PathBuf::from(path.map_or_else(|| format!("src/bin/{name}.rs"), str::to_string));
+        if seen.insert(name.to_string()) {
+            claimed.insert(path.clone());
+            out.push(BinTarget {
+                name: name.to_string(),
+                path,
+            });
         }
     }
-    flush_bin(&mut block, &mut out, &mut seen, &mut claimed);
 
     let mut inferred: Vec<String> = Vec::new();
     for path in dir_entries(&crate_dir.join("src/bin")) {
@@ -764,47 +739,33 @@ fn split_targets(crate_dir: &Path) -> (Vec<(String, Vec<PathBuf>)>, Vec<PathBuf>
     (bin_closures, lib_files)
 }
 
-/// The quoted value of `key = "..."` inside one manifest line's inline table.
-fn quoted_value<'a>(table: &'a str, key: &str) -> Option<&'a str> {
-    let mut from = 0;
-    while let Some(i) = table[from..].find(key) {
-        let at = from + i;
-        from = at + key.len();
-        let before = table[..at].chars().last();
-        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-            continue;
-        }
-        let Some(rest) = table[from..].trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start().strip_prefix('"')?;
-        return rest.split_once('"').map(|(v, _)| v);
-    }
-    None
+/// One manifest, parsed; a missing one is empty, the rule [`read`] applies.
+/// A malformed one fails the census rather than dropping its crate from it.
+fn manifest(path: &Path) -> toml::Table {
+    read(path)
+        .parse()
+        .unwrap_or_else(|e| panic!("ioc-spawn-gate: cannot parse {}: {e}", path.display()))
+}
+
+/// The `path` of one dependency entry, inline (`name = { path = .. }`) or as
+/// its own table (`[dependencies.name]`) — both parse to a table.
+fn dep_path(entry: &toml::Value) -> Option<&str> {
+    entry.get("path").and_then(|p| p.as_str())
 }
 
 /// `[workspace.dependencies]` entries that carry a `path`, by key.
 fn workspace_dep_dirs(crate_dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
-    let Some(root) = crate_dir.ancestors().skip(1).find(|d| {
-        read(&d.join("Cargo.toml"))
-            .lines()
-            .any(|l| l.trim() == "[workspace]")
+    let Some((root, workspace)) = crate_dir.ancestors().skip(1).find_map(|d| {
+        let m = manifest(&d.join("Cargo.toml"));
+        m.get("workspace").cloned().map(|w| (d.to_path_buf(), w))
     }) else {
         return out;
     };
-    let mut in_table = false;
-    for line in read(&root.join("Cargo.toml")).lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_table = t == "[workspace.dependencies]";
-            continue;
-        }
-        if in_table
-            && let Some((key, table)) = t.split_once('=')
-            && let Some(path) = quoted_value(table, "path")
-        {
-            out.insert(key.trim().to_string(), root.join(path));
+    let deps = workspace.get("dependencies").and_then(|d| d.as_table());
+    for (key, entry) in deps.into_iter().flatten() {
+        if let Some(path) = dep_path(entry) {
+            out.insert(key.clone(), root.join(path));
         }
     }
     out
@@ -825,24 +786,28 @@ struct DevDepSpawner {
 /// where a spawning library of the package's own is promoted to every binary.
 fn dev_dep_spawners(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<DevDepSpawner> {
     let workspace = workspace_dep_dirs(crate_dir);
+    let manifest = manifest(&crate_dir.join("Cargo.toml"));
+    // `[dev-dependencies]` and every `[target.'cfg(..)'.dev-dependencies]`.
+    let targets = manifest.get("target").and_then(|t| t.as_table());
+    let tables = std::iter::once(&manifest)
+        .chain(
+            targets
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, t)| t.as_table()),
+        )
+        .filter_map(|t| t.get("dev-dependencies").and_then(|d| d.as_table()));
     let mut out = Vec::new();
-    let mut in_dev = false;
-    for line in read(&crate_dir.join("Cargo.toml")).lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_dev = t.trim_end_matches(']').ends_with("dev-dependencies");
-            continue;
-        }
-        let Some((key, table)) = t.split_once('=').filter(|_| in_dev) else {
-            continue;
-        };
-        let key = key.trim();
-        let dir = match quoted_value(table, "path") {
+    for (key, entry) in tables.flatten() {
+        let key = key.as_str();
+        let dir = match dep_path(entry) {
             Some(path) => crate_dir.join(path),
-            None if table.contains("workspace = true") => match workspace.get(key) {
-                Some(dir) => dir.clone(),
-                None => continue,
-            },
+            None if entry.get("workspace").and_then(|w| w.as_bool()) == Some(true) => {
+                match workspace.get(key) {
+                    Some(dir) => dir.clone(),
+                    None => continue,
+                }
+            }
             None => continue,
         };
         let (_, lib_files) = split_targets(&dir);
@@ -964,41 +929,26 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
         .collect()
 }
 
-fn package_name(manifest: &Path) -> Option<String> {
-    let text = fs::read_to_string(manifest).ok()?;
-    let mut in_package = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_package = t == "[package]";
-            continue;
-        }
-        if in_package && let Some(rest) = t.strip_prefix("name") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            return Some(rest.trim_matches(['"', '\'']).to_string());
-        }
-    }
-    None
+fn package_name(path: &Path) -> Option<String> {
+    let name = manifest(path)
+        .get("package")?
+        .get("name")?
+        .as_str()?
+        .to_string();
+    Some(name)
 }
 
 /// Every workspace crate that has a `Cargo.toml`, under the member globs.
 pub fn workspace_crates(root: &Path) -> Vec<PathBuf> {
-    let manifest = root.join("Cargo.toml");
-    let text = fs::read_to_string(&manifest)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest.display()));
-    let list = text
-        .split_once("members")
-        .and_then(|(_, rest)| rest.split_once('['))
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .expect("the workspace manifest declares a `members` array")
-        .0;
+    let manifest = manifest(&root.join("Cargo.toml"));
+    let list = manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("the workspace manifest declares a `members` array");
 
     let mut out = Vec::new();
-    for pattern in list.split(',') {
-        let pattern = pattern.trim().trim_matches('"');
-        if pattern.is_empty() || pattern.starts_with('#') {
-            continue;
-        }
+    for pattern in list.iter().filter_map(|p| p.as_str()) {
         match pattern.strip_suffix("/*") {
             Some(group) => {
                 for path in dir_entries(&root.join(group)) {
@@ -1830,6 +1780,36 @@ mod tests {
             rows[0].evidence.starts_with("fixture-rig/src/lib.rs:"),
             "{:?}",
             rows[0].evidence
+        );
+    }
+
+    /// `[dev-dependencies.<name>]` is the same dependency as the inline
+    /// `name = { path = .. }`, spelled as its own table; the line matcher
+    /// that preceded `toml` read its `path` line as a dependency named
+    /// `path` and lost it.
+    #[test]
+    fn a_dev_dependency_table_is_followed_like_an_inline_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawns = format!(
+            "{}pub fn go() {{ let _ = {}(\"softIoc\"); }}\n",
+            process_import(),
+            spawn_call()
+        );
+        write_crate(
+            &tmp.path().join("fixture-rig"),
+            "[package]\nname = \"fixture-rig\"\n",
+            &[("src/lib.rs", &spawns)],
+        );
+        let crate_dir = tmp.path().join("fixture-ca");
+        write_crate(
+            &crate_dir,
+            "[package]\nname = \"fixture-ca\"\n\n\
+             [dev-dependencies.fixture-rig]\npath = \"../fixture-rig\"\n",
+            &[("tests/calls.rs", "#[test]\nfn t() { fixture_rig::go(); }\n")],
+        );
+        assert_eq!(
+            labels(&spawners_in_crate(&crate_dir, &tokens())),
+            ["fixture-ca::calls"]
         );
     }
 

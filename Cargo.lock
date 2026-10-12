@@ -2055,6 +2055,7 @@ name = "ioc-spawn-gate"
 version = "0.0.0"
 dependencies = [
  "tempfile",
+ "toml",
 ]
 
 [[package]]

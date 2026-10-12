@@ -145,6 +145,11 @@ impl ManagedIoc {
         format!("127.0.0.1:{}", self.udp_port)
     }
 
+    /// The child's pid, for a caller that signals it (SIGSTOP / SIGCONT).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Everything the IOC has printed so far, both streams, for a failure
     /// message.
     pub fn console(&self) -> String {
@@ -155,14 +160,18 @@ impl ManagedIoc {
 use named_port::verdict as softioc_verdict;
 pub use softioc_verdict::{SoftIocVerdict, softioc_verdict};
 
-/// Write `db_content` where a child can read it, for the child's lifetime.
-fn db_file(db_content: &str) -> std::path::PathBuf {
+/// Write `content` where a child can read it, for the child's lifetime.
+fn child_file(name: &str, content: &str) -> std::path::PathBuf {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("test.db");
-    std::fs::write(&db_path, db_content).expect("write db");
-    // Keep the tempdir alive by leaking — the child has the .db open.
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).expect("write child file");
+    // Keep the tempdir alive by leaking — the child has the file open.
     std::mem::forget(dir);
-    db_path
+    path
+}
+
+fn db_file(db_content: &str) -> std::path::PathBuf {
+    child_file("test.db", db_content)
 }
 
 /// Spawn a `softIoc` on `port`, or `None` when that number was taken between
@@ -172,9 +181,13 @@ fn db_file(db_content: &str) -> std::path::PathBuf {
 /// go wrong — the binary refusing to start, the IOC dying, neither line
 /// arriving inside the budget — panics with the console, because none of them
 /// gets better on a different port.
-fn softioc_on(db_path: &Path, port: u16) -> Option<ManagedIoc> {
-    let mut child = Command::new("softIoc")
-        .arg("-S") // No interactive shell — keeps softIoc happy without a TTY
+fn softioc_on(db_path: &Path, acf_path: Option<&Path>, port: u16) -> Option<ManagedIoc> {
+    let mut cmd = Command::new("softIoc");
+    cmd.arg("-S"); // No interactive shell — keeps softIoc happy without a TTY
+    if let Some(acf) = acf_path {
+        cmd.arg("-a").arg(acf);
+    }
+    let mut child = cmd
         .arg("-d")
         .arg(db_path)
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
@@ -244,7 +257,15 @@ fn softioc_on(db_path: &Path, port: u16) -> Option<ManagedIoc> {
 /// never what the code did and could not have worked on this host.
 pub fn spawn_softioc(db_content: &str) -> ManagedIoc {
     let db_path = db_file(db_content);
-    named_port::on_a_named_port(|port| softioc_on(&db_path, port))
+    named_port::on_a_named_port(|port| softioc_on(&db_path, None, port))
+}
+
+/// [`spawn_softioc`] with `acf_content` loaded as the IOC's access security
+/// file (`softIoc -a`).
+pub fn spawn_softioc_with_acf(db_content: &str, acf_content: &str) -> ManagedIoc {
+    let db_path = db_file(db_content);
+    let acf_path = child_file("test.acf", acf_content);
+    named_port::on_a_named_port(|port| softioc_on(&db_path, Some(&acf_path), port))
 }
 
 /// Spawn a `softIoc` on exactly `port`.
@@ -255,7 +276,7 @@ pub fn spawn_softioc(db_content: &str) -> ManagedIoc {
 /// instead of leaving a client to time out against a stranger's socket.
 pub fn spawn_softioc_on(db_content: &str, port: u16) -> ManagedIoc {
     let db_path = db_file(db_content);
-    softioc_on(&db_path, port).unwrap_or_else(|| {
+    softioc_on(&db_path, None, port).unwrap_or_else(|| {
         panic!("port {port} was taken before `softIoc` could re-bind it");
     })
 }

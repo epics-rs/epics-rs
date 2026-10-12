@@ -51,6 +51,28 @@ pub mod verdict;
 
 use std::net::{TcpListener, UdpSocket};
 
+/// Build `shim/getsockname_einval.c` into `dir` and return the `.so`: under
+/// `LD_PRELOAD` it fails `getsockname` with EINVAL on a listening socket, as
+/// RTEMS does on the CA listener, so a host run reaches the console
+/// [`verdict::LOCAL_ADDR_FAILED`] records. Panics when `cc` cannot build it.
+pub fn getsockname_einval_shim(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/shim/getsockname_einval.c");
+    let so = dir.join("getsockname_einval.so");
+    let out = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(src)
+        .arg("-ldl")
+        .output()
+        .expect("run cc");
+    assert!(
+        out.status.success(),
+        "cc could not build {src}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    so
+}
+
 /// How many candidates a test may burn before the run is called broken.
 ///
 /// A steal is a coincidence of timing; sixteen of them in a row is a box

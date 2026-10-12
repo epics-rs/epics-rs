@@ -280,6 +280,53 @@ mod exec_model {
         }
     }
 
+    /// c1ca882a5 pinned `rs_ioc_port_was_taken` to this console but kept
+    /// the getsockname shim that measured it out of the tree; this rebuilds
+    /// the shim and re-measures. The number is a named candidate, so the
+    /// recorded console is compared with its port substituted.
+    #[test]
+    fn a_local_addr_failure_prints_the_measured_stderr() {
+        use named_port::verdict::{LOCAL_ADDR_FAILED, LOCAL_ADDR_FAILED_PORT};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shim = named_port::getsockname_einval_shim(dir.path());
+        let (port, stderr) = named_port::on_a_named_port(|port| {
+            let err_path = dir.path().join(format!("stderr-{port}.log"));
+            let err = std::fs::File::create(&err_path).expect("create the stderr log");
+            let mut child = Killed(
+                Command::new(env!("CARGO_BIN_EXE_realtime-ca-ioc"))
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("LD_PRELOAD", &shim)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(err))
+                    .spawn()
+                    .expect("spawn realtime-ca-ioc"),
+            );
+            let deadline = Instant::now() + INIT_BUDGET;
+            let status = loop {
+                if let Some(status) = child.0.try_wait().expect("poll the child") {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "realtime-ca-ioc is still running under the shim after {INIT_BUDGET:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let stderr = std::fs::read_to_string(&err_path).expect("read the stderr log");
+            if rs_ioc_port_was_taken(&stderr, port) {
+                return None;
+            }
+            assert_eq!(status.code(), Some(1), "{stderr}");
+            Some((port, stderr))
+        });
+        assert_eq!(
+            stderr,
+            LOCAL_ADDR_FAILED.replace(&LOCAL_ADDR_FAILED_PORT.to_string(), &port.to_string())
+        );
+    }
+
     #[test]
     fn init_path_runs_without_a_panic() {
         let dir = tempfile::tempdir().expect("temp dir");

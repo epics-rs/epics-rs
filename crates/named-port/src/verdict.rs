@@ -77,26 +77,32 @@ pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// realtime-ca-ioc's stderr, verbatim, when `local_addr` fails after a good
-    /// bind: measured on Linux 6.14 / glibc 2.39 (thread-backend build,
-    /// port 32961) with `getsockname` forced to EINVAL on the listening socket,
-    /// which is RTEMS's failure there. The RTEMS console itself is unmeasured.
-    /// The port was bound, so it is no steal, and a retry on it would hide the
-    /// failure as a slow pass.
-    const LOCAL_ADDR_FAILED: &str = "\
+/// realtime-ca-ioc's stderr, verbatim, when `local_addr` fails after a good
+/// bind: measured on Linux 6.14 / glibc 2.39 (thread-backend build, port
+/// [`LOCAL_ADDR_FAILED_PORT`]) under [`crate::getsockname_einval_shim`],
+/// which is RTEMS's failure there. The RTEMS console itself is unmeasured.
+/// The port was bound, so it is no steal, and a retry on it would hide the
+/// failure as a slow pass.
+pub const LOCAL_ADDR_FAILED: &str = "\
 Starting iocInit
 iocRun: All initialization complete
 realtime-ca-ioc: cannot start the CA TCP server on port 32961: bind() succeeded; \
 local_addr() on the listener failed: Invalid argument (os error 22)
 ";
 
+/// The port [`LOCAL_ADDR_FAILED`] was measured on.
+pub const LOCAL_ADDR_FAILED_PORT: u16 = 32961;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn a_local_addr_failure_is_not_a_stolen_port() {
-        assert!(!rs_ioc_port_was_taken(LOCAL_ADDR_FAILED, 32961));
+        assert!(!rs_ioc_port_was_taken(
+            LOCAL_ADDR_FAILED,
+            LOCAL_ADDR_FAILED_PORT
+        ));
         assert!(rs_ioc_port_was_taken(
             "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
              Address already in use (os error 98)\n",

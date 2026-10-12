@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::DbFieldType;
-use crate::client::{CaChannel, CaClient};
+use crate::client::{CaChannel, CaClient, ConnFold};
 use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
 use epics_base_rs::runtime::task;
@@ -57,7 +57,7 @@ struct CachedSnapshot {
 /// repopulates it (`dbCaGetLink` invalid-cache path `dbCa.c:455-464`).
 ///
 /// Pure (no `self`) so the type/count gate is unit-testable without a live
-/// CA channel — the same factoring as [`note_conn_event`].
+/// CA channel — the same factoring as [`LinkConnState::sync`].
 fn cache_native_matches(
     cached_type: DbFieldType,
     cached_count: u32,
@@ -214,6 +214,9 @@ struct LinkConnState {
     /// the only true→false edge, so the count cannot double under a
     /// `Disconnected` that arrives twice.
     n_disconnect: AtomicU64,
+    /// The connects ([`ConnFold`] outages plus the live one) the watcher has
+    /// refetched attributes for. Written only by [`Self::sync`].
+    connects_seen: AtomicU64,
     /// C `pvlOptInpNative` (`dbCa.c:456`) — the link has served a native
     /// input transfer. Set by [`CaLink::value`], the port's `dbCaGetLink`.
     ///
@@ -233,6 +236,7 @@ impl LinkConnState {
             read_access: AtomicBool::new(true),
             write_access: AtomicBool::new(true),
             n_disconnect: AtomicU64::new(0),
+            connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
             db,
             pv_name,
@@ -297,24 +301,26 @@ impl LinkConnState {
         self.used_input_native.load(Ordering::Relaxed)
     }
 
-    /// Bring the cache to the channel's current state (`None` =
-    /// disconnected) after the watcher lost events: each transition the
-    /// lost run would have made, through its owner. Rights are applied only
-    /// when they differ from the cache, so a resync that finds nothing
-    /// changed dispatches no holder.
-    fn resync(&self, now: Option<crate::client::AccessRights>) {
-        match now {
-            None => {
-                self.mark_disconnected();
-            }
-            Some(rights) => {
-                self.mark_connected();
-                if rights.read != self.has_read_access() || rights.write != self.has_write_access()
-                {
-                    self.note_access_rights(rights.read, rights.write);
-                }
+    /// THE connection transition, run on every watcher wake — an event and
+    /// a lag alike: bring the link to `fold`, the state of a receiver that
+    /// lost nothing. Every outage the link has not counted is replayed as
+    /// the edge it was, dispatch included, so an outage that began and
+    /// ended inside a lag still lands LINK/INVALID on the CP holders; a
+    /// rights change is applied once, when it differs from the cache.
+    /// Returns `true` when `fold` holds a connect not yet refetched for.
+    fn sync(&self, fold: ConnFold) -> bool {
+        for _ in self.disconnect_count()..fold.outages {
+            self.mark_connected();
+            self.mark_disconnected();
+        }
+        if fold.connected {
+            self.mark_connected();
+            if (fold.read, fold.write) != (self.has_read_access(), self.has_write_access()) {
+                self.note_access_rights(fold.read, fold.write);
             }
         }
+        let connects = fold.outages + u64::from(fold.connected);
+        self.connects_seen.swap(connects, Ordering::Relaxed) < connects
     }
 
     /// C `accessRightsCallback` (`dbCa.c:1014-1040`) as one owned
@@ -928,10 +934,7 @@ async fn run_connection_watcher(
     pv_name: String,
 ) {
     loop {
-        let step = watch_step(&mut conn_rx, &connected, async || {
-            channel.info().await.ok().map(|info| info.access_rights)
-        })
-        .await;
+        let step = watch_step(&mut conn_rx, &connected, || channel.conn_fold()).await;
         match step {
             WatchStep::Closed => return,
             WatchStep::Applied => {}
@@ -959,61 +962,19 @@ enum WatchStep {
     Closed,
 }
 
-/// Receive one connection event into `state`. On `Lagged` the dropped
-/// events are gone for good, rights changes included — no later event
-/// repeats them — so the cache is resynced from `now`, the channel's
-/// current rights (`None` = disconnected). The dropped run may hold a
-/// reconnect, so a live link refetches its attributes.
+/// Wait for one connection event, then [`LinkConnState::sync`] to `fold`.
+/// The event is only the wake: a lag wakes the same way, and the fold holds
+/// what the dropped events would have done.
 async fn watch_step(
     conn_rx: &mut epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     state: &LinkConnState,
-    now: impl AsyncFnOnce() -> Option<crate::client::AccessRights>,
+    fold: impl Fn() -> ConnFold,
 ) -> WatchStep {
     use epics_base_rs::runtime::sync::broadcast::error::RecvError;
     match conn_rx.recv().await {
-        Ok(evt) if note_conn_event(&evt, state) => WatchStep::Refetch,
-        Ok(_) => WatchStep::Applied,
-        Err(RecvError::Lagged(_)) => {
-            let now = now().await;
-            state.resync(now);
-            if now.is_some() {
-                WatchStep::Refetch
-            } else {
-                WatchStep::Applied
-            }
-        }
+        Ok(_) | Err(RecvError::Lagged(_)) if state.sync(fold()) => WatchStep::Refetch,
+        Ok(_) | Err(RecvError::Lagged(_)) => WatchStep::Applied,
         Err(RecvError::Closed) => WatchStep::Closed,
-    }
-}
-
-/// Apply one connection event to the [`LinkConnState`] owner, returning
-/// `true` iff this was a `Connected` transition (the caller then kicks
-/// off a metadata refetch). `Disconnected` clears the flag — an echo
-/// timeout arrives as `Disconnected` too, exactly as `CA_OP_CONN_DOWN`
-/// does in C. `AccessRightsChanged` never touches the flag; it routes
-/// into [`LinkConnState::note_access_rights`] — the C
-/// `accessRightsCallback` (`dbCa.c:1014-1040`), which caches the read
-/// right and dispatches the CP/CPP holders on a rights loss while
-/// connected. `NativeTypeChanged` leaves the state untouched.
-/// Factored out of [`run_connection_watcher`] so the transition logic —
-/// the disconnect-tracking regression — is unit-testable without a live
-/// CA channel.
-fn note_conn_event(evt: &crate::client::ConnectionEvent, state: &LinkConnState) -> bool {
-    use crate::client::ConnectionEvent;
-    match evt {
-        ConnectionEvent::Connected => {
-            state.mark_connected();
-            true
-        }
-        ConnectionEvent::Disconnected => {
-            state.mark_disconnected();
-            false
-        }
-        ConnectionEvent::AccessRightsChanged { read, write } => {
-            state.note_access_rights(*read, *write);
-            false
-        }
-        _ => false,
     }
 }
 
@@ -1254,7 +1215,7 @@ impl LinkSet for CaLinkResolver {
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
     /// return -1;` (`dbCa.c:529-532`), answered from cached state: the links
     /// map plus the `CaLink::connected` owner, which carries both the
-    /// connection flag (`note_conn_event`) and the cached rights
+    /// connection flag (`sync`) and the cached rights
     /// (`note_access_rights`). No I/O — the database asks this on the
     /// record-processing thread, inside the record's advisory write gate.
     ///
@@ -1462,86 +1423,73 @@ mod tests {
         );
     }
 
+    fn fold(connected: bool, (read, write): (bool, bool), outages: u64) -> ConnFold {
+        ConnFold {
+            connected,
+            read,
+            write,
+            outages,
+        }
+    }
+
+    const RW: (bool, bool) = (true, true);
+
     /// C `pca->nDisconnect` counts EDGES, not events: `connectionCallback`
     /// bumps it inside `if (!pca->isConnected)` after the flag was
-    /// recomputed (`dbCa.c:817-822`), so a repeated `Disconnected` — the
+    /// recomputed (`dbCa.c:817-822`), so a repeated disconnect — the
     /// watcher's, then the subscription-ended tail's — adds nothing, and a
     /// reconnect followed by a second drop adds one more.
     #[test]
     fn the_disconnect_count_moves_once_per_edge() {
         let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        // Never connected: C's `caLink` at its calloc zero.
+        connected.sync(fold(false, RW, 0));
         assert_eq!(connected.disconnect_count(), 0);
 
-        // Never connected: a disconnect that is not an edge counts nothing,
-        // which is C's `caLink` still at its calloc zero before the first
-        // `connectionCallback`.
-        note_conn_event(&ConnectionEvent::Disconnected, &connected);
-        assert_eq!(connected.disconnect_count(), 0);
-
-        note_conn_event(&ConnectionEvent::Connected, &connected);
-        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        connected.sync(fold(true, RW, 0));
+        connected.sync(fold(false, RW, 1));
         assert_eq!(connected.disconnect_count(), 1);
-        // The subscription-ended tail arrives behind the watcher's event.
-        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        // The subscription-ended tail, then a wake on the same fold.
+        connected.mark_disconnected();
+        connected.sync(fold(false, RW, 1));
         assert_eq!(connected.disconnect_count(), 1, "one edge, one count");
 
-        note_conn_event(&ConnectionEvent::Connected, &connected);
-        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        connected.sync(fold(true, RW, 1));
+        connected.sync(fold(false, RW, 2));
         assert_eq!(connected.disconnect_count(), 2);
     }
 
-    /// BUG 1 regression: the connection-event → `connected` flag
-    /// transition, which [`note_conn_event`] owns (the watcher loop only
-    /// calls it). A disconnect MUST flip the flag false; pre-fix
+    /// BUG 1 regression: a disconnect MUST clear the flag — pre-fix
     /// `is_connected()` keyed off cache presence alone and stayed `true`
-    /// forever once any event had been cached, so an upstream IOC restart
-    /// was invisible and stale data was served. a
-    /// `Connected` transition additionally returns `true` to signal the
-    /// CTRL attribute refetch; the clearing/neutral events return `false`.
+    /// once any event had been cached. `sync` returns `true` for each
+    /// connect it has not refetched attributes for, the C
+    /// `connectionCallback` scheduling `CA_GET_ATTRIBUTES` per connect, and
+    /// that includes a connect `run_monitor` flagged first.
     #[test]
     fn bug1_connection_event_tracks_disconnect() {
-        // No database attached: `mark_disconnected`'s dispatch is a no-op,
-        // so this test stays about the flag alone. The dispatch itself is
-        // covered by `disconnect_edge_dispatches_cp_holders_once`.
         let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
-
-        // Circuit comes up — flag true, and signals an attribute refetch.
-        assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
-        assert!(connected.is_set());
-
-        // Upstream IOC restart — circuit drops. Flag MUST go false; no
-        // refetch on a disconnect.
-        assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
-        assert!(!connected.is_set());
-
-        // Reconnect — flag true again (CA monitors auto-restore), refetch
-        // signalled again.
-        assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
-        assert!(connected.is_set());
-
-        // Echo timeout (TCP up, server hung) reaches the watcher as a plain
-        // `Disconnected` — C's `unresponsiveCircuitNotify` fires the same
-        // `CA_OP_CONN_DOWN` — so it clears the flag with no refetch.
-        assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
-        assert!(!connected.is_set());
-
-        // An access-rights change never touches the connection flag and
-        // signals no refetch — but it is not neutral: it routes into
-        // `note_access_rights` (the C `accessRightsCallback`), which
-        // caches the read right. The flag staying set while the read
-        // gate closes is exactly the read-denied-but-connected state.
-        connected.mark_connected();
-        assert!(!note_conn_event(
-            &ConnectionEvent::AccessRightsChanged {
-                read: false,
-                write: true,
-            },
-            &connected,
-        ));
+        assert!(connected.sync(fold(true, RW, 0)));
         assert!(connected.is_set());
         assert!(
-            !connected.has_read_access(),
-            "the watcher must route AccessRightsChanged into note_access_rights"
+            !connected.sync(fold(true, RW, 0)),
+            "one refetch per connect"
+        );
+
+        assert!(!connected.sync(fold(false, RW, 1)));
+        assert!(!connected.is_set());
+        assert!(connected.sync(fold(true, RW, 1)));
+        assert!(connected.is_set());
+
+        // A rights change leaves the flag set and closes the read gate.
+        assert!(!connected.sync(fold(true, (false, true), 1)));
+        assert!(connected.is_set());
+        assert!(!connected.has_read_access());
+
+        let early = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        early.mark_connected();
+        assert!(
+            early.sync(fold(true, RW, 0)),
+            "a monitor event that set the flag first does not eat the refetch"
         );
     }
 
@@ -1603,50 +1551,102 @@ mod tests {
         epics_base_rs::runtime::task::block_on_sync(f).expect("a plain test thread")
     }
 
-    /// A lag drops events for good: here the write loss is overrun by two
-    /// events the link ignores, and only the resync from the channel's
-    /// current rights lands it; a resync that finds the channel down takes
-    /// the disconnect edge.
+    /// The flag as an lset, the way `CaLink::value` gates on it: a dispatch
+    /// made while it is down fails the holder's read.
+    struct FlagLset(Arc<LinkConnState>);
+
+    #[async_trait::async_trait]
+    impl epics_base_rs::server::database::LinkSet for FlagLset {
+        fn is_connected(&self, _: &str) -> bool {
+            self.0.is_set()
+        }
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            self.0.is_set().then_some(EpicsValue::Double(42.5))
+        }
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+            self.0.is_set().then_some(EpicsValue::Double(42.5))
+        }
+        async fn connect_link(&self, _: &str) {}
+    }
+
+    /// An outage that began and ended inside a lag: the receiver sees only
+    /// `Lagged` and what came after, the channel is connected again, and
+    /// the CP holder must still commit LINK/INVALID for it, as C's
+    /// `connectionCallback` processed it (`dbCa.c:820-826`). A resync from
+    /// the channel's current state found nothing to do.
     #[test]
-    fn a_lagged_watcher_takes_the_rights_it_lost_from_the_channel() {
-        use crate::client::AccessRights;
+    fn an_outage_lost_in_a_lag_still_alarms_the_cp_holder() {
         use epics_base_rs::runtime::sync::broadcast;
-        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
-        state.mark_connected();
-        let denied = AccessRights {
-            read: true,
-            write: false,
+        use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db_slot = Arc::new(RwLock::new(None));
+        let state = Arc::new(LinkConnState::new(db_slot.clone(), "UP:PV".to_string()));
+        let db = block(async {
+            let db = PvDatabase::new();
+            db.register_link_set("ca", Arc::new(FlagLset(state.clone())))
+                .await;
+            db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            {
+                let rec = db.get_record("HOLDER").unwrap();
+                let mut inst = rec.write();
+                inst.common.inp = "ca://UP:PV CP".to_string();
+                inst.install_link_cache(
+                    "INP",
+                    Arc::new(epics_base_rs::server::record::parse_link_v2(
+                        "ca://UP:PV CP",
+                    )),
+                )
+                .expect("a common link");
+            }
+            db.initialize_link_locality().await;
+            db.setup_cp_links().await;
+            db
+        });
+        *db_slot.write() = Some(db.clone());
+        let alarm = || {
+            let rec = db.get_record("HOLDER").unwrap();
+            let inst = rec.read();
+            (inst.common.stat, inst.common.sevr as u16)
         };
-        let native = ConnectionEvent::NativeTypeChanged {
-            previous: None,
-            current: epics_base_rs::types::DbFieldType::Double,
-        };
+
+        state.sync(fold(true, RW, 0));
+        db.dispatch_external_cp_targets("UP:PV");
+        assert_eq!(alarm(), (0, 0), "connected: the holder reads 42.5");
 
         let (tx, mut rx) = broadcast::channel(2);
-        tx.send(ConnectionEvent::AccessRightsChanged {
-            read: true,
-            write: false,
-        })
-        .unwrap();
-        tx.send(native).unwrap();
-        tx.send(native).unwrap();
-        let step = block(watch_step(&mut rx, &state, async || Some(denied)));
-        assert_eq!(step, WatchStep::Refetch);
-        assert!(state.is_set());
-        assert!(
-            !state.has_write_access(),
-            "the overrun write loss is resynced"
+        for evt in [
+            ConnectionEvent::Disconnected,
+            ConnectionEvent::AccessRightsChanged {
+                read: false,
+                write: false,
+            },
+            ConnectionEvent::Connected,
+            ConnectionEvent::AccessRightsChanged {
+                read: true,
+                write: true,
+            },
+        ] {
+            tx.send(evt).unwrap();
+        }
+        let now = fold(true, RW, 1);
+        assert_eq!(
+            block(watch_step(&mut rx, &state, || now)),
+            WatchStep::Refetch
         );
-        assert!(state.has_read_access());
+        assert_eq!(
+            alarm(),
+            (LINK_ALARM, 3),
+            "the lost outage processed the holder while the link was down"
+        );
+        assert_eq!(state.disconnect_count(), 1);
+        assert!(state.is_set());
 
-        tx.send(native).unwrap();
-        tx.send(native).unwrap();
-        tx.send(native).unwrap();
-        let step = block(watch_step(&mut rx, &state, async || None));
-        assert_eq!(step, WatchStep::Applied);
-        assert!(
-            !state.is_set(),
-            "a channel found down takes the disconnect edge"
+        // The retained tail wakes the watcher again; the outage is counted.
+        assert_eq!(
+            block(watch_step(&mut rx, &state, || now)),
+            WatchStep::Applied
         );
         assert_eq!(state.disconnect_count(), 1);
     }

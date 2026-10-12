@@ -13,13 +13,13 @@
 
 #![cfg(feature = "client-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(4): measured, not argued — every case here is
-// `#[ignore]`d, and all four pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
+// RTEMS-EXEC-MODEL-ALLOW(6): measured, not argued — every case here is
+// `#[ignore]`d, and all six pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
 // cargo nextest run --profile interop -p epics-ca-rs --run-ignored all`.
 
 use std::time::Duration;
 
-use c_ca_tools::{require_tool, spawn_softioc, spawn_softioc_on};
+use c_ca_tools::{require_tool, spawn_softioc, spawn_softioc_on, spawn_softioc_with_acf};
 use epics_base_rs::types::EpicsValue;
 use serial_test::serial;
 
@@ -208,4 +208,100 @@ async fn rust_client_handles_softioc_restart() {
         result.is_ok(),
         "did not reconnect after IOC restart; the second IOC said:\n{console}"
     );
+}
+
+/// Stop or continue the IOC process; a stopped softIoc keeps its socket and
+/// answers nothing, which is the echo-timeout path, not a circuit close.
+fn signal(pid: u32, sig: &str) {
+    let ok = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .expect("run kill")
+        .success();
+    assert!(ok, "kill {sig} {pid} failed");
+}
+
+/// One unresponsive → responsive cycle against a softIoc granting `acf`'s
+/// rights. libca keeps the permits on an unresponsive circuit (only
+/// `setServerAddressUnknown`, `nciu.cpp:184-195`, clears them, and
+/// `tcpiiu::unresponsiveCircuitNotify` never calls it), so the rights
+/// softIoc granted at connect are what the channel holds through the outage
+/// and what the receiver is told after `Connected` on recovery.
+async fn rights_survive_an_unresponsive_circuit(acf: &str) {
+    use epics_ca_rs::client::ConnectionEvent;
+    if !require_tool("softIoc") {
+        return;
+    }
+    let ioc = spawn_softioc_with_acf("record(ao, \"RIGHTS:PV\") {}\n", acf);
+    set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
+    // The echo watchdog arms after EPICS_CA_CONN_TMO of silence.
+    unsafe { std::env::set_var("EPICS_CA_CONN_TMO", "1") };
+    let client = epics_ca_rs::client::CaClient::new()
+        .await
+        .expect("CaClient");
+    let (ch, mut rx) = client.create_channel_with_events("RIGHTS:PV", 0);
+    // Every recv is bounded; the echo timeout is CONN_TMO + 5 s.
+    let mut next = async || {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, rx.recv())
+            .await
+            .expect("connection event inside the budget")
+            .expect("receiver open, not lagged")
+    };
+    assert_eq!(next().await, ConnectionEvent::Connected);
+    let granted = match next().await {
+        ConnectionEvent::AccessRightsChanged { read, write } => (read, write),
+        other => panic!("softIoc's rights follow Connected, got {other:?}"),
+    };
+
+    signal(ioc.pid(), "-STOP");
+    let down = (next().await, next().await);
+    let rights = async || {
+        ch.info()
+            .await
+            .ok()
+            .map(|i| (i.access_rights.read, i.access_rights.write))
+    };
+    let held = rights().await;
+    signal(ioc.pid(), "-CONT");
+    assert_eq!(
+        down,
+        (
+            ConnectionEvent::Disconnected,
+            ConnectionEvent::AccessRightsChanged {
+                read: false,
+                write: false
+            }
+        ),
+        "C: disconnectNotify then accessRightsNotify(noRights), nciu.cpp:170-177"
+    );
+    assert_eq!(
+        held,
+        Some(granted),
+        "ca_write_access answers the held permits while the circuit is unresponsive"
+    );
+
+    assert_eq!(next().await, ConnectionEvent::Connected);
+    assert_eq!(
+        next().await,
+        ConnectionEvent::AccessRightsChanged {
+            read: granted.0,
+            write: granted.1
+        },
+        "recovery reports the rights softIoc granted, not the outage's no-rights"
+    );
+    assert_eq!(rights().await, Some(granted));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "spawns external libca softIoc; run with --include-ignored"]
+async fn a_write_right_held_across_an_unresponsive_circuit() {
+    rights_survive_an_unresponsive_circuit("ASG(DEFAULT) { RULE(1, WRITE) }").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "spawns external libca softIoc; run with --include-ignored"]
+async fn a_read_only_right_held_across_an_unresponsive_circuit() {
+    rights_survive_an_unresponsive_circuit("ASG(DEFAULT) { RULE(1, READ) }").await;
 }

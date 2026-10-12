@@ -18,7 +18,7 @@
 // `exec_backend` lands it on a callback-pool worker that has none. A hosted
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread` build had `feature = "client"` on and
 // panicked on both of those sockets at `realtime-ca-ioc` boot, measured.
-// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the full CA client over
+// RTEMS-EXEC-MODEL-ALLOW(9): the flavored tests drive the full CA client over
 // tokio::net or pin a specific tokio runtime flavor. These run and pass in the
 // exec-backend suite on the tokio driver.
 #[cfg(ca_beacon_monitor)]
@@ -63,6 +63,7 @@ use epics_base_rs::types::{
     DBR_STRING, DBR_TIME_INT, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, decode_dbr,
 };
 
+pub(crate) use state::ConnFold;
 pub use state::{ChannelState, ConnectionEvent};
 
 /// DBR type code to request for an ENUM field's *default* readback,
@@ -469,7 +470,7 @@ pub struct CaClient {
     /// Every task the client owns — search engine, transport manager,
     /// coordinator, beacon monitor, the graceful drain in `Drop` — opens a
     /// socket or arms a timer, and several of them are started from plain
-    /// `fn`s (`Drop::drop`, `CaChannel::on_connection_change`) where no
+    /// `fn`s (`Drop::drop`) where no
     /// runtime is entered. Carrying the capability is what makes those sites
     /// legal by construction instead of by the caller happening to be on a
     /// runtime thread.
@@ -514,7 +515,7 @@ enum CoordRequest {
         /// the coordinator's `ChannelInner` and threaded into every
         /// `TransportCommand` the coordinator builds for this channel.
         priority: u8,
-        conn_tx: broadcast::Sender<ConnectionEvent>,
+        conn_tx: state::ConnEvents,
     },
     WaitConnected {
         cid: u32,
@@ -1200,7 +1201,8 @@ impl CaClient {
         // reserve the cid against the live-set. Released by the
         // coordinator at `DropChannel` (the single channel-removal site).
         let cid = self.cid_alloc.allocate();
-        let (conn_tx, conn_rx) = broadcast::channel(16);
+        let (conn_tx, conn_rx) = state::ConnEvents::new(16);
+        let conn_view = conn_tx.view();
 
         // C `cac::createChannel` rejects empty names with
         // ECA_BADSTR, and `tcpiiu::createChannelRequest` rejects
@@ -1235,7 +1237,7 @@ impl CaClient {
             cid,
             pv_name: pv_name.clone(),
             priority,
-            conn_tx: conn_tx.clone(),
+            conn_tx,
         });
 
         if valid {
@@ -1260,7 +1262,7 @@ impl CaClient {
             in_flight: self.in_flight.clone(),
             snapshots: self.snapshots.clone(),
             server_writers: self.server_writers.clone(),
-            conn_tx,
+            conn_tx: conn_view,
             cached_read: Arc::new(Mutex::new(None)),
             search_attempts: self.search_attempts.clone(),
             user_data: Arc::new(Mutex::new(None)),
@@ -1734,7 +1736,7 @@ pub struct CaChannel {
     /// Per-server writer sidecar (Option C, Phase E). Read/write hot
     /// paths use this after `snapshot()` proves the channel is active.
     server_writers: DirectServerWriters,
-    conn_tx: broadcast::Sender<ConnectionEvent>,
+    conn_tx: state::ConnEventsView,
     /// Warm-read fast path. `None` until the first successful default
     /// GET; refilled (with a fresh Sender) on every subsequent
     /// `get_many_with_timeout` call. See `CachedRead`.
@@ -1754,10 +1756,9 @@ pub struct CaChannel {
     user_data: Arc<Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
-    /// The reactor the owning [`CaClient`] was created on, carried so the
-    /// plain-`fn` watcher registrations ([`Self::on_connection_change`],
-    /// [`Self::on_access_rights_change`]) can start their tasks from a thread
-    /// that has entered no runtime.
+    /// The reactor the owning [`CaClient`] was created on, carried so a
+    /// channel's own tasks (`sync_group`) start from a thread that has
+    /// entered no runtime.
     reactor: epics_base_rs::runtime::task::Reactor,
 }
 
@@ -1810,7 +1811,7 @@ impl CaChannel {
     /// itself. Wires the provided `coord_tx` (so the lifecycle guard
     /// targets a live receiver) and leaves every sidecar empty.
     fn for_test(coord_tx: mpsc::UnboundedSender<CoordRequest>) -> Self {
-        let (conn_tx, _) = broadcast::channel(1);
+        let conn_tx = state::ConnEvents::new(1).0.view();
         let (transport_tx, _) = mpsc::unbounded_channel();
         let cid = 0;
         let lifecycle = Arc::new(ChannelLifecycle {
@@ -3231,53 +3232,15 @@ impl CaChannel {
         self.conn_tx.subscribe()
     }
 
+    /// The fold of every connection event this channel has sent — what a
+    /// receiver that lost nothing holds (see [`state::ConnFold`]).
+    pub(crate) fn conn_fold(&self) -> state::ConnFold {
+        self.conn_tx.fold()
+    }
+
     /// The reactor the owning client was created on.
     pub(crate) fn reactor(&self) -> &epics_base_rs::runtime::task::Reactor {
         &self.reactor
-    }
-
-    /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb` on every `AccessRightsChanged`. Returns an
-    /// [`EventWatcher`] guard — drop it (or call `.abort()`) to stop
-    /// watching; the watcher task is aborted on drop. Mirrors libca
-    /// `ca_replace_access_rights_event` at the callback-registration
-    /// shape.
-    pub fn on_access_rights_change<F>(&self, mut cb: F) -> EventWatcher
-    where
-        F: FnMut(AccessRights) + Send + 'static,
-    {
-        let mut rx = self.conn_tx.subscribe();
-        let handle = self.reactor.spawn(async move {
-            while let Ok(evt) = rx.recv().await {
-                if let ConnectionEvent::AccessRightsChanged { read, write } = evt {
-                    cb(AccessRights { read, write });
-                }
-            }
-        });
-        EventWatcher { handle }
-    }
-
-    /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb(true)` on `Connected` and `cb(false)` on
-    /// `Disconnected`. Mirrors libca
-    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229).
-    /// Returns an [`EventWatcher`] guard — drop it (or call `.abort()`)
-    /// to stop watching; the watcher task is aborted on drop.
-    pub fn on_connection_change<F>(&self, mut cb: F) -> EventWatcher
-    where
-        F: FnMut(bool) + Send + 'static,
-    {
-        let mut rx = self.conn_tx.subscribe();
-        let handle = self.reactor.spawn(async move {
-            while let Ok(evt) = rx.recv().await {
-                match evt {
-                    ConnectionEvent::Connected => cb(true),
-                    ConnectionEvent::Disconnected => cb(false),
-                    _ => {}
-                }
-            }
-        });
-        EventWatcher { handle }
     }
 
     /// The server's host NAME, as libca `ca_host_name(chid)`
@@ -3494,35 +3457,6 @@ impl Drop for MonitorHandle {
         let _ = self
             .coord_tx
             .send(CoordRequest::Unsubscribe { subid: self.subid });
-    }
-}
-
-/// Abort-on-drop guard for a connection / access-rights watcher task.
-///
-/// A bare `tokio::task::JoinHandle` *detaches* on drop — it does not
-/// abort the spawned task. Returning one from
-/// [`CaChannel::on_connection_change`] / [`CaChannel::on_access_rights_change`]
-/// while documenting "drop to stop" would leak a running task. This
-/// guard mirrors the `ServerConnection` abort-on-drop pattern: dropping
-/// it aborts the inner watcher task.
-#[must_use = "dropping the EventWatcher immediately stops the watcher task; \
-              bind it to a variable to keep watching"]
-pub struct EventWatcher {
-    // Spawned via `runtime::task::spawn`; seam handle (see `ServerConnection`).
-    handle: epics_base_rs::runtime::task::TaskHandle<()>,
-}
-
-impl EventWatcher {
-    /// Stop watching now. Equivalent to dropping the guard; provided
-    /// for callers that want an explicit, named teardown.
-    pub fn abort(self) {
-        // Drop runs `handle.abort()`.
-    }
-}
-
-impl Drop for EventWatcher {
-    fn drop(&mut self) {
-        self.handle.abort();
     }
 }
 
@@ -4429,6 +4363,15 @@ async fn run_coordinator(
                                     snap.state = ChannelState::Connected;
                                 }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                                // The down edge told the receiver no-rights;
+                                // C's connect handlers re-read the held
+                                // permits (`dbCa.c:875-876`,
+                                // `gatePv.cc:395-396`), a receiver has only
+                                // this event to read them from.
+                                let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
+                                    read: ch.access_rights.read,
+                                    write: ch.access_rights.write,
+                                });
                                 recovered_cids.push(ch.cid);
                             }
                         }
@@ -4529,8 +4472,8 @@ async fn run_coordinator(
 }
 
 /// Which way a channel leaves the connected set. The two variants differ
-/// only in the terminal [`ChannelState`] and the snapshot treatment — i.e.
-/// in how the channel *recovers*. What the application sees is identical
+/// only in the terminal [`ChannelState`], the snapshot treatment and the
+/// cached rights — i.e. in how the channel *recovers*. The events are identical
 /// and deliberately so: C reaches `nciu::disconnectNotify` (`CA_OP_CONN_DOWN`)
 /// from both, so [`ConnectionEvent::Disconnected`] is the only event either
 /// path can emit.
@@ -4561,9 +4504,11 @@ impl DisconnectKind {
 /// **Invariant (MUST):** a channel that leaves the connected set — by TCP
 /// close, by `CA_PROTO_SERVER_DISCONN`, or by echo timeout — has its
 /// pending get/put IOs and its subscriptions failed with `ECA_DISCONN`,
-/// its cached access rights reset to no-rights, and emits the connection
-/// event followed by `AccessRightsChanged { read: false, write: false }`.
+/// and emits the connection event followed by
+/// `AccessRightsChanged { read: false, write: false }`.
 /// **MUST NOT:** any of those steps happen on one path and not another.
+/// The cached rights are the one difference, and it is C's: only a channel
+/// that leaves its circuit is reset to no-rights.
 ///
 /// In C all three paths converge on `nciu::unresponsiveCircuitNotify`
 /// (`nciu.cpp:161-182`), reached from `tcpiiu::disconnectAllChannels`
@@ -4619,16 +4564,18 @@ fn disconnect_channels(
         // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:184-195`)
         // clears both permits as the channel leaves the circuit, before any
         // callback runs, so a handler that reads the rights sees no-rights.
+        // An unresponsive channel stays on its circuit
+        // (`tcpiiu.cpp:929-937` only moves it to `unrespCircuit`), so its
+        // permits are held and `ca_write_access` keeps answering them.
         ch.state = kind.terminal_state();
-        ch.access_rights = NO_RIGHTS;
         match kind {
             DisconnectKind::CircuitGone => {
+                ch.access_rights = NO_RIGHTS;
                 snapshots.remove(cid);
             }
             DisconnectKind::Unresponsive => {
                 if let Some(mut snap) = snapshots.get_mut(cid) {
                     snap.state = ChannelState::Unresponsive;
-                    snap.access_rights = NO_RIGHTS;
                 }
             }
         }
@@ -6099,86 +6046,6 @@ mod waiter_drain_tests {
 }
 
 #[cfg(test)]
-mod event_watcher_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    /// Wait for a condition driven by *another* executor.
-    ///
-    /// These tests run on a `current_thread` tokio runtime but the watcher
-    /// task runs on whatever backend the `runtime::task` seam selects — a
-    /// tokio worker by default, a background-executor band worker under
-    /// `exec_backend`. `yield_now()` only reschedules on *this* runtime,
-    /// so it establishes no happens-before edge with the other executor:
-    /// spinning on it is a race, not a wait. Poll with a real time budget
-    /// instead, which is a correct wait on either backend.
-    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..2_000 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("{label} (waited 2s)");
-    }
-
-    /// Dropping an `EventWatcher` must abort the spawned watcher task
-    /// (a bare `JoinHandle` would only detach, leaking the task). The
-    /// task here loops forever; after the guard drops, `is_finished()`
-    /// must become true.
-    #[tokio::test(flavor = "current_thread")]
-    async fn drop_aborts_watcher_task() {
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_in_task = ran.clone();
-        let handle = epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor")
-            .spawn(async move {
-                ran_in_task.store(true, Ordering::SeqCst);
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            });
-        let abort_handle = handle.abort_handle();
-        let watcher = EventWatcher { handle };
-        wait_for("watcher task should have started", || {
-            ran.load(Ordering::SeqCst)
-        })
-        .await;
-        assert!(
-            !abort_handle.is_finished(),
-            "task still running before drop"
-        );
-        drop(watcher);
-        wait_for("EventWatcher::drop must abort the watcher task", || {
-            abort_handle.is_finished()
-        })
-        .await;
-    }
-
-    /// `EventWatcher::abort()` is an explicit, named teardown that
-    /// behaves identically to dropping the guard.
-    #[tokio::test(flavor = "current_thread")]
-    async fn explicit_abort_stops_watcher_task() {
-        let handle = epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor")
-            .spawn(async move {
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            });
-        let abort_handle = handle.abort_handle();
-        let watcher = EventWatcher { handle };
-        watcher.abort();
-        wait_for("EventWatcher::abort must stop the watcher task", || {
-            abort_handle.is_finished()
-        })
-        .await;
-    }
-}
-
-#[cfg(test)]
 mod typed_string_put_tests {
     use super::*;
 
@@ -6461,7 +6328,7 @@ mod disconnect_transition_tests {
         cid: u32,
         priority: u8,
     ) -> (ChannelInner, broadcast::Receiver<ConnectionEvent>) {
-        let (conn_tx, conn_rx) = broadcast::channel(16);
+        let (conn_tx, conn_rx) = state::ConnEvents::new(16);
         let ch = ChannelInner {
             cid,
             pv_name: format!("TEST:PV{cid}"),
@@ -6690,7 +6557,10 @@ mod disconnect_transition_tests {
 
         let ch = channels.get(&42).unwrap();
         assert_eq!(ch.state, ChannelState::Unresponsive);
-        assert!(!ch.access_rights.read && !ch.access_rights.write);
+        assert!(
+            ch.access_rights.read && ch.access_rights.write,
+            "an unresponsive channel keeps its permits (no setServerAddressUnknown)"
+        );
         assert_eq!(
             drain_events(&mut conn_rx),
             vec![

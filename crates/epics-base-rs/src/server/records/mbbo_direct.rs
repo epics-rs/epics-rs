@@ -91,7 +91,7 @@ impl MbboDirectRecord {
     fn bits_to_val(&mut self) {
         self.val = 0;
         for i in 0..32 {
-            self.val |= (self.bits[i] as u32 & 1) << i;
+            self.val |= u32::from(self.bits[i] != 0) << i;
         }
     }
 
@@ -342,9 +342,15 @@ impl Record for MbboDirectRecord {
 
     /// C `:323` posts a bit on `bitsChanged` or an alarm event, never on a
     /// compare against what a client was last sent: a bit put is posted by
-    /// `dbPut` and must not post again from the next `monitor()`.
+    /// `dbPut` and must not post again from the next `monitor()`. RVAL and
+    /// RBV likewise answer from the record's own `oraw`/`orbv`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &BIT_NAMES
+        static CLAIMED: [&str; 34] = [
+            "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB",
+            "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18",
+            "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ];
+        &CLAIMED
     }
 
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
@@ -422,7 +428,7 @@ impl Record for MbboDirectRecord {
     /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
     /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
     /// translation. A CA put to `mbboDirect.VAL` must therefore
-    /// recompute `RVAL`/`ORAW`. `mbboDirect` is an output record, so it
+    /// recompute `RVAL`. `mbboDirect` is an output record, so it
     /// does NOT override `set_device_did_compute` or
     /// `soft_channel_skips_convert` — the soft-channel convert-skip
     /// applies only to INPUT records.
@@ -437,13 +443,50 @@ impl Record for MbboDirectRecord {
             self.convert();
         }
         self.skip_convert = false;
-        // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
-        // (the hardware read-back); record support never assigns it.
-        // Forcing `RBV = RVAL` here would mask hardware disagreement,
-        // so we only roll `orbv` forward and leave `rbv` untouched.
-        self.orbv = self.rbv;
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbboDirectRecord.c:331-339` posts RVAL and RBV with `events |
+    /// DBE_VALUE | DBE_LOG` outside the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// The RVAL/RBV block sits outside `if (events)`, so a readback that
+    /// moves RBV while VAL holds still posts.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` posts VAL, B0-B1F, RVAL and RBV alone
+    /// (`mbboDirectRecord.c:305-340`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        static POSTED: [&str; 35] = [
+            "VAL", "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA",
+            "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17",
+            "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ];
+        Some(&POSTED)
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbboDirectRecord.c:332-339`) and its RBV twin, minus the post.
+    /// Outside init, `monitor()` is the only writer of `oraw`/`orbv`.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        match field {
+            "RVAL" if self.oraw != self.rval => {
+                self.oraw = self.rval;
+                true
+            }
+            "RBV" if self.orbv != self.rbv => {
+                self.orbv = self.rbv;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
@@ -619,19 +662,15 @@ impl Record for MbboDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
-                    // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod), so a
-                    // numeric CA put coerces to the native `UChar`; accept it
-                    // alongside the signed variants device support / autosave
-                    // may send. C `mbboDirectRecord.c::special` (after==1, line
-                    // 282) sets the bit with `if (*pBn)` — the coerced value
-                    // defines the bit when NONZERO, not by its low bit — and
-                    // `bitsFromVAL` (line 96) then normalizes it to 0/1. So the
-                    // store rule is `value != 0`, uniform across all 32 bits.
+                    // B0..B1F are DBF_UCHAR: C stores the cast byte, which
+                    // `special()` (`mbboDirectRecord.c:281-287`) and the init
+                    // fold (`:150-152`) test only for nonzero; `bitsFromVAL`
+                    // normalises it on the next cycle.
                     let bit = match value {
-                        EpicsValue::UChar(v) => u8::from(v != 0),
-                        EpicsValue::Char(v) => u8::from(v != 0),
-                        EpicsValue::Short(v) => u8::from(v != 0),
-                        EpicsValue::Long(v) => u8::from(v != 0),
+                        EpicsValue::UChar(v) => v,
+                        EpicsValue::Char(v) => v as u8,
+                        EpicsValue::Short(v) => v as u8,
+                        EpicsValue::Long(v) => v as u8,
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;

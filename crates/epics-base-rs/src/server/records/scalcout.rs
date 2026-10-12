@@ -201,6 +201,8 @@ pub struct ScalcoutRecord {
     /// SVAL (bit 0), OSV (bit 1) and AA..LL (bits 2..) posts the last
     /// `monitor()` made, each against the record's own previous copy.
     string_posts: u64,
+    /// This cycle's `monitor()` A..L posts against PA..PL, a bit per input.
+    input_changes: u32,
 }
 
 impl Default for ScalcoutRecord {
@@ -238,6 +240,7 @@ impl Default for ScalcoutRecord {
             calc_posts: 0,
             posv: PvString::new(),
             string_posts: 0,
+            input_changes: 0,
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pa: [0.0; 12],
@@ -436,14 +439,14 @@ impl ScalcoutRecord {
         }
     }
 
-    /// C `monitor()`'s string posts (`sCalcoutRecord.c:842-863`): SVAL against
-    /// PSVL and OSV against POSV, each copy then advanced, and AA..LL against
-    /// PAA..PLL, which `process` snapshotted. Decided here, at the end of every
+    /// C `monitor()`'s comparisons (`sCalcoutRecord.c:842-863`): SVAL against
+    /// PSVL and OSV against POSV, each copy then advanced, and A..L / AA..LL
+    /// against PA..PL / PAA..PLL, which `process` snapshotted. Decided here, at the end of every
     /// cycle that reaches `monitor()`, and posted by the framework from
     /// [`Record::take_cycle_posted_fields`]. The ODLY-scheduling cycle is not
     /// one of them: C `return(0)`s at `:407`, so PSVL lags SVAL for the length
     /// of the delay.
-    fn monitor_strings(&mut self) {
+    fn monitor_copies(&mut self) {
         let mut posts = 0;
         if c_str(self.sval.as_bytes()) != c_str(self.psvl.as_bytes()) {
             posts |= 1;
@@ -459,6 +462,13 @@ impl ScalcoutRecord {
             }
         }
         self.string_posts = posts;
+        let mut changes = 0;
+        for (i, (new, prev)) in self.num_vals.iter().zip(&self.pa).enumerate() {
+            if new != prev {
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
     }
 
     /// C `sCalcoutRecord.c::special:463-471` (and the same two lines in
@@ -826,6 +836,24 @@ impl Record for ScalcoutRecord {
         )
     }
 
+    /// C `monitor()` posts every input A..L when the alarm moved, changed or
+    /// not: `if ((*pnew != *pprev) || (monitor_mask&DBE_ALARM))` with
+    /// `monitor_mask|DBE_VALUE|DBE_LOG` (`sCalcoutRecord.c:855-856`).
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &crate::server::records::calc::CALC_INPUT_FIELDS[..12]
+    }
+
+    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
+        (
+            &crate::server::records::calc::CALC_INPUT_FIELDS[..12],
+            self.input_changes,
+        )
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
     /// C posts these only from `monitor()`'s comparisons with the record's own
     /// copies, never from a change the framework sees.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
@@ -881,6 +909,7 @@ impl Record for ScalcoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.input_changes = 0;
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
         // branch, lines 421-432). No input fetch and no CALC pass — C's `pact`
@@ -905,7 +934,7 @@ impl Record for ScalcoutRecord {
         if self.awaiting_out {
             self.awaiting_out = false;
             self.cached_should_output = false;
-            self.monitor_strings();
+            self.monitor_copies();
             return Ok(ProcessOutcome::complete());
         }
 
@@ -914,7 +943,7 @@ impl Record for ScalcoutRecord {
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
-            self.monitor_strings();
+            self.monitor_copies();
             // C `:429-431` — the delayed `execOutput` reaches the same
             // `writeValue`, so the continuation can itself go async.
             if let Some(outcome) = self.issue_wait_put() {
@@ -1048,7 +1077,7 @@ impl Record for ScalcoutRecord {
             // the write, not the DOPT switch that precedes it.
             self.exec_output_data();
         }
-        self.monitor_strings();
+        self.monitor_copies();
         if let Some(outcome) = self.issue_wait_put() {
             return Ok(outcome);
         }

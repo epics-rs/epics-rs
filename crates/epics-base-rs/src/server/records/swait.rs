@@ -194,6 +194,8 @@ pub struct SwaitRecord {
     pending_output: bool,
     /// The CLCV/CALC/CLCV posts owed by a CALC `special()`.
     calc_post: bool,
+    /// This cycle's `monitor()` posts of A..L and LA..LL, a bit per input.
+    input_changes: u16,
 }
 
 impl Default for SwaitRecord {
@@ -240,6 +242,7 @@ impl Default for SwaitRecord {
             output_wait: false,
             pending_output: false,
             calc_post: false,
+            input_changes: 0,
         }
     }
 }
@@ -451,6 +454,27 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 /// *precision = 3;` — the one field swait answers with a literal instead of PREC.
 const SWAIT_ODLY_PRECISION: i16 = 3;
 
+/// VAL, then each input beside its LA..LL, in `monitor()`'s post order.
+const SWAIT_MONITORED: [&str; 25] = [
+    "VAL", "A", "LA", "B", "LB", "C", "LC", "D", "LD", "E", "LE", "F", "LF", "G", "LG", "H", "LH",
+    "I", "LI", "J", "LJ", "K", "LK", "L", "LL",
+];
+
+/// `special()`'s CALC posts, then the input pairs `monitor()` marks.
+static SWAIT_POSTS: [(&str, crate::server::record::CyclePostMask); 27] = {
+    use crate::server::record::CyclePostMask::{MonitorValue, Value};
+    let mut t = [("", MonitorValue); 27];
+    t[0] = ("CLCV", Value);
+    t[1] = ("CALC", Value);
+    t[2] = ("CLCV", Value);
+    let mut i = 0;
+    while i < 24 {
+        t[3 + i] = (SWAIT_MONITORED[1 + i], MonitorValue);
+        i += 1;
+    }
+    t
+};
+
 impl Record for SwaitRecord {
     /// What `put_field` stores for `A`..`L`, without the by-name lookups
     /// that precede it on the default path.
@@ -570,20 +594,49 @@ impl Record for SwaitRecord {
     }
 
     /// C `special(SPC_CALC)` posts CLCV, CALC, CLCV, each a literal
-    /// `DBE_VALUE` (swaitRecord.c:566-568), and does not process.
+    /// `DBE_VALUE` (swaitRecord.c:566-568), and does not process; `monitor()`
+    /// posts each moved input then its LA..LL with `monitor_mask | DBE_VALUE`
+    /// (`:647-654`).
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
-        use crate::server::record::{CycleMarks, CyclePostMask};
-        static CALC_POSTS: [(&str, CyclePostMask); 3] = [
-            ("CLCV", CyclePostMask::Value),
-            ("CALC", CyclePostMask::Value),
-            ("CLCV", CyclePostMask::Value),
-        ];
-        let bits = if std::mem::take(&mut self.calc_post) {
+        use crate::server::record::CycleMarks;
+        let calc = if std::mem::take(&mut self.calc_post) {
             0b111
         } else {
             0
         };
-        CycleMarks::of(&CALC_POSTS, bits)
+        let mut inputs = 0u64;
+        for i in 0..12 {
+            if self.input_changes & (1 << i) != 0 {
+                inputs |= 0b11 << (2 * i);
+            }
+        }
+        self.input_changes = 0;
+        CycleMarks::of(&SWAIT_POSTS, u128::from(calc | inputs << 3))
+    }
+
+    /// `monitor()` posts VAL and the A..L / LA..LL pairs alone.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&SWAIT_MONITORED)
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SWAIT_MONITORED[1..]
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's input
+    /// marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.input_changes != 0;
+        classes
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -773,13 +826,16 @@ impl Record for SwaitRecord {
         // (see `output_link_value`).
         self.oval = self.val;
 
-        // C `swaitRecord.c::monitor` (647-654) advances each previous-input
-        // field to the input it just posted (`*pprev = *pnew`) — so LA..LL is
-        // "the value of input A..L as of the last cycle that posted it", which
-        // for these fields is every cycle the input changed. Assigning
-        // unconditionally is the same state: the C guard only skips the
-        // assignment when the two are already equal.
-        self.prev_vals = self.num_vals;
+        // C `swaitRecord.c::monitor` (647-654): each input that differs from
+        // its LA..LL posts, advances `*pprev = *pnew`, and posts LA..LL.
+        let mut changes = 0;
+        for (i, (new, prev)) in self.num_vals.iter().zip(&mut self.prev_vals).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
 
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
         // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
@@ -863,32 +919,6 @@ impl Record for SwaitRecord {
     /// CLCV's post (`:309`, `:566`) carries a literal `DBE_VALUE` too.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         &["DOLD", "CLCV"]
-    }
-
-    /// C `swaitRecord.c::monitor` (647-654) posts a changed input A..L with
-    /// `monitor_mask | DBE_VALUE` — no forced `DBE_LOG`:
-    ///
-    /// ```c
-    /// for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {
-    ///     if (*pnew != *pprev) {
-    ///         db_post_events(pwait, pnew, monitor_mask|DBE_VALUE);
-    ///         ...
-    /// ```
-    ///
-    /// so an archiver subscribed `DBE_LOG` to `swait.A` is sent a value only on
-    /// a cycle where VAL's own ADEL deadband crossed (which puts `DBE_LOG` into
-    /// `monitor_mask`), not on every change. `calcRecord.c:420` writes
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` in the same loop and keeps the
-    /// framework default.
-    ///
-    /// LA..LL ride the same post: C advances `*pprev = *pnew` between the two
-    /// `db_post_events` calls, so the previous-value field is published with the
-    /// same mask as the input that moved it.
-    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
-        &[
-            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "LA", "LB", "LC", "LD",
-            "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
-        ]
     }
 
     /// `OEVT` ("Output Event"): post the numeric output event when output

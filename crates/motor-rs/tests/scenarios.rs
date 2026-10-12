@@ -483,6 +483,7 @@ fn set_mode_redefines_coordinates() {
 
     // Write VAL=100 → should update OFF, not move
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
 
     assert_eq!(rec.pos.val, 100.0);
     assert_eq!(rec.pos.dval, 10.0); // unchanged
@@ -1339,7 +1340,7 @@ fn calibration_set_current_position_updates_offset() {
 
     // Write new position: "I am now at 10.0"
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Set);
+    let effects = rec.plan_motion(CommandSource::Val);
 
     // C 2206-2227: a FOFF=Variable redefinition is offset-only — no
     // controller command (LOAD_POS belongs to the Frozen leg and the

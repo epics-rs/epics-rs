@@ -705,7 +705,8 @@ fn soft_input_read_as_names_every_soft_dsets_request() {
     type = "seq",
     crate_path = "epics_base_rs",
     take_cycle_posted_fields = take_marks,
-    fields_posted_only_when_marked = MARKED_ONLY
+    fields_posted_only_when_marked = MARKED_ONLY,
+    process_posted_fields = POSTED
 )]
 struct MarkingRecord {
     /// The marks, as bits: a derive member is a field.
@@ -721,13 +722,14 @@ static POSTS: [(&str, epics_base_rs::server::record::CyclePostMask); 2] = [
     ("B", epics_base_rs::server::record::CyclePostMask::Value),
 ];
 const MARKED_ONLY: [&str; 2] = ["A", "B"];
+const POSTED: [&str; 3] = ["VAL", "A", "B"];
 
 fn take_marks(rec: &mut MarkingRecord) -> epics_base_rs::server::record::CycleMarks {
     epics_base_rs::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut rec.val) as u128)
 }
 
-/// The two post attributes reach the named function and set, and make the
-/// cycle take the marks; a type without them keeps the trait's empty answers.
+/// The post attributes reach the named function and sets, and make the cycle
+/// take the marks; a type without them keeps the trait's empty answers.
 #[test]
 fn post_attributes_forward_the_marks_and_the_claimed_set() {
     use epics_base_rs::server::record::CycleHooks;
@@ -735,6 +737,7 @@ fn post_attributes_forward_the_marks_and_the_claimed_set() {
     let mut rec = MarkingRecord { val: 0b10 };
     assert!(rec.cycle_hooks().has(CycleHooks::CYCLE_POSTED));
     assert_eq!(rec.fields_posted_only_when_marked(), &MARKED_ONLY);
+    assert_eq!(rec.process_posted_fields(), Some(&POSTED[..]));
     assert_eq!(
         rec.take_cycle_posted_fields().collect::<Vec<_>>(),
         [POSTS[1]]
@@ -744,5 +747,6 @@ fn post_attributes_forward_the_marks_and_the_claimed_set() {
     let mut plain = SoftLonginRecord { val: 0 };
     assert_eq!(plain.cycle_hooks(), CycleHooks::NONE);
     assert!(plain.fields_posted_only_when_marked().is_empty());
+    assert_eq!(plain.process_posted_fields(), None);
     assert!(plain.take_cycle_posted_fields().is_empty());
 }

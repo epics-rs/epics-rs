@@ -536,8 +536,9 @@ pub struct TableRecord {
     // --- Internal: previous yaw angle (for the YANG offset rotation) ---
     curr_yang: f64,
 
-    /// SET owed by an `SSET`/`SUSE` put; the put drains it.
-    set_marked: bool,
+    /// `special()`'s posts owed by a put, a bit per [`SPECIAL_POSTS`] row; the
+    /// put drains them.
+    special_posts: u64,
 }
 
 impl Default for TableRecord {
@@ -726,7 +727,7 @@ impl Default for TableRecord {
             async_ctx: None,
             curr_aunit: AngleUnit::Degrees,
             curr_yang: 0.0,
-            set_marked: false,
+            special_posts: 0,
         }
     }
 }
@@ -2324,6 +2325,15 @@ impl TableRecord {
 // Record trait implementation
 // ===========================================================================
 
+/// `special()`'s literal-`DBE_VALUE` posts, in [`TableRecord::special_posts`] bit order.
+static SPECIAL_POSTS: [(&str, CyclePostMask); 5] = [
+    ("SET", CyclePostMask::Value),
+    ("SYNC", CyclePostMask::Value),
+    ("INIT", CyclePostMask::Value),
+    ("ZERO", CyclePostMask::Value),
+    ("READ", CyclePostMask::Value),
+];
+
 /// Record-internal monitor posts that C `tableRecord.c` emits with a
 /// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
 /// six-element arrays plus `LVIO` with `monitor_mask = recGblResetAlarms |
@@ -3148,23 +3158,27 @@ impl Record for TableRecord {
             }
             "SSET" => {
                 self.set = SetMode::Set;
-                self.set_marked = true;
+                self.special_posts |= 1;
             }
             "SUSE" => {
                 self.set = SetMode::Use;
-                self.set_marked = true;
+                self.special_posts |= 1;
             }
             "SYNC" => {
                 self.sync = 1;
+                self.special_posts |= 1 << 1;
             }
             "INIT" => {
                 self.init = 1;
+                self.special_posts |= 1 << 2;
             }
             "ZERO" => {
                 self.zero = 1;
+                self.special_posts |= 1 << 3;
             }
             "READ" => {
                 self.read = 1;
+                self.special_posts |= 1 << 4;
             }
             "AUNIT" => {
                 // Update angle unit label and conversion
@@ -3220,12 +3234,14 @@ impl Record for TableRecord {
         TABLE_VALUE_ONLY_FIELDS
     }
 
-    /// C `tableRecord.c::special()` flips SET mode on an `SSET`/`SUSE` write
-    /// and posts `SET` with a literal `DBE_VALUE` (tableRecord.c:658-663).
-    /// Neither is `pp(TRUE)`, so no process cycle posts it.
+    /// C `tableRecord.c::special()` posts SET on an `SSET`/`SUSE` write, and
+    /// SYNC, INIT, ZERO or READ on its own write, each with a literal
+    /// `DBE_VALUE` (tableRecord.c:658-679).
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
-        static SET_POST: [(&str, CyclePostMask); 1] = [("SET", CyclePostMask::Value)];
-        CycleMarks::of(&SET_POST, u128::from(std::mem::take(&mut self.set_marked)))
+        CycleMarks::of(
+            &SPECIAL_POSTS,
+            u128::from(std::mem::take(&mut self.special_posts)),
+        )
     }
 
     /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:
@@ -4143,15 +4159,26 @@ mod tests {
     }
 
     #[test]
-    fn test_sset_suse_post_set_as_side_effect() {
+    fn test_special_posts_its_flag_as_side_effect() {
         let mut t = TableRecord::new();
 
-        // C special() flips SET mode on SSET/SUSE and posts SET with a
-        // literal DBE_VALUE; SSET/SUSE are not pp, so the put drains the post.
-        for (field, marks) in [("SSET", 1), ("SUSE", 1), ("AX", 0), ("SYNC", 0)] {
+        // C special() posts SET on SSET/SUSE, and SYNC/INIT/ZERO/READ on their
+        // own put, each with a literal DBE_VALUE (tableRecord.c:658-679).
+        for (field, want) in [
+            ("SSET", Some("SET")),
+            ("SUSE", Some("SET")),
+            ("AX", None),
+            ("SYNC", Some("SYNC")),
+            ("INIT", Some("INIT")),
+            ("ZERO", Some("ZERO")),
+            ("READ", Some("READ")),
+        ] {
             t.on_put(field);
             let posts: Vec<_> = t.take_cycle_posted_fields().collect();
-            let want: &[(&str, CyclePostMask)] = &[("SET", CyclePostMask::Value)][..marks];
+            let want: Vec<_> = want
+                .map(|f| (f, CyclePostMask::Value))
+                .into_iter()
+                .collect();
             assert_eq!(posts, want, "{field}");
         }
     }

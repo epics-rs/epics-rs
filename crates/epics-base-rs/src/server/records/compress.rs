@@ -101,6 +101,8 @@ pub struct CompressRecord {
     /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
     /// [`RESET_POSTS`] entry, until the put drains them.
     reset_posts: u64,
+    /// This cycle's `monitor()` found `nuse != ouse` (`compressRecord.c:105`).
+    nuse_moved: bool,
 }
 
 impl Default for CompressRecord {
@@ -136,6 +138,7 @@ impl Default for CompressRecord {
             cycle_emitted: false,
             inpn: 0,
             reset_posts: 0,
+            nuse_moved: false,
         }
     }
 }
@@ -564,6 +567,12 @@ const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
 
 /// C `monitor()`'s posts (`compressRecord.c:105-110`): NUSE when it moved,
 /// NUSE when only the alarm did, then VAL.
+/// `monitor()` from a cycle: NUSE with `monitor_mask | DBE_VALUE | DBE_LOG`.
+static CYCLE_POSTS: [(&str, crate::server::record::CyclePostMask); 1] = [(
+    "NUSE",
+    crate::server::record::CyclePostMask::MonitorValueLog,
+)];
+
 static RESET_POSTS: [(&str, crate::server::record::CyclePostMask); 3] = [
     ("NUSE", crate::server::record::CyclePostMask::ResetValueLog),
     (
@@ -636,11 +645,49 @@ impl Record for CompressRecord {
         Ok(())
     }
 
+    /// A put's drain takes the `special()` posts; a cycle takes NUSE's mark.
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        if std::mem::take(&mut self.nuse_moved) {
+            return crate::server::record::CycleMarks::of(&CYCLE_POSTS, 1);
+        }
         crate::server::record::CycleMarks::of(
             &RESET_POSTS,
             u128::from(std::mem::take(&mut self.reset_posts)),
         )
+    }
+
+    /// `monitor()` posts VAL and NUSE alone (`compressRecord.c:101-111`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "NUSE"])
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["NUSE"]
+    }
+
+    /// The `alarm_mask ||` half of NUSE's test (`compressRecord.c:105`).
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &["NUSE"]
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
+    /// The deadband classes, with the walk told to take NUSE's mark only on a
+    /// cycle that moved it.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.nuse_moved;
+        classes
     }
 
     /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`
@@ -685,7 +732,7 @@ impl Record for CompressRecord {
         }
         // C `compressRecord.c:365-371`: the epilogue calls `monitor(prec)`,
         // which is where OUSE latches on a publishing cycle.
-        self.monitor();
+        self.nuse_moved = self.monitor();
         Ok(ProcessOutcome::complete())
     }
 

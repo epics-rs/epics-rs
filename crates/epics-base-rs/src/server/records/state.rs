@@ -69,6 +69,11 @@ impl Record for StateRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `monitor()` posts VAL alone (`stateRecord.c:120-129`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn record_type(&self) -> &'static str {
         "state"
     }

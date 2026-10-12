@@ -613,7 +613,7 @@ impl Record for MbboRecord {
     /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
     /// translation. It is never gated on whether VAL was just written
     /// (CA put, DOL fetch, or device support). A CA put to `mbbo.VAL`
-    /// must therefore recompute `RVAL`/`ORAW`/`ORBV`. `mbbo` is an
+    /// must therefore recompute `RVAL`. `mbbo` is an
     /// output record, so it does NOT override `set_device_did_compute`
     /// or `soft_channel_skips_convert` — the soft-channel convert-skip
     /// applies only to INPUT records (ai/bi/mbbi), where VAL is the
@@ -628,9 +628,50 @@ impl Record for MbboRecord {
             self.convert();
         }
         self.skip_convert = false;
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbboRecord.c:407-415` posts RVAL and RBV with `events |
+    /// DBE_VALUE | DBE_LOG` outside the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// The RVAL/RBV block sits outside `if (events)`, so a readback that
+    /// moves RBV while VAL holds still posts.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` decides RVAL and RBV from the record's own `oraw` and
+    /// `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL", "RBV"]
+    }
+
+    /// `monitor()` posts VAL, RVAL and RBV alone (`mbboRecord.c:394-416`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL", "RBV"])
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbboRecord.c:408-415`) and its RBV twin, minus the post. Outside
+    /// init, `monitor()` is the only writer of `oraw`/`orbv`.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        match field {
+            "RVAL" if self.oraw != self.rval => {
+                self.oraw = self.rval;
+                true
+            }
+            "RBV" if self.orbv != self.rbv => {
+                self.orbv = self.rbv;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

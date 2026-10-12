@@ -132,9 +132,44 @@ impl Record for BiRecord {
             }
         }
         self.skip_convert = false; // reset for next cycle
-
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `biRecord.c:298-299` posts RVAL with `monitor_mask | DBE_VALUE |
+    /// DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// The RVAL block sits outside `if (monitor_mask)`, so a cycle that
+    /// leaves VAL alone still posts a moved RVAL.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`biRecord.c:283-305`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL"])
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`biRecord.c:297-303`), minus the post. Outside init, `monitor()` is
+    /// the only writer of `oraw`, so an RVAL put posts again from its cycle
+    /// unless the cycle reads back the value `oraw` already holds.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        if field == "RVAL" && self.oraw != self.rval {
+            self.oraw = self.rval;
+            return true;
+        }
+        false
     }
 
     fn set_device_did_compute(&mut self, did_compute: bool) {

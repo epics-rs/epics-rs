@@ -150,6 +150,11 @@ impl Record for EventRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `monitor()` posts VAL alone (`eventRecord.c:157-165`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn has_array_monitor_post(&self) -> bool {
         false
     }

@@ -1038,6 +1038,14 @@ impl Record for TransformRecord {
     /// link-fed channel has `no_inlink == false` and is never gated by
     /// `new_value` at all.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        // C refuses a put to a value field whose input link is not CONSTANT,
+        // valid or not (`transformRecord.c:651-660`).
+        if !after
+            && let Some(i) = Self::channel_index(field)
+            && !self.no_inlink(i)
+        {
+            return Err(CaError::ReadOnlyField(field.to_string()));
+        }
         if after {
             // C `transformRecord.c:699-705` marks the bitmap only for a field
             // in the `A..P` range (`i = fieldIndex - transformRecordA; if ((i

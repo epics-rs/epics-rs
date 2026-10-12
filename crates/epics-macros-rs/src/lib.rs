@@ -317,6 +317,10 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   named `fn(&mut Self) -> CycleMarks`, taken every cycle
 ///   (`CycleHooks::CYCLE_POSTED`), and `Record::fields_posted_only_when_marked`
 ///   answers the named `&'static [&'static str]`
+/// - `#[record(type = "longin", process_posted_fields = LONGIN_POSTED)]` —
+///   the closed set the record's C `process()` + `monitor()` post:
+///   `Record::process_posted_fields` answers `Some` of the named
+///   `&'static [&'static str]`
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -401,6 +405,8 @@ struct RecordAttrs {
     take_cycle_posted_fields: Option<syn::Path>,
     /// `#[record(fields_posted_only_when_marked = SOME_SET)]`.
     fields_posted_only_when_marked: Option<syn::Path>,
+    /// `#[record(process_posted_fields = SOME_SET)]`.
+    process_posted_fields: Option<syn::Path>,
     /// `#[record(dset_owns_udf_on_computed)]` — the record's C `process()` does
     /// NOT re-derive `udf` after a device read that wrote VAL directly (C
     /// `return 2`), because the `else if (status == 2) status = 0;` fold sits
@@ -714,6 +720,14 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         },
         None => quote! {},
     };
+    let process_posted_method = match &attrs.process_posted_fields {
+        Some(path) => quote! {
+            fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+                Some(&#path)
+            }
+        },
+        None => quote! {},
+    };
 
     // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
     // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
@@ -899,6 +913,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #link_metadata_field_method
             #take_cycle_posted_method
             #posted_only_when_marked_method
+            #process_posted_method
 
             // The derive emits no `pre_process_actions`.
             fn acts_before_process(&self) -> bool {
@@ -957,6 +972,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut no_value_monitor = false;
     let mut take_cycle_posted_fields: Option<syn::Path> = None;
     let mut fields_posted_only_when_marked: Option<syn::Path> = None;
+    let mut process_posted_fields: Option<syn::Path> = None;
     let mut dset_owns_udf_on_computed = false;
     let mut soft_input_read_as: Option<syn::Ident> = None;
 
@@ -1009,6 +1025,9 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("fields_posted_only_when_marked") {
                     fields_posted_only_when_marked = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("process_posted_fields") {
+                    process_posted_fields = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else if meta.path.is_ident("dset_owns_udf_on_computed") {
                     // Bare flag.
                     dset_owns_udf_on_computed = true;
@@ -1021,7 +1040,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
                          `no_value_monitor`, `take_cycle_posted_fields`, \
-                         `fields_posted_only_when_marked`, \
+                         `fields_posted_only_when_marked`, `process_posted_fields`, \
                          `dset_owns_udf_on_computed` or `soft_input_read_as`",
                     ))
                 }
@@ -1042,6 +1061,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         no_value_monitor,
         take_cycle_posted_fields,
         fields_posted_only_when_marked,
+        process_posted_fields,
         dset_owns_udf_on_computed,
         soft_input_read_as,
     })

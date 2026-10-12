@@ -6,6 +6,20 @@ use crate::types::EpicsValue;
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
 const SEL_MAX: usize = 12;
 
+/// The fields `selRecord.c::monitor` posts from its own copies, bit order.
+const SEL_MARKED: [&str; SEL_MAX + 1] = [
+    "SELN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L",
+];
+
+/// VAL and [`SEL_MARKED`]: everything `monitor()` posts.
+const SEL_MONITORED: [&str; SEL_MAX + 2] = [
+    "VAL", "SELN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L",
+];
+
+const SEL_PREV_FIELDS: [&str; SEL_MAX] = [
+    "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
+];
+
 /// Choice labels for the SELM select-mechanism menu, in index order.
 /// C `menu(selSELM)` (selRecord.dbd.pod:21-26): 0=Specified, 1=High Signal,
 /// 2=Low Signal, 3=Median Signal.
@@ -105,6 +119,12 @@ pub struct SelRecord {
     /// `fetch_values` failed (`:114`), leaves UDF frozen. Consumed by
     /// `check_alarms`, which owns the write.
     value_computed: bool,
+    /// LA..LL, C's `pprev` copies: the A..L `monitor()` last posted.
+    prev: [f64; SEL_MAX],
+    /// C `prec->nlst`: the SELN `monitor()` last posted.
+    nlst: u16,
+    /// This cycle's `advance_monitored` posts: bit 0 SELN, bits 1.. A..L.
+    monitored_changes: u16,
 }
 
 impl Default for SelRecord {
@@ -156,11 +176,32 @@ impl Default for SelRecord {
             soft_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
+            prev: [0.0; SEL_MAX],
+            nlst: 0,
+            monitored_changes: 0,
         }
     }
 }
 
 impl SelRecord {
+    /// C `selRecord.c::monitor` (:325-338) advances NLST and LA..LL inside
+    /// each change test, outside `if (monitor_mask)`, on every cycle, the
+    /// failed-fetch one included.
+    fn advance_monitored(&mut self) {
+        let mut changes = 0;
+        if self.nlst != self.seln {
+            self.nlst = self.seln;
+            changes |= 1;
+        }
+        for (i, (new, prev)) in self.get_values().iter().zip(&mut self.prev).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 2 << i;
+            }
+        }
+        self.monitored_changes = changes;
+    }
+
     fn get_values(&self) -> [f64; SEL_MAX] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
@@ -214,6 +255,44 @@ impl Record for SelRecord {
     /// `checkAlarms` (:270-302).
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
+    /// `monitor()` posts VAL, SELN and A..L alone (`selRecord.c:321-338`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&SEL_MONITORED)
+    }
+
+    /// SELN against NLST and A..L against LA..LL, with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` (`selRecord.c:325-338`); `advance_monitored` made
+    /// the comparisons.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(&str, CyclePostMask); SEL_MAX + 1] =
+            uniform_post_table(&SEL_MARKED, CyclePostMask::MonitorValueLog);
+        CycleMarks::of(
+            &POSTS,
+            u128::from(std::mem::take(&mut self.monitored_changes)),
+        )
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SEL_MARKED
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's SELN and
+    /// A..L marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.monitored_changes != 0;
+        classes
+    }
+
     fn has_array_monitor_post(&self) -> bool {
         false
     }
@@ -259,6 +338,7 @@ impl Record for SelRecord {
         // and raises none of `do_sel`'s own alarms. Consumed as a one-shot so
         // the by-name path, which files no fetch report, never freezes.
         if std::mem::take(&mut self.fetch_gate_failed) {
+            self.advance_monitored();
             return Ok(ProcessOutcome::complete());
         }
         let vals = self.get_values();
@@ -342,6 +422,7 @@ impl Record for SelRecord {
         if value_selected {
             self.value_computed = true;
         }
+        self.advance_monitored();
         Ok(ProcessOutcome::complete())
     }
 
@@ -535,7 +616,11 @@ impl Record for SelRecord {
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
-            _ => None,
+            "NLST" => Some(EpicsValue::UShort(self.nlst)),
+            _ => SEL_PREV_FIELDS
+                .iter()
+                .position(|f| *f == name)
+                .map(|i| EpicsValue::Double(self.prev[i])),
         }
     }
 

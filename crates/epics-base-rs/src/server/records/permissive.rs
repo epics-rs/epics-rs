@@ -71,6 +71,11 @@ impl Record for PermissiveRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `monitor()` posts VAL and WFLG alone (`permissiveRecord.c:90-117`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "WFLG"])
+    }
+
     fn record_type(&self) -> &'static str {
         "permissive"
     }

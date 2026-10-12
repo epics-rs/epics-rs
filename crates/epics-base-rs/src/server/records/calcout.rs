@@ -79,6 +79,8 @@ pub struct CalcoutRecord {
     pub dopt: i16, // Data Option: 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     pub oval: f64,
+    /// C `prec->povl`: the OVAL `monitor()` last compared and posted.
+    povl: f64,
     pub ivoa: i16, // Invalid Output Action: 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
     // Input links (INPA..INPU)
@@ -172,6 +174,9 @@ pub struct CalcoutRecord {
     // delay is pending, cleared on the delayed re-process. Externally
     // readable (DBF_SHORT) so clients can observe the pending state.
     pub dlya: i16,
+    /// This cycle set or cleared DLYA, which C posts from `process()` with a
+    /// literal `DBE_VALUE` (`calcoutRecord.c:279`, `:296`).
+    dlya_moved: bool,
     // OEVT ("Event To Issue") — C `calcoutRecord.c` `prec->oevt` (DBF_STRING).
     // When output fires and OEVT names a non-empty event, `execOutput` posts
     // it (`postEvent(eventNameToHandle(oevt))`) right after `writeValue`; see
@@ -260,6 +265,7 @@ impl Default for CalcoutRecord {
             dopt: 0,
             ocal: String::new(),
             oval: 0.0,
+            povl: 0.0,
             ivoa: 0,
             ivov: 0.0,
             inpa: String::new(),
@@ -338,6 +344,7 @@ impl Default for CalcoutRecord {
             pval: 0.0,
             odly: 0.0,
             dlya: 0,
+            dlya_moved: false,
             oevt: String::new(),
             pending_output: false,
             pact: false,
@@ -638,6 +645,12 @@ const CALCOUT_OOPT_CHOICES: &[&str] = &[
 /// C `menu(calcoutDOPT)` (`calcoutRecord.dbd.pod:41-43`).
 const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 
+/// VAL, A..U and OVAL: what `calcoutRecord.c::monitor` posts.
+const CALCOUT_PROCESS_POSTED: [&str; 23] = [
+    "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+    "R", "S", "T", "U", "OVAL",
+];
+
 impl Record for CalcoutRecord {
     fn alarms_before_stamp(&self) -> bool {
         true
@@ -708,6 +721,7 @@ impl Record for CalcoutRecord {
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
             .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::PROCESS_POSTED)
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {
@@ -721,6 +735,49 @@ impl Record for CalcoutRecord {
     /// `calcoutRecord.c:124-126` discards the dset status and seeds.
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         crate::server::record::seed_trackers_from_val(self);
+        self.povl = self.oval;
+    }
+
+    /// `monitor()` posts VAL, A..U and OVAL alone (`calcoutRecord.c:660-691`);
+    /// DLYA posts from `process()` through [`Self::take_process_posted_fields`].
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&CALCOUT_PROCESS_POSTED)
+    }
+
+    /// C `calcoutRecord.c:687-690` posts OVAL with `monitor_mask | DBE_VALUE |
+    /// DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("OVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// The OVAL block sits outside `if (monitor_mask)`, so a cycle that leaves
+    /// VAL alone still posts a moved OVAL.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// C `if (prec->povl != prec->oval) { ...; prec->povl = prec->oval; }`
+    /// (`calcoutRecord.c:687-690`), minus the post. Outside init, `monitor()`
+    /// is the only writer of `povl`, so an OVAL put posts again from its cycle
+    /// unless the cycle sets back the value `povl` holds.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        if field == "OVAL" && self.povl != self.oval {
+            self.povl = self.oval;
+            return true;
+        }
+        false
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["OVAL"]
+    }
+
+    fn take_process_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static DLYA_POST: [(&str, CyclePostMask); 1] = [("DLYA", CyclePostMask::Value)];
+        CycleMarks::of(&DLYA_POST, u128::from(std::mem::take(&mut self.dlya_moved)))
     }
 
     fn record_type(&self) -> &'static str {
@@ -854,6 +911,7 @@ impl Record for CalcoutRecord {
         // A..U present at expiry.
         if self.pact && self.dlya == 1 {
             self.dlya = 0;
+            self.dlya_moved = true;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
@@ -923,6 +981,7 @@ impl Record for CalcoutRecord {
         // branch at the top of process() then emits the captured output.
         if do_output && self.odly > 0.0 {
             self.dlya = 1;
+            self.dlya_moved = true;
             self.pending_output = true;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
@@ -939,10 +998,7 @@ impl Record for CalcoutRecord {
             // snapshot + FLNK tail on the delaying cycle, so VAL/OVAL posted
             // ODLY-seconds early and the forward link fired twice.
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DLYA".to_string(),
-                    EpicsValue::Short(1),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),

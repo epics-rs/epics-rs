@@ -267,26 +267,25 @@ fn test_athm_tracks_home_switch_every_poll() {
 }
 
 #[test]
-fn test_process_motor_info_marks_diff_rdif_for_force_post() {
+fn test_process_motor_info_marks_diff_rdif() {
     // C process_motor_info (motorRecord.cc:3764-3767) MARKs M_DIFF/M_RDIF
-    // on every CALLBACK_DATA pass; monitor() (3522-3531) then posts both
-    // with DBE_VAL_LOG regardless of change. The Rust record records the
-    // mark so the framework re-posts DIFF/RDIF this cycle even when the
-    // following error is constant. A record that has not run
-    // process_motor_info this pass must name no force-posted field.
+    // on every CALLBACK_DATA pass, so monitor() (3522-3531) posts both
+    // whether or not the following error moved. MMAP is C's mark word.
+    let diff_rdif = (1 << 27) | (1 << 28);
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    assert!(
-        rec.force_posted_fields().is_empty(),
-        "a fresh record (no CALLBACK_DATA pass) force-posts nothing"
-    );
+    let mmap = |rec: &MotorRecord| match rec.get_field("MMAP") {
+        Some(EpicsValue::Long(v)) => v,
+        other => panic!("MMAP: {other:?}"),
+    };
+    assert_eq!(mmap(&rec) & diff_rdif, 0, "a fresh record has no mark");
 
     let status = asyn_rs::interfaces::motor::MotorStatus::default();
     rec.process_motor_info(&status);
     assert_eq!(
-        rec.force_posted_fields(),
-        &["DIFF", "RDIF"],
-        "a CALLBACK_DATA pass marks DIFF/RDIF for unconditional re-post"
+        mmap(&rec) & diff_rdif,
+        diff_rdif,
+        "a CALLBACK_DATA pass marks DIFF/RDIF"
     );
 }
 
@@ -459,6 +458,7 @@ fn test_set_mode_offset_redefinition_retranslates_user_limits() {
 
     // VAL redefinition: off = 7 - 0 = 7.
     rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.pos.off, 7.0);
     assert_eq!(rec.limits.hlm, 17.0);
     assert_eq!(rec.limits.llm, -3.0);
@@ -479,6 +479,8 @@ fn test_set_foff_variable_val_completes_without_command() {
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
 
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no LOAD_POS, no motion");
     assert_eq!(rec.pos.off, 95.0);
     assert_eq!(rec.pos.dval, 5.0, "DVAL untouched");
     assert_eq!(rec.pos.rbv, 100.0, "RBV retranslated through new OFF");
@@ -5203,6 +5205,7 @@ fn test_loadpos_block_allows_offset_only_val_redefinition() {
     rec.pos.off = 0.0;
 
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.pos.off, 95.0, "OFF absorbs the redefinition");
     assert_eq!(rec.pos.dval, 5.0, "DVAL untouched (offset-only)");
 }
@@ -5215,6 +5218,7 @@ fn test_loadpos_block_allows_normal_set_when_unblocked() {
     rec.conv.loadpos_blocked = false;
     rec.pos.dval = 5.0;
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     // Unblocked: SET mode redefines OFF (100 - 1*5 = 95)
     assert_eq!(rec.pos.off, 95.0);
 }
@@ -9029,9 +9033,8 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // transition fired, every field in the posting list goes out even
     // when unmarked — `local_mask = monitor_mask | (MARKED(x) ?
     // DBE_VAL_LOG : 0)` is non-zero for unmarked fields once
-    // `monitor_mask != 0`. A subscriber on DMOV must observe the alarm
-    // moment with a DBE_ALARM-only event even though DMOV itself did
-    // not change.
+    // `monitor_mask != 0` — up to the short circuit, below which a field
+    // posts only when one there is marked.
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::record::RecordInstance;
     use epics_base_rs::types::DbFieldType;
@@ -9054,6 +9057,14 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
             (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
         )
         .expect("DMOV subscriber");
+    let _drbv_rx = instance
+        .add_subscriber(
+            "DRBV",
+            2,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .expect("DRBV subscriber");
 
     // Quiescent pass: no alarm transition, DMOV unchanged — no DMOV post.
     let (snap, _) = instance.process_local().unwrap();
@@ -9074,15 +9085,15 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
         .msta
         .insert(MstaFlags::PROBLEM);
     let (snap, _) = instance.process_local().unwrap();
-    let dmov_mask = snap
-        .iter()
-        .find(|(k, _, _)| k == "DMOV")
-        .map(|(_, _, m)| *m);
+    let mask = |field: &str| snap.iter().find(|(k, _, _)| k == field).map(|(_, _, m)| *m);
     assert_eq!(
-        dmov_mask,
+        mask("DRBV"),
         Some(EventMask::ALARM),
         "alarm cycle posts unchanged listed fields with DBE_ALARM alone"
     );
+    // The short circuit (3550-3551): with nothing below it marked, the
+    // fields under it do not post on the alarm.
+    assert_eq!(mask("DMOV"), None, "nothing marked below the short circuit");
 }
 
 #[test]

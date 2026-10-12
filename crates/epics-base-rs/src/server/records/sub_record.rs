@@ -13,6 +13,23 @@ const VAL_NAMES: [&str; INP_ARG_MAX] = [
     "T", "U",
 ];
 
+/// `LA..LU`, C's `pold` copies of `A..U`.
+const PREV_NAMES: [&str; INP_ARG_MAX] = [
+    "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL", "LM", "LN", "LO", "LP",
+    "LQ", "LR", "LS", "LT", "LU",
+];
+
+/// VAL, then `A..U`: all `monitor()` posts (`subRecord.c:396-410`).
+const SUB_MONITORED: [&str; INP_ARG_MAX + 1] = {
+    let mut t = ["VAL"; INP_ARG_MAX + 1];
+    let mut i = 0;
+    while i < INP_ARG_MAX {
+        t[1 + i] = VAL_NAMES[i];
+        i += 1;
+    }
+    t
+};
+
 /// The 21 input link field names `INPA..INPU`.
 const INP_NAMES: [&str; INP_ARG_MAX] = [
     "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
@@ -60,6 +77,10 @@ pub struct SubRecord {
     pub inp: [String; INP_ARG_MAX],
     /// Input values `A..U`.
     pub a: [f64; INP_ARG_MAX],
+    /// `LA..LU`: the `A..U` `monitor()` last posted.
+    pub la: [f64; INP_ARG_MAX],
+    /// This cycle's `monitor()` posts of `A..U`, a bit per input.
+    input_changes: u32,
     /// Monitor / archive deadbands and last-posted trackers. C
     /// `subRecord.c::monitor` (lines 386-394) gates the `VAL` post on the
     /// MDEL/ADEL deadbands against MLST/ALST, and `checkAlarms` (319-373)
@@ -87,6 +108,8 @@ impl Default for SubRecord {
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: [0.0; INP_ARG_MAX],
+            la: [0.0; INP_ARG_MAX],
+            input_changes: 0,
             mdel: 0.0,
             adel: 0.0,
             lalm: 0.0,
@@ -165,8 +188,52 @@ impl Record for SubRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // The subroutine is invoked by the framework via
         // `RecordInstance::subroutine` (it needs the registry of
-        // named functions, which the record does not own).
+        // named functions, which the record does not own), before this.
+        // C `monitor()` (`:403-410`): each input that differs from its LA..LU
+        // posts and advances `*pold = *pnew`, on every cycle.
+        let mut changes = 0;
+        for (i, (new, old)) in self.a.iter().zip(&mut self.la).enumerate() {
+            if *new != *old {
+                *old = *new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// `monitor()` posts VAL and `A..U` alone.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&SUB_MONITORED)
+    }
+
+    /// Each moved input with `monitor_mask | DBE_VALUE | DBE_LOG`
+    /// (`subRecord.c:405`); `process()` made the comparisons.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(&str, CyclePostMask); INP_ARG_MAX] =
+            uniform_post_table(&VAL_NAMES, CyclePostMask::MonitorValueLog);
+        CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &VAL_NAMES
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's input
+    /// marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.input_changes != 0;
+        classes
     }
 
     /// C `subRecord.c::do_sub` writes `prec->udf` in exactly one place — the
@@ -234,6 +301,9 @@ impl Record for SubRecord {
         }
         if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
             return Some(EpicsValue::Double(self.a[idx]));
+        }
+        if let Some(idx) = PREV_NAMES.iter().position(|&n| n == name) {
+            return Some(EpicsValue::Double(self.la[idx]));
         }
         None
     }
@@ -311,6 +381,12 @@ impl Record for SubRecord {
         }
         if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
             self.a[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+            return Ok(());
+        }
+        if let Some(idx) = PREV_NAMES.iter().position(|&n| n == name) {
+            self.la[idx] = value
                 .to_f64()
                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
             return Ok(());

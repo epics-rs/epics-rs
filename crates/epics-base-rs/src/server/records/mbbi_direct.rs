@@ -228,8 +228,14 @@ impl Record for MbbiDirectRecord {
     /// C `:221-224` posts a bit on its own change against the record's bit or
     /// with the alarm events, never on a compare against what a client was
     /// last sent: a Bx put is posted by `dbPut` and monitor() then restores it.
+    /// RVAL likewise answers from the record's own `oraw`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &BIT_NAMES
+        static CLAIMED: [&str; 33] = [
+            "RVAL", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB", "BC",
+            "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19",
+            "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ];
+        &CLAIMED
     }
 
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
@@ -302,8 +308,43 @@ impl Record for MbbiDirectRecord {
             self.val = raw;
         }
         self.skip_convert = false;
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbbiDirectRecord.c:235-238` posts RVAL with `vl_events` outside
+    /// the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// The RVAL block sits outside `if (events)`, so a cycle that leaves VAL
+    /// alone still posts a moved RVAL.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` posts VAL, RVAL and B0-B1F alone
+    /// (`mbbiDirectRecord.c:208-239`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        static POSTED: [&str; 34] = [
+            "VAL", "RVAL", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB",
+            "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18",
+            "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ];
+        Some(&POSTED)
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbbiDirectRecord.c:235-238`), minus the post. Outside init,
+    /// `monitor()` is the only writer of `oraw`.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        if field == "RVAL" && self.oraw != self.rval {
+            self.oraw = self.rval;
+            return true;
+        }
+        false
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {
@@ -444,20 +485,14 @@ impl Record for MbbiDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
-                    // B0..B1F are DBF_UCHAR, so a numeric CA put coerces to the
-                    // native `UChar`; accept it alongside the signed variants
-                    // device support / autosave may send. C stores the coerced
-                    // byte into `*pBn` and `monitor()` re-derives it as
-                    // `!! (val & 1)` (mbbiDirectRecord.c:221) — a NONZERO byte is
-                    // bit 1, not the low bit. This transient store is overwritten
-                    // by the re-derive below on the very next process, so it only
-                    // affects a readback taken before process; mirror C's nonzero
-                    // rule regardless.
+                    // B0..B1F are DBF_UCHAR: C stores the cast byte, and only
+                    // `monitor()`'s re-derive (`mbbiDirectRecord.c:221`)
+                    // normalises it.
                     let bit = match value {
-                        EpicsValue::UChar(v) => u8::from(v != 0),
-                        EpicsValue::Char(v) => u8::from(v != 0),
-                        EpicsValue::Short(v) => u8::from(v != 0),
-                        EpicsValue::Long(v) => u8::from(v != 0),
+                        EpicsValue::UChar(v) => v,
+                        EpicsValue::Char(v) => v as u8,
+                        EpicsValue::Short(v) => v as u8,
+                        EpicsValue::Long(v) => v as u8,
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     // INPUT record: Bx is DERIVED from VAL, so a Bx put must

@@ -112,12 +112,6 @@ impl BusyRecord {
             self.rval = self.val as u32;
         }
     }
-
-    /// Update monitoring fields.
-    fn monitor(&mut self) {
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
-    }
 }
 
 /// C `busyRecord.c:281` — `if(paddr->pfield == (void *)&prec->high) *precision=2;`
@@ -132,6 +126,49 @@ impl Record for BusyRecord {
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::NONE
+    }
+
+    /// C `busyRecord.c:371-380` posts RVAL and RBV with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// `monitor()` decides RVAL and RBV from the record's own `oraw` and
+    /// `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL", "RBV"]
+    }
+
+    /// `monitor()` posts VAL, RVAL and RBV alone (`busyRecord.c:357-383`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL", "RBV"])
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }` and
+    /// its RBV twin (`busyRecord.c:371-380`), minus the post. Outside init,
+    /// `monitor()` is the only writer of `oraw`/`orbv`.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        match field {
+            "RVAL" if self.oraw != self.rval => {
+                self.oraw = self.rval;
+                true
+            }
+            "RBV" if self.orbv != self.rbv => {
+                self.orbv = self.rbv;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The RVAL/RBV block sits outside `if (monitor_mask)`, so a cycle that
+    /// leaves VAL alone still posts a moved RVAL or RBV.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
     }
 
     /// C `busyRecord.c:277-284` `get_precision`: `HIGH` — busy's only
@@ -275,9 +312,6 @@ impl Record for BusyRecord {
         // vs COS, raw menu ordinals), and the INVALID-output IVOA policy is
         // enforced by the framework which gates the OUT write on
         // common.sevr == Invalid.
-
-        // Step 5: Monitor
-        self.monitor();
 
         // Step 6: HIGH one-shot — C `busyRecord.c:258-262` arms
         // `callbackRequestDelayed` on every process that leaves VAL at 1, and

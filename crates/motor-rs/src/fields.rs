@@ -398,6 +398,73 @@ impl Default for TimingFields {
     }
 }
 
+/// C `mmap_field` / `nmap_field` (motorRecord.cc:333-389), NMAP's 32 bits
+/// up, and past them the literal posts `special()` makes; a bit is its row
+/// in the record's post table.
+pub mod m {
+    pub const VAL: u64 = 1 << 0;
+    pub const DVAL: u64 = 1 << 1;
+    pub const HLM: u64 = 1 << 2;
+    pub const LLM: u64 = 1 << 3;
+    pub const DMOV: u64 = 1 << 4;
+    pub const SPMG: u64 = 1 << 5;
+    pub const RCNT: u64 = 1 << 6;
+    pub const MRES: u64 = 1 << 7;
+    pub const ERES: u64 = 1 << 8;
+    pub const UEIP: u64 = 1 << 9;
+    pub const STOP: u64 = 1 << 10;
+    pub const LVIO: u64 = 1 << 11;
+    pub const RVAL: u64 = 1 << 12;
+    pub const RLV: u64 = 1 << 13;
+    pub const OFF: u64 = 1 << 14;
+    pub const RBV: u64 = 1 << 15;
+    pub const DHLM: u64 = 1 << 16;
+    pub const DLLM: u64 = 1 << 17;
+    pub const DRBV: u64 = 1 << 18;
+    pub const MOVN: u64 = 1 << 19;
+    pub const HLS: u64 = 1 << 20;
+    pub const LLS: u64 = 1 << 21;
+    pub const RRBV: u64 = 1 << 22;
+    pub const MSTA: u64 = 1 << 23;
+    pub const ATHM: u64 = 1 << 24;
+    pub const TDIR: u64 = 1 << 25;
+    pub const MIP: u64 = 1 << 26;
+    pub const DIFF: u64 = 1 << 27;
+    pub const RDIF: u64 = 1 << 28;
+    /// The raw switch `monitor()` posts beside HLS or LLS (3576-3589).
+    pub const RHLS: u64 = 1 << 29;
+    pub const RLLS: u64 = 1 << 30;
+    /// `process_motor_info`'s own UEIP post (3671-3675), no `MARK`.
+    pub const UEIP_POSTED: u64 = 1 << 31;
+    pub const SBAS: u64 = 1 << 32;
+    pub const SREV: u64 = 1 << 33;
+    pub const UREV: u64 = 1 << 34;
+    pub const VELO: u64 = 1 << 35;
+    pub const VBAS: u64 = 1 << 36;
+    pub const MISS: u64 = 1 << 37;
+    pub const STUP: u64 = 1 << 38;
+    pub const JOGF: u64 = 1 << 39;
+    pub const JOGR: u64 = 1 << 40;
+    pub const HOMF: u64 = 1 << 41;
+    pub const HOMR: u64 = 1 << 42;
+    pub const RHLM: u64 = 1 << 43;
+    pub const RLLM: u64 = 1 << 44;
+    /// Every bit a `MARK` sets.
+    pub const MONITOR: u64 = (1 << 45) - 1;
+    /// What `monitor()` posts above its short circuit (3462-3549).
+    pub const UPPER: u64 = RBV | RRBV | DRBV | DIFF | RDIF | MSTA;
+    // `special()`'s literal posts, drained by the put.
+    pub const PUT_DMOV: u64 = 1 << 45;
+    pub const PUT_VBAS: u64 = 1 << 46;
+    pub const PUT_SBAS: u64 = 1 << 47;
+    pub const PUT_VELO: u64 = 1 << 48;
+    pub const PUT_DLLM: u64 = 1 << 49;
+    pub const PUT_DHLM: u64 = 1 << 50;
+    pub const PUT_HLM: u64 = 1 << 51;
+    pub const PUT_LLM: u64 = 1 << 52;
+    pub const PUT_STUP: u64 = 1 << 53;
+}
+
 /// Internal bookkeeping fields (not directly exposed as PVs).
 #[derive(Debug, Clone, Default)]
 pub struct InternalFields {
@@ -406,11 +473,19 @@ pub struct InternalFields {
     pub lrvl: i64,
     /// Last RLV value posted (C `motorRecord.dbd` LRLV, DBF_DOUBLE, SPC_NOMOD).
     pub lrlv: f64,
-    /// Monitored-field bitmap (C `motorRecord.dbd` MMAP, DBF_ULONG, SPC_NOMOD).
-    pub mmap: i64,
-    /// Non-monitored-field bitmap (C `motorRecord.dbd` NMAP, DBF_ULONG,
-    /// SPC_NOMOD).
-    pub nmap: i64,
+    /// C `mmap` (low word) and `nmap` (high word): the fields the next
+    /// `monitor()` posts, set by `MotorRecord::mark` at C's `MARK` sites
+    /// and drained by the cycle ([`m`] has the bits).
+    pub mmap: u64,
+    /// The cycle that set this ran `process()`, so the next take of the
+    /// post marks is its `monitor()`; any other take is a put's.
+    pub monitor_due: bool,
+    /// `monitor()` found a mark below its short circuit this cycle
+    /// (motorRecord.cc:3550-3551), so an alarm move posts that group too.
+    pub monitor_lower_marked: bool,
+    /// The literal `DBE_VAL_LOG` posts `special()` makes itself, drained
+    /// by the put that ran it ([`m`] bits past `m::MONITOR`).
+    pub put_posted: u64,
     pub lspg: SpmgMode,
     /// C `pmr->sync` — latched SYNC request. Set by a nonzero SYNC put,
     /// consumed by `apply_latent_sync` only when the record is idle under
@@ -489,15 +564,6 @@ pub struct InternalFields {
     /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
     /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
-    /// One-pass mark: `process_motor_info` recomputed DIFF/RDIF this
-    /// cycle — the C `MARK(M_DIFF)` / `MARK(M_RDIF)` of
-    /// `process_motor_info` (motorRecord.cc:3764-3767), set on every
-    /// `CALLBACK_DATA` pass. C `monitor()` (3522-3531) then posts both
-    /// with `monitor_mask | DBE_VAL_LOG` regardless of whether the value
-    /// changed, so a `camonitor DIFF/RDIF` on a settled axis parked at a
-    /// constant non-zero following error gets an event every poll. Read by
-    /// `force_posted_fields`; reset at the top of each `process()`.
-    pub diff_rdif_marked: bool,
     /// Driver commands a put queued at special() time (C sends them
     /// from special() before the pp pass runs do_work: pidcof
     /// 3003-3026, set_user/dial_*limit 4076-4328). Every motor put is

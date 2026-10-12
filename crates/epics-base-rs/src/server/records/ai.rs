@@ -796,6 +796,18 @@ impl Record for AiRecord {
         &[("RVAL", ValuePostGate::OnChange)]
     }
 
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`aiRecord.c:448-467`); INIT,
+    /// which `process()` clears (`:170`), posts nothing.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL"])
+    }
+
     /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
     /// inside `if (monitor_mask)` (aiRecord.c:461-464): ORAW advances only
     /// on a cycle that posts VAL.

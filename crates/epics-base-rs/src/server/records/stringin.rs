@@ -188,6 +188,12 @@ impl Record for StringinRecord {
         false
     }
 
+    /// `monitor()` posts VAL alone (`stringinRecord.c:174-188`); OVAL is
+    /// its private copy.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
     }

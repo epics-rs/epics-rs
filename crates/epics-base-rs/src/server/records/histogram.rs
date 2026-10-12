@@ -128,6 +128,11 @@ impl Default for HistogramRecord {
 }
 
 impl HistogramRecord {
+    /// [`Record::check_alarms`]' SOFT/INVALID condition.
+    fn limits_inverted(&self) -> bool {
+        self.csta && self.llim > self.ulim
+    }
+
     pub fn new(nelm: i32, llim: f64, ulim: f64) -> Self {
         let n = nelm.max(1);
         Self {
@@ -229,6 +234,11 @@ pub(crate) fn set_histogram_sdel_precision(value: i32) {
 impl Record for HistogramRecord {
     fn acts_before_process(&self) -> bool {
         false
+    }
+
+    /// `monitor()` posts VAL alone (`histogramRecord.c:282-297`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
@@ -360,7 +370,7 @@ impl Record for HistogramRecord {
     /// about configuration, and C's `add_count` returns there too.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::record::AlarmSeverity;
-        if self.csta && self.llim > self.ulim {
+        if self.limits_inverted() {
             crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::SOFT_ALARM,
@@ -480,9 +490,11 @@ impl Record for HistogramRecord {
     /// value is stored, then commits it via `recGblResetAlarms` (see
     /// `field_io.rs`), so the SOFT/INVALID the record raises is observable on
     /// this monitor-less path — CBUG-F12 refused (raised consistently, not
-    /// path-dependent).
+    /// path-dependent). Only when the alarm is raised: on sane limits C's
+    /// `add_count` leaves stat/sevr alone, and a reset would commit NO_ALARM
+    /// over a born UDF INVALID.
     fn special_checks_alarms(&self, put_field: &str) -> bool {
-        put_field.eq_ignore_ascii_case("SGNL")
+        put_field.eq_ignore_ascii_case("SGNL") && self.limits_inverted()
     }
 
     /// `clear_histogram`'s closing `prec->udf = FALSE` (`histogramRecord.c:361`).

@@ -102,6 +102,11 @@ impl Record for Int64outRecord {
         crate::server::record::CycleHooks::NONE
     }
 
+    /// `monitor()` posts VAL alone (`int64outRecord.c:353-377`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn has_array_monitor_post(&self) -> bool {
         false
     }

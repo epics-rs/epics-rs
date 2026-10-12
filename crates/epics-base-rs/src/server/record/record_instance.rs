@@ -13938,13 +13938,24 @@ mod skipped_posted_tests {
 mod walk_post_name_tests {
     use super::*;
     use crate::server::recgbl::EventMask;
-    use crate::server::records::ai::AiRecord;
     use crate::types::DbFieldType;
+    use epics_macros_rs::EpicsRecord;
 
-    /// The walk's posts for one ai cycle with `key` subscribed and HOPR, a
+    /// Borrows ai's field declarations and claims no `monitor()` post, so
+    /// the walk change-detects HOPR. These tests go with the walk (M1).
+    #[derive(Default, EpicsRecord)]
+    #[record(type = "ai", crate_path = "crate")]
+    struct WalkProbe {
+        #[field(type = "Double")]
+        val: f64,
+        #[field(type = "Double")]
+        hopr: f64,
+    }
+
+    /// The walk's posts for one cycle with `key` subscribed and HOPR, a
     /// change-detected field, moved since.
     fn hopr_posts(key: &str) -> Vec<PostName> {
-        let mut inst = RecordInstance::new("AI:NAME".to_string(), AiRecord::default());
+        let mut inst = RecordInstance::new("AI:NAME".to_string(), WalkProbe::default());
         let _rx = inst
             .add_subscriber(key, 1, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("subscriber");

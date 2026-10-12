@@ -7595,7 +7595,9 @@ mod tests {
                 .union(CycleHooks::PROCESS_POSTED)
                 .union(CycleHooks::PUT_REPORT),
             "mbbiDirect" | "mbboDirect" | "seq" => CycleHooks::CYCLE_POSTED,
-            "calcout" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
+            "calcout" => CycleHooks::WRITE_POSTED
+                .union(CycleHooks::PUT_REPORT)
+                .union(CycleHooks::PROCESS_POSTED),
             "swait" => CycleHooks::WRITE_POSTED.union(CycleHooks::PUT_REPORT),
             "mbbi" | "mbbo" | "lso" | "lsi" => CycleHooks::WRITE_POSTED,
             "transform" => CycleHooks::CYCLE_POSTED

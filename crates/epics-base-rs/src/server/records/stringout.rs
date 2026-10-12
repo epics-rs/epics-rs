@@ -203,6 +203,12 @@ impl Record for StringoutRecord {
         (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
+    /// `monitor()` posts VAL alone (`stringoutRecord.c:212-227`); OVAL is
+    /// its private copy.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
     }

@@ -245,6 +245,11 @@ impl Record for LongoutRecord {
         }
     }
 
+    /// `monitor()` posts VAL alone (`longoutRecord.c:371-395`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL"])
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if !self.skip_convert && self.drvh > self.drvl {
             self.val = self.val.clamp(self.drvl, self.drvh);

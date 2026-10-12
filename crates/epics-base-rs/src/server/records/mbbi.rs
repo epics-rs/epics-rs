@@ -579,8 +579,43 @@ impl Record for MbbiRecord {
             self.val = self.raw_to_val(rval);
         }
         self.skip_convert = false;
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbbiRecord.c:363-366` posts RVAL with `events | DBE_VALUE |
+    /// DBE_LOG` outside the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// The RVAL block sits outside `if (events)`, so a cycle that leaves VAL
+    /// alone still posts a moved RVAL.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`mbbiRecord.c:349-367`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL"])
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbbiRecord.c:363-366`), minus the post. Outside init, `monitor()` is
+    /// the only writer of `oraw`.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        if field == "RVAL" && self.oraw != self.rval {
+            self.oraw = self.rval;
+            return true;
+        }
+        false
     }
 
     fn link_text_ref(&self, link_field: &str) -> Option<&str> {

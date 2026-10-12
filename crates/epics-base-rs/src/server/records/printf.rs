@@ -65,6 +65,8 @@ pub struct PrintfRecord {
     /// [`Record::input_links_generation`]: moved on by every write of an
     /// `INPn` text or of the `FMT` that [`Record::input_link_request`] reads.
     links_generation: u64,
+    /// The cycle ran to `printfRecord.c:399-401`, which posts LEN unchanged.
+    len_posted: bool,
 }
 
 impl Default for PrintfRecord {
@@ -86,6 +88,7 @@ impl Default for PrintfRecord {
             requests: [InputLinkRequest::NotRead; 10],
             links_generation: 0,
             fmt_buf: Vec::new(),
+            len_posted: false,
         }
     }
 }
@@ -942,7 +945,36 @@ impl Record for PrintfRecord {
         // — LEN counts the formatted bytes plus the terminating NUL.
         self.val.set_text(&out);
         self.fmt_buf = out;
+        self.len_posted = true;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// `printfRecord.c:399-401` posts VAL and LEN, both unconditionally.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "LEN"])
+    }
+
+    /// VAL posts on every cycle, and LEN rides the walk's marks.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        crate::server::record::MonitorValueClasses {
+            marked: self.len_posted,
+            ..crate::server::record::MonitorValueClasses::ALWAYS
+        }
+    }
+
+    /// `db_post_events(prec, &prec->len, events | DBE_VALUE | DBE_LOG)`.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        static LEN_POST: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::MonitorValueLog)];
+        CycleMarks::of(&LEN_POST, u128::from(std::mem::take(&mut self.len_posted)))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["LEN"]
     }
 
     fn val(&self) -> Option<EpicsValue> {

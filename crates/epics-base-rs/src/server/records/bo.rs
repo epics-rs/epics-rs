@@ -278,6 +278,51 @@ impl Record for BoRecord {
         self.lalm = self.val;
     }
 
+    /// C `boRecord.c:411-420` posts RVAL and RBV with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// The RVAL/RBV block sits outside `if (monitor_mask)`, so a readback
+    /// that moves RBV while VAL holds still posts.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
+    /// `monitor()` decides RVAL and RBV from the record's own `oraw` and
+    /// `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL", "RBV"]
+    }
+
+    /// `monitor()` posts VAL, RVAL and RBV alone (`boRecord.c:398-421`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "RVAL", "RBV"])
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`boRecord.c:411-415`) and its RBV twin, minus the post. Outside init,
+    /// `monitor()` is the only writer of `oraw`/`orbv`: a client that put
+    /// RVAL is left holding its own value when the cycle converts back to
+    /// the old one.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        match field {
+            "RVAL" if self.oraw != self.rval => {
+                self.oraw = self.rval;
+                true
+            }
+            "RBV" if self.orbv != self.rbv => {
+                self.orbv = self.rbv;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // DOL/OMSL: a real (DB/CA/PVA) link is fetched and applied to VAL
         // by the framework before process(). A *constant* DOL is applied
@@ -295,9 +340,6 @@ impl Record for BoRecord {
             self.val_to_rval();
         }
         self.skip_convert = false;
-
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
 
         // HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
         // on every process that leaves VAL at 1, and the timer — never a

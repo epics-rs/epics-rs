@@ -11198,8 +11198,19 @@ async fn test_put_time_post_is_the_only_post_for_that_put() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
 
+    /// Borrows ai's field declarations and claims no `monitor()` post, so
+    /// the walk change-detects SVAL. This test goes with the walk (M1).
+    #[derive(Default, epics_macros_rs::EpicsRecord)]
+    #[record(type = "ai", crate_path = "epics_base_rs")]
+    struct WalkProbe {
+        #[field(type = "Double")]
+        val: f64,
+        #[field(type = "Double")]
+        sval: f64,
+    }
+
     let db = PvDatabase::new();
-    db.add_record("PUTPOST", Box::new(AiRecord::new(0.0)))
+    db.add_record("PUTPOST", Box::new(WalkProbe::default()))
         .await
         .unwrap();
 

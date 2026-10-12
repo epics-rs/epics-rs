@@ -108,6 +108,7 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
     init = seq_init_record,
     take_cycle_posted_fields = seq_monitor_posts,
     fields_posted_only_when_marked = SEQ_CLAIMED,
+    process_posted_fields = SEQ_POSTED,
     // seq's VAL is a `pp(TRUE)` "trigger" — C `process()` posts VAL only with
     // alarm events (`if (events) db_post_events(&prec->val, events)`,
     // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
@@ -384,12 +385,16 @@ impl SeqRecord {
     }
 }
 
-/// SELN, posted by `asyncFinish`, and DO0..DOF, posted by `processCallback`
-/// (`seqRecord.c:230-232`, `:266-268`), each against the record's own copy.
-const SEQ_CLAIMED: [&str; 17] = [
-    "SELN", "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB",
-    "DOC", "DOD", "DOE", "DOF",
+/// VAL, posted with alarm events alone, SELN, posted by `asyncFinish`, and
+/// DO0..DOF, posted by `processCallback` (`seqRecord.c:227-232`, `:266-268`):
+/// all a cycle posts.
+const SEQ_POSTED: [&str; 18] = [
+    "VAL", "SELN", "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
+    "DOB", "DOC", "DOD", "DOE", "DOF",
 ];
+
+/// SELN and DO0..DOF, each decided against the record's own copy.
+const SEQ_CLAIMED: &[&str] = SEQ_POSTED.split_at(1).1;
 
 /// C `asyncFinish`'s SELN post (`seqRecord.c:230-232`): `if (prec->seln !=
 /// prec->oldn)` post it with `events | DBE_VALUE | DBE_LOG`, then `oldn = seln`.

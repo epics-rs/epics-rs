@@ -6,8 +6,9 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    FieldDesc, ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record,
-    RecordProcessResult, ResolvedInputLinks, parse_link_v2,
+    CycleMarks, CyclePostMask, FieldDesc, MonitorValueClasses, MonitorValueGate, ParsedLink,
+    ProcessAction, ProcessActions, ProcessOutcome, Record, RecordProcessResult, ResolvedInputLinks,
+    parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -53,6 +54,77 @@ pub struct MotorRecord {
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
 }
+
+/// One row per [`m`] bit: C `monitor()`'s `monitor_mask | DBE_VAL_LOG`
+/// posts, then the literal `DBE_VAL_LOG` ones.
+static MONITOR_POSTS: [(&str, CyclePostMask); 54] = {
+    use CyclePostMask::{MonitorValueLog as M, ValueLog as L};
+    [
+        ("VAL", M),
+        ("DVAL", M),
+        ("HLM", M),
+        ("LLM", M),
+        ("DMOV", M),
+        ("SPMG", M),
+        ("RCNT", M),
+        ("MRES", M),
+        ("ERES", M),
+        ("UEIP", M),
+        ("STOP", M),
+        ("LVIO", M),
+        ("RVAL", M),
+        ("RLV", M),
+        ("OFF", M),
+        ("RBV", M),
+        ("DHLM", M),
+        ("DLLM", M),
+        ("DRBV", M),
+        ("MOVN", M),
+        ("HLS", M),
+        ("LLS", M),
+        ("RRBV", M),
+        ("MSTA", M),
+        ("ATHM", M),
+        ("TDIR", M),
+        ("MIP", M),
+        ("DIFF", M),
+        ("RDIF", M),
+        ("RHLS", M),
+        ("RLLS", M),
+        ("UEIP", L),
+        ("SBAS", M),
+        ("SREV", M),
+        ("UREV", M),
+        ("VELO", M),
+        ("VBAS", M),
+        ("MISS", M),
+        ("STUP", M),
+        ("JOGF", M),
+        ("JOGR", M),
+        ("HOMF", M),
+        ("HOMR", M),
+        ("RHLM", M),
+        ("RLLM", M),
+        ("DMOV", L),
+        ("VBAS", L),
+        ("SBAS", L),
+        ("VELO", L),
+        ("DLLM", L),
+        ("DHLM", L),
+        ("HLM", L),
+        ("LLM", L),
+        ("STUP", L),
+    ]
+};
+
+/// C `monitor()`'s fields in its order, RBV and CNEN aside: the five above
+/// its short circuit (3509-3549), then the rest (3553-3643).
+static MONITOR_FIELDS: [&str; 43] = [
+    "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM", "LLM",
+    "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS", "ATHM", "MRES",
+    "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS", "MISS", "MOVN", "DMOV",
+    "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
+];
 
 impl Default for MotorRecord {
     fn default() -> Self {
@@ -154,6 +226,76 @@ impl MotorRecord {
         self.conv.rdbl_error = error;
     }
 
+    /// C `MARK` / `MARK_AUX`: post these fields at the next `monitor()`.
+    #[inline]
+    pub(crate) fn mark(&mut self, bits: u64) {
+        self.internal.mmap |= bits;
+    }
+
+    /// DMOV as C writes it: marked where it changes (`if (pmr->dmov) { dmov
+    /// = FALSE; MARK(M_DMOV); }`).
+    pub(crate) fn set_dmov(&mut self, dmov: bool) {
+        if self.stat.dmov != dmov {
+            self.stat.dmov = dmov;
+            self.mark(m::DMOV);
+        }
+    }
+
+    /// MOVN as `process_motor_info` posts it, on change (3746-3748).
+    pub(crate) fn set_movn(&mut self, movn: bool) {
+        if self.stat.movn != movn {
+            self.stat.movn = movn;
+            self.mark(m::MOVN);
+        }
+    }
+
+    /// The collection's `if (val != lval) MARK(M_VAL)` (2204-2206, 2302).
+    pub(crate) fn mark_val_collected(&mut self) {
+        if self.pos.val != self.internal.lval {
+            self.mark(m::VAL);
+        }
+    }
+
+    /// C `UNMARK`.
+    #[inline]
+    pub(crate) fn unmark(&mut self, bits: u64) {
+        self.internal.mmap &= !bits;
+    }
+
+    /// The marks `monitor()` posts from, cleared as its `UNMARK_ALL` does
+    /// (motorRecord.cc:3645), with each switch mark carrying the raw switch
+    /// `monitor()` posts beside it (3576-3589).
+    fn take_monitor_marks(&mut self) -> u64 {
+        let mut bits = std::mem::take(&mut self.internal.mmap) & !m::RBV;
+        let same = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
+        if bits & m::HLS != 0 {
+            bits |= if same { m::RHLS } else { m::RLLS };
+        }
+        if bits & m::LLS != 0 {
+            bits |= if same { m::RLLS } else { m::RHLS };
+        }
+        // The short circuit (3550-3551) reads C's own bits only.
+        self.internal.monitor_lower_marked =
+            bits & m::MONITOR & !(m::UPPER | m::RHLS | m::RLLS | m::UEIP_POSTED) != 0;
+        bits
+    }
+
+    /// The move-start pass's posts: what its `monitor()` would post from the
+    /// marks, RBV through the deadband when marked.
+    fn monitor_notify_fields(&mut self) -> Vec<(String, EpicsValue)> {
+        let rbv = self.internal.mmap & m::RBV != 0;
+        let bits = self.take_monitor_marks() & m::MONITOR;
+        let mut fields: Vec<(String, EpicsValue)> =
+            CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
+                .filter_map(|(name, _)| Some((name.to_string(), self.get_field(name)?)))
+                .collect();
+        if rbv {
+            self.internal.mmap |= m::RBV;
+            fields.push(("RBV".to_string(), EpicsValue::Double(self.pos.rbv)));
+        }
+        fields
+    }
+
     /// Fire the readback output link (RLNK) with the current RBV.
     ///
     /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
@@ -206,12 +348,6 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // Clear the one-pass DIFF/RDIF mark before any `process_motor_info`
-        // can set it this cycle (it runs from `determine_event` below and
-        // from `do_process`). The post-process snapshot reads it through
-        // `force_posted_fields`; a pass that does not recompute DIFF/RDIF
-        // (no CALLBACK_DATA) leaves it false and does not force-post.
-        self.internal.diff_rdif_marked = false;
         // If wired to device state, determine event from shared mailbox.
         // An event that survived a put-owned pass is a still-pending
         // signal: this pass consumes it before pulling a new one from
@@ -252,32 +388,8 @@ impl Record for MotorRecord {
             // First DMOV 1→0 transition: flush immediately so monitors see
             // the transition before the move completes.
             self.internal.dmov_notified = true;
-            use epics_base_rs::types::EpicsValue;
-            let fields = vec![
-                ("DMOV".to_string(), EpicsValue::Short(0)),
-                ("MOVN".to_string(), EpicsValue::Short(1)),
-                ("VAL".to_string(), EpicsValue::Double(self.pos.val)),
-                ("DVAL".to_string(), EpicsValue::Double(self.pos.dval)),
-                ("RVAL".to_string(), EpicsValue::Int64(self.pos.rval)),
-                ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
-                ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
-                // C do_work move block (motorRecord.cc:2248-2256) recomputes
-                // diff=dval-drbv + MARK(M_DIFF) and rdif=NINT(diff/mres) +
-                // MARK(M_RDIF) before too_small/LVIO, so monitor() posts the
-                // new full-distance following error on the move-start pass.
-                // `plan_absolute_move` already refreshed pos.diff/pos.rdif.
-                ("DIFF".to_string(), EpicsValue::Double(self.pos.diff)),
-                ("RDIF".to_string(), EpicsValue::Int64(self.pos.rdif)),
-                // C do_work marks M_MIP on every move dispatch and
-                // M_RCNT when the retry count resets (motorRecord.cc:
-                // 1929-1932), so the move-start monitor() pass posts
-                // both.
-                (
-                    "MIP".to_string(),
-                    EpicsValue::Short(self.stat.mip.bits() as i16),
-                ),
-                ("RCNT".to_string(), EpicsValue::Short(self.retry.rcnt)),
-            ];
+            // The pass's `monitor()` (motorRecord.cc:1507), from its marks.
+            let fields = self.monitor_notify_fields();
             // C fires `dbPutLink(&rlnk, ...)` (motorRecord.cc:1495) on this
             // move-start pass too — before `monitor()` and the `recGblFwdLink`
             // gate — so the RLNK readback target still re-processes while the
@@ -295,11 +407,11 @@ impl Record for MotorRecord {
                 post_write_fields: Vec::new(),
             })
         } else {
-            // Ongoing motion or idle: full snapshot so all changed fields
-            // (RBV, DRBV, MSTA, limits, etc.) get posted as monitors.
+            // Ongoing motion or idle: the cycle's monitor() posts the marks.
             if !move_started {
                 self.internal.dmov_notified = false;
             }
+            self.internal.monitor_due = true;
             let mut outcome = ProcessOutcome::complete();
             self.push_readback_link_write(&mut outcome.actions);
             Ok(outcome)
@@ -443,8 +555,11 @@ impl Record for MotorRecord {
         if ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"]
             .iter()
             .any(|f| field.eq_ignore_ascii_case(f))
+            && self.stat.dmov
         {
+            // C 2603-2606 posts the blink itself.
             self.stat.dmov = false;
+            self.internal.put_posted |= m::PUT_DMOV;
         }
         Ok(())
     }
@@ -482,6 +597,7 @@ impl Record for MotorRecord {
             // restore write to a drive field may have left behind.
             self.stat.dmov = true;
             self.stat.movn = false;
+            self.mark(m::DMOV | m::MOVN | m::SPMG | m::DIFF | m::RDIF | m::MSTA);
             // C 734-743: LVIO starts clear; with soft limits enabled
             // (the dial pair not both 0), an initial dial readback
             // outside the dial window by more than one MRES, or an
@@ -516,47 +632,73 @@ impl Record for MotorRecord {
     }
 
     /// The deadband gates RBV's monitor delivery (C motorRecord.cc
-    /// 3468-3507); with this, the framework routes VAL through generic
-    /// change-detection — posted only when the setpoint actually moved
-    /// (C M_VAL mark semantics), not on every readback poll.
+    /// 3468-3507), not VAL's.
     fn monitor_deadband_field(&self) -> &'static str {
         "RBV"
     }
 
-    /// C `monitor()` posts every field in its list on a cycle whose
-    /// alarm transition fired, even when unmarked — `local_mask =
-    /// monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)` is non-zero for
-    /// unmarked fields once `monitor_mask != 0` (motorRecord.cc
-    /// 3456-3646), so a `DBE_ALARM`-only subscriber on any of them
-    /// observes the alarm moment. The list is C's posting order, minus
-    /// RBV (the deadband-gated field, delivered by the deadband
-    /// trigger with the same alarm bits) and CNEN (C posts it only on
-    /// an actual EA_POSITION-driven change, which generic
-    /// change-detection covers). Both raw limit-switch mirrors RHLS
-    /// and RLLS are listed: C's M_HLS and M_LLS branches each post one
-    /// of them, and on an alarm cycle both branches run.
+    /// C `monitor()` posts every field it lists with `monitor_mask` on an
+    /// alarm move, marked or not, but the group below its short circuit
+    /// only when one of them is marked (motorRecord.cc:3550-3551). RBV is
+    /// the deadband field and CNEN posts only on its own change.
     fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM",
-            "LLM", "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS",
-            "ATHM", "MRES", "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS",
-            "MISS", "MOVN", "DMOV", "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
-        ]
+        if self.internal.monitor_lower_marked {
+            &MONITOR_FIELDS
+        } else {
+            &MONITOR_FIELDS[..5]
+        }
     }
 
-    /// C `process_motor_info` (motorRecord.cc:3764-3767) MARKs M_DIFF /
-    /// M_RDIF unconditionally every CALLBACK_DATA pass, and `monitor()`
-    /// (3522-3531) posts both with `monitor_mask | DBE_VAL_LOG`. So on a
-    /// cycle that ran `process_motor_info`, DIFF and RDIF re-post even when
-    /// their value did not change — a `camonitor DIFF` on an axis parked at
-    /// a constant non-zero following error gets an event each poll. Gated on
-    /// the one-pass `diff_rdif_marked` mark so a non-CALLBACK_DATA pass (a
-    /// put that ran `do_work`, not `process_motor_info`) does not over-post.
-    fn force_posted_fields(&self) -> &'static [&'static str] {
-        if self.internal.diff_rdif_marked {
-            &["DIFF", "RDIF"]
+    /// C `monitor()` posts from `mmap`/`nmap`, never on a value change.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &MONITOR_FIELDS
+    }
+
+    /// The cycle's `monitor()` drains the marks; a put drains the literal
+    /// posts its `special()` made.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        let bits = if std::mem::take(&mut self.internal.monitor_due) {
+            self.take_monitor_marks()
         } else {
-            &[]
+            std::mem::take(&mut self.internal.put_posted)
+        };
+        CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
+    }
+
+    /// C `monitor()`'s RBV (motorRecord.cc:3468-3507): posted only when
+    /// marked, through MDEL/ADEL unless both are zero.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> MonitorValueClasses {
+        let marked = self.internal.mmap & m::RBV != 0;
+        self.unmark(m::RBV);
+        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
+        let crossed = |del: f64, last: &mut f64| {
+            del == 0.0
+                || ((*last - rbv).abs() > del && {
+                    *last = rbv;
+                    true
+                })
+        };
+        let (value, archive) = if !marked {
+            (false, false)
+        } else if mdel == 0.0 && adel == 0.0 {
+            (true, true)
+        } else {
+            // C reads and writes the record's own MLST/ALST.
+            (
+                crossed(mdel, &mut self.disp.mlst),
+                crossed(adel, &mut self.disp.alst),
+            )
+        };
+        *last_posted = [self.disp.mlst, self.disp.alst];
+        MonitorValueClasses {
+            value,
+            archive,
+            hash_changed: false,
+            marked: false,
         }
     }
 
@@ -665,13 +807,14 @@ mod tests {
         rec.pos.dval = 5.0;
         rec.conv.set = true;
         rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+        let effects = rec.plan_motion(CommandSource::Val);
         // Offset should be updated, DVAL unchanged
         assert_eq!(rec.pos.dval, 5.0);
         assert_eq!(rec.pos.off, 95.0); // 100 - 1*5
-        // C 2206-2227: the FOFF=Variable redefinition completes on the
-        // spot — no controller command is dispatched (LOAD_POS belongs
-        // to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
-        assert_eq!(rec.last_write, None);
+        // C 2206-2227: the FOFF=Variable redefinition completes in the
+        // collection — no controller command is dispatched (LOAD_POS
+        // belongs to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
+        assert!(effects.commands.is_empty());
         assert!(rec.stat.dmov);
         assert!(rec.stat.mip.is_empty());
     }
@@ -778,12 +921,13 @@ mod tests {
         );
     }
 
-    // C do_work marks M_MIP on the move dispatch and M_RCNT on the retry
-    // counter reset (motorRecord.cc:1929-1932); monitor() posts both on
-    // the move-start pass.
+    // C do_work marks M_MIP on the move dispatch (2461-2462) and M_RCNT
+    // when the reset clears a nonzero count (2352-2356); monitor() posts
+    // both on the move-start pass.
     #[test]
     fn move_start_notify_carries_mip_and_rcnt() {
         let mut rec = MotorRecord::new();
+        rec.retry.rcnt = 2;
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let outcome = rec.process().unwrap();

@@ -413,7 +413,7 @@ impl DeviceUser {
 
     /// Bind to an already-resolved port, for tests that build a [`PortEntry`]
     /// by hand rather than publishing it to the process registry.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "epics"))]
     pub(crate) fn attach_for_test(&mut self, entry: PortEntry, addr: i32) {
         self.device = Some(entry);
         self.addr = addr;

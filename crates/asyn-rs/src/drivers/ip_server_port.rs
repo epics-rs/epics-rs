@@ -1838,6 +1838,47 @@ mod tests {
         idx
     }
 
+    /// The child port names the listener announces to an octet user on
+    /// `filter` (C `connectionListener`, drvAsynIPServerPort.c:374-383).
+    fn hear_announcements(
+        srv: &DrvAsynIPServerPort,
+        filter: crate::interrupt::InterruptFilter,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<String>>>,
+        crate::interrupt::SyncCallbackSubscription,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen_cb = seen.clone();
+        let sub = srv.base().interrupts.register_sync_callback(
+            filter,
+            move |iv: &crate::interrupt::InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(s).into_owned());
+                }
+            },
+        );
+        (seen, sub)
+    }
+
+    /// Wait for `n` announcements. The announcement is the last thing an accept
+    /// does — after the slot fills, which is all [`wait_for_slot`] sees, and
+    /// after the child inherits the parent's trace — so a test that checks
+    /// anything past the slot waits here.
+    fn wait_for_announcements(seen: &std::sync::Mutex<Vec<String>>, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{n} announcements never came: {:?}",
+                seen.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Re-drive slot reads until the peer's abortive close (RST) becomes
     /// **visible** to the server read, then return the teardown failure. Each
     /// `step` performs one read and reports whether the slot is now torn down
@@ -2473,9 +2514,8 @@ mod tests {
     /// would silently hide every client after the first.
     #[test]
     fn every_octet_user_hears_a_new_connection_whatever_slot_it_lands_in() {
-        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use crate::interrupt::InterruptFilter;
         use std::net::TcpStream as ClientStream;
-        use std::sync::Mutex as StdMutex;
 
         let mut srv = DrvAsynIPServerPort::with_config(
             "srv_announce",
@@ -2488,29 +2528,20 @@ mod tests {
         srv.connect(&AsynUser::default()).unwrap();
         let port = srv.local_port();
 
-        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-        let seen_cb = seen.clone();
         // A device-support user bound to addr 0 — C registers on the SERVER
         // port, and the payload it wants is which child port to talk to.
-        let _cb = srv.base().interrupts.register_sync_callback(
+        let (seen, _cb) = hear_announcements(
+            &srv,
             InterruptFilter {
                 addr: Some(0),
                 ..InterruptFilter::default()
             },
-            move |iv: &InterruptValue| {
-                if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(s).into_owned());
-                }
-            },
         );
 
         let _c0 = ClientStream::connect(("127.0.0.1", port)).unwrap();
-        wait_for_slot(&srv, 0);
+        wait_for_announcements(&seen, 1);
         let _c1 = ClientStream::connect(("127.0.0.1", port)).unwrap();
-        wait_for_slot(&srv, 1);
+        wait_for_announcements(&seen, 2);
 
         let got = seen.lock().unwrap().clone();
         assert_eq!(
@@ -2550,8 +2581,9 @@ mod tests {
 
         srv.connect(&AsynUser::default()).unwrap();
         let port = srv.local_port();
+        let (seen, _cb) = hear_announcements(&srv, Default::default());
         let _client = ClientStream::connect(("127.0.0.1", port)).unwrap();
-        wait_for_slot(&srv, 0);
+        wait_for_announcements(&seen, 1);
 
         assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
         assert_eq!(trace.get_trace_io_mask(Some("srv_trace:0")), parent_io);

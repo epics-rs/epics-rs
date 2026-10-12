@@ -524,6 +524,23 @@ impl AsyncDbHandle {
         }
     }
 
+    /// C `dbScanLock`, the record's own code, `dbScanUnlock`, from a thread
+    /// that holds no record: asynRecord's `exceptCallback` (asynRecord.c:911-916).
+    /// The marks `f` leaves are posted under the same hold. A no-op if the
+    /// record or the database is gone.
+    pub fn with_record(&self, name: &str, f: impl FnOnce(&mut dyn crate::server::record::Record)) {
+        let Some(db) = self.db() else {
+            return;
+        };
+        let Some(rec) = db.get_record(name) else {
+            return;
+        };
+        // `write` takes the record's lock set: `dbScanLock`.
+        let mut instance = rec.write();
+        f(&mut *instance.record);
+        super::field_io::emit_cycle_posts(&mut instance);
+    }
+
     /// Arm a put-notify wait-set — see [`PvDatabase::new_put_notify`].
     /// Database-independent (re-exported associated fn).
     pub fn new_put_notify() -> (

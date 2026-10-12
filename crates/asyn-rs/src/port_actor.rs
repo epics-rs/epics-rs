@@ -939,7 +939,7 @@ impl PortActor {
         // `snapshot` is the single owner of C's `findTracePvt` fallback chain —
         // device, else port, else global (asynManager.c:546-551) — so the report
         // prints the masks the port actually traces with.
-        let snap = trace.snapshot(&base.port_name, addr);
+        let snap = trace.snapshot(Some(&base.port_name), addr);
         (
             snap.trace_mask.bits(),
             snap.io_mask.bits(),

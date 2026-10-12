@@ -125,7 +125,15 @@ name = "asyn_monitor_posts_its_read_fields"
 required-features = ["epics"]
 
 [[test]]
+name = "asyn_errs_posts_ahead_of_the_alarm"
+required-features = ["epics"]
+
+[[test]]
 name = "asyn_portless_errs_posts_once"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_special_posts_in_c_order"
 required-features = ["epics"]
 
 [[test]]

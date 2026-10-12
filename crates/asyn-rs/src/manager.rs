@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 
 use crate::error::{AsynError, AsynResult};
 use crate::exception::ExceptionManager;
+use crate::fixed_text::FixedText;
 use crate::port::PortDriver;
 use crate::port_handle::PortHandle;
 use crate::registry::PortEntry;
@@ -262,6 +263,10 @@ impl Default for PortManager {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceError;
 
+/// C `ERROR_MESSAGE_SIZE` (asynManager.c:44), the `errorMessageSize` every
+/// `createAsynUser` hands out (:1194).
+const ERROR_MESSAGE_SIZE: usize = 160;
+
 /// C's `pasynUser` as the manager's device calls see it: the port the user is
 /// connected to (`userPvt->pport`, asynManager.c:1345-1352) beside the
 /// `errorMessage` buffer those calls write their diagnostic into.
@@ -292,7 +297,7 @@ pub struct DeviceUser {
     /// (asynManager.c:1349-1352), and `findDpCommon` then answers from the
     /// port's own `dpc` (:541-544).
     addr: i32,
-    error_message: String,
+    error_message: FixedText<{ ERROR_MESSAGE_SIZE - 1 }>,
 }
 
 impl Default for DeviceUser {
@@ -302,7 +307,7 @@ impl Default for DeviceUser {
             // C `pasynManager->createAsynUser` leaves `pdevice` null until
             // `connectDevice` sets it; `-1` is that null in port addressing.
             addr: -1,
-            error_message: String::new(),
+            error_message: FixedText::EMPTY,
         }
     }
 }
@@ -320,7 +325,7 @@ impl DeviceUser {
     /// write one, which is what makes the *order* of the manager calls
     /// observable in the text a caller splices.
     pub fn error_message(&self) -> &str {
-        &self.error_message
+        self.error_message.as_str()
     }
 
     /// C `connectDevice` (asynManager.c:1324-1355), in C's order: no port name,
@@ -328,17 +333,19 @@ impl DeviceUser {
     /// connected to a device.
     pub fn connect_device(&mut self, port_name: &str, addr: i32) -> Result<PortEntry, DeviceError> {
         if port_name.is_empty() {
-            return Err(self.fail("asynManager:connectDevice no port name provided".to_string()));
+            return Err(self.fail(format_args!(
+                "asynManager:connectDevice no port name provided"
+            )));
         }
         let Some(entry) = crate::registry::get_port(port_name) else {
-            return Err(self.fail(format!(
+            return Err(self.fail(format_args!(
                 "asynManager:connectDevice port {port_name} not found"
             )));
         };
         if self.device.is_some() {
-            return Err(
-                self.fail("asynManager:connectDevice already connected to device".to_string())
-            );
+            return Err(self.fail(format_args!(
+                "asynManager:connectDevice already connected to device"
+            )));
         }
         // C :1349-1352 under `asynManagerLock`: `locateDevice(pport, addr,
         // TRUE)` creates the device on a multi-device port. The port owns
@@ -346,7 +353,7 @@ impl DeviceUser {
         // cannot fail, and the one way this one can - the actor is gone -
         // is a port that is no longer the one the registry answered with.
         if let Err(e) = entry.handle.connect_device_blocking(addr) {
-            return Err(self.fail(format!(
+            return Err(self.fail(format_args!(
                 "asynManager:connectDevice port {port_name} not found: {e}"
             )));
         }
@@ -418,13 +425,13 @@ impl DeviceUser {
         if let Some(entry) = self.device.as_ref() {
             return Ok(entry.handle.clone());
         }
-        Err(self.fail(format!(
+        Err(self.fail(format_args!(
             "asynManager:{which} asynUser not connected to device"
         )))
     }
 
-    fn fail(&mut self, message: String) -> DeviceError {
-        self.error_message = message;
+    fn fail(&mut self, message: std::fmt::Arguments<'_>) -> DeviceError {
+        self.error_message = FixedText::format(message);
         DeviceError
     }
 }

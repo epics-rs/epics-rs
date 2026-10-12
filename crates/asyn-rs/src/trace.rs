@@ -985,25 +985,22 @@ impl TraceManager {
     /// (asynManager.c:546-551) — which is also the chain the record's `setTrace*`
     /// writes target. One snapshot keeps read and write on the same rung: a
     /// per-device write read back at port level would snap the record's field
-    /// back to the port's value on the next refresh.
-    pub fn snapshot(&self, port: &str, addr: Option<i32>) -> TraceSnapshot {
-        self.with_dp_common(port, addr, |cfg| TraceSnapshot {
+    /// back to the port's value on the next refresh. `port: None` is a user
+    /// connected to no port, which reads the global rung, as the setters' `None`
+    /// writes it.
+    pub fn snapshot(&self, port: Option<&str>, addr: Option<i32>) -> TraceSnapshot {
+        let of = |cfg: &TraceConfig| TraceSnapshot {
             trace_mask: cfg.trace_mask,
             io_mask: cfg.trace_io_mask,
             info_mask: cfg.trace_info_mask,
             io_truncate_size: cfg.io_truncate_size,
             file_id: cfg.file.id(),
-        })
-        .unwrap_or_else(|| {
-            let cfg = TraceConfig::default();
-            TraceSnapshot {
-                trace_mask: cfg.trace_mask,
-                io_mask: cfg.trace_io_mask,
-                info_mask: cfg.trace_info_mask,
-                io_truncate_size: cfg.io_truncate_size,
-                file_id: cfg.file.id(),
-            }
-        })
+        };
+        match port {
+            Some(port) => self.with_dp_common(port, addr, of),
+            None => self.global_config.lock().ok().map(|cfg| of(&cfg)),
+        }
+        .unwrap_or_else(|| of(&TraceConfig::default()))
     }
 
     /// C parity: `getTraceInfoMask` (asynManager.c) — the per-port trace
@@ -2286,10 +2283,10 @@ mod tests {
         mgr.set_device_trace_io_mask("p", 4, TraceIoMask::HEX);
 
         // Device slot carries the new mask.
-        assert_eq!(mgr.snapshot("p", Some(4)).io_mask, TraceIoMask::HEX);
+        assert_eq!(mgr.snapshot(Some("p"), Some(4)).io_mask, TraceIoMask::HEX);
 
         // Port dpCommon untouched by the per-device write.
-        assert_eq!(mgr.snapshot("p", None).io_mask, TraceIoMask::ASCII);
+        assert_eq!(mgr.snapshot(Some("p"), None).io_mask, TraceIoMask::ASCII);
 
         // Per-device announce fires with addr=4.
         let events = observed.lock().unwrap();
@@ -2318,7 +2315,7 @@ mod tests {
         mgr.set_device_trace_info_mask("p", 2, TraceInfoMask::SOURCE | TraceInfoMask::TIME);
 
         assert_eq!(
-            mgr.snapshot("p", Some(2)).info_mask,
+            mgr.snapshot(Some("p"), Some(2)).info_mask,
             TraceInfoMask::SOURCE | TraceInfoMask::TIME
         );
 

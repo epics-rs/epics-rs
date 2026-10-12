@@ -87,6 +87,7 @@
 pub mod drivers;
 pub mod error;
 pub(crate) mod escape;
+pub mod fixed_text;
 // Public: `PortManager::exception_manager` / `PortServices::exceptions` hand
 // out an `Arc<ExceptionManager>`, and a caller registering an exception
 // callback needs to name `AsynException` to match on it.

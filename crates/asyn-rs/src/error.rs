@@ -1,3 +1,5 @@
+use std::fmt;
+
 /// Status codes matching C asyn's asynStatus enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsynStatus {
@@ -237,15 +239,13 @@ impl AsynError {
     /// into `ERRS`. Reads *through* the partial carriers, so a failed transfer
     /// reports the same text whether or not it moved bytes first.
     pub fn message(&self) -> String {
-        match self {
-            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
-                message.clone()
-            }
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.message()
-            }
-            other => other.to_string(),
-        }
+        self.message_display().to_string()
+    }
+
+    /// [`Self::message`] as a borrowed `Display`, for a caller that formats it
+    /// into a fixed buffer and must not allocate.
+    pub fn message_display(&self) -> ErrorMessage<'_> {
+        ErrorMessage(self)
     }
 
     /// Re-stamp a gate refusal as one: the request was rejected by
@@ -413,3 +413,20 @@ impl AsynError {
 }
 
 pub type AsynResult<T> = Result<T, AsynError>;
+
+/// [`AsynError::message`] without the copy.
+pub struct ErrorMessage<'a>(&'a AsynError);
+
+impl fmt::Display for ErrorMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
+                f.write_str(message)
+            }
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.message_display().fmt(f)
+            }
+            other => fmt::Display::fmt(other, f),
+        }
+    }
+}

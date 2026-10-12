@@ -2206,12 +2206,21 @@ mod tests {
         };
 
         set(-1, 40);
-        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), None).io_truncate_size,
+            40
+        );
 
         // addr >= 0 writes the device, not the port.
         set(2, 4096);
-        assert_eq!(trace.snapshot("trunc_port", Some(2)).io_truncate_size, 4096);
-        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), Some(2)).io_truncate_size,
+            4096
+        );
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), None).io_truncate_size,
+            40
+        );
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option

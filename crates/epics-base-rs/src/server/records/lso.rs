@@ -12,17 +12,6 @@ const MAX_STRING_SIZE: usize = 40;
 /// `menuPost_OnChange` (0).
 const MENU_POST_ALWAYS: i16 = 1;
 
-/// Truncate `s` to at most `max` bytes. C `lsoRecord.c` keeps the long
-/// string in a fixed `char[]` and copies it byte for byte
-/// (`memcpy`/`strncpy`) with no UTF-8 awareness, so the cut is on a raw
-/// byte boundary and a non-UTF-8 value keeps its bytes verbatim.
-fn truncate_bytes(s: PvString, max: usize) -> PvString {
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
-}
-
 // Long string output record (EPICS 7).
 // Native CA type is DBR_CHAR array; SIZV (default 256) sets the max byte count.
 pub struct LsoRecord {
@@ -96,6 +85,13 @@ impl LsoRecord {
 }
 
 impl Record for LsoRecord {
+    // LEN/OLEN are VAL's and OVAL's lengths, not members.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::lso;
+        IVOV => ivov,
+        SDLY => sdly;
+        read_only:
+        SIZV => sizv);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -203,6 +199,12 @@ impl Record for LsoRecord {
     /// OVAL to its one meaning.
     fn output_link_value(&self) -> Option<EpicsValue> {
         self.val()
+    }
+
+    fn output_view(&self) -> Option<crate::server::record::OutView<'_>> {
+        Some(crate::server::record::OutView::Chars(
+            &self.val.elements()[..],
+        ))
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -428,15 +430,16 @@ impl Record for LsoRecord {
             // one, so IVOV's 40-byte field holds 39 bytes of text however it is
             // written.
             "IVOV" => {
-                let s = match value {
-                    EpicsValue::String(s) => s,
+                let bytes = match &value {
+                    EpicsValue::String(s) => s.as_bytes(),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        PvString::from_bytes(bytes[..end].to_vec())
+                        &bytes[..end]
                     }
                     _ => return Err(CaError::TypeMismatch("IVOV".into())),
                 };
-                self.ivov = truncate_bytes(s, MAX_STRING_SIZE - 1);
+                self.ivov
+                    .set_bytes(&bytes[..bytes.len().min(MAX_STRING_SIZE - 1)]);
             }
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {

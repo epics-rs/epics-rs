@@ -5,9 +5,7 @@ use crate::calc::engine::string::escaped_from_raw;
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::ERL_ERROR;
 use crate::runtime::mac_lib::macro_defn_pairs;
-use crate::server::database::char_view::{
-    CharView, CharWrite, char_view, field_addr_types, long_string_len,
-};
+use crate::server::database::char_view::{CharView, char_view, field_addr_types, long_string_len};
 use crate::server::database::filters::sync::DbState;
 use crate::server::database::{DbNode, parse_pv_name};
 use crate::server::db_loader;
@@ -1197,15 +1195,12 @@ fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsVa
     }
 }
 
-/// `dbPutField` through a `$` address: the put the record's own path makes of
-/// [`CharView::put_value`]'s result, `false` where C's status is non-zero.
-fn char_view_put(ctx: &CommandContext, addr: &DbAddr, view: &CharView, written: CharWrite) -> bool {
-    let Some(value) = view.put_value(written) else {
-        return false;
-    };
+/// `dbPutField` through a `$` address, `false` where C's status is non-zero.
+fn char_view_put(ctx: &CommandContext, addr: &DbAddr, value: EpicsValue) -> bool {
+    let field = format!("{}$", addr.field);
     ctx.block_on(
         ctx.db()
-            .put_record_field_from_ca_no_notify(&addr.record, &addr.field, value),
+            .put_record_field_from_ca_no_notify(&addr.record, &field, value),
     )
     .is_ok()
 }
@@ -1463,10 +1458,10 @@ fn cmd_dbpf() -> CommandDef {
 
             // `$` makes the address `DBR_CHAR` with `no_elements > 1`, so C
             // puts `strlen + 1` characters (`dbTest.c:413-416`).
-            if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
+            if addr.char_view {
                 let mut chars = value_str.as_bytes().to_vec();
                 chars.push(0);
-                let put_ok = char_view_put(ctx, &addr, &view, CharWrite::Chars(chars));
+                let put_ok = char_view_put(ctx, &addr, EpicsValue::CharArray(chars.into()));
                 dbgf_echo(ctx, &addr);
                 return Ok(if put_ok {
                     CommandOutcome::Continue
@@ -2911,8 +2906,8 @@ fn cmd_dbtpf() -> CommandDef {
                     ctx.println(&format!("Cvt to DBR_{dbr} failed."));
                     continue;
                 };
-                if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
-                    if !char_view_put(ctx, &addr, &view, CharWrite::Elements(target, value)) {
+                if addr.char_view {
+                    if !char_view_put(ctx, &addr, value) {
                         ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
                         continue;
                     }

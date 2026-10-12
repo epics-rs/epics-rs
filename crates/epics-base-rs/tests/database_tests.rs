@@ -2657,7 +2657,8 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
         inst.common.dtyp = "Raw Soft Channel".into();
         inst.common.inp = "SRC_LI".to_string();
         let inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
-        inst.set_link_cache("INP", inp);
+        inst.install_link_cache("INP", std::sync::Arc::new(inp))
+            .expect("a common link");
         inst.record
             .put_field("MASK", EpicsValue::Long(0x0F))
             .unwrap();
@@ -6830,7 +6831,8 @@ async fn test_tsel_cp_link_registration() {
         let mut inst = rec_arc.write();
         inst.common.tsel = "TSE_SRC CP".to_string();
         let tsel = parse_link_v2(&inst.common.tsel);
-        inst.set_link_cache("TSEL", tsel);
+        inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
+            .expect("a common link");
     }
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
@@ -6874,7 +6876,8 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
         let mut inst = rec.write();
         inst.common.tsel = "TSE_SRC.TIME".to_string();
         let tsel = parse_link_v2(&inst.common.tsel);
-        inst.set_link_cache("TSEL", tsel);
+        inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
+            .expect("a common link");
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -6948,7 +6951,8 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         let mut inst = rec.write();
         inst.common.tsel = "ca://TSE_SRC.TIME".to_string();
         let tsel = parse_link_v2(&inst.common.tsel);
-        inst.set_link_cache("TSEL", tsel);
+        inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
+            .expect("a common link");
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -7025,7 +7029,8 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         let mut inst = rec.write();
         inst.common.tsel = "TSE_SRC.TIME".to_string();
         let tsel = parse_link_v2(&inst.common.tsel);
-        inst.set_link_cache("TSEL", tsel);
+        inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
+            .expect("a common link");
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

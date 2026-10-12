@@ -32,6 +32,12 @@
 //!   Carried is not servable: `FieldDesc::unreadable` is what refuses
 //!   the read, so the SEARCH is answered off the descriptor instead of
 //!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 

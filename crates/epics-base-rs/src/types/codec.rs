@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use std::fmt::Write as _;
 use std::time::SystemTime;
 
 use super::{DbFieldType, EpicsValue, PvString, WallTime, c_cast};
@@ -273,6 +274,42 @@ fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvStrin
         .unwrap_or_default()
 }
 
+/// A fixed `char` buffer a cvtFast conversion writes into, as C's callers
+/// hand `cvtDoubleToString` their own `char *`: rendering into it allocates
+/// nothing. A write past `N` bytes fails and leaves the buffer short.
+pub(crate) struct StrBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StrBuf<N> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn as_str(&self) -> &str {
+        // Only `write_str` fills the buffer, and it copies whole `&str`s.
+        std::str::from_utf8(self.as_bytes()).unwrap_or_default()
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StrBuf<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
 ///
 /// `pub(crate)` so records that mirror C's `cvtDoubleToString(value, str,
@@ -281,17 +318,27 @@ fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvStrin
 /// wire encoder uses, instead of a divergent `format!` that rounds
 /// differently.
 pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
+    let mut out = String::new();
+    write_cvt_double(&mut out, val, precision).expect("a String sink does not fail");
+    out
+}
+
+/// [`cvt_double_to_string`] into `out`.
+pub(crate) fn write_cvt_double(
+    out: &mut impl std::fmt::Write,
+    val: f64,
+    precision: u16,
+) -> std::fmt::Result {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val > 1e16 || val < -1e16 {
             let p = precision.min(17) as usize;
-            return fmt_exp_c(val, p, p + 7);
+            return write_exp_c(out, val, p, p + 7);
         }
-        return fmt_fixed_c(val, precision.min(3) as usize);
+        return write_fixed_c(out, val, precision.min(3) as usize);
     }
     let mut val = val;
-    let mut out = String::new();
     if val < 0.0 {
-        out.push('-');
+        out.write_char('-')?;
         val = -val;
     }
     let mut whole = val as i32;
@@ -303,25 +350,34 @@ pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
         whole += 1;
         fraction -= fplace_full;
     }
-    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
-    out
+    write_fixed_digits(out, whole, fraction, fplace_full, precision)
 }
 
 /// Port of libCom `cvtFloatToString` (cvtFast.c:32-109). The fast path runs
 /// in f32 to match the C float arithmetic; the overflow branches cast to
 /// double exactly as the C `sprintf((double) flt_value)` does.
 pub(crate) fn cvt_float_to_string(val: f32, precision: u16) -> String {
+    let mut out = String::new();
+    write_cvt_float(&mut out, val, precision).expect("a String sink does not fail");
+    out
+}
+
+/// [`cvt_float_to_string`] into `out`.
+pub(crate) fn write_cvt_float(
+    out: &mut impl std::fmt::Write,
+    val: f32,
+    precision: u16,
+) -> std::fmt::Result {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val >= 1e8 || val <= -1e8 {
             let p = precision.min(12) as usize;
-            return fmt_exp_c(val as f64, p, p + 6);
+            return write_exp_c(out, val as f64, p, p + 6);
         }
-        return fmt_fixed_c(val as f64, precision.min(3) as usize);
+        return write_fixed_c(out, val as f64, precision.min(3) as usize);
     }
     let mut val = val;
-    let mut out = String::new();
     if val < 0.0 {
-        out.push('-');
+        out.write_char('-')?;
         val = -val;
     }
     let mut whole = val as i32;
@@ -333,19 +389,18 @@ pub(crate) fn cvt_float_to_string(val: f32, precision: u16) -> String {
         whole += 1;
         fraction -= fplace_full;
     }
-    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
-    out
+    write_fixed_digits(out, whole, fraction, fplace_full, precision)
 }
 
 /// Emit the whole-number then fractional digits, shared by the float/double
 /// fast paths (cvtFast.c:75-105 / :156-186).
-fn push_fixed_digits(
-    out: &mut String,
+fn write_fixed_digits(
+    out: &mut impl std::fmt::Write,
     mut whole: i32,
     mut fraction: i32,
     fplace_full: i32,
     precision: u16,
-) {
+) -> std::fmt::Result {
     let mut got_one = false;
     let mut iplace = 10_000_000i32;
     while iplace >= 1 {
@@ -353,58 +408,68 @@ fn push_fixed_digits(
             got_one = true;
             let number = whole / iplace;
             whole -= number * iplace;
-            out.push((b'0' + number as u8) as char);
+            out.write_char((b'0' + number as u8) as char)?;
         } else if got_one {
-            out.push('0');
+            out.write_char('0')?;
         }
         iplace /= 10;
     }
     if !got_one {
-        out.push('0');
+        out.write_char('0')?;
     }
     if precision > 0 {
-        out.push('.');
+        out.write_char('.')?;
         let mut fplace = fplace_full / 10;
         for _ in 0..precision {
             let number = fraction / fplace;
             fraction -= number * fplace;
-            out.push((b'0' + number as u8) as char);
+            out.write_char((b'0' + number as u8) as char)?;
             fplace /= 10;
         }
     }
+    Ok(())
 }
 
 /// C `sprintf("%.*f", precision, val)`, with glibc NaN/Inf spellings.
-fn fmt_fixed_c(val: f64, precision: usize) -> String {
+fn write_fixed_c(out: &mut impl std::fmt::Write, val: f64, precision: usize) -> std::fmt::Result {
     if val.is_nan() {
-        return "nan".to_string();
+        return out.write_str("nan");
     }
     if val.is_infinite() {
-        return if val < 0.0 { "-inf" } else { "inf" }.to_string();
+        return out.write_str(if val < 0.0 { "-inf" } else { "inf" });
     }
-    format!("{val:.precision$}")
+    write!(out, "{val:.precision$}")
 }
 
 /// C `sprintf("%*.*e", width, precision, val)`: scientific notation with a
 /// signed, ≥2-digit exponent, right-justified in `width`. glibc NaN/Inf
 /// spellings.
-fn fmt_exp_c(val: f64, precision: usize, width: usize) -> String {
-    let body = if val.is_nan() {
-        "nan".to_string()
+fn write_exp_c(
+    out: &mut impl std::fmt::Write,
+    val: f64,
+    precision: usize,
+    width: usize,
+) -> std::fmt::Result {
+    // `precision` ≤ 17: a sign, 18 digits, the point and `e-308` fit.
+    let mut body = StrBuf::<32>::new();
+    if val.is_nan() {
+        body.write_str("nan")?;
     } else if val.is_infinite() {
-        if val < 0.0 { "-inf" } else { "inf" }.to_string()
+        body.write_str(if val < 0.0 { "-inf" } else { "inf" })?;
     } else {
         // Rust `{:.*e}` rounds the mantissa half-to-even (matching glibc)
         // and emits `<mantissa>e<exp>` with no exponent sign / leading
         // zero; reformat the exponent to C's `e±dd`.
-        let raw = format!("{val:.precision$e}");
-        let (mantissa, exp) = raw.split_once('e').unwrap_or((raw.as_str(), "0"));
+        let mut raw = StrBuf::<32>::new();
+        write!(raw, "{val:.precision$e}")?;
+        let raw = raw.as_str();
+        let (mantissa, exp) = raw.split_once('e').unwrap_or((raw, "0"));
         let exp_num: i32 = exp.parse().unwrap_or(0);
         let sign = if exp_num < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp_num.abs())
-    };
+        write!(body, "{mantissa}e{sign}{:02}", exp_num.abs())?;
+    }
     // Right-justify in `width` (C `%*.*e` pads with leading spaces).
-    format!("{body:>width$}")
+    write!(out, "{:>width$}", body.as_str())
 }
 
 /// RISC alignment padding bytes required between metadata header and value.

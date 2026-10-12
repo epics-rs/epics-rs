@@ -310,9 +310,15 @@ fn var_index(name: &str) -> Option<usize> {
     }
 }
 
-/// [`Record::field_slot`]'s index for `VAL`, past the `A`..`U` and
-/// `LA`..`LU` blocks.
-const VAL_SLOT: usize = 2 * crate::calc::CALC_NARGS;
+use crate::server::record::dbd_generated::slots::calc as slots;
+
+// `A`..`U` then `LA`..`LU`, contiguous in `calcRecord.dbd`: the
+// `get_slot_f64` / `put_slot_f64` overrides index both blocks off `A`.
+const _: () = assert!(
+    slots::U.0 - slots::A.0 + 1 == crate::calc::CALC_NARGS as u16
+        && slots::LA.0 == slots::U.0 + 1
+        && slots::LU.0 - slots::LA.0 + 1 == crate::calc::CALC_NARGS as u16
+);
 
 /// `LA`..`LU` → 0..21, the same index into the previous-value block.
 fn prev_index(name: &str) -> Option<usize> {
@@ -636,7 +642,7 @@ impl Record for CalcRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -755,41 +761,88 @@ impl Record for CalcRecord {
         Some(self.inp_generation)
     }
 
-    /// `A`..`U`, `LA`..`LU` and `VAL` — the fields a link reads — by
-    /// index into the three `f64` blocks C lays them out in.
-    fn field_slot(&self, field: &str) -> Option<FieldSlot> {
-        let slot = if let Some(i) = var_index(field) {
-            i
-        } else if let Some(i) = prev_index(field) {
-            crate::calc::CALC_NARGS + i
-        } else if field == "VAL" {
-            VAL_SLOT
-        } else {
-            return None;
-        };
-        Some(FieldSlot(slot as u16))
-    }
+    crate::slot_map!(crate::server::record::dbd_generated::slots::calc;
+        VAL => val,
+        EGU => egu,
+        PREC => prec,
+        HOPR => hopr,
+        LOPR => lopr,
+        AFTC => aftc,
+        ADEL => adel,
+        MDEL => mdel,
+        A => vars[0],
+        B => vars[1],
+        C => vars[2],
+        D => vars[3],
+        E => vars[4],
+        F => vars[5],
+        G => vars[6],
+        H => vars[7],
+        I => vars[8],
+        J => vars[9],
+        K => vars[10],
+        L => vars[11],
+        M => vars[12],
+        N => vars[13],
+        O => vars[14],
+        P => vars[15],
+        Q => vars[16],
+        R => vars[17],
+        S => vars[18],
+        T => vars[19],
+        U => vars[20];
+        read_only:
+        LA => prev[0],
+        LB => prev[1],
+        LC => prev[2],
+        LD => prev[3],
+        LE => prev[4],
+        LF => prev[5],
+        LG => prev[6],
+        LH => prev[7],
+        LI => prev[8],
+        LJ => prev[9],
+        LK => prev[10],
+        LL => prev[11],
+        LM => prev[12],
+        LN => prev[13],
+        LO => prev[14],
+        LP => prev[15],
+        LQ => prev[16],
+        LR => prev[17],
+        LS => prev[18],
+        LT => prev[19],
+        LU => prev[20],
+        AFVL => afvl,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst);
 
+    /// `slot_ref`'s value with no call per link read: the default's
+    /// out-of-line `slot_ref` cost calc-link +29 instr/cycle.
     fn get_slot_f64(&self, slot: FieldSlot) -> Option<f64> {
-        let i = usize::from(slot.0);
-        if i < crate::calc::CALC_NARGS {
+        const N: usize = crate::calc::CALC_NARGS;
+        let i = usize::from(slot.0.wrapping_sub(slots::A.0));
+        if i < N {
             Some(self.vars[i])
-        } else if i < VAL_SLOT {
-            Some(self.prev[i - crate::calc::CALC_NARGS])
-        } else if i == VAL_SLOT {
+        } else if i < 2 * N {
+            Some(self.prev[i - N])
+        } else if slot == slots::VAL {
             Some(self.val)
         } else {
-            None
+            self.slot_ref(slot)?.to_f64()
         }
     }
 
+    /// `A`..`U` only: the multi-input fetch is the one caller.
     fn put_slot_f64(&mut self, slot: FieldSlot, value: f64) -> bool {
-        let i = usize::from(slot.0);
-        if i < crate::calc::CALC_NARGS {
-            self.vars[i] = value;
-            true
-        } else {
-            false
+        let i = usize::from(slot.0.wrapping_sub(slots::A.0));
+        match self.vars.get_mut(i) {
+            Some(v) => {
+                *v = value;
+                true
+            }
+            None => false,
         }
     }
 

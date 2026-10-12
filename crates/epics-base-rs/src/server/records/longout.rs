@@ -182,6 +182,25 @@ const LONGOUT_OOPT_CHOICES: &[&str] = &[
 ];
 
 impl Record for LongoutRecord {
+    // The alarm ladder lives in dbCommon's analog block; the menus are
+    // stored as `i16` and served as ENUM. Neither maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::longout;
+        VAL => val,
+        EGU => egu,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        ADEL => adel,
+        MDEL => mdel,
+        SDLY => sdly,
+        IVOV => ivov,
+        PVAL => pval;
+        read_only:
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -372,7 +391,7 @@ impl Record for LongoutRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                 }
             }
             "HOPR" => {

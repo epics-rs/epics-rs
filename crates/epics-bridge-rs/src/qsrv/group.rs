@@ -1417,10 +1417,9 @@ impl GroupChannel {
         if member.string_view {
             // `dbPut(DBR_CHAR)` through the char address, as the
             // single-record `$` channel puts.
-            use epics_base_rs::server::database::char_view::{CharWrite, char_view};
-            let rec = self.db.get_record(&member.record)?;
-            let write = CharWrite::from_pva(&crate::convert::pv_field_to_epics(pv_field)?)?;
-            return char_view(&rec.read(), &member.field)?.put_value(write);
+            return epics_base_rs::server::database::char_view::pva_char_request(
+                &crate::convert::pv_field_to_epics(pv_field)?,
+            );
         }
         match pv_field {
             // A string into a `DBF_CHAR` array member is pvxs's
@@ -1596,6 +1595,7 @@ impl GroupChannel {
         use super::channel::ProcessMode;
         let (record_name, field_name) = member.names();
         let pv_name = format!("{record_name}.{field_name}");
+        let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
             user: &self.access.creds.user,
@@ -1641,14 +1641,15 @@ impl GroupChannel {
     /// awaits it.
     async fn apply_member_value(
         &self,
-        record_name: &str,
-        field_name: &str,
+        member: &MemberChannel,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         grant: super::provider::WriteGrant,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
+        let (record_name, field_name) = member.names();
         let pv_name = format!("{record_name}.{field_name}");
+        let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
             user: &self.access.creds.user,
@@ -2066,8 +2067,6 @@ impl GroupChannel {
             // must run regardless of whether the request contains that field
             // (matches C++ pdbgroup.cpp:300+ allowProc semantics).
             for member in ordered {
-                let (record_name, field_name) = member.names();
-
                 // Same classifier as the atomic loop, same three outcomes.
                 let action = classify(member);
                 match action {
@@ -2109,8 +2108,7 @@ impl GroupChannel {
                         // The member's trap grant (resolved in the per-member
                         // ACF pass) gates `asTrapWrite` emission for this write.
                         self.apply_member_value(
-                            record_name,
-                            field_name,
+                            member,
                             epics_val,
                             opts.process,
                             member_grants

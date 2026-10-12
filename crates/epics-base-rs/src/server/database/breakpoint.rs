@@ -1647,4 +1647,110 @@ mod tests {
         assert_eq!(second.lock().sets[0].id, from_b);
         assert_eq!(from_b, dblsr, "dbstat prints dblsr's id");
     }
+
+    /// Spec §5 test 19: a breakpoint parks the OUT write's PP inside the
+    /// target, and the park lets the source's set go (C `dbBkpt.c:794-796`).
+    /// Meanwhile another thread re-points the source's OUT and removes the
+    /// target. The old parse is freed by that put, not later by the frame,
+    /// because the write ended its handle before PP; the frame resumes on
+    /// the target it owns and the next cycle writes the new target.
+    // RTEMS-EXEC-MODEL-ALLOW(1): parks a real OS thread, the std-thread backend's own primitive; the runtime only awaits add_record and the puts; passes on the exec backend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_out_write_parked_in_its_pp_outlives_its_link_and_its_target() {
+        use crate::server::record::{LinkFieldType, parse_link_field};
+        use crate::server::records::ao::AoRecord;
+
+        let db = PvDatabase::new();
+        for name in ["BPO:src", "BPO:tgt", "BPO:new"] {
+            db.add_record(name, Box::new(AoRecord::new(0.0)))
+                .await
+                .expect("add_record");
+        }
+        // BPO:new links to BPO:tgt so the re-point below keeps the parked
+        // target in the source's set: a re-point that splits it off leaves
+        // the resumed frame on a set that no longer holds it.
+        for (from, to) in [
+            ("BPO:src", "BPO:tgt.VAL PP"),
+            ("BPO:new", "BPO:tgt.VAL NPP"),
+        ] {
+            let rec = db.get_record(from).expect("record");
+            let mut inst = rec.write();
+            inst.common.out = to.to_string();
+            inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
+        }
+        db.build_lock_sets();
+        let table = db.breakpoints_or_install();
+        let joiner = {
+            let owned = db.clone();
+            let cell: Arc<Mutex<Option<std::thread::JoinHandle<String>>>> =
+                Arc::new(Mutex::new(None));
+            let out = cell.clone();
+            table
+                .set(&db, "BPO:tgt", move |key, ex| {
+                    *cell.lock().expect("cell") = Some(std::thread::spawn(move || {
+                        continuation_loop(owned, key, ex)
+                    }));
+                })
+                .expect("dbb");
+            out.lock().expect("cell").take().expect("spawned")
+        };
+        let old = match db
+            .get_record("BPO:src")
+            .expect("record")
+            .read()
+            .parsed_out
+            .link()
+        {
+            crate::server::record::ParsedLink::Db(link) => Arc::downgrade(link),
+            other => panic!("a DB link: {other:?}"),
+        };
+
+        db.process_record_with_links("BPO:src", &mut crate::server::database::ProcStack::new())
+            .await
+            .expect("foreign entry falls out of dbProcess");
+        assert_eq!(
+            await_stop(&table, |at| at == Some("BPO:tgt")).as_deref(),
+            Some("BPO:tgt"),
+            "parked in the OUT write's PP"
+        );
+
+        db.put_record_field_from_ca(
+            "BPO:src",
+            "OUT",
+            crate::types::EpicsValue::String("BPO:new.VAL PP".into()),
+        )
+        .await
+        .expect("re-point OUT during the park");
+        assert!(old.upgrade().is_none(), "the put freed the old parse");
+        assert!(db.remove_record("BPO:tgt").await);
+
+        table.cont(&db, None).expect("dbc");
+        assert_eq!(await_stop(&table, |at| at.is_none()), None);
+        // `dbd` cannot name a removed record: empty the set as its tail does.
+        {
+            let mut stack = table.lock();
+            stack.sets[0].breakpoints.clear();
+            stack.sets[0].step = false;
+            let (ex, cont) = (stack.sets[0].ex.clone(), stack.sets[0].cont.clone());
+            drop(stack);
+            resume_continuation(cont.as_ref());
+            ex.signal();
+        }
+        joiner.join().expect("the frame finished without a panic");
+
+        db.get_record("BPO:src")
+            .expect("record")
+            .write()
+            .record
+            .set_val(crate::types::EpicsValue::Double(9.0))
+            .expect("VAL");
+        db.process_record_with_links("BPO:src", &mut crate::server::database::ProcStack::new())
+            .await
+            .expect("process");
+        assert_eq!(
+            db.get_pv("BPO:new").expect("BPO:new").to_f64(),
+            Some(9.0),
+            "the next cycle writes through the new link"
+        );
+    }
 }

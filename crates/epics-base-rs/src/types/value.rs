@@ -224,9 +224,9 @@ fn read_be<T, const N: usize>(
 /// its bits through the `i64` view, so an integer target truncates to the low
 /// N bits (C/pvxs `static_cast`: `uint32 0xffffffff -> int32 -1`, and
 /// `getLongUInt64`: -200 -> 0xffffffffffffff38); only a float takes the
-/// `c_cast` policy.
-#[derive(Clone, Copy)]
-enum Num {
+/// `c_cast` policy. `to_<ty>` is the one implementation of that row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scalar {
     Int(i64),
     /// Its own case only for the `f64` view, which is unsigned.
     U64(u64),
@@ -235,7 +235,7 @@ enum Num {
     Float(f64),
 }
 
-impl Num {
+impl Scalar {
     #[inline]
     fn int(self) -> Option<i64> {
         match self {
@@ -246,7 +246,7 @@ impl Num {
     }
 
     #[inline]
-    fn f64(self) -> f64 {
+    pub(crate) fn to_f64(self) -> f64 {
         match self {
             Self::Int(i) => i as f64,
             Self::U64(u) => u as f64,
@@ -255,48 +255,82 @@ impl Num {
         }
     }
 
+    #[inline]
+    pub(crate) fn to_f32(self) -> f32 {
+        match self {
+            Self::F32(f) => f,
+            _ => c_cast::f64_to_f32(self.to_f64()),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_i8(self) -> i8 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_i8(self.to_f64()), |i| i as i8)
+    }
+
+    #[inline]
+    pub(crate) fn to_u8(self) -> u8 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_u8(self.to_f64()), |i| i as u8)
+    }
+
+    #[inline]
+    pub(crate) fn to_i16(self) -> i16 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_i16(self.to_f64()), |i| i as i16)
+    }
+
+    /// Also the `DBF_ENUM` row: `putDoubleEnum` is the same `(epicsEnum16)`
+    /// cast as `putDoubleUshort`.
+    #[inline]
+    pub(crate) fn to_u16(self) -> u16 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_u16(self.to_f64()), |i| i as u16)
+    }
+
+    #[inline]
+    pub(crate) fn to_i32(self) -> i32 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_i32(self.to_f64()), |i| i as i32)
+    }
+
+    #[inline]
+    pub(crate) fn to_u32(self) -> u32 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_u32(self.to_f64()), |i| i as u32)
+    }
+
+    #[inline]
+    pub(crate) fn to_i64(self) -> i64 {
+        self.int()
+            .unwrap_or_else(|| c_cast::f64_to_i64(self.to_f64()))
+    }
+
+    #[inline]
+    pub(crate) fn to_u64(self) -> u64 {
+        self.int()
+            .map_or_else(|| c_cast::f64_to_u64(self.to_f64()), |i| i as u64)
+    }
+
     /// The value in a numeric `target`; `None` for `String`, the text
     /// projection, which is the caller's.
     #[inline(always)]
     fn to_field(self, target: DbFieldType) -> Option<EpicsValue> {
-        let i = self.int();
         Some(match target {
             DbFieldType::String => return None,
-            DbFieldType::Double => EpicsValue::Double(self.f64()),
-            DbFieldType::Float => EpicsValue::Float(match self {
-                Self::F32(f) => f,
-                _ => c_cast::f64_to_f32(self.f64()),
-            }),
-            DbFieldType::Short => {
-                EpicsValue::Short(i.map_or_else(|| c_cast::f64_to_i16(self.f64()), |i| i as i16))
-            }
-            // `putDoubleEnum` is the same `(epicsEnum16)` cast as
-            // `putDoubleUshort`, so it takes the same `c_cast` policy.
-            DbFieldType::Enum => {
-                EpicsValue::Enum(i.map_or_else(|| c_cast::f64_to_u16(self.f64()), |i| i as u16))
-            }
+            DbFieldType::Double => EpicsValue::Double(self.to_f64()),
+            DbFieldType::Float => EpicsValue::Float(self.to_f32()),
+            DbFieldType::Short => EpicsValue::Short(self.to_i16()),
+            DbFieldType::Enum => EpicsValue::Enum(self.to_u16()),
             // `Char` carries the epicsInt8's bits: C `(epicsInt8) d`.
-            DbFieldType::Char => {
-                EpicsValue::Char(i.map_or_else(|| c_cast::f64_to_i8(self.f64()) as u8, |i| i as u8))
-            }
-            DbFieldType::Long => {
-                EpicsValue::Long(i.map_or_else(|| c_cast::f64_to_i32(self.f64()), |i| i as i32))
-            }
-            DbFieldType::Int64 => {
-                EpicsValue::Int64(i.unwrap_or_else(|| c_cast::f64_to_i64(self.f64())))
-            }
-            DbFieldType::UInt64 => {
-                EpicsValue::UInt64(i.map_or_else(|| c_cast::f64_to_u64(self.f64()), |i| i as u64))
-            }
-            DbFieldType::UShort => {
-                EpicsValue::UShort(i.map_or_else(|| c_cast::f64_to_u16(self.f64()), |i| i as u16))
-            }
-            DbFieldType::ULong => {
-                EpicsValue::ULong(i.map_or_else(|| c_cast::f64_to_u32(self.f64()), |i| i as u32))
-            }
-            DbFieldType::UChar => {
-                EpicsValue::UChar(i.map_or_else(|| c_cast::f64_to_u8(self.f64()), |i| i as u8))
-            }
+            DbFieldType::Char => EpicsValue::Char(self.to_i8() as u8),
+            DbFieldType::Long => EpicsValue::Long(self.to_i32()),
+            DbFieldType::Int64 => EpicsValue::Int64(self.to_i64()),
+            DbFieldType::UInt64 => EpicsValue::UInt64(self.to_u64()),
+            DbFieldType::UShort => EpicsValue::UShort(self.to_u16()),
+            DbFieldType::ULong => EpicsValue::ULong(self.to_u32()),
+            DbFieldType::UChar => EpicsValue::UChar(self.to_u8()),
         })
     }
 }
@@ -946,21 +980,21 @@ impl EpicsValue {
         self.num()?.int()
     }
 
-    /// A numeric scalar as the one [`Num`] every narrowing reads, and the
+    /// A numeric scalar as the one [`Scalar`] every narrowing reads, and the
     /// classification [`Self::as_int_i64`] is a view of.
     #[inline]
-    fn num(&self) -> Option<Num> {
+    pub(crate) fn num(&self) -> Option<Scalar> {
         Some(match *self {
-            Self::Double(v) => Num::Float(v),
-            Self::Float(v) => Num::F32(v),
-            Self::UInt64(v) => Num::U64(v),
-            Self::Short(v) => Num::Int(v as i64),
-            Self::Enum(v) | Self::UShort(v) => Num::Int(v as i64),
-            Self::Long(v) => Num::Int(v as i64),
-            Self::Int64(v) => Num::Int(v),
-            Self::ULong(v) => Num::Int(v as i64),
-            Self::Char(v) => Num::Int(v as i8 as i64),
-            Self::UChar(v) => Num::Int(v as i64),
+            Self::Double(v) => Scalar::Float(v),
+            Self::Float(v) => Scalar::F32(v),
+            Self::UInt64(v) => Scalar::U64(v),
+            Self::Short(v) => Scalar::Int(v as i64),
+            Self::Enum(v) | Self::UShort(v) => Scalar::Int(v as i64),
+            Self::Long(v) => Scalar::Int(v as i64),
+            Self::Int64(v) => Scalar::Int(v),
+            Self::ULong(v) => Scalar::Int(v as i64),
+            Self::Char(v) => Scalar::Int(v as i8 as i64),
+            Self::UChar(v) => Scalar::Int(v as i64),
             _ => return None,
         })
     }
@@ -1099,46 +1133,49 @@ impl EpicsValue {
             let ints = self.as_int_i64_array();
             return match target {
                 DbFieldType::Short => EpicsValue::ShortArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as i16).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_i16(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_i16()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_i16()).collect(),
                 }),
-                DbFieldType::Float => {
-                    EpicsValue::FloatArray(nums.iter().map(|&v| c_cast::f64_to_f32(v)).collect())
-                }
+                DbFieldType::Float => EpicsValue::FloatArray(
+                    nums.iter().map(|&v| Scalar::Float(v).to_f32()).collect(),
+                ),
                 DbFieldType::Enum => EpicsValue::EnumArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u16()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_u16()).collect(),
                 }),
                 DbFieldType::Long => EpicsValue::LongArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as i32).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_i32(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_i32()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_i32()).collect(),
                 }),
                 DbFieldType::Double => EpicsValue::DoubleArray(nums.into()),
                 DbFieldType::Int64 => EpicsValue::Int64Array(match &ints {
                     Some(v) => v.clone().into(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_i64(v)).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_i64()).collect(),
                 }),
                 DbFieldType::UInt64 => EpicsValue::UInt64Array(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u64).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u64(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u64()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_u64()).collect(),
                 }),
                 DbFieldType::UShort => EpicsValue::UShortArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u16()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_u16()).collect(),
                 }),
                 DbFieldType::ULong => EpicsValue::ULongArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u32).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u32(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u32()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_u32()).collect(),
                 }),
                 DbFieldType::Char => EpicsValue::CharArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_i8(v) as u8).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_i8() as u8).collect(),
+                    None => nums
+                        .iter()
+                        .map(|&v| Scalar::Float(v).to_i8() as u8)
+                        .collect(),
                 }),
                 // DBF_UCHAR[] narrows off the integer view (low 8 bits), the
                 // unsigned twin of the Char target.
                 DbFieldType::UChar => EpicsValue::UCharArray(match &ints {
-                    Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
+                    Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u8()).collect(),
+                    None => nums.iter().map(|&v| Scalar::Float(v).to_u8()).collect(),
                 }),
                 DbFieldType::String => EpicsValue::StringArray(self.element_texts(&nums)),
             };
@@ -1225,7 +1262,7 @@ impl EpicsValue {
             }
             _ => self
                 .num()
-                .unwrap_or_else(|| Num::Float(self.to_f64().unwrap_or(0.0)))
+                .unwrap_or_else(|| Scalar::Float(self.to_f64().unwrap_or(0.0)))
                 .to_field(target)
                 .unwrap_or_else(|| EpicsValue::String(format!("{self}").into())),
         }
@@ -2407,5 +2444,137 @@ mod wire_array_tests {
             EpicsValue::Float(0.1).convert_to(DbFieldType::String),
             EpicsValue::String("0.100000".into())
         );
+    }
+}
+
+/// `Scalar::to_<ty>` against spec §1.2's float → integer table: the C
+/// column, read back from softIoc (epics-base 8f5015b66, x86-64).
+#[cfg(test)]
+mod scalar_row_tests {
+    use super::*;
+    use DbFieldType as T;
+
+    const NUMERIC: [DbFieldType; 11] = [
+        T::Double,
+        T::Float,
+        T::Char,
+        T::UChar,
+        T::Short,
+        T::UShort,
+        T::Enum,
+        T::Long,
+        T::ULong,
+        T::Int64,
+        T::UInt64,
+    ];
+
+    /// `s` in `target`, through `to_<ty>` alone.
+    fn row(s: Scalar, target: DbFieldType) -> EpicsValue {
+        match target {
+            T::Double => EpicsValue::Double(s.to_f64()),
+            T::Float => EpicsValue::Float(s.to_f32()),
+            T::Char => EpicsValue::Char(s.to_i8() as u8),
+            T::UChar => EpicsValue::UChar(s.to_u8()),
+            T::Short => EpicsValue::Short(s.to_i16()),
+            T::UShort => EpicsValue::UShort(s.to_u16()),
+            T::Enum => EpicsValue::Enum(s.to_u16()),
+            T::Long => EpicsValue::Long(s.to_i32()),
+            T::ULong => EpicsValue::ULong(s.to_u32()),
+            T::Int64 => EpicsValue::Int64(s.to_i64()),
+            T::UInt64 => EpicsValue::UInt64(s.to_u64()),
+            T::String => unreachable!(),
+        }
+    }
+
+    const MIN32: i32 = i32::MIN;
+    const MIN64: i64 = i64::MIN;
+    const TWO63: u64 = 1 << 63;
+
+    /// (source, LONG, ULONG, INT64, UINT64, the saturated value a `≠` cell
+    /// replaced, by target, `""` where C and the old policy agreed).
+    #[rustfmt::skip]
+    const WIDE: [(f64, i32, u32, i64, u64, &str); 12] = [
+        (-2.7, -2, 4294967294, -2, 18446744073709551614, "ULONG was 0, UINT64 was 0"),
+        (-1.0, -1, 4294967295, -1, u64::MAX, "ULONG was 0, UINT64 was 0"),
+        (3e9, MIN32, 3000000000, 3000000000, 3000000000, "LONG was 2147483647"),
+        (5e9, MIN32, 705032704, 5000000000, 5000000000, "LONG was 2147483647, ULONG was 4294967295"),
+        (3e10, MIN32, 4230196224, 30000000000, 30000000000, "LONG was 2147483647, ULONG was 4294967295"),
+        (-3e10, MIN32, 64771072, -30000000000, 18446744043709551616, "ULONG was 0, UINT64 was 0"),
+        (1e19, MIN32, 0, MIN64, 10000000000000000000, "LONG was 2147483647, ULONG was 4294967295, INT64 was i64::MAX"),
+        (-1e19, MIN32, 0, MIN64, TWO63, "UINT64 was 0"),
+        (f64::NAN, MIN32, 0, MIN64, TWO63, "LONG was 0, INT64 was 0, UINT64 was 0"),
+        (f64::INFINITY, MIN32, 0, MIN64, 0, "LONG was 2147483647, ULONG was 4294967295, INT64 was i64::MAX, UINT64 was u64::MAX"),
+        (f64::NEG_INFINITY, MIN32, 0, MIN64, TWO63, "UINT64 was 0"),
+        (1e39, MIN32, 0, MIN64, 0, "LONG was 2147483647, ULONG was 4294967295, INT64 was i64::MAX, UINT64 was u64::MAX"),
+    ];
+
+    /// (source, CHAR, UCHAR, SHORT, USHORT = ENUM). Every cell agreed with the
+    /// old policy: the 32-bit `cvttsd2si` step's `INT_MIN` cuts to 0.
+    #[rustfmt::skip]
+    const NARROW: [(f64, i8, u8, i16, u16); 13] = [
+        (300.0, 44, 44, 300, 300),
+        (-2.7, -2, 254, -2, 65534),
+        (-1.0, -1, 255, -1, 65535),
+        (3e9, 0, 0, 0, 0),
+        (5e9, 0, 0, 0, 0),
+        (3e10, 0, 0, 0, 0),
+        (-3e10, 0, 0, 0, 0),
+        (1e19, 0, 0, 0, 0),
+        (-1e19, 0, 0, 0, 0),
+        (f64::NAN, 0, 0, 0, 0),
+        (f64::INFINITY, 0, 0, 0, 0),
+        (f64::NEG_INFINITY, 0, 0, 0, 0),
+        (1e39, 0, 0, 0, 0),
+    ];
+
+    #[test]
+    fn scalar_casts_follow_the_c_cast_policy() {
+        for (x, long, ulong, int64, uint64, was) in WIDE {
+            let s = Scalar::Float(x);
+            assert_eq!(s.to_i32(), long, "{x} -> LONG; {was}");
+            assert_eq!(s.to_u32(), ulong, "{x} -> ULONG; {was}");
+            assert_eq!(s.to_i64(), int64, "{x} -> INT64; {was}");
+            assert_eq!(s.to_u64(), uint64, "{x} -> UINT64; {was}");
+        }
+        for (x, char, uchar, short, ushort) in NARROW {
+            let s = Scalar::Float(x);
+            assert_eq!(s.to_i8(), char, "{x} -> CHAR");
+            assert_eq!(s.to_u8(), uchar, "{x} -> UCHAR");
+            assert_eq!(s.to_i16(), short, "{x} -> SHORT");
+            assert_eq!(s.to_u16(), ushort, "{x} -> USHORT / ENUM");
+        }
+        assert_eq!(Scalar::Float(1e39).to_f32(), f32::MAX, "1e39 -> FLOAT");
+        assert_eq!(Scalar::Float(f64::INFINITY).to_f32(), f32::INFINITY);
+
+        // An integer source truncates to the low bits.
+        assert_eq!(Scalar::Int(300).to_i8(), 44);
+        assert_eq!(Scalar::Int(-1).to_u32(), 0xFFFF_FFFF);
+        assert_eq!(Scalar::Int(70000).to_u16(), 4464);
+        assert_eq!(Scalar::Int((1 << 40) + 5).to_i32(), 5);
+        assert_eq!(row(Scalar::Float(1.9), T::Enum), EpicsValue::Enum(1));
+    }
+
+    fn sources() -> Vec<Scalar> {
+        let mut s: Vec<Scalar> = WIDE.iter().map(|w| Scalar::Float(w.0)).collect();
+        s.extend([300.0, 1.9].map(Scalar::Float));
+        s.extend([300, -1, 70000, (1 << 40) + 5, i64::MIN, i64::MAX].map(Scalar::Int));
+        s.extend([u64::MAX, TWO63].map(Scalar::U64));
+        s.extend([1.5, -2.7, f32::NAN, f32::INFINITY, f32::MAX].map(Scalar::F32));
+        s
+    }
+
+    /// Debug, so a NaN cell compares equal to itself.
+    #[test]
+    fn to_field_equals_scalar_row() {
+        for s in sources() {
+            for t in NUMERIC {
+                assert_eq!(
+                    format!("{:?}", s.to_field(t).unwrap()),
+                    format!("{:?}", row(s, t)),
+                    "{s:?} -> {t:?}"
+                );
+            }
+            assert_eq!(s.to_field(T::String), None);
+        }
     }
 }

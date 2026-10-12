@@ -17,6 +17,7 @@ pub(crate) mod scan_index;
 mod snapshot;
 
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
+pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
     LinkSetRegistry, PutAdmission, RemoteAlarm,

@@ -84,10 +84,13 @@ async fn holder_db(lset: Arc<SwitchableLset>) -> PvDatabase {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
         inst.common.inp = "ca://UP:PV CP".to_string();
-        inst.set_link_cache(
+        inst.install_link_cache(
             "INP",
-            epics_base_rs::server::record::parse_link_v2("ca://UP:PV CP"),
-        );
+            std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2(
+                "ca://UP:PV CP",
+            )),
+        )
+        .expect("a common link");
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;

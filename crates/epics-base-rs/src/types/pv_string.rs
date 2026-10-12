@@ -61,6 +61,25 @@ impl PvString {
         self.0
     }
 
+    /// Replace the bytes in the buffer this string already has, so a slot
+    /// reserved at load does not grow (or reallocate) under the record lock.
+    pub fn set_bytes(&mut self, bytes: &[u8]) {
+        self.0.clear();
+        self.0.extend_from_slice(bytes);
+    }
+
+    /// Bytes the buffer holds without growing.
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Grow the buffer to hold `additional` more bytes than its length,
+    /// with no slack, so a later [`Self::set_bytes`] within it allocates
+    /// nothing.
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.0.reserve_exact(additional);
+    }
+
     /// Lossy UTF-8 view for diagnostics / JSON / text comparisons where a
     /// faithful byte rendering is not required. Non-UTF-8 bytes become
     /// `U+FFFD`. For pvxs-faithful CLI output, escape [`Self::as_bytes`]
@@ -199,6 +218,22 @@ mod tests {
         oval.clone_from(&PvString::from("next"));
         assert_eq!(oval, "next");
         assert_eq!(oval.as_bytes().as_ptr(), buf);
+    }
+
+    #[test]
+    fn set_bytes_keeps_the_buffer() {
+        let mut s = PvString::new();
+        s.0.reserve(40);
+        let (buf, cap) = (s.0.as_ptr(), s.0.capacity());
+        s.set_bytes(&[b'x'; 39]);
+        assert_eq!(s.as_bytes(), &[b'x'; 39]);
+        s.set_bytes(b"short");
+        assert_eq!(s, "short");
+        s.set_bytes(b"equal");
+        assert_eq!(s, "equal");
+        s.set_bytes(b"");
+        assert!(s.is_empty());
+        assert_eq!((s.0.as_ptr(), s.0.capacity()), (buf, cap));
     }
 
     #[test]

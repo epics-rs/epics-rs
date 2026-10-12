@@ -789,15 +789,94 @@ impl WaveformRecord {
 /// VAL from DOL each cycle (C `aaoRecord.c::fetchValue`).
 const MENU_OMSL_CLOSED_LOOP: i16 = 1;
 
+/// The members a slot of any of the four kinds names.
+#[derive(Clone, Copy)]
+enum SlotMember {
+    Rarm,
+    Prec,
+    Egu,
+    Hopr,
+    Lopr,
+    Sdly,
+    Hash,
+}
+
+impl WaveformRecord {
+    /// `slot` in this kind's table. NELM/NORD/INDX/MALM are DBF_ULONG held
+    /// as `i32` and BUSY a `bool`, so none of them maps.
+    fn slot_member(&self, slot: crate::server::record::FieldSlot) -> Option<SlotMember> {
+        use crate::server::record::dbd_generated::slots;
+        use SlotMember::*;
+        macro_rules! table {
+            ($t:ident; $($f:ident => $m:ident),*) => {
+                match slot {
+                    $(slots::$t::$f => Some($m),)*
+                    _ => None,
+                }
+            };
+        }
+        match self.kind {
+            ArrayKind::Waveform => table!(waveform;
+                RARM => Rarm, PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr,
+                SDLY => Sdly, HASH => Hash),
+            ArrayKind::Aai => table!(aai;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr, SDLY => Sdly,
+                HASH => Hash),
+            ArrayKind::Aao => table!(aao;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr, SDLY => Sdly,
+                HASH => Hash),
+            ArrayKind::SubArray => table!(subArray;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr),
+        }
+    }
+}
+
 impl Record for WaveformRecord {
     fn acts_before_process(&self) -> bool {
         false
+    }
+
+    fn slot_ref(
+        &self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::SlotRef<'_>> {
+        Some(match self.slot_member(slot)? {
+            SlotMember::Rarm => (&self.rarm).into(),
+            SlotMember::Prec => (&self.prec).into(),
+            SlotMember::Egu => (&self.egu).into(),
+            SlotMember::Hopr => (&self.hopr).into(),
+            SlotMember::Lopr => (&self.lopr).into(),
+            SlotMember::Sdly => (&self.sdly).into(),
+            SlotMember::Hash => (&self.hash).into(),
+        })
+    }
+
+    fn slot_mut(
+        &mut self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::SlotMut<'_>> {
+        Some(match self.slot_member(slot)? {
+            SlotMember::Rarm => (&mut self.rarm).into(),
+            SlotMember::Prec => (&mut self.prec).into(),
+            SlotMember::Egu => (&mut self.egu).into(),
+            SlotMember::Hopr => (&mut self.hopr).into(),
+            SlotMember::Lopr => (&mut self.lopr).into(),
+            SlotMember::Sdly => (&mut self.sdly).into(),
+            SlotMember::Hash => (&mut self.hash).into(),
+        })
     }
 
     /// No kind has an `OVAL`: the served `VAL`, read directly rather than
     /// through the default's two by-name asks.
     fn output_link_value(&self) -> Option<EpicsValue> {
         Some(self.val.head(self.served_element_count()))
+    }
+
+    /// [`Self::output_link_value`], borrowed; aao's OUT writes it
+    /// (`devAaoSoft.c:56`). A `STRING` FTVL has no view.
+    fn output_view(&self) -> Option<crate::server::record::OutView<'_>> {
+        self.monitor_value_view()
+            .map(crate::server::record::OutView::Array)
     }
 
     /// The served `VAL` of [`Self::get_field`], borrowed. A `STRING` FTVL has
@@ -1377,7 +1456,7 @@ impl Record for WaveformRecord {
             "BUSY" if self.declares_busy() => Err(CaError::ReadOnlyField(name.to_string())),
             "EGU" => {
                 if let EpicsValue::String(s) = value {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("EGU".into()))

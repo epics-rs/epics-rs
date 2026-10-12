@@ -349,6 +349,21 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     mdel: String,
 /// }
 /// ```
+///
+/// A numeric or `PvStr` member is the record's [`Record::slot_mut`] at
+/// `slots::<type>::<FIELD>`, so a member the type's `.dbd` does not declare
+/// does not compile:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs")]
+/// struct Bad {
+///     #[field(type = "Long")]
+///     no_such_field: i32,
+/// }
+/// ```
 #[proc_macro_derive(EpicsRecord, attributes(record, field))]
 pub fn derive_epics_record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -526,6 +541,43 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
         })
         .collect();
+
+    // `slot_ref`/`slot_mut` over `slots::<record_type>`, through C3's
+    // `slot_map!`. Only a member whose emitted `put_field` arm is a plain
+    // store of the declared kind is mapped (`slot_mut` must store exactly what
+    // `put_field` stores); a read-only one gets a `slot_ref` only. A `menu()`
+    // member is stored `Short` but declared `DBF_MENU`, so it is not mapped
+    // ([`slot_kind`]).
+    // A mapped name the `.dbd` does not declare has no `slots::` constant and
+    // does not compile.
+    let slotted = |fi: &&FieldInfo| fi.menu_choices.is_none() && slot_kind(&fi.dbf_type);
+    let slot_arm = |fi: &FieldInfo| {
+        let field = proc_macro2::Ident::new(&fi.epics_name, fi.ident.span());
+        let ident = &fi.ident;
+        quote! { #field => #ident }
+    };
+    let rw_slots: Vec<_> = field_infos
+        .iter()
+        .filter(slotted)
+        .filter(|fi| !fi.read_only)
+        .map(slot_arm)
+        .collect();
+    let ro_slots: Vec<_> = field_infos
+        .iter()
+        .filter(slotted)
+        .filter(|fi| fi.read_only)
+        .map(slot_arm)
+        .collect();
+    let slot_methods = if rw_slots.is_empty() && ro_slots.is_empty() {
+        quote! {}
+    } else {
+        let rtype = proc_macro2::Ident::new(record_type_str, proc_macro2::Span::call_site());
+        quote! {
+            #krate::slot_map!(#krate::server::record::dbd_generated::slots::#rtype;
+                #(#rw_slots),*;
+                read_only: #(#ro_slots),*);
+        }
+    };
 
     // Generate menu_field_choices for any `#[field(menu_choices = ...)]`
     // fields, so a DBF_MENU field served as DBR_ENUM carries its menu()
@@ -956,6 +1008,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #link_text_method
             #simm_cells_method
             #seq_group_cells_method
+            #slot_methods
         }
     };
 
@@ -1115,6 +1168,19 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
     Ok((dbf_type, read_only, menu_choices, link))
 }
 
+/// A `#[field(type)]` whose member is a `SlotMut` variant agreeing with the
+/// `DBF_*` it is declared as, and whose `put_field` arm stores the matching
+/// `EpicsValue` as is. `Char` is a `u8` member for a signed `DBF_CHAR` and
+/// `String` a Rust `String`, neither a variant; `Short` is also how a
+/// `menu()` field is stored when it carries no `menu_choices` (`int64in.SIMS`),
+/// which the derive cannot tell from a `DBF_SHORT`.
+fn slot_kind(dbf_type: &str) -> bool {
+    matches!(
+        dbf_type,
+        "Double" | "Float" | "Long" | "Int64" | "Enum" | "UShort" | "PvStr"
+    )
+}
+
 /// The `CycleValue` variant a scan-cycle cell of `dbf_type` is read in, or
 /// `None` for a type that is not a number.
 /// The scan-cycle carriers that have a typed soft dset entry
@@ -1214,10 +1280,11 @@ fn value_from_epics(
     // `EpicsValue::String` variant wraps `PvString`, so convert on assign.
     // `PvStr` fields already store a `PvString`, so the wire bytes move in
     // verbatim — a non-UTF-8 value is preserved.
-    let assign = if dbf_type == "String" {
-        quote! { self.#field_ident = v.as_str_lossy().into_owned(); }
-    } else {
-        quote! { self.#field_ident = v; }
+    // A `PvStr` member keeps its buffer, so a reserve made at load holds.
+    let assign = match dbf_type {
+        "String" => quote! { self.#field_ident = v.as_str_lossy().into_owned(); },
+        "PvStr" => quote! { self.#field_ident.set_bytes(v.as_bytes()); },
+        _ => quote! { self.#field_ident = v; },
     };
 
     quote! {

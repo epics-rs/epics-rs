@@ -1,6 +1,6 @@
 use crate::error::CaResult;
 use crate::types::c_parse::Converted;
-use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
+use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, Scalar, c_parse};
 
 use super::CommonFields;
 use super::alarm::{AlarmLimit, AlarmSeverity};
@@ -141,11 +141,130 @@ pub enum Base {
     Hex,
 }
 
-/// A record type's index for one of its fields — C's `dbFldDes::offset`
-/// as a handle rather than a byte count. Meaningful only to the type that
-/// handed it out ([`Record::field_slot`]).
+/// A field's index in its record type's generated field table
+/// ([`Record::field_list`]) — C's `dbFldDes::offset` as a handle rather than
+/// a byte count. `dbd_generated::slots::<rtype>::<FIELD>` names each one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FieldSlot(pub u16);
+
+/// Declares the typed-slot pair: `SlotRef`/`SlotMut` with one variant per
+/// Rust storage type, and a `From<&T>`/`From<&mut T>` per variant so the
+/// variant always follows the member's type.
+macro_rules! typed_slots {
+    ($($variant:ident($ty:ty)),* $(,)?) => {
+        /// A borrowed field at a [`FieldSlot`] ([`Record::slot_ref`]), keyed by
+        /// the Rust type the record stores it as. A `DBF_ENUM` field is a
+        /// `U16`; the declaration ([`FieldDesc::dbf_type`]) tells the two apart.
+        #[derive(Debug)]
+        pub enum SlotRef<'a> {
+            $($variant(&'a $ty),)*
+        }
+
+        /// The writable twin of [`SlotRef`] ([`Record::slot_mut`]).
+        #[derive(Debug)]
+        pub enum SlotMut<'a> {
+            $($variant(&'a mut $ty),)*
+        }
+
+        $(
+            impl<'a> From<&'a $ty> for SlotRef<'a> {
+                fn from(v: &'a $ty) -> Self {
+                    SlotRef::$variant(v)
+                }
+            }
+
+            impl<'a> From<&'a mut $ty> for SlotMut<'a> {
+                fn from(v: &'a mut $ty) -> Self {
+                    SlotMut::$variant(v)
+                }
+            }
+        )*
+    };
+}
+
+typed_slots! {
+    F64(f64),
+    F32(f32),
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    Str(PvString),
+}
+
+impl SlotRef<'_> {
+    /// The field as `dbGet(DBR_DOUBLE)` delivers it ([`Record::get_slot_f64`]).
+    pub(crate) fn to_f64(&self) -> Option<f64> {
+        Some(match self {
+            SlotRef::F64(v) => **v,
+            SlotRef::F32(v) => f64::from(**v),
+            SlotRef::I8(v) => f64::from(**v),
+            SlotRef::U8(v) => f64::from(**v),
+            SlotRef::I16(v) => f64::from(**v),
+            SlotRef::U16(v) => f64::from(**v),
+            SlotRef::I32(v) => f64::from(**v),
+            SlotRef::U32(v) => f64::from(**v),
+            SlotRef::I64(v) => **v as f64,
+            SlotRef::U64(v) => **v as f64,
+            // `getStringDouble` (`dbConvert.c:392-414`).
+            SlotRef::Str(s) => c_parse::get_string(
+                c_parse::NumericField::of(DbFieldType::Double)?,
+                &s.as_str_lossy(),
+            )
+            .ok()?
+            .into_double()
+            .ok()?,
+        })
+    }
+}
+
+/// [`Record::slot_ref`] and [`Record::slot_mut`] over a record type's
+/// generated slot constants:
+///
+/// ```ignore
+/// slot_map!(crate::server::record::dbd_generated::slots::calc;
+///     VAL => val, A => vars[0];
+///     read_only: LA => prev[0]);
+/// ```
+///
+/// Each arm matches `slots::<rtype>::<FIELD>`, so a misspelt field does not
+/// compile, and the variant comes from the member's type. A `read_only:`
+/// field (`SPC_NOMOD`, refused by `put_field`) has a `slot_ref` and no
+/// `slot_mut`. Every `slot_mut` arm must store what `put_field(name, v)`
+/// stores (`every_slot_store_equals_the_name_store`).
+#[macro_export]
+macro_rules! slot_map {
+    ($($seg:ident)::+;
+     $($field:ident => $member:ident $([$i:expr])?),* $(,)?
+     $(; read_only: $($rfield:ident => $rmember:ident $([$ri:expr])?),* $(,)?)?) => {
+        fn slot_ref(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::SlotRef<'_>> {
+            use $($seg)::+ as __slots;
+            match slot {
+                $(__slots::$field => Some((&self.$member $([$i])?).into()),)*
+                $($(__slots::$rfield => Some((&self.$rmember $([$ri])?).into()),)*)?
+                _ => None,
+            }
+        }
+
+        fn slot_mut(
+            &mut self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::SlotMut<'_>> {
+            use $($seg)::+ as __slots;
+            match slot {
+                $(__slots::$field => Some((&mut self.$member $([$i])?).into()),)*
+                _ => None,
+            }
+        }
+    };
+}
 
 /// The `.dbd` declaration of a single record field.
 ///
@@ -3657,6 +3776,12 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// [`Self::raw_soft_output_value`], borrowed: C's `(dbrType, pbuffer)`
+    /// for the Raw Soft dset. `None` takes the materialised value.
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        None
+    }
+
     /// Apply a raw device value read *back* from an output record's device
     /// support (the asyn init seed and driver readback callback), the output
     /// counterpart of an input record's raw path, where device support
@@ -5648,14 +5773,30 @@ pub trait Record: Send + Sync + 'static {
         self.put_field_internal(field, EpicsValue::Double(value))
     }
 
-    /// C `dbFldDes::offset` for `field` (upper-case): a handle into the
-    /// record's own storage that [`Self::get_slot_f64`] takes in place of
-    /// the name, settled once per link target as `dbDbInitLink` settles a
-    /// `dbAddr`. A type hands out a slot ONLY for a field the typed accessor
-    /// answers; `None` (the default) sends every read of the field through
-    /// [`Self::get_field`] by name.
-    fn field_slot(&self, _field: &str) -> Option<FieldSlot> {
+    /// The field at `slot`, borrowed as the Rust type the record stores it
+    /// as. `None` (the default) for a field the type does not map; every
+    /// read of it then goes through [`Self::get_field`] by name.
+    /// [`slot_map!`](crate::slot_map) writes this and [`Self::slot_mut`].
+    fn slot_ref(&self, _slot: FieldSlot) -> Option<SlotRef<'_>> {
         None
+    }
+
+    /// The field at `slot`, writable. A store through it MUST equal what
+    /// [`Self::put_field`] stores for the same value; a field `put_field`
+    /// refuses has no `slot_mut`.
+    fn slot_mut(&mut self, _slot: FieldSlot) -> Option<SlotMut<'_>> {
+        None
+    }
+
+    /// C `dbFldDes::offset` for `field` (upper-case): its index in
+    /// [`Self::field_list`], settled once per link target as `dbDbInitLink`
+    /// settles a `dbAddr`. A type hands out a slot ONLY for a field
+    /// [`Self::slot_ref`] answers; `None` sends every read of the field
+    /// through [`Self::get_field`] by name.
+    fn field_slot(&self, field: &str) -> Option<FieldSlot> {
+        let at = self.field_list().iter().position(|f| f.name == field)?;
+        let slot = FieldSlot(u16::try_from(at).ok()?);
+        self.slot_ref(slot).is_some().then_some(slot)
     }
 
     /// The field at `slot` as `dbGet(DBR_DOUBLE)` delivers it: what
@@ -5663,19 +5804,26 @@ pub trait Record: Send + Sync + 'static {
     /// ([`EpicsValue::into_double`] / `get_convert_f64`) produces, without
     /// the value built and taken apart on the way. Defined for every slot
     /// [`Self::field_slot`] hands out; `None` for any other.
-    fn get_slot_f64(&self, _slot: FieldSlot) -> Option<f64> {
-        None
+    fn get_slot_f64(&self, slot: FieldSlot) -> Option<f64> {
+        self.slot_ref(slot)?.to_f64()
     }
 
     /// Store a multi-input link's scalar read at `slot`, the
     /// [`Self::field_slot`] of one of [`Self::multi_input_links`]' value
     /// fields — C's `dbGetLink(plink, DBR_DOUBLE, &prec->a + i, ...)` store
-    /// through the address instead of the name. `true` when stored; the
-    /// default stores nothing and the fetch falls back to
-    /// [`Self::put_multi_input_f64`]. A type that overrides this must store
-    /// exactly what `put_multi_input_f64` stores for that field.
-    fn put_slot_f64(&mut self, _slot: FieldSlot, _value: f64) -> bool {
-        false
+    /// through the address instead of the name. `true` when stored, which
+    /// the default does for an `f64` [`Self::slot_mut`] only; otherwise the
+    /// fetch falls back to [`Self::put_multi_input_f64`]. A type that
+    /// overrides this must store exactly what `put_multi_input_f64` stores
+    /// for that field.
+    fn put_slot_f64(&mut self, slot: FieldSlot, value: f64) -> bool {
+        match self.slot_mut(slot) {
+            Some(SlotMut::F64(v)) => {
+                *v = value;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The `(link_field, value_field)` pairs whose CONSTANT value this record's
@@ -6034,6 +6182,21 @@ pub trait Record: Send + Sync + 'static {
             CycleRead::Value(v) => Some(v.into()),
             CycleRead::Absent => self.val(),
             CycleRead::ByName => self.get_field("OVAL").or_else(|| self.val()),
+        }
+    }
+
+    /// [`Self::output_link_value`], borrowed: C's `dbPutLink(&prec->out,
+    /// dbrType, pbuffer, nRequest)` copies nothing. `None` means no borrowed
+    /// view, and the caller takes `output_link_value`; a `Some` view is that
+    /// value. The default answers only a numeric OVAL (else VAL) cell.
+    fn output_view(&self) -> Option<OutView<'_>> {
+        let cell = match self.cycle_cell(CycleCell::Oval) {
+            CycleRead::Absent => self.cycle_cell(CycleCell::Val),
+            oval => oval,
+        };
+        match cell {
+            CycleRead::Value(v) => Some(OutView::Num(v.into())),
+            CycleRead::Absent | CycleRead::ByName => None,
         }
     }
 
@@ -7032,20 +7195,27 @@ fn coerce_put_value_in_row<R: Record + ?Sized>(
             cap_string_to_field_size(record, field, s),
         )));
     }
-    // The float/double rows of C's DBR_STRING put column render through the
-    // record's `get_precision`, seeded 6: `putFloatString`/`putDoubleString`
-    // (`dbConvert.c:1558`/`:1600`) for the array path,
-    // `cvt_f_st`/`cvt_d_st` (`dbFastLinkConv.c:1216`/`:1333`) for the scalar
-    // one that `dbAccess.c:1391` actually takes. `convert_to` cannot express
-    // it — it is field-blind by contract, and precision is the record's — so
-    // the row belongs here, next to the menu and enum rows it also cannot
-    // express. Rendering through the GET direction's own converter is what
-    // keeps `dbtgf REC.DESC` and a `caput` of the same number agreeing.
-    if target == DbFieldType::String
-        && let Some(rendered) =
+    // C's DBR_STRING put column renders a number at the record's
+    // `get_precision`, seeded 6: `cvt_*_st` (`dbFastLinkConv.c:1216`/`:1333`)
+    // for the scalar `dbAccess.c:1391` takes, through the one renderer the
+    // lean `Str` arm also uses. A long-string field is `DBF_STRING` of
+    // `field_size = SIZV` in its `cvt_dbaddr` (`lsoRecord.c:183-186`), so it
+    // takes the same row and `putStringString`'s cap.
+    if target == DbFieldType::String || record.field_is_long_string(field) {
+        if let Some(n) = value.num() {
+            let text = crate::server::database::render_for_string_target(record, n)
+                .ok_or_else(|| crate::error::CaError::TypeMismatch(field.into()))?;
+            return Ok(Converted::Stored(EpicsValue::String(
+                cap_string_to_field_size(record, field, PvString::from(text.as_bytes())),
+            )));
+        }
+        // `putFloatString`/`putDoubleString` (`dbConvert.c:1558`/`:1600`)
+        // per element of an array request.
+        if let Some(rendered) =
             crate::types::codec::dbr_string_at_precision(&value, put_string_precision(record))
-    {
-        return Ok(Converted::Stored(rendered));
+        {
+            return Ok(Converted::Stored(rendered));
+        }
     }
     Ok(Converted::Stored(value.into_type(target)))
 }
@@ -7288,10 +7458,222 @@ mod declaration_numbering_tests {
     }
 }
 
+/// `(record type, field)` pairs declared `Special::None` whose put still
+/// runs a hook — a `special()` or `on_put` arm the `.dbd` cannot see. C
+/// skips `dbPutSpecial` when `special == 0`; a lean put here would skip the
+/// hook as well, so these take the general put.
+/// `special_none_fields_have_no_put_hooks` holds the list.
+pub const FORCE_GENERAL: &[(&str, &str)] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::records::compress::CompressRecord;
+
+    /// Every module-owned type too: the sweeps below cover `RECORD_TYPES`.
+    fn any_record(record_type: &str) -> Box<dyn Record> {
+        use crate::server::records::{
+            acalcout::AcalcoutRecord, asyn_record::AsynRecord, busy::BusyRecord,
+            scalcout::ScalcoutRecord, sseq::SseqRecord, swait::SwaitRecord,
+            transform::TransformRecord,
+        };
+        fn f<R: Record + Default + 'static>() -> crate::server::RecordFactory {
+            Box::new(|| Box::new(R::default()))
+        }
+        let factories = std::collections::HashMap::from([
+            ("acalcout".to_string(), f::<AcalcoutRecord>()),
+            ("asyn".to_string(), f::<AsynRecord>()),
+            ("busy".to_string(), f::<BusyRecord>()),
+            ("scalcout".to_string(), f::<ScalcoutRecord>()),
+            ("sseq".to_string(), f::<SseqRecord>()),
+            ("swait".to_string(), f::<SwaitRecord>()),
+            ("transform".to_string(), f::<TransformRecord>()),
+        ]);
+        crate::server::db_loader::create_record_with_factories(record_type, &factories)
+            .unwrap_or_else(|e| panic!("{record_type}: {e}"))
+    }
+
+    /// Every field of `record` as `get_field` reads it, NaN-safe.
+    fn image(record: &dyn Record) -> Vec<String> {
+        record
+            .field_list()
+            .iter()
+            .map(|f| format!("{}={:?}", f.name, record.get_field(f.name)))
+            .collect()
+    }
+
+    /// The value a slot of this variant is stored with, as `put_field` takes it
+    /// for a field declared `dbf`, for each boundary of the kind.
+    fn boundary_puts(slot: &SlotMut<'_>, dbf: DbFieldType) -> Vec<EpicsValue> {
+        macro_rules! ints {
+            ($t:ty, $wrap:expr) => {
+                [0 as $t, (-1i64) as $t, <$t>::MAX, <$t>::MIN]
+                    .into_iter()
+                    .map($wrap)
+                    .collect()
+            };
+        }
+        match slot {
+            SlotMut::F64(_) => [0.0, -1.0, f64::MAX, f64::NAN]
+                .into_iter()
+                .map(EpicsValue::Double)
+                .collect(),
+            SlotMut::F32(_) => [0.0, -1.0, f32::MAX, f32::NAN]
+                .into_iter()
+                .map(EpicsValue::Float)
+                .collect(),
+            SlotMut::I8(_) => ints!(i8, |v| EpicsValue::Char(v as u8)),
+            SlotMut::U8(_) => ints!(u8, EpicsValue::UChar),
+            SlotMut::I16(_) => ints!(i16, EpicsValue::Short),
+            SlotMut::U16(_) if dbf == DbFieldType::Enum => ints!(u16, EpicsValue::Enum),
+            SlotMut::U16(_) => ints!(u16, EpicsValue::UShort),
+            SlotMut::I32(_) => ints!(i32, EpicsValue::Long),
+            SlotMut::U32(_) => ints!(u32, EpicsValue::ULong),
+            SlotMut::I64(_) => ints!(i64, EpicsValue::Int64),
+            SlotMut::U64(_) => ints!(u64, EpicsValue::UInt64),
+            SlotMut::Str(_) => ["x".repeat(39), "y".repeat(40)]
+                .into_iter()
+                .map(|s| EpicsValue::String(s.into()))
+                .collect(),
+        }
+    }
+
+    /// The `DBF_*` a slot of this variant may be declared as.
+    fn variant_agrees(slot: &SlotRef<'_>, dbf: DbFieldType) -> bool {
+        use DbFieldType as T;
+        matches!(
+            (slot, dbf),
+            (SlotRef::F64(_), T::Double)
+                | (SlotRef::F32(_), T::Float)
+                | (SlotRef::I8(_), T::Char)
+                | (SlotRef::U8(_), T::UChar)
+                | (SlotRef::I16(_), T::Short)
+                | (SlotRef::U16(_), T::UShort | T::Enum)
+                | (SlotRef::I32(_), T::Long)
+                | (SlotRef::U32(_), T::ULong)
+                | (SlotRef::I64(_), T::Int64)
+                | (SlotRef::U64(_), T::UInt64)
+                | (SlotRef::Str(_), T::String)
+        )
+    }
+
+    /// `value` as a `dbPut` hands it to the record: `putStringString` keeps
+    /// `field_size - 1` bytes of a `DBF_STRING` (`dbConvert.c:923-924`).
+    fn as_put(value: EpicsValue, desc: &FieldDesc) -> EpicsValue {
+        match value {
+            EpicsValue::String(s) if desc.size > 0 => {
+                let keep = s.len().min(usize::from(desc.size) - 1);
+                EpicsValue::String(s.as_bytes()[..keep].into())
+            }
+            other => other,
+        }
+    }
+
+    fn store(slot: SlotMut<'_>, value: &EpicsValue) {
+        match (slot, value) {
+            (SlotMut::F64(s), EpicsValue::Double(v)) => *s = *v,
+            (SlotMut::F32(s), EpicsValue::Float(v)) => *s = *v,
+            (SlotMut::I8(s), EpicsValue::Char(v)) => *s = *v as i8,
+            (SlotMut::U8(s), EpicsValue::UChar(v)) => *s = *v,
+            (SlotMut::I16(s), EpicsValue::Short(v)) => *s = *v,
+            (SlotMut::U16(s), EpicsValue::UShort(v) | EpicsValue::Enum(v)) => *s = *v,
+            (SlotMut::I32(s), EpicsValue::Long(v)) => *s = *v,
+            (SlotMut::U32(s), EpicsValue::ULong(v)) => *s = *v,
+            (SlotMut::I64(s), EpicsValue::Int64(v)) => *s = *v,
+            (SlotMut::U64(s), EpicsValue::UInt64(v)) => *s = *v,
+            (SlotMut::Str(s), EpicsValue::String(v)) => *s = v.clone(),
+            (slot, value) => panic!("{slot:?} cannot hold {value:?}"),
+        }
+    }
+
+    /// `slot_mut(slot)` stores exactly what `put_field(name, v)` stores, its
+    /// variant is the declared `DBF_*`, and `field_slot` hands out exactly the
+    /// slots `slot_ref` answers. A slot pointing at the wrong member, or one
+    /// whose `put_field` arm does more than store, fails here.
+    #[test]
+    fn every_slot_store_equals_the_name_store() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let mut checked = 0usize;
+        for record_type in RECORD_TYPES {
+            let probe = any_record(record_type);
+            for (i, desc) in probe.field_list().iter().enumerate() {
+                let slot = FieldSlot(i as u16);
+                let at = format!("{record_type}.{}", desc.name);
+                let answered = probe.slot_ref(slot);
+                let read = probe.get_slot_f64(slot).map(f64::to_bits);
+                let funnel = answered
+                    .as_ref()
+                    .and_then(SlotRef::to_f64)
+                    .map(f64::to_bits);
+                assert_eq!(read, funnel, "{at}: get_slot_f64 disagrees with slot_ref");
+                assert_eq!(
+                    probe.field_slot(desc.name),
+                    answered.as_ref().map(|_| slot),
+                    "{at}: field_slot disagrees with slot_ref"
+                );
+                if let Some(r) = &answered {
+                    assert!(
+                        variant_agrees(r, desc.dbf_type),
+                        "{at}: {r:?} for {:?}",
+                        desc.dbf_type
+                    );
+                }
+                let mut shape = any_record(record_type);
+                let Some(m) = shape.slot_mut(slot) else {
+                    continue;
+                };
+                assert!(answered.is_some(), "{at}: slot_mut without slot_ref");
+                for value in boundary_puts(&m, desc.dbf_type) {
+                    let value = as_put(value, desc);
+                    let mut by_slot = any_record(record_type);
+                    store(by_slot.slot_mut(slot).unwrap(), &value);
+                    let mut by_name = any_record(record_type);
+                    by_name
+                        .put_field(desc.name, value.clone())
+                        .unwrap_or_else(|e| panic!("{at}: put_field({value:?}): {e}"));
+                    assert_eq!(image(&*by_slot), image(&*by_name), "{at} <- {value:?}");
+                    if let EpicsValue::Double(v) = value {
+                        let mut by_put = any_record(record_type);
+                        if by_put.put_slot_f64(slot, v) {
+                            assert_eq!(image(&*by_put), image(&*by_name), "{at} put_slot_f64");
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no type maps a slot");
+    }
+
+    /// C `dbPut` skips `dbPutSpecial` for a field whose `special` is 0, and a
+    /// lean put does the same, so every `Special::None` field outside
+    /// [`FORCE_GENERAL`] must leave every field unchanged through
+    /// `special(f, false)`, `special(f, true)` and `on_put(f)`.
+    #[test]
+    fn special_none_fields_have_no_put_hooks() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let mut hooked = Vec::new();
+        for record_type in RECORD_TYPES {
+            let fields = any_record(record_type).field_list();
+            for desc in fields {
+                if desc.special != Special::None
+                    || FORCE_GENERAL.contains(&(*record_type, desc.name))
+                {
+                    continue;
+                }
+                let mut record = any_record(record_type);
+                let before = image(&*record);
+                let ran = record
+                    .special(desc.name, false)
+                    .and_then(|()| record.special(desc.name, true));
+                record.on_put(desc.name);
+                if ran.is_err() || image(&*record) != before {
+                    hooked.push((*record_type, desc.name));
+                }
+            }
+        }
+        assert!(hooked.is_empty(), "not on FORCE_GENERAL: {hooked:?}");
+    }
 
     /// `prec->lalm = val` into a CHAR cell is `PUT(epicsFloat64, char)`
     /// (`dbConvert.c:1631`), a signed cast: -5.5 is 0xfb.
@@ -7992,27 +8374,163 @@ mod tests {
         }
     }
 
+    /// A borrowed value, copied out.
+    fn owned(view: ValueView<'_>) -> EpicsValue {
+        match view {
+            ValueView::Scalar(v) => v.into(),
+            ValueView::Double(a) => EpicsValue::DoubleArray(a.to_vec().into()),
+            ValueView::Float(a) => EpicsValue::FloatArray(a.to_vec().into()),
+            ValueView::Long(a) => EpicsValue::LongArray(a.to_vec().into()),
+            ValueView::ULong(a) => EpicsValue::ULongArray(a.to_vec().into()),
+            ValueView::Int64(a) => EpicsValue::Int64Array(a.to_vec().into()),
+            ValueView::UInt64(a) => EpicsValue::UInt64Array(a.to_vec().into()),
+            ValueView::Short(a) => EpicsValue::ShortArray(a.to_vec().into()),
+            ValueView::UShort(a) => EpicsValue::UShortArray(a.to_vec().into()),
+            ValueView::Char(a) => EpicsValue::CharArray(a.to_vec().into()),
+            ValueView::UChar(a) => EpicsValue::UCharArray(a.to_vec().into()),
+            ValueView::Enum(a) => EpicsValue::EnumArray(a.to_vec().into()),
+        }
+    }
+
+    /// `view`, materialised, is `value`. A `Num` carries no `DBR_*`, so it
+    /// is compared as the `Scalar` the value's carrier narrows through.
+    fn view_is(view: OutView<'_>, value: &EpicsValue) -> bool {
+        match view {
+            OutView::Num(n) => CycleValue::from_epics(value)
+                .map(Scalar::from)
+                .is_some_and(|v| format!("{v:?}") == format!("{n:?}")),
+            OutView::Str(b) => matches!(value, EpicsValue::String(v) if v.as_bytes() == b),
+            OutView::Chars(b) => matches!(value, EpicsValue::CharArray(v) if v[..] == *b),
+            OutView::Array(a) => owned(a) == *value,
+        }
+    }
+
+    /// The states the sweep below reads each type's output in: default, then
+    /// VAL, then OVAL stored (numeric and string forms, whichever it takes),
+    /// then the type's own boundaries.
+    fn output_states(record_type: &str) -> Vec<Box<dyn Record>> {
+        let common = [
+            ("VAL", EpicsValue::Double(-3.25)),
+            ("VAL", EpicsValue::String("41".into())),
+            ("OVAL", EpicsValue::Double(6.5)),
+            ("OVAL", EpicsValue::String("17".into())),
+        ];
+        let runs: Vec<&[(&str, EpicsValue)]> = (0..=common.len()).map(|n| &common[..n]).collect();
+        let lso_full = EpicsValue::CharArray([&[b'y'; 40][..], &[0]].concat().into());
+        let own: &[&[(&str, EpicsValue)]] = match record_type {
+            "swait" => &[
+                &[
+                    ("DOPT", EpicsValue::Short(0)),
+                    ("DOLD", EpicsValue::Double(9.5)),
+                ],
+                &[
+                    ("DOPT", EpicsValue::Short(1)),
+                    ("DOLD", EpicsValue::Double(9.5)),
+                ],
+            ],
+            "ao" => &[
+                &[("RVAL", EpicsValue::Long(i32::MIN))],
+                &[("RVAL", EpicsValue::Long(-1))],
+            ],
+            "stringout" => &[
+                &[("VAL", EpicsValue::String("z".repeat(39).into()))],
+                &[("VAL", EpicsValue::String("".into()))],
+            ],
+            // LEN 0 is the default state; a full SIZV (41) is 40 bytes and the NUL.
+            "lso" => &[&[("VAL", lso_full)]],
+            // FTVL DOUBLE (the default STRING has no view): NORD = NELM, then 0.
+            "aao" => &[
+                &[
+                    ("FTVL", EpicsValue::Short(10)),
+                    ("NELM", EpicsValue::ULong(2)),
+                    ("VAL", EpicsValue::DoubleArray(vec![1.5, 2.5].into())),
+                ],
+                &[
+                    ("FTVL", EpicsValue::Short(10)),
+                    ("NELM", EpicsValue::ULong(2)),
+                    ("VAL", EpicsValue::DoubleArray(vec![1.5, 2.5].into())),
+                    ("VAL", EpicsValue::DoubleArray(Vec::new().into())),
+                ],
+            ],
+            "mbbo" => &[
+                &[("RVAL", EpicsValue::ULong(u32::MAX))],
+                &[
+                    ("RVAL", EpicsValue::ULong(u32::MAX)),
+                    ("MASK", EpicsValue::ULong(0x8000_0ff0)),
+                ],
+            ],
+            "mbboDirect" => &[
+                &[("RVAL", EpicsValue::ULong(u32::MAX))],
+                &[
+                    ("RVAL", EpicsValue::ULong(u32::MAX)),
+                    ("MASK", EpicsValue::ULong(0x8000_0ff0)),
+                ],
+            ],
+            "bo" => &[
+                &[("RVAL", EpicsValue::ULong(u32::MAX))],
+                &[("RVAL", EpicsValue::ULong(0x8000_0001))],
+            ],
+            _ => &[],
+        };
+        let mut states: Vec<Box<dyn Record>> = runs
+            .iter()
+            .map(|run| {
+                let mut r = any_record(record_type);
+                for (field, value) in *run {
+                    let _ = r.put_field(field, value.clone());
+                }
+                r
+            })
+            .collect();
+        // A type's own boundary must hold, or its case tests nothing.
+        for run in own {
+            let mut r = any_record(record_type);
+            for (field, value) in *run {
+                r.put_field(field, value.clone()).unwrap();
+                assert_eq!(
+                    r.get_field(field).as_ref(),
+                    Some(value),
+                    "{record_type}.{field}"
+                );
+            }
+            states.push(r);
+        }
+        states
+    }
+
+    /// A `Some` output view is the value [`Record::output_link_value`] (and
+    /// [`Record::raw_soft_output_value`]) materialises, for every type and
+    /// state; `None` falls back to that value, so it is never wrong.
+    #[test]
+    fn output_view_matches_output_link_value() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let mut viewed = 0usize;
+        let mut wrong = Vec::new();
+        for record_type in RECORD_TYPES {
+            for (i, r) in output_states(record_type).iter().enumerate() {
+                for (view, value, what) in [
+                    (r.output_view(), r.output_link_value(), "output"),
+                    (r.raw_soft_output_view(), r.raw_soft_output_value(), "raw"),
+                ] {
+                    let Some(view) = view else { continue };
+                    if !value.as_ref().is_some_and(|v| view_is(view, v)) {
+                        wrong.push(format!(
+                            "{record_type} state {i} {what}: {view:?} vs {value:?}"
+                        ));
+                    }
+                    viewed += 1;
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(viewed > 0, "no type lends its output");
+    }
+
     /// A lent value is the one [`Record::val`] would copy, and the queries that
     /// read it answer as they would from the copy.
     #[test]
     fn a_lent_value_is_what_val_would_copy() {
         use crate::server::record::dbd_generated::RECORD_TYPES;
-        fn owned(view: ValueView<'_>) -> EpicsValue {
-            match view {
-                ValueView::Scalar(v) => v.into(),
-                ValueView::Double(a) => EpicsValue::DoubleArray(a.to_vec().into()),
-                ValueView::Float(a) => EpicsValue::FloatArray(a.to_vec().into()),
-                ValueView::Long(a) => EpicsValue::LongArray(a.to_vec().into()),
-                ValueView::ULong(a) => EpicsValue::ULongArray(a.to_vec().into()),
-                ValueView::Int64(a) => EpicsValue::Int64Array(a.to_vec().into()),
-                ValueView::UInt64(a) => EpicsValue::UInt64Array(a.to_vec().into()),
-                ValueView::Short(a) => EpicsValue::ShortArray(a.to_vec().into()),
-                ValueView::UShort(a) => EpicsValue::UShortArray(a.to_vec().into()),
-                ValueView::Char(a) => EpicsValue::CharArray(a.to_vec().into()),
-                ValueView::UChar(a) => EpicsValue::UCharArray(a.to_vec().into()),
-                ValueView::Enum(a) => EpicsValue::EnumArray(a.to_vec().into()),
-            }
-        }
         // The last step lowers SIZV under a VAL already stored, so the lent
         // value has to apply the cap `val` applies.
         let steps = [
@@ -8460,6 +8978,39 @@ pub enum ValueView<'a> {
     Char(&'a [u8]),
     UChar(&'a [u8]),
     Enum(&'a [u16]),
+}
+
+/// An output value, borrowed from the record that holds it
+/// ([`Record::output_view`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutView<'a> {
+    /// A numeric field (OVAL, VAL, RVAL ...).
+    Num(Scalar),
+    /// A `DBR_STRING` value, up to its NUL.
+    Str(&'a [u8]),
+    /// A `DBR_CHAR` array of `nRequest` elements (a long string).
+    Chars(&'a [u8]),
+    /// A numeric array, `nRequest` = its length.
+    Array(ValueView<'a>),
+}
+
+impl From<CycleValue> for Scalar {
+    /// As `EpicsValue` classifies the same carrier for narrowing.
+    #[inline]
+    fn from(value: CycleValue) -> Self {
+        match value {
+            CycleValue::Double(v) => Self::Float(v),
+            CycleValue::Float(v) => Self::F32(v),
+            CycleValue::Long(v) => Self::Int(v.into()),
+            CycleValue::ULong(v) => Self::Int(v.into()),
+            CycleValue::Int64(v) => Self::Int(v),
+            CycleValue::UInt64(v) => Self::U64(v),
+            CycleValue::Short(v) => Self::Int(v.into()),
+            CycleValue::UShort(v) | CycleValue::Enum(v) => Self::Int(v.into()),
+            CycleValue::Char(v) => Self::Int((v as i8).into()),
+            CycleValue::UChar(v) => Self::Int(v.into()),
+        }
+    }
 }
 
 impl From<CycleValue> for EpicsValue {

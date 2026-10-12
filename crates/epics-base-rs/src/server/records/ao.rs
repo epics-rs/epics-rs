@@ -1,10 +1,10 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
 };
 use crate::server::records::convert_phase::ConvertPhase;
-use crate::types::{EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString, Scalar};
 
 /// Choice labels for the output-increment-format menu, in index order.
 /// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
@@ -347,6 +347,37 @@ impl AoRecord {
 }
 
 impl Record for AoRecord {
+    // LINR/EGUF/EGUL reset the convert in `put_field`; menus are stored as
+    // `i16` and served as ENUM, so neither maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::ao;
+        VAL => val,
+        OVAL => oval,
+        OROC => oroc,
+        PREC => prec,
+        EGU => egu,
+        ROFF => roff,
+        EOFF => eoff,
+        ESLO => eslo,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        AOFF => aoff,
+        ASLO => aslo,
+        ADEL => adel,
+        MDEL => mdel,
+        RVAL => rval,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        ORAW => oraw,
+        RBV => rbv,
+        ORBV => orbv,
+        PVAL => pval,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst);
+
     fn held_pointer(&self, field: &str) -> Option<usize> {
         match field {
             // C `pbrk`, the table `cvtRawToEngBpt`/`cvtEngToRawBpt` found.
@@ -406,6 +437,10 @@ impl Record for AoRecord {
     /// &prec->rval, 1)` — the raw word, unmasked, as DBR_LONG.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::Long(self.rval))
+    }
+
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(Scalar::Int(self.rval.into())))
     }
 
     /// C `aoRecord.c:112-113`:
@@ -715,7 +750,7 @@ impl Record for AoRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

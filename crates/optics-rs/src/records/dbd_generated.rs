@@ -32,6 +32,12 @@
 //!   Carried is not servable: `FieldDesc::unreadable` is what refuses
 //!   the read, so the SEARCH is answered off the descriptor instead of
 //!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
@@ -3947,6 +3953,196 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["table"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod table {
+        use super::FieldSlot;
+        pub const VERS: FieldSlot = FieldSlot(0);
+        pub const VAL: FieldSlot = FieldSlot(1);
+        pub const LX: FieldSlot = FieldSlot(2);
+        pub const LZ: FieldSlot = FieldSlot(3);
+        pub const SX: FieldSlot = FieldSlot(4);
+        pub const SY: FieldSlot = FieldSlot(5);
+        pub const SZ: FieldSlot = FieldSlot(6);
+        pub const RX: FieldSlot = FieldSlot(7);
+        pub const RY: FieldSlot = FieldSlot(8);
+        pub const RZ: FieldSlot = FieldSlot(9);
+        pub const YANG: FieldSlot = FieldSlot(10);
+        pub const AX: FieldSlot = FieldSlot(11);
+        pub const AY: FieldSlot = FieldSlot(12);
+        pub const AZ: FieldSlot = FieldSlot(13);
+        pub const X: FieldSlot = FieldSlot(14);
+        pub const Y: FieldSlot = FieldSlot(15);
+        pub const Z: FieldSlot = FieldSlot(16);
+        pub const AX0: FieldSlot = FieldSlot(17);
+        pub const AY0: FieldSlot = FieldSlot(18);
+        pub const AZ0: FieldSlot = FieldSlot(19);
+        pub const X0: FieldSlot = FieldSlot(20);
+        pub const Y0: FieldSlot = FieldSlot(21);
+        pub const Z0: FieldSlot = FieldSlot(22);
+        pub const AXL: FieldSlot = FieldSlot(23);
+        pub const AYL: FieldSlot = FieldSlot(24);
+        pub const AZL: FieldSlot = FieldSlot(25);
+        pub const XL: FieldSlot = FieldSlot(26);
+        pub const YL: FieldSlot = FieldSlot(27);
+        pub const ZL: FieldSlot = FieldSlot(28);
+        pub const AXRB: FieldSlot = FieldSlot(29);
+        pub const AYRB: FieldSlot = FieldSlot(30);
+        pub const AZRB: FieldSlot = FieldSlot(31);
+        pub const XRB: FieldSlot = FieldSlot(32);
+        pub const YRB: FieldSlot = FieldSlot(33);
+        pub const ZRB: FieldSlot = FieldSlot(34);
+        pub const EAX: FieldSlot = FieldSlot(35);
+        pub const EAY: FieldSlot = FieldSlot(36);
+        pub const EAZ: FieldSlot = FieldSlot(37);
+        pub const EX: FieldSlot = FieldSlot(38);
+        pub const EY: FieldSlot = FieldSlot(39);
+        pub const EZ: FieldSlot = FieldSlot(40);
+        pub const HLAX: FieldSlot = FieldSlot(41);
+        pub const HLAY: FieldSlot = FieldSlot(42);
+        pub const HLAZ: FieldSlot = FieldSlot(43);
+        pub const HLX: FieldSlot = FieldSlot(44);
+        pub const HLY: FieldSlot = FieldSlot(45);
+        pub const HLZ: FieldSlot = FieldSlot(46);
+        pub const LLAX: FieldSlot = FieldSlot(47);
+        pub const LLAY: FieldSlot = FieldSlot(48);
+        pub const LLAZ: FieldSlot = FieldSlot(49);
+        pub const LLX: FieldSlot = FieldSlot(50);
+        pub const LLY: FieldSlot = FieldSlot(51);
+        pub const LLZ: FieldSlot = FieldSlot(52);
+        pub const UHAX: FieldSlot = FieldSlot(53);
+        pub const UHAY: FieldSlot = FieldSlot(54);
+        pub const UHAZ: FieldSlot = FieldSlot(55);
+        pub const UHX: FieldSlot = FieldSlot(56);
+        pub const UHY: FieldSlot = FieldSlot(57);
+        pub const UHZ: FieldSlot = FieldSlot(58);
+        pub const ULAX: FieldSlot = FieldSlot(59);
+        pub const ULAY: FieldSlot = FieldSlot(60);
+        pub const ULAZ: FieldSlot = FieldSlot(61);
+        pub const ULX: FieldSlot = FieldSlot(62);
+        pub const ULY: FieldSlot = FieldSlot(63);
+        pub const ULZ: FieldSlot = FieldSlot(64);
+        pub const UHAXR: FieldSlot = FieldSlot(65);
+        pub const UHAYR: FieldSlot = FieldSlot(66);
+        pub const UHAZR: FieldSlot = FieldSlot(67);
+        pub const UHXR: FieldSlot = FieldSlot(68);
+        pub const UHYR: FieldSlot = FieldSlot(69);
+        pub const UHZR: FieldSlot = FieldSlot(70);
+        pub const ULAXR: FieldSlot = FieldSlot(71);
+        pub const ULAYR: FieldSlot = FieldSlot(72);
+        pub const ULAZR: FieldSlot = FieldSlot(73);
+        pub const ULXR: FieldSlot = FieldSlot(74);
+        pub const ULYR: FieldSlot = FieldSlot(75);
+        pub const ULZR: FieldSlot = FieldSlot(76);
+        pub const M0XL: FieldSlot = FieldSlot(77);
+        pub const M0YL: FieldSlot = FieldSlot(78);
+        pub const M1YL: FieldSlot = FieldSlot(79);
+        pub const M2XL: FieldSlot = FieldSlot(80);
+        pub const M2YL: FieldSlot = FieldSlot(81);
+        pub const M2ZL: FieldSlot = FieldSlot(82);
+        pub const M0X: FieldSlot = FieldSlot(83);
+        pub const M0Y: FieldSlot = FieldSlot(84);
+        pub const M1Y: FieldSlot = FieldSlot(85);
+        pub const M2X: FieldSlot = FieldSlot(86);
+        pub const M2Y: FieldSlot = FieldSlot(87);
+        pub const M2Z: FieldSlot = FieldSlot(88);
+        pub const R0XI: FieldSlot = FieldSlot(89);
+        pub const R0YI: FieldSlot = FieldSlot(90);
+        pub const R1YI: FieldSlot = FieldSlot(91);
+        pub const R2XI: FieldSlot = FieldSlot(92);
+        pub const R2YI: FieldSlot = FieldSlot(93);
+        pub const R2ZI: FieldSlot = FieldSlot(94);
+        pub const R0X: FieldSlot = FieldSlot(95);
+        pub const R0Y: FieldSlot = FieldSlot(96);
+        pub const R1Y: FieldSlot = FieldSlot(97);
+        pub const R2X: FieldSlot = FieldSlot(98);
+        pub const R2Y: FieldSlot = FieldSlot(99);
+        pub const R2Z: FieldSlot = FieldSlot(100);
+        pub const E0XI: FieldSlot = FieldSlot(101);
+        pub const E0YI: FieldSlot = FieldSlot(102);
+        pub const E1YI: FieldSlot = FieldSlot(103);
+        pub const E2XI: FieldSlot = FieldSlot(104);
+        pub const E2YI: FieldSlot = FieldSlot(105);
+        pub const E2ZI: FieldSlot = FieldSlot(106);
+        pub const E0X: FieldSlot = FieldSlot(107);
+        pub const E0Y: FieldSlot = FieldSlot(108);
+        pub const E1Y: FieldSlot = FieldSlot(109);
+        pub const E2X: FieldSlot = FieldSlot(110);
+        pub const E2Y: FieldSlot = FieldSlot(111);
+        pub const E2Z: FieldSlot = FieldSlot(112);
+        pub const V0XL: FieldSlot = FieldSlot(113);
+        pub const V0YL: FieldSlot = FieldSlot(114);
+        pub const V1YL: FieldSlot = FieldSlot(115);
+        pub const V2XL: FieldSlot = FieldSlot(116);
+        pub const V2YL: FieldSlot = FieldSlot(117);
+        pub const V2ZL: FieldSlot = FieldSlot(118);
+        pub const V0X: FieldSlot = FieldSlot(119);
+        pub const V0Y: FieldSlot = FieldSlot(120);
+        pub const V1Y: FieldSlot = FieldSlot(121);
+        pub const V2X: FieldSlot = FieldSlot(122);
+        pub const V2Y: FieldSlot = FieldSlot(123);
+        pub const V2Z: FieldSlot = FieldSlot(124);
+        pub const V0XI: FieldSlot = FieldSlot(125);
+        pub const V0YI: FieldSlot = FieldSlot(126);
+        pub const V1YI: FieldSlot = FieldSlot(127);
+        pub const V2XI: FieldSlot = FieldSlot(128);
+        pub const V2YI: FieldSlot = FieldSlot(129);
+        pub const V2ZI: FieldSlot = FieldSlot(130);
+        pub const H0XL: FieldSlot = FieldSlot(131);
+        pub const H0YL: FieldSlot = FieldSlot(132);
+        pub const H1YL: FieldSlot = FieldSlot(133);
+        pub const H2XL: FieldSlot = FieldSlot(134);
+        pub const H2YL: FieldSlot = FieldSlot(135);
+        pub const H2ZL: FieldSlot = FieldSlot(136);
+        pub const H0X: FieldSlot = FieldSlot(137);
+        pub const H0Y: FieldSlot = FieldSlot(138);
+        pub const H1Y: FieldSlot = FieldSlot(139);
+        pub const H2X: FieldSlot = FieldSlot(140);
+        pub const H2Y: FieldSlot = FieldSlot(141);
+        pub const H2Z: FieldSlot = FieldSlot(142);
+        pub const L0XL: FieldSlot = FieldSlot(143);
+        pub const L0YL: FieldSlot = FieldSlot(144);
+        pub const L1YL: FieldSlot = FieldSlot(145);
+        pub const L2XL: FieldSlot = FieldSlot(146);
+        pub const L2YL: FieldSlot = FieldSlot(147);
+        pub const L2ZL: FieldSlot = FieldSlot(148);
+        pub const L0X: FieldSlot = FieldSlot(149);
+        pub const L0Y: FieldSlot = FieldSlot(150);
+        pub const L1Y: FieldSlot = FieldSlot(151);
+        pub const L2X: FieldSlot = FieldSlot(152);
+        pub const L2Y: FieldSlot = FieldSlot(153);
+        pub const L2Z: FieldSlot = FieldSlot(154);
+        pub const INIT: FieldSlot = FieldSlot(155);
+        pub const ZERO: FieldSlot = FieldSlot(156);
+        pub const SYNC: FieldSlot = FieldSlot(157);
+        pub const READ: FieldSlot = FieldSlot(158);
+        pub const SET: FieldSlot = FieldSlot(159);
+        pub const SSET: FieldSlot = FieldSlot(160);
+        pub const SUSE: FieldSlot = FieldSlot(161);
+        pub const LVIO: FieldSlot = FieldSlot(162);
+        pub const PP0: FieldSlot = FieldSlot(163);
+        pub const PP1: FieldSlot = FieldSlot(164);
+        pub const PP2: FieldSlot = FieldSlot(165);
+        pub const PPO0: FieldSlot = FieldSlot(166);
+        pub const PPO1: FieldSlot = FieldSlot(167);
+        pub const PPO2: FieldSlot = FieldSlot(168);
+        pub const A: FieldSlot = FieldSlot(169);
+        pub const B: FieldSlot = FieldSlot(170);
+        pub const LEGU: FieldSlot = FieldSlot(171);
+        pub const AEGU: FieldSlot = FieldSlot(172);
+        pub const PREC: FieldSlot = FieldSlot(173);
+        pub const MMAP: FieldSlot = FieldSlot(174);
+        pub const GEOM: FieldSlot = FieldSlot(175);
+        pub const TORAD: FieldSlot = FieldSlot(176);
+        pub const AUNIT: FieldSlot = FieldSlot(177);
+    }
+}
 
 /// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
 pub static DBD: epics_base_rs::server::record::ContributedDbd =

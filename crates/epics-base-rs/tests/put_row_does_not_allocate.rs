@@ -124,3 +124,89 @@ async fn a_string_over_the_field_size_is_cut_in_place() {
     );
     assert_eq!(allocs, 0);
 }
+
+/// A number into a string field renders `cvtDoubleToString` into the put's
+/// own `MAX_STRING_SIZE` buffer, as C's `cvt_d_st` does into the field
+/// (`dbFastLinkConv.c:1333`), then copies it into the reserved slot; the
+/// field name resolves to its declared spelling. Neither allocates.
+#[epics_macros_rs::epics_test]
+async fn a_number_put_into_a_string_field_allocates_nothing() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(stringout, "SO") { field(VAL, "old") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (field, value, want) in [
+        ("VAL", EpicsValue::Double(3.25), "3.250000"),
+        ("VAL", EpicsValue::Double(1e20), " 1.000000e+20"),
+        ("val", EpicsValue::Float(-2.5), "-2.500000"),
+        ("Val", EpicsValue::Long(-7), "-7"),
+    ] {
+        let held = db.lock_for_put("SO", field, &value);
+        let (put, allocs) = count(|| db.put_pv_already_locked(held, value));
+        put.unwrap();
+        assert_eq!(allocs, 0, "{field} {want}");
+        assert_eq!(
+            db.get_pv("SO").unwrap(),
+            EpicsValue::String(PvString::from(want))
+        );
+    }
+}
+
+/// A lean `Str` store copies into the slot `RecordCell::new` reserved to the
+/// field's cap, so no length up to the cap grows it; 40 bytes is cut to 39
+/// (`putStringString`, `dbConvert.c:916-926`).
+#[epics_macros_rs::epics_test]
+async fn a_lean_string_put_into_a_fresh_record_allocates_nothing() {
+    let (db, _) = IocBuilder::new()
+        .db_string(r#"record(stringout, "SO") {}"#, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for len in [1, 39, 40] {
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"[..len].to_string();
+        let value = EpicsValue::String(PvString::from(text.as_str()));
+        let held = db.lock_for_put("SO", "VAL", &value);
+        let (put, allocs) = count(|| db.put_pv_already_locked(held, value));
+        put.unwrap();
+        assert_eq!(allocs, 0, "{len} bytes");
+        assert_eq!(
+            db.get_pv("SO").unwrap(),
+            EpicsValue::String(PvString::from(&text[..len.min(39)]))
+        );
+    }
+}
+
+/// With no subscriber on the field, the put returns from its post before
+/// reading the field, as C `db_post_events` does at `mlis.count == 0`
+/// (`dbEvent.c:885`). Lean `Str` arm only: the general arm still clones
+/// the value it stores.
+#[epics_macros_rs::epics_test]
+async fn a_put_into_an_unsubscribed_string_field_allocates_nothing() {
+    let (db, _) = IocBuilder::new()
+        .db_string(r#"record(stringout, "SO") {}"#, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (rec, field) in [("SO", "IVOV"), ("SO", "VAL")] {
+        for text in ["warm", "next"] {
+            let value = EpicsValue::String(PvString::from(text));
+            let held = db.lock_for_put(rec, field, &value);
+            let (put, allocs) = count(|| db.put_pv_already_locked(held, value));
+            put.unwrap();
+            if text == "next" {
+                assert_eq!(allocs, 0, "{rec}.{field}");
+            }
+        }
+        assert_eq!(
+            db.get_pv(&format!("{rec}.{field}")).unwrap(),
+            EpicsValue::String(PvString::from("next"))
+        );
+    }
+}

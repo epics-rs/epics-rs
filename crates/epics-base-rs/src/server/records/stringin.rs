@@ -7,16 +7,12 @@ use crate::types::{EpicsValue, PvString};
 /// buffers in C `stringinRecord.c`; every copy truncates at 40.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most `MAX_STRING_SIZE - 1` bytes. C
+/// `s` cut to at most `MAX_STRING_SIZE - 1` bytes. C
 /// `strncpy(dst, src, sizeof(prec->val))` copies 39 payload bytes + an
 /// implicit NUL byte for byte with no UTF-8 awareness, so the cut is on
 /// a raw byte boundary and a non-UTF-8 VAL keeps its bytes verbatim.
-fn truncate_string(s: PvString) -> PvString {
-    let max = MAX_STRING_SIZE - 1;
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
+fn truncated(s: &[u8]) -> &[u8] {
+    &s[..s.len().min(MAX_STRING_SIZE - 1)]
 }
 
 /// Stringin record — a 40-byte (`MAX_STRING_SIZE`) string input.
@@ -65,13 +61,20 @@ impl Default for StringinRecord {
 impl StringinRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(PvString::from(val)),
+            val: PvString::from(truncated(val.as_bytes())),
             ..Default::default()
         }
     }
 }
 
 impl Record for StringinRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::stringin;
+        VAL => val,
+        SVAL => sval,
+        SDLY => sdly;
+        read_only:
+        OVAL => oval);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -103,7 +106,7 @@ impl Record for StringinRecord {
     ) -> CaResult<()> {
         match value {
             Some(EpicsValue::String(s)) => {
-                self.val = truncate_string(s);
+                self.val.set_bytes(truncated(s.as_bytes()));
                 Ok(())
             }
             Some(value) => self.set_val(value),
@@ -271,14 +274,14 @@ impl Record for StringinRecord {
             "VAL" => match value {
                 // C truncates every VAL copy at MAX_STRING_SIZE (40).
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(s);
+                    self.val.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(s);
+                    self.oval.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -306,7 +309,7 @@ impl Record for StringinRecord {
             },
             "SVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.sval = truncate_string(s);
+                    self.sval.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SVAL".into())),

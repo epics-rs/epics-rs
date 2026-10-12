@@ -1389,7 +1389,7 @@ impl ChannelSource for PvDatabaseSource {
             let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
                 return self.put_value(&name, value).await;
             };
-            let epics = record_put_value(&rec, &cn, &value)?;
+            let (epics, char_address) = record_put_value(&rec, &cn, &value)?;
             // pvxs reads `record._options.process` / `.block` off the INIT
             // pvRequest inside `onPut` (`singlesource.cpp:347-352`) and
             // routes the write on them; this source used to write
@@ -1423,7 +1423,7 @@ impl ChannelSource for PvDatabaseSource {
                 dbr_type,
             };
             acs::put_with_trap(checked.rule_was_trap(), meta, epics, |v| {
-                put_record_field(&db, &cn, v, &opts)
+                put_record_field(&db, &cn, (v, char_address), &opts)
             })
             .await
         }
@@ -2094,10 +2094,16 @@ fn scalar_shaped(
 async fn put_record_field(
     db: &PvDatabase,
     cn: &ChannelName,
-    epics: EpicsValue,
+    (epics, char_address): (EpicsValue, bool),
     opts: &PutOptions,
 ) -> Result<(), OpError> {
-    db.put_field_from_client(&cn.record, &cn.field, epics, opts.process, opts.block)
+    // The char address is the `$` name's.
+    let field = if char_address {
+        std::borrow::Cow::Owned(format!("{}$", cn.field))
+    } else {
+        std::borrow::Cow::Borrowed(cn.field.as_str())
+    };
+    db.put_field_from_client(&cn.record, &field, epics, opts.process, opts.block)
         .await
         .map_err(|e| OpError::failed(e.to_string()))
 }
@@ -2117,49 +2123,44 @@ fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOption
     }
 }
 
-/// A record channel's PUT payload as the value its field's put path takes.
-/// A string put to a char-array channel — `$`, or a plain one pvxs re-views
+/// A record channel's PUT payload as the value its field's put path takes,
+/// and whether it goes through the field's char address. A string put to a
+/// char-array channel — `$`, or a plain one pvxs re-views
 /// ([`CharView::re_views_plain_channel`]) — is `putLongString`,
 /// `dbPut(DBR_CHAR, str, strlen+1)` (`ioc/iocsource.cpp:511`), and a char
-/// array put to a `$` channel is the same `dbPut(DBR_CHAR)`; both go through
-/// [`CharView::put_value`], the one owner CA, `dbpf` and QSRV put through.
-/// Any other string is `putScalar`'s `DBR_STRING`, `strncpy`'d into a
-/// `MAX_STRING_SIZE` buffer first (`ioc/iocsource.cpp:499-500`).
+/// array put to a `$` channel is the same `dbPut(DBR_CHAR)`. Any other string
+/// is `putScalar`'s `DBR_STRING`, `strncpy`'d into a `MAX_STRING_SIZE`
+/// buffer first (`ioc/iocsource.cpp:499-500`).
 ///
-/// [`CharView::put_value`]: epics_base_rs::server::database::char_view::CharView::put_value
 /// [`CharView::re_views_plain_channel`]: epics_base_rs::server::database::char_view::CharView::re_views_plain_channel
 fn record_put_value(
     rec: &epics_base_rs::server::record::RecordCell,
     cn: &ChannelName,
     value: &PvField,
-) -> Result<EpicsValue, OpError> {
-    use epics_base_rs::server::database::char_view::{CharWrite, char_view};
+) -> Result<(EpicsValue, bool), OpError> {
+    use epics_base_rs::server::database::char_view::{char_view, pva_char_request};
     let epics = put_payload_to_epics(value)?;
     // A char array is the `int8_t[]` only a `$` channel serves.
-    let write = match &epics {
+    let chars = match &epics {
         EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) if !cn.string_view => None,
-        v => CharWrite::from_pva(v),
+        v => pva_char_request(v),
     };
-    let Some(write) = write else {
-        return Ok(epics);
-    };
-    let view = char_view(&rec.read(), &cn.field);
-    let view = match view {
-        Some(view) if cn.string_view || view.re_views_plain_channel() => view,
-        _ => {
-            return Ok(match epics {
-                EpicsValue::String(text) => {
-                    let bytes = text.as_bytes();
-                    EpicsValue::String(epics_base_rs::types::PvString::from_bytes(
-                        &bytes[..bytes.len().min(39)],
-                    ))
-                }
-                other => other,
-            });
+    if let Some(chars) = chars
+        && (cn.string_view
+            || char_view(&rec.read(), &cn.field).is_some_and(|v| v.re_views_plain_channel()))
+    {
+        return Ok((chars, true));
+    }
+    let epics = match epics {
+        EpicsValue::String(text) => {
+            let bytes = text.as_bytes();
+            EpicsValue::String(epics_base_rs::types::PvString::from_bytes(
+                &bytes[..bytes.len().min(39)],
+            ))
         }
+        other => other,
     };
-    view.put_value(write)
-        .ok_or_else(|| OpError::failed(format!("PUT: {}: no $ view", cn.field)))
+    Ok((epics, false))
 }
 
 /// Decode a record PUT payload down to the [`EpicsValue`] the field takes.

@@ -94,6 +94,23 @@ impl Int64outRecord {
 }
 
 impl Record for Int64outRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::int64out;
+        VAL => val,
+        EGU => egu,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        HYST => hyst,
+        ADEL => adel,
+        MDEL => mdel,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -275,7 +292,7 @@ impl Record for Int64outRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                 } else {
                     return Err(CaError::TypeMismatch("EGU".into()));
                 }

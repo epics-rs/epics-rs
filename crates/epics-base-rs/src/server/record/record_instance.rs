@@ -525,7 +525,7 @@ impl ProcessCompletion {
 /// callback returns at t=6.9s: A=7 VAL=7  <- after the RESTARTED process
 /// ```
 pub struct DeferredNotifyPut {
-    /// The field the client wrote (already upper-cased).
+    /// The field the client wrote, by its declared name, `$` kept.
     pub field: String,
     /// The value it wrote — held here, unwritten, until the restart.
     pub value: crate::types::EpicsValue,
@@ -1231,21 +1231,65 @@ mod link_cache {
 
     /// A parsed `dbCommon` link, readable as the [`ParsedLink`] it holds and
     /// replaceable only from `record_instance` — through
-    /// `RecordInstance::set_link_cache`, which stamps the `CyclePlan`.
+    /// `RecordInstance::install_link_cache`, which stamps the `CyclePlan`.
+    /// The parse is shared so a swap under the hold is two pointer moves:
+    /// the new `Arc` is built before the hold and the old one is dropped
+    /// after it.
     #[derive(Debug)]
-    pub struct LinkCache(ParsedLink);
+    pub struct LinkCache {
+        facts: LinkFacts,
+        parse: Arc<ParsedLink>,
+    }
+
+    /// What the process cycle asks of the link on every pass, copied from
+    /// the parse whenever one is installed so the cycle answers from the
+    /// entry without following the `Arc` (spec-R2 §10: resolved at attach).
+    #[derive(Debug, Clone, Copy)]
+    struct LinkFacts {
+        constant: bool,
+        writable_out: bool,
+    }
+
+    impl LinkFacts {
+        fn of(link: &ParsedLink) -> Self {
+            Self {
+                constant: crate::server::recgbl::simm::is_constant(link),
+                writable_out: link.is_writable_out_link(),
+            }
+        }
+    }
 
     impl LinkCache {
-        pub(super) const fn none() -> Self {
-            LinkCache(ParsedLink::None)
+        pub(super) fn none() -> Self {
+            let parse = SHARED[NONE].clone();
+            LinkCache {
+                facts: LinkFacts::of(&parse),
+                parse,
+            }
         }
 
         pub fn link(&self) -> &ParsedLink {
-            &self.0
+            &self.parse
         }
 
-        pub(super) fn swap(&mut self, link: &mut ParsedLink) {
-            std::mem::swap(&mut self.0, link);
+        /// The parse itself, for a writer that must keep it past a swap.
+        pub(crate) fn shared(&self) -> &Arc<ParsedLink> {
+            &self.parse
+        }
+
+        /// C `dbLinkIsConstant` (`dbLink.c:215-225`).
+        pub fn is_constant(&self) -> bool {
+            self.facts.constant
+        }
+
+        /// [`ParsedLink::is_writable_out_link`].
+        pub fn is_writable_out_link(&self) -> bool {
+            self.facts.writable_out
+        }
+
+        pub(super) fn swap(&mut self, link: &mut Arc<ParsedLink>) {
+            std::mem::swap(&mut self.parse, link);
+            self.facts = LinkFacts::of(&self.parse);
         }
     }
 
@@ -1256,7 +1300,7 @@ mod link_cache {
     pub(crate) struct PreparedCommonLink {
         pub(super) field: &'static str,
         pub(super) text: String,
-        pub(super) parsed: ParsedLink,
+        pub(super) parsed: Arc<ParsedLink>,
         /// The new dset of a device-link put, prepared before the hold by
         /// [`Self::ask_add_record`].
         pub(super) device: Option<PreparedDevice>,
@@ -1307,6 +1351,8 @@ mod link_cache {
             let crate::types::EpicsValue::String(text) = value else {
                 return None;
             };
+            #[cfg(test)]
+            super::put_gate_probe::parsed();
             let (field, ftype) = [
                 ("FLNK", LinkFieldType::Fwd),
                 ("INP", LinkFieldType::In),
@@ -1332,7 +1378,7 @@ mod link_cache {
             }
             Some(PreparedCommonLink {
                 field,
-                parsed: crate::server::record::parse_link_field(&text, ftype),
+                parsed: parse(&text, ftype),
                 text,
                 device: None,
                 add_record_refusal: None,
@@ -1445,7 +1491,7 @@ mod link_cache {
         type Target = ParsedLink;
 
         fn deref(&self) -> &ParsedLink {
-            &self.0
+            &self.parse
         }
     }
 
@@ -1576,6 +1622,8 @@ mod link_cache {
             let crate::types::EpicsValue::String(text) = value else {
                 return None;
             };
+            #[cfg(test)]
+            super::put_gate_probe::parsed();
             // `fields` is what the record stores, so a `dbCommon` five in it
             // is one the record holds and has a slot ([`LinkSlots::of`]).
             let desc = super::field_desc_in(fields, field)?;
@@ -1714,6 +1762,10 @@ mod link_cache {
 
         pub(super) fn at(&self, i: usize) -> &Arc<ParsedLink> {
             &self.0[i].parsed
+        }
+
+        pub(super) fn links(&self) -> impl Iterator<Item = &Arc<ParsedLink>> {
+            self.0.iter().map(|slot| &slot.parsed)
         }
 
         /// C `dbRemoveLink` on slot `i`.
@@ -2031,6 +2083,47 @@ impl ProcessPlan {
     }
 }
 
+/// Link parses made while this thread holds a put gate, for the tests that
+/// pin C `dbPutFieldLink`'s parse-before-lock order (`dbAccess.c:1101`,
+/// `:1123`). Test builds only.
+#[cfg(test)]
+pub(crate) mod put_gate_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+        static PARSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Lives as long as the put gate that holds it.
+    pub(crate) struct Under(());
+
+    impl Under {
+        pub(crate) fn enter() -> Self {
+            DEPTH.with(|d| d.set(d.get() + 1));
+            Under(())
+        }
+    }
+
+    impl Drop for Under {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// A link parse: counted when this thread is under a put gate.
+    pub(crate) fn parsed() {
+        if DEPTH.with(Cell::get) > 0 {
+            PARSES.with(|p| p.set(p.get() + 1));
+        }
+    }
+
+    /// The parses counted under a gate since the last call.
+    pub(crate) fn take() -> usize {
+        PARSES.with(|p| p.replace(0))
+    }
+}
+
 /// How many record borrows this thread holds, in builds with debug
 /// assertions: the set-wide answer to "may this thread park, or enter a
 /// nested frame, now?" that the per-record borrow flag cannot give. A borrow
@@ -2107,6 +2200,9 @@ pub struct RecordCell {
     /// [`Record::field_slot`] for each entry of `rdes.fields`, asked once
     /// here so a link resolving its target's address needs no lock.
     slots: Box<[Option<super::record_trait::FieldSlot>]>,
+    /// Beside each `slots` entry, what [`PutAddr::resolve_in`] needs of the
+    /// record for a put, asked once here with the instance owned.
+    put_facts: Box<[PutFacts]>,
     /// [`Record::field_slot`] of each [`Record::multi_input_links`] value
     /// field, by the link's index — C's `&prec->a + i`, the address the
     /// fetch stores through ([`Record::put_slot_f64`]) when the type hands
@@ -2229,45 +2325,36 @@ impl RecordDesc {
 pub(crate) struct FieldAddr {
     pub(crate) declared: bool,
     pub(crate) desc: Option<&'static FieldDesc>,
-    /// The record's own handle for the field ([`Record::field_slot`]), when
-    /// the type has one and the address was resolved with the record in
-    /// hand ([`FieldAddr::resolve_in`]). A read at a slot goes to the typed
-    /// accessor and skips the by-name chain.
-    pub(crate) slot: Option<super::record_trait::FieldSlot>,
-    /// The name carried C's `$` modifier: `dbNameToAddr` re-made the address
-    /// a `DBF_CHAR` array (`dbAccess.c:682-701`), which every read takes
-    /// through [`char_view`](crate::server::database::char_view::char_view).
-    pub(crate) char_view: bool,
+    slot: Option<super::record_trait::FieldSlot>,
+    char_view: bool,
 }
 
 impl FieldAddr {
-    /// This address under the `$` modifier. The field's typed slot is not
-    /// the char array it now names, so the address keeps none.
-    pub(crate) fn viewed_as_chars(self) -> Self {
-        FieldAddr {
-            slot: None,
-            char_view: true,
-            ..self
-        }
-    }
-
     /// `field` (upper-case already) resolved against the cell's settled
     /// declaration and slots. Takes no lock, so a record may resolve a link
     /// to itself while it is held for writing.
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
+        Self::resolve_at(rec, field).0
+    }
+
+    /// [`Self::resolve_in`] and the field's index in `rdes.fields`.
+    fn resolve_at(rec: &RecordCell, field: &str) -> (Self, Option<usize>) {
         // One scan of the type's own list answers both the desc and, by the
         // same index, the slot; only a miss falls to `dbCommon`.
         let named = |f: &FieldDesc| f.name.eq_ignore_ascii_case(field);
         let fields = rec.rdes().fields;
+        let declared = declares_field(rec.rdes().record_type, field);
+        // `named` ignores case and `declares_field` does not (C
+        // `dbFindFieldPart`'s `strncmp`), so a mis-cased name has no slot.
         let at = fields.iter().position(named);
         let addr = FieldAddr {
-            declared: declares_field(rec.rdes().record_type, field),
+            declared,
             desc: at.map(|i| &fields[i]).or_else(|| {
                 super::dbd_generated::DB_COMMON_FIELDS
                     .iter()
                     .find(|f| named(f))
             }),
-            slot: at.and_then(|i| rec.slots[i]),
+            slot: at.filter(|_| declared).and_then(|i| rec.slots[i]),
             char_view: false,
         };
         debug_assert!(
@@ -2275,15 +2362,186 @@ impl FieldAddr {
             "{}.{field}: a field slot must name a declared, readable field",
             rec.rdes().record_type
         );
-        addr
+        (addr, at.filter(|_| declared))
+    }
+
+    /// The record's own handle for the field ([`Record::field_slot`]), when
+    /// the type has one and the name carried no `$`. A read at a slot goes
+    /// to the typed accessor and skips the by-name chain.
+    #[inline(always)]
+    pub(crate) fn slot(&self) -> Option<super::record_trait::FieldSlot> {
+        self.slot
+    }
+
+    /// The name carried C's `$` modifier: `dbNameToAddr` re-made the address
+    /// a `DBF_CHAR` array (`dbAccess.c:682-701`), which every read takes
+    /// through [`char_view`](crate::server::database::char_view::char_view).
+    #[inline(always)]
+    pub(crate) fn char_view(&self) -> bool {
+        self.char_view
+    }
+}
+
+/// How `dbPut` stores into a [`PutAddr`]: C's `dbFastPutConvertRoutine`
+/// column for the field (`dbFastLinkConv.c:1698`), chosen once with the
+/// address. A lean arm stores through [`Record::slot_mut`] with no name
+/// work; `General` is the full `dbPut` body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PutFn {
+    General,
+    F64(super::record_trait::FieldSlot),
+    F32(super::record_trait::FieldSlot),
+    I8(super::record_trait::FieldSlot),
+    U8(super::record_trait::FieldSlot),
+    I16(super::record_trait::FieldSlot),
+    U16(super::record_trait::FieldSlot),
+    I32(super::record_trait::FieldSlot),
+    U32(super::record_trait::FieldSlot),
+    I64(super::record_trait::FieldSlot),
+    U64(super::record_trait::FieldSlot),
+    /// `DBF_ENUM`, a `U16` slot.
+    Enum(super::record_trait::FieldSlot),
+    /// `DBF_STRING`; `cap` is `putStringString`'s `field_size - 1`.
+    Str {
+        slot: super::record_trait::FieldSlot,
+        cap: u16,
+    },
+}
+
+/// A [`SlotMut`](super::record_trait::SlotMut) variant, recorded per slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotKind {
+    F64,
+    F32,
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    Str,
+}
+
+impl SlotKind {
+    pub(crate) fn of(slot: &super::record_trait::SlotMut<'_>) -> Self {
+        use super::record_trait::SlotMut as M;
+        match slot {
+            M::F64(_) => Self::F64,
+            M::F32(_) => Self::F32,
+            M::I8(_) => Self::I8,
+            M::U8(_) => Self::U8,
+            M::I16(_) => Self::I16,
+            M::U16(_) => Self::U16,
+            M::I32(_) => Self::I32,
+            M::U32(_) => Self::U32,
+            M::I64(_) => Self::I64,
+            M::U64(_) => Self::U64,
+            M::Str(_) => Self::Str,
+        }
+    }
+}
+
+/// What a put needs of the record at a declared field, asked by
+/// [`RecordCell::new`] while it owns the instance.
+#[derive(Clone, Copy)]
+struct PutFacts {
+    /// The slot's [`SlotMut`](super::record_trait::SlotMut) variant.
+    kind: Option<SlotKind>,
+    /// [`Record::is_udf_defining_put`], C `dbIsValueField`.
+    udf: bool,
+}
+
+/// `putStringString`'s copy length for a `DBF_STRING` field: `field_size -
+/// 1`, never over `MAX_STRING_SIZE - 1`.
+fn str_cap(desc: &FieldDesc) -> u16 {
+    desc.size.clamp(1, 40) - 1
+}
+
+/// Each declared field's [`PutFacts`], with every `Str` slot reserved to its
+/// cap here, so a lean store never grows it under a hold.
+fn put_facts(
+    inst: &mut RecordInstance,
+    slots: &[Option<super::record_trait::FieldSlot>],
+) -> Box<[PutFacts]> {
+    use super::record_trait::SlotMut;
+    let fields = inst.record.field_list();
+    fields
+        .iter()
+        .zip(slots)
+        .map(|(desc, slot)| PutFacts {
+            udf: inst.record.is_udf_defining_put(desc.name),
+            kind: slot
+                .and_then(|slot| inst.record.slot_mut(slot))
+                .map(|m| match m {
+                    SlotMut::Str(s) => {
+                        let cap = usize::from(str_cap(desc));
+                        s.reserve_exact(cap.saturating_sub(s.len()));
+                        SlotKind::Str
+                    }
+                    m => SlotKind::of(&m),
+                }),
+        })
+        .collect()
+}
+
+/// The lean arm for `desc` at `slot`, or `General` (spec §1.3): anything
+/// with a put hook, a `dbCommon` or menu/device/link field, a runtime type,
+/// a watched write, or a slot whose recorded variant is not the declared
+/// type's.
+fn lean_put_fn(
+    record_type: &str,
+    desc: &'static FieldDesc,
+    slot: super::record_trait::FieldSlot,
+    kind: SlotKind,
+) -> PutFn {
+    use super::record_trait::Special;
+    use crate::types::DbfCode as D;
+    let general = desc.special != Special::None
+        || desc.declared_special != Special::None
+        || desc.runtime_typed
+        || desc.long_string
+        || desc.read_only
+        || desc.dbf_type.dbf_code() != desc.declared_dbf
+        || is_metadata_cache_source(desc.name)
+        || RecordInstance::field_posts_property(Some(desc))
+        || super::record_trait::FORCE_GENERAL.contains(&(record_type, desc.name));
+    if general {
+        return PutFn::General;
+    }
+    match (desc.declared_dbf, kind) {
+        (D::Double, SlotKind::F64) => PutFn::F64(slot),
+        (D::Float, SlotKind::F32) => PutFn::F32(slot),
+        (D::Char, SlotKind::I8) => PutFn::I8(slot),
+        (D::UChar, SlotKind::U8) => PutFn::U8(slot),
+        (D::Short, SlotKind::I16) => PutFn::I16(slot),
+        (D::UShort, SlotKind::U16) => PutFn::U16(slot),
+        (D::Enum, SlotKind::U16) => PutFn::Enum(slot),
+        (D::Long, SlotKind::I32) => PutFn::I32(slot),
+        (D::ULong, SlotKind::U32) => PutFn::U32(slot),
+        (D::Int64, SlotKind::I64) => PutFn::I64(slot),
+        (D::UInt64, SlotKind::U64) => PutFn::U64(slot),
+        // The general arm caps at `size - 1` and leaves an unsized field
+        // uncapped; `str_cap` agrees only for a size in `1..=40`.
+        (D::String, SlotKind::Str) if (1..=40).contains(&desc.size) => PutFn::Str {
+            slot,
+            cap: str_cap(desc),
+        },
+        _ => PutFn::General,
     }
 }
 
 /// A `dbPut` target: the [`FieldAddr`] plus the per-field answers `dbPut`
 /// asks on every put, settled with the address so a put asks none by name.
+/// Built only by [`Self::resolve_in`] and [`Self::resolve_chars_in`], so the
+/// store arm cannot be re-made after the address is.
 #[derive(Clone, Copy)]
 pub(crate) struct PutAddr {
-    pub(crate) field: FieldAddr,
+    field: FieldAddr,
+    put: PutFn,
+    /// C `dbIsValueField`: the put clears `udf`.
+    udf_defining: bool,
     /// The declaration's half of [`RecordInstance::is_no_mod`].
     no_mod: bool,
     /// [`is_metadata_cache_source`].
@@ -2310,10 +2568,60 @@ impl PutAddr {
     /// `field` is upper-case already. Takes no lock, as
     /// [`FieldAddr::resolve_in`].
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
-        let addr = FieldAddr::resolve_in(rec, field);
+        let (addr, at) = FieldAddr::resolve_at(rec, field);
+        let facts = at.map(|i| rec.put_facts[i]);
+        let put = match (addr.desc, addr.slot, facts.and_then(|f| f.kind)) {
+            (Some(desc), Some(slot), Some(kind)) => {
+                lean_put_fn(rec.rdes().record_type, desc, slot, kind)
+            }
+            _ => PutFn::General,
+        };
+        // A type with no field list still has `Record::is_udf_defining_put`'s
+        // default answer, its primary field.
+        let udf = facts.map_or(field == rec.rdes().primary_field, |f| f.udf);
+        Self::of(rec, field, addr, put, udf)
+    }
+
+    /// A by-name put's address: [`RecordCell::put_name`]'s field, through
+    /// [`Self::resolve_chars_in`] when the name carries `$`.
+    pub(crate) fn resolve_named<'f>(
+        rec: &RecordCell,
+        field: &'f str,
+    ) -> crate::error::CaResult<(Cow<'f, str>, Self)> {
+        let (field, chars) = rec.put_name(field);
+        let at = if chars {
+            Self::resolve_chars_in(rec, &field)
+                .ok_or_else(|| crate::error::CaError::FieldNotFound(format!("{field}$")))?
+        } else {
+            Self::resolve_in(rec, &field)
+        };
+        Ok((field, at))
+    }
+
+    /// C `dbNameToAddr`'s `$` arm (`dbAccess.c:682-701`): the field re-made
+    /// as characters, with no slot and the general put, or `None`
+    /// (`S_dbLib_fieldNotFound`, `:697-699`) for a field
+    /// [`RecordCell::takes_string_view`] refuses.
+    pub(crate) fn resolve_chars_in(rec: &RecordCell, field: &str) -> Option<Self> {
+        let (addr, at) = FieldAddr::resolve_at(rec, field);
+        if addr.desc.is_some_and(|d| !rec.takes_string_view(d)) {
+            return None;
+        }
+        let udf = at.map_or(field == rec.rdes().primary_field, |i| rec.put_facts[i].udf);
+        let addr = FieldAddr {
+            slot: None,
+            char_view: true,
+            ..addr
+        };
+        Some(Self::of(rec, field, addr, PutFn::General, udf))
+    }
+
+    fn of(rec: &RecordCell, field: &str, addr: FieldAddr, put: PutFn, udf: bool) -> Self {
         let (deadband_field, event_posted) = rec.walk_terms;
         let rdes = rec.rdes();
         PutAddr {
+            put,
+            udf_defining: udf,
             dbaddr: addr
                 .desc
                 .is_some_and(|d| d.declared_special == super::record_trait::Special::DbAddr),
@@ -2326,6 +2634,24 @@ impl PutAddr {
             walk_skip: walk_skip_term(field, deadband_field, event_posted),
             field: addr,
         }
+    }
+
+    /// The field half of the address.
+    #[inline(always)]
+    pub(crate) fn field(&self) -> FieldAddr {
+        self.field
+    }
+
+    /// The store arm `dbPut` takes.
+    #[inline(always)]
+    pub(crate) fn put(&self) -> PutFn {
+        self.put
+    }
+
+    /// Whether the put clears `udf` (C `dbIsValueField`).
+    #[inline(always)]
+    pub(crate) fn udf_defining(&self) -> bool {
+        self.udf_defining
     }
 
     /// Whether `dbPut` takes its array arm for this field whatever the
@@ -2444,8 +2770,9 @@ use posted::{PostedSet, Published};
 
 /// `field` spelled as the record's tables spell it, upper-case: borrowed
 /// unless the name has a lower-case letter, so a declared name or an
-/// upper-case key is never copied on a post.
-fn upper_field(field: &str) -> Cow<'_, str> {
+/// upper-case key is never copied on a post. A by-name entry asks
+/// [`RecordCell::canonical_field`], which allocates for no declared name.
+pub(crate) fn upper_field(field: &str) -> Cow<'_, str> {
     if field.bytes().any(|b| b.is_ascii_lowercase()) {
         Cow::Owned(field.to_ascii_uppercase())
     } else {
@@ -2474,7 +2801,21 @@ struct LockSetGuarded<T: Send + Sync>(std::cell::UnsafeCell<T>);
 unsafe impl<T: Send + Sync> Sync for LockSetGuarded<T> {}
 
 impl RecordCell {
-    pub(crate) fn new(instance: RecordInstance, load_order: u64, init_owed: bool) -> Self {
+    /// Record borrows the calling thread holds, for a test binary's
+    /// allocator to tell allocations under a hold from the rest; `0` in
+    /// builds without debug assertions.
+    #[doc(hidden)]
+    pub fn live_borrows_on_this_thread() -> usize {
+        live_borrows::count()
+    }
+
+    pub(crate) fn new(mut instance: RecordInstance, load_order: u64, init_owed: bool) -> Self {
+        let slots: Box<[_]> = instance
+            .record
+            .field_list()
+            .iter()
+            .map(|f| instance.record.field_slot(f.name))
+            .collect();
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -2483,12 +2824,8 @@ impl RecordCell {
             cp_edges: std::sync::atomic::AtomicBool::new(false),
             rdes: RecordDesc::of(&*instance.record),
             name: instance.name.as_str().into(),
-            slots: instance
-                .record
-                .field_list()
-                .iter()
-                .map(|f| instance.record.field_slot(f.name))
-                .collect(),
+            put_facts: put_facts(&mut instance, &slots),
+            slots,
             multi_input_val_slots: instance
                 .record
                 .multi_input_links()
@@ -2565,6 +2902,30 @@ impl RecordCell {
     /// The record type's declaration — C `precord->rdes`.
     pub(crate) fn rdes(&self) -> &RecordDesc {
         &self.rdes
+    }
+
+    /// The field name a by-name entry works with: the declared spelling of
+    /// the type's own field or a `dbCommon` one, matched without case (the
+    /// port takes the lower-case names C's `dbNameToAddr` refuses), found
+    /// with no allocation. Any other name goes to [`upper_field`].
+    pub(crate) fn canonical_field<'f>(&self, field: &'f str) -> Cow<'f, str> {
+        let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);
+        self.rdes
+            .fields
+            .iter()
+            .find(named)
+            .or_else(|| super::dbd_generated::DB_COMMON_FIELDS.iter().find(named))
+            .map_or_else(|| upper_field(field), |d| d.name.into())
+    }
+
+    /// A put name's field part as C `dbNameToAddr` reads it: the declared
+    /// spelling ([`Self::canonical_field`]) and whether a trailing `$` asks
+    /// for the field's `DBR_CHAR` address (`dbAccess.c:681-701`).
+    pub(crate) fn put_name<'f>(&self, field: &'f str) -> (Cow<'f, str>, bool) {
+        match field.strip_suffix('$') {
+            Some(core) => (self.canonical_field(core), true),
+            None => (self.canonical_field(field), false),
+        }
     }
 
     /// C `dbFindFieldPart`'s answer for `field`: a name the type's `.dbd`
@@ -2719,7 +3080,36 @@ impl RecordCell {
         live_borrows::taken();
         RecordMut {
             cell: self,
-            _set: set,
+            _set: Some(set),
+        }
+    }
+
+    /// [`Self::write`] for a put that may run inside a frame: under `held`,
+    /// when this record is in that set, only the borrow flag is touched, as
+    /// [`Self::write_in`]; any other record takes [`Self::write`]'s acquire.
+    /// Sound by Rule R, as [`Self::read_in`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::write`].
+    #[inline(always)]
+    pub(crate) fn write_under<'a>(
+        &'a self,
+        held: Option<&'a crate::server::database::SetGuard>,
+    ) -> RecordMut<'a> {
+        use std::sync::atomic::Ordering;
+        if !held.is_some_and(|held| held.holds(&self.lock_record)) {
+            return self.write();
+        }
+        assert!(
+            self.borrow.load(Ordering::Relaxed) == 0,
+            "record data written while this thread still holds a guard of it"
+        );
+        self.borrow.store(-1, Ordering::Relaxed);
+        live_borrows::taken();
+        RecordMut {
+            cell: self,
+            _set: None,
         }
     }
 
@@ -2849,7 +3239,9 @@ impl Drop for RecordRef<'_> {
 #[must_use = "the record's lock set is released as soon as the guard is dropped"]
 pub struct RecordMut<'a> {
     cell: &'a RecordCell,
-    _set: crate::server::database::SetGuard,
+    /// `None` for a [`RecordCell::write_under`] borrow inside the caller's
+    /// held set.
+    _set: Option<crate::server::database::SetGuard>,
 }
 
 impl std::ops::Deref for RecordMut<'_> {
@@ -4131,18 +4523,36 @@ impl RecordInstance {
         })
     }
 
-    /// Replace the parse cache of one `COMMON_LINK_FIELDS` entry, or return
-    /// `false` for any other field name. The only writer of the five caches
-    /// (`LinkCache` has no other way in), so the plan stamp they feed is
-    /// bumped here and cannot be skipped.
-    pub fn set_link_cache(&mut self, field: &str, link: ParsedLink) -> bool {
+    /// Install `link` as the parse cache of one `COMMON_LINK_FIELDS` entry
+    /// and return the parse it replaced, or hand `link` back for any other
+    /// field name. Either way nothing is allocated or freed here: the caller
+    /// builds the `Arc` before the record's hold and drops what comes back
+    /// after it, as C `dbPutFieldLink` parses ahead of `dbScanLock`. The only
+    /// writer of the five caches (`LinkCache` has no other way in), so the
+    /// plan stamp they feed is bumped here and cannot be skipped.
+    pub fn install_link_cache(
+        &mut self,
+        field: &str,
+        link: Arc<ParsedLink>,
+    ) -> Result<Arc<ParsedLink>, Arc<ParsedLink>> {
         let mut link = link;
-        self.swap_link_cache(field, &mut link)
+        if self.swap_link_cache(field, &mut link) {
+            Ok(link)
+        } else {
+            Err(link)
+        }
     }
 
-    /// [`Self::set_link_cache`] handing the old parse back in `link`, so a
-    /// caller under the hold can drop it after.
-    fn swap_link_cache(&mut self, field: &str, link: &mut ParsedLink) -> bool {
+    /// [`Self::install_link_cache`] for an in-crate test that holds a bare
+    /// parse; production installs only an `Arc` built before the hold.
+    #[cfg(test)]
+    pub(crate) fn set_link_cache(&mut self, field: &str, link: ParsedLink) -> bool {
+        self.install_link_cache(field, Arc::new(link)).is_ok()
+    }
+
+    /// [`Self::install_link_cache`] handing the old parse back in `link`, so
+    /// a caller under the hold can drop it after.
+    fn swap_link_cache(&mut self, field: &str, link: &mut Arc<ParsedLink>) -> bool {
         let slot = match field {
             "INP" => &mut self.parsed_inp,
             "OUT" => &mut self.parsed_out,
@@ -4274,7 +4684,7 @@ impl RecordInstance {
                 | CyclePostMask::ResetValueLog
                 | CyclePostMask::ResetValueLogOnAlarm => EventMask::VALUE | EventMask::LOG,
             };
-            self.post_field(
+            self.post_put_field(
                 Some(&mut burst),
                 field,
                 mask,
@@ -4404,7 +4814,7 @@ impl RecordInstance {
             && self.record.simm_cells().is_some_and(|c| c.simm == 0)
             && self.common.dtyp.is_soft()
             && self.common.sscn.is_unset()
-            && crate::server::recgbl::simm::is_constant(self.parsed_sdis.link())
+            && self.parsed_sdis.is_constant()
             && plan.simm.is_some()
             && self.siml_has_const_lset();
         let reads_double = || match self.parsed_inp.link() {
@@ -4445,8 +4855,7 @@ impl RecordInstance {
     /// dset whose `add_record` refused the link.
     #[inline]
     pub(crate) fn dset_reads_inp(&self) -> bool {
-        !crate::server::recgbl::simm::is_constant(self.parsed_inp.link())
-            && !self.common.dtyp.link_refused()
+        !self.parsed_inp.is_constant() && !self.common.dtyp.link_refused()
     }
 
     /// The single owner of [`CyclePlan`] staleness: whatever the plan was
@@ -4609,6 +5018,9 @@ impl RecordInstance {
     pub(crate) fn forward_target(&self) -> ForwardTarget {
         // The link kind goes first: with nothing to fire (the common empty
         // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
+        if self.parsed_flnk.is_constant() {
+            return ForwardTarget::None;
+        }
         match self.parsed_flnk.link() {
             ParsedLink::Db(l) if self.record.should_fire_forward_link() => ForwardTarget::Db {
                 link: ManuallyDrop::new(l.clone()),
@@ -4735,6 +5147,12 @@ impl RecordInstance {
     /// record's own link reads it here and never re-parses the text, which
     /// a removed link keeps ([`ParsedLink::Removed`]).
     pub(crate) fn stored_link(&self, field: &str) -> Option<&ParsedLink> {
+        self.stored_link_shared(field).map(|link| &**link)
+    }
+
+    /// [`Self::stored_link`] as the shared parse, which an output write
+    /// keeps past a swap of the field.
+    pub(crate) fn stored_link_shared(&self, field: &str) -> Option<&Arc<ParsedLink>> {
         if let Some(link) = self.declared_record_link(field) {
             return Some(link);
         }
@@ -4746,7 +5164,7 @@ impl RecordInstance {
             "FLNK" => &self.parsed_flnk,
             _ => return None,
         };
-        Some(cache.link())
+        Some(cache.shared())
     }
 
     /// [`Self::record_link`] for a field the type may not declare: `None`
@@ -5440,6 +5858,7 @@ impl RecordInstance {
     /// `field` is upper-case.
     pub(crate) fn notify_field_written_if_changed_at(
         &mut self,
+        burst: &mut PostBurst,
         field: &str,
         at: &PutAddr,
         pre: PrePut,
@@ -5447,7 +5866,13 @@ impl RecordInstance {
         let PrePut(Some(prev)) = pre else {
             return;
         };
-        self.written_if_changed(None, field, at.cache_source, at.field.desc, prev.as_ref());
+        self.written_if_changed(
+            Some(burst),
+            field,
+            at.cache_source,
+            at.field.desc,
+            prev.as_ref(),
+        );
     }
 
     /// The pre-put value of `field` at `at` for the change test; a field the
@@ -7671,13 +8096,9 @@ impl RecordInstance {
         bound: MenuBound,
         link: &mut Option<PreparedCommonLink>,
     ) -> CaResult<CommonFieldPutResult> {
-        // The put entries hand the name in uppercase already; only another
+        // The put entries hand the declared spelling already; only another
         // spelling allocates, under the caller's hold.
-        let name: Cow<'_, str> = if name.bytes().any(|b| b.is_ascii_lowercase()) {
-            Cow::Owned(name.to_ascii_uppercase())
-        } else {
-            Cow::Borrowed(name)
-        };
+        let name = upper_field(name);
         self.record.validate_put(&name, &value)?;
         self.record.special(&name, false)?;
         // The db loader hands every common field to this path as a raw
@@ -10264,7 +10685,7 @@ impl RecordInstance {
         mask: crate::server::recgbl::EventMask,
         origin: u64,
     ) {
-        self.post_field(
+        self.post_put_field(
             None,
             field,
             mask,
@@ -10287,7 +10708,7 @@ impl RecordInstance {
         mask: crate::server::recgbl::EventMask,
         origin: u64,
     ) {
-        self.post_field(
+        self.post_put_field(
             Some(burst),
             field,
             mask,
@@ -10300,19 +10721,21 @@ impl RecordInstance {
         );
     }
 
-    /// [`Self::notify_field_backed`] for a settled put target; `field` is
-    /// upper-case.
+    /// [`Self::notify_field_backed`] for a settled put target, into the
+    /// put's `burst`; `field` is upper-case.
     pub(crate) fn notify_field_at(
         &mut self,
+        burst: &mut PostBurst,
         field: &str,
         at: &PutAddr,
         mask: crate::server::recgbl::EventMask,
+        origin: u64,
     ) {
-        self.post_field(
-            None,
+        self.post_put_field(
+            Some(burst),
             field,
             mask,
-            0,
+            origin,
             (
                 |_: &Self| at.field.desc,
                 |inst: &Self| inst.resolve_field_upper_at(field, at.field.desc),
@@ -10326,7 +10749,7 @@ impl RecordInstance {
     /// `burst` `None` is a post that is its own burst, built only past the
     /// early returns: a field no one monitors pays nothing for it.
     #[inline(always)]
-    fn post_field(
+    fn post_put_field(
         &mut self,
         burst: Option<&mut PostBurst>,
         field: &str,
@@ -10360,22 +10783,16 @@ impl RecordInstance {
         );
         // Rows whose consumer went away without unsubscribing are reaped
         // from the field being posted, not by a sweep of every field per put.
-        let subscribed = !self.unwatched() && self.reap_closed(field) > 0;
-        // With no subscriber the post only feeds `record_value_post`, which
-        // stores nothing for the deadband field — a `dbPut` target's VAL.
-        if !subscribed && (!publishes_value || field == self.record.monitor_deadband_field()) {
+        // With none left this is C `db_post_events` at `mlis.count == 0`: no
+        // read, no allocation, and no published state moves; the monitor walk
+        // advances that for an unsubscribed field.
+        if self.unwatched() || self.reap_closed(field) == 0 {
             return;
         }
         // A reference-log field is not read: its post carries no value.
         let Some(value) = self.post_payload(field, desc, read) else {
             return;
         };
-        // With no subscriber the post is value-class (the return above), and
-        // the value goes straight to the owner.
-        if !subscribed {
-            self.record_value_post_as(field, walk_skip, value);
-            return;
-        }
         {
             let head = self.log_head();
             let mut logged = None;
@@ -10417,11 +10834,8 @@ impl RecordInstance {
         }
         // The value is now published: hand it to the `last_posted` owner so
         // the change detector does not publish it again. Delivery to any
-        // individual subscriber may have been filtered out, and the field may
-        // have no subscriber at all, exactly as C's `db_post_events` may find
-        // an empty `mlis` — C still leaves `monitor()`'s `*_lst` state
-        // advanced by the cycle that ran, so the post, not the delivery, is
-        // what counts.
+        // individual subscriber may have been filtered out; the post, not the
+        // delivery, is what counts.
         if publishes_value {
             self.record_value_post_as(field, walk_skip, value);
         }
@@ -10475,7 +10889,7 @@ impl RecordInstance {
         }
         // Reap the field's rows whose consumer is gone before counting
         // against the cap. A record field whose value never changes (e.g. a
-        // quasi-static catalog field) never triggers `post_field`'s reap, so a
+        // quasi-static catalog field) never triggers `post_put_field`'s reap, so a
         // long-lived subscribe-disconnect storm could pin the field at `cap`
         // worth of dead rows and lock out genuine new subscribers.
         let live = self.reap_closed(field);
@@ -10622,7 +11036,7 @@ impl RecordInstance {
         for entry in self.parsed_inputs.iter_mut().flatten() {
             entry.release_target();
         }
-        self.release_inp_addr();
+        self.release_link_addrs();
         first
     }
 
@@ -10637,17 +11051,25 @@ impl RecordInstance {
                 entry.release_target();
             }
         }
-        // Every handle the INP cell holds, not only `cell`'s: the removal
-        // moved the name revision, so the next read re-resolves anyway.
-        self.release_inp_addr();
+        // Every handle the cells hold, not only `cell`'s: the removal moved
+        // the name revision, so the next access re-resolves anyway.
+        self.release_link_addrs();
     }
 
-    /// Empty the INP link's address cell (`DbLink::release_addr`).
-    fn release_inp_addr(&mut self) {
-        if let ParsedLink::Db(db) = self.parsed_inp.link() {
-            // SAFETY: `&mut self` excludes every `PvDatabase::inp_addr`
-            // borrow, the only lender of this cell.
-            unsafe { db.release_addr() }
+    /// Empty the address cell of every link this record lends a target
+    /// through (`DbLink::release_addr`): INP for its reads, OUT and the
+    /// type's declared links for its writes.
+    fn release_link_addrs(&mut self) {
+        let links = [self.parsed_inp.link(), self.parsed_out.link()]
+            .into_iter()
+            .chain(self.link_slots.links().map(|l| &**l));
+        for link in links {
+            if let ParsedLink::Db(db) = link {
+                // SAFETY: `&mut self` excludes `PvDatabase::inp_addr`'s
+                // borrow, and the acquire that gave it excludes every
+                // `DbLink::lend_out_addr` holder of this record's set.
+                unsafe { db.release_addr() }
+            }
         }
     }
 
@@ -14087,5 +14509,191 @@ mod posted_settle_tests {
     #[test]
     fn a_field_published_before_the_first_settle_reads_settled() {
         assert!(posted(&mut toggles(false), "X"));
+    }
+}
+
+#[cfg(test)]
+mod link_cache_fact_tests {
+    use super::*;
+    use crate::server::record::{LinkFieldType, parse_link_field};
+    use crate::server::records::ai::AiRecord;
+
+    /// The entry's inline facts are the installed parse's answers, through
+    /// every kind change and back to empty: a fact left from the previous
+    /// parse would make the cycle skip or take a link its text no longer has.
+    #[test]
+    fn every_install_restates_the_entrys_facts() {
+        let mut inst = RecordInstance::new("LCF".to_string(), AiRecord::new(0.0));
+        let fresh = &inst.parsed_out;
+        assert!(fresh.is_constant() && !fresh.is_writable_out_link());
+        for text in ["OTHER.VAL", "5", "ca://OTHER", "@hw 1", "OTHER NPP", ""] {
+            let parse = parse_link_field(text, LinkFieldType::Out);
+            for field in ["OUT", "SDIS", "FLNK"] {
+                assert!(inst.set_link_cache(field, parse.clone()));
+            }
+            for cache in [&inst.parsed_out, &inst.parsed_sdis, &inst.parsed_flnk] {
+                assert_eq!(
+                    cache.is_constant(),
+                    crate::server::recgbl::simm::is_constant(cache.link()),
+                    "{text:?}"
+                );
+                assert_eq!(
+                    cache.is_writable_out_link(),
+                    cache.link().is_writable_out_link(),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod put_addr_tests {
+    use super::*;
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::ioc_builder::IocBuilder;
+    use crate::server::record::dbd_generated::RECORD_TYPES;
+    use crate::server::record::{FieldSlot, SlotRef};
+
+    /// One `R` per record type the builder loads with no fields set.
+    async fn every_type() -> Vec<std::sync::Arc<PvDatabase>> {
+        let mut dbs = Vec::new();
+        for record_type in RECORD_TYPES {
+            let db = format!(r#"record({record_type}, "R") {{}}"#);
+            let Ok(builder) = IocBuilder::new().db_string(&db, &Default::default()) else {
+                continue;
+            };
+            if let Ok((db, _)) = builder.build().await {
+                dbs.push(db);
+            }
+        }
+        dbs
+    }
+
+    /// `(field, slot, cap)` of every field `dbPut` stores through a lean
+    /// `Str` arm.
+    fn lean_strings(rec: &RecordCell) -> Vec<(&'static str, FieldSlot, u16)> {
+        rec.rdes()
+            .fields
+            .iter()
+            .filter_map(|d| match PutAddr::resolve_in(rec, d.name).put() {
+                PutFn::Str { slot, cap } => Some((d.name, slot, cap)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_reserved(db: &PvDatabase, name: &str, when: &str) -> usize {
+        let rec = db.get_record(name).unwrap();
+        let fields = lean_strings(&rec);
+        let inst = rec.read();
+        for &(field, slot, cap) in &fields {
+            let Some(SlotRef::Str(s)) = inst.record.slot_ref(slot) else {
+                panic!("{name}.{field}: no Str slot");
+            };
+            assert!(
+                s.capacity() >= usize::from(cap),
+                "{name}.{field} {when}: capacity {} < {cap}",
+                s.capacity()
+            );
+        }
+        fields.len()
+    }
+
+    /// A lean `Str` store copies within the reserve `RecordCell::new` gave
+    /// the slot; any writer that replaces the buffer instead makes the next
+    /// lean store grow it under the hold.
+    #[epics_macros_rs::epics_test]
+    async fn every_lean_string_slot_keeps_its_reserve() {
+        let mut checked = 0;
+        for db in every_type().await {
+            checked += assert_reserved(&db, "R", "at load");
+            let rec = db.get_record("R").unwrap();
+            for (field, _, _) in lean_strings(&rec) {
+                let _ = db
+                    .put_pv(&format!("R.{field}"), EpicsValue::String("x".into()))
+                    .await;
+            }
+            assert_reserved(&db, "R", "after a put by name");
+            let _ = db
+                .process_record_with_links("R", &mut ProcStack::new())
+                .await;
+            assert_reserved(&db, "R", "after a process cycle");
+        }
+        assert!(checked > 0, "no lean string field found");
+
+        // stringin's simulation SVAL and stringout's IVOA "Set output to
+        // IVOV" are the writers a plain cycle does not reach.
+        let (db, _) = IocBuilder::new()
+            .db_string(
+                r#"
+record(stringout, "SRC") { field(VAL, "simulated") }
+record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "SRC NPP") }
+record(ai, "BAD") { field(PINI, "YES") field(VAL, "5") field(HIHI, "1") field(HHSV, "INVALID") }
+record(stringout, "SOI") { field(OMSL, "closed_loop") field(DOL, "BAD MS")
+                           field(IVOA, "Set output to IVOV") field(IVOV, "iv") }
+"#,
+                &Default::default(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for name in ["BAD", "SI", "SOI"] {
+            db.process_record_with_links(name, &mut ProcStack::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            db.get_pv("SI").unwrap(),
+            EpicsValue::String("simulated".into())
+        );
+        assert_eq!(db.get_pv("SOI").unwrap(), EpicsValue::String("iv".into()));
+        assert_reserved(&db, "SI", "after simulation");
+        assert_reserved(&db, "SOI", "after IVOA");
+    }
+
+    /// `lean_put_fn` takes a lean arm only when the slot's recorded variant
+    /// is the declared type's; any other variant is `General`.
+    #[epics_macros_rs::epics_test]
+    async fn a_disagreeing_slot_variant_takes_general() {
+        use SlotKind as K;
+        const KINDS: [SlotKind; 11] = [
+            K::F64,
+            K::F32,
+            K::I8,
+            K::U8,
+            K::I16,
+            K::U16,
+            K::I32,
+            K::U32,
+            K::I64,
+            K::U64,
+            K::Str,
+        ];
+        let mut checked = 0;
+        for db in every_type().await {
+            let rec = db.get_record("R").unwrap();
+            let rdes = rec.rdes();
+            for (i, desc) in rdes.fields.iter().enumerate() {
+                let (Some(slot), Some(recorded)) = (rec.slots[i], rec.put_facts[i].kind) else {
+                    continue;
+                };
+                if lean_put_fn(rdes.record_type, desc, slot, recorded) == PutFn::General {
+                    continue;
+                }
+                for kind in KINDS.into_iter().filter(|&k| k != recorded) {
+                    assert_eq!(
+                        lean_put_fn(rdes.record_type, desc, slot, kind),
+                        PutFn::General,
+                        "{}.{} as {kind:?}",
+                        rdes.record_type,
+                        desc.name
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 }

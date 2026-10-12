@@ -418,7 +418,13 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
          //!   pointer's width is `sizeof(void *)` of the build, as C's is.\n\
          //!   Carried is not servable: `FieldDesc::unreadable` is what refuses\n\
          //!   the read, so the SEARCH is answered off the descriptor instead of\n\
-         //!   off the name list.\n",
+         //!   off the name list.\n\
+         //!\n\
+         //! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field\n\
+         //! table here, the one numbering a `FieldSlot` uses. Names are as\n\
+         //! declared; a name that is not a Rust identifier has each other\n\
+         //! character replaced by `_`, a leading digit prefixed by `_`, and a\n\
+         //! keyword suffixed by `_`.\n",
         input.dbd_dir
     )
     .unwrap();
@@ -578,6 +584,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     let mut decl_consts: Vec<(String, String)> = Vec::new();
     let mut dbaddr_consts: Vec<(String, String)> = Vec::new();
     let mut no_prompt: Vec<(String, usize)> = Vec::new();
+    let mut slot_mods: Vec<(String, Vec<String>)> = Vec::new();
     for rec in input.records {
         let konst = fields_const(&rec.name);
         let own: Vec<&Field> = rec
@@ -614,6 +621,10 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         }
         out.push_str("];\n\n");
         record_consts.push((rec.name.clone(), konst.clone()));
+        slot_mods.push((
+            rec.name.clone(),
+            own.iter().map(|f| f.name.clone()).collect(),
+        ));
 
         // The dropped internals keep their NAMES: C's `dbNameToAddr`
         // resolves a `DBF_NOACCESS` field, so a SEARCH for it is answered
@@ -878,6 +889,8 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     }
     out.push_str("];\n");
 
+    emit_slots(&mut out, base, &slot_mods)?;
+
     // Base's tables are base's own lookups; a downstream crate hands its set
     // to base through `register_contributed_dbd`, its `dbLoadDatabase`.
     if base != "crate" {
@@ -897,6 +910,76 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     }
 
     Ok(out)
+}
+
+/// `pub mod slots { pub mod <rtype> { pub const <FIELD>: FieldSlot = ...; } }`,
+/// each value the field's index in its type's field table. Nothing is emitted
+/// for a target with no record types.
+fn emit_slots(out: &mut String, base: &str, types: &[(String, Vec<String>)]) -> Result<(), String> {
+    if types.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\n/// Each field's index in its record type's field table: the slot\n\
+         /// `RecordCell::new` caches it at and `FieldSlot` names.\n\
+         // Module names are the record type names as declared (`aSub`).\n\
+         #[allow(non_snake_case)]\n\
+         pub mod slots {{\n\
+         \x20   use {base}::server::record::FieldSlot;"
+    )
+    .unwrap();
+    let mut mods = BTreeSet::new();
+    for (rtype, fields) in types {
+        let module = rust_ident(rtype);
+        if !mods.insert(module.clone()) {
+            return Err(format!("slots module collision: {rtype} -> {module}"));
+        }
+        writeln!(
+            out,
+            "\n    pub mod {module} {{\n        use super::FieldSlot;"
+        )
+        .unwrap();
+        let mut consts = BTreeSet::new();
+        for (i, name) in fields.iter().enumerate() {
+            let konst = rust_ident(name);
+            if !consts.insert(konst.clone()) {
+                return Err(format!("slots::{module} collision: {name} -> {konst}"));
+            }
+            let i = u16::try_from(i)
+                .map_err(|_| format!("{rtype}.{name}: index {i} exceeds FieldSlot"))?;
+            writeln!(
+                out,
+                "        pub const {konst}: FieldSlot = FieldSlot({i});"
+            )
+            .unwrap();
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
+    Ok(())
+}
+
+/// `name` as a Rust identifier, by the escape the module header documents.
+fn rust_ident(name: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod",
+        "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+        "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box",
+        "do", "final", "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+    ];
+    let mut out: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    if out == "_" || KEYWORDS.contains(&out.as_str()) {
+        out.push('_');
+    }
+    out
 }
 
 /// Emit the body of a `fn(&str) -> Option<&'static [T]>` string-keyed lookup:
@@ -1223,6 +1306,16 @@ mod tests {
         assert_eq!(fields_const("mbbiDirect"), "MBBI_DIRECT_FIELDS");
         assert_eq!(fields_const("aSub"), "A_SUB_FIELDS");
         assert_eq!(fields_const("int64in"), "INT64IN_FIELDS");
+    }
+
+    #[test]
+    fn slot_identifiers_escape_deterministically() {
+        assert_eq!(rust_ident("VAL"), "VAL");
+        assert_eq!(rust_ident("aSub"), "aSub");
+        assert_eq!(rust_ident("A.B"), "A_B");
+        assert_eq!(rust_ident("1X"), "_1X");
+        assert_eq!(rust_ident("type"), "type_");
+        assert_eq!(rust_ident(""), "__");
     }
 
     /// The generator emits the *declared* DBF type and leaves the CA promotion

@@ -652,6 +652,68 @@ const CALCOUT_PROCESS_POSTED: [&str; 23] = [
 ];
 
 impl Record for CalcoutRecord {
+    // DLYA is DBF_USHORT held as `i16`; the menus are `i16` served as ENUM.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::calcout;
+        VAL => val,
+        PVAL => pval,
+        CLCV => clcv,
+        ODLY => odly,
+        OCLV => oclv,
+        IVOV => ivov,
+        EGU => egu,
+        PREC => prec,
+        HOPR => hopr,
+        LOPR => lopr,
+        ADEL => adel,
+        MDEL => mdel,
+        A => a,
+        B => b,
+        C => c,
+        D => d,
+        E => e,
+        F => f,
+        G => g,
+        H => h,
+        I => i,
+        J => j,
+        K => k,
+        L => l,
+        M => m,
+        N => n,
+        O => o,
+        P => p,
+        Q => q,
+        R => r,
+        S => s,
+        T => t,
+        U => u,
+        OVAL => oval;
+        read_only:
+        LA => la,
+        LB => lb,
+        LC => lc,
+        LD => ld,
+        LE => le,
+        LF => lf,
+        LG => lg,
+        LH => lh,
+        LI => li,
+        LJ => lj,
+        LK => lk,
+        LL => ll,
+        LM => lm,
+        LN => ln,
+        LO => lo,
+        LP => lp,
+        LQ => lq,
+        LR => lr,
+        LS => ls,
+        LT => lt,
+        LU => lu,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst);
+
     fn alarms_before_stamp(&self) -> bool {
         true
     }
@@ -1224,7 +1286,7 @@ impl Record for CalcoutRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

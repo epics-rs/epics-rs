@@ -1,11 +1,11 @@
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
 };
-use crate::types::{EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString, Scalar};
 
 /// Binary output record matching C boRecord behavior.
 /// VAL is converted to RVAL using MASK before writing to hardware.
@@ -134,6 +134,23 @@ pub(crate) fn set_bo_high_limit(value: f64) {
 }
 
 impl Record for BoRecord {
+    // The menus are stored as `i16` and served as ENUM, so they stay General.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::bo;
+        VAL => val,
+        HIGH => high,
+        ZNAM => znam,
+        ONAM => onam,
+        RVAL => rval,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        ORAW => oraw,
+        MASK => mask,
+        RBV => rbv,
+        ORBV => orbv,
+        MLST => mlst,
+        LALM => lalm);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -214,6 +231,10 @@ impl Record for BoRecord {
     /// DBR_LONG put, so the cast is C's reinterpretation, not a range clamp.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::Long(self.rval as i32))
+    }
+
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(Scalar::Int((self.rval as i32).into())))
     }
 
     /// C `boRecord.c:230-238` (R7.0.10) is `prec->val = prec->ivov;` followed
@@ -565,14 +586,14 @@ impl Record for BoRecord {
             },
             "ZNAM" => match value {
                 EpicsValue::String(v) => {
-                    self.znam = v;
+                    self.znam.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ONAM" => match value {
                 EpicsValue::String(v) => {
-                    self.onam = v;
+                    self.onam.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

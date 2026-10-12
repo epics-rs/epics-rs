@@ -181,6 +181,8 @@ pub struct MemberChannel {
     pub pv_name: String,
     /// The `+channel` asked for the `$` view.
     pub string_view: bool,
+    /// [`Self::put_field`].
+    put_field: String,
     /// The value channel's filter chain — pvxs's `Field::value` filters.
     pub value_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// The PROPERTY channel's chain: an INDEPENDENT parse of the same
@@ -204,6 +206,7 @@ impl MemberChannel {
                 field: String::new(),
                 pv_name: String::new(),
                 string_view: false,
+                put_field: String::new(),
                 value_filters: Arc::new(f::FilterChain::new()),
                 property_filters: Arc::new(f::FilterChain::new()),
             };
@@ -221,12 +224,18 @@ impl MemberChannel {
             )
         };
         let (value_filters, property_filters) = (parse(), parse());
+        let put_field = if cn.string_view {
+            format!("{}$", cn.field)
+        } else {
+            cn.field.clone()
+        };
         Self {
             def,
             record: cn.record,
             field: cn.field,
             pv_name: cn.record_path,
             string_view: cn.string_view,
+            put_field,
             value_filters,
             property_filters,
         }
@@ -240,6 +249,12 @@ impl MemberChannel {
     /// `(record, FIELD)` as the group paths need them.
     pub fn names(&self) -> (&str, &str) {
         (self.record.as_str(), self.field.as_str())
+    }
+
+    /// The field a put to this member names: `field`, `$` kept, so the
+    /// database resolves the address the channel was bound with.
+    pub fn put_field(&self) -> &str {
+        &self.put_field
     }
 
     /// The value this member's channel serves, read through the `$` view it
@@ -671,17 +686,14 @@ impl BridgeChannel {
             got: value.struct_id.to_string(),
         })?;
 
+        // A put through the char address goes by the `$` name, which the
+        // database resolves to it.
+        let mut char_address = false;
         let epics_val = if self.nt_type == NtType::Dollar(PvaDollar::Chars) {
             // The `int8_t[]` a `$` channel serves: `putArray`'s
             // `dbPut(DBR_CHAR)` through the char address.
-            use epics_base_rs::server::database::char_view::{CharWrite, char_view};
-            let rec = self
-                .db
-                .get_record(&self.record_name)
-                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
-            let view = char_view(&rec.read(), &self.field);
-            view.zip(CharWrite::from_pva(&raw_val))
-                .and_then(|(view, write)| view.put_value(write))
+            char_address = true;
+            epics_base_rs::server::database::char_view::pva_char_request(&raw_val)
                 .ok_or_else(|| BridgeError::PutRejected(format!("{}: no $ view", self.pv_name)))?
         } else if matches!(
             self.nt_type,
@@ -693,24 +705,19 @@ impl BridgeChannel {
             // `DBF_CHAR` storage — that would parse the whole string as one
             // integer and reject the PUT.
             let text = pvif::long_string_value(&raw_val);
-            use epics_base_rs::server::database::char_view::{CharWrite, char_view};
-            let refused = || BridgeError::PutRejected(format!("{}: no $ view", self.pv_name));
             let rec = self
                 .db
                 .get_record(&self.record_name)
                 .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
             // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through the
-            // char address — `$`, or the plain one pvxs re-views — the one
-            // owner CA and `dbpf` put through.
-            let view = char_view(&rec.read(), &self.field)
-                .filter(|v| self.string_view || v.re_views_plain_channel());
-            if let Some(view) = view {
+            // char address — `$`, or the plain one pvxs re-views.
+            char_address = self.string_view
+                || epics_base_rs::server::database::char_view::char_view(&rec.read(), &self.field)
+                    .is_some_and(|v| v.re_views_plain_channel());
+            if char_address {
                 let mut chars = text.as_bytes().to_vec();
                 chars.push(0);
-                view.put_value(CharWrite::Chars(chars))
-                    .ok_or_else(refused)?
-            } else if self.string_view {
-                return Err(refused());
+                EpicsValue::CharArray(chars.into())
             } else if self.value_dbf == DbFieldType::Char {
                 // The field's storage IS a `DBR_CHAR` array, so this is
                 // pvxs's `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`,
@@ -796,14 +803,13 @@ impl BridgeChannel {
             // `put_field_from_client`, shared with the native PVA source so
             // the two servers cannot drift on what `process=false` or
             // `block=true` means.
+            let field = if char_address {
+                std::borrow::Cow::Owned(format!("{}$", self.field))
+            } else {
+                std::borrow::Cow::Borrowed(self.field.as_str())
+            };
             self.db
-                .put_field_from_client(
-                    &self.record_name,
-                    &self.field,
-                    value,
-                    opts.process,
-                    opts.block,
-                )
+                .put_field_from_client(&self.record_name, &field, value, opts.process, opts.block)
                 .await
                 .map_err(|e| BridgeError::PutRejected(e.to_string()))
         })

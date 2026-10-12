@@ -616,8 +616,9 @@ fn test_record_instance() {
 fn test_read_only_field() {
     use epics_macros_rs::EpicsRecord;
 
+    // A real type: the derive maps `VAL` to `slots::ai::VAL`.
     #[derive(EpicsRecord)]
-    #[record(type = "test", crate_path = "epics_base_rs")]
+    #[record(type = "ai", crate_path = "epics_base_rs")]
     struct TestRecord {
         #[field(type = "Double")]
         pub val: f64,
@@ -647,7 +648,7 @@ fn test_read_only_field() {
     // No `field_list()` assertion here: `#[derive(EpicsRecord)]` is not a
     // declaration source. `#[field(read_only)]` drives this record's own
     // `put_field` refusal (asserted above); the wire-visible SPC_NOMOD
-    // declaration comes from the `.dbd`, and record type "test" has none.
+    // declaration comes from the `.dbd`, not from the derive.
 }
 
 #[test]

@@ -4269,23 +4269,6 @@ enum PutPlan {
     Refuse { logged_value: Option<EpicsValue> },
 }
 
-/// What a put through a `$` channel stores: the decoded chars (or one element
-/// of another type) through C's DBR_CHAR address of `field`, or C's refusal.
-fn dollar_put_value(
-    record: &epics_base_rs::server::record::RecordCell,
-    field: &str,
-    value: EpicsValue,
-) -> CaResult<EpicsValue> {
-    use epics_base_rs::server::database::char_view::{CharWrite, char_view};
-    let refused = || epics_base_rs::error::CaError::PutDisabled(field.to_string());
-    let view = char_view(&record.read(), field).ok_or_else(refused)?;
-    let written = match value {
-        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => CharWrite::Chars(b.to_vec()),
-        v => CharWrite::Elements(v.db_field_type(), v),
-    };
-    view.put_value(written).ok_or_else(refused)
-}
-
 /// The shared synchronous head of `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY`.
 ///
 /// This is the whole wire path both front-ends run in ONE copy: the SID /
@@ -4984,34 +4967,31 @@ pub(crate) async fn serve_write_head(
                 }
                 ChannelTarget::RecordField { record, field } => {
                     let name: &str = record.name();
-                    // A `$` channel writes through C's DBR_CHAR address of the
-                    // field: the shared owner turns the chars into what that
-                    // `dbPutField` stores, or refuses as C does.
-                    let new_value = match entry.long_string_mode {
+                    // A `$` channel puts by its `$` name, which the database
+                    // resolves to C's DBR_CHAR address of the field.
+                    let dollar;
+                    let field: &str = match entry.long_string_mode {
                         LongStringMode::DollarChar { .. } => {
-                            dollar_put_value(record, field, new_value)
+                            dollar = format!("{field}$");
+                            &dollar
                         }
-                        _ => Ok(new_value),
+                        _ => field,
                     };
-                    match new_value {
-                        Err(e) => Err(e),
-                        Ok(new_value) if is_notify => {
-                            db.put_record_field_from_ca(name, field, new_value).await
-                        }
-                        Ok(new_value) => {
-                            // C `write_action` (`rsrv/camessage.c:781-789`)
-                            // routes CA_PROTO_WRITE through `dbPutField` —
-                            // no putNotify is ever built. Parking a wait-set
-                            // whose receiver this fire-and-forget arm drops
-                            // would occupy the record's notify slot until
-                            // any async processing it starts settles (a
-                            // motor's whole motion), failing every
-                            // legitimate WRITE_NOTIFY on the record with
-                            // ECA_PUTCBINPROG in the meantime.
-                            db.put_record_field_from_ca_no_notify(name, field, new_value)
-                                .await
-                                .map(|()| ProcessCompletion::Sync)
-                        }
+                    if is_notify {
+                        db.put_record_field_from_ca(name, field, new_value).await
+                    } else {
+                        // C `write_action` (`rsrv/camessage.c:781-789`)
+                        // routes CA_PROTO_WRITE through `dbPutField` —
+                        // no putNotify is ever built. Parking a wait-set
+                        // whose receiver this fire-and-forget arm drops
+                        // would occupy the record's notify slot until
+                        // any async processing it starts settles (a
+                        // motor's whole motion), failing every
+                        // legitimate WRITE_NOTIFY on the record with
+                        // ECA_PUTCBINPROG in the meantime.
+                        db.put_record_field_from_ca_no_notify(name, field, new_value)
+                            .await
+                            .map(|()| ProcessCompletion::Sync)
                     }
                 }
             };

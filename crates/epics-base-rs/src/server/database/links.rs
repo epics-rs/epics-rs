@@ -22,6 +22,11 @@ use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select
 /// together for a local lookup. The external name stays `pvname`, which keeps
 /// the filter because C hands it to `dbCaAddLink` unchanged.
 fn local_pv_name(target: &ChannelName) -> String {
+    // A `$` address the record refused keeps its `$`, so the put is refused
+    // too rather than storing through the field's own type.
+    if target.string_view {
+        return format!("{}.{}$", target.record, target.field);
+    }
     local_name(&target.record, &target.field)
 }
 
@@ -378,7 +383,7 @@ impl LinkAlarm {
 ///
 /// Shared by the INPUT-link read path (`processing.rs`, where `dest` is
 /// the record reading its inputs) and the DB OUT-link write path
-/// (`write_db_link_value`, C `dbDbPutValue` →
+/// (`write_db_link_value_in`, C `dbDbPutValue` →
 /// `recGblInheritSevrMsg`, dbDbLink.c:382-383, where `dest` is the
 /// OUT-link target). One implementation keeps the two sides from
 /// diverging — an earlier INPUT-side variant wrongly treated MS like
@@ -429,6 +434,42 @@ pub(crate) struct OutLinkSrc<'a> {
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
     pub alarm: &'a LinkAlarm,
     pub field: &'static str,
+}
+
+/// What [`PvDatabase::write_db_link_value_in`] leaves once the link's
+/// address is gone: everything owned, so nothing borrowed from the link or
+/// the lend outlives the put.
+pub(crate) struct DbLinkWrite {
+    /// The local target, kept only when the special's link writes, an
+    /// inherit or `processTarget` still act on it.
+    target: Option<Arc<crate::server::record::RecordCell>>,
+    switch: crate::server::record::MonitorSwitch,
+    gate: Option<ProcessTargetGate>,
+    failed: bool,
+}
+
+impl DbLinkWrite {
+    /// A write that reached no local record: the external route's.
+    fn untargeted(failed: bool) -> Self {
+        Self {
+            target: None,
+            switch: crate::server::record::MonitorSwitch::NoMaximize,
+            gate: None,
+            failed,
+        }
+    }
+}
+
+/// The special's link writes and the rest of its `dbPut`, with the put's
+/// report owed after them. A caller-owned slot that only a special with
+/// link writes fills: returned by value, its ~440 bytes were copied on
+/// every write.
+pub(crate) struct LinkStage {
+    stage: (
+        super::field_io::LinkActions,
+        super::field_io::LinkTail<'static>,
+    ),
+    report: Option<(super::field_io::PutTail, std::borrow::Cow<'static, str>)>,
 }
 
 /// Which of C's two gates a `processTarget` call is coming through — the two
@@ -782,14 +823,19 @@ impl PvDatabase {
         if !self.names_field(&rec, db.field_as_written()) {
             return DbLinkAnswer::Absent;
         }
-        let mut put =
-            crate::server::record::record_instance::PutAddr::resolve_in(&rec, &db.target().field);
-        if db.target().string_view {
-            put.field = put.field.viewed_as_chars();
-        }
+        use crate::server::record::record_instance::PutAddr;
+        let field = &db.target().field;
+        let put = if db.target().string_view {
+            match PutAddr::resolve_chars_in(&rec, field) {
+                Some(put) => put,
+                None => return DbLinkAnswer::Absent,
+            }
+        } else {
+            PutAddr::resolve_in(&rec, field)
+        };
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
-                .then(|| super::field_io::double_slot(put.field))
+                .then(|| super::field_io::double_slot(put.field()))
                 .flatten(),
             rec,
             name,
@@ -828,7 +874,7 @@ impl PvDatabase {
     fn read_db_target(&self, db: &crate::server::record::DbLink) -> TargetValue {
         use crate::server::record::DbLinkAnswer;
         match self.db_link_answer(db) {
-            DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field),
+            DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
             DbLinkAnswer::Shadowed(pv) => TargetValue::NoRecord(Some(pv.get())),
             DbLinkAnswer::Absent => self.read_db_target_by_name(db),
         }
@@ -843,7 +889,7 @@ impl PvDatabase {
             // revision moved: read through the re-resolved answer, once. A
             // target gone again by then has nothing readable this cycle.
             LinkTarget::Local(_) => match self.db_link_answer(db) {
-                DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field),
+                DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
                 DbLinkAnswer::Shadowed(pv) => TargetValue::NoRecord(Some(pv.get())),
                 DbLinkAnswer::Absent => TargetValue::NoRecord(None),
             },
@@ -897,12 +943,12 @@ impl PvDatabase {
         let mut value;
         let alarm;
         let render;
-        if at.put.field.char_view {
+        if at.put.field().char_view() {
             alarm = db_link_alarm(db, at, &instance);
             value = char_image_after_hold(instance, &target.field);
             render = None;
         } else {
-            value = self.read_field_at(&instance, &target.field, at.put.field);
+            value = self.read_field_at(&instance, &target.field, at.put.field());
             alarm = db_link_alarm(db, at, &instance);
             // A `$` source is a `DBF_CHAR` array, which renders with nothing
             // of the record's; a string renders as itself.
@@ -941,7 +987,7 @@ impl PvDatabase {
         let instance = rec.read();
         let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
             .then(|| LinkAlarm::committed(&instance.common));
-        let value = if addr.char_view {
+        let value = if addr.char_view() {
             char_image_after_hold(instance, &db.target().field)
         } else {
             self.read_field_at(&instance, &db.target().field, addr)
@@ -1103,6 +1149,7 @@ impl PvDatabase {
     /// `LinkFetch::Value` arm.
     pub(crate) fn read_link_value_as_with_alarm(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut ProcStack,
@@ -1113,7 +1160,7 @@ impl PvDatabase {
         let Some(value) = value else {
             return (empty_read_fetch(link), None);
         };
-        match self.apply_link_read_as(link, read_as, value, render) {
+        match self.apply_link_read_as(held, link, read_as, value, render) {
             Some(v) => (LinkFetch::Value(v), alarm),
             None => (LinkFetch::Failed, None),
         }
@@ -1133,6 +1180,7 @@ impl PvDatabase {
     /// goes back to the source for it.
     pub(crate) fn apply_link_read_as(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
@@ -1140,7 +1188,7 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         match read_as {
             crate::server::record::LinkReadAs::Native => Some(value),
-            _ => self.convert_link_read(link, read_as, value, render),
+            _ => self.convert_link_read(held, link, read_as, value, render),
         }
     }
 
@@ -1148,6 +1196,7 @@ impl PvDatabase {
     /// read's frame.
     fn convert_link_read(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
@@ -1169,7 +1218,7 @@ impl PvDatabase {
             | LinkReadAs::UShort
             | LinkReadAs::Int64
             | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type()?),
-            LinkReadAs::Enum => self.enum_read_of(link, value),
+            LinkReadAs::Enum => self.enum_read_of(held, link, value),
             LinkReadAs::String => self
                 .dbr_string_of(link, value, render)
                 .map(EpicsValue::String),
@@ -1177,7 +1226,7 @@ impl PvDatabase {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
             LinkReadAs::Array { dbr, n_request } => {
-                self.array_read_of(link, dbr, n_request, value, render)
+                self.array_read_of(held, link, dbr, n_request, value, render)
             }
         }
     }
@@ -1187,6 +1236,7 @@ impl PvDatabase {
     /// matching scalar request does.
     fn array_read_of(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         dbr: DbFieldType,
         n_request: usize,
@@ -1204,7 +1254,7 @@ impl PvDatabase {
             DbFieldType::String => self
                 .dbr_string_of(link, value, render)
                 .map(EpicsValue::String),
-            DbFieldType::Enum => self.enum_read_of(link, value),
+            DbFieldType::Enum => self.enum_read_of(held, link, value),
             _ => value.get_convert(dbr).ok(),
         }
     }
@@ -1218,6 +1268,7 @@ impl PvDatabase {
     /// `dbGet`'s `n <= 0` arm, which converts nothing and succeeds.
     fn enum_read_of(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
     ) -> Option<EpicsValue> {
@@ -1248,9 +1299,9 @@ impl PvDatabase {
             return None;
         };
         let at = self.db_link_addr(db)?;
-        let mut source = at.rec.write();
+        let mut source = at.rec.write_under(held);
         // Named only by a refusal, so a delivered read never looks it up.
-        let field = || at.put.field.desc.map_or("VAL", |d| d.name);
+        let field = || at.put.field().desc.map_or("VAL", |d| d.name);
         // C's `cvt_st_e` reports both refusals under the reader's lock set
         // (`dbFastLinkConv.c:255-256`, `:277-280`); printed here once the
         // source's data lock is down.
@@ -1603,7 +1654,7 @@ impl PvDatabase {
         else {
             return (None, None);
         };
-        match self.apply_link_read_as(link, read_as, value, render) {
+        match self.apply_link_read_as(Some(held), link, read_as, value, render) {
             Some(value) => (Some(value), alarm),
             None => (None, None),
         }
@@ -2428,23 +2479,26 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) {
         if let Some(at) = self.db_link_addr(link) {
-            self.process_target_at(&at, gate, src_putf, src_notify, visited);
+            self.process_target_at(&at.rec, gate, src_putf, src_notify, None, visited);
         }
     }
 
     /// [`Self::process_target`] for a target a link has already resolved —
     /// the `dbAddr`'s `precord` C's `processTarget` is handed.
+    ///
+    /// `held` is the caller's frame set, which a target merged into it is
+    /// written under without taking it again.
     pub(crate) fn process_target_at(
         &self,
-        at: &crate::server::record::record_instance::ResolvedTarget,
+        target_rec: &Arc<crate::server::record::RecordCell>,
         gate: ProcessTargetGate,
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
+        held: Option<&super::SetGuard>,
         visited: &mut ProcStack,
     ) {
-        let target_rec = &at.rec;
         {
-            let mut tg = target_rec.write();
+            let mut tg = target_rec.write_under(held);
             // The gate. A target that does not pass it never reaches
             // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
             // join — the join in particular would `enter` the wait-set without
@@ -2468,33 +2522,12 @@ impl PvDatabase {
         // `dbProcess(pdst)` is: an active target is refused inside
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there.
-        let _ = self.process_record_with_links_recursive_at(&at.name, target_rec, visited);
+        let _ = self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited);
     }
 
-    /// Write a value through a DbLink, optionally processing the target if PP and Passive.
-    ///
-    /// Returns `true` when the write failed — C `dbPutLink` status `!= 0`:
-    /// the local `dbPut` was rejected (conversion error, missing field) or
-    /// the non-local external write returned `Err`. Callers that mirror a
-    /// record's `dbPutLink` status (e.g. dfanout `push_values` raising
-    /// `LINK_ALARM/MAJOR`, dfanoutRecord.c:312) fold this into the source's
-    /// alarm; the fanout/seq dispatch paths ignore it.
-    ///
-    /// `src_putf` carries the source record's `PUTF` bit so the target inherits
-    /// it the same way C `dbDbLink.c::processTarget` propagates it (lines 470-498):
-    ///
-    /// - target not pact: `target.putf = src_putf` (normal propagation),
-    /// - target pact AND `src_putf` AND target not on current process chain:
-    ///   `target.rpro = true`, `target.putf = false` so the in-flight cycle
-    ///   reprocesses on completion attributing the put to the originator,
-    /// - otherwise: no PUTF change (target is either being processed
-    ///   recursively by us, or wasn't triggered by a dbPutField).
-    ///
-    /// Without this, a CA WRITE_NOTIFY landing on an upstream calc/seq/dfanout
-    /// that fanned out via DB OUT links would see `target.putf = 0` on every
-    /// downstream record — breaking dbNotify completion attribution and any
-    /// device-support code that uses PUTF to distinguish operator-driven from
-    /// scan-driven processing.
+    /// C `dbDbPutValue` (`dbDbLink.c:372-392`) for a caller with no frame —
+    /// a test's direct write. Returns `true` when the put failed.
+    #[cfg(test)]
     pub(crate) fn write_db_link_value(
         &self,
         link: &crate::server::record::DbLink,
@@ -2502,131 +2535,231 @@ impl PvDatabase {
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
-        let target = link.target();
-        // C `dbDbPutValue` puts through the link's `dbAddr`; the cached
-        // address is that, so the write hashes and allocates no name.
-        let (addr, shadow) = match self.db_link_answer(link) {
-            crate::server::record::DbLinkAnswer::Local(at) => (Some(at), None),
-            crate::server::record::DbLinkAnswer::Shadowed(pv) => (None, Some(pv)),
-            crate::server::record::DbLinkAnswer::Absent => (None, None),
+        let link = Arc::new(crate::server::record::ParsedLink::Db(Arc::new(
+            link.clone(),
+        )));
+        let mut staged = None;
+        let write = self.write_db_link_value_in(
+            None,
+            link,
+            super::field_io::PutSrc::Owned(value),
+            false,
+            src.notify,
+            &mut staged,
+        );
+        self.finish_db_link_write(write, &mut staged, None, src, visited)
+    }
+
+    /// The `dbPut` of C `dbDbPutValue` (`dbDbLink.c:372-380`) through `link`,
+    /// a DB link, and the one place its address lives: lent under `held`
+    /// (the writer's frame set), or the owned answer on a route that holds
+    /// none. The address and the handle end here, before anything that can
+    /// park and so let the owner's set go (a special's link write, PP): a
+    /// link swapped during a park is freed by the swapper, never by the
+    /// frame. What the rest of `dbDbPutValue` needs comes back owned.
+    ///
+    /// A target record not present in this IOC is a CA link (`dbInitLink`
+    /// locality, `dbLink.c:118-130`): its write goes to the external put
+    /// path (`dbCaPutLink`), which performs none of the inherit / PUTF /
+    /// `processTarget` body, so it comes back with no target.
+    ///
+    /// `ls`: the put is C `dbPutLinkLS`'s, `src` a long string.
+    pub(crate) fn write_db_link_value_in(
+        &self,
+        held: Option<&super::SetGuard>,
+        link: Arc<crate::server::record::ParsedLink>,
+        src: super::field_io::PutSrc<'_>,
+        ls: bool,
+        notify: Option<&Arc<NotifyWaitSet>>,
+        staged: &mut Option<LinkStage>,
+    ) -> DbLinkWrite {
+        use crate::server::record::DbLinkAnswer;
+        use crate::server::record::record_instance::LinkTargetResolver;
+        let crate::server::record::ParsedLink::Db(db) = &*link else {
+            unreachable!("write_db_link_value_in takes a DB link");
         };
-        // C `dbInitLink` locality (`dbLink.c:118-130`): a target record
-        // not present in this IOC is a CA link, so its write is routed
-        // through the external put path (`dbCaPutLink`), not a local
-        // `dbPut`. The alarm-inheritance / PUTF / `processTarget`
-        // machinery below is the local-DB `dbDbPutValue` body
-        // (dbDbLink.c:372-393), which `dbCaPutLink` performs none of —
-        // so a non-local target returns right after the remote write.
-        // OUTPUT-side twin of the `read_db_link_value` locality fallback.
-        if addr.is_none() && !self.has_name_no_resolve(&target.record) {
-            let external = link.pvname();
-            if let Err(refusal) = self.write_external_pv(&external, value, src.notify) {
-                refusal.report(&external);
-                return true;
+        let target = db.target();
+        let lent = held.and_then(|held| {
+            db.lend_out_addr(held, self.name_revision(), || self.resolve_db_link(db))
+        });
+        let owned;
+        let (at, shadow) = match lent {
+            Some(at) => (Some(at), None),
+            None => match self.db_link_answer(db) {
+                DbLinkAnswer::Local(at) => {
+                    owned = at;
+                    (Some(&owned), None)
+                }
+                DbLinkAnswer::Shadowed(pv) => (None, Some(pv)),
+                DbLinkAnswer::Absent => (None, None),
+            },
+        };
+        // C `dbPutLinkLS` (`dbLink.c:527-538`): only a `DBF_CHAR`/`DBF_UCHAR`
+        // field takes the characters; any other takes one `DBR_STRING`.
+        let src = match (src.value(), at) {
+            (EpicsValue::CharArray(chars), Some(at))
+                if ls && !takes_chars(held, at, &target.field) =>
+            {
+                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                super::field_io::PutSrc::Owned(EpicsValue::String(PvString::from(&chars[..end])))
             }
-            return false;
+            _ => src,
+        };
+        if at.is_none() && !self.has_name_no_resolve(&target.record) {
+            let external = db.pvname();
+            let failed = match self.write_external_pv(&external, src.into_value(), notify) {
+                Ok(()) => false,
+                Err(refusal) => {
+                    refusal.report(&external);
+                    true
+                }
+            };
+            return DbLinkWrite::untargeted(failed);
         }
-        // an OUT-link write-back is an internal step of the
-        // processing chain that already holds the entry record's
-        // advisory write gate (`dbScanLock` analogue). It must use the
-        // `_already_locked` write so it does not re-acquire a gate: a
-        // self-referencing OUT link (`SELF PP`) would otherwise
-        // dead-lock on the entry record's own non-reentrant gate. C
-        // `dbDbPutValue` writes the OUT-link target under the same
-        // lock set the chain already owns.
-        // No put-notify restart is armed by this write, whether or not the
-        // `PP` / `.PROC` branch below drives a cycle: C's owner is the cycle
-        // tail (`recGblFwdLink` → `dbNotifyCompletion`), so a target whose park
-        // this releases replays on its next cycle and an NPP link — `gate` is
-        // `None` below — leaves it parked, exactly as C does.
-        // A cycle's write has no put gate to drop: a refusal's report prints
-        // here, under the cycle's hold as in C, and `special()`'s after-gate
-        // work is discarded.
-        let mut chain = super::field_io::PutChain::root(&mut *visited);
-        let put_result = match (&addr, shadow) {
-            (Some(at), _) => {
-                self.put_record_body(&at.name, &at.rec, &target.field, &at.put, value, &mut chain)
-            }
+        // No put-notify restart is armed by this write, whether or not PP
+        // drives a cycle: C's owner is the cycle tail (`recGblFwdLink` →
+        // `dbNotifyCompletion`), so a target whose park this releases replays
+        // on its next cycle. A refusal's report prints here, under the
+        // cycle's hold as in C, and `special()`'s after-gate work is
+        // discarded.
+        let mut tail = super::field_io::PutTail::default();
+        let put = match (at, shadow) {
+            (Some(at), _) => self.db_put_at(
+                held,
+                super::field_io::PutTarget {
+                    name: &at.name,
+                    rec: &at.rec,
+                    field: &target.field,
+                    at: &at.put,
+                },
+                src,
+                0,
+                super::field_io::PutVia::DbPut,
+                &mut tail,
+            ),
             // `put_pv_body`'s simple-PV arm, with the PV already settled.
             (None, Some(pv)) => {
-                pv.set(value);
-                Ok(())
+                pv.set(src.into_value());
+                Ok(None)
             }
-            (None, None) => self.put_pv_body(&local_pv_name(target), value, &mut chain),
+            // No frame reaches here, so the put roots its own chain.
+            (None, None) => {
+                let mut visited = ProcStack::new();
+                let mut chain = super::field_io::PutChain::root(&mut visited);
+                let put = self.put_pv_body(&local_pv_name(target), src.into_value(), &mut chain);
+                tail = chain.tail;
+                put.map(|()| None)
+            }
         };
-        if chain.tail.has_report() {
-            let record = addr.as_ref().map_or(target.record.as_str(), |at| &at.name);
-            self.emit_cycle_report(record, &target.field, chain.tail);
+        // The report prints after the special's link writes, as `dbPut`'s
+        // own does; with none to run it prints here.
+        let failed = put.is_err();
+        if let Ok(Some((actions, rest))) = put {
+            let rest = rest.detach();
+            let report = tail.has_report().then(|| {
+                let field = rest.field();
+                (tail, field)
+            });
+            *staged = Some(LinkStage {
+                stage: (actions, rest),
+                report,
+            });
+        } else if tail.has_report() {
+            let record = at.map_or(target.record.as_str(), |at| &at.name);
+            self.emit_cycle_report(record, &target.field, tail);
         }
-
-        // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
-        // record's alarm into the destination via `recGblInheritSevrMsg`,
-        // AFTER the `dbPut` and BEFORE `processTarget`. The fields C reads
-        // there are `psrce->nsta/nsev/namsg` — the source's PENDING alarm,
-        // because the put runs inside the source's `process()`, before its
-        // `recGblResetAlarms`. Every OUT-put site in this port drives its
-        // writes in that same pre-commit window and hands them
-        // [`LinkAlarm::pending`]; a committed snapshot would carry the
-        // PREVIOUS cycle's severity. The inherited
-        // severity lands in the dest's PENDING nsev/nsta(/namsg for MSS);
-        // the dest commits it on its next `rec_gbl_reset_alarms` — its
-        // own process cycle, reached below for a `.PROC`/`PP` link, or a
-        // later independent scan otherwise. NMS (the common case) skips
-        // the dest lookup/lock entirely.
-        if link.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize {
-            if let Some(at) = &addr {
-                let mut tg = at.rec.write();
-                inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
-            }
-        }
-
-        // C `dbDbPutValue` (dbDbLink.c:384-385) returns the put status
-        // immediately after the alarm inheritance and BEFORE the
-        // `.PROC`/`PP` `processTarget` branch: only a successful write
-        // reaches target processing. A failed OUT-link write (missing
-        // field, record put rejection) must therefore NOT trigger the
-        // target's process cycle, which would otherwise run the target
-        // on its stale field value and diverge from C on side effects,
-        // FLNK, alarms, and put-notify completion ordering. The alarm
-        // inheritance above already ran (C folds it regardless of
-        // status), matching the C ordering exactly.
-        //
-        // An empty array into a scalar field is NOT such a failure: C
-        // `dbPut` accepts it, raises LINK/INVALID on the destination and
-        // returns 0 (`dbAccess.c:1370-1372`), so a `PP` link still
-        // processes its target — see `field_io::PutRequest`.
-        if put_result.is_err() {
-            return true;
-        }
-
-        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when the
-        // destination field is `.PROC` **or** the link carries `pvlOptPP` (an
-        // explicit ` PP` token → `ProcessPassive`) and the target is Passive.
-        // The two arms are different gates, not one: the `.PROC` arm is
-        // independent of both the PP flag and the target's SCAN (R18-94). It is
-        // therefore checked here in the write path rather than encoded as a
-        // parse-time policy: a modifier-less link defaults to `NoProcess`
-        // uniformly (INPUT and OUTPUT alike), and writing into a record's
-        // `.PROC` field still forces a process.
+        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when
+        // the destination field is `.PROC` **or** the link carries
+        // `pvlOptPP` and the target is Passive: two gates, not one — the
+        // `.PROC` arm is independent of both the PP flag and the target's
+        // SCAN (R18-94), so it is decided here and not at parse time.
         let gate = if target.field == "PROC" {
             Some(ProcessTargetGate::ProcField)
-        } else if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+        } else if db.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
             Some(ProcessTargetGate::ScanPassive)
         } else {
             None
         };
-        if let Some(gate) = gate {
-            // Through the single `processTarget` owner, which holds the gate.
-            // Alias-aware: `process_target` resolves the name, as
-            // `process_record_with_links` does at entry.
-            // A target that is no local record has no address and nothing
-            // to process, as `process_target`'s lookup would find.
-            if let Some(at) = &addr {
-                self.process_target_at(at, gate, src.putf, src.notify, visited);
-            }
+        let switch = db.monitor_switch;
+        // The owned target, a refcount bump, only for what still acts on it.
+        let needed = staged.is_some()
+            || switch != crate::server::record::MonitorSwitch::NoMaximize
+            || (gate.is_some() && !failed);
+        DbLinkWrite {
+            target: at.filter(|_| needed).map(|at| Arc::clone(&at.rec)),
+            switch,
+            gate,
+            failed,
         }
-        // Successful local write (C `dbPutLink` status 0).
+    }
+
+    /// The rest of C `dbDbPutValue` after its `dbPut`: the special's link
+    /// writes and the rest of that `dbPut` (`LinkTail`), then the source's
+    /// alarm inherited by the target (`dbDbLink.c:382-383`), then
+    /// `processTarget` on a successful put (`:384-390`). Returns `true` when
+    /// the put failed — C `dbPutLink` status `!= 0`.
+    fn finish_db_link_write(
+        &self,
+        write: DbLinkWrite,
+        staged: &mut Option<LinkStage>,
+        held: Option<&super::SetGuard>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        let DbLinkWrite {
+            target,
+            switch,
+            gate,
+            mut failed,
+        } = write;
+        if staged.is_some()
+            && let Some(rec) = &target
+        {
+            failed |= self.finish_link_stage(rec, staged, held, visited);
+        }
+        // C folds the source's PENDING alarm (`psrce->nsta/nsev/namsg`: the
+        // put runs inside the source's `process()`, before its
+        // `recGblResetAlarms`) into the destination whatever the put's
+        // status; the dest commits it on its own next cycle. NMS (the
+        // common case) takes no borrow.
+        if switch != crate::server::record::MonitorSwitch::NoMaximize
+            && let Some(rec) = &target
+        {
+            let mut tg = rec.write_under(held);
+            inherit_sevr_msg(&mut tg.common, switch, src.alarm);
+        }
+        // Only a successful write reaches target processing. An empty array
+        // into a scalar field is not a failure: C `dbPut` raises LINK/INVALID
+        // on the destination and returns 0 (`dbAccess.c:1370-1372`).
+        if failed {
+            return true;
+        }
+        if let (Some(gate), Some(rec)) = (gate, &target) {
+            self.process_target_at(rec, gate, src.putf, src.notify, held, visited);
+        }
         false
+    }
+
+    /// [`LinkStage`]'s owed work: the special's link writes, the rest of its
+    /// `dbPut`, then the report. `true` when the put failed.
+    #[cold]
+    fn finish_link_stage(
+        &self,
+        rec: &Arc<crate::server::record::RecordCell>,
+        staged: &mut Option<LinkStage>,
+        held: Option<&super::SetGuard>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        let Some(LinkStage { stage, report }) = staged.take() else {
+            return false;
+        };
+        let failed = self
+            .finish_put_stage(rec.name(), rec, Some(stage), held, visited)
+            .is_err();
+        if let Some((tail, field)) = report {
+            self.emit_cycle_report(rec.name(), &field, tail);
+        }
+        failed
     }
 
     /// Resolve an external OUT-link name to its put-queue target and ask C
@@ -3125,12 +3258,15 @@ impl PvDatabase {
             let links = instance.record.multi_output_links();
             let mut pairs = Vec::new();
             for &(link_field, val_field) in links {
-                let link = match instance.stored_link(link_field) {
-                    None | Some(crate::server::record::ParsedLink::None) => continue,
+                let link = match instance.stored_link_shared(link_field) {
+                    None => continue,
+                    Some(link) if matches!(**link, crate::server::record::ParsedLink::None) => {
+                        continue;
+                    }
                     Some(link) => link,
                 };
                 if let Some(val) = instance.record.get_field(val_field) {
-                    pairs.push((link_field, link.clone(), val));
+                    pairs.push((link_field, Arc::clone(link), val));
                 }
             }
             pairs
@@ -3151,8 +3287,8 @@ impl PvDatabase {
             let val = self.multi_out_buffer_choice(rec, link_field, &parsed, val);
             self.write_out_link_value(
                 rec,
-                &parsed,
-                val,
+                parsed,
+                super::PutSrc::Owned(val),
                 OutLinkSrc {
                     field: link_field,
                     ..src
@@ -3164,7 +3300,7 @@ impl PvDatabase {
 
     /// **The put owner** — C `dbLink.c::dbPutLink` (434-448). Writes a value
     /// through a parsed OUT link, dispatching DB links to
-    /// [`Self::write_db_link_value`] and external (`ca://`/`pva://`) links to
+    /// [`Self::write_db_link_value_in`] and external (`ca://`/`pva://`) links to
     /// [`Self::write_external_pv`], and — this is the part no caller may skip
     /// — raising the source record's `LINK_ALARM`/`INVALID` when the put
     /// fails:
@@ -3206,14 +3342,26 @@ impl PvDatabase {
     pub(crate) fn write_out_link_value(
         &self,
         src_rec: InFrame<'_>,
-        link: &crate::server::record::ParsedLink,
-        value: EpicsValue,
+        link: Arc<crate::server::record::ParsedLink>,
+        value: super::field_io::PutSrc<'_>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
-        let failed = match link {
-            crate::server::record::ParsedLink::Db(db) => {
-                self.write_db_link_value(db, value, src, visited)
+        let failed = match &*link {
+            crate::server::record::ParsedLink::Db(_) => {
+                let held = Some(src_rec.set());
+                // The `dbPutLinkLS` callers (`lsoRecord.c:286`,
+                // `devLsoSoft.c:21`, `devPrintfSoft.c:19`) are the sources
+                // whose output is a long string.
+                let ls = matches!(value.value(), EpicsValue::CharArray(_))
+                    && matches!(
+                        src_rec.read().record.output_view(),
+                        Some(crate::server::record::OutView::Chars(_))
+                    );
+                let mut staged = None;
+                let write =
+                    self.write_db_link_value_in(held, link, value, ls, src.notify, &mut staged);
+                self.finish_db_link_write(write, &mut staged, held, src, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -3221,7 +3369,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                match self.write_external_pv(&name, value, src.notify) {
+                match self.write_external_pv(&name, value.into_value(), src.notify) {
                     Ok(()) => false,
                     Err(refusal) => {
                         refusal.report(&name);
@@ -3235,7 +3383,7 @@ impl PvDatabase {
             // (`dbLink.c:443-446`).
             crate::server::record::ParsedLink::State(st) => {
                 use crate::server::record::{StateLink, StatePut};
-                match StateLink::put_of(&value) {
+                match StateLink::put_of(value.value()) {
                     StatePut::Truth(truth) => {
                         self.db_state(&st.name).set(st.write(truth));
                         false
@@ -3247,7 +3395,7 @@ impl PvDatabase {
             // Constant / Hw / Calc / None are not writable OUT-link
             // targets — no-op. A removed link has no lset: `S_db_noLSET`,
             // and no `setLinkAlarm` (`dbLink.c:440-441`).
-            _ => return matches!(link, crate::server::record::ParsedLink::Removed(_)),
+            other => return matches!(other, crate::server::record::ParsedLink::Removed(_)),
         };
         if failed {
             let mut inst = src_rec.write();
@@ -3452,9 +3600,9 @@ impl PvDatabase {
         }
 
         // Snapshot the source record's PUTF bit + put-notify wait-set so
-        // every write_db_link_value call below propagates them to its
+        // every write_db_link_value_in call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value doc). The PENDING
+        // wait-set invariants (see write_db_link_value_in doc). The PENDING
         // alarm travels the same way for `recGblInheritSevrMsg` MS-class
         // propagation into each OUT-link target: the OUTn/LNKn puts precede
         // the source's `recGblResetAlarms`, so C reads `psrce->nsta/nsev`
@@ -3630,13 +3778,14 @@ impl PvDatabase {
                     }
                 }
             }
-            MultiOut::Dfanout(links) => {
+            MultiOut::Dfanout(mut links) => {
                 if let Some(ref val) = val {
                     for idx in indices {
-                        let Some(parsed) = links[idx].as_deref() else {
+                        // Taken, so the handle ends inside the put.
+                        let Some(parsed) = links[idx].take() else {
                             continue;
                         };
-                        if matches!(parsed, crate::server::record::ParsedLink::None) {
+                        if matches!(*parsed, crate::server::record::ParsedLink::None) {
                             continue;
                         }
                         // C `dfanoutRecord.c:323` drives each OUTn via
@@ -3651,7 +3800,7 @@ impl PvDatabase {
                         // default and the `.PROC`/`PP` processing rule
                         // are both honoured by `parse_output_link_v2`
                         // (uniform NoProcess default) +
-                        // `write_db_link_value` (write-path target
+                        // `write_db_link_value_in` (write-path target
                         // processing), so no per-call downgrade is needed.
                         // Through the put owner, so a failed OUTn raises the
                         // record's LINK_ALARM/INVALID from inside the put (C
@@ -3665,7 +3814,7 @@ impl PvDatabase {
                         if self.write_out_link_value(
                             rec,
                             parsed,
-                            val.clone(),
+                            super::PutSrc::Value(val),
                             OutLinkSrc {
                                 field: DFANOUT_LINK_FIELDS[idx],
                                 ..out_src
@@ -3858,8 +4007,8 @@ impl PvDatabase {
             // `dbLink.c:444-446`).
             self.write_out_link_value(
                 rec,
-                &grp.lnk,
-                EpicsValue::Double(new_dov),
+                Arc::clone(&grp.lnk),
+                super::PutSrc::Owned(EpicsValue::Double(new_dov)),
                 OutLinkSrc {
                     putf: src_putf,
                     notify: src_notify.as_ref(),
@@ -4225,7 +4374,7 @@ impl PvDatabase {
                     })
                     .collect()
             };
-            let mut rewrites: Vec<(&str, crate::server::record::ParsedLink)> = Vec::new();
+            let mut rewrites: Vec<(&str, Arc<crate::server::record::ParsedLink>)> = Vec::new();
             for (field, text) in &raw {
                 let ftype = COMMON_LINK_FIELDS
                     .iter()
@@ -4242,7 +4391,9 @@ impl PvDatabase {
                 let json = matches!(parsed, crate::server::record::ParsedLink::PvaJson(_));
                 let next = self.db_init_link_locality(parsed);
                 match (&next, unserviceable) {
-                    (crate::server::record::ParsedLink::Ca(_), _) => rewrites.push((field, next)),
+                    (crate::server::record::ParsedLink::Ca(_), _) => {
+                        rewrites.push((field, Arc::new(next)))
+                    }
                     // C names a `{pva:...}` with no `link(pva, ...)` loaded
                     // (`dbJLink.c:264`); a `pva://` text is a CA link to C
                     // (`dbLink.c:119-130`), refused silently.
@@ -4252,7 +4403,7 @@ impl PvDatabase {
                                 "dbJLinkInit: Link type '{scheme}' not found\n"
                             ));
                         }
-                        rewrites.push((field, next));
+                        rewrites.push((field, Arc::new(next)));
                     }
                     _ => {}
                 }
@@ -4260,13 +4411,23 @@ impl PvDatabase {
             if rewrites.is_empty() {
                 continue;
             }
-            let mut inst = rec.write();
-            for (field, link) in rewrites {
-                let is_refusal = matches!(link, crate::server::record::ParsedLink::None);
-                if inst.set_link_cache(field, link) && !is_refusal {
-                    converted += 1;
+            // The parses were built above and the replaced ones leave in
+            // `retired`, reserved here: the hold only moves pointers.
+            let mut retired = Vec::with_capacity(rewrites.len());
+            {
+                let mut inst = rec.write();
+                for (field, link) in rewrites.drain(..) {
+                    let is_refusal = matches!(*link, crate::server::record::ParsedLink::None);
+                    match inst.install_link_cache(field, link) {
+                        Ok(old) => {
+                            converted += usize::from(!is_refusal);
+                            retired.push(old);
+                        }
+                        Err(link) => retired.push(link),
+                    }
                 }
             }
+            drop((retired, rewrites));
         }
         if converted > 0 {
             tracing::debug!("iocInit: {converted} non-local DB link(s) made external");
@@ -4472,15 +4633,19 @@ impl PvDatabase {
             return;
         }
         let holder = self.canonical_name(holder);
-        let removed = self
-            .get_record(&holder)
+        let rec = self.get_record(&holder);
+        let removed = rec
+            .as_ref()
             .is_some_and(|rec| rec.read().link_unadded(field));
         let edge = self
             .record_link_fields(&holder)
             .into_iter()
             .find(|(f, _, _)| !removed && f.eq_ignore_ascii_case(field))
             .and_then(|(_, _, parsed)| Self::classify_cp_link(parsed));
-        let field = field.to_ascii_uppercase();
+        let field = rec.as_ref().map_or_else(
+            || crate::server::record::record_instance::upper_field(field),
+            |rec| rec.canonical_field(field),
+        );
         for external in [false, true] {
             let keyed = edge
                 .as_ref()
@@ -4614,6 +4779,34 @@ pub(crate) type RenderedFetch = (
     Option<SourceAlarm>,
     Option<crate::server::record::record_instance::SourceRender>,
 );
+
+/// Whether `at` addresses a `DBF_CHAR`/`DBF_UCHAR` field — C
+/// `dbGetLinkDBFtype` of a DB link (`dbDbGetDBFtype`). A runtime-typed field
+/// is typed by the variant it holds, as `cvt_dbaddr` is in the port.
+#[cold]
+fn takes_chars(
+    held: Option<&super::SetGuard>,
+    at: &crate::server::record::record_instance::ResolvedTarget,
+    field: &str,
+) -> bool {
+    use crate::types::DbfCode;
+    let addr = at.put.field();
+    if addr.char_view() {
+        return true;
+    }
+    let Some(desc) = addr.desc else {
+        return false;
+    };
+    let value = desc.runtime_typed.then(|| {
+        let guard = match held {
+            Some(held) => at.rec.read_in(held),
+            None => at.rec.read(),
+        };
+        guard.resolve_field(field)
+    });
+    let code = super::char_view::field_addr_types(desc, value.flatten().as_ref()).0;
+    matches!(code, DbfCode::Char | DbfCode::UChar)
+}
 
 #[cfg(test)]
 mod out_link_put_fail_tests {
@@ -5108,7 +5301,11 @@ mod cp_link_locality_tests {
             inst.common.inp = "SRC CP".to_string();
             // Seed the parse cache as load would, so the assertion proves
             // setup_cp_links leaves a local CP link untouched.
-            inst.set_link_cache("INP", crate::server::record::parse_link_v2("SRC CP"));
+            inst.install_link_cache(
+                "INP",
+                std::sync::Arc::new(crate::server::record::parse_link_v2("SRC CP")),
+            )
+            .expect("INP is a common link");
         }
 
         db.initialize_link_locality().await;
@@ -5933,13 +6130,14 @@ mod db_link_addr_tests {
             assert_eq!(
                 link.target_is_val()
                     && link.target().json_suffix.is_none()
-                    && crate::server::database::field_io::double_slot(at.put.field).is_some(),
+                    && crate::server::database::field_io::double_slot(at.put.field()).is_some(),
                 slot_path,
                 "{text}"
             );
             let held = db.lock_record(&link.target().record);
             let (value, alarm) = db.read_db_link_f64_at(held.set(), link, &at);
             let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+                None,
                 &parsed,
                 LinkReadAs::Double,
                 &mut ProcStack::new(),
@@ -6002,6 +6200,7 @@ mod db_link_addr_tests {
             ("SABC", None),
         ] {
             let (fetch, _) = db.read_link_value_as_with_alarm(
+                None,
                 &parse_link_v2(src),
                 read_as,
                 &mut ProcStack::new(),
@@ -6058,7 +6257,7 @@ mod db_link_addr_tests {
                 let held = db.lock_record(&link.target().record);
                 let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
                 let (fetch, general_alarm) =
-                    db.read_link_value_as_with_alarm(&parsed, read_as, &mut ProcStack::new());
+                    db.read_link_value_as_with_alarm(None, &parsed, read_as, &mut ProcStack::new());
                 let general = match fetch {
                     crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
                     _ => None,
@@ -6167,7 +6366,7 @@ mod db_link_addr_tests {
         for (text, rec, field, slotted) in cases {
             let cell = db.get_record(rec).unwrap();
             assert_eq!(
-                FieldAddr::resolve_in(&cell, field).slot.is_some(),
+                FieldAddr::resolve_in(&cell, field).slot().is_some(),
                 slotted,
                 "{text}"
             );
@@ -6258,6 +6457,133 @@ impl std::fmt::Display for ExternalPutRefusal {
                  (db/dbCa.c:558-560 (dbCaPutLinkCallback))",
             ),
             Self::Unserviceable(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Spec §5 test 17: an OUT target outside the source's held set. Every DB
+/// link merges its two sets at iocInit, so the state is reached as
+/// breakpoint.rs's fixtures reach theirs: the link poked in after the sets
+/// were built. rs only; C has no observable equivalent.
+#[cfg(test)]
+mod out_link_held_set_tests {
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::record::{LinkFieldType, parse_link_field};
+    use crate::server::records::ao::AoRecord;
+    use crate::types::EpicsValue;
+
+    fn point_out(db: &PvDatabase, from: &str, to: &str) {
+        let rec = db.get_record(from).expect("record");
+        let mut inst = rec.write();
+        inst.common.out = to.to_string();
+        inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
+    }
+
+    fn num(db: &PvDatabase, pv: &str) -> f64 {
+        db.get_pv(pv).unwrap().to_f64().unwrap()
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): the runtime only awaits add_record and the frame; passes on the exec backend.
+    #[tokio::test]
+    async fn a_target_outside_the_held_set_is_written_like_one_inside() {
+        let db = PvDatabase::new();
+        for name in ["HS:IN", "HS:SI", "HS:OUT", "HS:SO"] {
+            db.add_record(name, Box::new(AoRecord::new(0.0)))
+                .await
+                .expect("add_record");
+        }
+        point_out(&db, "HS:SI", "HS:IN.VAL PP");
+        db.build_lock_sets();
+        point_out(&db, "HS:SO", "HS:OUT.VAL PP");
+        let members = |r: &str| db.lock_set_of(r).expect("a set").members;
+        assert!(members("HS:SI").contains(&"HS:IN".to_string()));
+        assert!(
+            !members("HS:SO").contains(&"HS:OUT".to_string()),
+            "the precondition: HS:OUT is outside HS:SO's set"
+        );
+
+        for (src, tgt) in [("HS:SI", "HS:IN"), ("HS:SO", "HS:OUT")] {
+            db.get_record(src)
+                .unwrap()
+                .write()
+                .record
+                .set_val(EpicsValue::Double(4.0))
+                .unwrap();
+            db.process_record_with_links(src, &mut ProcStack::new())
+                .await
+                .expect("process");
+            assert_eq!(num(&db, tgt), 4.0, "{tgt}");
+            assert_eq!(num(&db, &format!("{tgt}.UDF")), 0.0, "{tgt} processed");
+            assert_eq!(num(&db, &format!("{tgt}.SEVR")), 0.0, "{tgt}");
+            assert_eq!(num(&db, &format!("{src}.SEVR")), 0.0, "{src}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod enum_read_held_set_tests {
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::recgbl::EventMask;
+    use crate::server::recgbl::simm::LinkFetch;
+    use crate::server::record::{LinkReadAs, Record, parse_link_v2};
+    use crate::server::records::{ao::AoRecord, bi::BiRecord};
+    use crate::types::{DbFieldType, EpicsValue};
+
+    /// `cvt_st_e` stores the source's VAL through `put_enum_str` and posts
+    /// nothing, from a reader whose set holds the source (the borrow) and
+    /// from one whose set does not (the acquire).
+    // RTEMS-EXEC-MODEL-ALLOW(1): the runtime only awaits add_record; passes on the exec backend.
+    #[tokio::test]
+    async fn a_state_name_read_stores_the_source_val_in_or_out_of_the_held_set() {
+        let db = PvDatabase::new();
+        let mut bsrc = BiRecord::new(0);
+        bsrc.put_field("ZNAM", EpicsValue::String("Low".into()))
+            .unwrap();
+        bsrc.put_field("ONAM", EpicsValue::String("High".into()))
+            .unwrap();
+        db.add_record("BSRC", Box::new(bsrc)).await.unwrap();
+        db.add_record("OTHER", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.build_lock_sets();
+        assert!(
+            !db.lock_set_of("OTHER")
+                .unwrap()
+                .members
+                .contains(&"BSRC".to_string())
+        );
+        let mut posts = db
+            .get_record("BSRC")
+            .unwrap()
+            .write()
+            .add_subscriber(
+                "VAL",
+                1,
+                DbFieldType::Enum,
+                (EventMask::VALUE | EventMask::LOG).bits(),
+            )
+            .unwrap();
+        while posts.try_recv().is_ok() {}
+
+        for (reader, field, want) in [("BSRC", "ONAM", 1), ("OTHER", "ZNAM", 0)] {
+            let held = db.lock_record(reader);
+            let (fetch, _) = db.read_link_value_as_with_alarm(
+                Some(held.set()),
+                &parse_link_v2(&format!("BSRC.{field} NPP")),
+                LinkReadAs::Enum,
+                &mut ProcStack::new(),
+            );
+            drop(held);
+            assert!(
+                matches!(&fetch, LinkFetch::Value(EpicsValue::EnumArray(v)) if v.is_empty()),
+                "{reader}: the reader's buffer is unwritten, {fetch:?}"
+            );
+            assert_eq!(
+                db.get_pv("BSRC").unwrap(),
+                EpicsValue::Enum(want),
+                "{reader}"
+            );
+            assert!(posts.try_recv().is_err(), "{reader}: nothing posted");
         }
     }
 }

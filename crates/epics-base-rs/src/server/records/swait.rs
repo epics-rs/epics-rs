@@ -5,12 +5,12 @@ use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
-use crate::types::{EpicsValue, c_cast};
+use crate::types::{EpicsValue, Scalar, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
 /// (`INAV`..`INLV`), then `DOLV`, then `OUTV`. C keeps the statuses in one
@@ -251,6 +251,12 @@ impl Default for SwaitRecord {
 const CHAN: [char; 12] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 
 impl SwaitRecord {
+    /// `outValue = pwait->dopt ? pwait->dold : pwait->val`
+    /// (`swaitRecord.c:764-775`).
+    fn out_value(&self) -> f64 {
+        if self.dopt == 1 { self.dold } else { self.val }
+    }
+
     /// C `swaitRecord.c:304,561` — swait compiles its CALC with the **numeric**
     /// `postfix()`, not `sCalcPostfix()`. Its grammar is therefore epics-base
     /// calc's: no SVAL, no string literals, no sCalc string functions.
@@ -887,11 +893,13 @@ impl Record for SwaitRecord {
     /// the DOLD it reads is the one the framework just refreshed from the DOL
     /// link (see [`Record::output_time_input_links`]).
     fn output_link_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(if self.dopt == 1 {
-            self.dold
-        } else {
-            self.val
-        }))
+        Some(EpicsValue::Double(self.out_value()))
+    }
+
+    /// The same value; swait's OVAL is "Old Value", so the default view over
+    /// OVAL would be wrong.
+    fn output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(Scalar::Float(self.out_value())))
     }
 
     /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C

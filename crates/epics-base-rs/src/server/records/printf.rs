@@ -5,16 +5,6 @@ use crate::server::record::{
 };
 use crate::types::{EpicsValue, PvString};
 
-/// Truncate `s` to at most `max` bytes. C keeps the result in a fixed
-/// `char[SIZV]` and copies it byte for byte, so the cut is on a raw byte
-/// boundary and a non-UTF-8 value keeps its bytes verbatim.
-fn truncate_bytes(s: PvString, max: usize) -> PvString {
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
-}
-
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
 // Each format specifier in FMT consumes the next input in order. A `*`
@@ -892,6 +882,12 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
 }
 
 impl Record for PrintfRecord {
+    // FMT recompiles on put and LEN is VAL's length, so neither maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::printf;
+        IVLS => ivls;
+        read_only:
+        SIZV => sizv);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -986,6 +982,12 @@ impl Record for PrintfRecord {
         self.val()
     }
 
+    fn output_view(&self) -> Option<crate::server::record::OutView<'_>> {
+        Some(crate::server::record::OutView::Chars(
+            &self.val.elements()[..],
+        ))
+    }
+
     fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
         Some(crate::server::record::ValueView::Char(self.val.elements()))
     }
@@ -1058,7 +1060,7 @@ impl Record for PrintfRecord {
                 if let EpicsValue::String(s) = value {
                     // C dbd `field(IVLS,DBF_STRING) size(16)`: a 16-byte
                     // buffer holds at most 15 bytes plus the NUL.
-                    self.ivls = truncate_bytes(s, 15);
+                    self.ivls.set_bytes(&s.as_bytes()[..s.len().min(15)]);
                 } else {
                     return Err(CaError::TypeMismatch("IVLS".into()));
                 }

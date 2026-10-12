@@ -1,9 +1,9 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record, uniform_post_table,
 };
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, Scalar};
 
 use super::mbbi_direct::BIT_NAMES;
 
@@ -126,6 +126,19 @@ impl MbboDirectRecord {
 }
 
 impl Record for MbboDirectRecord {
+    // VAL/IVOV/MLST/OBIT are DBF_LONG held as `u32`, B0..B1F rewrite VAL,
+    // and the menus are `i16` served as ENUM: none of them maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbboDirect;
+        SHFT => shft,
+        SDLY => sdly;
+        read_only:
+        NOBT => nobt,
+        RVAL => rval,
+        ORAW => oraw,
+        RBV => rbv,
+        ORBV => orbv,
+        MASK => mask);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -156,6 +169,10 @@ impl Record for MbboDirectRecord {
     /// 1)`.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::ULong(self.rval & self.mask))
+    }
+
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(Scalar::Int((self.rval & self.mask).into())))
     }
 
     fn set_device_did_compute(&mut self, did: bool) {

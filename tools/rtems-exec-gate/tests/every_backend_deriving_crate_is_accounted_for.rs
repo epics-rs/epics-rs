@@ -162,6 +162,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/cli_dbr_type_race.rs"),
     ("epics-ca-rs", "tests/cli_monitor_separator.rs"),
     ("epics-ca-rs", "tests/cli_value_format.rs"),
+    ("epics-ca-rs", "tests/dbput_ca_link_target.rs"),
     ("epics-ca-rs", "tests/differential_libca.rs"),
     ("epics-ca-rs", "tests/discovery_mdns.rs"),
     ("epics-ca-rs", "tests/dollar_long_string_record.rs"),

@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead, CycleValue};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString, Scalar};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
 pub struct MbboRecord {
@@ -326,11 +326,11 @@ macro_rules! mbb_put_field {
         }
     };
     // `PvStr`-tagged fields are genuine DBF_STRING state-name data stored
-    // in a `PvString`; move the wire bytes in verbatim so a non-UTF-8
-    // state string is preserved.
+    // in a `PvString`; copy the wire bytes in verbatim, into the buffer the
+    // field has, so a non-UTF-8 state string is preserved.
     (@put $self:expr, $field:ident, PvStr, $value:expr, $name:expr) => {
         if let EpicsValue::String(v) = $value {
-            $self.$field = v;
+            $self.$field.set_bytes(v.as_bytes());
         } else {
             return Err(CaError::TypeMismatch($name.into()));
         }
@@ -393,6 +393,54 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbboRecord {
+    // The menus are stored as `i16` and served as ENUM, so they stay General.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbbo;
+        VAL => val,
+        ZRVL => zrvl,
+        ONVL => onvl,
+        TWVL => twvl,
+        THVL => thvl,
+        FRVL => frvl,
+        FVVL => fvvl,
+        SXVL => sxvl,
+        SVVL => svvl,
+        EIVL => eivl,
+        NIVL => nivl,
+        TEVL => tevl,
+        ELVL => elvl,
+        TVVL => tvvl,
+        TTVL => ttvl,
+        FTVL => ftvl,
+        FFVL => ffvl,
+        ZRST => zrst,
+        ONST => onst,
+        TWST => twst,
+        THST => thst,
+        FRST => frst,
+        FVST => fvst,
+        SXST => sxst,
+        SVST => svst,
+        EIST => eist,
+        NIST => nist,
+        TEST => test,
+        ELST => elst,
+        TVST => tvst,
+        TTST => ttst,
+        FTST => ftst,
+        FFST => ffst,
+        RVAL => rval,
+        SHFT => shft,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        NOBT => nobt,
+        ORAW => oraw,
+        RBV => rbv,
+        ORBV => orbv,
+        MASK => mask,
+        MLST => mlst,
+        LALM => lalm);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -481,6 +529,10 @@ impl Record for MbboRecord {
     /// 1)` — the RAW word, not the state index `devMbboSoft` writes.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::ULong(self.rval & self.mask))
+    }
+
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(Scalar::Int((self.rval & self.mask).into())))
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):

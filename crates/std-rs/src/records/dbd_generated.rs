@@ -32,6 +32,12 @@
 //!   Carried is not servable: `FieldDesc::unreadable` is what refuses
 //!   the read, so the SEARCH is answered off the descriptor instead of
 //!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
@@ -2042,6 +2048,103 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["epid", "throttle", "timestamp"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod epid {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const SMSL: FieldSlot = FieldSlot(1);
+        pub const STPL: FieldSlot = FieldSlot(2);
+        pub const INP: FieldSlot = FieldSlot(3);
+        pub const OUTL: FieldSlot = FieldSlot(4);
+        pub const TRIG: FieldSlot = FieldSlot(5);
+        pub const TVAL: FieldSlot = FieldSlot(6);
+        pub const CVAL: FieldSlot = FieldSlot(7);
+        pub const CVLP: FieldSlot = FieldSlot(8);
+        pub const OVAL: FieldSlot = FieldSlot(9);
+        pub const OVLP: FieldSlot = FieldSlot(10);
+        pub const PREC: FieldSlot = FieldSlot(11);
+        pub const MDT: FieldSlot = FieldSlot(12);
+        pub const FMOD: FieldSlot = FieldSlot(13);
+        pub const FBON: FieldSlot = FieldSlot(14);
+        pub const FBOP: FieldSlot = FieldSlot(15);
+        pub const KP: FieldSlot = FieldSlot(16);
+        pub const KI: FieldSlot = FieldSlot(17);
+        pub const KD: FieldSlot = FieldSlot(18);
+        pub const EGU: FieldSlot = FieldSlot(19);
+        pub const HOPR: FieldSlot = FieldSlot(20);
+        pub const LOPR: FieldSlot = FieldSlot(21);
+        pub const DRVH: FieldSlot = FieldSlot(22);
+        pub const DRVL: FieldSlot = FieldSlot(23);
+        pub const HIHI: FieldSlot = FieldSlot(24);
+        pub const LOLO: FieldSlot = FieldSlot(25);
+        pub const HIGH: FieldSlot = FieldSlot(26);
+        pub const LOW: FieldSlot = FieldSlot(27);
+        pub const HHSV: FieldSlot = FieldSlot(28);
+        pub const LLSV: FieldSlot = FieldSlot(29);
+        pub const HSV: FieldSlot = FieldSlot(30);
+        pub const LSV: FieldSlot = FieldSlot(31);
+        pub const HYST: FieldSlot = FieldSlot(32);
+        pub const ADEL: FieldSlot = FieldSlot(33);
+        pub const MDEL: FieldSlot = FieldSlot(34);
+        pub const ODEL: FieldSlot = FieldSlot(35);
+        pub const P: FieldSlot = FieldSlot(36);
+        pub const PP: FieldSlot = FieldSlot(37);
+        pub const I: FieldSlot = FieldSlot(38);
+        pub const IP: FieldSlot = FieldSlot(39);
+        pub const D: FieldSlot = FieldSlot(40);
+        pub const DP: FieldSlot = FieldSlot(41);
+        pub const CT: FieldSlot = FieldSlot(42);
+        pub const CTP: FieldSlot = FieldSlot(43);
+        pub const DT: FieldSlot = FieldSlot(44);
+        pub const DTP: FieldSlot = FieldSlot(45);
+        pub const ERR: FieldSlot = FieldSlot(46);
+        pub const ERRP: FieldSlot = FieldSlot(47);
+        pub const LALM: FieldSlot = FieldSlot(48);
+        pub const ALST: FieldSlot = FieldSlot(49);
+        pub const MLST: FieldSlot = FieldSlot(50);
+    }
+
+    pub mod throttle {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const OVAL: FieldSlot = FieldSlot(1);
+        pub const SENT: FieldSlot = FieldSlot(2);
+        pub const OSENT: FieldSlot = FieldSlot(3);
+        pub const WAIT: FieldSlot = FieldSlot(4);
+        pub const HOPR: FieldSlot = FieldSlot(5);
+        pub const LOPR: FieldSlot = FieldSlot(6);
+        pub const DRVLH: FieldSlot = FieldSlot(7);
+        pub const DRVLL: FieldSlot = FieldSlot(8);
+        pub const DRVLS: FieldSlot = FieldSlot(9);
+        pub const DRVLC: FieldSlot = FieldSlot(10);
+        pub const VER: FieldSlot = FieldSlot(11);
+        pub const RPVT: FieldSlot = FieldSlot(12);
+        pub const STS: FieldSlot = FieldSlot(13);
+        pub const PREC: FieldSlot = FieldSlot(14);
+        pub const DPREC: FieldSlot = FieldSlot(15);
+        pub const DLY: FieldSlot = FieldSlot(16);
+        pub const OUT: FieldSlot = FieldSlot(17);
+        pub const OV: FieldSlot = FieldSlot(18);
+        pub const SINP: FieldSlot = FieldSlot(19);
+        pub const SIV: FieldSlot = FieldSlot(20);
+        pub const SYNC: FieldSlot = FieldSlot(21);
+    }
+
+    pub mod timestamp {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const OVAL: FieldSlot = FieldSlot(1);
+        pub const RVAL: FieldSlot = FieldSlot(2);
+        pub const TST: FieldSlot = FieldSlot(3);
+    }
+}
 
 /// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
 pub static DBD: epics_base_rs::server::record::ContributedDbd =

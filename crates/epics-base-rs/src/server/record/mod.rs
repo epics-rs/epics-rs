@@ -74,18 +74,19 @@ pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
     ConstantInitLink, CycleCell, CycleHooks, CycleList, CycleMarks, CyclePostMask, CycleRead,
     CycleValue, DeadbandCells, DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
+    FORCE_GENERAL, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
     InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, Pact, PostName, PostedValue, ProcessAction, ProcessActions,
-    ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult,
-    ResolvedInputLinks, SimmCells, Special, SubroutineFn, ValuePostGate, ValueView,
-    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
-    dbput_coerce_value, input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
+    MonitorValueGate, OutTarget, OutView, Pact, PostName, PostedValue, ProcessAction,
+    ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record,
+    RecordProcessResult, ResolvedInputLinks, SimmCells, SlotMut, SlotRef, Special, SubroutineFn,
+    ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
+    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
     put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{
-    SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, seed_trackers_from_val,
-    served_element_size, value_gate,
+    SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, put_string_precision,
+    seed_trackers_from_val, served_element_size, value_gate,
 };
 pub use scan::{ScanList, ScanType, SimModeScan};
 pub use sparse_text::SparseText;

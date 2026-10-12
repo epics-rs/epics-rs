@@ -35,8 +35,20 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
     let Some(EpicsValue::String(link_str)) = record.get_field(seed.link_field) else {
         return None;
     };
+    #[cfg(test)]
+    super::record_instance::put_gate_probe::parsed();
     let parsed = parse_link_v2(link_str.as_str_lossy().as_ref());
-    let ParsedLink::Constant(constant) = &parsed else {
+    load_constant_link(record, seed, &parsed)
+}
+
+/// [`rec_gbl_init_constant_link`] for a link already parsed: the load from
+/// `link` into `seed.target_field`.
+fn load_constant_link<R: Record + ?Sized>(
+    record: &mut R,
+    seed: &ConstantInitLink,
+    link: &ParsedLink,
+) -> Option<EpicsValue> {
+    let ParsedLink::Constant(constant) = link else {
         return None;
     };
     if let Some((dbr, nreq)) = seed.array {
@@ -83,19 +95,23 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
 /// The `special()` half: re-seed the input whose LINK field was just written,
 /// when the record's C `special()` does that (`Record::special_reseed_input_links`).
 ///
+/// `link` is the parse the put installed, made before its hold, so the
+/// re-seed parses nothing.
+///
 /// Returns the value field to post (C's `db_post_events(prec, pvalue,
 /// DBE_VALUE)`), or `None` when this field is not a re-seeding link or the new
 /// link is not constant.
 pub fn reseed_constant_input_link<R: Record + ?Sized>(
     record: &mut R,
     link_field: &str,
+    link: &ParsedLink,
 ) -> Option<&'static str> {
     let seed = record
         .special_reseed_input_links()
         .iter()
-        .find(|(link, _)| *link == link_field)
-        .map(|(link, target)| ConstantInitLink::new(link, target))?;
-    rec_gbl_init_constant_link(record, &seed).map(|_| seed.target_field)
+        .find(|(field, _)| *field == link_field)
+        .map(|(field, target)| ConstantInitLink::new(field, target))?;
+    load_constant_link(record, &seed, link).map(|_| seed.target_field)
 }
 
 /// C `dbConstLoadScalar(plink, dbrType, pbuffer)` (`dbConstLink.c`) — the

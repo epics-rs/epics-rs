@@ -1200,6 +1200,14 @@ struct MultiInputLink<'a> {
     failure_is_inert: bool,
 }
 
+/// The reader of a link conversion: its record, and the set its frame
+/// holds, under which a `cvt_st_e` store into the source is a borrow.
+#[derive(Clone, Copy)]
+struct Reader<'a> {
+    record: &'a dyn crate::server::record::Record,
+    held: &'a crate::server::database::SetGuard,
+}
+
 /// What one link's read came to, for the fetch policy after it.
 struct LinkOutcome {
     read_failed: bool,
@@ -1224,7 +1232,10 @@ impl PvDatabase {
     ) -> LinkOutcome {
         use crate::server::recgbl::simm::LinkFetch;
         let store_raw = self.convert_link_fetch_as(
-            record,
+            Reader {
+                record,
+                held: reader.set(),
+            },
             link.link_field,
             link.parsed,
             link.request,
@@ -1323,10 +1334,10 @@ impl PvDatabase {
         // A field the target hands out a slot for is read as the `f64` the
         // numeric funnel would make of it; any other goes by name and
         // through the funnel.
-        let value = match at.put.field.slot {
+        let value = match at.put.field().slot() {
             Some(slot) => instance.record.get_slot_f64(slot).map(Ok),
             None => self
-                .read_field_at(&instance, field, at.put.field)
+                .read_field_at(&instance, field, at.put.field())
                 .map(|value| value.into_double()),
         };
         let alarm = inherits.then(|| LinkAlarm::committed(&instance.common));
@@ -3298,8 +3309,8 @@ impl PvDatabase {
             self.with_frame(&rec, |frame| {
                 self.write_out_link_value(
                     frame,
-                    &parsed,
-                    value,
+                    Arc::new(parsed),
+                    super::PutSrc::Owned(value),
                     super::links::OutLinkSrc {
                         putf: src_putf,
                         notify: Some(&waitset),
@@ -3784,8 +3795,7 @@ impl PvDatabase {
     /// wraps the whole TSEL read in `if (!dbLinkIsConstant(plink))`: a constant
     /// or unset TSEL is skipped outright and TSE keeps its own value.
     fn tsel_link(instance: &RecordInstance) -> Option<crate::server::record::ParsedLink> {
-        (!crate::server::recgbl::simm::is_constant(instance.parsed_tsel.link()))
-            .then(|| instance.parsed_tsel.clone())
+        (!instance.parsed_tsel.is_constant()).then(|| instance.parsed_tsel.clone())
     }
 
     /// The link half of [`Self::read_tsel`]. Takes other records' locks, so
@@ -4098,8 +4108,7 @@ impl PvDatabase {
             // is CONSTANT, and a CONSTANT tsel is never loaded into TSE by
             // either — `recGbl.c:315` gates the `dbGetLink` on
             // `!dbLinkIsConstant` — so the two orders cannot disagree.
-            let wants_source_time = instance.common.tse == -2
-                && crate::server::recgbl::simm::is_constant(instance.parsed_tsel.link());
+            let wants_source_time = instance.common.tse == -2 && instance.parsed_tsel.is_constant();
 
             // DOL link info for the records that perform C's SCALAR
             // closed-loop DOL fetch. Which records those are is
@@ -4501,6 +4510,7 @@ impl PvDatabase {
                     match fetch {
                         crate::server::recgbl::simm::LinkFetch::Value(v) => {
                             let converted = self.apply_link_read_as(
+                                Some(rec.set()),
                                 &parsed,
                                 crate::server::record::LinkReadAs::UShort,
                                 v,
@@ -4902,8 +4912,7 @@ impl PvDatabase {
             // nothing but read-only tests in between.
             let (sdis_link, disv, diss, disa) = {
                 let instance = guard.hold();
-                let sourced = !PLAIN
-                    && !crate::server::recgbl::simm::is_constant(instance.parsed_sdis.link());
+                let sourced = !PLAIN && !instance.parsed_sdis.is_constant();
                 no_sim_pact_exit = instance.pact_exit_without_release();
                 (
                     sourced.then(|| instance.parsed_sdis.clone()),
@@ -5362,10 +5371,7 @@ impl PvDatabase {
                     // sourced, so the status-gated UDF assignment is skipped.
                     read_produced_no_value = true;
                 }
-                if !had_inp_value
-                    && stage_is_soft
-                    && crate::server::recgbl::simm::is_constant(instance.parsed_inp.link())
-                {
+                if !had_inp_value && stage_is_soft && instance.parsed_inp.is_constant() {
                     // C `dbLinkIsConstant(&prec->inp)` at process. The load-once
                     // rule (a constant delivers nothing here — it was loaded at
                     // init) is the default and stays the default; the ONE soft
@@ -6558,7 +6564,7 @@ impl PvDatabase {
                             // Write OVAL to OUT when the record says should_output().
                             if record_should_output && instance.parsed_out.is_writable_out_link() {
                                 let out_val = instance.record.output_link_value();
-                                out_val.map(|v| (instance.parsed_out.clone(), v))
+                                out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
                             } else {
                                 None
                             }
@@ -6575,7 +6581,7 @@ impl PvDatabase {
                                 instance
                                     .soft_output_value()
                                     .flatten()
-                                    .map(|v| (instance.parsed_out.clone(), v))
+                                    .map(|v| (Arc::clone(instance.parsed_out.shared()), v))
                             } else {
                                 None
                             }
@@ -6746,8 +6752,14 @@ impl PvDatabase {
                     alarm: &src_alarm,
                     field: "OUT",
                 };
-                if let Some((ref link, ref out_val)) = out_info {
-                    self.write_out_link_value(rec, link, out_val.clone(), src, visited);
+                if let Some((link, ref out_val)) = out_info {
+                    self.write_out_link_value(
+                        rec,
+                        link,
+                        super::PutSrc::Value(out_val),
+                        src,
+                        visited,
+                    );
                 }
                 // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
                 // the OOPT reference advances on a suppressed cycle too, which
@@ -7340,7 +7352,8 @@ impl PvDatabase {
         use crate::server::recgbl::simm::LinkFetch;
         // One read for both halves — see
         // `PvDatabase::read_link_value_and_alarm_at_source`.
-        let (fetch, source_alarm) = self.read_link_value_as_with_alarm(&parsed, read_as, visited);
+        let (fetch, source_alarm) =
+            self.read_link_value_as_with_alarm(Some(rec.set()), &parsed, read_as, visited);
         match fetch {
             LinkFetch::NoData => InputFetch::Nothing,
             // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
@@ -7524,8 +7537,8 @@ impl PvDatabase {
                     let (parsed, src_putf, src_notify, src_alarm) = {
                         let instance = rec.read();
                         let link = instance
-                            .stored_link(link_field)
-                            .filter(|l| !matches!(l, crate::server::record::ParsedLink::None))
+                            .stored_link_shared(link_field)
+                            .filter(|l| !matches!(***l, crate::server::record::ParsedLink::None))
                             .cloned();
                         debug_assert!(
                             instance.stored_link(link_field).is_some(),
@@ -7564,8 +7577,8 @@ impl PvDatabase {
                     // `S_db_noLSET` with no alarm.
                     let failed = self.write_out_link_value(
                         rec,
-                        &parsed,
-                        value.clone(),
+                        parsed,
+                        super::PutSrc::Value(&value),
                         super::links::OutLinkSrc {
                             putf: src_putf,
                             notify: src_notify.as_ref(),
@@ -7670,8 +7683,8 @@ impl PvDatabase {
                     let (parsed, src_putf, src_alarm) = {
                         let instance = rec.read();
                         let link = instance
-                            .stored_link(link_field)
-                            .filter(|l| !matches!(l, crate::server::record::ParsedLink::None))
+                            .stored_link_shared(link_field)
+                            .filter(|l| !matches!(***l, crate::server::record::ParsedLink::None))
                             .cloned();
                         (
                             link,
@@ -7689,8 +7702,8 @@ impl PvDatabase {
                     if let Some(parsed) = parsed {
                         self.write_out_link_value(
                             rec,
-                            &parsed,
-                            value,
+                            parsed,
+                            super::PutSrc::Owned(value),
                             super::links::OutLinkSrc {
                                 putf: src_putf,
                                 notify: Some(&waitset),
@@ -8000,13 +8013,13 @@ impl PvDatabase {
                     // (DB or external `ca://`/`pva://`).
                     if record_should_output && instance.parsed_out.is_writable_out_link() {
                         let out_val = instance.record.output_link_value();
-                        out_val.map(|v| (instance.parsed_out.clone(), v))
+                        out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
                     } else {
                         None
                     }
                 } else if let Some(out_val) = soft_out {
                     if instance.parsed_out.is_writable_out_link() {
-                        out_val.map(|v| (instance.parsed_out.clone(), v))
+                        out_val.map(|v| (Arc::clone(instance.parsed_out.shared()), v))
                     } else {
                         None
                     }
@@ -8043,8 +8056,8 @@ impl PvDatabase {
                 alarm: &src_alarm,
                 field: "OUT",
             };
-            if let Some((ref link, ref out_val)) = out_info {
-                self.write_out_link_value(rec, link, out_val.clone(), src, visited);
+            if let Some((link, ref out_val)) = out_info {
+                self.write_out_link_value(rec, link, super::PutSrc::Value(out_val), src, visited);
             }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
@@ -8400,8 +8413,8 @@ impl PvDatabase {
         if let Some(value) = value {
             self.write_out_link_value(
                 rec,
-                siol,
-                value,
+                Arc::clone(siol),
+                super::PutSrc::Owned(value),
                 super::links::OutLinkSrc {
                     field: "SIOL",
                     ..src
@@ -8613,7 +8626,10 @@ impl PvDatabase {
         let request = instance.record.input_link_request(link_field);
         let mut fetch = fetch;
         let store_raw = self.convert_link_fetch_as(
-            &*instance.record,
+            Reader {
+                record: &*instance.record,
+                held: rec.set(),
+            },
             link_field,
             link,
             request,
@@ -8631,7 +8647,7 @@ impl PvDatabase {
     #[inline]
     fn convert_link_fetch_as(
         &self,
-        record: &dyn crate::server::record::Record,
+        reader: Reader<'_>,
         link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
@@ -8650,14 +8666,14 @@ impl PvDatabase {
         if !matches!(fetch, LinkFetch::Value(_)) {
             return false;
         }
-        self.convert_link_value(record, link_field, link, request, fetch, render)
+        self.convert_link_value(reader, link_field, link, request, fetch, render)
     }
 
     /// [`Self::convert_link_fetch_as`] past its gates: `fetch` holds a value
     /// and the request is not native.
     fn convert_link_value(
         &self,
-        record: &dyn crate::server::record::Record,
+        reader: Reader<'_>,
         link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         request: crate::server::record::InputLinkRequest,
@@ -8669,7 +8685,7 @@ impl PvDatabase {
         let LinkFetch::Value(value) = std::mem::replace(fetch, LinkFetch::NoData) else {
             unreachable!("gated by convert_link_fetch_as");
         };
-        match self.link_read_as(record, link_field, link, request) {
+        match self.link_read_as(reader.record, link_field, link, request) {
             None => false,
             Some(LinkReadAs::Array { dbr, n_request })
                 if value.is_array()
@@ -8694,7 +8710,7 @@ impl PvDatabase {
                 // type; only `Double` (and `Enum`'s unwritten buffer) is the
                 // numeric funnel's.
                 let raw = !matches!(read_as, LinkReadAs::Double | LinkReadAs::Enum);
-                match self.apply_link_read_as(link, read_as, value, render) {
+                match self.apply_link_read_as(Some(reader.held), link, read_as, value, render) {
                     Some(v) => {
                         *fetch = LinkFetch::Value(v);
                         raw
@@ -8762,7 +8778,10 @@ impl PvDatabase {
         let store_raw = {
             let instance = rec.read();
             self.convert_link_fetch_as(
-                &*instance.record,
+                Reader {
+                    record: &*instance.record,
+                    held: rec.set(),
+                },
                 link_field,
                 link,
                 request,
@@ -8837,7 +8856,9 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         use crate::server::record::InputLinkRequest;
         match request {
-            InputLinkRequest::As(read_as) => self.apply_link_read_as(link, read_as, value, render),
+            InputLinkRequest::As(read_as) => {
+                self.apply_link_read_as(Some(rec.set()), link, read_as, value, render)
+            }
             InputLinkRequest::NotRead => None,
             InputLinkRequest::FromSource => {
                 self.typed_input_value(rec, link_field, link, value, render)
@@ -8854,7 +8875,7 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         let read_as = self.input_link_read_as(rec, link_field, link)?;
-        self.apply_link_read_as(link, read_as, value, render)
+        self.apply_link_read_as(Some(rec.set()), link, read_as, value, render)
     }
 
     /// C `dbDbGetValue`'s tail, applied to the reader: the ONE place a

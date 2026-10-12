@@ -1,15 +1,14 @@
-//! `last_posted` — the value a field last published — advances on every
-//! value-class post whether or not the field has a subscriber.
+//! A field's next transition reaches a subscriber that joined after posts it
+//! never saw.
 //!
-//! C `db_post_events` (`dbEvent.c:876-906`) is a no-op on an empty `mlis`, and
-//! the record's own state (`motorRecord.cc:2603-2606` `if (pmr->dmov == TRUE)`,
-//! `MARKED(M_DMOV)`) advances regardless, so a later subscriber sees the next
-//! transition. The framework's change detector advanced `last_posted` on a
-//! move-start notify with no subscriber but not on the completion walk (it
-//! walked subscribed fields only) nor on an out-of-band post to a field with
-//! no subscriber bucket, so the cache kept the move-start 0 while DMOV read 1
-//! and the next subscriber's move-start 0 compared equal and was dropped —
-//! ophyd `EpicsMotor` waits for a 1→0→1 DMOV and never finished its move.
+//! C `db_post_events` (`dbEvent.c:876-906`) is a no-op on an empty `mlis`, so a
+//! post with no subscriber moves no published state. What reaches the late
+//! subscriber is the record: motor posts DMOV on `MARKED(M_DMOV)`
+//! (`motorRecord.cc:3628-3629`), whatever it compares to, so the mover here
+//! claims DMOV through `fields_posted_only_when_marked` and marks it on the
+//! completion pass. Compared against a `last_posted` that the unwatched posts
+//! never advanced, the next move-start 0 would be dropped — ophyd
+//! `EpicsMotor` waits for a 1→0→1 DMOV and never finished its move.
 //!
 //! One case per boundary: no bucket, bucket emptied by `remove_subscriber`,
 //! and an out-of-band post with no bucket; the control keeps a subscriber
@@ -28,7 +27,12 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// completes (the completion walk).
 struct Mover {
     dmov: i16,
+    /// `MARKED(M_DMOV)`: the completion pass marks DMOV, and `monitor()`
+    /// posts it whatever it compares to (`motorRecord.cc:3628-3629`).
+    marked: u64,
 }
+
+static MOVER_POSTS: [(&str, CyclePostMask); 1] = [("DMOV", CyclePostMask::ValueLog)];
 
 static MOVER_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Double, false),
@@ -53,6 +57,7 @@ impl Record for Mover {
             })
         } else {
             self.dmov = 1;
+            self.marked = 1;
             Ok(ProcessOutcome::complete())
         }
     }
@@ -76,11 +81,17 @@ impl Record for Mover {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         MOVER_FIELDS
     }
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["DMOV"]
+    }
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(&MOVER_POSTS, u128::from(std::mem::take(&mut self.marked)))
+    }
 }
 
 async fn mover_db() -> PvDatabase {
     let db = PvDatabase::new();
-    db.add_record("M", Box::new(Mover { dmov: 1 }))
+    db.add_record("M", Box::new(Mover { dmov: 1, marked: 0 }))
         .await
         .unwrap();
     db

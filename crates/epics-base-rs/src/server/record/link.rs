@@ -991,7 +991,8 @@ pub(crate) enum DbLinkAnswer {
 /// entry and only the reader's `INP` is reached by the sweep that enforces
 /// it. `owned` (any link, any caller) keeps a `Weak`, so no record is held
 /// by a link no sweep reaches. `lent` ([`DbLink::lend_addr`], reachable only
-/// through `RecordInstance::lend_inp_addr`) keeps strong handles, which
+/// through `RecordInstance::lend_inp_addr` and [`DbLink::lend_out_addr`])
+/// keeps strong handles, which
 /// [`DbLink::release_addr`] drops when the target is removed or the reader
 /// destroyed; until then it keeps every target it has published — one per
 /// retarget, not per read — since a lent one may still be borrowed.
@@ -1109,9 +1110,10 @@ impl DbLink {
     /// # Safety
     ///
     /// [`Self::release_addr`] must not run while the returned borrow lives.
-    /// Private, so the one lender is
-    /// [`super::record_instance::RecordInstance::lend_inp_addr`],
-    /// whose `&mut` reader excludes `release_addr`'s callers.
+    /// Private, so the lenders are
+    /// [`super::record_instance::RecordInstance::lend_inp_addr`], whose
+    /// `&mut` reader excludes `release_addr`'s callers, and
+    /// [`Self::lend_out_addr`], whose `&SetGuard` does.
     #[inline(always)]
     unsafe fn lend_addr(
         &self,
@@ -1128,6 +1130,26 @@ impl DbLink {
         // SAFETY: as above, for the entry the miss publishes.
         self.publish_lent(revision, resolve)
             .map(|at| unsafe { &*std::sync::Arc::as_ptr(&at) })
+    }
+
+    /// An output link's local target lent for as long as the writer holds
+    /// `held`, the set of the record that owns this link: C's `dbAddr` of
+    /// `dbDbPutValue`. `None` is no settled local answer; the caller takes
+    /// [`Self::answer`]'s owned route for it.
+    ///
+    /// Sound because `release_addr` runs only from
+    /// `RecordInstance::release_link_addrs`, with the link's owner taken by
+    /// a full acquire: `held` keeps that from every other thread, and this
+    /// thread cannot reach it from inside a frame.
+    #[inline(always)]
+    pub(crate) fn lend_out_addr<'g>(
+        &'g self,
+        _held: &'g crate::server::database::SetGuard,
+        revision: u64,
+        resolve: impl FnOnce() -> DbLinkAnswer,
+    ) -> Option<&'g super::record_instance::ResolvedTarget> {
+        // SAFETY: see above; the borrow is tied to `held`.
+        unsafe { self.lend_addr(revision, resolve) }
     }
 
     /// Resolve (outside the cell lock: `resolve` takes record locks) and
@@ -3837,7 +3859,7 @@ fn split_record_field(link_part: &str) -> Option<(&str, String)> {
 /// modifier set first (`:2252`). The OUT-link target-processing decision —
 /// process when the link is explicit ` PP` **or** the destination field is
 /// `.PROC` — lives in the write path
-/// (`PvDatabase::write_db_link_value`), matching C
+/// (`PvDatabase::write_db_link_value_in`), matching C
 /// `dbDbPutValue` (`dbDbLink.c:387-390`).
 pub fn parse_output_link_v2(s: &str) -> ParsedLink {
     parse_link_field(s, LinkFieldType::Out)
@@ -4716,7 +4738,7 @@ mod json_link_tests {
     /// A modifier-less OUT link to a `.PROC` field parses to the uniform
     /// `NoProcess` default like any other bare link; the target-process
     /// decision for `.PROC` lives in the write path
-    /// (`write_db_link_value`, C `dbDbPutValue` dbDbLink.c:387-390), not
+    /// (`write_db_link_value_in`, C `dbDbPutValue` dbDbLink.c:387-390), not
     /// in a parse-time policy. (Behaviour — that a `.PROC` write still
     /// processes the target — is covered by the database-level
     /// `*_proc_out_link_processes_target` test.)

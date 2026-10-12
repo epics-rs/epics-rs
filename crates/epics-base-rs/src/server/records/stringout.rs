@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{CycleCell, CycleRead};
+use crate::server::record::{CycleCell, CycleRead, OutView};
 use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -7,16 +7,12 @@ use crate::types::{EpicsValue, PvString};
 /// buffers in C `stringoutRecord.c`.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most 39 payload bytes (40 incl. the implicit
-/// NUL). Mirrors C `strncpy(dst, src, 40)`, which copies bytes with no
-/// UTF-8 awareness, so the cut is on a raw byte boundary and a non-UTF-8
-/// VAL keeps its bytes verbatim.
-fn truncate_string(s: PvString) -> PvString {
-    let max = MAX_STRING_SIZE - 1;
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
+/// `s` cut to at most 39 payload bytes (40 incl. the implicit NUL). Mirrors
+/// C `strncpy(dst, src, 40)`, which copies bytes with no UTF-8 awareness, so
+/// the cut is on a raw byte boundary and a non-UTF-8 VAL keeps its bytes
+/// verbatim.
+fn truncated(s: &[u8]) -> &[u8] {
+    &s[..s.len().min(MAX_STRING_SIZE - 1)]
 }
 
 /// Stringout record — a 40-byte (`MAX_STRING_SIZE`) string output.
@@ -72,13 +68,20 @@ impl Default for StringoutRecord {
 impl StringoutRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(PvString::from(val)),
+            val: PvString::from(truncated(val.as_bytes())),
             ..Default::default()
         }
     }
 }
 
 impl Record for StringoutRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::stringout;
+        VAL => val,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        OVAL => oval);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -173,6 +176,10 @@ impl Record for StringoutRecord {
     /// cycle.
     fn output_link_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::String(self.val.clone()))
+    }
+
+    fn output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Str(self.val.as_bytes()))
     }
 
     /// C `stringoutRecord.c:138-144`: `process()` clears `udf` to FALSE only
@@ -273,14 +280,14 @@ impl Record for StringoutRecord {
             // C truncates VAL/OVAL/IVOV copies at MAX_STRING_SIZE (40).
             "VAL" => match value {
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(s);
+                    self.val.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(s);
+                    self.oval.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -294,7 +301,7 @@ impl Record for StringoutRecord {
             },
             "IVOV" => match value {
                 EpicsValue::String(s) => {
-                    self.ivov = truncate_string(s);
+                    self.ivov.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("IVOV".into())),

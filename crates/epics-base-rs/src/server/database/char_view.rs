@@ -304,9 +304,10 @@ impl CharView {
         EpicsValue::CharArray(chars)
     }
 
-    /// `dbPutField(paddr, dbrType, …)` of `written` as the value the record's
-    /// put path stores, or `None` where C refuses it.
-    pub fn put_value(&self, written: CharWrite) -> Option<EpicsValue> {
+    /// `dbPut`'s conversion of `written` through the `DBR_CHAR` address into
+    /// the value the field stores, or `None` where C refuses it. Only
+    /// `db_put_at`'s `$` arm calls it, under the put's hold.
+    pub(crate) fn put_value(&self, written: CharWrite) -> Option<EpicsValue> {
         let inst_value = self.value.as_ref();
         use crate::types::DbFieldType as T;
         match self.source {
@@ -396,26 +397,35 @@ impl CharView {
 }
 
 /// What a `$` put writes.
-pub enum CharWrite {
+pub(crate) enum CharWrite {
     /// `dbpf`'s `DBR_CHAR` array, NUL included.
     Chars(Vec<u8>),
     /// Elements of a request type: `dbtpf`'s one, a CA put's `count`.
     Elements(crate::types::DbFieldType, EpicsValue),
 }
 
+/// A PVA put's `dbPut(DBR_CHAR)` request through a `$` address: a string is
+/// `putLongString`, its bytes and NUL (`ioc/iocsource.cpp:511`); an
+/// `int8_t[]` is `putArray`, its elements. `None` for any other payload.
+pub fn pva_char_request(value: &EpicsValue) -> Option<EpicsValue> {
+    match value {
+        EpicsValue::String(s) => {
+            let mut chars = s.as_bytes().to_vec();
+            chars.push(0);
+            Some(EpicsValue::CharArray(chars.into()))
+        }
+        EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 impl CharWrite {
-    /// A PVA put's `dbPut(DBR_CHAR)`: a string is `putLongString`, its bytes
-    /// and NUL (`ioc/iocsource.cpp:511`); an `int8_t[]` is `putArray`, its
-    /// elements. `None` for any other payload.
-    pub fn from_pva(value: &EpicsValue) -> Option<Self> {
+    /// A put's request buffer: a char array is `DBR_CHAR` elements, any
+    /// other value elements of its own type.
+    pub(crate) fn of(value: EpicsValue) -> Self {
         match value {
-            EpicsValue::String(s) => {
-                let mut chars = s.as_bytes().to_vec();
-                chars.push(0);
-                Some(Self::Chars(chars))
-            }
-            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => Some(Self::Chars(b.to_vec())),
-            _ => None,
+            EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => Self::Chars(b.to_vec()),
+            v => Self::Elements(v.db_field_type(), v),
         }
     }
 }

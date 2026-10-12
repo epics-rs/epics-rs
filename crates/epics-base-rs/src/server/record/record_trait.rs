@@ -1933,17 +1933,35 @@ pub struct FieldMetadataOverride {
 /// Work a record's `special(_, true)` owes once the put's gate is down, and
 /// may not do under the hold — a spawned link-status classification, say.
 /// See [`Record::take_after_gate`].
-pub struct AfterGate(Box<dyn FnOnce(&crate::server::database::PvDatabase) + Send + Sync>);
+pub struct AfterGate(AfterWork);
+
+/// Shared work a record builds once, so leaving it from `special()` under the
+/// hold allocates nothing.
+pub type SharedAfterWork =
+    std::sync::Arc<dyn Fn(&crate::server::database::PvDatabase) + Send + Sync>;
+
+enum AfterWork {
+    Once(Box<dyn FnOnce(&crate::server::database::PvDatabase) + Send + Sync>),
+    Shared(SharedAfterWork),
+}
 
 impl AfterGate {
     pub fn new(
         work: impl FnOnce(&crate::server::database::PvDatabase) + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(work))
+        Self(AfterWork::Once(Box::new(work)))
+    }
+
+    /// `work`, preallocated by the record; the gate holds a clone.
+    pub fn shared(work: &SharedAfterWork) -> Self {
+        Self(AfterWork::Shared(std::sync::Arc::clone(work)))
     }
 
     pub(crate) fn run(self, db: &crate::server::database::PvDatabase) {
-        (self.0)(db)
+        match self.0 {
+            AfterWork::Once(work) => work(db),
+            AfterWork::Shared(work) => work(db),
+        }
     }
 }
 

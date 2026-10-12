@@ -40,9 +40,7 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
-use crate::request::{
-    CellBody, PortCallback, PortCalls, RequestCell, RequestOp, RequestResult, Unrun,
-};
+use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 use crate::user::AsynUser;
 
@@ -544,9 +542,11 @@ pub struct AsynRecord {
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
     except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
-    // The SCAN put `cancelIOInterruptScan` owes the put that reached
-    // `special()`, run by the put path once the hold drops.
-    after_gate: Option<epics_base_rs::server::record::AfterGate>,
+    // The SCAN put `cancelIOInterruptScan` makes, built once the record has a
+    // database, so `special()` leaves it to the put path without allocating.
+    cancel_scan: Option<epics_base_rs::server::record::SharedAfterWork>,
+    // The put that reached `special()` owes `cancel_scan` once the hold drops.
+    cancel_scan_owed: bool,
     // The record alarm `(stat, sevr)` raised by this process cycle's I/O — the C
     // `recGblSetSevr(pasynRec, …)` calls in the `perform*IO` helpers `performIO`
     // dispatches to (asynRecord.c:1364-1636) and the no-asynGpib-interface COMM
@@ -875,7 +875,8 @@ impl Default for AsynRecord {
             status_dirty: Arc::new(AtomicBool::new(false)),
             except_cb: None,
             own_raise: Arc::default(),
-            after_gate: None,
+            cancel_scan: None,
+            cancel_scan_owed: false,
             io_alarm: None,
             old_trace_file_id: TraceFile::Errlog.id(),
             io_intr: Arc::new(IoIntrScan::new()),
@@ -3115,7 +3116,7 @@ impl AsynRecord {
     /// C `queueRequest` of an `asynCallbackSpecial` request, and the callback.
     ///
     /// On a blocking port with a database the request is queued on the port
-    /// as a [`RequestOp::Callback`] and the put returns: C's `queueRequest`
+    /// as a [`RequestOp::Cell`] and the put returns: C's `queueRequest`
     /// takes `asynManagerLock` under the record lock, links the request and
     /// signals the port thread (asynManager.c:1542-1628), and that is all this
     /// does under the hold. The actor runs the port half and hands the result
@@ -3130,19 +3131,19 @@ impl AsynRecord {
             let request = special.body.request.lock().unwrap();
             (request.queue_user(), request.what.queued_by())
         };
-        if let Err(e) = handle.queue_gate(&user) {
-            self.report_never_ran(&e, queued_by);
+        if let Err(refusal) = handle.queue_gate(&user) {
+            self.report_queue_refused(refusal.status(), format_args!("{refusal}"), queued_by);
             return;
         }
         if handle.can_block() && self.async_ctx.is_some() {
             self.special_lane
                 .in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Err(e) = special.cell.queue(&user) {
+            if let Err(refusal) = special.cell.queue(&user) {
                 self.special_lane
                     .in_flight
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                self.report_never_ran(&e.into_queue_refusal(), queued_by);
+                self.report_queue_refused(refusal.status(), format_args!("{refusal}"), queued_by);
             }
         } else {
             let done = special.body.request.lock().unwrap().run(&mut handle);
@@ -3344,17 +3345,29 @@ impl AsynRecord {
     /// posts off a request the port never accepted.
     fn report_never_ran(&mut self, e: &AsynError, queued_by: QueuedBy) {
         if e.is_queue_refused() {
-            match queued_by {
-                QueuedBy::Special => {
-                    self.report_special_refused(e.status(), format_args!("{}", e.message_display()))
-                }
-                QueuedBy::ConnectReadback => self.report_error(
-                    AsynStatus::Error,
-                    format_args!("{CONNECT_READBACK_QUEUE_REFUSED_MSG}"),
-                ),
-            }
+            self.report_queue_refused(
+                e.status(),
+                format_args!("{}", e.message_display()),
+                queued_by,
+            );
         } else {
             self.report_special_queue_timeout();
+        }
+    }
+
+    /// [`Self::report_never_ran`]'s `queueRequest` refusal, its text `message`.
+    fn report_queue_refused(
+        &mut self,
+        status: AsynStatus,
+        message: std::fmt::Arguments<'_>,
+        queued_by: QueuedBy,
+    ) {
+        match queued_by {
+            QueuedBy::Special => self.report_special_refused(status, message),
+            QueuedBy::ConnectReadback => self.report_error(
+                AsynStatus::Error,
+                format_args!("{CONNECT_READBACK_QUEUE_REFUSED_MSG}"),
+            ),
         }
     }
 
@@ -3439,20 +3452,12 @@ impl AsynRecord {
             return;
         }
         let _ = self.io_intr.set_active(false);
-        let Some((name, _)) = &self.async_ctx else {
-            // No database (a record built outside an IOC): the registration is
-            // cancelled above; there is no SCAN field to put.
-            return;
-        };
         // C calls `dbPutField` inline under its recursive `dbScanLock`; this
         // hold is not recursive, so the put runs on the putting thread as soon
         // as the hold drops, before the put that reached `special()` returns.
-        let name = name.clone();
-        self.after_gate = Some(epics_base_rs::server::record::AfterGate::new(move |db| {
-            let passive = EpicsValue::Enum(ScanType::Passive.to_u16());
-            let held = db.lock_for_put(&name, "SCAN", &passive);
-            let _ = db.put_pv_already_locked(held, passive);
-        }));
+        // No database (a record built outside an IOC): the registration is
+        // cancelled above; there is no SCAN field to put.
+        self.cancel_scan_owed = self.cancel_scan.is_some();
     }
 
     /// C's four `callbackInterrupt*` routines (asynRecord.c:709-792) write the
@@ -4415,6 +4420,12 @@ impl Record for AsynRecord {
     /// record never built into a database keeps `None` and stays fully
     /// synchronous.
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        let target = name.clone();
+        self.cancel_scan = Some(Arc::new(move |db| {
+            let passive = EpicsValue::Enum(ScanType::Passive.to_u16());
+            let held = db.lock_for_put(&target, "SCAN", &passive);
+            let _ = db.put_pv_already_locked(held, passive);
+        }));
         *self.process_job.reentry.lock().unwrap() = Some((name.clone(), db.clone()));
         *self.special_lane.record.lock().unwrap() = Some((name.clone(), db.clone()));
         self.async_ctx = Some((name, db));
@@ -5211,7 +5222,12 @@ impl Record for AsynRecord {
     }
 
     fn take_after_gate(&mut self) -> Option<epics_base_rs::server::record::AfterGate> {
-        self.after_gate.take()
+        if !std::mem::take(&mut self.cancel_scan_owed) {
+            return None;
+        }
+        self.cancel_scan
+            .as_ref()
+            .map(epics_base_rs::server::record::AfterGate::shared)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

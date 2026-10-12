@@ -105,7 +105,7 @@ pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
     (multi_device && addr >= 0).then_some(addr)
 }
 
-use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
 use crate::interpose::{
@@ -221,7 +221,7 @@ impl QueueGate {
     /// The gate of an enabled, connected port no actor owns — for a test
     /// fixture's handle whose channel has nothing behind it. It never refuses,
     /// so it never names a port.
-    #[cfg(all(test, feature = "epics"))]
+    #[cfg(test)]
     pub(crate) fn open() -> Self {
         Self {
             port_name: "".into(),
@@ -232,18 +232,12 @@ impl QueueGate {
 
     /// `!pport->dpc.enabled → asynDisabled`, then, unless waived,
     /// `!pport->dpc.connected → asynDisconnected`.
-    pub(crate) fn check(&self, connect: ConnectCheck) -> AsynResult<()> {
+    pub(crate) fn check(&self, connect: ConnectCheck) -> Result<(), QueueRefusal<'_>> {
         if !self.enabled.load(Ordering::Acquire) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} disabled", self.port_name),
-            });
+            return Err(QueueRefusal::PortDisabled(&self.port_name));
         }
         if connect == ConnectCheck::Required && !self.connected.load(Ordering::Acquire) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disconnected,
-                message: format!("port {} not connected", self.port_name),
-            });
+            return Err(QueueRefusal::PortNotConnected(&self.port_name));
         }
         Ok(())
     }
@@ -1057,7 +1051,12 @@ impl PortDriverBase {
     /// `defunct ⟹ !enabled` (see the field doc) lets the one check answer for
     /// both.
     pub fn check_ready(&self) -> AsynResult<()> {
-        self.queue_gate().check(ConnectCheck::Required)
+        self.queue_gate()
+            .check(ConnectCheck::Required)
+            .map_err(|refusal| AsynError::Status {
+                status: refusal.status(),
+                message: refusal.to_string(),
+            })
     }
 
     /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):

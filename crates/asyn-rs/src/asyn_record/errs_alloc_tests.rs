@@ -287,6 +287,89 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
     assert_eq!(rec.special_cells.len(), 1, "a released request is reused");
 }
 
+/// C `queueRequest` refuses a disabled port's request under
+/// `asynManagerLock` with `port %s disabled` (asynManager.c:1542-1547), which
+/// `special()` reports to ERRS under the record's lock; neither the refusal
+/// nor the report allocates.
+#[test]
+fn a_special_put_refused_by_its_port_reports_without_allocating() {
+    use std::sync::Arc;
+
+    use epics_base_rs::server::database::PvDatabase;
+
+    use crate::port::{PortDriver, PortDriverBase, PortFlags};
+    use crate::port_actor::PortActor;
+    use crate::port_handle::PortHandle;
+
+    struct Device {
+        base: PortDriverBase,
+    }
+    impl PortDriver for Device {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+    }
+
+    let mut base = PortDriverBase::new("ALLOCRF", 1, PortFlags::default());
+    base.set_enabled(false).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let actor = PortActor::new(Box::new(Device { base }), rx);
+    let link = actor.link();
+    std::thread::spawn(move || actor.run());
+    let mut handle = PortHandle::new(
+        tx,
+        "ALLOCRF".into(),
+        Arc::new(crate::interrupt::InterruptManager::new(16)),
+        link,
+        Arc::new(crate::trace::TraceManager::new()),
+    );
+    handle.set_can_block(true);
+
+    let mut rec = AsynRecord::default();
+    rec.device_user
+        .attach_for_test(crate::registry::PortEntry { handle }, rec.addr);
+    let db = PvDatabase::new();
+    rec.set_async_context("ALLOC_RF".into(), db.async_handle());
+    rec.lbaud = 115200;
+
+    let put = |rec: &mut AsynRecord| -> u64 {
+        let before = ALLOCS.with(Cell::get);
+        rec.special("LBAUD", true).unwrap();
+        let allocs = ALLOCS.with(Cell::get) - before;
+        assert_eq!(rec.errs, "port ALLOCRF disabled");
+        allocs
+    };
+    put(&mut rec);
+    assert_eq!(put(&mut rec), 0);
+}
+
+/// C `cancelIOInterruptScan` (asynRecord.c:794-806) is a `dbPutField` of SCAN
+/// made under the record's lock; here the put waits for the hold to drop, and
+/// leaving it from `special()` — the hold — allocates nothing.
+#[test]
+fn a_put_that_cancels_io_intr_leaves_its_scan_put_without_allocating() {
+    use epics_base_rs::server::database::PvDatabase;
+
+    let mut rec = AsynRecord::default();
+    let db = PvDatabase::new();
+    rec.set_async_context("ALLOC_CANCEL".into(), db.async_handle());
+    let put = |rec: &mut AsynRecord| -> u64 {
+        rec.io_intr.set_active(true).unwrap();
+        let before = ALLOCS.with(Cell::get);
+        rec.special("UI32MASK", true).unwrap();
+        let owed = rec.take_after_gate();
+        let allocs = ALLOCS.with(Cell::get) - before;
+        assert!(owed.is_some(), "the SCAN put is owed");
+        assert!(!rec.io_intr.is_active(), "the registration is cancelled");
+        allocs
+    };
+    put(&mut rec);
+    assert_eq!(put(&mut rec), 0);
+}
+
 /// C's queue timer runs on `pasynBase->timerQueue`'s thread (asynManager.c:
 /// 501-502, :1189-1190), so `queueTimeoutCallback` unlinks a queued request
 /// while the port thread is inside the driver (:649-701), and the request's

@@ -231,7 +231,6 @@ pub struct PortHandle {
     cells: Arc<crate::request::CellQueue>,
     /// The port-level half of C `queueRequest`'s gate, over the actor's own
     /// cells — see [`Self::queue_gate`].
-    #[cfg(feature = "epics")]
     gate: QueueGate,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
@@ -281,7 +280,6 @@ impl PortHandle {
             port_name: port_name.into(),
             actor: actor.id,
             cells: actor.cells,
-            #[cfg(feature = "epics")]
             gate: actor.gate,
             interrupts,
             can_block: false,
@@ -375,10 +373,8 @@ impl PortHandle {
     /// them under `asynManagerLock` before anything is queued. The refusal is
     /// an [`AsynError::QueueRefused`], as the actor's.
     #[cfg(feature = "epics")]
-    pub(crate) fn queue_gate(&self, user: &AsynUser) -> AsynResult<()> {
-        self.gate
-            .check(user.connect_check(self.multi_device))
-            .map_err(AsynError::into_queue_refusal)
+    pub(crate) fn queue_gate(&self, user: &AsynUser) -> Result<(), crate::error::QueueRefusal<'_>> {
+        self.gate.check(user.connect_check(self.multi_device))
     }
 
     /// A preallocated request on this port that runs `body` — C
@@ -431,6 +427,7 @@ impl PortHandle {
         user: AsynUser,
         cancel: CancelToken,
     ) -> AsynResult<AsyncCompletionHandle> {
+        crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, cancel, reply_tx);
         self.tx.try_send(msg).map_err(|e| {
@@ -477,9 +474,8 @@ impl PortHandle {
     ///
     /// The request goes through [`Self::submit_cancellable`], so an
     /// [`AsynUser::queue_timeout`] deadline is enforced on every path: the
-    /// reply wait wakes at the deadline, and the actor refuses to run a
-    /// request that waited past it
-    /// (`PortActor::process_one`), replying [`AsynError::QueueTimeout`].
+    /// reply wait wakes at the deadline and takes a request still queued off
+    /// the queue, replying [`AsynError::QueueTimeout`].
     pub fn submit_blocking(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
         self.blocking(
             "submit_blocking",
@@ -513,6 +509,7 @@ impl PortHandle {
         user: AsynUser,
         cancel: CancelToken,
     ) -> AsynResult<RequestResult> {
+        crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
         let queue_timeout = user.queue_timeout;
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, cancel.clone(), reply_tx);
@@ -1469,6 +1466,113 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         )
+    }
+
+    /// A waiter's request queued just before its port went down stays queued,
+    /// as C `portThread` leaves it (asynManager.c:808-810, :856-861): it times
+    /// out on its own queue timer, or runs once the port is back. Only one
+    /// submitted while the port is down is refused, by `queueRequest`
+    /// (:1549-1552).
+    #[test]
+    fn a_request_queued_before_its_port_went_down_stays_queued() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc as std_mpsc;
+
+        struct Drops {
+            base: PortDriverBase,
+            entered: std_mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std_mpsc::Receiver<()>>,
+            line_up: Arc<AtomicBool>,
+        }
+        impl PortDriver for Drops {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+                if user.reason == 1 {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                    // The line drops while the port thread is in the driver.
+                    self.base.set_connected(false);
+                }
+                Ok(7)
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                if !self.line_up.load(Ordering::SeqCst) {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "line down".into(),
+                    });
+                }
+                self.base.set_connected(true);
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered) = std_mpsc::sync_channel(1);
+        let (release, release_rx) = std_mpsc::channel();
+        let line_up = Arc::new(AtomicBool::new(false));
+        let mut base = PortDriverBase::new("park_waiter", 1, PortFlags::default());
+        // The port comes back on its own retry timer (asynManager.c:3252-3283).
+        base.seconds_between_port_connect = Duration::from_millis(20);
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(
+            Box::new(Drops {
+                base,
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+                line_up: line_up.clone(),
+            }),
+            rx,
+        );
+        let link = actor.link();
+        // The production loop: the test loop runs no connect-retry timer.
+        let (_shutdown, shutdown_rx) = mpsc::channel(1);
+        std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
+        let handle = PortHandle::new(
+            tx,
+            "park_waiter".into(),
+            Arc::new(InterruptManager::new(16)),
+            link,
+            Arc::new(TraceManager::new()),
+        );
+
+        let submit = |user: AsynUser| {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.submit_blocking(RequestOp::Int32Read, user))
+        };
+        let jam = submit(AsynUser::new(1));
+        entered.recv().unwrap();
+        let timed = submit(AsynUser::new(0).with_queue_timeout(Duration::from_millis(100)));
+        let waits = submit(AsynUser::new(0));
+        // Both are queued — the actor, inside the driver, has not taken them —
+        // before the line drops.
+        while handle.tx.capacity() > handle.tx.max_capacity() - 2 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release.send(()).unwrap();
+        jam.join().unwrap().unwrap();
+
+        let err = timed.join().unwrap().unwrap_err();
+        assert!(
+            matches!(err, AsynError::QueueTimeout { .. }),
+            "queued until its timer, not refused: {err:?}"
+        );
+        assert!(!waits.is_finished(), "still queued");
+
+        let down = AsynUser::new(0).with_queue_timeout(Duration::from_secs(1));
+        let err = handle
+            .submit_blocking(RequestOp::Int32Read, down)
+            .unwrap_err();
+        assert!(err.is_queue_refused(), "queueRequest refuses: {err:?}");
+        assert_eq!(err.status(), AsynStatus::Disconnected);
+
+        line_up.store(true, Ordering::SeqCst);
+        let r = waits.join().unwrap().expect("runs once the port is back");
+        assert_eq!(r.int_val, Some(7));
     }
 
     /// `with_driver` hands the closure the driver's concrete type, runs it on

@@ -414,6 +414,51 @@ impl AsynError {
 
 pub type AsynResult<T> = Result<T, AsynError>;
 
+/// C `queueRequest`'s refusal (asynManager.c:1538-1579), its text made only
+/// when printed: a caller queueing under a hold reports it without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueRefusal<'a> {
+    /// `port %s disabled` (:1543-1546).
+    PortDisabled(&'a str),
+    /// `port %s not connected` (:1549-1552).
+    PortNotConnected(&'a str),
+    /// The user is already on a queue (:1574-1579).
+    AlreadyQueued,
+    /// The port's queue is gone.
+    ShutDown,
+}
+
+impl QueueRefusal<'_> {
+    pub fn status(&self) -> AsynStatus {
+        match self {
+            Self::PortDisabled(_) => AsynStatus::Disabled,
+            Self::PortNotConnected(_) => AsynStatus::Disconnected,
+            Self::AlreadyQueued | Self::ShutDown => AsynStatus::Error,
+        }
+    }
+}
+
+impl fmt::Display for QueueRefusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PortDisabled(port) => write!(f, "port {port} disabled"),
+            Self::PortNotConnected(port) => write!(f, "port {port} not connected"),
+            Self::AlreadyQueued => f.write_str("asynManager::queueRequest is already queued"),
+            Self::ShutDown => f.write_str("port shut down"),
+        }
+    }
+}
+
+/// The refusal as a [`AsynError::QueueRefused`].
+impl From<QueueRefusal<'_>> for AsynError {
+    fn from(refusal: QueueRefusal<'_>) -> Self {
+        AsynError::QueueRefused {
+            status: refusal.status(),
+            message: refusal.to_string(),
+        }
+    }
+}
+
 /// [`AsynError::message`] without the copy.
 pub struct ErrorMessage<'a>(&'a AsynError);
 

@@ -472,6 +472,13 @@ pub(crate) struct LinkStage {
     report: Option<(super::field_io::PutTail, std::borrow::Cow<'static, str>)>,
 }
 
+/// What a DB link's `dbPut` leaves its caller to finish: the special's
+/// stage, and the chain that put and its link writes run on.
+pub(crate) struct LinkWriteOut<'a> {
+    staged: &'a mut Option<LinkStage>,
+    visited: &'a mut ProcStack,
+}
+
 /// Which of C's two gates a `processTarget` call is coming through — the two
 /// are NOT the same test (R18-94).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2539,15 +2546,19 @@ impl PvDatabase {
             link.clone(),
         )));
         let mut staged = None;
+        let mut out = LinkWriteOut {
+            staged: &mut staged,
+            visited,
+        };
         let write = self.write_db_link_value_in(
             None,
             link,
             super::field_io::PutSrc::Owned(value),
             false,
             src.notify,
-            &mut staged,
+            &mut out,
         );
-        self.finish_db_link_write(write, &mut staged, None, src, visited)
+        self.finish_db_link_write(write, out.staged, None, src, out.visited)
     }
 
     /// The `dbPut` of C `dbDbPutValue` (`dbDbLink.c:372-380`) through `link`,
@@ -2571,7 +2582,7 @@ impl PvDatabase {
         src: super::field_io::PutSrc<'_>,
         ls: bool,
         notify: Option<&Arc<NotifyWaitSet>>,
-        staged: &mut Option<LinkStage>,
+        out: &mut LinkWriteOut<'_>,
     ) -> DbLinkWrite {
         use crate::server::record::DbLinkAnswer;
         use crate::server::record::record_instance::LinkTargetResolver;
@@ -2642,10 +2653,8 @@ impl PvDatabase {
                 pv.set(src.into_value());
                 Ok(None)
             }
-            // No frame reaches here, so the put roots its own chain.
             (None, None) => {
-                let mut visited = ProcStack::new();
-                let mut chain = super::field_io::PutChain::root(&mut visited);
+                let mut chain = super::field_io::PutChain::root(&mut *out.visited);
                 let put = self.put_pv_body(&local_pv_name(target), src.into_value(), &mut chain);
                 tail = chain.tail;
                 put.map(|()| None)
@@ -2660,7 +2669,7 @@ impl PvDatabase {
                 let field = rest.field();
                 (tail, field)
             });
-            *staged = Some(LinkStage {
+            *out.staged = Some(LinkStage {
                 stage: (actions, rest),
                 report,
             });
@@ -2682,7 +2691,7 @@ impl PvDatabase {
         };
         let switch = db.monitor_switch;
         // The owned target, a refcount bump, only for what still acts on it.
-        let needed = staged.is_some()
+        let needed = out.staged.is_some()
             || switch != crate::server::record::MonitorSwitch::NoMaximize
             || (gate.is_some() && !failed);
         DbLinkWrite {
@@ -3359,9 +3368,13 @@ impl PvDatabase {
                         Some(crate::server::record::OutView::Chars(_))
                     );
                 let mut staged = None;
+                let mut out = LinkWriteOut {
+                    staged: &mut staged,
+                    visited,
+                };
                 let write =
-                    self.write_db_link_value_in(held, link, value, ls, src.notify, &mut staged);
-                self.finish_db_link_write(write, &mut staged, held, src, visited)
+                    self.write_db_link_value_in(held, link, value, ls, src.notify, &mut out);
+                self.finish_db_link_write(write, out.staged, held, src, out.visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)

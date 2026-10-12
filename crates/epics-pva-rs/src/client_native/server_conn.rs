@@ -3589,8 +3589,12 @@ mod tests {
                 "a dial toward a blackhole must be pending, not resolved on \
                  the caller's thread"
             );
+            // The pool's own count, not `dial_threads()`: `std` names a thread
+            // from inside it, so a worker `dial()` has just created still
+            // carries its parent's `comm` until it is scheduled. `workers` is
+            // raised under the pool's lock before `dial()` returns in this poll.
             assert_eq!(
-                dial_threads(),
+                PVA_DIAL_POOL.worker_count(),
                 1,
                 "the first poll must have handed the connect to a dedicated \
                  dial thread"

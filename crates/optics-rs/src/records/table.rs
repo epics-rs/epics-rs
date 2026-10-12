@@ -12,8 +12,9 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, LinkRead,
-    OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
+    InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
+    ProcessOutcome, Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -539,6 +540,37 @@ pub struct TableRecord {
     /// `special()`'s posts owed by a put, a bit per [`SPECIAL_POSTS`] row; the
     /// put drains them.
     special_posts: u64,
+
+    // --- Internal: where the cycle resumes after its link-stage read ---
+    resume: Resume,
+}
+
+/// The read a cycle has in flight: C's `process()` reads its links inline,
+/// the port in the link stage, one at a time, and picks the cycle up again
+/// from [`Record::link_read_result`] at axis `at` of `stage`'s loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Resume {
+    stage: Stage,
+    at: usize,
+}
+
+/// A loop of `dbGetLink`s C's `process()` makes. Each returns at its first
+/// failed read, leaving the later axes as they were.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Stage {
+    /// No read in flight.
+    #[default]
+    Idle,
+    /// `GetReadback` ahead of SYNC's or INIT's branch (`tableRecord.c:461`,
+    /// `:494`), which runs after it.
+    Branch { init: bool },
+    /// `SaveMotorSpeeds` (`:536`), then the move from the motor positions
+    /// `sm` the cycle started at.
+    Speeds { sm: [f64; 6] },
+    /// The closing `GetReadback` (`:587`).
+    Readbacks,
+    /// The closing `ReadEncoders` (`:591`).
+    Encoders,
 }
 
 impl Default for TableRecord {
@@ -728,6 +760,7 @@ impl Default for TableRecord {
             curr_aunit: AngleUnit::Degrees,
             curr_yang: 0.0,
             special_posts: 0,
+            resume: Resume::default(),
         }
     }
 }
@@ -2122,59 +2155,181 @@ impl TableRecord {
         )
     }
 
-    /// Build ReadDbLink actions to read motor readbacks.
-    fn build_read_rbv_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_drive {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: MOTOR_RBV_LINK[i],
-                    target_field: MOTOR_RBV_VAL[i],
-                });
-            }
-        }
-        actions
-    }
-
-    /// C's closing `GetReadback` then `ReadEncoders` (tableRecord.c:587-592,
-    /// :1094-1138) from loop position `from`: readbacks 0..6, encoders 6..12.
-    /// Zeroes each axis the loop passes and returns the next read; past the
-    /// end, transforms both into user coordinates.
-    ///
-    /// They run in the link stage after the cycle's drive writes, one at a
-    /// time, because a failed readback ends `GetReadback` early.
-    fn next_final_read(&mut self, from: usize) -> Option<ProcessAction> {
-        for k in from..12 {
-            let i = k % 6;
-            if k < 6 {
-                let mut r = self.motor_readback();
-                r[i] = 0.0;
-                self.set_motor_readback(&r);
-                if self.lnk_stat[i].can_rw_drive {
-                    return Some(ProcessAction::ReadDbLink {
-                        link_field: MOTOR_RBV_LINK[i],
-                        target_field: MOTOR_RBV_VAL[i],
-                    });
-                }
-            } else {
-                let mut e = self.encoder_motor();
-                e[i] = 0.0;
-                self.set_encoder_motor(&e);
-                if self.lnk_stat[i].can_read_position {
-                    return Some(ProcessAction::ReadDbLink {
-                        link_field: ENCODER_LINK[i],
-                        target_field: ENCODER_VAL[i],
-                    });
-                }
-            }
-        }
+    /// SYNC's branch after its `GetReadback` (`tableRecord.c:462-478`): the
+    /// drive follows the readbacks.
+    fn sync_to_readbacks(&mut self) {
         let r = self.motor_readback();
         let rb = self.do_motor_to_user(&r);
         self.set_user_readback(&rb);
-        let e = self.encoder_motor();
-        let eu = self.do_motor_to_user(&e);
-        self.set_encoder_user(&eu);
-        None
+
+        let ax0 = self.user_offset();
+        let mut ax = [0.0; 6];
+        let mut axl = [0.0; 6];
+        let mut m0x = [0.0; 6];
+        for i in 0..6 {
+            m0x[i] = r[i];
+            ax[i] = rb[i];
+            axl[i] = ax[i] + ax0[i];
+        }
+        self.set_user_drive(&ax);
+        self.set_motor_drive(&m0x);
+        self.set_user_last(&axl);
+        self.sync = 0;
+    }
+
+    /// INIT's branch (`tableRecord.c:480-503`): offsets zeroed, the drive
+    /// taken from the readbacks.
+    fn init_from_readbacks(&mut self) {
+        let ax0 = [0.0f64; 6];
+        let uhax = self.user_hi_abs();
+        let ulax = self.user_lo_abs();
+        let mut uhaxr = [0.0f64; 6];
+        let mut ulaxr = [0.0f64; 6];
+        for i in 0..6 {
+            uhaxr[i] = uhax[i] - ax0[i];
+            ulaxr[i] = ulax[i] - ax0[i];
+        }
+        self.set_user_offset(&ax0);
+        self.set_user_hi_rel(&uhaxr);
+        self.set_user_lo_rel(&ulaxr);
+
+        let r = self.motor_readback();
+        let rb = self.do_motor_to_user(&r);
+        self.set_user_readback(&rb);
+
+        let mut ax = [0.0; 6];
+        let mut axl = [0.0; 6];
+        let mut m0x = [0.0; 6];
+        for i in 0..6 {
+            m0x[i] = r[i];
+            ax[i] = rb[i];
+            axl[i] = ax[i] + ax0[i];
+        }
+        self.set_user_drive(&ax);
+        self.set_motor_drive(&m0x);
+        self.set_user_last(&axl);
+        self.init = 0;
+    }
+
+    /// The move after `SaveMotorSpeeds` (`tableRecord.c:537-574`): speeds
+    /// scaled so every motor stops at once, then the writes.
+    fn move_motors(&mut self, sm: &[f64; 6]) -> Vec<ProcessAction> {
+        let m = self.motor_drive();
+        let sv0x = self.speed_val();
+
+        // Find which motors must move and max distance/speed
+        let mut motor_move_mask: u8 = 0;
+        let mut velo: f64 = 0.0;
+        let mut move_max: f64 = 0.0;
+
+        for i in 0..6 {
+            if self.lnk_stat[i].can_rw_speed && (m[i] - sm[i]).abs() > SMALL {
+                motor_move_mask |= 1 << i;
+                move_max = move_max.max((m[i] - sm[i]).abs());
+                velo = velo.max(sv0x[i]);
+            }
+        }
+
+        if move_max > SMALL {
+            let mut v = [0.0f64; 6];
+            let mut speed_ratio = LARGE;
+            for i in 0..6 {
+                if self.lnk_stat[i].can_rw_speed {
+                    v[i] = velo * (m[i] - sm[i]).abs() / move_max;
+                    if v[i] > 0.0 {
+                        speed_ratio = speed_ratio.min(sv0x[i] / v[i]);
+                    }
+                }
+            }
+            if speed_ratio < 1.0 {
+                for vi in v.iter_mut() {
+                    *vi *= speed_ratio;
+                }
+            }
+            self.set_speed_val(&v);
+        } else {
+            self.set_speed_val(&sv0x);
+        }
+
+        self.build_output_actions(motor_move_mask, &sv0x)
+    }
+
+    /// `stage`'s next read from axis `from`, zeroing the readback or encoder
+    /// of each axis its loop passes as C does; past the loop's end, what
+    /// follows it.
+    fn next_read(&mut self, stage: Stage, from: usize) -> Vec<ProcessAction> {
+        for i in from..6 {
+            let read = match stage {
+                Stage::Idle => None,
+                Stage::Branch { .. } | Stage::Readbacks => {
+                    let mut r = self.motor_readback();
+                    r[i] = 0.0;
+                    self.set_motor_readback(&r);
+                    self.lnk_stat[i]
+                        .can_rw_drive
+                        .then_some((MOTOR_RBV_LINK[i], MOTOR_RBV_VAL[i]))
+                }
+                Stage::Speeds { .. } => self.lnk_stat[i]
+                    .can_rw_speed
+                    .then_some((SPEED_IN_LINK[i], SPEED_VAL[i])),
+                Stage::Encoders => {
+                    let mut e = self.encoder_motor();
+                    e[i] = 0.0;
+                    self.set_encoder_motor(&e);
+                    self.lnk_stat[i]
+                        .can_read_position
+                        .then_some((ENCODER_LINK[i], ENCODER_VAL[i]))
+                }
+            };
+            if let Some((link_field, target_field)) = read {
+                self.resume = Resume { stage, at: i };
+                return vec![ProcessAction::ReadDbLink {
+                    link_field,
+                    target_field,
+                }];
+            }
+        }
+        self.resume = Resume::default();
+        match stage {
+            Stage::Idle => Vec::new(),
+            Stage::Branch { init } => {
+                if init {
+                    self.init_from_readbacks();
+                } else {
+                    self.sync_to_readbacks();
+                }
+                self.close_cycle()
+            }
+            Stage::Speeds { sm } => {
+                let mut actions = self.move_motors(&sm);
+                actions.extend(self.close_cycle());
+                actions
+            }
+            Stage::Readbacks => self.next_read(Stage::Encoders, 0),
+            Stage::Encoders => {
+                let r = self.motor_readback();
+                let rb = self.do_motor_to_user(&r);
+                self.set_user_readback(&rb);
+                let e = self.encoder_motor();
+                let eu = self.do_motor_to_user(&e);
+                self.set_encoder_user(&eu);
+                Vec::new()
+            }
+        }
+    }
+
+    /// The tail every branch reaches (`tableRecord.c:580-592`): the user-
+    /// coordinate copies and limits, then the closing reads.
+    fn close_cycle(&mut self) -> Vec<ProcessAction> {
+        let ax = self.user_drive();
+        let ax0 = self.user_offset();
+        let mut axl = [0.0; 6];
+        for i in 0..6 {
+            axl[i] = ax[i] + ax0[i];
+        }
+        self.set_user_last(&axl);
+        self.do_calc_user_limits();
+        self.next_read(Stage::Readbacks, 0)
     }
 
     /// Build ReadDbLink actions to read motor limits.
@@ -2189,20 +2344,6 @@ impl TableRecord {
                 actions.push(ProcessAction::ReadDbLink {
                     link_field: LO_LIMIT_LINK[i],
                     target_field: LO_LIMIT_VAL[i],
-                });
-            }
-        }
-        actions
-    }
-
-    /// Build ReadDbLink actions to read motor speeds.
-    fn build_read_speed_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: SPEED_IN_LINK[i],
-                    target_field: SPEED_VAL[i],
                 });
             }
         }
@@ -2428,6 +2569,7 @@ impl Record for TableRecord {
         let mut actions = Vec::new();
         self.check_links();
         self.lvio = 0;
+        self.resume = Resume::default();
 
         if self.zero != 0 {
             // --- Zero table ---
@@ -2452,55 +2594,9 @@ impl Record for TableRecord {
             // --- Read motors (readback done below) ---
             self.read = 0;
         } else if self.sync != 0 {
-            // --- Sync: read motor readbacks and set drive values to match ---
-            let r = self.motor_readback();
-            let rb = self.do_motor_to_user(&r);
-            self.set_user_readback(&rb);
-
-            let ax0 = self.user_offset();
-            let mut ax = [0.0; 6];
-            let mut axl = [0.0; 6];
-            let mut m0x = [0.0; 6];
-            for i in 0..6 {
-                m0x[i] = r[i];
-                ax[i] = rb[i];
-                axl[i] = ax[i] + ax0[i];
-            }
-            self.set_user_drive(&ax);
-            self.set_motor_drive(&m0x);
-            self.set_user_last(&axl);
-            self.sync = 0;
+            self.resume.stage = Stage::Branch { init: false };
         } else if self.init != 0 {
-            // --- Init: read motors, zero offsets, recalculate ---
-            let ax0 = [0.0f64; 6];
-            let uhax = self.user_hi_abs();
-            let ulax = self.user_lo_abs();
-            let mut uhaxr = [0.0f64; 6];
-            let mut ulaxr = [0.0f64; 6];
-            for i in 0..6 {
-                uhaxr[i] = uhax[i] - ax0[i];
-                ulaxr[i] = ulax[i] - ax0[i];
-            }
-            self.set_user_offset(&ax0);
-            self.set_user_hi_rel(&uhaxr);
-            self.set_user_lo_rel(&ulaxr);
-
-            let r = self.motor_readback();
-            let rb = self.do_motor_to_user(&r);
-            self.set_user_readback(&rb);
-
-            let mut ax = [0.0; 6];
-            let mut axl = [0.0; 6];
-            let mut m0x = [0.0; 6];
-            for i in 0..6 {
-                m0x[i] = r[i];
-                ax[i] = rb[i];
-                axl[i] = ax[i] + ax0[i];
-            }
-            self.set_user_drive(&ax);
-            self.set_motor_drive(&m0x);
-            self.set_user_last(&axl);
-            self.init = 0;
+            self.resume.stage = Stage::Branch { init: true };
         } else if self.set == SetMode::Set {
             // --- SET mode: update offsets ---
             let ax = self.user_drive();
@@ -2543,60 +2639,15 @@ impl Record for TableRecord {
                 }
                 self.set_user_drive(&ax_restored);
             } else {
-                // Save motor speeds, coordinate speeds, write outputs
-                let sv0x = self.speed_val();
-
-                // Find which motors must move and max distance/speed
-                let mut motor_move_mask: u8 = 0;
-                let mut velo: f64 = 0.0;
-                let mut move_max: f64 = 0.0;
-
-                for i in 0..6 {
-                    if self.lnk_stat[i].can_rw_speed && (m[i] - sm[i]).abs() > SMALL {
-                        motor_move_mask |= 1 << i;
-                        move_max = move_max.max((m[i] - sm[i]).abs());
-                        velo = velo.max(sv0x[i]);
-                    }
-                }
-
-                if move_max > SMALL {
-                    let mut v = [0.0f64; 6];
-                    let mut speed_ratio = LARGE;
-                    for i in 0..6 {
-                        if self.lnk_stat[i].can_rw_speed {
-                            v[i] = velo * (m[i] - sm[i]).abs() / move_max;
-                            if v[i] > 0.0 {
-                                speed_ratio = speed_ratio.min(sv0x[i] / v[i]);
-                            }
-                        }
-                    }
-                    if speed_ratio < 1.0 {
-                        for vi in v.iter_mut() {
-                            *vi *= speed_ratio;
-                        }
-                    }
-                    self.set_speed_val(&v);
-                } else {
-                    self.set_speed_val(&sv0x);
-                }
-
-                actions.extend(self.build_output_actions(motor_move_mask, &sv0x));
+                self.resume.stage = Stage::Speeds { sm };
             }
         }
 
-        // Save user-coordinate values (ignore offsets)
-        let ax = self.user_drive();
-        let ax0 = self.user_offset();
-        let mut axl = [0.0; 6];
-        for i in 0..6 {
-            axl[i] = ax[i] + ax0[i];
+        // SYNC, INIT and a move read first; every other branch closes now.
+        match self.resume.stage {
+            Stage::Idle => actions.extend(self.close_cycle()),
+            stage => actions.extend(self.next_read(stage, 0)),
         }
-        self.set_user_last(&axl);
-
-        // Calculate user limits
-        self.do_calc_user_limits();
-
-        actions.extend(self.next_final_read(0));
         Ok(ProcessOutcome::complete_with(actions))
     }
 
@@ -2636,28 +2687,25 @@ impl Record for TableRecord {
             .copied()
             .map(|link_field| ProcessAction::ResolveOutTarget { link_field })
             .collect();
-        // Only sync and init read the readbacks before deciding.
-        if self.zero == 0 && self.read == 0 && (self.sync != 0 || self.init != 0) {
-            actions.extend(self.build_read_rbv_actions());
-        }
         actions.extend(self.build_read_limit_actions());
-        actions.extend(self.build_read_speed_actions());
         actions.into()
     }
 
-    fn link_read_result(&mut self, link_field: &'static str, read: LinkRead) -> ProcessActions {
-        let k = match MOTOR_RBV_LINK.iter().position(|&l| l == link_field) {
-            Some(_) if matches!(read, LinkRead::Failed) => 6,
-            Some(i) => i + 1,
-            None => match ENCODER_LINK.iter().position(|&l| l == link_field) {
-                Some(i) => 7 + i,
-                None => return ProcessActions::new(),
-            },
+    /// Every `dbGetLink` table makes asks for `DBR_DOUBLE`.
+    fn input_link_request(&self, _link_field: &str) -> InputLinkRequest {
+        InputLinkRequest::As(LinkReadAs::Double)
+    }
+
+    /// Resumes the cycle after the read [`Resume`] holds; never asks which
+    /// link reported, so the cycle path compares no names.
+    fn link_read_result(&mut self, _link_field: &'static str, read: LinkRead) -> ProcessActions {
+        let Resume { stage, at } = self.resume;
+        let from = if matches!(read, LinkRead::Failed) {
+            6
+        } else {
+            at + 1
         };
-        self.next_final_read(k)
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into()
+        self.next_read(stage, from).into()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -3439,6 +3487,30 @@ impl Record for TableRecord {
 #[allow(clippy::excessive_precision, clippy::needless_range_loop)]
 mod tests {
     use super::*;
+
+    /// The link a read result names is never looked at: the cycle resumes
+    /// from the read [`Resume`] holds, so no name is compared on the way.
+    #[test]
+    fn link_read_result_resumes_from_its_own_cursor() {
+        let mut t = TableRecord::default();
+        t.lnk_stat[0].can_rw_drive = true;
+        t.lnk_stat[1].can_rw_drive = true;
+        let reads = |actions: Vec<ProcessAction>| -> Vec<&'static str> {
+            actions
+                .iter()
+                .map(|a| match a {
+                    ProcessAction::ReadDbLink { link_field, .. } => *link_field,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(reads(t.next_read(Stage::Readbacks, 0)), ["R0XI"]);
+        let next = t.link_read_result("not a link", LinkRead::Succeeded);
+        assert_eq!(reads(next.into_vec()), ["R0YI"]);
+        let next = t.link_read_result("not a link", LinkRead::Failed);
+        assert!(next.into_vec().is_empty());
+        assert_eq!(t.resume, Resume::default());
+    }
 
     /// `field_is_dbaddr` answers from the generated `SPC_DBADDR` list, which
     /// is the `.dbd`'s declared special on every field.

@@ -117,6 +117,9 @@ impl From<&RequestOp> for PortCommand {
             },
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::WithDriver(_) => Self::WithDriver,
+            RequestOp::Callback(cb) => Self::Callback {
+                connect_queue: cb.connect_queue(),
+            },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             RequestOp::SetTimeStampSource { name } => {
@@ -259,6 +262,9 @@ impl From<&PortCommand> for RequestOp {
             },
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::WithDriver => Self::WithDriver(crate::request::DriverCall::spent()),
+            PortCommand::Callback { connect_queue } => {
+                Self::Callback(crate::request::PortCallback::spent(*connect_queue))
+            }
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             PortCommand::SetTimeStampSource { name } => {

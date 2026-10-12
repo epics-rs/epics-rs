@@ -3500,7 +3500,7 @@ pub fn register_asyn_device_support_for_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port_actor::ActorId;
+    use crate::port_actor::ActorLink;
 
     /// The generated asyn device menus match the C `asyn.dbd` load, in the exact
     /// order (the DTYP index is wire-visible): `mbbo` gets `asynInt32` then
@@ -3940,7 +3940,7 @@ mod tests {
                     tx,
                     name.into(),
                     interrupts,
-                    ActorId::new(),
+                    ActorLink::unowned(),
                     std::sync::Arc::new(crate::trace::TraceManager::new()),
                 ),
                 _rx,
@@ -3975,7 +3975,7 @@ mod tests {
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4011,7 +4011,7 @@ mod tests {
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4065,7 +4065,7 @@ mod tests {
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4211,7 +4211,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-bounds-actor".into())
             .spawn(move || actor.run())
@@ -4220,7 +4220,7 @@ mod tests {
             tx,
             "test_bounds".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4239,7 +4239,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-adapter-actor".into())
             .spawn(move || actor.run())
@@ -4248,7 +4248,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
 
@@ -4281,7 +4281,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-seeded-actor".into())
             .spawn(move || actor.run())
@@ -4290,7 +4290,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4315,7 +4315,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-average-actor".into())
             .spawn(move || actor.run())
@@ -4324,7 +4324,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4359,7 +4359,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-ts-actor".into())
             .spawn(move || actor.run())
@@ -4368,7 +4368,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4776,7 +4776,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("ts-factory-actor".into())
             .spawn(move || actor.run())
@@ -4785,7 +4785,7 @@ mod tests {
             tx,
             "ts_factory".into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(crate::trace::TraceManager::new()),
         );
         crate::asyn_record::register_port("ts_factory", handle).unwrap();
@@ -4830,7 +4830,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-u32-actor".into())
             .spawn(move || actor.run())
@@ -4839,7 +4839,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -5828,7 +5828,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-enum-actor".into())
             .spawn(move || actor.run())
@@ -5837,7 +5837,7 @@ mod tests {
             tx,
             "test_enum".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -6326,7 +6326,7 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, rx) = tokio::sync::mpsc::channel(256);
             let actor = PortActor::new(Box::new(driver), rx);
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("cap-actor".into())
                 .spawn(move || actor.run())
@@ -6335,7 +6335,7 @@ mod tests {
                 tx,
                 "capport".into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 std::sync::Arc::new(crate::trace::TraceManager::new()),
             );
             let link = AsynLink {
@@ -6532,7 +6532,7 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, rx) = tokio::sync::mpsc::channel(256);
             let actor = PortActor::new(Box::new(driver), rx);
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("ondemand-actor".into())
                 .spawn(move || actor.run())
@@ -6541,7 +6541,7 @@ mod tests {
                 tx,
                 "ondemand".into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 std::sync::Arc::new(crate::trace::TraceManager::new()),
             );
             let link = AsynLink {
@@ -6917,7 +6917,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-arr-actor".into())
             .spawn(move || actor.run())
@@ -6926,7 +6926,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -7521,7 +7521,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-f64-actor".into())
             .spawn(move || actor.run())
@@ -7530,7 +7530,7 @@ mod tests {
             tx,
             "test_f64".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -7971,7 +7971,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("binwrite-actor".into())
             .spawn(move || actor.run())
@@ -7980,7 +7980,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, writes)
@@ -8219,7 +8219,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("f32array-actor".into())
             .spawn(move || actor.run())
@@ -8228,7 +8228,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, writes)
@@ -8431,7 +8431,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("cmdresp-actor".into())
             .spawn(move || actor.run())
@@ -8440,7 +8440,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, (writes, sequence))
@@ -8619,13 +8619,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             "octet_partial".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
 

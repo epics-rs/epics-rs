@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use epics_libcom_rs::SharedArray;
 
-use crate::error::AsynStatus;
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::param::ParamValue;
 use crate::port::PortDriver;
 
@@ -39,6 +39,98 @@ impl DriverCall {
 impl std::fmt::Debug for DriverCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DriverCall")
+    }
+}
+
+/// The port as a [`RequestOp::Callback`] body sees it: each call goes straight
+/// to the driver, as C's callback calls the interfaces it holds, with no
+/// further `queueRequest`.
+pub trait PortCalls {
+    fn call(&mut self, op: RequestOp, user: crate::user::AsynUser) -> AsynResult<RequestResult>;
+}
+
+/// The callback a [`RequestOp::Callback`] queues — C `queueRequest`'s
+/// `processUser`, which the port thread runs once the request reaches the
+/// head of its queue (asynManager.c:904), or `timeoutUser` with the reason it
+/// never did (:649-701).
+///
+/// It runs exactly once, with the port or with the error that kept the request
+/// from running — a request dropped unrun, with its port gone, runs it as
+/// refused. Clones share one slot, as [`DriverCall`]'s do; one rebuilt from a
+/// serialized `PortCommand` carries nothing.
+#[derive(Clone)]
+pub struct PortCallback {
+    body: Arc<CallbackSlot>,
+    connect_queue: bool,
+}
+
+type CallbackFn = Box<dyn FnOnce(Result<&mut dyn PortCalls, AsynError>) + Send>;
+
+struct CallbackSlot(Mutex<Option<CallbackFn>>);
+
+impl Drop for CallbackSlot {
+    fn drop(&mut self) {
+        let body = self.0.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(body) = body {
+            body(Err(AsynError::QueueRefused {
+                status: AsynStatus::Error,
+                message: "port shut down before the request ran".into(),
+            }));
+        }
+    }
+}
+
+impl PortCallback {
+    /// `connect_queue`: C queues it at `asynQueuePriorityConnect`.
+    pub fn new(
+        connect_queue: bool,
+        body: impl FnOnce(Result<&mut dyn PortCalls, AsynError>) + Send + 'static,
+    ) -> Self {
+        Self {
+            body: Arc::new(CallbackSlot(Mutex::new(Some(Box::new(body))))),
+            connect_queue,
+        }
+    }
+
+    /// A callback with no body, which the actor refuses.
+    pub fn spent(connect_queue: bool) -> Self {
+        Self {
+            body: Arc::new(CallbackSlot(Mutex::new(None))),
+            connect_queue,
+        }
+    }
+
+    /// Whether C queues it at `asynQueuePriorityConnect`.
+    pub fn connect_queue(&self) -> bool {
+        self.connect_queue
+    }
+
+    fn take(&self) -> Option<CallbackFn> {
+        self.body.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Run it against the port. `false` when it had already run.
+    pub(crate) fn run(&self, port: &mut dyn PortCalls) -> bool {
+        self.take().map(|body| body(Ok(port))).is_some()
+    }
+
+    /// Take it back unrun, for a caller whose queueing failed and who reports
+    /// that itself. `false` when it had already run.
+    pub fn withdraw(&self) -> bool {
+        self.take().is_some()
+    }
+
+    /// Run it with the reason it never reached the port.
+    pub(crate) fn refuse(&self, e: AsynError) {
+        if let Some(body) = self.take() {
+            body(Err(e));
+        }
+    }
+}
+
+impl std::fmt::Debug for PortCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PortCallback")
     }
 }
 
@@ -378,6 +470,10 @@ pub enum RequestOp {
     /// threads do between `lock()` and `unlock()` (asynPortDriver.cpp:3858).
     /// Built by [`crate::port_handle::PortHandle::with_driver`].
     WithDriver(DriverCall),
+    /// A queued callback the port thread runs — C `queueRequest` with the
+    /// caller's own `processUser` (asynManager.c:1513, :904), as asynRecord
+    /// queues `asynCallbackSpecial` (asynRecord.c:528-578).
+    Callback(PortCallback),
     /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
     /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
     /// interpose layer reads, so asynRecord IEOS writes survive a

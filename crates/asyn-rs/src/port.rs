@@ -189,16 +189,63 @@ impl Default for PortFlags {
 /// disconnected" unrepresentable rather than merely unlikely.
 #[derive(Debug, Clone)]
 enum Connection {
-    Own(bool),
+    Own(Arc<AtomicBool>),
     Shared(Arc<AtomicBool>),
 }
 
 impl Connection {
-    fn get(&self) -> bool {
+    fn cell(&self) -> &Arc<AtomicBool> {
         match self {
-            Connection::Own(c) => *c,
-            Connection::Shared(cell) => cell.load(Ordering::Acquire),
+            Connection::Own(cell) | Connection::Shared(cell) => cell,
         }
+    }
+
+    fn get(&self) -> bool {
+        self.cell().load(Ordering::Acquire)
+    }
+}
+
+/// The port-level half of C `queueRequest`'s gate (asynManager.c:1541-1552)
+/// over the port's own `enabled` and `connected` cells, which only the actor
+/// writes. [`PortDriverBase::check_queue`] asks it from the actor, and a
+/// [`crate::port_handle::PortHandle`] holding a clone asks it from the thread
+/// that queues, as C's `queueRequest` does, without a round trip.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueGate {
+    port_name: Arc<str>,
+    enabled: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+}
+
+impl QueueGate {
+    /// The gate of an enabled, connected port no actor owns — for a test
+    /// fixture's handle whose channel has nothing behind it. It never refuses,
+    /// so it never names a port.
+    #[cfg(all(test, feature = "epics"))]
+    pub(crate) fn open() -> Self {
+        Self {
+            port_name: "".into(),
+            enabled: Arc::new(AtomicBool::new(true)),
+            connected: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// `!pport->dpc.enabled → asynDisabled`, then, unless waived,
+    /// `!pport->dpc.connected → asynDisconnected`.
+    pub(crate) fn check(&self, connect: ConnectCheck) -> AsynResult<()> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: format!("port {} disabled", self.port_name),
+            });
+        }
+        if connect == ConnectCheck::Required && !self.connected.load(Ordering::Acquire) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("port {} not connected", self.port_name),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -225,7 +272,9 @@ pub struct PortDriverBase {
     /// [`Self::is_connected`] is the only thing that answers that, and it reads
     /// the truth.
     last_announced: bool,
-    pub enabled: bool,
+    /// Whether the port is enabled — read it with [`Self::is_enabled`], move it
+    /// with [`Self::set_enabled`]. A cell so that [`QueueGate`] reads it.
+    enabled: Arc<AtomicBool>,
     pub auto_connect: bool,
     /// C `dpCommon.defunct` (asynManager.c:2284) — the port was torn down via
     /// `shutdownPort` and is gone for good. Read it with [`Self::is_defunct`].
@@ -388,9 +437,9 @@ impl PortDriverBase {
             flags,
             params: ParamList::new(max_addr),
             interrupts: InterruptManager::new(256),
-            connected: Connection::Own(true),
+            connected: Connection::Own(Arc::new(AtomicBool::new(true))),
             last_announced: true,
-            enabled: true,
+            enabled: Arc::new(AtomicBool::new(true)),
             auto_connect: true,
             defunct: false,
             announcer: ExceptionAnnouncer::new(port_name),
@@ -509,8 +558,8 @@ impl PortDriverBase {
     /// set — the owner's cell already holds it — so this is a no-op there rather
     /// than a silent overwrite of the owner's truth.
     pub fn init_connected(&mut self, connected: bool) {
-        if let Connection::Own(c) = &mut self.connected {
-            *c = connected;
+        if let Connection::Own(c) = &self.connected {
+            c.store(connected, Ordering::Release);
             self.last_announced = connected;
         }
     }
@@ -582,8 +631,8 @@ impl PortDriverBase {
     /// Returns `true` if the state actually changed (a fan-out
     /// happened); `false` if the call was a no-op.
     pub fn set_connected(&mut self, connected: bool) -> bool {
-        if let Connection::Own(c) = &mut self.connected {
-            *c = connected;
+        if let Connection::Own(c) = &self.connected {
+            c.store(connected, Ordering::Release);
         }
         self.sync_connection_edge()
     }
@@ -739,7 +788,7 @@ impl PortDriverBase {
     /// C `findDpCommon(puserPvt)->enabled` (asynManager.c:2352) — what
     /// `pasynManager->isEnabled` answers for this address.
     pub fn dp_enabled(&self, addr: i32) -> bool {
-        self.device(addr).map_or(self.enabled, |ds| ds.enabled)
+        self.device(addr).map_or(self.is_enabled(), |ds| ds.enabled)
     }
 
     /// C `findDpCommon(puserPvt)->connected` (asynManager.c:2340) — what
@@ -771,7 +820,16 @@ impl PortDriverBase {
 
     /// Query whether the port is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// The port-level queue gate over this port's cells — see [`QueueGate`].
+    pub(crate) fn queue_gate(&self) -> QueueGate {
+        QueueGate {
+            port_name: self.port_name.as_str().into(),
+            enabled: Arc::clone(&self.enabled),
+            connected: Arc::clone(self.connected.cell()),
+        }
     }
 
     /// Single owner-API for the port-level `enabled` transition.
@@ -789,7 +847,7 @@ impl PortDriverBase {
         if self.defunct {
             return Err(Self::shut_down_error());
         }
-        self.enabled = enabled;
+        self.enabled.store(enabled, Ordering::Release);
         self.announce_exception(AsynException::Enable, -1);
         Ok(())
     }
@@ -891,8 +949,8 @@ impl PortDriverBase {
     ///
     /// They are independent, and the [`ConnectCheck`] the caller hands in
     /// selects between them — it can waive the *connected* refusal and nothing
-    /// else. There is no argument, op class or priority that waives
-    /// [`Self::check_enabled`]: C's `if(!pport->dpc.enabled) return asynDisabled`
+    /// else. There is no argument, op class or priority that waives the
+    /// enabled refusal: C's `if(!pport->dpc.enabled) return asynDisabled`
     /// (:1541-1546) sits *above* `checkPortConnect` and is reached by every
     /// request, and its port thread refuses to run anything at all on a disabled
     /// port (`portThread`, :806-809).
@@ -932,10 +990,7 @@ impl PortDriverBase {
     ///    — so applying them here refused requests C parks (R15-47). Every real
     ///    transport port is CANBLOCK.
     fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
-        self.check_enabled()?;
-        if connect == ConnectCheck::Required {
-            self.check_port_connected()?;
-        }
+        self.queue_gate().check(connect)?;
         if !self.flags.can_block {
             // C :1561-1567 — the device-enabled refusal in the synchronous block
             // is *not* conditioned on `checkPortConnect`; only the connected one
@@ -944,34 +999,6 @@ impl PortDriverBase {
             if connect == ConnectCheck::Required {
                 self.check_device_connected(addr)?;
             }
-        }
-        Ok(())
-    }
-
-    /// The unconditional half of the queue gate: a disabled port refuses every
-    /// request (asynManager.c:1541-1546).
-    ///
-    /// There is no defunct branch here, and there is none in C's `queueRequest`
-    /// either: `shutdownPort` clears `enabled` alongside setting `defunct`
-    /// (:2283-2284) precisely so this one check answers for both. The invariant
-    /// `defunct ⟹ !enabled` (see the field doc) is what makes that sound.
-    pub fn check_enabled(&self) -> AsynResult<()> {
-        if !self.enabled {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} disabled", self.port_name),
-            });
-        }
-        Ok(())
-    }
-
-    /// The port-level connected refusal (asynManager.c:1547-1552).
-    pub fn check_port_connected(&self) -> AsynResult<()> {
-        if !self.is_connected() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disconnected,
-                message: format!("port {} not connected", self.port_name),
-            });
         }
         Ok(())
     }
@@ -1024,9 +1051,13 @@ impl PortDriverBase {
     /// Check that the port is enabled, connected, and not defunct.
     /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
     /// (defunct => permanently disabled) otherwise.
+    ///
+    /// There is no defunct branch: `shutdownPort` clears `enabled` alongside
+    /// setting `defunct` (asynManager.c:2283-2284), and the invariant
+    /// `defunct ⟹ !enabled` (see the field doc) lets the one check answer for
+    /// both.
     pub fn check_ready(&self) -> AsynResult<()> {
-        self.check_enabled()?;
-        self.check_port_connected()
+        self.queue_gate().check(ConnectCheck::Required)
     }
 
     /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):
@@ -1058,7 +1089,7 @@ impl PortDriverBase {
                 ),
             });
         }
-        self.enabled = false;
+        self.enabled.store(false, Ordering::Release);
         // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this port
         // owns, not only the port's own. Clearing the device slots here is what
         // makes it hold by construction: [`Self::device_state`] seeds a new slot
@@ -1115,7 +1146,7 @@ impl PortDriverBase {
     pub(crate) fn device_state(&mut self, addr: i32) -> &mut DeviceState {
         let seed = DeviceState {
             connected: self.is_connected(),
-            enabled: self.enabled,
+            enabled: self.is_enabled(),
             auto_connect: self.auto_connect,
             last_connect_disconnect: None,
         };
@@ -3915,7 +3946,7 @@ mod tests {
         base.create_param("V", ParamType::Int32).unwrap();
 
         // Port-level disabled overrides addr-level enabled
-        base.enabled = false;
+        base.set_enabled(false).unwrap();
         base.enable_addr(0); // addr 0 is enabled, but port is disabled
         let err = base.check_ready_addr(0).unwrap_err();
         assert!(format!("{err}").contains("disabled"));

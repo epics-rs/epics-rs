@@ -21,8 +21,8 @@ use crate::interfaces::InterfaceType;
 use crate::interpose::EomReason;
 use crate::interrupt::InterruptValue;
 use crate::param::ParamValue;
-use crate::port::{PortDriver, QueuePriority};
-use crate::request::{CancelToken, RequestOp, RequestResult};
+use crate::port::{PortDriver, QueueGate, QueuePriority};
+use crate::request::{CancelToken, PortCalls, RequestOp, RequestResult};
 use crate::user::{AsynUser, ConnectCheck};
 
 static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -50,6 +50,48 @@ impl ActorId {
     /// no caller can be it.
     pub(crate) fn new() -> Self {
         Self(ACTOR_IDS.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
+/// Which refusals C's `queueRequest` gate (asynManager.c:1541-1552) applies
+/// to this request on a port that is (`multi_device`) or is not
+/// `ASYN_MULTIDEVICE`. `None` — C never queues it, so no gate runs.
+pub(crate) fn queue_gate(
+    op: &RequestOp,
+    user: &AsynUser,
+    multi_device: bool,
+) -> Option<ConnectCheck> {
+    match PortActor::c_dispatch(op) {
+        CDispatch::Direct => None,
+        // The op fixes the priority at Connect (every C call site passes
+        // `asynQueuePriorityConnect`), but the waiver is still the user's
+        // (asynManager.c:1538-1540).
+        CDispatch::ConnectQueue => Some(user.connect_check_at_connect_priority(multi_device)),
+        CDispatch::Queued => Some(user.connect_check(multi_device)),
+    }
+}
+
+/// What a [`crate::port_handle::PortHandle`] takes from the actor behind its
+/// channel: the actor's identity, for the re-entrancy guard, and the port's
+/// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread.
+#[derive(Clone)]
+pub(crate) struct ActorLink {
+    pub(crate) id: ActorId,
+    /// Read by the asynRecord, which queues from under its hold.
+    #[cfg(feature = "epics")]
+    pub(crate) gate: QueueGate,
+}
+
+impl ActorLink {
+    /// A link for a handle whose channel has no actor behind it (a test
+    /// fixture): a fresh id no thread publishes, and an open gate.
+    #[cfg(test)]
+    pub(crate) fn unowned() -> Self {
+        Self {
+            id: ActorId::new(),
+            #[cfg(feature = "epics")]
+            gate: QueueGate::open(),
+        }
     }
 }
 
@@ -144,6 +186,20 @@ impl ActorMessage {
     }
 }
 
+impl ActorMessage {
+    /// The request leaves the queue without running: its waiter gets `e`, or
+    /// a [`RequestOp::Callback`] runs with it — C's `timeoutUser` — since a
+    /// callback has no waiter. The one exit every never-ran path takes.
+    fn refuse(self, e: AsynError) {
+        match self.op {
+            RequestOp::Callback(cb) => cb.refuse(e),
+            _ => {
+                let _ = self.reply.send(Err(e));
+            }
+        }
+    }
+}
+
 /// Sleep until `deadline`, or never if there is none.
 ///
 /// A disarmed connect timer must not make the `select!` arm ready — otherwise
@@ -204,7 +260,7 @@ impl PartialOrd for ActorMessage {
 }
 
 /// How C performs an operation: the one classification every gate in the actor
-/// derives from ([`PortActor::queue_gate`], [`PortActor::is_lifecycle_op`]).
+/// derives from ([`queue_gate`], [`PortActor::is_lifecycle_op`]).
 ///
 /// The match that produces it ([`PortActor::c_dispatch`]) is **exhaustive by
 /// construction — no wildcard arm**. "Does C queue this?" has a different answer
@@ -413,13 +469,16 @@ impl PortActor {
         }
     }
 
-    /// This actor's identity. Hand it to every [`PortHandle`] built against
-    /// this actor's channel so blocking callers can detect a re-entrant call
-    /// from the actor's own thread.
+    /// This actor's [`ActorLink`]. Hand it to every [`PortHandle`] built
+    /// against this actor's channel.
     ///
     /// [`PortHandle`]: crate::port_handle::PortHandle
-    pub fn id(&self) -> ActorId {
-        self.id
+    pub(crate) fn link(&self) -> ActorLink {
+        ActorLink {
+            id: self.id,
+            #[cfg(feature = "epics")]
+            gate: self.driver.base().queue_gate(),
+        }
     }
 
     /// Run the actor loop. Returns when the channel is closed (all senders dropped).
@@ -431,7 +490,7 @@ impl PortActor {
             // Drain all pending messages into the heap
             self.drain_channel();
             self.rescan_parked();
-            self.expire_parked();
+            self.expire_queued();
 
             if self.heap.is_empty() {
                 // No work — block on the channel
@@ -442,7 +501,7 @@ impl PortActor {
                 // Drain any more that arrived
                 self.drain_channel();
                 self.rescan_parked();
-                self.expire_parked();
+                self.expire_queued();
             }
 
             // Process one eligible request from the heap
@@ -495,7 +554,7 @@ impl PortActor {
                 // Drain all pending messages into the heap
                 self.drain_channel();
                 self.rescan_parked();
-                self.expire_parked();
+                self.expire_queued();
 
                 if self.heap.is_empty() {
                     // Wait for a message, an explicit shutdown, or the
@@ -505,15 +564,16 @@ impl PortActor {
                     // Connect-priority request to the port thread,
                     // asynManager.c:3252-3266); here the actor IS the port
                     // thread, so it wakes itself.
-                    // ...and at the earliest parked request's queue deadline: C
-                    // arms an `epicsTimer` per request at `queueRequest`
-                    // (asynManager.c:1617-1623) that unlinks it wherever it is
-                    // sitting, and a request parked behind a disabled device has
-                    // no other clock — a blocking caller with no Tokio reactor
-                    // arms no timer of its own (`PortHandle::await_reply`).
+                    // ...and at the earliest parked or blocked request's queue
+                    // deadline: C arms an `epicsTimer` per request at
+                    // `queueRequest` (asynManager.c:1617-1623) that unlinks it
+                    // wherever it is sitting, and such a request may have no
+                    // other clock — a blocking caller with no Tokio reactor arms
+                    // no timer of its own (`PortHandle::await_reply`), and a
+                    // `RequestOp::Callback` has no caller waiting at all.
                     let retry_at = earliest(
                         self.driver.base().connect_retry_at,
-                        self.earliest_parked_deadline(),
+                        self.earliest_waiting_deadline(),
                     );
                     tokio::select! {
                         msg = self.rx.recv() => {
@@ -538,7 +598,7 @@ impl PortActor {
                     // Drain any more that arrived
                     self.drain_channel();
                     self.rescan_parked();
-                    self.expire_parked();
+                    self.expire_queued();
                 }
 
                 // Run any due connect retry before servicing the queue: a
@@ -703,39 +763,52 @@ impl PortActor {
         }
     }
 
-    /// The queue timer of a parked request, fired where it sits — C
+    /// The queue timer of a queued request, fired where it sits — C
     /// `queueTimeoutCallback` unlinks the request from `queueList` while
     /// `isQueued` (asynManager.c:649-701) and runs the user's timeout callback,
-    /// wherever in the queue the port thread had left it.
-    fn expire_parked(&mut self) {
-        if self.parked.is_empty() {
+    /// wherever in the queue the port thread had left it: behind other
+    /// requests, parked behind a disabled device, or held by a block. A
+    /// [`RequestOp::Callback`] has no waiter to arm a timer of its own, so this
+    /// is its only clock.
+    fn expire_queued(&mut self) {
+        let now = Instant::now();
+        let due = |msg: &ActorMessage| msg.queue_deadline.is_some_and(|at| now >= at);
+        if !(self.parked.iter().any(due)
+            || self.pending_while_blocked.iter().any(due)
+            || self.heap.iter().any(due))
+        {
             return;
         }
-        let now = Instant::now();
         let port = self.driver.base().port_name.clone();
-        let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
-            .into_iter()
-            .partition(|msg| msg.queue_deadline.is_some_and(|at| now >= at));
-        self.parked = kept;
+        let mut expired = Vec::new();
+        for queue in [&mut self.parked, &mut self.pending_while_blocked] {
+            let (gone, kept) = std::mem::take(queue).into_iter().partition(due);
+            *queue = kept;
+            expired.extend::<Vec<_>>(gone);
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.heap).into_iter().partition(due);
+        self.heap = kept.into();
+        expired.extend(gone);
         // C `queueTimeoutCallback` ends by signalling the port thread (:700): the
         // request left the queue, so the thread must look at what is left.
-        if !expired.is_empty() {
-            self.woken = true;
-        }
+        self.woken = true;
         for msg in expired {
             // The token settles which outcome wins, exactly as at the dequeue
             // gate: if the caller's own timer got there first it already
             // reported, and this reply lands on a dropped receiver.
             msg.cancel.time_out_if_queued();
-            let _ = msg
-                .reply
-                .send(Err(AsynError::QueueTimeout { port: port.clone() }));
+            msg.refuse(AsynError::QueueTimeout { port: port.clone() });
         }
     }
 
-    /// When the earliest-deadlined parked request must be woken.
-    fn earliest_parked_deadline(&self) -> Option<Instant> {
-        self.parked.iter().filter_map(|m| m.queue_deadline).min()
+    /// When the earliest-deadlined request waiting off the heap must be woken.
+    fn earliest_waiting_deadline(&self) -> Option<Instant> {
+        self.parked
+            .iter()
+            .chain(&self.pending_while_blocked)
+            .filter_map(|m| m.queue_deadline)
+            .min()
     }
 
     /// The gate every connect attempt the actor makes *on its own initiative*
@@ -818,7 +891,7 @@ impl PortActor {
             let _ = writeln!(
                 out,
                 "    enabled:{} connected:{} numberConnects {}",
-                yn(base.enabled),
+                yn(base.is_enabled()),
                 yn(base.is_connected()),
                 base.number_connects
             );
@@ -997,6 +1070,10 @@ impl PortActor {
             // enabled check. The actor's serial ownership is that mutex.
             | RequestOp::WithDriver(_) => CDispatch::Direct,
 
+            // The caller's own callback, queued at the band it names.
+            RequestOp::Callback(cb) if cb.connect_queue() => CDispatch::ConnectQueue,
+            RequestOp::Callback(_) => CDispatch::Queued,
+
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT put,
             // asynRecord.c:537-538,561-571) or from the port thread itself.
@@ -1074,22 +1151,6 @@ impl PortActor {
         Self::c_dispatch(op) != CDispatch::Queued
     }
 
-    /// Which refusals C's `queueRequest` gate (asynManager.c:1541-1552) applies
-    /// to this request. `None` — C never queues it, so no gate runs.
-    fn queue_gate(op: &RequestOp, user: &AsynUser) -> Option<ConnectCheck> {
-        match Self::c_dispatch(op) {
-            CDispatch::Direct => None,
-            // The op fixes the priority at Connect (every C call site passes
-            // `asynQueuePriorityConnect`), but the WAIVER is still the user's:
-            // C waives `checkPortConnect` only for a port-level user
-            // (`addr == -1`) or the explicit sentinel (asynManager.c:1536-1538).
-            // A device-addressed CNCT put without either is refused on a
-            // disconnected port — the C wart W10-D1, reproduced by decision.
-            CDispatch::ConnectQueue => Some(user.connect_check_at_connect_priority()),
-            CDispatch::Queued => Some(user.connect_check()),
-        }
-    }
-
     fn enqueue_message(&mut self, msg: ActorMessage) {
         // C `queueRequest` sets `pport->queueStateChange` and signals the port
         // thread (asynManager.c:1615, 1626) — the queue changed, so anything the
@@ -1134,9 +1195,8 @@ impl PortActor {
         if msg.queue_deadline.is_some_and(|at| Instant::now() >= at)
             && msg.cancel.time_out_if_queued()
         {
-            let _ = msg.reply.send(Err(AsynError::QueueTimeout {
-                port: self.driver.base().port_name.clone(),
-            }));
+            let port = self.driver.base().port_name.clone();
+            msg.refuse(AsynError::QueueTimeout { port });
             return;
         }
 
@@ -1145,7 +1205,7 @@ impl PortActor {
         // request stay on it (:875).
 
         // The queue gate — C `queueRequest` (asynManager.c:1541-1552).
-        // [`Self::queue_gate`] says whether it runs at all (C queues this op or
+        // [`queue_gate`] says whether it runs at all (C queues this op or
         // performs it as a direct manager call) and, when it does, which of its
         // two independent refusals the request may waive. The *connected* waiver
         // follows the request's own user (`AsynUser::connect_check`, C's
@@ -1172,7 +1232,8 @@ impl PortActor {
         // no-op for them.
         self.driver.base_mut().sync_connection_edge();
 
-        if let Some(connect) = Self::queue_gate(&msg.op, &msg.user) {
+        let multi_device = self.driver.base().flags.multi_device;
+        if let Some(connect) = queue_gate(&msg.op, &msg.user, multi_device) {
             // C drains the Connect queue *before* `autoConnectDevice`
             // (asynManager.c:811-855): a waived request runs on the dead line
             // with no connect attempt in front of it. The attempt C makes
@@ -1181,7 +1242,7 @@ impl PortActor {
                 self.auto_connect_device(msg.user.addr, msg.user.reason);
             }
             if let Err(e) = self.driver.base().check_queue(msg.user.addr, connect) {
-                let _ = msg.reply.send(Err(e));
+                msg.refuse(e);
                 return;
             }
             // C `portThread`'s per-request DEVICE checks (asynManager.c:875-886):
@@ -1229,21 +1290,12 @@ impl PortActor {
                     .is_err()
                 {
                     msg.cancel.time_out_if_queued();
-                    let _ = msg.reply.send(Err(AsynError::QueueTimeout {
-                        port: self.driver.base().port_name.clone(),
-                    }));
+                    let port = self.driver.base().port_name.clone();
+                    msg.refuse(AsynError::QueueTimeout { port });
                     return;
                 }
             }
         }
-
-        let ActorMessage {
-            op,
-            mut user,
-            cancel,
-            reply,
-            ..
-        } = msg;
 
         // Claim the request for execution. This is the C dequeue under
         // `asynManagerLock` (:889-891): `begin_running` transitions the cancel
@@ -1253,19 +1305,27 @@ impl PortActor {
         // cancel, or a queue-wait deadline the *waiter* resolved first (the
         // async path arms its own timer, `PortHandle::submit_cancellable`) — in
         // which case it must be dropped, reporting the outcome that won.
-        if !cancel.begin_running() {
-            if cancel.is_timed_out() {
-                let _ = reply.send(Err(AsynError::QueueTimeout {
+        if !msg.cancel.begin_running() {
+            let e = if msg.cancel.is_timed_out() {
+                AsynError::QueueTimeout {
                     port: self.driver.base().port_name.clone(),
-                }));
-                return;
-            }
-            let _ = reply.send(Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "request cancelled".into(),
-            }));
+                }
+            } else {
+                AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "request cancelled".into(),
+                }
+            };
+            msg.refuse(e);
             return;
         }
+        let ActorMessage {
+            op,
+            mut user,
+            cancel,
+            reply,
+            ..
+        } = msg;
         // From here the request is running (C `callbackActive`): a concurrent
         // cancel can no longer win, and `finish` marks it `Done` on every exit
         // path so a late cancel stays a no-op and a multi-phase plan can
@@ -2042,6 +2102,16 @@ impl PortActor {
                 self.report_port(*level);
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::Callback(cb) => {
+                if cb.run(&mut ActorCalls(self)) {
+                    Ok(RequestResult::write_ok())
+                } else {
+                    Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "callback carries no body".into(),
+                    })
+                }
+            }
             RequestOp::WithDriver(call) => match call.take() {
                 Some(f) => {
                     f(self.driver.as_mut());
@@ -2135,6 +2205,18 @@ impl PortActor {
         }
 
         result
+    }
+}
+
+/// The port a [`RequestOp::Callback`] runs against: each call is dispatched on
+/// the actor thread with no queue and no gate, as C's callback calls the
+/// driver's interfaces directly while it owns the port.
+struct ActorCalls<'a>(&'a mut PortActor);
+
+impl PortCalls for ActorCalls<'_> {
+    fn call(&mut self, op: RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
+        user.trace = self.0.user_trace();
+        self.0.dispatch_io(&mut user, &op)
     }
 }
 
@@ -2839,7 +2921,7 @@ mod tests {
     #[test]
     fn actor_disabled_port() {
         let mut drv = TestDriver::new();
-        drv.base.enabled = false;
+        drv.base.set_enabled(false).unwrap();
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
@@ -3431,7 +3513,7 @@ mod tests {
             );
             base.auto_connect = true;
             base.set_connected(false);
-            base.enabled = enabled;
+            base.set_enabled(enabled).unwrap();
             if defunct {
                 // C `shutdownPort` clears `enabled` on its way to `defunct`
                 // (:2283-2284), so the gate refuses the port as a disabled one.
@@ -3687,7 +3769,7 @@ mod tests {
     #[test]
     fn a_canblock_port_still_applies_the_port_level_refusals() {
         let mut drv = multi_device_driver(true);
-        drv.base.enabled = false;
+        drv.base.set_enabled(false).unwrap();
         let tx = spawn_actor(drv);
         let err = send_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1))
             .expect_err("a disabled port refuses everything");
@@ -3850,7 +3932,7 @@ mod tests {
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
             base.auto_connect = true;
-            base.enabled = enabled;
+            base.set_enabled(enabled).unwrap();
             if defunct {
                 shut_down(&mut base);
             }
@@ -4011,7 +4093,7 @@ mod tests {
         // answer even when the port is disabled (they are lifecycle ops
         // that bypass the enabled/connected check).
         let mut drv = TestDriver::new();
-        drv.base.enabled = false;
+        drv.base.set_enabled(false).unwrap();
         drv.base.auto_connect = true;
         let tx = spawn_actor(drv);
 
@@ -4027,12 +4109,13 @@ mod tests {
     /// C `queueRequest` (asynManager.c:1536-1552): a request queued at
     /// `asynQueuePriorityConnect` carrying `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`
     /// skips the `!pport->dpc.connected → asynDisconnected` refusal. Bare Connect
-    /// priority does not (unless the user carries no device, `addr == -1`) — that
-    /// is what keeps the record's Low-priority EOS readback (asynRecord.c:1296)
-    /// blank on a down port while its option readback (:1277-1280) fills in.
+    /// priority does not (unless the user carries no device) — that is what
+    /// keeps the record's Low-priority EOS readback (asynRecord.c:1296) blank on
+    /// a down port while its option readback (:1277-1280) fills in. Multi-device,
+    /// so that addr 0 is a device.
     #[test]
     fn queue_even_if_not_connected_reason_waives_only_the_connected_refusal() {
-        let mut drv = TestDriver::new();
+        let mut drv = multi_device_driver(true);
         drv.base.auto_connect = false; // no reconnect can rescue the request
         drv.base.set_connected(false);
         let tx = spawn_actor(drv);
@@ -4054,8 +4137,8 @@ mod tests {
         );
         assert_eq!(err.status(), AsynStatus::Disconnected);
 
-        // Connect priority alone is not the waiver: the user carries addr 0, so
-        // C's :1536-1538 leaves `checkPortConnect` set.
+        // Connect priority alone is not the waiver: the user carries device 0,
+        // so C's :1538-1540 leaves `checkPortConnect` set.
         let user = AsynUser::new(0)
             .with_addr(0)
             .with_timeout(Duration::from_secs(1))
@@ -4118,7 +4201,7 @@ mod tests {
             let mut drv = TestDriver::new();
             drv.base.auto_connect = false; // no reconnect can rescue the update
             drv.base.set_connected(connected);
-            drv.base.enabled = enabled;
+            drv.base.set_enabled(enabled).unwrap();
             let val = drv.base.find_param("VAL").unwrap();
             let tx = spawn_actor(drv);
 
@@ -4146,8 +4229,7 @@ mod tests {
             let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
             send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
             // Port-level user (addr == -1): the Connect-queue waiver holds on
-            // the disconnected port (a device-addressed connect would be
-            // refused — W10-D1).
+            // the disconnected port.
             let user = AsynUser::new(0)
                 .with_addr(-1)
                 .with_timeout(Duration::from_secs(1));
@@ -4315,7 +4397,7 @@ mod tests {
             let mut drv = TestDriver::new();
             drv.base.auto_connect = false;
             drv.base.set_connected(connected);
-            drv.base.enabled = enabled;
+            drv.base.set_enabled(enabled).unwrap();
             let f64_reason = drv.base.find_param("F64").unwrap();
             let tx = spawn_actor(drv);
 
@@ -4521,7 +4603,7 @@ mod tests {
             let mut base = PortDriverBase::new("rep", 1, PortFlags::default());
             base.auto_connect = false;
             base.set_connected(connected);
-            base.enabled = enabled;
+            base.set_enabled(enabled).unwrap();
             let tx = spawn_actor(ReportSpy {
                 base,
                 reports: reports.clone(),
@@ -4786,7 +4868,7 @@ mod tests {
         let mut base = PortDriverBase::new("disabled_port", 1, PortFlags::default());
         base.auto_connect = false;
         base.set_connected(false);
-        base.enabled = false; // C `asynEnable(port, 0)`
+        base.set_enabled(false).unwrap(); // C `asynEnable(port, 0)`
         let tx = spawn_actor(ConnectSpy {
             base,
             connects: connects.clone(),
@@ -4831,25 +4913,11 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
 
-        // …but a device-addressed CNCT=1 put is still refused: the port is
-        // enabled yet disconnected, and C's `checkPortConnect` waiver covers
-        // only `addr == -1` or the sentinel (asynManager.c:1536-1538) — the
-        // W10-D1 wart, reproduced.
+        // …and once enabled, the same CNCT=1 put opens the disconnected
+        // single-device port: its user has no device at addr 0
+        // (asynManager.c:576), so the Connect-queue waiver holds (:1538-1540).
         let user = AsynUser::new(0)
             .with_addr(0)
-            .with_timeout(Duration::from_secs(1));
-        let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
-        assert!(
-            err.is_queue_refused(),
-            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
-        );
-        assert_eq!(err.status(), AsynStatus::Disconnected);
-        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        // The route that DOES bring the enabled port up is the port-level
-        // user — C `connectDevice(port, -1)`, whose waiver holds.
-        let user = AsynUser::new(0)
-            .with_addr(-1)
             .with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Connect, user).unwrap();
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -4866,9 +4934,7 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Disconnect, user).unwrap();
 
-        // Port is now disconnected. A device-addressed reconnect is refused
-        // (C's checkPortConnect, W10-D1) — the port-level user (addr == -1,
-        // C `connectDevice(port, -1)`) is the route back up.
+        // Port is now disconnected; the Connect queue takes the reconnect.
         let user = AsynUser::new(0)
             .with_addr(-1)
             .with_timeout(Duration::from_secs(1));
@@ -4879,20 +4945,31 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// W10-D1 boundaries of C's Connect-queue waiver (asynManager.c:1536-1538):
-    /// on a disconnected, non-autoconnect port a Connect-priority request runs
-    /// iff the user is port-level (`addr == -1`) or carries the sentinel. The
-    /// device-addressed CNCT put (asynRecord's special user at the record's
-    /// ADDR, no sentinel) is refused `asynDisconnected` — the C wart, kept by
-    /// decision.
+    /// Boundaries of C's Connect-queue waiver (asynManager.c:1538-1540): on a
+    /// disconnected, non-autoconnect port a Connect-priority request runs iff
+    /// its user has no device or carries the sentinel. A user has a device
+    /// only on an `ASYN_MULTIDEVICE` port at `addr >= 0` (`locateDevice`,
+    /// :576), so asynRecord's CNCT put (its special user at the record's ADDR,
+    /// no sentinel) is refused `asynDisconnected` only there.
     #[test]
-    fn device_addressed_connect_is_refused_on_a_disconnected_port() {
+    fn device_addressed_connect_is_refused_only_on_a_multi_device_port() {
+        // Boundary 0: single-device port, addr 0 → no device, waived, runs.
         let mut drv = TestDriver::new();
         drv.base.auto_connect = false;
         drv.base.set_connected(false);
         let tx = spawn_actor(drv);
+        let user = AsynUser::new(0)
+            .with_addr(0)
+            .with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Connect, user)
+            .expect("a single-device port has no device at addr 0, so the waiver holds");
 
-        // Boundary 1: addr >= 0, no sentinel → refused (C checkPortConnect).
+        let mut drv = multi_device_driver(true);
+        drv.base.auto_connect = false;
+        drv.base.set_connected(false);
+        let tx = spawn_actor(drv);
+
+        // Boundary 1: multi-device, addr >= 0, no sentinel → refused.
         let user = AsynUser::new(0)
             .with_addr(0)
             .with_timeout(Duration::from_secs(1));

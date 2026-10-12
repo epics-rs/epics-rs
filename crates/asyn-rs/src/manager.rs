@@ -735,7 +735,7 @@ mod tests {
             tx,
             "extowned".to_string(),
             Arc::new(crate::interrupt::InterruptManager::new(4)),
-            crate::port_actor::ActorId::new(),
+            crate::port_actor::ActorLink::unowned(),
             Arc::new(crate::trace::TraceManager::new()),
         );
         crate::registry::register_port("extowned", ext).unwrap();

@@ -153,6 +153,10 @@ pub enum PortCommand {
     /// `RequestOp::WithDriver`. Code does not serialize, so only the kind of
     /// request survives; converting back yields a call the actor refuses.
     WithDriver,
+    /// `RequestOp::Callback`, which carries code the same way.
+    Callback {
+        connect_queue: bool,
+    },
     /// Set input EOS bytes — C `pasynOctet->setInputEos` /
     /// asynRecord IEOS.
     SetInputEos {
@@ -303,6 +307,9 @@ mod tests {
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
             PortCommand::WithDriver,
+            PortCommand::Callback {
+                connect_queue: true,
+            },
             PortCommand::ConnectUser,
         ];
         for cmd in commands {

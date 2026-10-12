@@ -211,7 +211,7 @@ mod tests {
             tx,
             name.to_string(),
             Arc::new(InterruptManager::new(4)),
-            crate::port_actor::ActorId::new(),
+            crate::port_actor::ActorLink::unowned(),
             Arc::new(TraceManager::new()),
         )
     }

@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(14): checked, not waived — all 14 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(15): checked, not waived — all 15 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1132/1132). asyn-rs became a census subject when its
+// --all-features`, 1134/1134). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -40,7 +40,7 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
-use crate::request::{CancelToken, RequestOp, RequestResult};
+use crate::request::{CancelToken, PortCallback, PortCalls, RequestOp, RequestResult};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 use crate::user::AsynUser;
 
@@ -523,6 +523,10 @@ pub struct AsynRecord {
     // both, the callback refreshes under the record's hold at once, as C
     // does, and never sets this flag.
     status_dirty: Arc<AtomicBool>,
+    // Set by [`AsynRecord::raise_exception`] while one of the record's own
+    // setters runs, so the registered callback leaves that exception to the
+    // refresh `special()` runs after it.
+    own_raise: Arc<AtomicBool>,
     // Owner handle for the registered exception callback so it can
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
@@ -846,6 +850,7 @@ impl Default for AsynRecord {
             io_inflight: None,
             status_dirty: Arc::new(AtomicBool::new(false)),
             except_cb: None,
+            own_raise: Arc::default(),
             io_alarm: None,
             old_trace_file_id: TraceFile::Errlog.id(),
             io_intr: Arc::new(IoIntrScan::new()),
@@ -1861,9 +1866,12 @@ impl SpecialUser {
 
 /// One request the record queues for C `asynCallbackSpecial`
 /// (asynRecord.c:834-899): its port half, built under the record's hold and
-/// run off it by [`SpecialJob::run`].
+/// run by [`SpecialJob::run`] against the port.
 struct SpecialJob {
-    handle: PortHandle,
+    /// The port has asynOption / asynOctet — what C's `optioniv` / `octetiv`
+    /// say when `setOption` / `setEos` test them.
+    option: bool,
+    octet: bool,
     kind: SpecialKind,
 }
 
@@ -1887,6 +1895,34 @@ enum SpecialKind {
     GetEos { user: SpecialUser },
     /// `callbackConnect` (:856-889), for the CNCT the put wrote.
     Connect { addr: i32, want: bool },
+}
+
+impl SpecialKind {
+    /// The user C hands `queueRequest` for this request, at the priority it
+    /// queues it at: `callbackConnect` and HOSTINFO at
+    /// `asynQueuePriorityConnect` (asynRecord.c:561-569), `connectDevice`'s
+    /// option readback with the sentinel (:1277-1280).
+    fn queue_user(&self) -> AsynUser {
+        match self {
+            Self::SetOption { user, .. }
+            | Self::GetOption { user }
+            | Self::SetEos { user, .. }
+            | Self::GetEos { user } => user.user(),
+            Self::Connect { addr, .. } => AsynUser::new(0)
+                .with_addr(*addr)
+                .with_priority(crate::port::QueuePriority::Connect),
+        }
+    }
+
+    /// Which C site queued it — see [`QueuedBy`].
+    fn queued_by(&self) -> QueuedBy {
+        match self {
+            Self::GetOption { .. } | Self::GetEos { .. } => QueuedBy::ConnectReadback,
+            Self::SetOption { .. } | Self::SetEos { .. } | Self::Connect { .. } => {
+                QueuedBy::Special
+            }
+        }
+    }
 }
 
 /// What a [`SpecialJob`] did on the port, for
@@ -1916,37 +1952,45 @@ enum Readback {
 }
 
 impl SpecialJob {
-    fn run(self) -> SpecialDone {
+    fn new(handle: &PortHandle, kind: SpecialKind) -> Self {
         use crate::interfaces::InterfaceType as Registry;
-        let handle = self.handle;
+        Self {
+            option: handle.has_interface(Registry::Option),
+            octet: handle.has_interface(Registry::Octet),
+            kind,
+        }
+    }
+
+    fn run(self, port: &mut dyn PortCalls) -> SpecialDone {
         match self.kind {
             SpecialKind::SetOption { user, key, value } => {
                 // C `setOption`'s `return` leaves `setOption`, not the
                 // callback: `getOptions` then returns on `!optioniv` too.
-                if !handle.has_interface(Registry::Option) {
+                if !self.option {
                     return SpecialDone::Ran(
                         Some(SpecialReport::NoInterface("asynOption")),
                         Readback::None,
                     );
                 }
-                let report = match handle.set_option_blocking(user.user(), &key, &value) {
-                    Ok(()) => None,
+                let op = RequestOp::SetOption { key, value };
+                let report = match port.call(op, user.user()) {
+                    Ok(_) => None,
                     Err(e) if e.never_ran() => return SpecialDone::NeverRan(e, QueuedBy::Special),
                     Err(e) => Some(SpecialReport::Errs(Errs::format(format_args!(
                         "Error setting option, {}",
                         e.message_display()
                     )))),
                 };
-                SpecialDone::Ran(report, read_options(&handle, user).into())
+                SpecialDone::Ran(report, read_options(port, user).into())
             }
-            SpecialKind::GetOption { user } => match read_options(&handle, user) {
+            SpecialKind::GetOption { user } => match read_options(port, user) {
                 Ok(opts) => SpecialDone::Ran(None, Readback::Options(opts)),
                 Err(e) => SpecialDone::NeverRan(e, QueuedBy::ConnectReadback),
             },
             SpecialKind::SetEos { user, output, eos } => {
                 // C `setEos` returns on `!octetiv`, and `getEos` then posts
                 // both fields blank (:1997-1998, `goto post`).
-                if !handle.has_interface(Registry::Octet) {
+                if !self.octet {
                     return SpecialDone::Ran(
                         Some(SpecialReport::NoInterface(
                             InterfaceType::Octet.c_asyn_name(),
@@ -1954,13 +1998,13 @@ impl SpecialJob {
                         Readback::Eos(String::new(), String::new()),
                     );
                 }
-                let res = if output {
-                    handle.set_output_eos_blocking(user.user(), &eos)
+                let op = if output {
+                    RequestOp::SetOutputEos { eos }
                 } else {
-                    handle.set_input_eos_blocking(user.user(), &eos)
+                    RequestOp::SetInputEos { eos }
                 };
-                let report = match res {
-                    Ok(()) => None,
+                let report = match port.call(op, user.user()) {
+                    Ok(_) => None,
                     Err(e) if e.never_ran() => return SpecialDone::NeverRan(e, QueuedBy::Special),
                     Err(e) => {
                         let which = if output { "output" } else { "input" };
@@ -1970,18 +2014,21 @@ impl SpecialJob {
                         ))))
                     }
                 };
-                SpecialDone::Ran(report, read_eos(&handle, user).into())
+                SpecialDone::Ran(report, read_eos(port, user).into())
             }
-            SpecialKind::GetEos { user } => match read_eos(&handle, user) {
+            SpecialKind::GetEos { user } => match read_eos(port, user) {
                 Ok((ieos, oeos)) => SpecialDone::Ran(None, Readback::Eos(ieos, oeos)),
                 Err(e) => SpecialDone::NeverRan(e, QueuedBy::ConnectReadback),
             },
             SpecialKind::Connect { addr, want } => {
                 // The connect user is the record's own, at ADDR, with no
-                // waiver: a device-addressed CNCT put to a disconnected port
-                // is refused `asynDisconnected` as C's `checkPortConnect`
-                // refuses it (W10-D1).
-                let op = match (want, handle.is_connected_blocking(addr)) {
+                // sentinel: on a disconnected multi-device port C's
+                // `checkPortConnect` refuses it (asynManager.c:1538-1552).
+                let user = || AsynUser::new(0).with_addr(addr);
+                let connected = port
+                    .call(RequestOp::GetConnected, user())
+                    .map(|r| r.int_val.unwrap_or(0) != 0);
+                let op = match (want, connected) {
                     (true, Ok(false)) => Some(("connect", RequestOp::Connect)),
                     (false, Ok(true)) => Some(("disconnect", RequestOp::Disconnect)),
                     // Already in the requested state: no driver call.
@@ -1995,10 +2042,7 @@ impl SpecialJob {
                         );
                     }
                 };
-                let report = match op.map(|(what, op)| {
-                    let user = AsynUser::new(0).with_addr(addr);
-                    (what, handle.submit_blocking(op, user))
-                }) {
+                let report = match op.map(|(what, op)| (what, port.call(op, user()))) {
                     Some((_, Err(e))) if e.never_ran() => {
                         return SpecialDone::NeverRan(e, QueuedBy::Special);
                     }
@@ -2035,17 +2079,24 @@ impl From<Result<(String, String), AsynError>> for Readback {
 /// driver does not know these keys" left ERRS empty where C reports
 /// `queueRequest failed` on every attach to a disconnected port.
 fn read_options(
-    handle: &PortHandle,
+    port: &mut dyn PortCalls,
     user: SpecialUser,
 ) -> Result<HashMap<String, String>, AsynError> {
     let mut opts = HashMap::new();
     for key in OPTION_READBACK_KEYS {
-        match handle.get_option_blocking(user.user(), key) {
-            Ok(val) => {
+        let op = RequestOp::GetOption {
+            key: (*key).to_string(),
+        };
+        match port.call(op, user.user()) {
+            Ok(RequestResult {
+                option_value: Some(val),
+                ..
+            }) => {
                 opts.insert((*key).to_string(), val);
             }
             Err(e) if e.never_ran() => return Err(e),
-            Err(_) => {}
+            // An unknown key, or one the driver answered with no value.
+            Ok(_) | Err(_) => {}
         }
     }
     Ok(opts)
@@ -2060,41 +2111,53 @@ fn read_options(
 /// request that never ran is `Err`, as in [`read_options`]: this is the
 /// readback C queues with no not-connected waiver (`asynQueuePriorityLow`,
 /// :1296), so the gate really does refuse it.
-fn read_eos(handle: &PortHandle, user: SpecialUser) -> Result<(String, String), AsynError> {
-    let read = |res: AsynResult<Vec<u8>>| match res {
-        Ok(bytes) if !bytes.is_empty() => Ok(crate::escape::escaped_from_raw(&bytes, EOS_SIZE)),
+fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, String), AsynError> {
+    let mut read = |op| match port.call(op, user.user()) {
+        Ok(RequestResult {
+            data: Some(bytes), ..
+        }) if !bytes.is_empty() => Ok(crate::escape::escaped_from_raw(&bytes, EOS_SIZE)),
         Ok(_) => Ok(String::new()),
         Err(e) if e.never_ran() => Err(e),
         Err(_) => Ok(String::new()),
     };
-    let ieos = read(handle.get_input_eos_blocking(user.user()))?;
-    let oeos = read(handle.get_output_eos_blocking(user.user()))?;
+    let ieos = read(RequestOp::GetInputEos)?;
+    let oeos = read(RequestOp::GetOutputEos)?;
     Ok((ieos, oeos))
 }
 
-/// The record's `asynCallbackSpecial` queue on a blocking port: C runs every
-/// request a record queues on the one port thread, in queue order, so they
-/// are run here by one worker at a time, in the order they were queued.
-/// Without it a CNCT 1 then CNCT 0 could reach the port the other way round.
+/// The record half of the `asynCallbackSpecial` requests the record queued on
+/// a blocking port. C's port thread runs each callback whole, in queue order
+/// (asynRecord.c:834-899); here the port half runs on the port's actor
+/// ([`RequestOp::Callback`]), which hands its result over, and one drainer at
+/// a time applies the results under the record's hold in that order. The hold
+/// is never taken on the actor thread: a record holding it may be waiting on
+/// that actor.
 #[derive(Default)]
-struct SpecialLane(Mutex<SpecialQueue>);
+struct SpecialLane {
+    done: Mutex<SpecialQueue>,
+    /// Requests queued and not yet applied: raised under the hold before the
+    /// request is queued, lowered by the drainer once applied.
+    in_flight: std::sync::atomic::AtomicUsize,
+}
 
 #[derive(Default)]
 struct SpecialQueue {
-    jobs: std::collections::VecDeque<SpecialJob>,
+    done: std::collections::VecDeque<SpecialDone>,
     draining: bool,
 }
 
 impl SpecialLane {
-    fn push(
+    /// From the port's actor, as the callback ends: queue the result, and start
+    /// the drainer — C `callbackRequest` — unless it is running.
+    fn complete(
         self: &Arc<Self>,
-        job: SpecialJob,
+        done: SpecialDone,
         name: String,
         db: AsyncDbHandle,
         prio: epics_libcom_rs::runtime::task::CallbackPriority,
     ) {
-        let mut queue = self.0.lock().unwrap();
-        queue.jobs.push_back(job);
+        let mut queue = self.done.lock().unwrap();
+        queue.done.push_back(done);
         if std::mem::replace(&mut queue.draining, true) {
             return;
         }
@@ -2105,20 +2168,18 @@ impl SpecialLane {
         });
     }
 
-    /// Run each job's port half off the hold, then its completion under it.
     fn drain(&self, name: &str, db: &AsyncDbHandle) {
         loop {
-            let job = {
-                let mut queue = self.0.lock().unwrap();
-                match queue.jobs.pop_front() {
-                    Some(job) => job,
+            let done = {
+                let mut queue = self.done.lock().unwrap();
+                match queue.done.pop_front() {
+                    Some(done) => done,
                     None => {
                         queue.draining = false;
                         return;
                     }
                 }
             };
-            let done = job.run();
             db.with_record(name, |rec| {
                 if let Some(rec) = rec
                     .as_any_mut()
@@ -2127,6 +2188,8 @@ impl SpecialLane {
                     rec.complete_special(done);
                 }
             });
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -2288,7 +2351,8 @@ impl AsynRecord {
     /// device rung on a multi-device port, else the port's, else — a user
     /// connected to no port — the global one. Every trace read and write the
     /// record makes resolves here, so a record whose connect failed still
-    /// reads and writes the trace C does.
+    /// reads and writes the trace C does; the three mask setters refuse that
+    /// user instead ([`Self::mask_rung`]).
     fn trace_rung(&self) -> TraceRung<'_> {
         match self.device_user.device() {
             Some(entry) => TraceRung {
@@ -2304,54 +2368,85 @@ impl AsynRecord {
         }
     }
 
+    /// The rung C's `setTraceMask` / `setTraceIOMask` / `setTraceInfoMask`
+    /// write: none for a user on no port, which they refuse with "not
+    /// connected to port" (asynManager.c:2797-2800, :2839-2842, :2881-2884)
+    /// rather than fall to the global rung as `setTraceFile` and
+    /// `setTraceIOTruncateSize` do. `special()` drops the status, so nothing
+    /// is reported (oracle as12).
+    fn mask_rung(&self) -> Option<TraceRung<'_>> {
+        Some(self.trace_rung()).filter(|rung| rung.port.is_some())
+    }
+
     /// C `setTraceMask` (asynRecord.c:410, :424).
     fn apply_trace_mask(&mut self, value: TraceMask) {
-        let rung = self.trace_rung();
-        match (rung.port, rung.addr) {
-            (Some(port), Some(addr)) => rung.trace.set_device_trace_mask(port, addr, value),
-            (port, _) => rung.trace.set_trace_mask(port, value),
+        if self.mask_rung().is_none() {
+            return;
         }
-        self.exception_raised();
+        self.raise_exception(|rec| {
+            let rung = rec.trace_rung();
+            match (rung.port, rung.addr) {
+                (Some(port), Some(addr)) => rung.trace.set_device_trace_mask(port, addr, value),
+                (port, _) => rung.trace.set_trace_mask(port, value),
+            }
+        });
     }
 
     /// C `setTraceIOMask` (asynRecord.c:427, :435).
     fn apply_trace_io_mask(&mut self, value: TraceIoMask) {
-        let rung = self.trace_rung();
-        match (rung.port, rung.addr) {
-            (Some(port), Some(addr)) => rung.trace.set_device_trace_io_mask(port, addr, value),
-            (port, _) => rung.trace.set_trace_io_mask(port, value),
+        if self.mask_rung().is_none() {
+            return;
         }
-        self.exception_raised();
+        self.raise_exception(|rec| {
+            let rung = rec.trace_rung();
+            match (rung.port, rung.addr) {
+                (Some(port), Some(addr)) => rung.trace.set_device_trace_io_mask(port, addr, value),
+                (port, _) => rung.trace.set_trace_io_mask(port, value),
+            }
+        });
     }
 
     /// C `setTraceInfoMask` (asynRecord.c:438, :448).
     fn apply_trace_info_mask(&mut self, value: TraceInfoMask) {
-        let rung = self.trace_rung();
-        match (rung.port, rung.addr) {
-            (Some(port), Some(addr)) => rung.trace.set_device_trace_info_mask(port, addr, value),
-            (port, _) => rung.trace.set_trace_info_mask(port, value),
+        if self.mask_rung().is_none() {
+            return;
         }
-        self.exception_raised();
+        self.raise_exception(|rec| {
+            let rung = rec.trace_rung();
+            match (rung.port, rung.addr) {
+                (Some(port), Some(addr)) => {
+                    rung.trace.set_device_trace_info_mask(port, addr, value)
+                }
+                (port, _) => rung.trace.set_trace_info_mask(port, value),
+            }
+        });
     }
 
     /// C `setTraceIOTruncateSize` (asynRecord.c:451).
     fn apply_trace_truncate_size(&mut self) {
         let value = self.tsiz as usize;
-        let rung = self.trace_rung();
-        match (rung.port, rung.addr) {
-            (Some(port), Some(addr)) => rung.trace.set_device_io_truncate_size(port, addr, value),
-            (port, _) => rung.trace.set_io_truncate_size(port, value),
-        }
-        self.exception_raised();
+        self.raise_exception(|rec| {
+            let rung = rec.trace_rung();
+            match (rung.port, rung.addr) {
+                (Some(port), Some(addr)) => {
+                    rung.trace.set_device_io_truncate_size(port, addr, value)
+                }
+                (port, _) => rung.trace.set_io_truncate_size(port, value),
+            }
+        });
     }
 
-    /// C's `exceptCallback` for an exception a setter in `special()` just
-    /// raised: asynManager calls it on the setter's own thread, so its
-    /// `monitorStatus` runs inside `special()` under the recursive
-    /// `dbScanLock` (asynRecord.c:911-916). The callback this port registers
-    /// runs the same refresh again off the port's thread once the hold is
-    /// free, and finds nothing moved.
-    fn exception_raised(&mut self) {
+    /// Run a setter in `special()` that raises an exception, then C's
+    /// `exceptCallback` for it: asynManager calls that on the setter's own
+    /// thread, so its `monitorStatus` runs inside `special()` under the
+    /// recursive `dbScanLock` (asynRecord.c:911-916), once. The registered
+    /// callback stands down while `own_raise` is set — the setter announces
+    /// before it returns, on the port actor before its reply — and a foreign
+    /// exception it skips in that window is read by the refresh after it.
+    fn raise_exception(&mut self, set: impl FnOnce(&Self)) {
+        self.own_raise.store(true, Ordering::Release);
+        set(self);
+        self.own_raise.store(false, Ordering::Release);
         if self.except_cb.is_some() {
             self.monitor_status();
         }
@@ -2384,12 +2479,13 @@ impl AsynRecord {
         // monitorStatus — which would otherwise see the record's own write as a
         // foreign change and overwrite TFIL with "Unknown" (asynRecord.c:474-475).
         self.old_trace_file_id = file.id();
-        let rung = self.trace_rung();
-        match (rung.port, rung.addr) {
-            (Some(port), Some(addr)) => rung.trace.set_device_trace_file(port, addr, file),
-            (port, _) => rung.trace.set_trace_file(port, file),
-        }
-        self.exception_raised();
+        self.raise_exception(|rec| {
+            let rung = rec.trace_rung();
+            match (rung.port, rung.addr) {
+                (Some(port), Some(addr)) => rung.trace.set_device_trace_file(port, addr, file),
+                (port, _) => rung.trace.set_trace_file(port, file),
+            }
+        });
     }
 
     /// Read current trace state from TraceManager into record fields.
@@ -2462,6 +2558,7 @@ impl AsynRecord {
         };
         let port = self.port.clone();
         let dirty = Arc::clone(&self.status_dirty);
+        let own_raise = Arc::clone(&self.own_raise);
         // The exception fires on the thread that raised it — iocsh, or the port
         // actor itself — which is not a worker of the IOC's executor, so the
         // `Reactor` is captured here, where registration runs in the
@@ -2476,7 +2573,7 @@ impl AsynRecord {
         let id = mgr.add_callback(move |ev| {
             // The subscription is per-port in C (the callback hangs off the
             // record's `pasynUser`), which is what this name check reproduces.
-            if ev.port_name != port {
+            if ev.port_name != port || own_raise.load(Ordering::Acquire) {
                 return;
             }
             let Some((name, db, rt)) = immediate.clone() else {
@@ -2687,21 +2784,52 @@ impl AsynRecord {
 
     /// C `queueRequest` of an `asynCallbackSpecial` request, and the callback.
     ///
-    /// On a blocking port with a database the request runs on the record's
-    /// [`SpecialLane`] and [`Self::complete_special`] runs under the hold
-    /// [`AsyncDbHandle::with_record`] takes — C runs the callback on the port
-    /// thread with no record lock at all, so this is stricter than C. Anything
-    /// else runs it here, as C's `queueRequest` runs a synchronous port's
-    /// callback before it returns.
-    fn queue_port_request(&mut self, handle: PortHandle, kind: SpecialKind) {
-        let job = SpecialJob { handle, kind };
+    /// On a blocking port with a database the request is queued on the port
+    /// as a [`RequestOp::Callback`] and the put returns: C's `queueRequest`
+    /// takes `asynManagerLock` under the record lock, links the request and
+    /// signals the port thread (asynManager.c:1542-1628), and that is all this
+    /// does under the hold. The actor runs the port half and hands the result
+    /// to the [`SpecialLane`]. Anything else runs it here, as C's
+    /// `queueRequest` runs a synchronous port's callback before it returns.
+    ///
+    /// C's `queueRequest` refuses before anything is queued, so its refusal is
+    /// reported here, under the hold and before the put returns
+    /// (asynRecord.c:571-578, :1281-1285, :1297-1301).
+    fn queue_port_request(&mut self, mut handle: PortHandle, kind: SpecialKind) {
+        let user = kind.queue_user();
+        let queued_by = kind.queued_by();
+        if let Err(e) = handle.queue_gate(&user) {
+            self.report_never_ran(&e, queued_by);
+            return;
+        }
+        let job = SpecialJob::new(&handle, kind);
         match self.async_ctx.clone() {
-            Some((name, db)) if job.handle.can_block() => {
+            Some((name, db)) if handle.can_block() => {
+                let lane = Arc::clone(&self.special_lane);
+                let prio = self.callback_priority;
+                let connect_queue = user.priority == crate::port::QueuePriority::Connect;
+                let callback = PortCallback::new(connect_queue, move |port| {
+                    let done = match port {
+                        Ok(port) => job.run(port),
+                        Err(e) => SpecialDone::NeverRan(e, queued_by),
+                    };
+                    lane.complete(done, name, db, prio);
+                });
                 self.special_lane
-                    .push(job, name, db, self.callback_priority);
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = handle.try_submit(RequestOp::Callback(callback.clone()), user) {
+                    // A full or closed channel: `queueRequest` failed, reported
+                    // here as C reports it.
+                    callback.withdraw();
+                    self.special_lane
+                        .in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.report_never_ran(&e.into_queue_refusal(), queued_by);
+                }
             }
             _ => {
-                let done = job.run();
+                let done = job.run(&mut handle);
                 self.complete_special(done);
             }
         }
@@ -2849,10 +2977,9 @@ impl AsynRecord {
     fn report_never_ran(&mut self, e: &AsynError, queued_by: QueuedBy) {
         if e.is_queue_refused() {
             match queued_by {
-                // C splices `pasynUser->errorMessage` — the gate's own text, e.g.
-                // "port X not connected" — into ERRS (:575). No severity: C's
-                // `reportError` raises none.
-                QueuedBy::Special => self.report_error(format_args!("{}", e.message_display())),
+                QueuedBy::Special => {
+                    self.report_special_refused(format_args!("{}", e.message_display()))
+                }
                 QueuedBy::ConnectReadback => {
                     self.report_error(format_args!("{CONNECT_READBACK_QUEUE_REFUSED_MSG}"))
                 }
@@ -2860,6 +2987,15 @@ impl AsynRecord {
         } else {
             self.report_special_queue_timeout();
         }
+    }
+
+    /// C `special()`'s refused `queueRequest` (asynRecord.c:573-575): its own
+    /// text, then `pasynUser->errorMessage` — the manager's, e.g. "port X not
+    /// connected" — which is the one ERRS keeps. No severity: C's
+    /// `reportError` raises none.
+    fn report_special_refused(&mut self, error_message: std::fmt::Arguments<'_>) {
+        self.report_error(format_args!("queueRequest failed for special."));
+        self.report_error(error_message);
     }
 
     /// C `special()`'s `queueRequest` for the arms it hands to
@@ -2870,10 +3006,8 @@ impl AsynRecord {
     fn queue_special(&mut self) -> Option<crate::registry::PortEntry> {
         match self.device_user.device() {
             Some(entry) => Some(entry.clone()),
-            // `report_never_ran`'s Special refusal, with the text C's manager
-            // writes.
             None => {
-                self.report_error(format_args!(
+                self.report_special_refused(format_args!(
                     "asynManager::queueRequest asynUser not associated with a port"
                 ));
                 None
@@ -4336,9 +4470,12 @@ impl Record for AsynRecord {
             // associated asynExceptionEnable fan-out from
             // PortDriverBase::set_enabled).
             "ENBL" => {
-                if let Some(entry) = self.device_user.device() {
-                    let _ = entry.handle.set_enable_blocking(self.addr, self.enbl != 0);
-                    self.exception_raised();
+                if self.device_user.device().is_some() {
+                    self.raise_exception(|rec| {
+                        if let Some(entry) = rec.device_user.device() {
+                            let _ = entry.handle.set_enable_blocking(rec.addr, rec.enbl != 0);
+                        }
+                    });
                 }
             }
 
@@ -4347,11 +4484,14 @@ impl Record for AsynRecord {
             // asynExceptionAutoConnect unconditionally, which Rust
             // mirrors via PortDriverBase::set_auto_connect.
             "AUCT" => {
-                if let Some(entry) = self.device_user.device() {
-                    let _ = entry
-                        .handle
-                        .set_auto_connect_blocking(self.addr, self.auct != 0);
-                    self.exception_raised();
+                if self.device_user.device().is_some() {
+                    self.raise_exception(|rec| {
+                        if let Some(entry) = rec.device_user.device() {
+                            let _ = entry
+                                .handle
+                                .set_auto_connect_blocking(rec.addr, rec.auct != 0);
+                        }
+                    });
                 }
             }
 
@@ -4698,9 +4838,9 @@ impl Record for AsynRecord {
         CycleMarks::of(&ASYN_POSTS, held)
     }
 
-    /// A process cycle posts only what `monitor()` names: ERRS posts from its
-    /// mark, the `monitorStatus` set through [`Self::publish`], and VAL never
-    /// posts.
+    /// A process cycle posts only what `monitor()` names: ERRS and the
+    /// `monitorStatus` set post from their marks (`mark`), and VAL
+    /// never posts.
     fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
         Some(&MONITOR_CLAIMED)
     }
@@ -5184,13 +5324,13 @@ mod tests {
         let port_name = "errs_attach_readback_refused";
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(NullOctetPort::new(port_name)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -5660,13 +5800,13 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(ParamDriver(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -5782,13 +5922,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -5960,13 +6100,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -6044,13 +6184,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -6458,14 +6598,14 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         register_port(port_name, handle).unwrap();
@@ -6528,14 +6668,14 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(TestDriver::new()), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             "test_asyn_rec".into(),
             interrupts,
-            actor_id,
+            actor_link,
             trace.clone(),
         );
 
@@ -6580,10 +6720,11 @@ mod tests {
             Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
-        let mut handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id, trace.clone());
+        let mut handle =
+            PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         handle.set_capabilities(true, 4);
         register_port(port_name, handle).unwrap();
 
@@ -6653,13 +6794,13 @@ mod tests {
                 Box::new(DpDriver(PortDriverBase::new(port_name, max_addr, flags))),
                 rx,
             );
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::spawn(move || actor.run());
             let mut handle = PortHandle::new(
                 tx,
                 port_name.into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 Arc::new(TraceManager::new()),
             );
             handle.set_capabilities(multi_device, max_addr as i32);
@@ -6788,14 +6929,17 @@ mod tests {
 
     /// A record whose connect failed has a user on no port, and C's
     /// `findTracePvt` gives that user the global rung (asynManager.c:548-551):
-    /// `special()`'s trace arms write it and `monitorStatus` reads it. The
-    /// oracle (as5): `caput A.PORT NOSUCH` posts TMSK 1 and TFIL "Unknown" off
+    /// `setTraceFile` / `setTraceIOTruncateSize` write it and `monitorStatus`
+    /// reads it, while the mask setters refuse the user. The oracles: as5,
+    /// `caput A.PORT NOSUCH` posts TMSK 1 and TFIL "Unknown" off
     /// `asynRecPvt.old`'s zeroes, and `caput A.TFIL /nonexistent/dir/f` leaves
-    /// ERRS `Error opening trace file: /nonexistent/dir/f`.
+    /// ERRS `Error opening trace file: /nonexistent/dir/f`; as12, after `caput
+    /// A.TMSK 17; caput A.TSIZ 77` a second portless record reads TMSK 1 and
+    /// TSIZ 77.
     ///
     /// One case per boundary: an arm that opens a file, an arm that writes a
-    /// mask, the read, and the read's first sample against C's NULL
-    /// `old.traceFd`.
+    /// mask, an arm that writes the truncate size, the read, and the read's
+    /// first sample against C's NULL `old.traceFd`.
     #[test]
     fn a_portless_record_reads_and_writes_the_global_trace() {
         let global = crate::manager::PortManager::global();
@@ -6807,16 +6951,24 @@ mod tests {
 
         let before = trace.get_trace_mask(None);
         let flow = TraceMask::ERROR | TraceMask::FLOW;
+        assert_ne!(before, flow);
         rec.tmsk = flow.bits() as i32;
         rec.special("TMSK", true).unwrap();
-        let written = trace.get_trace_mask(None);
+        let size_before = trace.snapshot(None, None).io_truncate_size;
+        rec.tsiz = 77;
+        rec.special("TSIZ", true).unwrap();
 
         let mut fresh = AsynRecord::default();
         fresh.tfil = String::new();
         fresh.read_trace_state();
-        trace.set_trace_mask(None, before);
-        assert_eq!(written, flow);
-        assert_eq!(fresh.tmsk, flow.bits() as i32, "the global mask");
+        trace.set_io_truncate_size(None, size_before);
+        assert_eq!(rec.errs, "", "the refused mask write reports nothing");
+        assert_eq!(
+            fresh.tmsk,
+            before.bits() as i32,
+            "the global mask, untouched"
+        );
+        assert_eq!(fresh.tsiz, 77, "the global truncate size, written");
         assert_eq!(
             fresh.tfil, TFIL_UNKNOWN,
             "a first sample of any sink but errlog moved off NULL"
@@ -6853,10 +7005,10 @@ mod tests {
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id, trace.clone());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         // Non-default info mask set on the manager BEFORE the record connects.
         trace.set_trace_info_mask(
             Some(port_name),
@@ -6909,10 +7061,10 @@ mod tests {
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id, trace.clone());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         // Wire the exception sink as a real IOC would (PortManager installs
         // it); without it the record's subscription is a no-op.
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
@@ -6996,13 +7148,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7103,13 +7255,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7202,13 +7354,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7384,13 +7536,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7540,13 +7692,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7641,13 +7793,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7742,13 +7894,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7837,13 +7989,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7942,13 +8094,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -7980,50 +8132,18 @@ mod tests {
             "CNCT must not drop the port binding"
         );
 
-        // CNCT=1 on the disconnected port is REFUSED: the record's special
-        // user rides the Connect queue at the record's ADDR (0) with no
-        // sentinel, and C's `checkPortConnect` waiver covers only addr == -1
-        // or the sentinel (asynManager.c:1520,1536-1538) — the W10-D1 wart,
-        // reproduced by decision. The refusal is `queueRequest`'s return value,
-        // so `asynCallbackSpecial` never runs: C reports
-        // `pasynUserSpecial->errorMessage` and frees the user
-        // (asynRecord.c:571-578), and with no callback there is no `monitorStatus`
-        // tail — CNCT keeps the value the operator typed until the next status
-        // cycle (R14-46).
+        // CNCT=1 on the disconnected port connects it: the record's special
+        // user rides the Connect queue, and on a single-device port it has no
+        // device at its ADDR (`locateDevice`, asynManager.c:576), so C's
+        // `checkPortConnect` waiver holds (:1538-1540).
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
         assert_eq!(
             connects.load(Ordering::SeqCst),
-            base_connects,
-            "a device-addressed CNCT=1 put must be refused on a disconnected \
-             port (C checkPortConnect)"
+            base_connects + 1,
+            "CNCT=1 must connect the driver's transport"
         );
-        assert!(
-            rec.errs.contains("not connected"),
-            "the gate's refusal message is what reaches ERRS: {}",
-            rec.errs
-        );
-        assert!(
-            !rec.errs.contains("callbackConnect"),
-            "a refused request never entered the callback: {}",
-            rec.errs
-        );
-        assert_eq!(
-            rec.cnct, 1,
-            "no callback ran, so no monitorStatus tail snapped CNCT back \
-             (asynRecord.c:571-578 vs :897)"
-        );
-
-        // The port-level route (C `connectDevice(port, -1)`) brings the line
-        // back up; CNCT reads it back on the next status cycle.
-        rec.device_user
-            .device()
-            .unwrap()
-            .handle
-            .connect_blocking()
-            .unwrap();
-        rec.cnct = 1;
-        rec.special("CNCT", true).unwrap();
+        assert_eq!(rec.errs, "");
         assert_eq!(rec.cnct, 1);
 
         // C's isConnected gate: re-putting the state the port is already in
@@ -8166,13 +8286,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -8259,10 +8379,11 @@ mod tests {
             rec.errs
         );
 
-        // --- Boundary 4: the CNCT put refused on that same disconnected port
-        // (the device-addressed W10-D1 wart). No connect is attempted, and with
-        // no callback there is no monitorStatus tail: CNCT keeps the operator's
-        // value instead of being snapped back.
+        // --- Boundary 4: the CNCT put refused, by the disabled port — the one
+        // refusal the Connect queue's waiver does not lift (:1541-1546). No
+        // connect is attempted, and with no callback there is no monitorStatus
+        // tail: CNCT keeps the operator's value instead of being snapped back.
+        entry_handle.set_enable_blocking(-1, false).unwrap();
         let connects_before = connects.load(Ordering::SeqCst);
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
@@ -8272,7 +8393,7 @@ mod tests {
             "a refused CNCT put must not touch the wire"
         );
         assert!(
-            rec.errs.contains("not connected"),
+            rec.errs.contains("disabled"),
             "ERRS is the gate's errorMessage, not a callback-shaped text: {}",
             rec.errs
         );
@@ -8343,13 +8464,13 @@ mod tests {
                 }),
                 rx,
             );
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::spawn(move || actor.run());
             let handle = PortHandle::new(
                 tx,
                 port_name.into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 Arc::new(TraceManager::new()),
             );
             register_port(port_name, handle).unwrap();
@@ -8473,13 +8594,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -8593,13 +8714,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -8702,13 +8823,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -8768,13 +8889,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -8871,13 +8992,13 @@ mod tests {
             }),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -9486,7 +9607,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(ReadDriver { base }), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("asynio-test-actor".into())
             .spawn(move || actor.run())
@@ -9496,7 +9617,7 @@ mod tests {
             tx,
             "ASYNIO".into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         handle.set_can_block(true);
@@ -9641,7 +9762,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("asynaqr-test-actor".into())
             .spawn(move || actor.run())
@@ -9650,7 +9771,7 @@ mod tests {
             tx,
             "ASYNAQR".into(),
             Arc::new(InterruptManager::new(16)),
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         handle.set_can_block(true);
@@ -9751,14 +9872,14 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
 
@@ -9919,14 +10040,14 @@ A.TMSK 1
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
@@ -10026,8 +10147,7 @@ A.TMSK 1
     /// — a blocking octet port with no asynOption, not auto-connected —
     /// `camonitor -m v|a|l -S` on `A.ERRS A.CNCT A.IEOS A.OEOS A.BAUD
     /// A.HOSTINFO` of `record(asyn,"A"){field(PORT,"P") field(ADDR,"-1")}`
-    /// (a port-level user, which the Connect queue takes on a disconnected
-    /// port), driven with `caput
+    /// and of the same record at the default ADDR 0, driven with `caput
     /// A.CNCT 1; sleep; caput A.IEOS \r; caput A.OEOS \n; caput A.BAUD 9600;
     /// caput A.HOSTINFO x; caput A.CNCT 0; sleep; caput A.CNCT 0`. The value
     /// and log streams are the same and the alarm stream is empty.
@@ -10146,8 +10266,231 @@ A.CNCT Disconnect
             out
         }
 
-        let port_name = "as8_echo";
-        let mut base = PortDriverBase::new(
+        // ADDR -1 is as9 and ADDR 0 as8: a single-device port has no device at
+        // any ADDR (`locateDevice`, asynManager.c:576), so the Connect queue
+        // takes CNCT 1 from either on the disconnected port.
+        let no_option = "No asynOption interface";
+        let errs = ["", "", "", "", no_option, no_option, "", "", ""];
+        for (port_name, addr) in [("as9_echo", -1), ("as8_echo", 0)] {
+            oracle(port_name, addr, &STEPS, WANT, &errs, ("\\r", "\\n")).await;
+        }
+        // as11: an EOS put the gate refuses on the disconnected port. C
+        // reports it from `special()` (asynRecord.c:571-578), so ERRS posts
+        // ahead of dbPut's post of the field, and no readback follows.
+        const REFUSED: &str = "\
+--
+A.ERRS
+A.CNCT Connect
+--
+--
+A.CNCT Disconnect
+--
+--
+A.ERRS
+A.IEOS
+--
+--
+A.ERRS
+A.OEOS
+--
+";
+        let refused = "port as11_echo not connected";
+        oracle(
+            "as11_echo",
+            0,
+            &[
+                Some(("CNCT", "1")),
+                None,
+                Some(("CNCT", "0")),
+                None,
+                Some(("IEOS", "\\r")),
+                None,
+                Some(("OEOS", "\\n")),
+                None,
+            ],
+            REFUSED,
+            &["", "", "", "", refused, refused, refused, refused],
+            ("\\r", "\\n"),
+        )
+        .await;
+
+        async fn oracle(
+            port_name: &'static str,
+            addr: i32,
+            steps: &[Option<(&'static str, &'static str)>],
+            want: &str,
+            errs_after: &[&str],
+            eos: (&str, &str),
+        ) {
+            let mut base = PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags {
+                    can_block: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.install_octet_interpose(Box::new(EosInterpose::default()));
+            base.set_connected(false);
+            base.auto_connect = false;
+            let (rt, jh) = create_port_runtime(Echo(base), RuntimeConfig::default()).unwrap();
+            std::mem::forget(jh);
+            register_port(port_name, rt.port_handle().clone()).unwrap();
+            std::mem::forget(rt);
+
+            let db = PvDatabase::new();
+            let mut rec = AsynRecord::default();
+            rec.addr = addr;
+            db.add_record("A", Box::new(rec)).await.unwrap();
+            let cell = db.get_record("A").unwrap();
+            // The record's special requests have all completed.
+            let settled = || async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let idle = {
+                        let mut inst = cell.write();
+                        let rec = inst
+                            .record
+                            .as_any_mut()
+                            .and_then(|any| any.downcast_mut::<AsynRecord>())
+                            .unwrap();
+                        rec.special_lane
+                            .in_flight
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            == 0
+                    };
+                    if idle {
+                        return;
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "the lane drains");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let field = |name: &str| cell.read().record.get_field(name);
+            let text = |name: &str| match field(name) {
+                Some(EpicsValue::CharArray(buf)) => {
+                    String::from_utf8(buf.split(|b| *b == 0).next().unwrap().to_vec()).unwrap()
+                }
+                Some(EpicsValue::String(s)) => s.to_string(),
+                other => panic!("{name}: {other:?}"),
+            };
+
+            db.put_record_field_from_ca("A", "PORT", EpicsValue::String(port_name.into()))
+                .await
+                .unwrap();
+            settled().await;
+            // `connectDevice`'s EOS readback, refused on the disconnected port
+            // (asynRecord.c:1296-1301).
+            assert_eq!(text("ERRS"), CONNECT_READBACK_QUEUE_REFUSED_MSG);
+
+            let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
+            let streams: Vec<Arc<std::sync::Mutex<String>>> =
+                classes.iter().map(|_| Arc::default()).collect();
+            let mut readers = Vec::new();
+            {
+                let mut inst = cell.write();
+                let mut sid = 0;
+                for (class, stream) in classes.iter().zip(&streams) {
+                    for (pv, field, ty) in [
+                        ("A.ERRS", "ERRS", DbFieldType::Char),
+                        ("A.CNCT", "CNCT", DbFieldType::Enum),
+                        ("A.IEOS", "IEOS", DbFieldType::String),
+                        ("A.OEOS", "OEOS", DbFieldType::String),
+                        ("A.BAUD", "BAUD", DbFieldType::Enum),
+                        ("A.HOSTINFO", "HOSTINFO", DbFieldType::String),
+                    ] {
+                        readers.push(inst.add_subscriber(field, sid, ty, class.bits()).unwrap());
+                        sid += 1;
+                        assert!(inst.attach_filter_to_last_subscriber(
+                            field,
+                            Arc::new(Line {
+                                pv,
+                                stream: stream.clone(),
+                            }),
+                        ));
+                    }
+                }
+            }
+            let mut errs = Vec::new();
+            for step in steps {
+                for stream in &streams {
+                    stream.lock().unwrap().push_str("--\n");
+                }
+                if let Some((field, value)) = *step {
+                    db.put_record_field_from_ca("A", field, EpicsValue::String(value.into()))
+                        .await
+                        .unwrap();
+                }
+                settled().await;
+                errs.push(text("ERRS"));
+            }
+            assert_eq!(errs, errs_after);
+            // `getEos` writes the driver's terminator back escaped (:2003-2024).
+            assert_eq!((text("IEOS").as_str(), text("OEOS").as_str()), eos);
+            for (got, want, class) in [
+                (&streams[0], want, "DBE_VALUE"),
+                (
+                    &streams[1],
+                    "--\n".repeat(steps.len()).as_str(),
+                    "DBE_ALARM",
+                ),
+                (&streams[2], want, "DBE_LOG"),
+            ] {
+                assert_eq!(first_by_reference(&got.lock().unwrap()), want, "{class}");
+            }
+        }
+    }
+
+    /// C runs `setEos` and the `getEos` it falls through to in one
+    /// `asynCallbackSpecial` on the port thread (asynRecord.c:851-855), so a
+    /// request another client queues while the driver is inside `setInputEos`
+    /// runs after the readback, and IEOS shows the record's own terminator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn special_readback_runs_in_the_same_port_callback() {
+        use crate::interfaces::Capability;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_base_rs::server::database::PvDatabase;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Gated {
+            base: PortDriverBase,
+            ieos: Vec<u8>,
+            entered: std::sync::Mutex<mpsc::Sender<()>>,
+            proceed: std::sync::Mutex<mpsc::Receiver<()>>,
+        }
+        impl PortDriver for Gated {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn capabilities(&self) -> Vec<Capability> {
+                vec![Capability::OctetRead, Capability::OctetWrite]
+            }
+            fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+                if eos == b"\r" {
+                    self.entered.lock().unwrap().send(()).unwrap();
+                    self.proceed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+                self.ieos = eos.to_vec();
+                Ok(())
+            }
+            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+                self.ieos.clone()
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let port_name = "special_one_callback";
+        let base = PortDriverBase::new(
             port_name,
             1,
             PortFlags {
@@ -10155,20 +10498,23 @@ A.CNCT Disconnect
                 ..PortFlags::default()
             },
         );
-        base.install_octet_interpose(Box::new(EosInterpose::default()));
-        base.set_connected(false);
-        base.auto_connect = false;
-        let (rt, jh) = create_port_runtime(Echo(base), RuntimeConfig::default()).unwrap();
+        let driver = Gated {
+            base,
+            ieos: Vec::new(),
+            entered: std::sync::Mutex::new(entered_tx),
+            proceed: std::sync::Mutex::new(proceed_rx),
+        };
+        let (rt, jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
-        register_port(port_name, rt.port_handle().clone()).unwrap();
+        let handle = rt.port_handle().clone();
+        register_port(port_name, handle.clone()).unwrap();
         std::mem::forget(rt);
 
         let db = PvDatabase::new();
-        let mut rec = AsynRecord::default();
-        rec.addr = -1;
-        db.add_record("A", Box::new(rec)).await.unwrap();
+        db.add_record("A", Box::new(AsynRecord::default()))
+            .await
+            .unwrap();
         let cell = db.get_record("A").unwrap();
-        // The record's special requests have all completed.
         let settled = || async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -10179,7 +10525,10 @@ A.CNCT Disconnect
                         .as_any_mut()
                         .and_then(|any| any.downcast_mut::<AsynRecord>())
                         .unwrap();
-                    !rec.special_lane.0.lock().unwrap().draining
+                    rec.special_lane
+                        .in_flight
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
                 };
                 if idle {
                     return;
@@ -10188,75 +10537,28 @@ A.CNCT Disconnect
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
-        let field = |name: &str| cell.read().record.get_field(name);
-        let text = |name: &str| match field(name) {
-            Some(EpicsValue::CharArray(buf)) => {
-                String::from_utf8(buf.split(|b| *b == 0).next().unwrap().to_vec()).unwrap()
-            }
-            Some(EpicsValue::String(s)) => s.to_string(),
-            other => panic!("{name}: {other:?}"),
-        };
-
         db.put_record_field_from_ca("A", "PORT", EpicsValue::String(port_name.into()))
             .await
             .unwrap();
         settled().await;
-        // `connectDevice`'s EOS readback, refused on the disconnected port
-        // (asynRecord.c:1296-1301).
-        assert_eq!(text("ERRS"), CONNECT_READBACK_QUEUE_REFUSED_MSG);
 
-        let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
-        let streams: Vec<Arc<std::sync::Mutex<String>>> =
-            classes.iter().map(|_| Arc::default()).collect();
-        let mut readers = Vec::new();
-        {
-            let mut inst = cell.write();
-            let mut sid = 0;
-            for (class, stream) in classes.iter().zip(&streams) {
-                for (pv, field, ty) in [
-                    ("A.ERRS", "ERRS", DbFieldType::Char),
-                    ("A.CNCT", "CNCT", DbFieldType::Enum),
-                    ("A.IEOS", "IEOS", DbFieldType::String),
-                    ("A.OEOS", "OEOS", DbFieldType::String),
-                    ("A.BAUD", "BAUD", DbFieldType::Enum),
-                    ("A.HOSTINFO", "HOSTINFO", DbFieldType::String),
-                ] {
-                    readers.push(inst.add_subscriber(field, sid, ty, class.bits()).unwrap());
-                    sid += 1;
-                    assert!(inst.attach_filter_to_last_subscriber(
-                        field,
-                        Arc::new(Line {
-                            pv,
-                            stream: stream.clone(),
-                        }),
-                    ));
-                }
-            }
-        }
-        let mut errs = Vec::new();
-        for step in STEPS {
-            for stream in &streams {
-                stream.lock().unwrap().push_str("--\n");
-            }
-            if let Some((field, value)) = step {
-                db.put_record_field_from_ca("A", field, EpicsValue::String(value.into()))
-                    .await
-                    .unwrap();
-            }
-            settled().await;
-            errs.push(text("ERRS"));
-        }
-        let no_option = "No asynOption interface";
-        assert_eq!(errs, ["", "", "", "", no_option, no_option, "", "", ""]);
-        // `getEos` writes the driver's terminator back escaped (:2003-2024).
-        assert_eq!((text("IEOS"), text("OEOS")), ("\\r".into(), "\\n".into()));
-        for (got, want, class) in [
-            (&streams[0], WANT, "DBE_VALUE"),
-            (&streams[1], "--\n".repeat(9).as_str(), "DBE_ALARM"),
-            (&streams[2], WANT, "DBE_LOG"),
-        ] {
-            assert_eq!(first_by_reference(&got.lock().unwrap()), want, "{class}");
-        }
+        db.put_record_field_from_ca("A", "IEOS", EpicsValue::String("\\r".into()))
+            .await
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let other = handle
+            .try_submit(
+                RequestOp::SetInputEos { eos: b"X".to_vec() },
+                AsynUser::new(0),
+            )
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        settled().await;
+        drop(other);
+        assert_eq!(
+            cell.read().record.get_field("IEOS"),
+            Some(EpicsValue::String("\\r".into()))
+        );
     }
 
     /// Boundary: the exception refresh is C `POST_IF_NEW`
@@ -10297,14 +10599,14 @@ A.CNCT Disconnect
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
 
@@ -10450,14 +10752,14 @@ A.CNCT Disconnect
         base.auto_connect = false;
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
@@ -10561,14 +10863,14 @@ A.CNCT Disconnect
         base.auto_connect = false;
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
@@ -10727,13 +11029,13 @@ A.CNCT Disconnect
         drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
         let (tx, rx) = mpsc::channel(64);
         let actor = PortActor::new(Box::new(drv), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(64)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -10837,13 +11139,13 @@ A.CNCT Disconnect
         let base = PortDriverBase::new(port_name, 1, PortFlags::default());
         let (tx, rx) = mpsc::channel(64);
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(64)),
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         );
         register_port(port_name, handle).unwrap();
@@ -10939,13 +11241,13 @@ A.CNCT Disconnect
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         crate::registry::register_port(port_name, handle.clone()).unwrap();
@@ -11026,13 +11328,13 @@ A.CNCT Disconnect
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new(256)),
-            actor_id,
+            actor_link,
             trace.clone(),
         );
         register_port(port_name, handle.clone()).unwrap();
@@ -11053,6 +11355,80 @@ A.CNCT Disconnect
         );
         assert_eq!(rec.enbl, 1, "ENBL is re-read and unchanged");
         assert_eq!(rec.auct, 1, "AUCT is re-read and unchanged");
+    }
+
+    /// The record's own setter runs C's `exceptCallback` once, inside
+    /// `special()` (asynRecord.c:911-916); the registered callback leaves it
+    /// alone. On a record with no database handle a second run shows as
+    /// `status_dirty`, which would refresh again on the next `process()`.
+    /// One case per announcer: a trace setter (the setter's own thread), an
+    /// actor setter (the port actor, before its reply), and a foreign
+    /// exception, which still raises the flag.
+    #[test]
+    fn an_own_setter_refreshes_the_status_once() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_own_setter_refreshes_once";
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(exceptions.clone());
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.bind_exception_sink(exceptions.clone());
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_link,
+            trace.clone(),
+        );
+        register_port(port_name, handle).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.tmod = TransferMode::NoIo as i32;
+        let _ = rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        rec.status_dirty.store(false, Ordering::Release);
+
+        rec.tmsk = (TraceMask::ERROR | TraceMask::FLOW).bits() as i32;
+        rec.special("TMSK", true).unwrap();
+        assert_eq!(rec.tb4, 1, "the refresh in special() ran");
+        assert!(!rec.status_dirty.load(Ordering::Acquire), "trace setter");
+
+        rec.enbl = 0;
+        rec.special("ENBL", true).unwrap();
+        assert!(!rec.status_dirty.load(Ordering::Acquire), "actor setter");
+        rec.enbl = 1;
+        rec.special("ENBL", true).unwrap();
+
+        std::thread::spawn({
+            let trace = trace.clone();
+            move || trace.set_trace_mask(Some(port_name), TraceMask::ERROR)
+        })
+        .join()
+        .unwrap();
+        assert!(
+            rec.status_dirty.load(Ordering::Acquire),
+            "a foreign exception still reaches the callback"
+        );
     }
 
     /// R10-55. A GPIB driver takes its interfaces from

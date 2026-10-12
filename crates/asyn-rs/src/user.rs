@@ -61,9 +61,10 @@ pub const ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED: usize = 0x7000_0000;
 ///   `asynEnable(port,0)` was disabled precisely to keep the IOC off the
 ///   hardware, so nothing it queues may touch the wire.
 /// * `!pport->dpc.connected → asynDisconnected` (:1547-1552) is conditional on
-///   `checkPortConnect`, which :1536-1538 clears for a request that is queued at
-///   `asynQueuePriorityConnect` **and** either carries no device (`addr == -1`)
-///   or carries [`ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`].
+///   `checkPortConnect`, which :1538-1540 clears for a request that is queued at
+///   `asynQueuePriorityConnect` **and** either carries no device or carries
+///   [`ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`]. A user has a device only on an
+///   `ASYN_MULTIDEVICE` port at `addr >= 0` (`locateDevice`, :576).
 ///
 /// Producing this value is [`AsynUser::connect_check`]'s job and nobody else's:
 /// there is deliberately no way to ask the gate to skip the *enabled* half.
@@ -249,12 +250,13 @@ impl AsynUser {
         self
     }
 
-    /// C `queueRequest`'s `checkPortConnect` (asynManager.c:1536-1538) — the
-    /// *only* producer of a [`ConnectCheck`], so the connected refusal is waived
+    /// C `queueRequest`'s `checkPortConnect` (asynManager.c:1538-1540) on a port
+    /// that is (`multi_device`) or is not `ASYN_MULTIDEVICE` — the *only*
+    /// producer of a [`ConnectCheck`], so the connected refusal is waived
     /// exactly where C waives it and the enabled refusal is waived nowhere.
-    pub fn connect_check(&self) -> ConnectCheck {
+    pub fn connect_check(&self, multi_device: bool) -> ConnectCheck {
         if self.priority == QueuePriority::Connect {
-            self.connect_check_at_connect_priority()
+            self.connect_check_at_connect_priority(multi_device)
         } else {
             ConnectCheck::Required
         }
@@ -264,13 +266,16 @@ impl AsynUser {
     /// queue *by construction* — the `asynCommon` connect/disconnect callbacks,
     /// whose C call sites always pass `asynQueuePriorityConnect`
     /// (asynRecord.c:561-563, asynShellCommands.c). Priority being given, only
-    /// the second half of C's `checkPortConnect` waiver remains (:1536-1538):
-    /// a port-level user (`addr == -1`) or the explicit sentinel. A
-    /// device-addressed user with neither — asynRecord's CNCT put, whose
-    /// special user is connected at the record's ADDR — is refused
-    /// `asynDisconnected` on a disconnected port (W10-D1): a C wart, kept.
-    pub fn connect_check_at_connect_priority(&self) -> ConnectCheck {
-        if self.addr < 0 || self.reason == ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED {
+    /// the second half of C's `checkPortConnect` waiver remains (:1538-1540):
+    /// a user with no device or the explicit sentinel. C's `addr` there is the
+    /// device's (`pdevice ? pdevice->addr : -1`, :1529), and `connectDevice`
+    /// finds no device on a port without `ASYN_MULTIDEVICE` (:576, :1352), so
+    /// only a multi-device port refuses a device-addressed CNCT put on a
+    /// disconnected port.
+    pub fn connect_check_at_connect_priority(&self, multi_device: bool) -> ConnectCheck {
+        if crate::port::dp_common_key(multi_device, self.addr).is_none()
+            || self.reason == ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED
+        {
             ConnectCheck::Waived
         } else {
             ConnectCheck::Required

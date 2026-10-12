@@ -27,9 +27,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::{Capability, InterfaceType};
 use crate::interrupt::InterruptManager;
+use crate::port::QueueGate;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
-use crate::port_actor::{ActorId, ActorMessage};
-use crate::request::{CancelToken, DriverCall, RequestOp, RequestResult};
+use crate::port_actor::{ActorId, ActorLink, ActorMessage};
+use crate::request::{CancelToken, DriverCall, PortCalls, RequestOp, RequestResult};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
@@ -226,6 +227,10 @@ pub struct PortHandle {
     /// Identity of the actor on the receiving end of `tx`. Every blocking entry
     /// point compares it against the calling thread — see [`guard_reentrant`].
     actor: ActorId,
+    /// The port-level half of C `queueRequest`'s gate, over the actor's own
+    /// cells — see [`Self::queue_gate`].
+    #[cfg(feature = "epics")]
+    gate: QueueGate,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
     multi_device: bool,
@@ -248,21 +253,33 @@ pub struct PortHandle {
     trace: Arc<TraceManager>,
 }
 
+/// A synchronous port's callback runs on the caller's thread, each call a
+/// blocking round trip — C's `queueRequest` on a port without
+/// `ASYN_CANBLOCK`.
+impl PortCalls for PortHandle {
+    fn call(&mut self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.submit_blocking(op, user)
+    }
+}
+
 impl PortHandle {
-    /// `actor` must be the id of the actor owning `tx`'s receiving end
-    /// (`PortActor::id`), so that a blocking caller can recognise a re-entrant
-    /// call from that actor's own thread.
+    /// `actor` must be the link of the actor owning `tx`'s receiving end
+    /// (`PortActor::link`), so that a blocking caller can recognise a
+    /// re-entrant call from that actor's own thread and a queueing caller reads
+    /// that port's gate.
     pub(crate) fn new(
         tx: mpsc::Sender<ActorMessage>,
         port_name: String,
         interrupts: Arc<InterruptManager>,
-        actor: ActorId,
+        actor: ActorLink,
         trace: Arc<TraceManager>,
     ) -> Self {
         Self {
             tx,
             port_name: port_name.into(),
-            actor,
+            actor: actor.id,
+            #[cfg(feature = "epics")]
+            gate: actor.gate,
             interrupts,
             can_block: false,
             multi_device: false,
@@ -347,6 +364,18 @@ impl PortHandle {
     /// argument of `asynPortDriver`. Always at least 1.
     pub fn max_addr(&self) -> i32 {
         self.max_addr
+    }
+
+    /// C `queueRequest(pasynUser, priority, …)`'s refusals
+    /// (asynManager.c:1538-1552) for `user`, at the priority it carries,
+    /// answered on the calling thread from the port's own state as C answers
+    /// them under `asynManagerLock` before anything is queued. The refusal is
+    /// an [`AsynError::QueueRefused`], as the actor's.
+    #[cfg(feature = "epics")]
+    pub(crate) fn queue_gate(&self, user: &AsynUser) -> AsynResult<()> {
+        self.gate
+            .check(user.connect_check(self.multi_device))
+            .map_err(AsynError::into_queue_refusal)
     }
 
     /// Port name this handle is connected to.
@@ -1249,7 +1278,7 @@ impl PortHandle {
     /// runs on a disconnected port — this is the route that brings a down
     /// line up. A device-addressed connect (asynRecord CNCT at the record's
     /// ADDR) goes through [`Self::submit_blocking`] with the caller's own
-    /// user and is refused on a disconnected port, as C refuses it (W10-D1).
+    /// user, which a disconnected multi-device port refuses, as C does.
     pub fn connect_blocking(&self) -> AsynResult<()> {
         self.submit_blocking(RequestOp::Connect, AsynUser::new(0).with_addr(-1))?;
         Ok(())
@@ -1409,7 +1438,7 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-handle-actor".into())
             .spawn(move || actor.run())
@@ -1418,7 +1447,7 @@ mod tests {
             tx,
             "handle_test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(TraceManager::new()),
         )
     }

@@ -606,7 +606,7 @@ impl UpstreamManager {
         // exactly once when the subscription is dropped.
         // The receiver is taken with the channel, before its search starts:
         // a connect that wins the race publishes its rights only once.
-        let (channel, mut conn_rx) = self.client.create_channel_with_events(upstream_name);
+        let (channel, mut conn_rx) = self.client.create_channel_with_events(upstream_name, 0);
         let channel = Arc::new(channel);
 
         // only register a shadow PV once the upstream channel

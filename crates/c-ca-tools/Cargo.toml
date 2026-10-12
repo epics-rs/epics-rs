@@ -1,0 +1,16 @@
+[package]
+name = "c-ca-tools"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: run the EPICS C reference tools (softIoc, caget, caput) against epics-ca-rs"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest.
+publish = false
+
+[dependencies]
+named-port = { path = "../named-port" }
+fact-budget = { path = "../fact-budget" }
+tempfile = "3"

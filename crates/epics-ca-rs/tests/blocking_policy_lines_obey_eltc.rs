@@ -7,9 +7,6 @@
 //! Each test is its own process under nextest, which is what lets it set the
 //! policy's environment before the server reads it.
 
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
-
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;

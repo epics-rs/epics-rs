@@ -76,3 +76,52 @@ pub fn rs_ioc_port_was_taken(console: &str, port: u16) -> bool {
                 && l.contains("Address already in use"))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// realtime-ca-ioc's stderr, verbatim, when `local_addr` fails after a good
+    /// bind: measured on Linux 6.14 / glibc 2.39 (thread-backend build,
+    /// port 32961) with `getsockname` forced to EINVAL on the listening socket,
+    /// which is RTEMS's failure there. The RTEMS console itself is unmeasured.
+    /// The port was bound, so it is no steal, and a retry on it would hide the
+    /// failure as a slow pass.
+    const LOCAL_ADDR_FAILED: &str = "\
+Starting iocInit
+iocRun: All initialization complete
+realtime-ca-ioc: cannot start the CA TCP server on port 32961: bind() succeeded; \
+local_addr() on the listener failed: Invalid argument (os error 22)
+";
+
+    #[test]
+    fn a_local_addr_failure_is_not_a_stolen_port() {
+        assert!(!rs_ioc_port_was_taken(LOCAL_ADDR_FAILED, 32961));
+        assert!(rs_ioc_port_was_taken(
+            "realtime-ca-ioc: cannot start the CA TCP server on port 32961: \
+             Address already in use (os error 98)\n",
+            32961
+        ));
+    }
+
+    /// A report names the port it is about: softioc-rs's measured UDP-held
+    /// line and realtime-ca-ioc's UDP arm are no steal of another number,
+    /// including one the named port's digits start with.
+    #[test]
+    fn a_report_about_another_port_is_not_a_stolen_port() {
+        const UDP_HELD: &str = "iocRun: All initialization complete\n\
+            \x1b[31;1mERROR\x1b[0m: I/O error: CA server UDP search responder bind \
+            127.0.0.1:32961: Address already in use (os error 98)\n";
+        const RT_UDP: &str = "realtime-ca-ioc: cannot start the CA UDP search responder on port \
+            32961: Address already in use (os error 98)\n";
+        for console in [UDP_HELD, RT_UDP] {
+            assert!(rs_ioc_port_was_taken(console, 32961), "{console:?}");
+        }
+        assert!(!rs_ioc_port_was_taken(UDP_HELD, 3296));
+        assert!(!rs_ioc_port_was_taken(RT_UDP, 32962));
+        assert!(!rs_ioc_port_was_taken(
+            "Starting iocInit\niocRun: All initialization complete\n",
+            32961
+        ));
+    }
+}

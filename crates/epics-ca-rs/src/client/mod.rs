@@ -1163,16 +1163,17 @@ impl CaClient {
         self.create_channel_expanded(expand_pv_name(name), 0).0
     }
 
-    /// [`Self::create_channel`] plus a [`CaChannel::connection_events`]
-    /// receiver that exists before the search starts — libca's
-    /// `ca_create_channel` connection callback. A receiver taken after
-    /// `create_channel` returns misses a connect that wins the race,
-    /// together with the access rights it carries.
+    /// [`Self::create_channel_with_priority`] plus a
+    /// [`CaChannel::connection_events`] receiver that exists before the
+    /// search starts — libca's `ca_create_channel` connection callback. A
+    /// receiver taken after the channel is created misses a connect that wins
+    /// the race, together with the access rights it carries.
     pub fn create_channel_with_events(
         &self,
         name: &str,
+        priority: u8,
     ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
-        self.create_channel_expanded(expand_pv_name(name), 0)
+        self.create_channel_expanded(expand_pv_name(name), priority.min(99))
     }
 
     /// Create a persistent channel at a specific CA priority (`0..=99`,

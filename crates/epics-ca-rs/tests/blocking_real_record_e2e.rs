@@ -37,9 +37,6 @@
 
 #![cfg(exec_backend)]
 
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

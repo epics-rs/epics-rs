@@ -27,14 +27,11 @@
 //! makes that a checked property rather than an assumption.
 //!
 //! Waits go through [`Circuit`], which never discards a frame — see the
-//! `common/raw_ca.rs` module docs for why that matters when one write produces
+//! `raw-ca` crate docs for why that matters when one write produces
 //! two replies whose order the server does not fix.
 //!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
-
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};

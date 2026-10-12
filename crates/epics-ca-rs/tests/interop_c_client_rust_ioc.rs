@@ -9,12 +9,10 @@
 
 #![cfg(tokio_backend)]
 
-mod common;
-
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{LineCollector, require_tool, run_caget, run_caput};
+use c_ca_tools::{LineCollector, require_tool, run_caget, run_caput};
 use serial_test::serial;
 
 const TEST_DB: &str = "
@@ -162,7 +160,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
 
     // Wait for camonitor's leading event (it prints the current value on
     // connect) rather than assuming a fixed sleep covers search + connect.
-    let out_lines = common::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
+    let out_lines = c_ca_tools::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
     assert!(
         out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
         "camonitor never connected; got:\n{}",

@@ -741,6 +741,142 @@ fn test_roots(crate_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// A crate's bin targets with their module closures, and the library files
+/// none of those bins own.
+fn split_targets(crate_dir: &Path) -> (Vec<(String, Vec<PathBuf>)>, Vec<PathBuf>) {
+    // A bin's own modules belong to the bin, not to the library beside it.
+    let mut bin_closures: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    let mut owned_by_a_bin: BTreeSet<PathBuf> = BTreeSet::new();
+    for bin in &bin_targets(crate_dir) {
+        let root = crate_dir.join(&bin.path);
+        if !root.is_file() {
+            continue;
+        }
+        let mut closure = module_closure(&root);
+        closure.sort();
+        owned_by_a_bin.extend(closure.iter().cloned());
+        bin_closures.push((bin.name.clone(), closure));
+    }
+    let mut lib_files = Vec::new();
+    rust_files(&crate_dir.join("src"), &mut lib_files);
+    lib_files.retain(|f| !owned_by_a_bin.contains(f));
+    lib_files.sort();
+    (bin_closures, lib_files)
+}
+
+/// The quoted value of `key = "..."` inside one manifest line's inline table.
+fn quoted_value<'a>(table: &'a str, key: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(i) = table[from..].find(key) {
+        let at = from + i;
+        from = at + key.len();
+        let before = table[..at].chars().last();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            continue;
+        }
+        let Some(rest) = table[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix('"')?;
+        return rest.split_once('"').map(|(v, _)| v);
+    }
+    None
+}
+
+/// `[workspace.dependencies]` entries that carry a `path`, by key.
+fn workspace_dep_dirs(crate_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut out = BTreeMap::new();
+    let Some(root) = crate_dir.ancestors().skip(1).find(|d| {
+        read(&d.join("Cargo.toml"))
+            .lines()
+            .any(|l| l.trim() == "[workspace]")
+    }) else {
+        return out;
+    };
+    let mut in_table = false;
+    for line in read(&root.join("Cargo.toml")).lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_table = t == "[workspace.dependencies]";
+            continue;
+        }
+        if in_table
+            && let Some((key, table)) = t.split_once('=')
+            && let Some(path) = quoted_value(table, "path")
+        {
+            out.insert(key.trim().to_string(), root.join(path));
+        }
+    }
+    out
+}
+
+/// A crate a binary of this package may link through `[dev-dependencies]`:
+/// the identifier code names it by, and its library's spawn evidence.
+struct DevDepSpawner {
+    ident: String,
+    evidence: String,
+}
+
+/// The `path` dev-dependencies of one crate whose library spawns an IOC,
+/// `workspace = true` entries resolved through the workspace manifest.
+///
+/// A dev-dependency is linked into every test binary of the package, but only
+/// a binary that names it calls it; so the promotion is per binary, by name,
+/// where a spawning library of the package's own is promoted to every binary.
+fn dev_dep_spawners(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<DevDepSpawner> {
+    let workspace = workspace_dep_dirs(crate_dir);
+    let mut out = Vec::new();
+    let mut in_dev = false;
+    for line in read(&crate_dir.join("Cargo.toml")).lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_dev = t.trim_end_matches(']').ends_with("dev-dependencies");
+            continue;
+        }
+        let Some((key, table)) = t.split_once('=').filter(|_| in_dev) else {
+            continue;
+        };
+        let key = key.trim();
+        let dir = match quoted_value(table, "path") {
+            Some(path) => crate_dir.join(path),
+            None if table.contains("workspace = true") => match workspace.get(key) {
+                Some(dir) => dir.clone(),
+                None => continue,
+            },
+            None => continue,
+        };
+        let (_, lib_files) = split_targets(&dir);
+        let Some(ev) = first_evidence(&lib_files, &dir, tokens) else {
+            continue;
+        };
+        let package = package_name(&dir.join("Cargo.toml")).unwrap_or_else(|| key.to_string());
+        out.push(DevDepSpawner {
+            ident: key.replace('-', "_"),
+            evidence: format!(
+                "{package}/{ev} (through the {package} dev-dependency this binary names)"
+            ),
+        });
+    }
+    out
+}
+
+/// The evidence of the first spawning dev-dependency that `files` name.
+fn named_dev_dep_evidence(files: &[PathBuf], deps: &[DevDepSpawner]) -> Option<String> {
+    if deps.is_empty() {
+        return None;
+    }
+    files.iter().find_map(|file| {
+        let mut in_block = false;
+        let code: String = read(file)
+            .lines()
+            .map(|l| code_only(l, &mut in_block) + "\n")
+            .collect();
+        deps.iter()
+            .find(|d| has_path(&code, &format!("{}::", d.ident)))
+            .map(|d| d.evidence.clone())
+    })
+}
+
 /// Walk one crate and report every nextest binary in it that spawns an IOC.
 ///
 /// Three kinds of binary, enumerated separately because nextest addresses them
@@ -764,26 +900,9 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
         None => return Vec::new(),
     };
 
-    // A bin's own modules belong to the bin, not to the library beside it.
-    let bins = bin_targets(crate_dir);
-    let mut bin_closures: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    let mut owned_by_a_bin: BTreeSet<PathBuf> = BTreeSet::new();
-    for bin in &bins {
-        let root = crate_dir.join(&bin.path);
-        if !root.is_file() {
-            continue;
-        }
-        let mut closure = module_closure(&root);
-        closure.sort();
-        owned_by_a_bin.extend(closure.iter().cloned());
-        bin_closures.push((bin.name.clone(), closure));
-    }
-
-    let mut lib_files = Vec::new();
-    rust_files(&crate_dir.join("src"), &mut lib_files);
-    lib_files.retain(|f| !owned_by_a_bin.contains(f));
-    lib_files.sort();
+    let (bin_closures, lib_files) = split_targets(crate_dir);
     let lib = first_evidence(&lib_files, crate_dir, tokens);
+    let dev_deps = dev_dep_spawners(crate_dir, tokens);
 
     let through_lib = |ev: &str| format!("{ev} (through the {package} library this binary links)");
 
@@ -805,11 +924,18 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
         }
     };
 
-    record(None, lib.clone(), false);
+    match lib.clone() {
+        Some(ev) => record(None, Some(ev), false),
+        None => record(None, named_dev_dep_evidence(&lib_files, &dev_deps), true),
+    }
     for (name, closure) in &bin_closures {
         match first_evidence(closure, crate_dir, tokens) {
             Some(ev) => record(Some(name.clone()), Some(ev), false),
-            None => record(Some(name.clone()), lib.as_deref().map(through_lib), true),
+            None => record(
+                Some(name.clone()),
+                named_dev_dep_evidence(closure, &dev_deps).or(lib.as_deref().map(through_lib)),
+                true,
+            ),
         }
     }
     for root in test_roots(crate_dir) {
@@ -821,7 +947,11 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
         closure.sort();
         match first_evidence(&closure, crate_dir, tokens) {
             Some(ev) => record(Some(binary), Some(ev), false),
-            None => record(Some(binary), lib.as_deref().map(through_lib), true),
+            None => record(
+                Some(binary),
+                named_dev_dep_evidence(&closure, &dev_deps).or(lib.as_deref().map(through_lib)),
+                true,
+            ),
         }
     }
 
@@ -1657,6 +1787,83 @@ mod tests {
             after.len() > before.len(),
             "the library's own unit tests are a binary too; after = {:?}",
             labels(&after)
+        );
+    }
+
+    /// A spawner moved out of `tests/common/` into a dev-dependency keeps its
+    /// callers in the census: `mod` and `#[path]` no longer reach it, so only
+    /// following the dev-dependency does. A binary that never names the crate
+    /// links it and still spawns nothing, and naming it in a comment is not
+    /// naming it.
+    #[test]
+    fn a_binary_naming_a_spawning_dev_dependency_is_a_spawner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawns = format!(
+            "{}pub fn go() {{ let _ = {}(\"softIoc\"); }}\n",
+            process_import(),
+            spawn_call()
+        );
+        write_crate(
+            &tmp.path().join("fixture-rig"),
+            "[package]\nname = \"fixture-rig\"\n",
+            &[("src/lib.rs", &spawns)],
+        );
+        let crate_dir = tmp.path().join("fixture-ca");
+        write_crate(
+            &crate_dir,
+            "[package]\nname = \"fixture-ca\"\n\n\
+             [dev-dependencies]\nfixture-rig = { path = \"../fixture-rig\" }\n",
+            &[
+                ("src/lib.rs", "pub fn nothing() {}\n"),
+                ("tests/calls.rs", "#[test]\nfn t() { fixture_rig::go(); }\n"),
+                ("tests/imports.rs", "use fixture_rig::go;\n"),
+                ("tests/silent.rs", "#[test]\nfn t() {}\n"),
+                (
+                    "tests/mentions.rs",
+                    "// fixture_rig::go() is not called here\n",
+                ),
+            ],
+        );
+        let rows = spawners_in_crate(&crate_dir, &tokens());
+        assert_eq!(labels(&rows), ["fixture-ca::calls", "fixture-ca::imports"]);
+        assert!(
+            rows[0].evidence.starts_with("fixture-rig/src/lib.rs:"),
+            "{:?}",
+            rows[0].evidence
+        );
+    }
+
+    /// `name = { workspace = true }` is a path dependency too, by way of the
+    /// workspace manifest.
+    #[test]
+    fn a_workspace_dev_dependency_is_followed_through_the_workspace_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawns = format!(
+            "{}pub fn go() {{ let _ = {}(\"softIoc\"); }}\n",
+            process_import(),
+            spawn_call()
+        );
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n\n\
+             [workspace.dependencies]\nfixture-rig = { path = \"crates/fixture-rig\" }\n",
+        )
+        .unwrap();
+        write_crate(
+            &tmp.path().join("crates/fixture-rig"),
+            "[package]\nname = \"fixture-rig\"\n",
+            &[("src/lib.rs", &spawns)],
+        );
+        let crate_dir = tmp.path().join("crates/fixture-ca");
+        write_crate(
+            &crate_dir,
+            "[package]\nname = \"fixture-ca\"\n\n\
+             [dev-dependencies]\nfixture-rig = { workspace = true }\n",
+            &[("tests/calls.rs", "#[test]\nfn t() { fixture_rig::go(); }\n")],
+        );
+        assert_eq!(
+            labels(&spawners_in_crate(&crate_dir, &tokens())),
+            ["fixture-ca::calls"]
         );
     }
 

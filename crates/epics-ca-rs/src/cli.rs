@@ -8,7 +8,8 @@ use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
-use crate::client::{CaChannel, CaClient};
+use crate::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_base_rs::runtime::sync::broadcast;
 
 /// Default CA CLI timeout in seconds when neither `-w` nor a usable
 /// `EPICS_CLI_TIMEOUT` env var is set.
@@ -196,7 +197,10 @@ pub async fn connect_pvs(
     // C `connect_pvs:625-626`: `create_pvs` first, and its non-zero return
     // is returned WITHOUT entering `ca_pend_io` — so a rejected name costs
     // no timeout and emits no "Channel connect timed out" line.
-    let channels = create_pvs(client, names, priority)?;
+    let channels: Vec<CaChannel> = create_pvs(client, names, priority)?
+        .into_iter()
+        .map(|(channel, _)| channel)
+        .collect();
     let all_connected =
         futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
             .await
@@ -233,17 +237,21 @@ pub async fn connect_pvs(
 ///
 /// Every rejected name gets its own line, in argv order, because C's loop
 /// reports each one and only then returns 1.
+///
+/// Each channel comes with the connection-event receiver it was created
+/// with, as C's `create_pvs` installs `connection_handler` in
+/// `ca_create_channel`.
 pub fn create_pvs(
     client: &CaClient,
     names: &[String],
     priority: u8,
-) -> Result<Vec<CaChannel>, ConnectPvsFailure> {
+) -> Result<Vec<(CaChannel, broadcast::Receiver<ConnectionEvent>)>, ConnectPvsFailure> {
     if let Some(message) = uncreatable_names_message(names) {
         return Err(ConnectPvsFailure { message });
     }
     Ok(names
         .iter()
-        .map(|name| client.create_channel_with_priority(name, priority))
+        .map(|name| client.create_channel_with_events(name, priority))
         .collect())
 }
 

@@ -10,8 +10,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-mod common;
-
 use epics_base_rs::server::records::int64out::Int64outRecord;
 use epics_base_rs::server::records::longout::LongoutRecord;
 use epics_base_rs::server::records::mbbo::MbboRecord;

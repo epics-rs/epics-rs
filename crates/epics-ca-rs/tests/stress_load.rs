@@ -14,11 +14,9 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile (default-filter excludes it).
 
-mod common;
-
 use std::time::Duration;
 
-use common::{require_tool, spawn_softioc};
+use c_ca_tools::{require_tool, spawn_softioc};
 use epics_base_rs::types::EpicsValue;
 use serial_test::serial;
 

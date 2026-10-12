@@ -297,6 +297,26 @@ impl LinkConnState {
         self.used_input_native.load(Ordering::Relaxed)
     }
 
+    /// Bring the cache to the channel's current state (`None` =
+    /// disconnected) after the watcher lost events: each transition the
+    /// lost run would have made, through its owner. Rights are applied only
+    /// when they differ from the cache, so a resync that finds nothing
+    /// changed dispatches no holder.
+    fn resync(&self, now: Option<crate::client::AccessRights>) {
+        match now {
+            None => {
+                self.mark_disconnected();
+            }
+            Some(rights) => {
+                self.mark_connected();
+                if rights.read != self.has_read_access() || rights.write != self.has_write_access()
+                {
+                    self.note_access_rights(rights.read, rights.write);
+                }
+            }
+        }
+    }
+
     /// C `accessRightsCallback` (`dbCa.c:1014-1040`) as one owned
     /// transition. Returns `true` iff the CP/CPP holders were dispatched.
     ///
@@ -666,7 +686,7 @@ impl CaLinkResolver {
         // watcher is lost for good — `meta` stays empty and the write right
         // stays at its default `true` (C `connectionCallback` scheduling
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
-        let (channel, conn_rx) = self.client().await?.create_channel_with_events(pv_name);
+        let (channel, conn_rx) = self.client().await?.create_channel_with_events(pv_name, 0);
         let channel = Arc::new(channel);
         // C `dbCa` opens the record-link monitor with `ca_add_array_event`
         // (`dbCa.c:1225-1229`), whose libca macro expands to
@@ -908,25 +928,61 @@ async fn run_connection_watcher(
     pv_name: String,
 ) {
     loop {
-        match conn_rx.recv().await {
-            // A fresh `Connected` transition kicks off the CTRL attribute
-            // refetch; detached so a hung get never stalls
-            // the watcher from seeing a later disconnect.
-            Ok(evt) => {
-                if note_conn_event(&evt, &connected) {
-                    reactor.spawn(fetch_link_metadata(
-                        channel.clone(),
-                        meta.clone(),
-                        pv_name.clone(),
-                    ));
-                }
+        let step = watch_step(&mut conn_rx, &connected, async || {
+            channel.info().await.ok().map(|info| info.access_rights)
+        })
+        .await;
+        match step {
+            WatchStep::Closed => return,
+            WatchStep::Applied => {}
+            // Detached so a hung CTRL get never stalls the watcher from
+            // seeing a later disconnect.
+            WatchStep::Refetch => {
+                reactor.spawn(fetch_link_metadata(
+                    channel.clone(),
+                    meta.clone(),
+                    pv_name.clone(),
+                ));
             }
-            // Lagged: a burst of events overran the bounded channel.
-            // Keep watching; the next event resyncs the flag.
-            Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            // Closed: the channel was dropped — watcher's job is done.
-            Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+/// What one [`watch_step`] left for the watcher to do.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchStep {
+    Applied,
+    /// The link is (or may have become) newly connected: refetch the CTRL
+    /// attributes, C `connectionCallback` scheduling `CA_GET_ATTRIBUTES`.
+    Refetch,
+    /// The channel is gone; the watcher's job is done.
+    Closed,
+}
+
+/// Receive one connection event into `state`. On `Lagged` the dropped
+/// events are gone for good, rights changes included — no later event
+/// repeats them — so the cache is resynced from `now`, the channel's
+/// current rights (`None` = disconnected). The dropped run may hold a
+/// reconnect, so a live link refetches its attributes.
+async fn watch_step(
+    conn_rx: &mut epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
+    state: &LinkConnState,
+    now: impl AsyncFnOnce() -> Option<crate::client::AccessRights>,
+) -> WatchStep {
+    use epics_base_rs::runtime::sync::broadcast::error::RecvError;
+    match conn_rx.recv().await {
+        Ok(evt) if note_conn_event(&evt, state) => WatchStep::Refetch,
+        Ok(_) => WatchStep::Applied,
+        Err(RecvError::Lagged(_)) => {
+            let now = now().await;
+            state.resync(now);
+            if now.is_some() {
+                WatchStep::Refetch
+            } else {
+                WatchStep::Applied
+            }
+        }
+        Err(RecvError::Closed) => WatchStep::Closed,
     }
 }
 
@@ -1541,6 +1597,58 @@ mod tests {
         // outage, one dispatch.
         assert!(state.mark_disconnected());
         assert!(!state.note_access_rights(false, false));
+    }
+
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        epics_base_rs::runtime::task::block_on_sync(f).expect("a plain test thread")
+    }
+
+    /// A lag drops events for good: here the write loss is overrun by two
+    /// events the link ignores, and only the resync from the channel's
+    /// current rights lands it; a resync that finds the channel down takes
+    /// the disconnect edge.
+    #[test]
+    fn a_lagged_watcher_takes_the_rights_it_lost_from_the_channel() {
+        use crate::client::AccessRights;
+        use epics_base_rs::runtime::sync::broadcast;
+        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        state.mark_connected();
+        let denied = AccessRights {
+            read: true,
+            write: false,
+        };
+        let native = ConnectionEvent::NativeTypeChanged {
+            previous: None,
+            current: epics_base_rs::types::DbFieldType::Double,
+        };
+
+        let (tx, mut rx) = broadcast::channel(2);
+        tx.send(ConnectionEvent::AccessRightsChanged {
+            read: true,
+            write: false,
+        })
+        .unwrap();
+        tx.send(native).unwrap();
+        tx.send(native).unwrap();
+        let step = block(watch_step(&mut rx, &state, async || Some(denied)));
+        assert_eq!(step, WatchStep::Refetch);
+        assert!(state.is_set());
+        assert!(
+            !state.has_write_access(),
+            "the overrun write loss is resynced"
+        );
+        assert!(state.has_read_access());
+
+        tx.send(native).unwrap();
+        tx.send(native).unwrap();
+        tx.send(native).unwrap();
+        let step = block(watch_step(&mut rx, &state, async || None));
+        assert_eq!(step, WatchStep::Applied);
+        assert!(
+            !state.is_set(),
+            "a channel found down takes the disconnect edge"
+        );
+        assert_eq!(state.disconnect_count(), 1);
     }
 
     /// Stage C6 criterion 4 regression, at the level the invariant is

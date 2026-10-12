@@ -26,13 +26,11 @@
 // command line, so these cases follow `softioc-rs` rather than move.
 #![cfg(tokio_backend)]
 
-mod common;
-
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 
 /// A spawned child that is killed and reaped on every exit path, including a
 /// panicking assertion inside the test.

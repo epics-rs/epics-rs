@@ -9,9 +9,6 @@
 //! Both receive loops are driven: each tears a circuit down through its own
 //! subscription map.
 
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
-
 // RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — the site is the async
 // loop's runtime, which its `cfg(tokio_backend)` test keeps off the exec
 // backend; the blocking loop's case runs and passes under

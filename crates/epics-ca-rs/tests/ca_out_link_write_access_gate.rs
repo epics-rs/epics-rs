@@ -240,7 +240,7 @@ async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to()
         .await
         .expect("CA client");
     client.set_host_name(DENIED_HOST);
-    let (channel, mut with_channel) = client.create_channel_with_events(PV);
+    let (channel, mut with_channel) = client.create_channel_with_events(PV, 0);
     channel
         .wait_connected(fact_budget::FACT_BUDGET)
         .await

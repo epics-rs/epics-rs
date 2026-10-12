@@ -202,9 +202,8 @@ fn put_and_await_reentry(db: &Arc<PvDatabase>, processes: &Arc<AtomicUsize>) {
 }
 
 // ---------------------------------------------------------------------------
-// A minimal raw CA client. Deliberately NOT `tests/common/raw_ca.rs`: this file
-// needs three frames out of that module's twenty, and pulling the whole module
-// in for a subset makes every helper it does not use a `dead_code` error.
+// A minimal raw CA client, apart from the `raw-ca` crate: this file needs three
+// frames out of that crate's twenty.
 // ---------------------------------------------------------------------------
 
 const DBR_DOUBLE: u16 = 6;

@@ -130,16 +130,6 @@ fn run_caput(port: u16, pv: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[allow(dead_code)]
-trait DefaultExt {
-    fn unwrap_or_default(self) -> String;
-}
-impl DefaultExt for Option<(String, String, String)> {
-    fn unwrap_or_default(self) -> String {
-        self.map(|t| t.2).unwrap_or_default()
-    }
-}
-
 // Pick a fixed pair of high ports for the rust + C softiocs.
 //
 // Using `TcpListener::bind("127.0.0.1:0")` to get an ephemeral port

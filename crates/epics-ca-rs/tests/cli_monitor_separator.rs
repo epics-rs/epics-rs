@@ -21,11 +21,9 @@
 
 #![cfg(tokio_backend)]
 
-mod common;
-
 use std::process::{Command, Stdio};
 
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;

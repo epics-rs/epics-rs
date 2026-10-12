@@ -10,9 +10,9 @@
 //! (R7.0.10-146) with a listener already holding the TCP port, which is the
 //! race this exists for.
 
-// Only the verdict, deliberately: `mod common;` would drag `softioc_on`'s
-// `Command::new("softIoc")` into a binary that spawns nothing, and
-// tools/ioc-spawn-gate reads the mod graph, not the call sites.
+// Only the verdict, deliberately: naming `c_ca_tools::` would make a binary
+// that spawns nothing a spawner, because tools/ioc-spawn-gate attributes a
+// dev-dependency's spawn to every binary that names the crate.
 use named_port::verdict as softioc_verdict;
 
 use softioc_verdict::{SoftIocVerdict, softioc_verdict};

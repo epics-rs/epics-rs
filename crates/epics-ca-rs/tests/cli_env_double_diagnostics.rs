@@ -22,14 +22,12 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-mod common;
-
 use std::process::Command;
 
 // Both are used only by the one `softioc-rs` case below, which the
 // reactor-free backend does not build.
 #[cfg(tokio_backend)]
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 #[cfg(tokio_backend)]
 use std::process::Stdio;
 

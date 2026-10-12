@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Included by `#[path]` into two suites that use overlapping subsets.
-
 //! Shared raw-socket CA client for the blocking-front-end e2e suites.
 //!
 //! Hand-rolled CA wire frames over `std::net::TcpStream` — no `CaClient`, no

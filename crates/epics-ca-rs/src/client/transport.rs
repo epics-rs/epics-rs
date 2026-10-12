@@ -4685,15 +4685,21 @@ mod flow_control_tests {
     use dashmap::DashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     /// Drive `read_loop` with a scriptable occupancy probe and collect the
     /// flow-control frames it emits.
+    ///
+    /// The probe is also the barrier. `read_loop` calls it once per receive
+    /// frame and sends that frame's EVENTS_OFF/ON right after it with no
+    /// await between, so while the probe is parked the write queue holds
+    /// exactly what the earlier frames sent.
     struct Harness {
         client: tokio::io::DuplexStream,
         writes: mpsc::UnboundedReceiver<Vec<u8>>,
         busy: Arc<AtomicBool>,
+        evaluated: mpsc::UnboundedReceiver<()>,
+        release: std::sync::mpsc::Sender<()>,
         _events: mpsc::UnboundedReceiver<TransportEvent>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -4703,9 +4709,18 @@ mod flow_control_tests {
         let (write_tx, writes) = mpsc::unbounded_channel::<Vec<u8>>();
         let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
         let busy = Arc::new(AtomicBool::new(false));
+        let (evaluated_tx, evaluated) = mpsc::unbounded_channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
         let probe: OsRecvQueueProbe = {
             let busy = Arc::clone(&busy);
-            Arc::new(move || busy.load(Ordering::SeqCst))
+            Arc::new(move || {
+                let pending = busy.load(Ordering::SeqCst);
+                let _ = evaluated_tx.send(());
+                // A dropped harness releases every later frame.
+                let _ = released.lock().unwrap().recv();
+                pending
+            })
         };
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client, server_io) = tokio::io::duplex(64 * 1024);
@@ -4728,30 +4743,42 @@ mod flow_control_tests {
             client,
             writes,
             busy,
+            evaluated,
+            release,
             _events,
             task,
         }
     }
 
-    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and wait
-    /// for `read_loop` to consume it, so each call drives exactly one receive
-    /// frame. Without the pause the duplex coalesces several frames into a
-    /// single `read()`, which is one frame for contiguous-count purposes.
-    async fn one_frame(h: &mut Harness) {
+    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and
+    /// return what the frames before it sent, read while `read_loop` is
+    /// parked in this frame's probe. The next frame is written only after
+    /// this one is evaluated, so every call is exactly one receive frame.
+    async fn frame(h: &mut Harness) -> Vec<u16> {
         let frame = CaHeader::new(CA_PROTO_ECHO).to_bytes().to_vec();
         h.client.write_all(&frame).await.expect("write");
         h.client.flush().await.expect("flush");
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::timeout(fact_budget::FACT_BUDGET, h.evaluated.recv())
+            .await
+            .expect("read_loop never evaluated the frame")
+            .expect("read_loop ended");
+        let mut sent = Vec::new();
+        while let Ok(frame) = h.writes.try_recv() {
+            sent.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
+        }
+        h.release
+            .send(())
+            .expect("read_loop is parked in the probe");
+        sent
     }
 
-    /// Drain whatever the loop queued for the wire, as command codes.
-    async fn drain(h: &mut Harness) -> Vec<u16> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut out = Vec::new();
-        while let Ok(frame) = h.writes.try_recv() {
-            out.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
-        }
-        out
+    /// The flow-control frame the last [`frame`] sent.
+    async fn sent_by_last_frame(h: &mut Harness) -> u16 {
+        let frame = tokio::time::timeout(fact_budget::FACT_BUDGET, h.writes.recv())
+            .await
+            .expect("the frame sent nothing")
+            .expect("read_loop ended");
+        CaHeader::from_bytes(&frame).expect("header").cmmd
     }
 
     /// The trigger is `max_contiguous_frames()` CONSECUTIVE busy frames —
@@ -4762,34 +4789,31 @@ mod flow_control_tests {
         let trigger = crate::protocol::max_contiguous_frames();
         let mut h = harness();
 
-        // Frames 1..trigger-1 with bytes still pending: under the bound, so no
-        // flow control yet.
+        // Frames 1..trigger-1 with bytes still pending: under the bound, so
+        // none of them asks for flow control — read at frame `trigger`.
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         assert_eq!(
-            drain(&mut h).await,
+            frame(&mut h).await,
             Vec::<u16>::new(),
             "{} contiguous busy frames is one short of the bound — no EVENTS_OFF",
             trigger - 1
         );
-
-        // Frame `trigger`: the bound is reached.
-        one_frame(&mut h).await;
         assert_eq!(
-            drain(&mut h).await,
-            vec![CA_PROTO_EVENTS_OFF],
+            sent_by_last_frame(&mut h).await,
+            CA_PROTO_EVENTS_OFF,
             "the {trigger}th contiguous busy frame must trip EVENTS_OFF"
         );
 
         // Socket drains. No consumer did anything — libca lifts flow control
         // on the socket alone, immediately, on the very next frame.
         h.busy.store(false, Ordering::SeqCst);
-        one_frame(&mut h).await;
+        assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         assert_eq!(
-            drain(&mut h).await,
-            vec![CA_PROTO_EVENTS_ON],
+            sent_by_last_frame(&mut h).await,
+            CA_PROTO_EVENTS_ON,
             "a drained socket must lift EVENTS_OFF immediately, with no \
              consumer-side drain"
         );
@@ -4807,20 +4831,20 @@ mod flow_control_tests {
 
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         // One clean read breaks the run.
         h.busy.store(false, Ordering::SeqCst);
-        one_frame(&mut h).await;
-        assert_eq!(drain(&mut h).await, Vec::<u16>::new());
+        assert_eq!(frame(&mut h).await, Vec::<u16>::new());
 
-        // Back to busy: a fresh run of trigger-1 must still be under the bound.
+        // Back to busy: a fresh run of trigger-1 must still be under the
+        // bound, read at the frame after it.
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         assert_eq!(
-            drain(&mut h).await,
+            frame(&mut h).await,
             Vec::<u16>::new(),
             "the clean read must have reset the count — the run restarts at 1"
         );

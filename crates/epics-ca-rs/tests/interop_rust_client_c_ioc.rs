@@ -17,11 +17,9 @@
 // `#[ignore]`d, and all four pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
 // cargo nextest run --profile interop -p epics-ca-rs --run-ignored all`.
 
-mod common;
-
 use std::time::Duration;
 
-use common::{require_tool, spawn_softioc, spawn_softioc_on};
+use c_ca_tools::{require_tool, spawn_softioc, spawn_softioc_on};
 use epics_base_rs::types::EpicsValue;
 use serial_test::serial;
 
@@ -134,7 +132,7 @@ async fn rust_client_monitors_softioc_changes() {
     let server_port = ioc.udp_port;
     tokio::task::spawn_blocking(move || {
         for v in [10, 20, 30] {
-            let _ = common::run_caput(&addr_list, server_port, "TEST:LOUT", &v.to_string());
+            let _ = c_ca_tools::run_caput(&addr_list, server_port, "TEST:LOUT", &v.to_string());
             std::thread::sleep(Duration::from_millis(150));
         }
     });

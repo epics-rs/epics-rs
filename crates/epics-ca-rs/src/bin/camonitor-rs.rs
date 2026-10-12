@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
+use epics_base_rs::runtime::sync::broadcast;
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time,
@@ -352,7 +353,7 @@ async fn main() {
     };
 
     let mut handles = Vec::new();
-    for (i, (pv_name, channel)) in args.pv_names.iter().zip(channels).enumerate() {
+    for (i, (pv_name, (channel, conn_rx))) in args.pv_names.iter().zip(channels).enumerate() {
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
@@ -362,6 +363,7 @@ async fn main() {
         handles.push(tokio::spawn(async move {
             monitor_pv(
                 channel,
+                conn_rx,
                 pv,
                 flag,
                 fmt,
@@ -420,6 +422,7 @@ fn format_server_timestamp(ts: SystemTime) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn monitor_pv(
     channel: CaChannel,
+    mut conn_rx: broadcast::Receiver<ConnectionEvent>,
     pv_name: String,
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
@@ -438,7 +441,6 @@ async fn monitor_pv(
     // Per-channel `firstStampPrinted` gate: the leading event of THIS
     // channel always prints an absolute stamp (C `tool_lib.c:414`).
     let mut first_printed = false;
-    let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
     let flag = connected_flag.clone();
     let sep = fmt.field_separator;

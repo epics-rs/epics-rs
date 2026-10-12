@@ -454,6 +454,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "c-ca-tools"
+version = "0.31.0"
+dependencies = [
+ "fact-budget",
+ "named-port",
+ "tempfile",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1072,6 +1081,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64",
+ "c-ca-tools",
  "chrono",
  "clap",
  "criterion",
@@ -1097,6 +1107,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand_core 0.6.4",
+ "raw-ca",
  "rcgen",
  "rtems-exec-gate",
  "rustls-pemfile",
@@ -3167,6 +3178,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "raw-ca"
+version = "0.31.0"
+dependencies = [
+ "epics-base-rs",
+ "epics-ca-rs",
+ "fact-budget",
 ]
 
 [[package]]

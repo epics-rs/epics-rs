@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Helpers are conditionally used across test files.
-
 //! Shared helpers for CA interop and soak tests.
 //!
 //! These tests exercise epics-ca-rs against the reference EPICS C
